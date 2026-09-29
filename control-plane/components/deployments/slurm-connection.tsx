@@ -9,10 +9,17 @@ import { Notice, Sheet } from "@/components/models/ui";
 import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { duration } from "@/lib/deployments-model";
+import { cn } from "@/lib/utils";
 import type { NodeAlias, SlurmHealthView, SlurmSettingsView, UpdateSlurmSettings } from "@/lib/obleth";
 
-const FIELDS = ["enabled", "url", "api_version", "user", "jwt", "aliases"];
-const LABELS: Record<string, string> = { enabled: "Slurm", url: "slurmrestd URL", api_version: "API version", user: "Slurm user", jwt: "JWT", aliases: "Node addresses" };
+const FIELDS = ["enabled", "url", "api_version", "user", "jwt", "aliases", "cache_dir", "images_dir", "images", "log_dir", "setup", "hf_token", "hf_clear"];
+const LABELS: Record<string, string> = { enabled: "Slurm", url: "slurmrestd URL", api_version: "API version", user: "Slurm user", jwt: "JWT", aliases: "Node addresses", cache_dir: "Weight cache", images_dir: "Images folder", images: "Image per engine", log_dir: "Job logs", setup: "Load before launch", hf_token: "Hugging Face token", hf_clear: "Hugging Face token" };
+const ENGINES: { id: string; label: string; placeholder: string }[] = [
+  { id: "vllm", label: "vLLM", placeholder: "vllm.sif" },
+  { id: "sglang", label: "SGLang", placeholder: "sglang.sif" },
+  { id: "llamacpp", label: "llama.cpp", placeholder: "empty: llama-server on the node's PATH" },
+  { id: "ollama", label: "Ollama", placeholder: "ollama.sif" },
+];
 
 function since(secs: number | null): string {
   if (secs == null) return "never";
@@ -45,6 +52,9 @@ export function SlurmConnection({ settings, replicas, onClose, onSaved }: { sett
   const { confirm, confirmElement } = useConfirm();
   const [enabled, setEnabled] = useState(settings.enabled);
   const [aliases, setAliases] = useState<NodeAlias[]>(settings.node_aliases);
+  const [tab, setTab] = useState<"connection" | "defaults">("connection");
+  const cd = settings.cluster_defaults ?? { cache_dir: "", images_dir: "", log_dir: "", setup: "", images: {} };
+  const [images, setImages] = useState<Record<string, string>>(cd.images ?? {});
   const [testing, startTest] = useTransition();
   const [health, setHealth] = useState<SlurmHealthView | null>(null);
   const [testError, setTestError] = useState<string | null>(null);
@@ -60,6 +70,16 @@ export function SlurmConnection({ settings, replicas, onClose, onSaved }: { sett
     };
     const jwt = String(data.get("jwt") ?? "").trim();
     if (jwt) body.slurm_jwt = jwt;
+    body.cluster_defaults = {
+      cache_dir: String(data.get("cache_dir") ?? "").trim(),
+      images_dir: String(data.get("images_dir") ?? "").trim(),
+      log_dir: String(data.get("log_dir") ?? "").trim(),
+      setup: String(data.get("setup") ?? ""),
+      images: Object.fromEntries(Object.entries(JSON.parse(String(data.get("images") || "{}")) as Record<string, string>).map(([k, v]) => [k, v.trim()]).filter(([, v]) => v)),
+    };
+    const hf = String(data.get("hf_token") ?? "").trim();
+    if (hf) body.hf_token = hf;
+    else if (data.get("hf_clear") === "on") body.hf_token = "";
     if (body.enabled && (!body.slurmrestd_url || !body.slurm_user)) return { ok: false, error: "Slurm needs a slurmrestd URL and a user to turn on.", saved: [] };
     const res = await setSlurmSettingsAction(body);
     if (!res.ok) return { ok: false, error: res.error, saved: [] };
@@ -128,6 +148,13 @@ export function SlurmConnection({ settings, replicas, onClose, onSaved }: { sett
         </div>
 
         <SettingsForm id="slurm" sectionOf={sectionOf} labelOf={labelOf} save={save} confirmSave={confirmSave} bar="panel" ariaLabel="Slurm connection">
+          <div className="flex gap-5 border-b border-border px-6" role="tablist" aria-label="Slurm settings">
+            {([["connection", "Connection"], ["defaults", "Cluster defaults"]] as const).map(([t, label]) => (
+              <button key={t} type="button" role="tab" aria-selected={tab === t} onClick={() => setTab(t)} className={cn("-mb-px h-10 border-b-2 text-[13.5px]", tab === t ? "border-foreground font-medium text-foreground" : "border-transparent text-muted-foreground hover:text-foreground")}>{label}</button>
+            ))}
+          </div>
+          {/* Both tabs stay in the form (hidden, not unmounted) so one save covers them. */}
+          <div hidden={tab !== "connection"}>
           <Setting label="Slurm" hint="On, models with a Slurm deployment are launched and kept running." fields={["enabled"]} was={{ field: "enabled", checkbox: true }} className="px-6">
             <Switch name="enabled" label="Launch models on Slurm" checked={enabled} onChange={setEnabled} />
             {!enabled && settings.enabled && <span className="text-xs font-medium">Running jobs keep their nodes; nothing new is launched or replaced.</span>}
@@ -156,6 +183,33 @@ export function SlurmConnection({ settings, replicas, onClose, onSaved }: { sett
             ))}
             <button type="button" onClick={() => setAliases((x) => [...x, { host: "", ip: "" }])} className="self-start text-[12.5px] text-secondary-foreground underline underline-offset-[3px] hover:text-foreground">{aliases.length ? "Add another" : "Add a node address"}</button>
           </Setting>
+          </div>
+          <div hidden={tab !== "defaults"}>
+          <p className="px-6 pb-2 pt-3.5 text-[12.5px] leading-relaxed text-muted-foreground">Recipes fill these in as {"{{cluster.cache}}"}, {"{{cluster.image.vllm}}"} and so on, so no recipe names a path on this cluster. A launch can still change them for itself.</p>
+          <Setting label="Weight cache" hint="Where models are downloaded (HF_HOME). Shared, fast storage the nodes can all reach." fields={["cache_dir"]} className="px-6">
+            <TextField name="cache_dir" label="Weight cache" defaultValue={cd.cache_dir} placeholder="/scratch/obleth/hf-cache" mono />
+          </Setting>
+          <Setting label="Container images" hint="The folder of .sif files, and the image each engine runs from. A name is looked up in the folder; a full path is used as is." fields={["images_dir", "images"]} className="px-6">
+            <TextField name="images_dir" label="Images folder" defaultValue={cd.images_dir} placeholder="/scratch/obleth/images" mono />
+            <input type="hidden" name="images" value={JSON.stringify(images)} />
+            <div className="grid grid-cols-[84px_minmax(0,1fr)] items-center gap-x-3 gap-y-2 text-[12.5px]">
+              {ENGINES.map((e) => (
+                <label key={e.id} className="contents"><span className="text-secondary-foreground">{e.label}</span><input aria-label={`${e.label} image`} value={images[e.id] ?? ""} onChange={(ev) => setImages((x) => ({ ...x, [e.id]: ev.target.value }))} placeholder={e.placeholder} autoComplete="off" className="h-9 min-w-0 rounded-md border border-input bg-background px-3 font-mono text-[12.5px]" /></label>
+              ))}
+            </div>
+            <span className="text-xs text-muted-foreground">Build or pull each image on a node of the right architecture (arm64 for Grace Hopper). A recipe says which engine version it needs.</span>
+          </Setting>
+          <Setting label="Job logs" hint="Where Slurm writes each job's output, unless a recipe says otherwise." fields={["log_dir"]} className="px-6">
+            <TextField name="log_dir" label="Job logs" defaultValue={cd.log_dir} placeholder="Slurm's default" mono />
+          </Setting>
+          <Setting label="Load before launch" hint="Lines run at the top of every job, such as module loads." fields={["setup"]} className="px-6">
+            <textarea name="setup" aria-label="Load before launch" defaultValue={cd.setup} rows={3} spellCheck={false} placeholder="module load apptainer" className="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-[12.5px]" />
+          </Setting>
+          <Setting label="Hugging Face token" hint={settings.hf_token_set ? `A token ending ${settings.hf_token_last4 ?? "····"} is set. Every job gets it as HF_TOKEN, for gated models; it's never in a script or shown.` : "For gated models. Every job gets it as HF_TOKEN; it's stored encrypted and never shown."} fields={["hf_token", "hf_clear"]} className="px-6">
+            <TextField name="hf_token" label="Hugging Face token" type="password" autoComplete="new-password" defaultValue="" placeholder={settings.hf_token_set ? `•••• ${settings.hf_token_last4 ?? ""} (set)` : "hf_…"} mono />
+            {settings.hf_token_set && <label className="flex items-center gap-2 text-[12.5px] text-secondary-foreground"><input type="checkbox" name="hf_clear" className="h-4 w-4 accent-foreground" />Remove the stored token</label>}
+          </Setting>
+          </div>
         </SettingsForm>
       </Sheet>
     </>

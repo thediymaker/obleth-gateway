@@ -118,7 +118,21 @@ describe("the Slurm connection", () => {
     await type(sheet.querySelector<HTMLInputElement>('input[name="user"]')!, "svc-obleth");
     await act(async () => { await new Promise((r) => requestAnimationFrame(r)); });
     await act(async () => button("Save changes").click());
-    expect(setSlurmSettingsAction).toHaveBeenCalledWith({ enabled: true, slurmrestd_url: "http://slurm:6820", slurmrestd_api_version: "v0.0.40", slurm_user: "svc-obleth", node_aliases: [{ host: "gh-007", ip: "10.0.0.7" }] });
+    expect(setSlurmSettingsAction).toHaveBeenCalledWith({ enabled: true, slurmrestd_url: "http://slurm:6820", slurmrestd_api_version: "v0.0.40", slurm_user: "svc-obleth", node_aliases: [{ host: "gh-007", ip: "10.0.0.7" }], cluster_defaults: { cache_dir: "", images_dir: "", log_dir: "", setup: "", images: {} } });
+  });
+
+  it("saves cluster defaults with the connection, and never sends an untouched token", async () => {
+    const withDefaults = { ...slurm, cluster_defaults: { cache_dir: "/scratch/hf", images_dir: "/scratch/images", log_dir: "", setup: "", images: { vllm: "vllm.sif" } }, hf_token_set: true, hf_token_last4: "9f3c" } as DeploymentsData["slurm"];
+    await render(<DeploymentsList initial={data({ slurm: withDefaults })} recipes={[]} tab="deployments" slurmSheet />);
+    await act(async () => button("Cluster defaults").click());
+    const sheet = document.querySelector('[role="dialog"][aria-label="Slurm connection"]')!;
+    expect(sheet.textContent).toContain("A token ending 9f3c is set");
+    await type(sheet.querySelector<HTMLInputElement>('input[aria-label="Ollama image"]')!, "ollama.sif");
+    await act(async () => { await new Promise((r) => requestAnimationFrame(r)); });
+    await act(async () => button("Save changes").click());
+    const body = vi.mocked(setSlurmSettingsAction).mock.calls[0][0];
+    expect(body.cluster_defaults).toEqual({ cache_dir: "/scratch/hf", images_dir: "/scratch/images", log_dir: "", setup: "", images: { vllm: "vllm.sif", ollama: "ollama.sif" } });
+    expect(body).not.toHaveProperty("hf_token");
   });
 
   it("asks before turning Slurm off while jobs run", async () => {
