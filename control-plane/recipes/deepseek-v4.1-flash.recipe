@@ -23,13 +23,13 @@ inputs:
     options: [65536, 131072, 262144, 1048576]
     default: 131072
   - name: offload_gb
-    label: Outside the GPU
+    label: Experts in CPU memory
     type: number
-    unit: GiB of experts
+    unit: GiB
     min: 0
     max: 480
     default: 240
-    help: Routed-expert weights held in CPU memory. About 240 on a 96 GB GPU.
+    help: The part of the model's expert weights kept in CPU memory instead of on the GPU. About 240 fits a 96 GB GPU.
   - name: image
     label: Container image
     type: path

@@ -25,14 +25,14 @@ inputs:
     default: 262144
     help: Only a few attention layers keep a cache, so long contexts stay cheap.
   - name: offload_gb
-    label: Outside the GPU
+    label: Weights in Grace memory
     type: number
     unit: GiB per node
     min: 0
     max: 460
     default: 270
     by_nodes: { "1": 270, "4": 10, "8": 0 }
-    help: Weights vLLM keeps in Grace memory and reads over NVLink-C2C. vLLM sizes itself to the GPU's 96 GB unless told.
+    help: The part of the model that doesn't fit in the GPU's 96 GB, kept in the node's CPU memory instead. Reading it from there is slower, so fewer nodes means slower answers.
   - name: image
     label: Container image
     type: path
