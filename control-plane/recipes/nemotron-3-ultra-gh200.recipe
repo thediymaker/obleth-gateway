@@ -35,7 +35,7 @@ inputs:
     # ~62 GiB of them (96 GB less the KV cache and working memory at 0.92
     # utilization); the rest of that node's share goes to Grace memory.
     by_nodes: { "1": 270, "4": 20, "8": 0 }
-    help: "The model's 352 GB is split across the nodes. Each GPU keeps about 62 GiB of its share; the rest waits in Grace memory, which is slower to read. So: 270 on 1 node, 20 on 4, none on 8."
+    help: "The weights are about 328 GiB and each GPU has room for about 62 GiB of them; what's left over waits in Grace memory, which is slower to read. 1 node: about 270 left over. 4 nodes: 4 × 62 = 248 on the GPUs, 80 left over, 20 on each node. 8 nodes: it all fits on the GPUs."
   - name: image
     label: Container image
     type: path
