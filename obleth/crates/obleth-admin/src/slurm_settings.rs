@@ -14,14 +14,15 @@ use axum::http::HeaderMap;
 use axum::Json;
 use base64::Engine;
 use chrono::{DateTime, Utc};
-use obleth_config::{NodeAlias, SlurmSettings};
+use obleth_config::{ClusterDefaults, NodeAlias, SlurmSettings};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::{audit_actor, AdminError, AdminState, Result};
 
-/// Masked view of the saved Slurm settings for the dashboard. The JWT is never
-/// returned; its presence and last 4 chars are surfaced instead.
+/// Masked view of the saved Slurm settings for the dashboard. The JWT and the
+/// Hugging Face token are never returned; their presence and last 4 chars are
+/// surfaced instead.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SlurmSettingsView {
     pub enabled: bool,
@@ -33,6 +34,11 @@ pub struct SlurmSettingsView {
     /// Operator-supplied node hostname → IP overrides. Echoed back in full (no
     /// secret) so the dashboard can render and edit the list.
     pub node_aliases: Vec<NodeAlias>,
+    /// Cluster-wide paths, setup lines and engine images for job scripts.
+    pub cluster_defaults: ClusterDefaults,
+    /// Whether a Hugging Face token is stored.
+    pub hf_token_set: bool,
+    pub hf_token_last4: Option<String>,
     /// Seconds since the provisioner last polled the gateway, or null if it has
     /// not been seen since this gateway process started. The provisioner is a
     /// separate plugin process — when it isn't running, Slurm can be "enabled"
@@ -76,20 +82,18 @@ pub struct ProvisionerBuild {
 impl SlurmSettingsView {
     fn from_settings(s: &SlurmSettings) -> Self {
         let jwt = s.slurm_jwt.trim();
-        // By chars, not bytes: a byte slice panics on a multibyte suffix.
-        let jwt_last4 = (jwt.chars().count() >= 4).then(|| {
-            let mut tail: Vec<char> = jwt.chars().rev().take(4).collect();
-            tail.reverse();
-            tail.into_iter().collect::<String>()
-        });
+        let hf_token = s.hf_token.trim();
         SlurmSettingsView {
             enabled: s.enabled,
             slurmrestd_url: s.slurmrestd_url.clone(),
             slurmrestd_api_version: s.slurmrestd_api_version.clone(),
             slurm_user: s.slurm_user.clone(),
             jwt_set: !jwt.is_empty(),
-            jwt_last4,
+            jwt_last4: last4(jwt),
             node_aliases: s.node_aliases.clone(),
+            cluster_defaults: s.cluster_defaults.clone(),
+            hf_token_set: !hf_token.is_empty(),
+            hf_token_last4: last4(hf_token),
             // Filled in by the GET handler, which has the heartbeat; the masked
             // view itself only knows the persisted settings.
             provisioner_last_seen_secs: None,
@@ -103,6 +107,16 @@ impl SlurmSettingsView {
             provisioner_held_secs: None,
         }
     }
+}
+
+/// Last four characters of a secret, or `None` when it is shorter than that.
+/// By chars, not bytes: a byte slice panics on a multibyte suffix.
+fn last4(secret: &str) -> Option<String> {
+    (secret.chars().count() >= 4).then(|| {
+        let mut tail: Vec<char> = secret.chars().rev().take(4).collect();
+        tail.reverse();
+        tail.into_iter().collect::<String>()
+    })
 }
 
 /// The provisioner's last reconcile-tick outcome, stored as JSON in Redis
@@ -214,7 +228,10 @@ fn provisioner_status(last_seen: i64, now: i64, fresh_secs: i64) -> (Option<i64>
 }
 
 /// Update payload. `slurm_jwt` is write-only: omit/empty to keep the stored JWT,
-/// or send a new value to replace it.
+/// or send a new value to replace it. `hf_token` is write-only too, but can be
+/// cleared: omit/null keeps it, `""` clears it, any other value replaces it.
+/// `cluster_defaults` replaces the stored block wholesale when present and
+/// keeps it when omitted.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateSlurmSettings {
     #[serde(default)]
@@ -232,6 +249,43 @@ pub struct UpdateSlurmSettings {
     /// dropped; a non-blank host with a non-IP address is rejected.
     #[serde(default)]
     pub node_aliases: Vec<NodeAlias>,
+    /// Full replacement of the cluster defaults. Omitted/null keeps the stored
+    /// block.
+    #[serde(default)]
+    pub cluster_defaults: Option<ClusterDefaults>,
+    /// New Hugging Face token. Omitted/null keeps the stored one; an empty
+    /// string clears it.
+    #[serde(default)]
+    pub hf_token: Option<String>,
+}
+
+/// Apply the `hf_token` PUT semantics: omitted/null keeps the stored token,
+/// empty (or whitespace-only) clears it, anything else replaces it.
+fn resolve_hf_token(update: Option<&str>, existing: &str) -> String {
+    match update.map(str::trim) {
+        None => existing.to_string(),
+        Some(t) => t.to_string(),
+    }
+}
+
+/// Tidy a submitted cluster-defaults block: trim the single-line fields and
+/// the image map, dropping rows whose engine name or image is blank. `setup`
+/// is multi-line shell and kept as written, minus trailing whitespace.
+fn normalize_cluster_defaults(d: &ClusterDefaults) -> ClusterDefaults {
+    ClusterDefaults {
+        cache_dir: d.cache_dir.trim().to_string(),
+        images_dir: d.images_dir.trim().to_string(),
+        log_dir: d.log_dir.trim().to_string(),
+        setup: d.setup.trim_end().to_string(),
+        images: d
+            .images
+            .iter()
+            .filter_map(|(k, v)| {
+                let (k, v) = (k.trim(), v.trim());
+                (!k.is_empty() && !v.is_empty()).then(|| (k.to_string(), v.to_string()))
+            })
+            .collect(),
+    }
 }
 
 /// Result of the "test connection" probe: JWT expiry + a slurmrestd ping.
@@ -493,6 +547,12 @@ pub async fn put_slurm_settings(
         });
     }
 
+    let cluster_defaults = match &body.cluster_defaults {
+        Some(d) => normalize_cluster_defaults(d),
+        None => existing.cluster_defaults.clone(),
+    };
+    let hf_token = resolve_hf_token(body.hf_token.as_deref(), &existing.hf_token);
+
     let settings = SlurmSettings {
         enabled: body.enabled,
         slurmrestd_url,
@@ -500,6 +560,8 @@ pub async fn put_slurm_settings(
         slurm_user,
         slurm_jwt,
         node_aliases,
+        cluster_defaults,
+        hf_token,
     };
 
     state.store.put_slurm_settings(&settings).await?;
@@ -517,6 +579,16 @@ pub async fn put_slurm_settings(
                 "slurm_user": settings.slurm_user,
                 "jwt_set": !settings.slurm_jwt.is_empty(),
                 "node_aliases": settings.node_aliases.len(),
+                // Paths and image names only: `setup` is free-form shell that
+                // may carry credentials, so only its size is recorded.
+                "cluster_defaults": {
+                    "cache_dir": settings.cluster_defaults.cache_dir,
+                    "images_dir": settings.cluster_defaults.images_dir,
+                    "log_dir": settings.cluster_defaults.log_dir,
+                    "setup_lines": settings.cluster_defaults.setup.lines().count(),
+                    "images": settings.cluster_defaults.images,
+                },
+                "hf_token_set": !settings.hf_token.is_empty(),
             }),
         )
         .await?;
@@ -668,6 +740,53 @@ mod tests {
         assert_eq!(view("header.payload.sig-éèêë").as_deref(), Some("éèêë"));
         assert_eq!(view("abcdef").as_deref(), Some("cdef"));
         assert_eq!(view("aé").as_deref(), None);
+    }
+
+    #[test]
+    fn hf_token_is_masked_in_the_view() {
+        let v = SlurmSettingsView::from_settings(&SlurmSettings {
+            hf_token: "hf_abcdefWXYZ".into(),
+            ..Default::default()
+        });
+        assert!(v.hf_token_set);
+        assert_eq!(v.hf_token_last4.as_deref(), Some("WXYZ"));
+        let json = serde_json::to_string(&v).unwrap();
+        assert!(!json.contains("hf_abcdef"), "full token leaked: {json}");
+        let unset = SlurmSettingsView::from_settings(&SlurmSettings::default());
+        assert!(!unset.hf_token_set);
+        assert_eq!(unset.hf_token_last4, None);
+    }
+
+    #[test]
+    fn hf_token_put_keeps_on_omit_clears_on_empty_replaces_otherwise() {
+        assert_eq!(resolve_hf_token(None, "hf_old"), "hf_old");
+        assert_eq!(resolve_hf_token(Some(""), "hf_old"), "");
+        assert_eq!(resolve_hf_token(Some("  "), "hf_old"), "");
+        assert_eq!(resolve_hf_token(Some(" hf_new "), "hf_old"), "hf_new");
+        // null deserializes to None, same as omitted.
+        let body: UpdateSlurmSettings = serde_json::from_str(r#"{"hf_token":null}"#).unwrap();
+        assert!(body.hf_token.is_none());
+        assert!(body.cluster_defaults.is_none());
+    }
+
+    #[test]
+    fn cluster_defaults_are_trimmed_and_blank_images_dropped() {
+        let d = normalize_cluster_defaults(&ClusterDefaults {
+            cache_dir: " /scratch/hf ".into(),
+            images_dir: "/images".into(),
+            log_dir: "".into(),
+            setup: "module load apptainer\nexport X=1\n\n".into(),
+            images: [
+                (" vllm ".to_string(), " vllm.sif ".to_string()),
+                ("sglang".to_string(), "  ".to_string()),
+                ("".to_string(), "x.sif".to_string()),
+            ]
+            .into(),
+        });
+        assert_eq!(d.cache_dir, "/scratch/hf");
+        assert_eq!(d.setup, "module load apptainer\nexport X=1");
+        assert_eq!(d.images.len(), 1);
+        assert_eq!(d.images.get("vllm").map(String::as_str), Some("vllm.sif"));
     }
 
     #[test]

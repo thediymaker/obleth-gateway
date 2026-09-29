@@ -341,6 +341,7 @@ use obleth_config::{
         CharoSettingsView,
         obleth_config::SlurmSettings,
         obleth_config::NodeAlias,
+        obleth_config::ClusterDefaults,
         crate::slurm_settings::SlurmSettingsView,
         crate::slurm_settings::UpdateSlurmSettings,
         crate::slurm_settings::SlurmHealthView,

@@ -3446,7 +3446,8 @@ impl Store {
     }
 
     /// Load the system-wide Slurm settings, or `None` if never configured. The
-    /// stored JWT is decrypted transparently (legacy/empty values pass through).
+    /// stored JWT and Hugging Face token are decrypted transparently
+    /// (legacy/empty values pass through).
     pub async fn get_slurm_settings(&self) -> Result<Option<obleth_config::SlurmSettings>> {
         let row = sqlx::query("select value from app_settings where key = 'slurm'")
             .fetch_optional(&self.pool)
@@ -3459,6 +3460,9 @@ impl Store {
                 if !settings.slurm_jwt.is_empty() {
                     settings.slurm_jwt = cipher().decrypt(&settings.slurm_jwt)?;
                 }
+                if !settings.hf_token.is_empty() {
+                    settings.hf_token = cipher().decrypt(&settings.hf_token)?;
+                }
                 Ok(Some(settings))
             }
             None => Ok(None),
@@ -3466,12 +3470,15 @@ impl Store {
     }
 
     /// Persist the system-wide Slurm settings (upsert on the single `slurm`
-    /// key). The JWT is encrypted at rest with the same envelope cipher used for
-    /// upstream provider keys before it is written.
+    /// key). The JWT and Hugging Face token are encrypted at rest with the same
+    /// envelope cipher used for upstream provider keys before they are written.
     pub async fn put_slurm_settings(&self, settings: &obleth_config::SlurmSettings) -> Result<()> {
         let mut to_store = settings.clone();
         if !to_store.slurm_jwt.is_empty() {
             to_store.slurm_jwt = cipher().encrypt(&to_store.slurm_jwt);
+        }
+        if !to_store.hf_token.is_empty() {
+            to_store.hf_token = cipher().encrypt(&to_store.hf_token);
         }
         sqlx::query(
             "insert into app_settings (key, value, updated_at)
@@ -6170,6 +6177,12 @@ mod tests {
                 host: "node001".into(),
                 ip: "10.0.0.1".into(),
             }],
+            cluster_defaults: obleth_config::ClusterDefaults {
+                cache_dir: "/scratch/hf".into(),
+                images: [("vllm".to_string(), "vllm.sif".to_string())].into(),
+                ..Default::default()
+            },
+            hf_token: "hf_secret_token".into(),
         };
         store.put_slurm_settings(&settings).await.expect("put");
 
@@ -6184,6 +6197,8 @@ mod tests {
         assert_eq!(got.slurm_user, settings.slurm_user);
         assert_eq!(got.slurm_jwt, settings.slurm_jwt);
         assert_eq!(got.node_aliases, settings.node_aliases);
+        assert_eq!(got.cluster_defaults, settings.cluster_defaults);
+        assert_eq!(got.hf_token, settings.hf_token);
 
         // the JWT must be ciphertext at rest whenever a cipher is configured
         let raw: sqlx::types::Json<serde_json::Value> =
@@ -6207,6 +6222,15 @@ mod tests {
                 "jwt must be encrypted at rest, got {stored_jwt}"
             );
             assert_ne!(stored_jwt, settings.slurm_jwt);
+            let stored_hf = raw
+                .0
+                .get("hf_token")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            assert!(
+                stored_hf.starts_with("enc:v1:"),
+                "hf_token must be encrypted at rest"
+            );
         }
     }
 
