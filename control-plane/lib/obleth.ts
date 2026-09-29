@@ -1073,6 +1073,11 @@ export interface SlurmSettingsView {
   // node names unreliably, these take DNS out of the loop (endpoints register by
   // IP). Echoed back in full so the form can render and edit them.
   node_aliases: NodeAlias[];
+  // Cluster-wide paths, setup lines and engine images recipes fill into jobs.
+  cluster_defaults: ClusterDefaults;
+  // Hugging Face token: never returned; presence + last 4 chars only.
+  hf_token_set: boolean;
+  hf_token_last4: string | null;
   // Seconds since the provisioner last polled, or null if never seen since the
   // gateway started. provisioner_running is true within the freshness window.
   provisioner_last_seen_secs: number | null;
@@ -1105,6 +1110,26 @@ export interface UpdateSlurmSettings {
   // Full replacement set of node hostname → IP overrides. Blank rows are dropped
   // server-side; a non-blank host must map to a real IP literal.
   node_aliases?: NodeAlias[];
+  // Replaces the stored block wholesale when present; omit to keep it.
+  cluster_defaults?: ClusterDefaults;
+  // Write-only: omit/null keeps the stored token, "" clears it, any other
+  // value replaces it. Passed to jobs as HF_TOKEN / HUGGING_FACE_HUB_TOKEN.
+  hf_token?: string | null;
+}
+
+// Cluster-wide defaults for recipe job scripts. Empty strings mean unset.
+export interface ClusterDefaults {
+  // Shared model-weight cache, used as HF_HOME.
+  cache_dir: string;
+  // Directory holding container images (e.g. .sif files).
+  images_dir: string;
+  // Directory for job stdout/stderr files.
+  log_dir: string;
+  // Shell lines run at the top of every job (module loads, PATH, ...).
+  setup: string;
+  // Engine name → image path or file name (e.g. "vllm" → "vllm.sif"); a bare
+  // file name is relative to images_dir.
+  images: Record<string, string>;
 }
 
 // One compute-node hostname → IP override for the Slurm provisioner.
