@@ -102,6 +102,19 @@ pub struct ClusterResources {
     pub nodes: Vec<NodeInfo>,
     pub accounts: Vec<String>,
     pub qos: Vec<String>,
+    /// The caller's associations, one per account (and partition, when the
+    /// association names one), so the launcher can tell which accounts a
+    /// partition takes before Slurm refuses the job.
+    #[serde(default)]
+    pub associations: Vec<AssociationInfo>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct AssociationInfo {
+    pub account: String,
+    /// None when the association covers every partition.
+    pub partition: Option<String>,
+    pub qos: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -110,6 +123,12 @@ pub struct PartitionInfo {
     pub nodes: Vec<String>,
     pub default_time: Option<String>,
     pub max_time: Option<String>,
+    /// The partition's AllowAccounts; empty means any account.
+    #[serde(default)]
+    pub allowed_accounts: Vec<String>,
+    /// The partition's DenyAccounts.
+    #[serde(default)]
+    pub denied_accounts: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
