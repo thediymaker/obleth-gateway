@@ -4,6 +4,7 @@
 // `import type` keeps this module free of any runtime dependency on the
 // fs-touching sbatch-recipes loader.
 import type { ParsedRecipe, RecipeVariable } from "@/lib/sbatch-recipes";
+import type { RecipeInput } from "@/lib/recipe-inputs";
 
 export interface RecipeDeployPreview {
   apiModelName: string;
@@ -30,6 +31,15 @@ export interface RecipeDeployPreview {
   rawBody: string;
   warnings: string[];
   variables?: RecipeVariable[];
+  inputs: RecipeInput[];
+  kind: "model" | "engine";
+  model?: string;
+  weightsGb?: number;
+  requires?: string;
+  nodeOptions?: number[];
+  basedOn?: string;
+  env?: Record<string, string>;
+  description?: string;
 }
 
 export interface RecipeCard {

@@ -1,0 +1,97 @@
+---
+name: Nemotron 3 Ultra on Grace Hopper
+description: "NVIDIA's 550B hybrid Mamba/MoE model (55B active) in NVFP4, on vLLM. One GH200 holds it with most experts in Grace memory; 4 or 8 nodes run it pipeline-parallel over Ray. Not yet run on GH200."
+engine: vllm
+kind: model
+model: nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4
+weights_gb: 352
+requires: "vLLM 0.22.0 or later (arm64 + CUDA image for GH200)"
+model_type: chat
+api_model_name: nemotron-3-ultra
+port: 8000
+health_path: /health
+nodes: 1
+node_options: [1, 4, 8]
+target_replicas: 1
+max_job_failures: 2
+env:
+  # First start downloads 352 GB; don't let vLLM give up while it loads.
+  VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+inputs:
+  - name: context
+    label: Context length
+    type: choice
+    options: [65536, 131072, 262144, 1048576]
+    default: 262144
+    help: Only a few attention layers keep a cache, so long contexts stay cheap.
+  - name: offload_gb
+    label: Outside the GPU
+    type: number
+    unit: GiB per node
+    min: 0
+    max: 460
+    default: 270
+    by_nodes: { "1": 270, "4": 10, "8": 0 }
+    help: Weights vLLM keeps in Grace memory and reads over NVLink-C2C. vLLM sizes itself to the GPU's 96 GB unless told.
+  - name: image
+    label: Container image
+    type: path
+    default: "{{cluster.image.vllm}}"
+    required: true
+  - name: cache
+    label: Weight cache
+    type: path
+    default: "{{cluster.cache}}"
+    required: true
+    help: HF_HOME. 352 GB is downloaded on the first start.
+  - name: tools
+    label: Tool calling
+    type: flag
+    default: true
+    adds: --enable-auto-tool-choice --tool-call-parser qwen3_coder
+  - name: reasoning
+    label: Reasoning
+    type: flag
+    default: true
+    adds: --reasoning-parser nemotron_v3
+  - name: mtp
+    label: Multi-token prediction
+    type: flag
+    default: true
+    adds: "--speculative-config '{\"method\":\"nemotron_h_mtp\",\"num_speculative_tokens\":5}'"
+---
+#!/bin/bash -l
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=72
+#SBATCH --mem=0
+set -euo pipefail
+{{cluster.setup}}
+export HF_HOME={{cache}}
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+RUN=(apptainer exec --nv --bind {{cache}} {{image}})
+
+# More than one node: start Ray here and on the other nodes, then split the
+# layers across them (pipeline parallel), one GPU per node.
+NNODES=${SLURM_JOB_NUM_NODES:-1}
+PARALLEL=()
+if [ "$NNODES" -gt 1 ]; then
+  HEAD_IP=$(hostname -I | awk '{print $1}')
+  RAY_PORT=$((OBLETH_SERVING_PORT + 1))
+  "${RUN[@]}" ray start --head --node-ip-address="$HEAD_IP" --port="$RAY_PORT" --num-gpus=1 --block &
+  sleep 15
+  srun --nodes=$((NNODES - 1)) --ntasks=$((NNODES - 1)) --exclude="$(hostname -s)" \
+    "${RUN[@]}" ray start --address="$HEAD_IP:$RAY_PORT" --num-gpus=1 --block &
+  sleep 30
+  PARALLEL=(--pipeline-parallel-size "$NNODES" --distributed-executor-backend ray)
+fi
+
+"${RUN[@]}" vllm serve nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4 \
+  --served-model-name nemotron-3-ultra \
+  --host 0.0.0.0 --port "$OBLETH_SERVING_PORT" \
+  "${PARALLEL[@]}" \
+  --trust-remote-code \
+  --max-model-len {{context}} \
+  --kv-cache-dtype fp8 --mamba-ssm-cache-dtype float16 \
+  --cpu-offload-gb {{offload_gb}} \
+  --gpu-memory-utilization 0.92 \
+  {{tools}} {{reasoning}} {{mtp}}

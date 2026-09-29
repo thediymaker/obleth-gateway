@@ -93,9 +93,16 @@ pub fn plan(
 
         match jobs.get(&r.slurm_job_id).map(|j| j.state) {
             None | Some(JobState::Gone) => {
+                // Carry Slurm's terminal state when the job is still listed, so
+                // the launch history records why it ended (TIMEOUT, OOM, ...).
+                let job = jobs.get(&r.slurm_job_id);
                 actions.push(Action::MarkLost {
                     replica_id: r.id,
                     endpoint_id: r.endpoint_id,
+                    raw_state: job
+                        .map(|j| j.raw_state.trim().to_string())
+                        .filter(|s| !s.is_empty()),
+                    reason: job.and_then(|j| j.reason.clone()),
                 });
                 // not alive
             }
@@ -516,7 +523,9 @@ mod tests {
         );
         assert!(actions.contains(&Action::MarkLost {
             replica_id: id,
-            endpoint_id: Some(ep)
+            endpoint_id: Some(ep),
+            raw_state: None,
+            reason: None,
         }));
         assert!(actions.contains(&Action::Submit));
     }
@@ -695,6 +704,41 @@ mod tests {
     }
 
     #[test]
+    fn terminal_job_still_listed_marks_lost_with_its_slurm_state() {
+        // The job is still visible in slurmrestd in a terminal state: MarkLost
+        // carries Slurm's state and reason for the launch history.
+        let ep = Uuid::new_v4();
+        let r = rv("healthy", "j1", Some(ep), 500);
+        let id = r.id;
+        let (k, mut info) = job("j1", JobState::Gone, &["n1"]);
+        info.raw_state = "TIMEOUT".into();
+        info.reason = Some("TimeLimit".into());
+        let jobs = HashMap::from([(k, info)]);
+        let actions = plan(&spec(1), &[r], &jobs, &HashMap::new(), &HashSet::new(), 900);
+        assert!(
+            actions.contains(&Action::MarkLost {
+                replica_id: id,
+                endpoint_id: Some(ep),
+                raw_state: Some("TIMEOUT".into()),
+                reason: Some("TimeLimit".into()),
+            }),
+            "got {actions:?}"
+        );
+        assert!(actions.contains(&Action::Submit));
+    }
+
+    #[test]
+    fn lost_message_formats_state_reason_and_gone() {
+        assert_eq!(lost_message(None, None), "job gone");
+        assert_eq!(lost_message(Some(""), Some("x")), "job gone");
+        assert_eq!(lost_message(Some("FAILED"), None), "job ended: FAILED");
+        assert_eq!(
+            lost_message(Some("OUT_OF_MEMORY"), Some("OutOfMemory")),
+            "job ended: OUT_OF_MEMORY (OutOfMemory)"
+        );
+    }
+
+    #[test]
     fn draining_replica_with_gone_job_is_deleted() {
         // Job already terminated (Gone) -> the stuck draining row must be deleted.
         let r = rv("draining", "j1", None, 120);
@@ -808,7 +852,9 @@ mod tests {
         );
         assert!(actions.contains(&Action::MarkLost {
             replica_id: id,
-            endpoint_id: Some(ep)
+            endpoint_id: Some(ep),
+            raw_state: None,
+            reason: None,
         }));
         assert!(
             !actions.iter().any(|a| matches!(a, Action::Cancel { .. })),

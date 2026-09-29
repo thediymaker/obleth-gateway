@@ -34,7 +34,11 @@ import type {
 import { requireAdmin } from "@/lib/auth/roles";
 import { validateManagedModelForm } from "@/lib/managed-model-schema";
 import { parseUpstreamHeaders } from "@/lib/upstream-headers";
-import { resolveRecipeById, buildManagedFromRecipe, parseRecipe, type DeployOverrides } from "@/lib/sbatch-recipes";
+import { resolveRecipeById, resolveRecipeText, buildManagedFromRecipe, parseRecipe, type DeployOverrides } from "@/lib/sbatch-recipes";
+import { clusterValuesFrom, inputDefaults, type ClusterValues } from "@/lib/recipe-inputs";
+import { savedRecipeText, type SaveAs } from "@/lib/recipe-save";
+import type { DeployForm } from "@/lib/deploy-form";
+import { lookupHfModel, type HfModel } from "@/lib/hf-model";
 import { parseUpstreamModelList, normalizeBase, type UpstreamModel } from "@/lib/provider-import";
 import { blockedHostReason } from "@/lib/ssrf";
 import { tagsInclude } from "@/lib/utils";
@@ -2584,13 +2588,22 @@ export async function removeDeploymentAction(modelId: string, deleteModel: boole
  * choose (a recipe can be launched more than once); placement overrides win
  * over the recipe's. Returns the new model's name, for its page.
  */
+/** The cluster defaults recipes fill {{cluster.*}} from; empty when unreadable. */
+async function clusterValues(): Promise<ClusterValues> {
+  try {
+    return clusterValuesFrom((await obleth.getSlurmSettings()).cluster_defaults);
+  } catch {
+    return clusterValuesFrom(null);
+  }
+}
+
 export async function launchRecipeAction(recipeId: string, overrides: DeployOverrides): Promise<{ ok: true; name: string } | { ok: false; error: string }> {
   const session = await requireAdmin();
   const recipe = await resolveRecipeById(recipeId);
   if (!recipe) return { ok: false, error: "That recipe no longer exists." };
   if (!recipe.valid) return { ok: false, error: recipe.error ?? "The recipe can't be read." };
   try {
-    const { createBody, managedBody } = buildManagedFromRecipe(recipe, overrides);
+    const { createBody, managedBody } = buildManagedFromRecipe(recipe, overrides, await clusterValues());
     const models = await obleth.listModels();
     if (models.some((m) => m.model_name === createBody.model_name || m.aliases?.includes(createBody.model_name))) {
       return { ok: false, error: `A model called ${createBody.model_name} already exists. Pick another name.` };
@@ -2607,6 +2620,74 @@ export async function launchRecipeAction(recipeId: string, overrides: DeployOver
     return { ok: true, name: created.model_name };
   } catch (e) {
     return actionError(e);
+  }
+}
+
+/** Save a filled-in launch as a recipe under Saved, with its values as defaults. */
+export async function saveRecipeFromFormAction(recipeId: string, form: DeployForm, as: Omit<SaveAs, "basedOn" | "clusterResolved">): Promise<{ ok: true; id: string } | { ok: false; error: string }> {
+  const session = await requireAdmin();
+  const [text, recipe] = await Promise.all([resolveRecipeText(recipeId), resolveRecipeById(recipeId)]);
+  if (!text || !recipe?.header) return { ok: false, error: "That recipe no longer exists." };
+  const name = as.name.trim();
+  if (!name) return { ok: false, error: "Name the recipe." };
+  try {
+    const cv = await clusterValues();
+    const body = savedRecipeText(text, form, { ...as, name, basedOn: recipeId, clusterResolved: inputDefaults(recipe.header.inputs, cv, form.slurm.nodes) });
+    const check = parseRecipe("saved", body);
+    if (!check.valid) return { ok: false, error: `The saved recipe wouldn't be valid: ${check.error}` };
+    const row = await obleth.createRecipe({ name, body }, { auditActor: session.email });
+    revalidatePath("/deployments");
+    return { ok: true, id: row.id };
+  } catch (e) {
+    return actionError(e);
+  }
+}
+
+/** Save a running deployment's settings as a recipe. */
+export async function saveRecipeFromDeploymentAction(modelId: string, name: string): Promise<{ ok: true; id: string } | { ok: false; error: string }> {
+  await requireAdmin();
+  try {
+    const [spec, models] = await Promise.all([obleth.getManagedModel(modelId), obleth.listModels()]);
+    const model = models.find((m) => m.id === modelId);
+    if (!model || !spec) return { ok: false, error: "That deployment no longer exists." };
+    const ls = (spec.launcher_spec ?? {}) as { recipe_id?: string; inputs?: Record<string, string>; env?: Record<string, string> };
+    if (!ls.recipe_id) return { ok: false, error: "This deployment wasn't launched from a recipe." };
+    const recipe = await resolveRecipeById(ls.recipe_id);
+    if (!recipe?.header) return { ok: false, error: "The recipe it was launched from no longer exists." };
+    const form: DeployForm = {
+      recipe: ls.recipe_id,
+      name: model.model_name,
+      inputs: { ...(ls.inputs ?? {}) },
+      slurm: {
+        partition: spec.partition,
+        account: spec.account ?? "",
+        qos: spec.qos ?? "",
+        time_limit: spec.time_limit ?? "",
+        nodes: spec.nodes || 1,
+        gres: spec.gres ?? "",
+        cpus_per_task: spec.cpus_per_task ? String(spec.cpus_per_task) : "",
+        mem: spec.mem ?? "",
+        constraints: spec.constraints ?? "",
+        exclude: spec.exclude ?? "",
+        log_output_dir: spec.log_output_dir ?? "",
+      },
+      env: { ...(ls.env ?? recipe.header.env ?? {}) },
+      serving: { keep_running: spec.target_replicas, serve_from: spec.min_replicas, stop_after_failed_launches: spec.max_job_failures, health_path: spec.health_path },
+    };
+    const model_ = recipe.header.kind === "engine" ? ls.inputs?.model : undefined;
+    return await saveRecipeFromFormAction(ls.recipe_id, form, { name, model: model_ });
+  } catch (e) {
+    return actionError(e);
+  }
+}
+
+/** What a Hugging Face repo holds and which engines can run it. */
+export async function lookupHfModelAction(input: string): Promise<{ ok: true; model: HfModel } | { ok: false; error: string }> {
+  await requireAdmin();
+  try {
+    return { ok: true, model: await lookupHfModel(input) };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
   }
 }
 

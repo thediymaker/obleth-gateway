@@ -420,6 +420,52 @@ export interface ModelReplica {
   updated_at: string;
 }
 
+// One past or current launch of a Slurm-backed replica. Outlives the replica
+// row (which is garbage-collected); id is the replica id.
+export interface DeploymentLaunch {
+  id: string;
+  model_id: string;
+  model_name: string;
+  recipe_id: string | null;
+  slurm_job_id: string;
+  // Managed spec as submitted.
+  partition: string | null;
+  account: string | null;
+  qos: string | null;
+  time_limit: string | null;
+  gres: string | null;
+  nodes_requested: number | null;
+  cpus_per_task: number | null;
+  mem: string | null;
+  exclude: string | null;
+  constraints: string | null;
+  launcher_spec: Record<string, unknown> | null;
+  // Allocated node hostnames (comma-separated), once the job ran.
+  nodes: string | null;
+  submitted_at: string;
+  started_at: string | null;
+  healthy_at: string | null;
+  ended_at: string | null;
+  // Slurm's terminal state (TIMEOUT, OUT_OF_MEMORY, NODE_FAIL, FAILED, ...),
+  // "gone" when the job vanished from slurmrestd, "cancelled:scale-down" |
+  // "cancelled:restart" | "cancelled:probe-failed" when obleth cancelled it,
+  // or "deleted" when the replica row was removed while still open.
+  end_state: string | null;
+  end_reason: string | null;
+  updated_at: string;
+  // Submit → start, start → healthy, start → end (or now while running).
+  queued_secs: number | null;
+  load_secs: number | null;
+  ran_secs: number | null;
+}
+
+export interface DeploymentLaunchesParams {
+  model_id?: string;
+  recipe_id?: string;
+  // Default 50, at most 500.
+  limit?: number;
+}
+
 export type AutotuneKneeReason =
   | "latency_degraded"
   | "plateau"
@@ -1073,6 +1119,11 @@ export interface SlurmSettingsView {
   // node names unreliably, these take DNS out of the loop (endpoints register by
   // IP). Echoed back in full so the form can render and edit them.
   node_aliases: NodeAlias[];
+  // Cluster-wide paths, setup lines and engine images recipes fill into jobs.
+  cluster_defaults: ClusterDefaults;
+  // Hugging Face token: never returned; presence + last 4 chars only.
+  hf_token_set: boolean;
+  hf_token_last4: string | null;
   // Seconds since the provisioner last polled, or null if never seen since the
   // gateway started. provisioner_running is true within the freshness window.
   provisioner_last_seen_secs: number | null;
@@ -1105,6 +1156,26 @@ export interface UpdateSlurmSettings {
   // Full replacement set of node hostname → IP overrides. Blank rows are dropped
   // server-side; a non-blank host must map to a real IP literal.
   node_aliases?: NodeAlias[];
+  // Replaces the stored block wholesale when present; omit to keep it.
+  cluster_defaults?: ClusterDefaults;
+  // Write-only: omit/null keeps the stored token, "" clears it, any other
+  // value replaces it. Passed to jobs as HF_TOKEN / HUGGING_FACE_HUB_TOKEN.
+  hf_token?: string | null;
+}
+
+// Cluster-wide defaults for recipe job scripts. Empty strings mean unset.
+export interface ClusterDefaults {
+  // Shared model-weight cache, used as HF_HOME.
+  cache_dir: string;
+  // Directory holding container images (e.g. .sif files).
+  images_dir: string;
+  // Directory for job stdout/stderr files.
+  log_dir: string;
+  // Shell lines run at the top of every job (module loads, PATH, ...).
+  setup: string;
+  // Engine name → image path or file name (e.g. "vllm" → "vllm.sif"); a bare
+  // file name is relative to images_dir.
+  images: Record<string, string>;
 }
 
 // One compute-node hostname → IP override for the Slurm provisioner.
@@ -2156,6 +2227,9 @@ export const obleth = {
       method: "POST",
       headers: auditActorHeaders(options),
     }),
+  /** Launch history of Slurm-backed replicas, newest first (limit default 50, max 500). */
+  listDeploymentLaunches: (params: DeploymentLaunchesParams = {}) =>
+    api<DeploymentLaunch[]>(`/deployments/launches${qs({ ...params })}`),
   restartReplica: (replicaId: string, options?: AuditOptions) =>
     api<{ ok: boolean }>(`/replicas/${replicaId}/restart`, {
       method: "POST",

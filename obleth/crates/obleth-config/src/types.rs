@@ -906,6 +906,53 @@ pub struct ModelReplica {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// One past or current launch of a Slurm-backed replica, from the durable
+/// launch history (`deployment_launches`). Outlives the replica row, which is
+/// garbage-collected. `id` is the replica id.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DeploymentLaunch {
+    #[schema(value_type = String)]
+    pub id: Uuid,
+    #[schema(value_type = String)]
+    pub model_id: Uuid,
+    pub model_name: String,
+    /// `launcher_spec.recipe_id` at submit time, when launched from a recipe.
+    pub recipe_id: Option<String>,
+    pub slurm_job_id: String,
+    // Managed spec as submitted.
+    pub partition: Option<String>,
+    pub account: Option<String>,
+    pub qos: Option<String>,
+    pub time_limit: Option<String>,
+    pub gres: Option<String>,
+    pub nodes_requested: Option<i64>,
+    pub cpus_per_task: Option<i64>,
+    pub mem: Option<String>,
+    pub exclude: Option<String>,
+    pub constraints: Option<String>,
+    #[schema(value_type = Option<Object>)]
+    pub launcher_spec: Option<serde_json::Value>,
+    /// Allocated node hostnames (comma-separated), once the job ran.
+    pub nodes: Option<String>,
+    pub submitted_at: chrono::DateTime<chrono::Utc>,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub healthy_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub ended_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Slurm's terminal state (`TIMEOUT`, `OUT_OF_MEMORY`, `NODE_FAIL`,
+    /// `FAILED`, ...), `gone` when the job vanished from slurmrestd,
+    /// `cancelled:scale-down|restart|probe-failed` when obleth cancelled it,
+    /// or `deleted` when the replica row was removed while still open.
+    pub end_state: Option<String>,
+    pub end_reason: Option<String>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    /// Seconds from submit to start (time in the queue).
+    pub queued_secs: Option<i64>,
+    /// Seconds from start to healthy (weights load and warm-up).
+    pub load_secs: Option<i64>,
+    /// Seconds from start to end, or to now while still running.
+    pub ran_secs: Option<i64>,
+}
+
 /// Valid `ModelReplica::state` values, in lifecycle order.
 pub const REPLICA_STATES: [&str; 5] = ["pending", "starting", "healthy", "draining", "lost"];
 
@@ -1100,6 +1147,39 @@ pub struct SlurmSettings {
     /// default). Entries whose host or ip is blank are ignored.
     #[serde(default)]
     pub node_aliases: Vec<NodeAlias>,
+    /// Cluster-wide paths and shell setup that recipes fill into the job
+    /// scripts they render. Informational to the provisioner: it never
+    /// rewrites a stored script from these.
+    #[serde(default)]
+    pub cluster_defaults: ClusterDefaults,
+    /// Hugging Face access token. When set, the provisioner passes it to every
+    /// job it submits as `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` in the job
+    /// environment (never in the script body). Encrypted at rest by the store
+    /// and masked in the public settings API, like the JWT.
+    #[serde(default)]
+    pub hf_token: String,
+}
+
+/// Cluster-wide defaults for job scripts, part of `SlurmSettings`. Every field
+/// is optional; empty means "not configured".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default, ToSchema)]
+pub struct ClusterDefaults {
+    /// Shared model-weight cache, used as `HF_HOME` in rendered jobs.
+    #[serde(default)]
+    pub cache_dir: String,
+    /// Directory holding container images (e.g. `.sif` files).
+    #[serde(default)]
+    pub images_dir: String,
+    /// Directory for job stdout/stderr files.
+    #[serde(default)]
+    pub log_dir: String,
+    /// Shell lines run at the top of every job (module loads, PATH, ...).
+    #[serde(default)]
+    pub setup: String,
+    /// Engine name → image path or file name (e.g. `vllm` → `vllm.sif`). A
+    /// bare file name is relative to `images_dir`.
+    #[serde(default)]
+    pub images: BTreeMap<String, String>,
 }
 
 /// One compute-node hostname → IP override for `SlurmSettings::node_aliases`.
@@ -3203,6 +3283,23 @@ mod tests {
         let s: SlurmSettings = serde_json::from_str("{}").expect("legacy blob deserializes");
         assert!(s.node_aliases.is_empty());
         assert!(s.node_alias_map().is_empty());
+    }
+
+    #[test]
+    fn slurm_settings_legacy_blob_has_empty_cluster_defaults_and_no_hf_token() {
+        let s: SlurmSettings =
+            serde_json::from_str(r#"{"enabled":true,"slurm_user":"svc"}"#).expect("parses");
+        assert_eq!(s.cluster_defaults, ClusterDefaults::default());
+        assert!(s.hf_token.is_empty());
+        // A partial cluster_defaults object fills the rest with defaults.
+        let s: SlurmSettings =
+            serde_json::from_str(r#"{"cluster_defaults":{"images":{"vllm":"vllm.sif"}}}"#)
+                .expect("parses");
+        assert_eq!(
+            s.cluster_defaults.images.get("vllm").map(String::as_str),
+            Some("vllm.sif")
+        );
+        assert!(s.cluster_defaults.cache_dir.is_empty());
     }
 
     #[test]

@@ -38,8 +38,8 @@ use obleth_config::routing::{
     RequestFeatures, RouterWeights,
 };
 use obleth_config::{
-    hash_api_key, ApiKey, FairshareGroup, ManagedModelSpec, McpServer, ModelEndpoint, ModelReplica,
-    ModelRoute, ResolvedKey, ResolvedMcpServer, ResolvedModel, Tenant,
+    hash_api_key, ApiKey, DeploymentLaunch, FairshareGroup, ManagedModelSpec, McpServer,
+    ModelEndpoint, ModelReplica, ModelRoute, ResolvedKey, ResolvedMcpServer, ResolvedModel, Tenant,
 };
 use obleth_config::{
     AlertSettings, AutoRouterSettings, BoonSettings, EmailSettings, StructuredOutputBoonSettings,
@@ -351,6 +351,10 @@ pub fn router(state: AdminState) -> Router {
         .route(
             "/api/v1/models/:id/replicas/clear-lost",
             post(clear_lost_replicas),
+        )
+        .route(
+            "/api/v1/deployments/launches",
+            get(list_deployment_launches),
         )
         .route(
             "/api/v1/models/:id/endpoints",
@@ -7215,6 +7219,42 @@ pub async fn clear_lost_replicas(
         )
         .await?;
     Ok(Json(serde_json::json!({ "deleted": n })))
+}
+
+#[derive(Debug, Deserialize, utoipa::IntoParams, ToSchema)]
+pub struct DeploymentLaunchesQuery {
+    /// Only launches of this model.
+    #[param(value_type = Option<String>)]
+    #[schema(value_type = Option<String>)]
+    pub model_id: Option<Uuid>,
+    /// Only launches from this recipe (`launcher_spec.recipe_id`).
+    pub recipe_id: Option<String>,
+    /// Rows to return, newest first. Default 50, at most 500.
+    pub limit: Option<i64>,
+}
+
+/// Launch history of Slurm-backed replicas, newest first. Rows outlive the
+/// replica rows they describe; `queued_secs`, `load_secs` and `ran_secs` are
+/// computed (ran counts to now while the launch is still going).
+#[utoipa::path(get, path = "/api/v1/deployments/launches",
+    params(DeploymentLaunchesQuery),
+    responses((status = 200, body = [DeploymentLaunch])))]
+async fn list_deployment_launches(
+    State(state): State<AdminState>,
+    Query(q): Query<DeploymentLaunchesQuery>,
+) -> Result<Json<Vec<DeploymentLaunch>>> {
+    let recipe_id = q
+        .recipe_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty());
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    Ok(Json(
+        state
+            .store
+            .list_deployment_launches(q.model_id, recipe_id, limit)
+            .await?,
+    ))
 }
 
 #[utoipa::path(

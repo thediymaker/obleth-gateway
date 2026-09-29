@@ -1,0 +1,56 @@
+---
+name: llama.cpp
+description: "Any GGUF model with llama-server, fetched from Hugging Face. Runs a native llama-server on the node's PATH, or one in a container image."
+engine: llamacpp
+kind: engine
+requires: "llama-server built for the node's GPU and CPU (arm64 + CUDA on Grace Hopper)"
+model_type: chat
+api_model_name: my-model
+port: 8000
+health_path: /health
+target_replicas: 1
+max_job_failures: 2
+inputs:
+  - name: model
+    label: GGUF on Hugging Face
+    type: text
+    required: true
+    help: "repo:quant, e.g. unsloth/Qwen3-32B-GGUF:Q4_K_M."
+  - name: context
+    label: Context length
+    type: number
+    min: 1024
+    default: 32768
+  - name: parallel
+    label: Requests at once
+    type: number
+    min: 1
+    max: 64
+    default: 4
+  - name: image
+    label: Container image
+    type: path
+    default: "{{cluster.image.llamacpp}}"
+    help: Leave empty to run the llama-server on the node's PATH.
+  - name: cache
+    label: Weight cache
+    type: path
+    default: "{{cluster.cache}}"
+    required: true
+  - name: extra
+    label: More llama-server flags
+    type: text
+    help: "e.g. --n-cpu-moe 60 to keep MoE experts in CPU memory."
+---
+#!/bin/bash -l
+#SBATCH --gres=gpu:1
+set -euo pipefail
+{{cluster.setup}}
+export LLAMA_CACHE={{cache}}
+IMAGE="{{image}}"
+if [ -n "$IMAGE" ]; then RUN=(apptainer exec --nv --bind {{cache}} "$IMAGE"); else RUN=(); fi
+"${RUN[@]}" llama-server -hf {{model}} \
+  --host 0.0.0.0 --port "$OBLETH_SERVING_PORT" --alias {{api_model_name}} \
+  -ngl 99 --ctx-size {{context}} --parallel {{parallel}} --threads "$(nproc)" \
+  --cont-batching --flash-attn on --jinja \
+  {{extra}}

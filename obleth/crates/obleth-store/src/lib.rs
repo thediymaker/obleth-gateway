@@ -6,10 +6,10 @@
 
 use chrono::{DateTime, Utc};
 use obleth_config::{
-    generate_api_key, ApiKey, FairshareGroup, IdentityProvision, ManagedModelSpec, McpServer,
-    ModelEndpoint, ModelHealthCheck, ModelHealthDetail, ModelHealthSummary, ModelReplica,
-    ModelRoute, ProvisionedIdentity, ResolvedEndpoint, ResolvedKey, ResolvedMcpServer,
-    ResolvedModel, Tenant, WeeklyWindow,
+    generate_api_key, ApiKey, DeploymentLaunch, FairshareGroup, IdentityProvision,
+    ManagedModelSpec, McpServer, ModelEndpoint, ModelHealthCheck, ModelHealthDetail,
+    ModelHealthSummary, ModelReplica, ModelRoute, ProvisionedIdentity, ResolvedEndpoint,
+    ResolvedKey, ResolvedMcpServer, ResolvedModel, Tenant, WeeklyWindow,
 };
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::Row;
@@ -98,6 +98,7 @@ const SCHEMA_V28: &str = include_str!("../../../../schema/postgres/0028_video_jo
 const SCHEMA_V29: &str =
     include_str!("../../../../schema/postgres/0029_model_capacity_discovery.sql");
 const SCHEMA_V30: &str = include_str!("../../../../schema/postgres/0030_video_jobs_key_index.sql");
+const SCHEMA_V31: &str = include_str!("../../../../schema/postgres/0031_deployment_launches.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -244,6 +245,7 @@ impl Store {
             sqlx::raw_sql(SCHEMA_V28).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V29).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V30).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V31).execute(&mut *conn).await?;
             Ok(())
         }
         .await;
@@ -2550,12 +2552,33 @@ impl Store {
     ) -> Result<ModelReplica> {
         // Idempotent: a retried insert for the same (model_id, slurm_job_id)
         // returns the existing row instead of erroring on the unique index.
+        //
+        // The same statement opens the replica's launch-history row (same id),
+        // snapshotting the managed spec as submitted. A model without a
+        // managed spec still gets a row, with the spec columns null. On a
+        // retried insert the launch row already exists and is left alone.
         let row = sqlx::query(
-            "insert into model_replicas (id, model_id, slurm_job_id, port_base)
-             values ($1, $2, $3, $4)
-             on conflict (model_id, slurm_job_id) do update set updated_at = now()
-             returning id, model_id, slurm_job_id, nodes, endpoint_id, state,
-                       last_message, port_base, cancel_requested, created_at, updated_at",
+            "with r as (
+                insert into model_replicas (id, model_id, slurm_job_id, port_base)
+                values ($1, $2, $3, $4)
+                on conflict (model_id, slurm_job_id) do update set updated_at = now()
+                returning id, model_id, slurm_job_id, nodes, endpoint_id, state,
+                          last_message, port_base, cancel_requested, created_at, updated_at
+             ), launch as (
+                insert into deployment_launches
+                    (id, model_id, model_name, recipe_id, slurm_job_id, partition, account,
+                     qos, time_limit, gres, nodes_requested, cpus_per_task, mem, exclude,
+                     constraints, launcher_spec, submitted_at)
+                select r.id, r.model_id, m.model_name, mm.launcher_spec->>'recipe_id',
+                       r.slurm_job_id, mm.partition, mm.account, mm.qos, mm.time_limit,
+                       mm.gres, mm.nodes, mm.cpus_per_task, mm.mem, mm.exclude,
+                       mm.constraints, mm.launcher_spec, r.created_at
+                from r
+                join models m on m.id = r.model_id
+                left join managed_models mm on mm.model_id = r.model_id
+                on conflict (id) do nothing
+             )
+             select * from r",
         )
         .bind(Uuid::new_v4())
         .bind(model_id)
@@ -2595,15 +2618,40 @@ impl Store {
         state: &str,
         message: Option<&str>,
     ) -> Result<ModelReplica> {
+        // The launch-history row follows in the same statement: timestamps are
+        // stamped once (coalesce) and the first end state recorded wins, so a
+        // replica that drains and is later seen gone keeps its cancel reason.
+        let t = launch_transition(state, message);
         let row = sqlx::query(
-            "update model_replicas set state = $2, last_message = $3, updated_at = now()
-             where id = $1
-             returning id, model_id, slurm_job_id, nodes, endpoint_id, state,
-                       last_message, port_base, cancel_requested, created_at, updated_at",
+            "with r as (
+                update model_replicas set state = $2, last_message = $3, updated_at = now()
+                where id = $1
+                returning id, model_id, slurm_job_id, nodes, endpoint_id, state,
+                          last_message, port_base, cancel_requested, created_at, updated_at
+             ), launch as (
+                update deployment_launches l set
+                    started_at = case when $4 then coalesce(l.started_at, now())
+                                      else l.started_at end,
+                    healthy_at = case when $5 then coalesce(l.healthy_at, now())
+                                      else l.healthy_at end,
+                    ended_at = case when $6 then coalesce(l.ended_at, now())
+                                    else l.ended_at end,
+                    end_state = coalesce(l.end_state, $7),
+                    end_reason = case when l.end_state is null and $7 is not null
+                                      then $8 else l.end_reason end,
+                    updated_at = now()
+                from r where l.id = r.id
+             )
+             select * from r",
         )
         .bind(id)
         .bind(state)
         .bind(message)
+        .bind(t.started)
+        .bind(t.healthy)
+        .bind(t.ended)
+        .bind(t.end_state)
+        .bind(t.end_reason)
         .fetch_optional(&self.pool)
         .await?
         .ok_or(StoreError::NotFound)?;
@@ -2621,12 +2669,23 @@ impl Store {
         nodes: Option<&str>,
         endpoint_id: Option<Uuid>,
     ) -> Result<ModelReplica> {
+        // Nodes arriving means the job was allocated and started: the launch
+        // row keeps the first allocation reported and stamps its start once.
         let row = sqlx::query(
-            "update model_replicas set nodes = coalesce($2, nodes),
-                    endpoint_id = coalesce($3, endpoint_id), updated_at = now()
-             where id = $1
-             returning id, model_id, slurm_job_id, nodes, endpoint_id, state,
-                       last_message, port_base, cancel_requested, created_at, updated_at",
+            "with r as (
+                update model_replicas set nodes = coalesce($2, nodes),
+                       endpoint_id = coalesce($3, endpoint_id), updated_at = now()
+                where id = $1
+                returning id, model_id, slurm_job_id, nodes, endpoint_id, state,
+                          last_message, port_base, cancel_requested, created_at, updated_at
+             ), launch as (
+                update deployment_launches l set
+                    nodes = coalesce(l.nodes, $2),
+                    started_at = coalesce(l.started_at, now()),
+                    updated_at = now()
+                from r where l.id = r.id and $2::text is not null
+             )
+             select * from r",
         )
         .bind(id)
         .bind(nodes)
@@ -2680,12 +2739,53 @@ impl Store {
         row.as_ref().map(replica_from_row).transpose()
     }
 
+    /// Delete a replica row. Its launch-history row stays; if the launch was
+    /// still open (the row was removed before it drained or was lost) it is
+    /// closed now with end state `deleted`.
     pub async fn delete_replica(&self, id: Uuid) -> Result<()> {
-        sqlx::query("delete from model_replicas where id = $1")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "with d as (delete from model_replicas where id = $1 returning id)
+             update deployment_launches set
+                 ended_at = coalesce(ended_at, now()),
+                 end_state = coalesce(end_state, 'deleted'),
+                 updated_at = now()
+             where id in (select id from d) and (ended_at is null or end_state is null)",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
+    }
+
+    /// Launch history, newest first, optionally narrowed to one model and/or
+    /// recipe. `limit` is clamped to 1..=500.
+    pub async fn list_deployment_launches(
+        &self,
+        model_id: Option<Uuid>,
+        recipe_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<DeploymentLaunch>> {
+        let rows = sqlx::query(
+            "select id, model_id, model_name, recipe_id, slurm_job_id, partition, account,
+                    qos, time_limit, gres, nodes_requested, cpus_per_task, mem, exclude,
+                    constraints, launcher_spec, nodes, submitted_at, started_at, healthy_at,
+                    ended_at, end_state, end_reason, updated_at,
+                    extract(epoch from (started_at - submitted_at))::bigint as queued_secs,
+                    extract(epoch from (healthy_at - started_at))::bigint as load_secs,
+                    extract(epoch from (coalesce(ended_at, now()) - started_at))::bigint
+                        as ran_secs
+             from deployment_launches
+             where ($1::uuid is null or model_id = $1)
+               and ($2::text is null or recipe_id = $2)
+             order by submitted_at desc, id
+             limit $3",
+        )
+        .bind(model_id)
+        .bind(recipe_id)
+        .bind(limit.clamp(1, 500))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(launch_from_row).collect()
     }
 
     pub async fn delete_lost_replicas(&self, model_id: Uuid) -> Result<u64> {
@@ -3446,7 +3546,8 @@ impl Store {
     }
 
     /// Load the system-wide Slurm settings, or `None` if never configured. The
-    /// stored JWT is decrypted transparently (legacy/empty values pass through).
+    /// stored JWT and Hugging Face token are decrypted transparently
+    /// (legacy/empty values pass through).
     pub async fn get_slurm_settings(&self) -> Result<Option<obleth_config::SlurmSettings>> {
         let row = sqlx::query("select value from app_settings where key = 'slurm'")
             .fetch_optional(&self.pool)
@@ -3459,6 +3560,9 @@ impl Store {
                 if !settings.slurm_jwt.is_empty() {
                     settings.slurm_jwt = cipher().decrypt(&settings.slurm_jwt)?;
                 }
+                if !settings.hf_token.is_empty() {
+                    settings.hf_token = cipher().decrypt(&settings.hf_token)?;
+                }
                 Ok(Some(settings))
             }
             None => Ok(None),
@@ -3466,12 +3570,15 @@ impl Store {
     }
 
     /// Persist the system-wide Slurm settings (upsert on the single `slurm`
-    /// key). The JWT is encrypted at rest with the same envelope cipher used for
-    /// upstream provider keys before it is written.
+    /// key). The JWT and Hugging Face token are encrypted at rest with the same
+    /// envelope cipher used for upstream provider keys before they are written.
     pub async fn put_slurm_settings(&self, settings: &obleth_config::SlurmSettings) -> Result<()> {
         let mut to_store = settings.clone();
         if !to_store.slurm_jwt.is_empty() {
             to_store.slurm_jwt = cipher().encrypt(&to_store.slurm_jwt);
+        }
+        if !to_store.hf_token.is_empty() {
+            to_store.hf_token = cipher().encrypt(&to_store.hf_token);
         }
         sqlx::query(
             "insert into app_settings (key, value, updated_at)
@@ -3974,6 +4081,115 @@ fn replica_from_row(row: &PgRow) -> Result<ModelReplica> {
     })
 }
 
+fn launch_from_row(row: &PgRow) -> Result<DeploymentLaunch> {
+    let launcher_spec: Option<sqlx::types::Json<serde_json::Value>> =
+        row.try_get("launcher_spec")?;
+    Ok(DeploymentLaunch {
+        id: row.try_get("id")?,
+        model_id: row.try_get("model_id")?,
+        model_name: row.try_get("model_name")?,
+        recipe_id: row.try_get("recipe_id")?,
+        slurm_job_id: row.try_get("slurm_job_id")?,
+        partition: row.try_get("partition")?,
+        account: row.try_get("account")?,
+        qos: row.try_get("qos")?,
+        time_limit: row.try_get("time_limit")?,
+        gres: row.try_get("gres")?,
+        nodes_requested: row.try_get("nodes_requested")?,
+        cpus_per_task: row.try_get("cpus_per_task")?,
+        mem: row.try_get("mem")?,
+        exclude: row.try_get("exclude")?,
+        constraints: row.try_get("constraints")?,
+        launcher_spec: launcher_spec.map(|j| j.0),
+        nodes: row.try_get("nodes")?,
+        submitted_at: row.try_get("submitted_at")?,
+        started_at: row.try_get("started_at")?,
+        healthy_at: row.try_get("healthy_at")?,
+        ended_at: row.try_get("ended_at")?,
+        end_state: row.try_get("end_state")?,
+        end_reason: row.try_get("end_reason")?,
+        updated_at: row.try_get("updated_at")?,
+        queued_secs: row.try_get("queued_secs")?,
+        load_secs: row.try_get("load_secs")?,
+        ran_secs: row.try_get("ran_secs")?,
+    })
+}
+
+/// What a replica state change means for its launch-history row.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LaunchTransition {
+    started: bool,
+    healthy: bool,
+    ended: bool,
+    end_state: Option<String>,
+    end_reason: Option<String>,
+}
+
+/// Map a replica state change (and the message the provisioner sent with it)
+/// onto the launch row. `lost` messages come from the provisioner's
+/// `lost_message`: `job ended: STATE (reason)` or `job gone`. `draining`
+/// messages name why obleth cancelled the job (see the provisioner's
+/// `CancelReason`).
+fn launch_transition(state: &str, message: Option<&str>) -> LaunchTransition {
+    let msg = message.map(str::trim).filter(|m| !m.is_empty());
+    match state {
+        "starting" => LaunchTransition {
+            started: true,
+            ..Default::default()
+        },
+        "healthy" => LaunchTransition {
+            started: true,
+            healthy: true,
+            ..Default::default()
+        },
+        "lost" => {
+            let (end_state, end_reason) = match msg {
+                Some(m) if m.starts_with("job ended:") => {
+                    let rest = m["job ended:".len()..].trim();
+                    match rest.split_once(" (") {
+                        Some((s, r)) => (
+                            s.trim().to_string(),
+                            Some(r.trim_end_matches(')').trim().to_string())
+                                .filter(|r| !r.is_empty()),
+                        ),
+                        None => (rest.to_string(), None),
+                    }
+                }
+                Some("job gone") => ("gone".to_string(), None),
+                other => ("lost".to_string(), other.map(str::to_string)),
+            };
+            let end_state = if end_state.is_empty() {
+                "gone".to_string()
+            } else {
+                end_state
+            };
+            LaunchTransition {
+                ended: true,
+                end_state: Some(end_state),
+                end_reason,
+                ..Default::default()
+            }
+        }
+        "draining" => {
+            let end_state = match msg {
+                Some("scaled down") => "cancelled:scale-down",
+                Some("restart requested") => "cancelled:restart",
+                Some(m) if m.starts_with("restarting: failed health probes") => {
+                    "cancelled:probe-failed"
+                }
+                _ => "cancelled",
+            };
+            LaunchTransition {
+                ended: true,
+                end_state: Some(end_state.to_string()),
+                end_reason: msg.map(str::to_string),
+                ..Default::default()
+            }
+        }
+        _ => LaunchTransition::default(),
+    }
+}
+
 fn endpoint_from_row(row: &PgRow) -> Result<ModelEndpoint> {
     Ok(ModelEndpoint {
         id: row.try_get("id")?,
@@ -4156,6 +4372,12 @@ pub(crate) mod test_support {
                     }
                     for id in replicas {
                         let _ = store.delete_replica(id).await;
+                        // Launch history outlives the replica by design;
+                        // fixtures must not leave it behind.
+                        let _ = sqlx::query("delete from deployment_launches where id = $1")
+                            .bind(id)
+                            .execute(&store.pool)
+                            .await;
                     }
                     for id in mcp_servers {
                         let _ = store.delete_mcp_server(id).await;
@@ -6170,6 +6392,12 @@ mod tests {
                 host: "node001".into(),
                 ip: "10.0.0.1".into(),
             }],
+            cluster_defaults: obleth_config::ClusterDefaults {
+                cache_dir: "/scratch/hf".into(),
+                images: [("vllm".to_string(), "vllm.sif".to_string())].into(),
+                ..Default::default()
+            },
+            hf_token: "hf_secret_token".into(),
         };
         store.put_slurm_settings(&settings).await.expect("put");
 
@@ -6184,6 +6412,8 @@ mod tests {
         assert_eq!(got.slurm_user, settings.slurm_user);
         assert_eq!(got.slurm_jwt, settings.slurm_jwt);
         assert_eq!(got.node_aliases, settings.node_aliases);
+        assert_eq!(got.cluster_defaults, settings.cluster_defaults);
+        assert_eq!(got.hf_token, settings.hf_token);
 
         // the JWT must be ciphertext at rest whenever a cipher is configured
         let raw: sqlx::types::Json<serde_json::Value> =
@@ -6207,6 +6437,15 @@ mod tests {
                 "jwt must be encrypted at rest, got {stored_jwt}"
             );
             assert_ne!(stored_jwt, settings.slurm_jwt);
+            let stored_hf = raw
+                .0
+                .get("hf_token")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            assert!(
+                stored_hf.starts_with("enc:v1:"),
+                "hf_token must be encrypted at rest"
+            );
         }
     }
 
@@ -6295,6 +6534,255 @@ mod tests {
 
         // Clean up.
         store.delete_replica(r2.id).await.expect("delete r2");
+    }
+
+    #[test]
+    fn launch_transition_maps_states_and_messages() {
+        assert_eq!(
+            launch_transition("pending", None),
+            LaunchTransition::default()
+        );
+        let s = launch_transition("starting", Some("node alloc"));
+        assert!(s.started && !s.healthy && !s.ended);
+        let h = launch_transition("healthy", Some("promoted"));
+        assert!(h.started && h.healthy && !h.ended && h.end_state.is_none());
+
+        let lost = |m: Option<&str>| {
+            let t = launch_transition("lost", m);
+            assert!(t.ended);
+            (t.end_state, t.end_reason)
+        };
+        assert_eq!(
+            lost(Some("job ended: TIMEOUT (TimeLimit)")),
+            (Some("TIMEOUT".into()), Some("TimeLimit".into()))
+        );
+        assert_eq!(
+            lost(Some("job ended: NODE_FAIL")),
+            (Some("NODE_FAIL".into()), None)
+        );
+        assert_eq!(lost(Some("job gone")), (Some("gone".into()), None));
+        assert_eq!(
+            lost(Some("node gone")),
+            (Some("lost".into()), Some("node gone".into()))
+        );
+        assert_eq!(lost(None), (Some("lost".into()), None));
+
+        let drained = |m: &str| launch_transition("draining", Some(m)).end_state;
+        assert_eq!(
+            drained("scaled down").as_deref(),
+            Some("cancelled:scale-down")
+        );
+        assert_eq!(
+            drained("restart requested").as_deref(),
+            Some("cancelled:restart")
+        );
+        assert_eq!(
+            drained("restarting: failed health probes while job running").as_deref(),
+            Some("cancelled:probe-failed")
+        );
+        assert_eq!(drained("by hand").as_deref(), Some("cancelled"));
+        assert!(launch_transition("draining", Some("scaled down")).ended);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn deployment_launch_history_test() {
+        let Some(url) = crate::test_support::test_db_url() else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        let mut fixtures = FixtureGuard::new(&store);
+
+        let model_name = format!("m-{}", Uuid::new_v4());
+        let args = default_test_model(&model_name);
+        let model = store
+            .create_model(
+                args.0,
+                args.1,
+                args.2,
+                args.3,
+                args.4,
+                args.5,
+                args.6,
+                args.7,
+                args.8,
+                args.9,
+                args.10,
+                args.11,
+                args.12,
+                args.13,
+                args.14,
+                args.15,
+                args.16,
+                args.17,
+                args.18,
+                &args.19,
+                &args.20,
+                &args.21,
+                args.22,
+                args.23,
+                true,
+                "",
+                "",
+                "",
+                &[],
+                "",
+                &Default::default(),
+                0.0,
+                "static",
+                &Default::default(),
+            )
+            .await
+            .expect("create model");
+        fixtures.track_model(model.id);
+        let recipe_id = format!("recipe-{}", Uuid::new_v4());
+        store
+            .upsert_managed_model(UpsertManagedModel {
+                model_id: model.id,
+                enabled: true,
+                partition: "gpu".into(),
+                gres: "gpu:4".into(),
+                nodes: 2,
+                constraints: Some("fast".into()),
+                exclude: Some("node9".into()),
+                account: Some("acct".into()),
+                qos: Some("normal".into()),
+                time_limit: Some("12:00:00".into()),
+                cpus_per_task: Some(16),
+                mem: Some("500G".into()),
+                image: "vllm.sif".into(),
+                preamble: String::new(),
+                log_output_dir: String::new(),
+                launch_command: "vllm serve x".into(),
+                script_body: String::new(),
+                serving_port: 8000,
+                health_path: "/health".into(),
+                target_replicas: 1,
+                min_replicas: 1,
+                max_job_failures: 0,
+                launcher_spec: Some(serde_json::json!({"source":"recipe","recipe_id":recipe_id})),
+            })
+            .await
+            .expect("upsert managed");
+
+        // Submit: the launch row snapshots the spec.
+        let r1 = store
+            .create_replica(model.id, "job-launch-1", Some(8000))
+            .await
+            .expect("create r1");
+        fixtures.track_replica(r1.id);
+        // A retried create is idempotent for the launch row too.
+        store
+            .create_replica(model.id, "job-launch-1", Some(8000))
+            .await
+            .expect("create r1 again");
+        let launches = store
+            .list_deployment_launches(Some(model.id), None, 50)
+            .await
+            .expect("list");
+        assert_eq!(launches.len(), 1);
+        let l = &launches[0];
+        assert_eq!(l.id, r1.id);
+        assert_eq!(l.model_name, model_name);
+        assert_eq!(l.recipe_id.as_deref(), Some(recipe_id.as_str()));
+        assert_eq!(l.slurm_job_id, "job-launch-1");
+        assert_eq!(l.partition.as_deref(), Some("gpu"));
+        assert_eq!(l.account.as_deref(), Some("acct"));
+        assert_eq!(l.qos.as_deref(), Some("normal"));
+        assert_eq!(l.gres.as_deref(), Some("gpu:4"));
+        assert_eq!(l.nodes_requested, Some(2));
+        assert_eq!(l.cpus_per_task, Some(16));
+        assert_eq!(l.mem.as_deref(), Some("500G"));
+        assert_eq!(l.exclude.as_deref(), Some("node9"));
+        assert_eq!(l.constraints.as_deref(), Some("fast"));
+        assert!(l.started_at.is_none() && l.queued_secs.is_none() && l.ran_secs.is_none());
+
+        // Nodes arrive (job started), then healthy, then Slurm ends it.
+        store
+            .set_replica_runtime(r1.id, Some("node1,node2"), None)
+            .await
+            .expect("runtime");
+        store
+            .set_replica_runtime(r1.id, Some("node1"), None)
+            .await
+            .expect("runtime again");
+        store
+            .update_replica_state(r1.id, "healthy", Some("promoted"))
+            .await
+            .expect("healthy");
+        store
+            .update_replica_state(r1.id, "lost", Some("job ended: TIMEOUT (TimeLimit)"))
+            .await
+            .expect("lost");
+        // Later messages must not overwrite the first recorded end.
+        store
+            .update_replica_state(r1.id, "lost", Some("job gone"))
+            .await
+            .expect("lost again");
+
+        // A second launch, cancelled by a scale-down, then GC'd.
+        let r2 = store
+            .create_replica(model.id, "job-launch-2", Some(8008))
+            .await
+            .expect("create r2");
+        fixtures.track_replica(r2.id);
+        store
+            .update_replica_state(r2.id, "draining", Some("scaled down"))
+            .await
+            .expect("drain");
+        store.delete_replica(r2.id).await.expect("delete r2");
+        // And the lost one is cleared.
+        store
+            .delete_lost_replicas(model.id)
+            .await
+            .expect("clear lost");
+
+        // Both launches survive their replica rows, newest first.
+        let launches = store
+            .list_deployment_launches(Some(model.id), None, 50)
+            .await
+            .expect("list");
+        assert_eq!(launches.len(), 2);
+        let (second, first) = (&launches[0], &launches[1]);
+        assert_eq!(second.id, r2.id);
+        assert_eq!(second.end_state.as_deref(), Some("cancelled:scale-down"));
+        assert!(second.ended_at.is_some());
+        assert!(second.started_at.is_none() && second.ran_secs.is_none());
+
+        assert_eq!(first.id, r1.id);
+        assert_eq!(first.nodes.as_deref(), Some("node1,node2"));
+        assert!(first.started_at.is_some() && first.healthy_at.is_some());
+        assert!(first.ended_at.is_some());
+        assert_eq!(first.end_state.as_deref(), Some("TIMEOUT"));
+        assert_eq!(first.end_reason.as_deref(), Some("TimeLimit"));
+        assert!(first.queued_secs.is_some_and(|s| s >= 0));
+        assert!(first.load_secs.is_some_and(|s| s >= 0));
+        assert!(first.ran_secs.is_some_and(|s| s >= 0));
+
+        // Filters: by recipe, limit, and a recipe nobody launched.
+        let by_recipe = store
+            .list_deployment_launches(None, Some(&recipe_id), 50)
+            .await
+            .expect("by recipe");
+        assert_eq!(by_recipe.len(), 2);
+        let limited = store
+            .list_deployment_launches(Some(model.id), None, 1)
+            .await
+            .expect("limited");
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].id, r2.id);
+        assert!(store
+            .list_deployment_launches(None, Some("no-such-recipe-xyz"), 50)
+            .await
+            .expect("none")
+            .is_empty());
+
+        store
+            .delete_managed_model(model.id)
+            .await
+            .expect("delete managed");
     }
 
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
