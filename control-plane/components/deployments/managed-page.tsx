@@ -12,6 +12,7 @@ import {
   saveDeploymentSettingsAction,
   setDeploymentEnabledAction,
   setDeploymentReplicasAction,
+  saveRecipeFromDeploymentAction,
 } from "@/app/actions";
 import { SettingsForm } from "@/components/access/settings-form";
 import { SettingsCard } from "@/components/access/ui";
@@ -216,6 +217,7 @@ export function ManagedPage({ modelId, initial, changes }: { modelId: string; in
   const [pending, start] = useTransition();
   const [notice, setNotice] = useState<{ text: string; strong?: boolean } | null>(null);
   const [removing, setRemoving] = useState(false);
+  const [saveName, setSaveName] = useState<string | null>(null);
   const [dirty, setDirty] = useState<string[]>([]);
   const [active, setActive] = useState("replicas");
   const live = useQuery({ queryKey: ["deployments"], queryFn: () => getJson<DeploymentsData>("/api/live/deployments"), initialData: initial, refetchInterval: 10_000 });
@@ -233,6 +235,7 @@ export function ManagedPage({ modelId, initial, changes }: { modelId: string; in
   const queued = fairshare.data?.model_queued?.[model.model_name] ?? 0;
   const cap = model.max_in_flight ?? 0;
   const engine = typeof spec.launcher_spec?.name === "string" ? (spec.launcher_spec.name as string) : null;
+  const fromRecipe = typeof spec.launcher_spec?.recipe_id === "string";
   const provisionerOk = !!data.slurm?.enabled && !!data.slurm.provisioner_running;
 
   const refresh = useCallback(async () => {
@@ -338,12 +341,26 @@ export function ManagedPage({ modelId, initial, changes }: { modelId: string; in
               <DropdownMenuItem onSelect={() => router.push(modelHref(model.model_name))}>Model settings</DropdownMenuItem>
               {model.enabled && <DropdownMenuItem onSelect={() => router.push(`/playground?model=${encodeURIComponent(model.model_name)}`)}>Try in Playground</DropdownMenuItem>}
               <DropdownMenuItem disabled={current.length === 0} onSelect={restartAll}>Restart all replicas…</DropdownMenuItem>
+              {fromRecipe && <DropdownMenuItem onSelect={() => setSaveName(`${engine ?? model.model_name} · ${spec.partition}${spec.nodes > 1 ? ` · ${spec.nodes} nodes` : ""}`)}>Save as recipe…</DropdownMenuItem>}
               <DropdownMenuSeparator />
               <DropdownMenuItem onSelect={() => setRemoving(true)}>Remove deployment…</DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
         </div>
       </div>
+
+      {fromRecipe && counts.healthy > 0 && saveName === null && (
+        <p className="text-[12.5px] text-muted-foreground">It serves. <button type="button" onClick={() => setSaveName(`${engine ?? model.model_name} · ${spec.partition}${spec.nodes > 1 ? ` · ${spec.nodes} nodes` : ""}`)} className="text-secondary-foreground underline underline-offset-[3px] hover:text-foreground">Save these settings as a recipe</button> to launch it the same way again.</p>
+      )}
+      {saveName !== null && (
+        <form onSubmit={(e) => { e.preventDefault(); run(async () => { const res = await saveRecipeFromDeploymentAction(modelId, saveName); if (res.ok) setSaveName(null); return res; }, "Saved. It's under Recipes › Saved, and first in New deployment."); }} aria-label="Save as recipe" className="flex flex-wrap items-center gap-2 rounded-xl border border-border bg-card px-4 py-3">
+          <span className="text-[13px] font-medium">Save as recipe</span>
+          <input aria-label="Recipe name" value={saveName} onChange={(e) => setSaveName(e.target.value)} className="h-9 min-w-[260px] flex-1 rounded-lg border border-input bg-background px-3 text-[13px]" />
+          <Button type="submit" size="sm" className="h-9" disabled={pending || !saveName.trim()}>Save</Button>
+          <Button type="button" variant="ghost" size="sm" className="h-9" onClick={() => setSaveName(null)}>Cancel</Button>
+          <span className="basis-full text-[12px] text-muted-foreground">Keeps the partition, account, QoS, walltime, replica counts and the recipe&apos;s values this deployment runs with.</span>
+        </form>
+      )}
 
       {!provisionerOk && (
         <Notice strong>
