@@ -12,6 +12,10 @@ port: 8000
 health_path: /health
 nodes: 1
 node_options: [1, 4, 8]
+node_notes:
+  "1": "All of it on one GH200. Only about a fifth fits on the GPU; the rest is read from the slower Grace memory, so this is the slowest way to run it."
+  "4": "Split across four GH200s. Nearly all of it fits on the GPUs, and a little is read from Grace memory."
+  "8": "Split across eight GH200s. It all fits on the GPUs, the fastest way to run it."
 target_replicas: 1
 max_job_failures: 2
 env:
@@ -24,18 +28,6 @@ inputs:
     options: [65536, 131072, 262144, 1048576]
     default: 262144
     help: Only a few attention layers keep a cache, so long contexts stay cheap.
-  - name: offload_gb
-    label: Weights in Grace memory
-    type: number
-    unit: GiB per node
-    min: 0
-    max: 460
-    default: 270
-    # The weights are ~328 GiB, split evenly across the nodes. Each GPU keeps
-    # ~62 GiB of them (96 GB less the KV cache and working memory at 0.92
-    # utilization); the rest of that node's share goes to Grace memory.
-    by_nodes: { "1": 270, "4": 20, "8": 0 }
-    help: "The weights are about 328 GiB and each GPU has room for about 62 GiB of them; what's left over waits in Grace memory, which is slower to read. 1 node: about 270 left over. 4 nodes: 4 × 62 = 248 on the GPUs, 80 left over, 20 on each node. 8 nodes: it all fits on the GPUs."
   - name: image
     label: Container image
     type: path
@@ -88,6 +80,13 @@ if [ "$NNODES" -gt 1 ]; then
   PARALLEL=(--pipeline-parallel-size "$NNODES" --distributed-executor-backend ray)
 fi
 
+# vLLM plans for the GPU's memory only, so tell it how much of this node's
+# share of the weights won't fit there and should wait in Grace memory. The
+# weights are about 328 GiB, split evenly across the nodes; each GPU has room
+# for about 62 GiB of them next to the KV cache. 1 node: 266, 4: 20, 8: none.
+SHARE_GIB=$(( (328 + NNODES - 1) / NNODES ))
+OFFLOAD_GIB=$(( SHARE_GIB > 62 ? SHARE_GIB - 62 : 0 ))
+
 "${RUN[@]}" vllm serve nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4 \
   --served-model-name nemotron-3-ultra \
   --host 0.0.0.0 --port "$OBLETH_SERVING_PORT" \
@@ -95,6 +94,6 @@ fi
   --trust-remote-code \
   --max-model-len {{context}} \
   --kv-cache-dtype fp8 --mamba-ssm-cache-dtype float16 \
-  --cpu-offload-gb {{offload_gb}} \
+  --cpu-offload-gb "$OFFLOAD_GIB" \
   --gpu-memory-utilization 0.92 \
   {{tools}} {{reasoning}} {{mtp}}

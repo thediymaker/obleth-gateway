@@ -36,6 +36,12 @@ describe("the deploy form", () => {
     expect(msgs.some((m) => m.includes("over gh200's 7 days limit"))).toBe(true);
   });
 
+  it("says which accounts a partition takes before Slurm refuses the job", () => {
+    const r = { ...resources, partitions: [{ ...resources.partitions[0], allowed_accounts: ["ai-research"] }], accounts: ["ai-research", "grp_rcadmins"] };
+    const f = setField(setField(base, "slurm.partition", "gh200"), "slurm.account", "grp_rcadmins");
+    expect(formProblems(f, p, r, []).map((x) => x.message)).toContain("gh200 doesn't take grp_rcadmins. It takes ai-research.");
+  });
+
   it("round-trips through YAML, writing only what changed", () => {
     const f = setField(setField(base, "slurm.account", "ai-research"), "inputs.mtp", "false");
     const text = formToYaml(f, base, { notes: { "slurm.account": "learned" } });

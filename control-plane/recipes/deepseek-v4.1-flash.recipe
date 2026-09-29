@@ -22,14 +22,6 @@ inputs:
     type: choice
     options: [65536, 131072, 262144, 1048576]
     default: 131072
-  - name: offload_gb
-    label: Experts in CPU memory
-    type: number
-    unit: GiB
-    min: 0
-    max: 480
-    default: 240
-    help: The part of the model's expert weights kept in CPU memory instead of on the GPU. About 240 fits a 96 GB GPU.
   - name: image
     label: Container image
     type: path
@@ -54,6 +46,7 @@ inputs:
 set -euo pipefail
 {{cluster.setup}}
 export HF_HOME={{cache}}
+# About 240 GiB of the routed experts wait in CPU memory; the rest fits a 96 GB GPU.
 apptainer exec --nv --bind {{cache}} {{image}} \
   vllm serve deepseek-ai/DeepSeek-V4.1-Flash \
     --served-model-name deepseek-v4.1-flash \
@@ -62,7 +55,7 @@ apptainer exec --nv --bind {{cache}} {{image}} \
     --reasoning-parser deepseek_v41 {{tools}} \
     --language-model-only \
     --engram-config '{"cpu_offload":true}' \
-    --offload-backend uva --cpu-offload-gb {{offload_gb}} \
+    --offload-backend uva --cpu-offload-gb 240 \
     --cpu-offload-params routed_experts.w13_weight routed_experts.w2_weight \
     --max-model-len {{context}} \
     --max-num-batched-tokens 4096 \

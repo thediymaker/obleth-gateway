@@ -390,6 +390,9 @@ export type ClusterResources = {
     nodes: string[];
     default_time: string | null;
     max_time: string | null;
+    /** AllowAccounts; empty means any. Absent from older gateways. */
+    allowed_accounts?: string[];
+    denied_accounts?: string[];
   }[];
   nodes: {
     name: string;
@@ -405,6 +408,8 @@ export type ClusterResources = {
   }[];
   accounts: string[];
   qos: string[];
+  /** The Slurm user's associations; `partition` null covers every partition. Absent from older gateways. */
+  associations?: { account: string; partition: string | null; qos: string[] }[];
 };
 
 export interface ModelReplica {
@@ -2025,6 +2030,10 @@ export const obleth = {
     api<ModelRoute[]>("/models", {
       next: { revalidate: LIST_REVALIDATE_SECS, tags: [CACHE_TAGS.models] },
     }),
+  /** The model list uncached. Each dashboard replica has its own Data Cache,
+   *  and a tag revalidated on one doesn't reach the others, so a page that
+   *  must see a model created a moment ago (on any replica) reads this. */
+  listModelsFresh: () => api<ModelRoute[]>("/models"),
   createModel: (
     body: ModelWriteFields & {
       model_name: string;

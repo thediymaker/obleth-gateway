@@ -16,7 +16,9 @@ export interface DeploymentsData {
 /** Everything the Deployments list and a deployment's page read, in one go. */
 export async function loadDeployments(now = Date.now()): Promise<DeploymentsData> {
   const [models, specs, replicas, discovery, usage, slurm] = await Promise.all([
-    safe(obleth.listModels(), [] as ModelRoute[]),
+    // Uncached: right after a launch the redirect can land on a replica whose
+    // cached list doesn't have the new model yet, and the page would 404.
+    safe(obleth.listModelsFresh(), [] as ModelRoute[]),
     safe(obleth.listManagedModels(), [] as ManagedModelSpec[]),
     safe(obleth.listAllReplicas(), [] as ModelReplica[]),
     safe<CapacityDiscoveryView | null>(obleth.capacityDiscovery(), null),

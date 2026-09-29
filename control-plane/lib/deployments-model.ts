@@ -134,7 +134,33 @@ export interface DeploymentRow {
 }
 
 export function slurmPlacement(s: Pick<ManagedModelSpec, "partition" | "gres" | "mem" | "cpus_per_task" | "time_limit">): string {
-  return [s.partition, s.gres || null, s.cpus_per_task ? `${s.cpus_per_task} CPU` : null, s.mem || null, s.time_limit ? walltimeLabel(parseTimeLimit(s.time_limit)) : null].filter(Boolean).join(" · ");
+  const mem = s.mem === "0" ? "all memory" : s.mem || null;
+  return [s.partition, s.gres || null, s.cpus_per_task ? `${s.cpus_per_task} CPU` : null, mem, s.time_limit ? walltimeLabel(parseTimeLimit(s.time_limit)) : null].filter(Boolean).join(" · ");
+}
+
+/**
+ * The accounts a partition takes from this Slurm user: their associations for
+ * that partition (or for every partition), less what the partition's
+ * AllowAccounts/DenyAccounts rule out. Null when the cluster doesn't report
+ * enough to tell, so callers fall back to every account.
+ */
+export function accountsFor(resources: ClusterResources, partition: string): string[] | null {
+  const assoc = resources.associations;
+  const p = resources.partitions.find((x) => x.name === partition);
+  if (!assoc?.length && !p?.allowed_accounts?.length && !p?.denied_accounts?.length) return null;
+  const base = assoc?.length ? assoc.filter((a) => !a.partition || a.partition === partition).map((a) => a.account) : resources.accounts;
+  const allowed = p?.allowed_accounts ?? [];
+  const denied = new Set(p?.denied_accounts ?? []);
+  return [...new Set(base)].filter((a) => (!allowed.length || allowed.includes(a)) && !denied.has(a)).sort();
+}
+
+/** Slurm's own words from a slurmrestd error body, e.g. "Invalid account or
+ *  account/partition combination specified", or the text unchanged. */
+export function slurmErrorText(raw: string): string {
+  const errors = [...raw.matchAll(/"error"\s*:\s*"((?:[^"\\]|\\.)*)"/g)].map((m) => m[1]).filter(Boolean);
+  const descs = [...raw.matchAll(/"description"\s*:\s*"((?:[^"\\]|\\.)*)"/g)].map((m) => m[1]).filter((d) => d && !/^Expected OpenAPI/.test(d));
+  const picked = errors.length ? errors : descs;
+  return picked.length ? [...new Set(picked)].join("; ") : raw;
 }
 
 export function buildDeploymentRows(

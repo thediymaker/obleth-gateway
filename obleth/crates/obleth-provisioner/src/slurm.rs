@@ -1,4 +1,6 @@
-use crate::domain::{ClusterResources, JobInfo, JobState, JobSubmit, NodeInfo, PartitionInfo};
+use crate::domain::{
+    AssociationInfo, ClusterResources, JobInfo, JobState, JobSubmit, NodeInfo, PartitionInfo,
+};
 use async_trait::async_trait;
 use obleth_config::ManagedModelSpec;
 
@@ -380,14 +382,17 @@ pub fn submit_body(job: &JobSubmit, hf_token: &str) -> serde_json::Value {
     // (/usr/local/bin, /opt, sbin dirs) rather than a minimal one that would
     // fail if the launcher isn't under /usr/bin. Operators whose cluster needs
     // more can prepend it inside launch_command.
-    let mut environment = serde_json::json!({
-        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/apptainer/bin:/opt/singularity/bin"
-    });
+    //
+    // slurmrestd v0.0.39 and later take the environment as a list of
+    // `NAME=value` strings. An object is only warned about ("Expected OpenAPI
+    // type=array") and then dropped, which silently loses every variable.
+    let mut environment = vec![
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/apptainer/bin:/opt/singularity/bin".to_string(),
+    ];
     let hf_token = hf_token.trim();
     if !hf_token.is_empty() {
-        let env = environment.as_object_mut().unwrap();
-        env.insert("HF_TOKEN".into(), serde_json::json!(hf_token));
-        env.insert("HUGGING_FACE_HUB_TOKEN".into(), serde_json::json!(hf_token));
+        environment.push(format!("HF_TOKEN={hf_token}"));
+        environment.push(format!("HUGGING_FACE_HUB_TOKEN={hf_token}"));
     }
     let mut spec = serde_json::json!({
         "name": job.name,
@@ -542,6 +547,7 @@ impl SlurmClient for Slurmrestd {
                     let (a, q) = parse_associations(&v);
                     out.accounts = a;
                     out.qos = q;
+                    out.associations = parse_association_list(&v);
                 }
                 Err(e) => tracing::warn!(error=%e, "slurm associations body not JSON"),
             },
@@ -668,6 +674,14 @@ pub fn parse_partitions(v: &serde_json::Value) -> Vec<PartitionInfo> {
                             .get("maximums")
                             .and_then(|d| d.get("time"))
                             .and_then(time_minutes),
+                        // slurmrestd reports AllowAccounts as "ALL" when unset.
+                        allowed_accounts: str_list(
+                            p.get("accounts").and_then(|a| a.get("allowed")),
+                        )
+                        .into_iter()
+                        .filter(|a| !a.eq_ignore_ascii_case("ALL"))
+                        .collect(),
+                        denied_accounts: str_list(p.get("accounts").and_then(|a| a.get("deny"))),
                     })
                 })
                 .collect()
@@ -714,6 +728,39 @@ pub fn parse_nodes(v: &serde_json::Value) -> Vec<NodeInfo> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Each association's account, partition (None = all) and QoS, deduplicated.
+pub fn parse_association_list(v: &serde_json::Value) -> Vec<AssociationInfo> {
+    let mut out: Vec<AssociationInfo> = Vec::new();
+    for a in v
+        .get("associations")
+        .and_then(|x| x.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let Some(account) = a
+            .get("account")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let partition = a
+            .get("partition")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        let info = AssociationInfo {
+            account: account.to_string(),
+            partition,
+            qos: str_list(a.get("qos")),
+        };
+        if !out.contains(&info) {
+            out.push(info);
+        }
+    }
+    out
 }
 
 pub fn parse_associations(v: &serde_json::Value) -> (Vec<String>, Vec<String>) {
@@ -774,20 +821,34 @@ mod tests {
     fn submit_body_carries_hf_token_in_environment_only_when_set() {
         let job = job_submit_from_spec(&spec(), "nemotron", "obleth-", 8000, 8);
         let with = submit_body(&job, " hf_secret ");
-        let env = &with["job"]["environment"];
-        assert_eq!(env["HF_TOKEN"], "hf_secret");
-        assert_eq!(env["HUGGING_FACE_HUB_TOKEN"], "hf_secret");
-        assert!(env["PATH"].is_string(), "PATH is still set");
+        let env: Vec<&str> = with["job"]["environment"]
+            .as_array()
+            .expect("environment is a list of NAME=value strings")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(env.contains(&"HF_TOKEN=hf_secret"));
+        assert!(env.contains(&"HUGGING_FACE_HUB_TOKEN=hf_secret"));
+        assert!(
+            env.iter().any(|e| e.starts_with("PATH=")),
+            "PATH is still set"
+        );
         assert!(
             !with["script"].as_str().unwrap().contains("hf_secret"),
             "token must not be written into the script"
         );
 
         let without = submit_body(&job, "");
-        let env = without["job"]["environment"].as_object().unwrap();
-        assert!(!env.contains_key("HF_TOKEN"));
-        assert!(!env.contains_key("HUGGING_FACE_HUB_TOKEN"));
-        assert!(env.contains_key("PATH"));
+        let env: Vec<&str> = without["job"]["environment"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(!env
+            .iter()
+            .any(|e| e.starts_with("HF_TOKEN=") || e.starts_with("HUGGING_FACE_HUB_TOKEN=")));
+        assert!(env.iter().any(|e| e.starts_with("PATH=")));
     }
 
     #[test]
@@ -1188,6 +1249,42 @@ mod tests {
         assert_eq!(n[0].alloc_cpus, Some(36));
         assert_eq!(n[0].alloc_memory_mb, Some(262144));
         assert_eq!(n[1].state, vec!["IDLE"]);
+    }
+
+    #[test]
+    fn parse_association_list_keeps_partitions() {
+        let v = serde_json::json!({"associations":[
+            {"account":"grp_a","partition":"gh200","qos":["normal"]},
+            {"account":"grp_a","partition":"gh200","qos":["normal"]},
+            {"account":"grp_b","partition":"","qos":"public"}
+        ]});
+        assert_eq!(
+            parse_association_list(&v),
+            vec![
+                AssociationInfo {
+                    account: "grp_a".into(),
+                    partition: Some("gh200".into()),
+                    qos: vec!["normal".into()]
+                },
+                AssociationInfo {
+                    account: "grp_b".into(),
+                    partition: None,
+                    qos: vec!["public".into()]
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_partitions_reads_allowed_and_denied_accounts() {
+        let v = serde_json::json!({"partitions":[
+            {"name":"gh200","accounts":{"allowed":"grp_a,grp_b","deny":""}},
+            {"name":"general","accounts":{"allowed":"ALL","deny":"grp_x"}}
+        ]});
+        let p = parse_partitions(&v);
+        assert_eq!(p[0].allowed_accounts, vec!["grp_a", "grp_b"]);
+        assert!(p[1].allowed_accounts.is_empty());
+        assert_eq!(p[1].denied_accounts, vec!["grp_x"]);
     }
 
     #[test]

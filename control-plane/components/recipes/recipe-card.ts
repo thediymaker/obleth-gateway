@@ -37,6 +37,7 @@ export interface RecipeDeployPreview {
   weightsGb?: number;
   requires?: string;
   nodeOptions?: number[];
+  nodeNotes?: Record<string, string>;
   basedOn?: string;
   env?: Record<string, string>;
   description?: string;
