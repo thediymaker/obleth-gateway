@@ -213,6 +213,20 @@ describe("a new deployment", () => {
     expect(host.textContent).toContain("Learned");
   });
 
+  it("moves a per-node value with Runs on, and offers the recipe's value back after an edit", async () => {
+    const multi: RecipeCard = { ...recipe, preview: { ...preview, nodes: 1, nodeOptions: [1, 4], inputs: [...preview.inputs, { name: "offload_gb", label: "Weights in Grace memory", type: "number" as const, unit: "GiB per node", default: "270", by_nodes: { "1": "270", "4": "10" }, required: false }] } };
+    await render(<NewDeployment recipes={[multi]} takenNames={[]} slurmOn initialRecipe="glm-5.2-multiuser" cluster={cluster} />);
+    await act(async () => button("Choose where it runs →").click());
+    const box = () => host.querySelector<HTMLInputElement>('input[aria-label="Weights in Grace memory"]')!;
+    expect(host.textContent).toContain("The recipe's value for 1 node; it updates when you change Runs on.");
+    await act(async () => button("4 nodes").click());
+    expect(box().value).toBe("10");
+    await type(box(), "20");
+    expect(host.textContent).toContain("The recipe suggests 10 for 4 nodes.");
+    await act(async () => button("Use 10").click());
+    expect(box().value).toBe("10");
+  });
+
   it("edits the same deployment as YAML", async () => {
     await render(<NewDeployment recipes={[recipe]} takenNames={[]} slurmOn initialRecipe="glm-5.2-multiuser" cluster={cluster} />);
     await act(async () => button("Choose where it runs →").click());

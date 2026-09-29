@@ -74,17 +74,26 @@ function tokensLabel(v: string): string {
   return n % 1048576 === 0 ? `${n / 1048576}M` : n % 1024 === 0 ? `${n / 1024}K` : v;
 }
 
-function InputControl({ spec, value, onChange }: { spec: RecipeInput; value: string; onChange: (v: string) => void }) {
+function InputControl({ spec, value, onChange, suggested, nodes }: { spec: RecipeInput; value: string; onChange: (v: string) => void; suggested?: string; nodes?: number }) {
   if (spec.type === "choice" && spec.options?.length) {
     const opts = spec.options.map((o) => ({ value: o, label: /context|len/i.test(spec.name) ? tokensLabel(o) : o }));
     return opts.length <= 6 ? <Seg label={spec.label || spec.name} value={value} onChange={onChange} options={opts} /> : <Select aria-label={spec.label || spec.name} value={value} onValueChange={onChange} options={opts} className="h-9 w-64 text-[13px]" />;
   }
   if (spec.type === "number") {
     return (
-      <span className="flex items-center gap-2.5">
-        <input aria-label={spec.label || spec.name} inputMode="numeric" value={value} onChange={(e) => onChange(e.target.value)} className={cn(input, "w-28 font-mono text-[12.5px]")} />
-        {spec.unit && <span className="text-[12.5px] text-muted-foreground">{spec.unit}</span>}
-        {spec.by_nodes && <span className="text-[12px] text-muted-foreground">follows Runs on: {Object.entries(spec.by_nodes).map(([n, v]) => `${v} on ${n}`).join(" · ")}</span>}
+      <span className="flex flex-col gap-1.5">
+        <span className="flex items-center gap-2.5">
+          <input aria-label={spec.label || spec.name} inputMode="numeric" value={value} onChange={(e) => onChange(e.target.value)} className={cn(input, "w-28 font-mono text-[12.5px]")} />
+          {spec.unit && <span className="text-[12.5px] text-muted-foreground">{spec.unit}</span>}
+        </span>
+        {/* A value that depends on the node count: say which count it was picked for. */}
+        {spec.by_nodes && suggested != null && nodes != null && (
+          value === suggested ? (
+            <span className="text-[12px] text-muted-foreground">The recipe&apos;s value for {nodes} node{nodes === 1 ? "" : "s"}; it updates when you change Runs on.</span>
+          ) : (
+            <span className="text-[12px] text-muted-foreground">The recipe suggests {suggested} for {nodes} node{nodes === 1 ? "" : "s"}. <button type="button" onClick={() => onChange(suggested)} className="text-secondary-foreground underline underline-offset-[3px] hover:text-foreground">Use {suggested}</button></span>
+          )
+        )}
       </span>
     );
   }
@@ -190,7 +199,7 @@ export function Configure(props: ConfigureProps) {
                 )}
                 {settings.map((i) => (
                   <Row key={i.name} label={i.label || i.name} hint={i.help} source={sourceOf(`inputs.${i.name}`)} saved={saved} problem={problemAt(`inputs.${i.name}`)}>
-                    <InputControl spec={i} value={form.inputs[i.name] ?? ""} onChange={(v) => set(`inputs.${i.name}`, v)} />
+                    <InputControl spec={i} value={form.inputs[i.name] ?? ""} onChange={(v) => set(`inputs.${i.name}`, v)} suggested={i.by_nodes ? inputDefault(i, cv, form.slurm.nodes) : undefined} nodes={form.slurm.nodes} />
                   </Row>
                 ))}
                 {flags.length > 0 && (
