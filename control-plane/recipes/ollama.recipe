@@ -1,0 +1,36 @@
+---
+name: Ollama
+description: "Any model in the Ollama library, pulled when the job starts. Quick to try; the model is served under its Ollama tag."
+engine: ollama
+kind: engine
+model_type: chat
+api_model_name: my-model
+port: 8000
+health_path: /api/tags
+target_replicas: 1
+max_job_failures: 2
+inputs:
+  - name: model
+    label: Ollama model
+    type: text
+    required: true
+    help: The tag, e.g. qwen2.5:0.5b. The API model name must match it.
+  - name: image
+    label: Container image
+    type: path
+    default: "{{cluster.image.ollama}}"
+    required: true
+  - name: cache
+    label: Model folder
+    type: path
+    default: "{{cluster.cache}}"
+    required: true
+    help: OLLAMA_MODELS, so pulled models are kept between jobs.
+---
+#!/bin/bash -l
+#SBATCH --nodes=1
+set -euo pipefail
+{{cluster.setup}}
+export OLLAMA_MODELS={{cache}}/ollama OLLAMA_HOST=0.0.0.0:${OBLETH_SERVING_PORT}
+apptainer exec --nv --bind {{cache}} {{image}} \
+  sh -c "ollama serve & sleep 5 && ollama pull {{model}} && wait"
