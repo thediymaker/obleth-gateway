@@ -31,8 +31,11 @@ inputs:
     min: 0
     max: 460
     default: 270
-    by_nodes: { "1": 270, "4": 10, "8": 0 }
-    help: The part of the model that doesn't fit in the GPU's 96 GB, kept in the node's CPU memory instead. Reading it from there is slower, so fewer nodes means slower answers.
+    # The weights are ~328 GiB, split evenly across the nodes. Each GPU keeps
+    # ~62 GiB of them (96 GB less the KV cache and working memory at 0.92
+    # utilization); the rest of that node's share goes to Grace memory.
+    by_nodes: { "1": 270, "4": 20, "8": 0 }
+    help: "The model's 352 GB is split across the nodes. Each GPU keeps about 62 GiB of its share; the rest waits in Grace memory, which is slower to read. So: 270 on 1 node, 20 on 4, none on 8."
   - name: image
     label: Container image
     type: path
