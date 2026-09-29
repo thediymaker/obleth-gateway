@@ -276,7 +276,7 @@ export function Configure(props: ConfigureProps) {
               <Row label="API model name" hint="What clients send as model." source={sourceOf("name")} saved={saved} problem={problemAt("name")}>
                 <input aria-label="API model name" value={form.name} onChange={(e) => set("name", e.target.value)} className={cn(input, "w-80 font-mono text-[12.5px]")} />
               </Row>
-              <Row label="Replicas" source={["serving.keep_running", "serving.serve_from", "serving.stop_after_failed_launches"].some((x) => changed.has(x)) ? "changed" : "recipe"} saved={saved} problem={problemAt("serving.keep_running") ?? problemAt("serving.serve_from")}>
+              <Row label="Replicas" hint="Failed launches count jobs on record, each forgotten 15 minutes after it ends. 0 never stops." source={["serving.keep_running", "serving.serve_from", "serving.stop_after_failed_launches"].some((x) => changed.has(x)) ? "changed" : "recipe"} saved={saved} problem={problemAt("serving.keep_running") ?? problemAt("serving.serve_from")}>
                 <div className="grid gap-2.5 sm:grid-cols-3">
                   {([["serving.keep_running", "Keep running"], ["serving.serve_from", "Serve once this many are healthy"], ["serving.stop_after_failed_launches", "Stop after failed launches"]] as const).map(([path, label]) => (
                     <label key={path} className="flex flex-col gap-1 text-[12px] text-muted-foreground">{label}<input aria-label={label} inputMode="numeric" value={String(getField(form, path) ?? "")} onChange={(e) => set(path, Number(e.target.value) || 0)} className={cn(input, "font-mono text-[12.5px] text-foreground")} /></label>
