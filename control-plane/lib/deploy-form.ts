@@ -3,7 +3,7 @@
 // it into what the launch action sends. Pure and client-safe.
 import { Document, isMap, isScalar, LineCounter, parseDocument, type Node as YamlNode } from "yaml";
 import type { RecipeDeployPreview } from "@/components/recipes/recipe-card";
-import { gresCount, memToMb, partitionFits, parseTimeLimit, walltimeLabel } from "@/lib/deployments-model";
+import { accountsFor, gresCount, memToMb, partitionFits, parseTimeLimit, walltimeLabel } from "@/lib/deployments-model";
 import type { ClusterResources } from "@/lib/obleth";
 import { inputDefaults, inputProblem, type ClusterValues } from "@/lib/recipe-inputs";
 import type { DeployOverrides } from "@/lib/sbatch-recipes";
@@ -147,7 +147,9 @@ export function formProblems(form: DeployForm, p: RecipeDeployPreview, resources
   const s = form.slurm;
   if (!s.partition.trim()) out.push({ path: "slurm.partition", message: "Pick a partition" });
   else if (resources.partitions.length && !resources.partitions.some((x) => x.name === s.partition)) out.push({ path: "slurm.partition", message: `There's no ${s.partition} partition on this cluster` });
+  const takes = s.partition ? accountsFor(resources, s.partition) : null;
   if (s.account && resources.accounts.length && !resources.accounts.includes(s.account)) out.push({ path: "slurm.account", message: `${s.account} isn't an account your Slurm user can charge${suggest(s.account, resources.accounts)}` });
+  else if (s.account && takes && !takes.includes(s.account)) out.push({ path: "slurm.account", message: takes.length ? `${s.partition} doesn't take ${s.account}. It takes ${takes.join(", ")}.` : `${s.partition} doesn't take any of your accounts.` });
   if (s.qos && resources.qos.length && !resources.qos.includes(s.qos)) out.push({ path: "slurm.qos", message: `${s.qos} isn't a QoS your user has${suggest(s.qos, resources.qos)}` });
   const minutes = parseTimeLimit(s.time_limit);
   if (s.time_limit.trim() && minutes == null) out.push({ path: "slurm.time_limit", message: "Walltime should look like D-HH:MM:SS" });

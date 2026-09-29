@@ -37,6 +37,7 @@ import {
   parseTimeLimit,
   partitionFits,
   replicaPhase,
+  slurmErrorText,
   slurmStatus,
   walltimeChoices,
   walltimeLabel,
@@ -373,7 +374,11 @@ export function ManagedPage({ modelId, initial, changes }: { modelId: string; in
         <section aria-label="Why it stopped" className="flex flex-col gap-3 rounded-xl border-[1.5px] border-foreground bg-card px-5 py-4">
           <p className="text-[15px] font-semibold">obleth stopped launching {model.model_name}</p>
           {spec.last_provision_error && counts.lost < spec.max_job_failures ? (
-            <p className="max-w-3xl text-[13px] text-secondary-foreground">Slurm refused the job when it was submitted: <span className="font-mono text-[12px] text-foreground">{spec.last_provision_error}</span></p>
+            <div className="flex max-w-3xl flex-col gap-1.5 text-[13px] text-secondary-foreground">
+              <p>Slurm refused the job when it was submitted: <b className="font-semibold text-foreground">{slurmErrorText(spec.last_provision_error)}</b></p>
+              {/invalid account|account\/partition/i.test(spec.last_provision_error) && <p>The account {spec.account ? <span className="font-mono text-[12px]">{spec.account}</span> : "(your default)"} can&apos;t run jobs on <span className="font-mono text-[12px]">{spec.partition}</span>. Change the account or the partition under Placement, then try once more.</p>}
+              <details className="text-[12px]"><summary className="cursor-pointer text-muted-foreground">Slurm&apos;s full answer</summary><pre className="mt-1.5 whitespace-pre-wrap break-all font-mono text-[11.5px] text-muted-foreground">{spec.last_provision_error}</pre></details>
+            </div>
           ) : (
             <p className="max-w-3xl text-[13px] text-secondary-foreground">
               The last {counts.lost} job{counts.lost === 1 ? "" : "s"} ended without becoming healthy, so it stopped submitting new ones (the limit is {spec.max_job_failures} failed jobs on record; each is forgotten 15 minutes after it ends).

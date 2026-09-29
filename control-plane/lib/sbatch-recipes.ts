@@ -63,6 +63,8 @@ export interface RecipeHeader {
   requires?: string;
   /** Node counts offered as "Runs on"; `nodes` is the default. */
   node_options?: number[];
+  /** A sentence per node count saying what it means for this model. */
+  node_notes?: Record<string, string>;
   /** Environment variables exported at the top of the job. */
   env?: Record<string, string>;
 }
@@ -147,6 +149,7 @@ const HeaderSchema = z
     weights_gb: z.coerce.number().positive().optional(),
     requires: z.string().optional(),
     node_options: z.array(z.coerce.number().int().positive()).optional(),
+    node_notes: z.record(z.string(), z.string()).optional(),
     env: z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/, "invalid environment variable name"), scalar).optional(),
   })
   .strip()
@@ -488,6 +491,7 @@ export function buildDeployPreview(recipe: ParsedRecipe): RecipeDeployPreview | 
     weightsGb: recipe.header.weights_gb,
     requires: recipe.header.requires,
     nodeOptions: recipe.header.node_options,
+    nodeNotes: recipe.header.node_notes,
     basedOn: recipe.header.based_on,
     env: recipe.header.env,
     description: recipe.header.description,

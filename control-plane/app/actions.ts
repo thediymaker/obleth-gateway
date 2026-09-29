@@ -2604,7 +2604,7 @@ export async function launchRecipeAction(recipeId: string, overrides: DeployOver
   if (!recipe.valid) return { ok: false, error: recipe.error ?? "The recipe can't be read." };
   try {
     const { createBody, managedBody } = buildManagedFromRecipe(recipe, overrides, await clusterValues());
-    const models = await obleth.listModels();
+    const models = await obleth.listModelsFresh();
     if (models.some((m) => m.model_name === createBody.model_name || m.aliases?.includes(createBody.model_name))) {
       return { ok: false, error: `A model called ${createBody.model_name} already exists. Pick another name.` };
     }

@@ -9,7 +9,7 @@ import { Button } from "@/components/ui/button";
 import { Select } from "@/components/ui/select";
 import { engineName } from "@/components/deployments/new/picker";
 import { changedPaths, formToYaml, getField, setField, yamlToForm, type DeployForm, type FieldPath, type Problem, type Source } from "@/lib/deploy-form";
-import { formatTimeLimit, gresCount, mbLabel, memToMb, parseTimeLimit, partitionFits, walltimeChoices, walltimeLabel, type PartitionFit } from "@/lib/deployments-model";
+import { accountsFor, formatTimeLimit, gresCount, mbLabel, memToMb, parseTimeLimit, partitionFits, walltimeChoices, walltimeLabel, type PartitionFit } from "@/lib/deployments-model";
 import type { Learned, Suggestion } from "@/lib/launch-learning";
 import type { ClusterResources } from "@/lib/obleth";
 import { inputDefault, inputSource, type ClusterValues, type RecipeInput } from "@/lib/recipe-inputs";
@@ -160,6 +160,7 @@ export function Configure(props: ConfigureProps) {
   const need = { gpus: gresCount(form.slurm.gres), cpus: form.slurm.cpus_per_task ? Number(form.slurm.cpus_per_task) : null, memMb: memToMb(form.slurm.mem) };
   const fits = useMemo(() => partitionFits(resources, need), [resources, need.gpus, need.cpus, need.memMb]); // eslint-disable-line react-hooks/exhaustive-deps
   const fit = fits.find((f) => f.name === form.slurm.partition);
+  const takes = form.slurm.partition ? accountsFor(resources, form.slurm.partition) : null;
   const flags = p.inputs.filter((i) => i.type === "flag");
   const settings = p.inputs.filter((i) => i.type !== "flag" && i.type !== "path");
   const paths = p.inputs.filter((i) => i.type === "path");
@@ -194,6 +195,7 @@ export function Configure(props: ConfigureProps) {
                 {nodeOptions && (
                   <Row label="Runs on" hint="More nodes split the model across them; the job starts Ray itself." source={sourceOf("slurm.nodes")} saved={saved} problem={problemAt("slurm.nodes")}>
                     <Seg label="Runs on" value={String(form.slurm.nodes)} onChange={(v) => set("slurm.nodes", Number(v))} options={nodeOptions.map((n) => ({ value: String(n), label: `${n} node${n === 1 ? "" : "s"}` }))} />
+                    {p.nodeNotes?.[String(form.slurm.nodes)] && <p className="text-[12.5px] leading-snug text-secondary-foreground">{p.nodeNotes[String(form.slurm.nodes)]}</p>}
                     {suggestionsAt("slurm.nodes").map((s) => <Hint key={s.title} s={s} onApply={apply} />)}
                   </Row>
                 )}
@@ -218,9 +220,9 @@ export function Configure(props: ConfigureProps) {
             )}
 
             <Section title="Slurm job" note={resources.accounts.length || resources.qos.length ? "Accounts, QoS and nodes come from slurmrestd" : undefined}>
-              <Row label="Account" hint="Charged for the job's time." source={sourceOf("slurm.account")} saved={saved} problem={problemAt("slurm.account")}>
+              <Row label="Account" hint={takes ? `The accounts ${form.slurm.partition} takes from your Slurm user.` : "Charged for the job's time."} source={sourceOf("slurm.account")} saved={saved} problem={problemAt("slurm.account")}>
                 {resources.accounts.length ? (
-                  <Select aria-label="Account" value={form.slurm.account} onValueChange={(v) => set("slurm.account", v)} className="h-9 w-72 text-[13px]" options={[{ value: "", label: "Your default account" }, ...[...new Set([form.slurm.account, ...resources.accounts])].filter(Boolean).map((a) => ({ value: a, label: a }))]} />
+                  <Select aria-label="Account" value={form.slurm.account} onValueChange={(v) => set("slurm.account", v)} className="h-9 w-72 text-[13px]" options={[{ value: "", label: "Your default account" }, ...[...new Set([form.slurm.account, ...(takes ?? resources.accounts)])].filter(Boolean).map((a) => ({ value: a, label: a }))]} />
                 ) : (
                   <input aria-label="Account" value={form.slurm.account} onChange={(e) => set("slurm.account", e.target.value)} placeholder="Your default account" className={cn(input, "w-72 font-mono text-[12.5px]")} />
                 )}
