@@ -398,6 +398,14 @@ pub fn submit_body(job: &JobSubmit, hf_token: &str) -> serde_json::Value {
         "environment": environment,
     });
     let m = spec.as_object_mut().unwrap();
+    // Multi-node jobs (e.g. vLLM over Ray) start one worker per node with
+    // `srun` inside the batch script, which needs one task per node in the
+    // allocation. `tasks` and `tasks_per_node` are both job_desc_msg fields in
+    // slurmrestd v0.0.39 through v0.0.41. Single-node jobs keep `tasks: 1`.
+    if job.nodes > 1 {
+        m.insert("tasks".into(), serde_json::json!(job.nodes));
+        m.insert("tasks_per_node".into(), serde_json::json!(1));
+    }
     if !job.gres.is_empty() {
         m.insert(
             "tres_per_node".into(),
@@ -780,6 +788,23 @@ mod tests {
         assert!(!env.contains_key("HF_TOKEN"));
         assert!(!env.contains_key("HUGGING_FACE_HUB_TOKEN"));
         assert!(env.contains_key("PATH"));
+    }
+
+    #[test]
+    fn submit_body_asks_for_one_task_per_node_on_multi_node_jobs() {
+        let single = job_submit_from_spec(&spec(), "m", "obleth-", 8000, 8);
+        let body = submit_body(&single, "");
+        assert_eq!(body["job"]["nodes"], "1");
+        assert_eq!(body["job"]["tasks"], 1);
+        assert!(body["job"].get("tasks_per_node").is_none());
+
+        let mut s = spec();
+        s.nodes = 4;
+        let multi = job_submit_from_spec(&s, "m", "obleth-", 8000, 8);
+        let body = submit_body(&multi, "");
+        assert_eq!(body["job"]["nodes"], "4");
+        assert_eq!(body["job"]["tasks"], 4);
+        assert_eq!(body["job"]["tasks_per_node"], 1);
     }
 
     #[test]
