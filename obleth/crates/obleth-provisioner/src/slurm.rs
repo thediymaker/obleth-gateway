@@ -331,6 +331,9 @@ pub struct Slurmrestd {
     version: String,
     user: String,
     jwt: String,
+    /// Hugging Face token passed to submitted jobs via their environment.
+    /// Empty = none. (No `Debug` derive on this struct: it holds secrets.)
+    hf_token: String,
 }
 
 impl Slurmrestd {
@@ -345,7 +348,15 @@ impl Slurmrestd {
             version: version.to_string(),
             user: user.to_string(),
             jwt: jwt.to_string(),
+            hf_token: String::new(),
         }
+    }
+    /// Pass a Hugging Face token to every job this client submits (as
+    /// `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` in the job environment). Empty
+    /// leaves the environment without it.
+    pub fn with_hf_token(mut self, token: &str) -> Self {
+        self.hf_token = token.trim().to_string();
+        self
     }
     fn auth(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         rb.header("X-SLURM-USER-NAME", &self.user)
@@ -353,86 +364,104 @@ impl Slurmrestd {
     }
 }
 
+/// Render the slurmrestd `job/submit` request body for `job`. Pure (no HTTP)
+/// so the payload shape is unit-testable.
+///
+/// A non-empty `hf_token` is passed to the job as `HF_TOKEN` and
+/// `HUGGING_FACE_HUB_TOKEN` in the job `environment` — never in the script
+/// body, which Slurm keeps on disk and shows in `scontrol write batch_script`.
+///
+/// NOTE: verify this body against your slurmrestd version's schema
+/// (`/openapi/v3`). Fields below are common to v0.0.39/40/41. Optional fields
+/// are omitted when None so they don't override cluster defaults.
+pub fn submit_body(job: &JobSubmit, hf_token: &str) -> serde_json::Value {
+    // slurmrestd requires a non-empty environment. Use a broad PATH that
+    // covers where apptainer/singularity typically live across clusters
+    // (/usr/local/bin, /opt, sbin dirs) rather than a minimal one that would
+    // fail if the launcher isn't under /usr/bin. Operators whose cluster needs
+    // more can prepend it inside launch_command.
+    let mut environment = serde_json::json!({
+        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/apptainer/bin:/opt/singularity/bin"
+    });
+    let hf_token = hf_token.trim();
+    if !hf_token.is_empty() {
+        let env = environment.as_object_mut().unwrap();
+        env.insert("HF_TOKEN".into(), serde_json::json!(hf_token));
+        env.insert("HUGGING_FACE_HUB_TOKEN".into(), serde_json::json!(hf_token));
+    }
+    let mut spec = serde_json::json!({
+        "name": job.name,
+        "partition": job.partition,
+        "nodes": job.nodes.to_string(),
+        "tasks": 1,
+        "current_working_directory": "/tmp",
+        "environment": environment,
+    });
+    let m = spec.as_object_mut().unwrap();
+    if !job.gres.is_empty() {
+        m.insert(
+            "tres_per_node".into(),
+            serde_json::json!(format!("gres/{}", job.gres)),
+        );
+    }
+    if let Some(t) = &job.time_limit {
+        // slurmrestd's `time_limit` is an integer number of minutes, not a
+        // Slurm walltime string: submitting `"0-04:00:00"` fails with
+        // `Expected integer ... Unable to convert Date type` (500). Parse the
+        // operator's Slurm-format walltime into minutes here. If it doesn't
+        // parse, omit the field rather than send a value slurmrestd rejects —
+        // the cluster's partition default applies.
+        if let Some(mins) = time_limit_to_minutes(t) {
+            m.insert("time_limit".into(), serde_json::json!(mins));
+        } else {
+            tracing::warn!(
+                time_limit = %t,
+                "unparseable time_limit; omitting so the partition default applies"
+            );
+        }
+    }
+    if let Some(a) = &job.account {
+        m.insert("account".into(), serde_json::json!(a));
+    }
+    if let Some(q) = &job.qos {
+        m.insert("qos".into(), serde_json::json!(q));
+    }
+    if let Some(c) = &job.constraints {
+        m.insert("constraints".into(), serde_json::json!(c));
+    }
+    if let Some(e) = &job.exclude {
+        m.insert("excluded_nodes".into(), serde_json::json!(e));
+    }
+    if let Some(c) = job.cpus_per_task {
+        if c > 0 {
+            m.insert("cpus_per_task".into(), serde_json::json!(c));
+        }
+    }
+    // slurmrestd expects memory_per_node in megabytes (integer).
+    if let Some(mb) = job.mem_mb {
+        if mb > 0 {
+            m.insert("memory_per_node".into(), serde_json::json!(mb));
+        }
+    }
+    if !job.log_output_dir.is_empty() {
+        let dir = job.log_output_dir.trim_end_matches('/');
+        m.insert(
+            "standard_output".into(),
+            serde_json::json!(format!("{dir}/{}-%j.out", job.name)),
+        );
+        m.insert(
+            "standard_error".into(),
+            serde_json::json!(format!("{dir}/{}-%j.err", job.name)),
+        );
+    }
+
+    serde_json::json!({ "job": spec, "script": job.script })
+}
+
 #[async_trait]
 impl SlurmClient for Slurmrestd {
     async fn submit(&self, job: &JobSubmit) -> anyhow::Result<String> {
-        // NOTE: verify this body against your slurmrestd version's schema
-        // (`/openapi/v3`). Fields below are common to v0.0.39/40. Optional
-        // fields are omitted when None so they don't override cluster defaults.
-        let mut spec = serde_json::json!({
-            "name": job.name,
-            "partition": job.partition,
-            "nodes": job.nodes.to_string(),
-            "tasks": 1,
-            "current_working_directory": "/tmp",
-            // slurmrestd requires a non-empty environment. Use a broad PATH that
-            // covers where apptainer/singularity typically live across clusters
-            // (/usr/local/bin, /opt, sbin dirs) rather than a minimal one that
-            // would fail if the launcher isn't under /usr/bin. Operators whose
-            // cluster needs more can prepend it inside launch_command.
-            "environment": {
-                "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/apptainer/bin:/opt/singularity/bin"
-            },
-        });
-        let m = spec.as_object_mut().unwrap();
-        if !job.gres.is_empty() {
-            m.insert(
-                "tres_per_node".into(),
-                serde_json::json!(format!("gres/{}", job.gres)),
-            );
-        }
-        if let Some(t) = &job.time_limit {
-            // slurmrestd's `time_limit` is an integer number of minutes, not a
-            // Slurm walltime string: submitting `"0-04:00:00"` fails with
-            // `Expected integer ... Unable to convert Date type` (500). Parse the
-            // operator's Slurm-format walltime into minutes here. If it doesn't
-            // parse, omit the field rather than send a value slurmrestd rejects —
-            // the cluster's partition default applies.
-            if let Some(mins) = time_limit_to_minutes(t) {
-                m.insert("time_limit".into(), serde_json::json!(mins));
-            } else {
-                tracing::warn!(
-                    time_limit = %t,
-                    "unparseable time_limit; omitting so the partition default applies"
-                );
-            }
-        }
-        if let Some(a) = &job.account {
-            m.insert("account".into(), serde_json::json!(a));
-        }
-        if let Some(q) = &job.qos {
-            m.insert("qos".into(), serde_json::json!(q));
-        }
-        if let Some(c) = &job.constraints {
-            m.insert("constraints".into(), serde_json::json!(c));
-        }
-        if let Some(e) = &job.exclude {
-            m.insert("excluded_nodes".into(), serde_json::json!(e));
-        }
-        if let Some(c) = job.cpus_per_task {
-            if c > 0 {
-                m.insert("cpus_per_task".into(), serde_json::json!(c));
-            }
-        }
-        // slurmrestd expects memory_per_node in megabytes (integer).
-        if let Some(mb) = job.mem_mb {
-            if mb > 0 {
-                m.insert("memory_per_node".into(), serde_json::json!(mb));
-            }
-        }
-        if !job.log_output_dir.is_empty() {
-            let dir = job.log_output_dir.trim_end_matches('/');
-            m.insert(
-                "standard_output".into(),
-                serde_json::json!(format!("{dir}/{}-%j.out", job.name)),
-            );
-            m.insert(
-                "standard_error".into(),
-                serde_json::json!(format!("{dir}/{}-%j.err", job.name)),
-            );
-        }
-
-        let body = serde_json::json!({ "job": spec, "script": job.script });
+        let body = submit_body(job, &self.hf_token);
         let url = format!("{}/slurm/{}/job/submit", self.base, self.version);
         let resp = self.auth(self.http.post(&url)).json(&body).send().await?;
         let status = resp.status();
@@ -731,6 +760,26 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
+    }
+
+    #[test]
+    fn submit_body_carries_hf_token_in_environment_only_when_set() {
+        let job = job_submit_from_spec(&spec(), "nemotron", "obleth-", 8000, 8);
+        let with = submit_body(&job, " hf_secret ");
+        let env = &with["job"]["environment"];
+        assert_eq!(env["HF_TOKEN"], "hf_secret");
+        assert_eq!(env["HUGGING_FACE_HUB_TOKEN"], "hf_secret");
+        assert!(env["PATH"].is_string(), "PATH is still set");
+        assert!(
+            !with["script"].as_str().unwrap().contains("hf_secret"),
+            "token must not be written into the script"
+        );
+
+        let without = submit_body(&job, "");
+        let env = without["job"]["environment"].as_object().unwrap();
+        assert!(!env.contains_key("HF_TOKEN"));
+        assert!(!env.contains_key("HUGGING_FACE_HUB_TOKEN"));
+        assert!(env.contains_key("PATH"));
     }
 
     #[test]

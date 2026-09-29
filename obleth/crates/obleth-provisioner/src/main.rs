@@ -164,7 +164,8 @@ async fn run_once(
         &settings.slurmrestd_api_version,
         &settings.slurm_user,
         &settings.slurm_jwt,
-    );
+    )
+    .with_hf_token(&settings.hf_token);
     tick(cfg, &slurm, obleth, http, resolver, probe_failures).await?;
     Ok(Tick::Ran)
 }
