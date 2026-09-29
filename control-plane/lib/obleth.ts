@@ -420,6 +420,52 @@ export interface ModelReplica {
   updated_at: string;
 }
 
+// One past or current launch of a Slurm-backed replica. Outlives the replica
+// row (which is garbage-collected); id is the replica id.
+export interface DeploymentLaunch {
+  id: string;
+  model_id: string;
+  model_name: string;
+  recipe_id: string | null;
+  slurm_job_id: string;
+  // Managed spec as submitted.
+  partition: string | null;
+  account: string | null;
+  qos: string | null;
+  time_limit: string | null;
+  gres: string | null;
+  nodes_requested: number | null;
+  cpus_per_task: number | null;
+  mem: string | null;
+  exclude: string | null;
+  constraints: string | null;
+  launcher_spec: Record<string, unknown> | null;
+  // Allocated node hostnames (comma-separated), once the job ran.
+  nodes: string | null;
+  submitted_at: string;
+  started_at: string | null;
+  healthy_at: string | null;
+  ended_at: string | null;
+  // Slurm's terminal state (TIMEOUT, OUT_OF_MEMORY, NODE_FAIL, FAILED, ...),
+  // "gone" when the job vanished from slurmrestd, "cancelled:scale-down" |
+  // "cancelled:restart" | "cancelled:probe-failed" when obleth cancelled it,
+  // or "deleted" when the replica row was removed while still open.
+  end_state: string | null;
+  end_reason: string | null;
+  updated_at: string;
+  // Submit → start, start → healthy, start → end (or now while running).
+  queued_secs: number | null;
+  load_secs: number | null;
+  ran_secs: number | null;
+}
+
+export interface DeploymentLaunchesParams {
+  model_id?: string;
+  recipe_id?: string;
+  // Default 50, at most 500.
+  limit?: number;
+}
+
 export type AutotuneKneeReason =
   | "latency_degraded"
   | "plateau"
@@ -2181,6 +2227,9 @@ export const obleth = {
       method: "POST",
       headers: auditActorHeaders(options),
     }),
+  /** Launch history of Slurm-backed replicas, newest first (limit default 50, max 500). */
+  listDeploymentLaunches: (params: DeploymentLaunchesParams = {}) =>
+    api<DeploymentLaunch[]>(`/deployments/launches${qs({ ...params })}`),
   restartReplica: (replicaId: string, options?: AuditOptions) =>
     api<{ ok: boolean }>(`/replicas/${replicaId}/restart`, {
       method: "POST",
