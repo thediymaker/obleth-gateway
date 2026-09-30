@@ -69,9 +69,14 @@ export function useConfirm() {
     resolve: (ok: boolean) => void;
   } | null>(null);
 
+  // Opened one microtask later, outside whatever transition called this.
+  // Callers ask from inside `startTransition(async () => ...)`, and React holds
+  // a transition's updates until its action finishes -- which is waiting on
+  // this dialog -- so an open set directly here never rendered and the action
+  // hung with its buttons disabled.
   const confirm = React.useCallback(
     (opts: ConfirmOptions) =>
-      new Promise<boolean>((resolve) => setState({ opts, resolve })),
+      new Promise<boolean>((resolve) => queueMicrotask(() => setState({ opts, resolve }))),
     [],
   );
 
