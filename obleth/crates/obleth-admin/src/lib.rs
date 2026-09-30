@@ -825,6 +825,10 @@ pub struct KeyFairshareView {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ModelPoolView {
     pub model: String,
+    /// The model has nowhere to send a request right now (see
+    /// [`models_with_servers`]). Its pool keeps its size for when servers
+    /// return, but the capacity totals leave it out.
+    pub no_servers: bool,
     /// Slots this replica enforces: `configured_cap` in `shared` and `local`
     /// mode, its share of it in `split` and `fallback` mode.
     pub cap: usize,
@@ -853,9 +857,15 @@ pub struct FairshareLiveView {
     /// snapshot*, so the two can differ until every enabled model has been
     /// used at least once.
     pub max_in_flight: usize,
-    /// The enabled models' pool sizes as configured, summed: the
-    /// cluster-wide capacity.
+    /// The enabled models' pool sizes as configured, summed over the models
+    /// that have servers: the cluster-wide capacity.
     pub configured_max_in_flight: usize,
+    /// How many enabled models the two totals above add up: those with
+    /// servers right now (see [`models_with_servers`]).
+    pub models_with_servers: usize,
+    /// The enabled models left out of the totals because they have no
+    /// servers right now, by name.
+    pub models_without_servers: Vec<String>,
     /// Total in-flight ceiling across all pools as this replica enforces it:
     /// `OBLETH_GLOBAL_MAX_IN_FLIGHT` in `shared` and `local` mode, this
     /// replica's share of it in `split` and `fallback` mode.
@@ -5109,6 +5119,55 @@ pub fn enabled_pool_share_with(
         .sum()
 }
 
+/// Names of the enabled models that have somewhere to send a request right
+/// now: a fixed `api_base` or at least one enabled endpoint, and not a model
+/// whose discovered backend currently has no ready replica. The scheduler
+/// keeps a pool for the others, at its last or configured size so a brief
+/// outage doesn't shrink it, but adding those slots to a capacity total
+/// shows capacity that isn't there.
+///
+/// `with_endpoint` is the ids of models with an enabled endpoint;
+/// `none_ready` the names discovery last saw with no ready replica.
+pub fn models_with_servers(
+    models: &[ModelRoute],
+    with_endpoint: &std::collections::HashSet<Uuid>,
+    none_ready: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<String> {
+    models
+        .iter()
+        .filter(|m| m.enabled)
+        .filter(|m| !m.api_base.trim().is_empty() || with_endpoint.contains(&m.id))
+        .filter(|m| !none_ready.contains(&m.model_name))
+        .map(|m| m.model_name.clone())
+        .collect()
+}
+
+/// The models [`models_with_servers`] counts, for a capacity total.
+fn served_models(
+    state: &AdminState,
+    models: Vec<ModelRoute>,
+    endpoints: &[obleth_config::ModelEndpoint],
+) -> (Vec<ModelRoute>, std::collections::HashSet<String>) {
+    let with_endpoint = endpoints
+        .iter()
+        .filter(|e| e.enabled)
+        .map(|e| e.model_id)
+        .collect();
+    let none_ready = state
+        .capacity_discovery
+        .statuses()
+        .into_iter()
+        .filter(|s| s.ready_replicas == Some(0))
+        .map(|s| s.model_name)
+        .collect();
+    let serving = models_with_servers(&models, &with_endpoint, &none_ready);
+    let counted = models
+        .into_iter()
+        .filter(|m| serving.contains(&m.model_name))
+        .collect();
+    (counted, serving)
+}
+
 /// How the answering replica enforces the limits right now: its mode, the
 /// live replica count, and what configured limits are divided by in that
 /// mode (1 unless the split applies).
@@ -5328,12 +5387,19 @@ async fn get_stats(State(state): State<AdminState>) -> Json<LiveStats> {
     // should degrade the capacity number, not fail the poll.
     let (mode, replicas, divisor) = enforcement(&state);
     let discovered = state.capacity_discovery.effective_caps();
+    let endpoints = state.store.all_model_endpoints().await.unwrap_or_default();
     let capacity = state
         .store
         .list_models()
         .await
         .map(|m| {
-            enabled_pool_share_with(&m, state.default_model_max_in_flight, divisor, &discovered)
+            let (counted, _) = served_models(&state, m, &endpoints);
+            enabled_pool_share_with(
+                &counted,
+                state.default_model_max_in_flight,
+                divisor,
+                &discovered,
+            )
         })
         .unwrap_or(0);
     Json(LiveStats {
@@ -5578,16 +5644,23 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
         .map(|k| (k.id, k.name))
         .collect();
     let models = state.store.list_models().await?;
+    let endpoints = state.store.all_model_endpoints().await?;
     let discovered = state.capacity_discovery.effective_caps();
     let (mode, _, divisor) = enforcement(&state);
+    let (counted, serving) = served_models(&state, models.clone(), &endpoints);
     let configured_capacity =
-        enabled_pool_share_with(&models, state.default_model_max_in_flight, 1, &discovered);
+        enabled_pool_share_with(&counted, state.default_model_max_in_flight, 1, &discovered);
     let capacity = enabled_pool_share_with(
-        &models,
+        &counted,
         state.default_model_max_in_flight,
         divisor,
         &discovered,
     );
+    let enabled_names: std::collections::HashSet<&str> = models
+        .iter()
+        .filter(|m| m.enabled)
+        .map(|m| m.model_name.as_str())
+        .collect();
     let pool_keys: Vec<PoolKey> = snap
         .pools
         .iter()
@@ -5635,6 +5708,7 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
             hidden_queued += h_q;
             ModelPoolView {
                 model: p.model.clone(),
+                no_servers: enabled_names.contains(p.model.as_str()) && !serving.contains(&p.model),
                 cap,
                 configured_cap: p.configured_cap,
                 in_flight: p.in_flight.saturating_sub(h_in),
@@ -5726,6 +5800,16 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
             configured_capacity
         } else {
             snap.configured_max_in_flight
+        },
+        models_with_servers: serving.len(),
+        models_without_servers: {
+            let mut names: Vec<String> = enabled_names
+                .iter()
+                .filter(|n| !serving.contains(**n))
+                .map(|n| n.to_string())
+                .collect();
+            names.sort_unstable();
+            names
         },
         hard_ceiling: snap.max_in_flight,
         configured_hard_ceiling: snap.configured_max_in_flight,
@@ -10602,6 +10686,7 @@ mod tests {
         let in_flight = tenants.iter().map(|t| t.in_flight).sum();
         ModelPoolView {
             model: model.into(),
+            no_servers: false,
             cap,
             configured_cap: cap,
             in_flight,
@@ -10684,6 +10769,35 @@ mod tests {
                 m
             })
             .collect()
+    }
+
+    #[test]
+    fn capacity_totals_count_only_models_with_servers() {
+        use std::collections::HashSet;
+        let fixed = fixture_model_route("fixed"); // has an api_base
+        let mut managed = fixture_model_route("managed"); // endpoints only
+        managed.api_base = String::new();
+        let mut unplaced = fixture_model_route("unplaced"); // neither: nowhere to go
+        unplaced.api_base = "  ".into();
+        let scaled_down = fixture_model_route("scaled-down"); // discovered, 0 ready
+        let mut off = fixture_model_route("off");
+        off.enabled = false;
+        let models = vec![fixed, managed.clone(), unplaced, scaled_down, off];
+        let with_endpoint: HashSet<Uuid> = [managed.id].into_iter().collect();
+        let none_ready: HashSet<String> = ["scaled-down".to_string()].into_iter().collect();
+
+        let serving = models_with_servers(&models, &with_endpoint, &none_ready);
+        let mut names: Vec<&str> = serving.iter().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["fixed", "managed"]);
+
+        // Without its endpoint the managed model has nowhere to go either.
+        let serving = models_with_servers(&models, &HashSet::new(), &HashSet::new());
+        assert!(!serving.contains("managed"));
+        assert!(
+            serving.contains("scaled-down"),
+            "no discovery verdict: counted by its api_base"
+        );
     }
 
     #[test]
