@@ -948,6 +948,8 @@ export interface KeyFairshareView {
 
 export interface ModelPoolView {
   model: string;
+  /** The model has nowhere to send a request right now; the totals leave its pool out. */
+  no_servers?: boolean;
   /** Slots the answering gateway enforces: `configured_cap`, or its share
    *  of it in split and fallback mode. */
   cap: number;
@@ -985,6 +987,10 @@ export interface FairshareLiveView {
   /** Enabled models' pool sizes as configured, summed: the cluster-wide
    *  capacity. */
   configured_max_in_flight?: number;
+  /** How many enabled models the slot totals add up: those with servers right now. */
+  models_with_servers?: number;
+  /** Enabled models left out of the totals because they have no servers right now. */
+  models_without_servers?: string[];
   /** Default per-model in-flight cap applied when a model has none configured. */
   default_model_max_in_flight?: number;
   /** Live gateway replicas. */

@@ -42,6 +42,14 @@ describe("pools", () => {
     expect(rows[0]).toMatchObject({ inFlight: 64, cap: 64, queued: 23, tenants: 5 });
     expect(rows[1]).toMatchObject({ inFlight: 9, cap: 10, tenants: 0 });
   });
+
+  it("marks a model with no servers as such and lists it after the idle pools", () => {
+    const rows = buildPoolRows(
+      [route("unplaced"), route("idle"), route("kimi")],
+      view(kimi, { models_without_servers: ["unplaced"] }),
+    );
+    expect(rows.map((r) => [r.model, r.state])).toEqual([["kimi", "full"], ["idle", "idle"], ["unplaced", "no_servers"]]);
+  });
 });
 
 describe("tenants in a pool", () => {

@@ -211,7 +211,7 @@ export const OTHER_TONE = "hsl(240 4% 30%)";
 // Pools
 // ---------------------------------------------------------------------------
 
-export type PoolState = "full" | "busy" | "normal" | "idle";
+export type PoolState = "full" | "busy" | "normal" | "idle" | "no_servers";
 
 export interface PoolRow {
   model: string;
@@ -236,15 +236,20 @@ export function poolState(inFlight: number, cap: number, queued: number): PoolSt
  */
 export function buildPoolRows(models: ModelRoute[], view: FairshareLiveView | undefined, discovery?: CapacityDiscoveryView): PoolRow[] {
   const byName = new Map((view?.pools ?? []).map((p) => [p.model, p]));
+  // Models with nowhere to send a request right now. Their pool keeps its size
+  // for when servers return, but the slot totals leave it out, so the row
+  // says so instead of reading as idle capacity.
+  const noServers = new Set(view?.models_without_servers ?? []);
   const rows = models
     .filter((m) => m.enabled && !isBenchmarkRoute(m))
     .map<PoolRow>((m) => {
       const occ = poolOccupancy(m.model_name, m, view, discovery);
       const pool = byName.get(m.model_name);
       const tenants = pool?.tenants.filter((t) => t.in_flight > 0 || t.queued > 0).length ?? 0;
-      return { model: m.model_name, ...occ, tenants, state: poolState(occ.inFlight, occ.cap, occ.queued) };
+      const state: PoolState = noServers.has(m.model_name) ? "no_servers" : poolState(occ.inFlight, occ.cap, occ.queued);
+      return { model: m.model_name, ...occ, tenants, state };
     });
-  const order: Record<PoolState, number> = { full: 0, busy: 1, normal: 2, idle: 3 };
+  const order: Record<PoolState, number> = { full: 0, busy: 1, normal: 2, idle: 3, no_servers: 4 };
   const ratio = (r: PoolRow) => (r.cap > 0 ? r.inFlight / r.cap : 0);
   return rows.sort((a, b) => order[a.state] - order[b.state] || ratio(b) - ratio(a) || b.inFlight - a.inFlight || a.model.localeCompare(b.model));
 }

@@ -47,7 +47,7 @@ import { modelHref } from "@/lib/model-links";
 export type { FairshareLiveView, GroupFairshareView, KeyFairshareView, ModelPoolView, TenantFairshareView } from "@/lib/obleth";
 
 const FIRST_POOLS = 8;
-const STATE_LABEL: Record<PoolRow["state"], string> = { full: "Full", busy: "Busy", normal: "Normal", idle: "Idle" };
+const STATE_LABEL: Record<PoolRow["state"], string> = { full: "Full", busy: "Busy", normal: "Normal", idle: "Idle", no_servers: "No servers" };
 
 function Tile({ label, value, detail, meter, emphasis }: { label: string; value: React.ReactNode; detail: React.ReactNode; meter?: [number, number]; emphasis?: boolean }) {
   return (
@@ -204,6 +204,17 @@ function WhatYouCanDo({ pool, view }: { pool?: PoolRow; view: FairshareLiveView 
   );
 }
 
+/**
+ * What the Running tile's total is: every model's own pool, added up. A
+ * request only ever uses its own model's pool, so say how many pools make up
+ * the number rather than let it read as one shared pool.
+ */
+function runningDetail(running: number, slots: number, models: number | undefined): string {
+  const used = `${Math.round((running / slots) * 100)}% in use`;
+  if (models === undefined) return `${used} · every pool combined`;
+  return `${used} · the pools of ${formatNumber(models)} model${models === 1 ? "" : "s"} with servers, added up`;
+}
+
 function AllPools({ raw, pools, expanded, onExpand, onScope, onOpen, tenantTotal }: {
   raw: FairshareLiveView; pools: PoolRow[]; expanded: boolean; onExpand: () => void; onScope: (model: string) => void; onOpen: (id: string) => void; tenantTotal: number;
 }) {
@@ -219,7 +230,7 @@ function AllPools({ raw, pools, expanded, onExpand, onScope, onOpen, tenantTotal
   return (
     <>
       <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
-        <Tile label="Running" value={<>{formatNumber(running)} <span className="text-sm font-normal text-muted-foreground">of {formatNumber(slots)} slots</span></>} meter={[running, slots]} detail={slots ? `${Math.round((running / slots) * 100)}% of every pool combined` : "No pool sizes known"} />
+        <Tile label="Running" value={<>{formatNumber(running)} <span className="text-sm font-normal text-muted-foreground">of {formatNumber(slots)} slots</span></>} meter={[running, slots]} detail={slots ? runningDetail(running, slots, raw.models_with_servers) : "No pool sizes known"} />
         <Tile label="Waiting" value={formatNumber(raw.global_queued)} emphasis={raw.global_queued > 0} detail={raw.global_queued ? `From ${waitingTenants.length} tenant${waitingTenants.length === 1 ? "" : "s"}` : "Nothing queued in any pool"} />
         <Tile label="Tenants active" value={<>{formatNumber(active.length)} {tenantTotal > 0 && <span className="text-sm font-normal text-muted-foreground">of {formatNumber(tenantTotal)}</span>}</>} detail={borrowing ? `${borrowing} using idle capacity beyond their share` : "Everyone within their share"} />
         <Tile label="Busiest pool" value={busiest ? `${Math.round((busiest.inFlight / busiest.cap) * 100)}%` : "—"} detail={busiest ? `${busiest.model} · ${busiest.inFlight} of ${busiest.cap} slots` : "Every pool is idle"} />
@@ -233,8 +244,8 @@ function AllPools({ raw, pools, expanded, onExpand, onScope, onOpen, tenantTotal
               {visible.map((p) => (
                 <button key={p.model} type="button" onClick={() => onScope(p.model)} className="grid w-full grid-cols-[minmax(0,1fr)_minmax(0,11rem)_4rem_4rem_4rem_4.5rem] items-center gap-3 border-t border-border px-[18px] py-[9px] text-left text-[13px] hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring">
                   <span className="truncate" title={p.model}>{p.model}</span>
-                  <Meter value={p.inFlight} max={p.cap} strong={p.state === "full"} />
-                  <span className="text-right font-mono text-xs tabular-nums">{p.inFlight}/{p.cap || "—"}</span>
+                  <Meter value={p.inFlight} max={p.state === "no_servers" ? 0 : p.cap} strong={p.state === "full"} />
+                  <span className="text-right font-mono text-xs tabular-nums">{p.state === "no_servers" ? "—" : `${p.inFlight}/${p.cap || "—"}`}</span>
                   <span className={cn("text-right font-mono text-xs tabular-nums", p.queued > 0 && "font-semibold text-foreground")}>{p.queued}</span>
                   <span className="text-right font-mono text-xs tabular-nums">{p.tenants}</span>
                   <span className="text-right">{p.state === "full" ? <Pill inverted>Full</Pill> : <span className={cn("text-xs", p.state === "busy" ? "text-foreground" : "text-muted-foreground")}>{STATE_LABEL[p.state]}</span>}</span>
