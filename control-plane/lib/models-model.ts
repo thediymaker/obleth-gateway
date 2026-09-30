@@ -475,3 +475,17 @@ export function changeSummary(fields: string[]): string[] {
 export function touches(changed: string[], fields: string[]): boolean {
   return changed.some((c) => fields.some((f) => (f.endsWith("_") ? c.startsWith(f) : c === f)));
 }
+
+/**
+ * Whether a model can take an image in a chat request: it reads images itself,
+ * or it opted into the vision boon and the boon is on, so the gateway describes
+ * each image for it. The auto router uses the same rule. `undefined` while the
+ * model isn't known yet, so callers can hold back or not.
+ */
+export function acceptsImages(
+  model: Pick<ModelRoute, "supports_vision" | "boons"> | undefined,
+  visionBoonActive: boolean,
+): boolean | undefined {
+  if (!model) return undefined;
+  return model.supports_vision || (visionBoonActive && (model.boons ?? []).includes("vision"));
+}
