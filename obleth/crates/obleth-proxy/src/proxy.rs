@@ -1102,11 +1102,13 @@ async fn proxy_handler_inner(
         resolved.tenant_id,
         state.session_id_derivation,
     );
+    let end_user = end_user_for(&resolved, &headers, &json);
     let req_meta = RequestMeta {
         session_id: conversation.value,
         session_id_source: conversation.source.as_str(),
         request_type: surfaced_request_type(&resolved, &path, &headers),
         device_id,
+        end_user: end_user.clone().unwrap_or_default(),
     };
     // Surface the conversation id on the OTLP/Jaeger root span for cross-request
     // grouping (the field is declared Empty on the #[instrument] below).
@@ -1574,6 +1576,7 @@ async fn proxy_handler_inner(
             route.as_deref(),
             effective_weight,
             est.total(),
+            end_user.as_deref(),
         ),
     );
     let admitted = match timeout(admit_wait, admit).await {
@@ -3790,17 +3793,33 @@ pub(crate) fn effective_admission_weight(tenant_weight: i64, route: Option<&Reso
 /// short window after a tenant's quota changes, two keys of the same tenant can
 /// carry different tenant caps and the last admit wins for that pool. It
 /// self-corrects once the cached keys refresh.
+///
+/// `end_user` is the end user [`end_user_for`] found (always `None` unless the
+/// key has `end_user_fairshare` on). With one, the scheduler key is derived
+/// from the key and the end user, so that user queues on their own, and the
+/// key's weight and cap apply to them alone.
 pub(crate) fn admit_request_for(
     resolved: &ResolvedKey,
     model: &str,
     route: Option<&ResolvedModel>,
     weight: i64,
     cost: u32,
+    end_user: Option<&str>,
 ) -> obleth_fairshare::AdmitRequest {
     let positive = |c: Option<i64>| c.and_then(|c| usize::try_from(c).ok()).filter(|c| *c > 0);
+    let (key, end_user) = match end_user {
+        Some(name) => (
+            obleth_config::end_user_key_id(resolved.key_id, name),
+            Some(obleth_fairshare::EndUser {
+                parent_key: resolved.key_id,
+                name: name.to_string(),
+            }),
+        ),
+        None => (resolved.key_id, None),
+    };
     obleth_fairshare::AdmitRequest {
         tenant: resolved.tenant_id,
-        key: resolved.key_id,
+        key,
         weight,
         key_weight: resolved.key_weight.max(1),
         group: resolved.fairshare_group.clone(),
@@ -3810,7 +3829,36 @@ pub(crate) fn admit_request_for(
         tenant_max_in_flight: positive(resolved.max_in_flight),
         key_max_in_flight: positive(resolved.key_max_in_flight),
         cost,
+        end_user,
     }
+}
+
+/// Header a shared front end names each request's end user with, for keys
+/// with `end_user_fairshare` on. A gateway directive, never sent upstream.
+pub(crate) const END_USER_HEADER: &str = "x-obleth-end-user";
+
+/// The end user a request names, for a key with `end_user_fairshare` on:
+/// the `x-obleth-end-user` header, else the body's OpenAI `user` field, else
+/// Anthropic's `metadata.user_id`. Always `None` for other keys, so an
+/// ordinary caller cannot split itself into many places in the queue.
+pub(crate) fn end_user_for(
+    resolved: &ResolvedKey,
+    headers: &HeaderMap,
+    json: &serde_json::Value,
+) -> Option<String> {
+    if !resolved.end_user_fairshare {
+        return None;
+    }
+    headers
+        .get(END_USER_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(obleth_config::normalize_end_user)
+        .or_else(|| {
+            json.get("user")
+                .or_else(|| json.pointer("/metadata/user_id"))
+                .and_then(serde_json::Value::as_str)
+                .and_then(obleth_config::normalize_end_user)
+        })
 }
 
 /// OpenAI-style endpoints that must resolve to a registered model route.
@@ -4738,7 +4786,7 @@ pub(crate) fn forward_headers(headers: &HeaderMap) -> HeaderMap {
             // strip hop-by-hop / auth / encoding so the body stays inspectable;
             // x-obleth-boons is a gateway directive, not an upstream header
             "host" | "content-length" | "authorization" | "x-api-key" | "accept-encoding"
-            | "connection" | "x-obleth-boons" => continue,
+            | "connection" | "x-obleth-boons" | END_USER_HEADER => continue,
             _ => {
                 out.insert(name.clone(), value.clone());
             }
@@ -4809,6 +4857,9 @@ pub(crate) struct RequestMeta {
     pub(crate) request_type: &'static str,
     /// Device id from the bearer token (identity-key requests), else empty.
     pub(crate) device_id: String,
+    /// The end user the caller named, on keys with `end_user_fairshare` on
+    /// (see [`end_user_for`]), else empty.
+    pub(crate) end_user: String,
 }
 
 /// Classify a request by its OpenAI-style path suffix. Matching the suffix (not
@@ -5143,6 +5194,7 @@ pub(crate) fn finalize(
         session_id_source: meta.session_id_source.to_string(),
         request_type: meta.request_type.to_string(),
         device_id: meta.device_id.clone(),
+        end_user: meta.end_user.clone(),
     });
 }
 
@@ -5232,14 +5284,14 @@ mod tests {
         admit_request_for, anthropic_error, apply_multipart_text_view,
         backfill_max_tokens_for_count_tokens, backoff_for, build_targets, build_upstream_url,
         canonical_post_path, clamp_max_tokens, compute_modality_cost, effective_request_type,
-        forward_headers, has_input_guardrails, has_path_traversal, input_guardrails_unscannable,
-        is_chat_path, is_models_collection, is_models_endpoint, is_multipart_endpoint,
-        is_retryable_status, looks_like_context_length_error, messages_input_estimate,
-        multipart_text_view, output_guardrails_unenforceable, parse_multipart,
-        prepare_upstream_body, redress_error, request_type_for_path, requires_registered_model,
-        resolve_conversation, session_hash_order, should_translate_as_stream, strip_beta_query,
-        surface, tenant_active_now, weighted_order, MultipartField, RequestMeta, TooLong,
-        REGISTERED_MODEL_PATHS,
+        end_user_for, forward_headers, has_input_guardrails, has_path_traversal,
+        input_guardrails_unscannable, is_chat_path, is_models_collection, is_models_endpoint,
+        is_multipart_endpoint, is_retryable_status, looks_like_context_length_error,
+        messages_input_estimate, multipart_text_view, output_guardrails_unenforceable,
+        parse_multipart, prepare_upstream_body, redress_error, request_type_for_path,
+        requires_registered_model, resolve_conversation, session_hash_order,
+        should_translate_as_stream, strip_beta_query, surface, tenant_active_now, weighted_order,
+        MultipartField, RequestMeta, TooLong, END_USER_HEADER, REGISTERED_MODEL_PATHS,
     };
     use crate::router::{BoonGrants, Candidate, Intent, RequestFeatures, RouterWeights};
     use axum::body::{Body, Bytes};
@@ -5301,6 +5353,7 @@ mod tests {
             key_budget_started_at: None,
             key_weight: 100,
             key_max_in_flight: None,
+            end_user_fairshare: false,
             allowed_models: None,
             internal: false,
             tracing_enabled: false,
@@ -6990,6 +7043,7 @@ mod tests {
             session_id_source: "none",
             request_type: "chat",
             device_id: "dev-1".into(),
+            end_user: String::new(),
         };
         assert_eq!(meta.device_id, "dev-1");
     }
@@ -7098,7 +7152,7 @@ mod tests {
         resolved.max_in_flight = Some(5);
         let mut route = minimal_model("m");
         route.max_in_flight = Some(9);
-        let req = admit_request_for(&resolved, "m", Some(&route), 77, 123);
+        let req = admit_request_for(&resolved, "m", Some(&route), 77, 123, None);
         assert_eq!(req.tenant, resolved.tenant_id);
         assert_eq!(req.key, resolved.key_id);
         assert_eq!(req.weight, 77);
@@ -7110,14 +7164,97 @@ mod tests {
         assert_eq!(req.tenant_max_in_flight, Some(5));
         assert_eq!(req.key_max_in_flight, Some(2));
         assert_eq!(req.cost, 123);
+        assert_eq!(req.end_user, None);
 
         // Zero and negative caps mean "no cap".
         resolved.max_in_flight = Some(0);
         resolved.key_max_in_flight = Some(-1);
-        let req = admit_request_for(&resolved, "m", None, 1, 1);
+        let req = admit_request_for(&resolved, "m", None, 1, 1, None);
         assert_eq!(req.tenant_max_in_flight, None);
         assert_eq!(req.key_max_in_flight, None);
         assert_eq!(req.model_max_in_flight, None);
+    }
+
+    #[test]
+    fn an_end_user_queues_under_a_key_derived_from_the_real_key() {
+        let mut resolved = key_with_schedule("UTC", None, None, None);
+        resolved.key_id = Uuid::new_v4();
+        resolved.tenant_id = Uuid::new_v4();
+        resolved.end_user_fairshare = true;
+        resolved.key_weight = 40;
+        resolved.key_max_in_flight = Some(3);
+        let alice = admit_request_for(&resolved, "m", None, 100, 10, Some("alice"));
+        let bob = admit_request_for(&resolved, "m", None, 100, 10, Some("bob"));
+
+        assert_eq!(
+            alice.key,
+            obleth_config::end_user_key_id(resolved.key_id, "alice")
+        );
+        assert_ne!(alice.key, bob.key, "each end user gets their own place");
+        assert_ne!(alice.key, resolved.key_id);
+        assert_eq!(alice.tenant, resolved.tenant_id, "still the key's tenant");
+        // The key's weight and cap apply to each end user.
+        assert_eq!(alice.key_weight, 40);
+        assert_eq!(alice.key_max_in_flight, Some(3));
+        assert_eq!(
+            alice.end_user,
+            Some(obleth_fairshare::EndUser {
+                parent_key: resolved.key_id,
+                name: "alice".into()
+            })
+        );
+    }
+
+    #[test]
+    fn end_user_is_read_only_for_keys_that_turned_it_on() {
+        let mut resolved = key_with_schedule("UTC", None, None, None);
+        let mut headers = HeaderMap::new();
+        headers.insert(END_USER_HEADER, "header-user".parse().unwrap());
+        let body = serde_json::json!({ "user": "body-user" });
+
+        // Off (the default): an ordinary caller can't split itself up.
+        assert_eq!(end_user_for(&resolved, &headers, &body), None);
+
+        resolved.end_user_fairshare = true;
+        // The header wins over the body.
+        assert_eq!(
+            end_user_for(&resolved, &headers, &body).as_deref(),
+            Some("header-user")
+        );
+        // Then the body's `user`, then Anthropic's metadata.user_id.
+        let none = HeaderMap::new();
+        assert_eq!(
+            end_user_for(&resolved, &none, &body).as_deref(),
+            Some("body-user")
+        );
+        let anthropic = serde_json::json!({ "metadata": { "user_id": "claude-user" } });
+        assert_eq!(
+            end_user_for(&resolved, &none, &anthropic).as_deref(),
+            Some("claude-user")
+        );
+        // A blank header falls through to the body; nothing named means None.
+        let mut blank = HeaderMap::new();
+        blank.insert(END_USER_HEADER, "   ".parse().unwrap());
+        assert_eq!(
+            end_user_for(&resolved, &blank, &body).as_deref(),
+            Some("body-user")
+        );
+        assert_eq!(end_user_for(&resolved, &none, &serde_json::json!({})), None);
+        // Non-string `user` values are ignored rather than stringified.
+        assert_eq!(
+            end_user_for(&resolved, &none, &serde_json::json!({ "user": 42 })),
+            None
+        );
+    }
+
+    #[test]
+    fn the_end_user_header_is_not_sent_upstream() {
+        let mut headers = HeaderMap::new();
+        headers.insert(END_USER_HEADER, "alice".parse().unwrap());
+        headers.insert("x-request-note", "kept".parse().unwrap());
+        let fwd = forward_headers(&headers);
+        assert!(fwd.get(END_USER_HEADER).is_none());
+        assert_eq!(fwd.get("x-request-note").unwrap(), "kept");
     }
     /// Endpoints whose OpenAI spec sends `multipart/form-data` (they take a
     /// file upload). The video create's upload is its optional

@@ -1880,3 +1880,76 @@ async fn a_dropped_model_cap_falls_back_to_the_route() {
     assert_eq!(fs.snapshot().await.unwrap().pools[0].configured_cap, 3);
     drop((first, second));
 }
+
+/// A key with per-end-user fairshare admits each named user under a key
+/// derived from the real one (as `admit_request_for` in obleth-proxy does), so
+/// a user with a backlog can't hold everyone else on that key behind it: the
+/// light user's single request goes next instead of after the heavy user's
+/// five. The snapshot names the end user so dashboards can show whose row it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn end_users_of_one_key_queue_on_their_own() {
+    let fs = FairShare::start(
+        Arc::new(StaticCapacity::new(1)),
+        FairshareAlgorithm::Hierarchical,
+        1,
+    );
+    let tenant = Uuid::new_v4();
+    let chatbot = Uuid::new_v4();
+    let as_user = |name: &str| {
+        AdmitRequest::new(tenant, "m", 10)
+            .key(obleth_config::end_user_key_id(chatbot, name), 100)
+            .end_user(chatbot, name)
+    };
+    let grants: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+
+    // The heavy user holds the only slot and queues five more.
+    let held = fs.admit(as_user("heavy")).await.unwrap().permit;
+    let mut handles = Vec::new();
+    for _ in 0..5 {
+        let (fs, grants, req) = (fs.clone(), grants.clone(), as_user("heavy"));
+        handles.push(tokio::spawn(async move {
+            let a = fs.admit(req).await.unwrap();
+            grants.lock().unwrap().push("heavy");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            drop(a.permit);
+        }));
+    }
+    wait_for_queued(&fs, "m", 5).await;
+    // Then the light user asks once, behind all of them.
+    {
+        let (fs, grants, req) = (fs.clone(), grants.clone(), as_user("light"));
+        handles.push(tokio::spawn(async move {
+            let a = fs.admit(req).await.unwrap();
+            grants.lock().unwrap().push("light");
+            drop(a.permit);
+        }));
+    }
+    wait_for_queued(&fs, "m", 6).await;
+
+    let snap = fs.snapshot().await.unwrap();
+    let light_key = obleth_config::end_user_key_id(chatbot, "light");
+    let light_row = snap.pools[0]
+        .keys
+        .iter()
+        .find(|k| k.key_id == light_key)
+        .unwrap();
+    assert_eq!(
+        light_row.end_user,
+        Some(obleth_fairshare::EndUser {
+            parent_key: chatbot,
+            name: "light".into()
+        })
+    );
+    assert_eq!(light_row.tenant_id, tenant);
+
+    drop(held);
+    for h in handles {
+        let _ = tokio::time::timeout(Duration::from_secs(5), h).await;
+    }
+    let order = grants.lock().unwrap().clone();
+    assert_eq!(order.len(), 6, "every request is served: {order:?}");
+    assert_eq!(
+        order[0], "light",
+        "the light user goes before the heavy user's backlog: {order:?}"
+    );
+}

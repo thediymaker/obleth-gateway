@@ -37,7 +37,7 @@ const key: ApiKey = {
   id: "k1", tenant_id: "t1", name: "alice", description: "", key_prefix: "sk-abc", kind: "secret",
   identity_issuer: null, identity_subject: null, identity_claims: null, weight: 250, max_in_flight: 3,
   budget_tokens: null, budget_cost_usd: null, budget_period: null, budget_started_at: null,
-  disabled: false, tracing_enabled: false, created_at: "", updated_at: "",
+  disabled: false, tracing_enabled: false, end_user_fairshare: false, created_at: "", updated_at: "",
 };
 
 let host: HTMLDivElement;

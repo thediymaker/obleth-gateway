@@ -1849,6 +1849,7 @@ mod shutdown_tests {
             key_budget_started_at: None,
             key_weight: 100,
             key_max_in_flight: None,
+            end_user_fairshare: false,
             allowed_models: None,
             internal: false,
             tracing_enabled: false,

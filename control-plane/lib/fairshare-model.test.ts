@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { FairshareLiveView, ModelRoute, TenantFairshareView } from "@/lib/obleth";
-import { buildPoolRows, groupShares, nextInLine, poolState, poolTenantRows, previewTenantWeight, tenantPools, whyWaiting } from "./fairshare-model";
+import type { FairshareLiveView, KeyFairshareView, ModelRoute, TenantFairshareView } from "@/lib/obleth";
+import { buildPoolRows, groupShares, keyRowLabel, nextInLine, poolState, poolTenantRows, previewTenantWeight, tenantPools, whyWaiting } from "./fairshare-model";
 
 const tenant = (id: string, o: Partial<TenantFairshareView> = {}): TenantFairshareView => ({
   tenant_id: id, name: id, fairshare_group: "research", weight: 100, in_flight: 0, queued: 0,
@@ -104,5 +104,21 @@ describe("weight previews", () => {
     expect(shares.map((s) => Math.round(s.share * 100))).toEqual([43, 43, 14, 0]);
     // With nothing active anywhere, every group counts.
     expect(groupShares([{ name: "a", weight: 1, active: false }, { name: "b", weight: 3, active: false }]).map((s) => s.share)).toEqual([0.25, 0.75]);
+  });
+});
+
+describe("keyRowLabel", () => {
+  const row = (over: Partial<KeyFairshareView> = {}): KeyFairshareView => ({
+    key_id: "0f6c2d8e-0000-4000-8000-000000000000", tenant_id: "t", name: "createai-builder", weight: 100,
+    max_in_flight: null, in_flight: 1, queued: 0, served_tokens: 0, share_score: 0, weight_share: 0, expected_slots: 0, ...over,
+  });
+
+  it("names a key by its name, or its id when it has none", () => {
+    expect(keyRowLabel(row())).toBe("createai-builder");
+    expect(keyRowLabel(row({ name: "" }))).toBe("0f6c2d8e");
+  });
+
+  it("names an end user's row after the key and the user the app named", () => {
+    expect(keyRowLabel(row({ end_user: "asurite-jdoe", parent_key_id: "k" }))).toBe("createai-builder · asurite-jdoe");
   });
 });

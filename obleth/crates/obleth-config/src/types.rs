@@ -232,6 +232,15 @@ pub struct ApiKey {
     pub max_in_flight: Option<i64>,
     pub disabled: bool,
     pub tracing_enabled: bool,
+    /// The key fronts many end users (a chatbot or other shared front end)
+    /// and names each one per request (`x-obleth-end-user`, else the body's
+    /// `user`). Each named end user then takes their own place in the fair
+    /// queue, as if they held their own key: the key's weight and in-flight
+    /// cap apply to each of them, while budgets stay on the key. Trusted:
+    /// only set it for a caller that names its users honestly, since a caller
+    /// could otherwise split itself into many users to jump the queue.
+    #[serde(default)]
+    pub end_user_fairshare: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -314,6 +323,10 @@ pub struct ResolvedKey {
     /// Per-model in-flight ceiling for the key. `None` = no cap.
     #[serde(default)]
     pub key_max_in_flight: Option<i64>,
+    /// Each named end user of this key queues separately (see
+    /// `ApiKey::end_user_fairshare`).
+    #[serde(default)]
+    pub end_user_fairshare: bool,
     /// Optional per-tenant model allowlist. Empty/`None` = all models permitted.
     #[serde(default)]
     pub allowed_models: Option<Vec<String>>,
@@ -1058,6 +1071,12 @@ pub struct UsageRecord {
     /// replayable.
     #[serde(default)]
     pub device_id: String,
+    /// The end user a shared front end named for this request, on keys with
+    /// `end_user_fairshare` on (`x-obleth-end-user` header or the body's
+    /// `user`); empty otherwise. `#[serde(default)]` keeps older WAL records
+    /// replayable.
+    #[serde(default)]
+    pub end_user: String,
 }
 
 /// Runtime-configurable retention for the raw per-request `usage` ledger.
@@ -2986,6 +3005,10 @@ pub struct ApiKeyBackup {
     /// Per-model in-flight ceiling for this key. `None` = no cap.
     #[serde(default)]
     pub max_in_flight: Option<i64>,
+    /// See `ApiKey::end_user_fairshare`. Defaults to off for backups taken
+    /// before the column existed.
+    #[serde(default)]
+    pub end_user_fairshare: bool,
     pub disabled: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }

@@ -701,7 +701,7 @@ export async function saveTenantSettingsAction(formData: FormData): Promise<Sett
   return { ok: true };
 }
 
-export type KeySettingsSection = "key" | "tracing";
+export type KeySettingsSection = "key" | "tracing" | "end_user";
 
 /** Save a key's panel: its fields (one update) and its tracing switch, each only when changed. */
 export async function saveKeySettingsAction(formData: FormData): Promise<SettingsSaveResult<KeySettingsSection>> {
@@ -722,6 +722,14 @@ export async function saveKeySettingsAction(formData: FormData): Promise<Setting
       return { ok: false, error: `Tracing: ${actionError(e).error}`, saved };
     }
     saved.push("tracing");
+  }
+  if (wanted.has("end_user")) {
+    try {
+      await obleth.setKeyEndUserFairshare(id, formData.get("end_user_fairshare") === "on", { auditActor: session.email });
+    } catch (e) {
+      return { ok: false, error: `Per-user fairshare: ${actionError(e).error}`, saved };
+    }
+    saved.push("end_user");
   }
   updateTag(CACHE_TAGS.keys);
   revalidatePath("/keys");
@@ -866,6 +874,7 @@ export async function replaceKeyAction(id: string): Promise<{ ok: true; secret: 
       budget_started_at: old.budget_started_at,
     }, { auditActor: session.email });
     if (old.tracing_enabled) await obleth.setKeyTracing(created.key.id, true, { auditActor: session.email });
+    if (old.end_user_fairshare) await obleth.setKeyEndUserFairshare(created.key.id, true, { auditActor: session.email });
     updateTag(CACHE_TAGS.keys);
     revalidatePath("/keys");
     return { ok: true, secret: created.secret, key: created.key };

@@ -11,6 +11,7 @@ import { isWaitingBelowShare } from "@/lib/fairshare";
 import {
   buildPoolRows,
   groupShares,
+  keyRowLabel,
   limitsNote,
   nextInLine,
   poolTenantRows,
@@ -393,7 +394,7 @@ function PoolView({ view, raw, poolRow, shared, onOpen }: { view: FairshareLiveV
               <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,10rem)_4.5rem_4.5rem_4.5rem_4.5rem] gap-3 border-t border-border px-[18px] py-2 text-[11.5px] text-muted-foreground"><span>Key</span><span>Tenant</span><span className="text-right">Weight</span><span className="text-right">Cap</span><span className="text-right">Running</span><span className="text-right">Waiting</span></div>
               {keys.slice(0, 12).map((k) => (
                 <button key={k.key_id} type="button" onClick={() => onOpen(k.tenant_id)} className="grid w-full grid-cols-[minmax(0,1fr)_minmax(0,10rem)_4.5rem_4.5rem_4.5rem_4.5rem] items-center gap-3 border-t border-border px-[18px] py-[9px] text-left text-[13px] hover:bg-accent/40">
-                  <span className="truncate">{k.name || k.key_id.slice(0, 8)}</span>
+                  <span className="truncate" title={keyRowLabel(k)}>{keyRowLabel(k)}</span>
                   <span className="truncate text-muted-foreground">{names.get(k.tenant_id) ?? "—"}</span>
                   <span className="text-right font-mono text-xs">{k.weight}</span>
                   <span className="text-right font-mono text-xs text-muted-foreground">{k.max_in_flight ?? "—"}</span>
