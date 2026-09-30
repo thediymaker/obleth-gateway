@@ -18,7 +18,8 @@ pub use jwt::{
     JwtIssuerConfig, ALLOWED_JWT_ALGORITHMS, DEVICE_ID_MAX_LEN,
 };
 pub use keys::{
-    cache_key, content_hash, generate_api_key, hash_api_key, pepper_is_set, GeneratedKey,
+    cache_key, content_hash, end_user_key_id, generate_api_key, hash_api_key, normalize_end_user,
+    pepper_is_set, GeneratedKey, END_USER_MAX_CHARS,
 };
 pub use manifest::{
     endpoint_to_manifest_entry, model_to_manifest_entry, resolve_endpoint, resolve_model,

@@ -77,6 +77,7 @@ use obleth_config::{
         crate::delete_key,
         crate::set_key_disabled,
         crate::set_key_tracing_handler,
+        crate::set_key_end_user_fairshare_handler,
         crate::get_key_usage,
         // usage & costs
         crate::get_usage,
@@ -376,6 +377,7 @@ use obleth_config::{
         crate::VersionInfo,
         crate::ResyncReport,
         crate::SetKeyTracing,
+        crate::SetKeyEndUserFairshare,
         crate::ProvisionErrorBody,
         crate::usage::SpanEntry,
         crate::recipes::RecipeView,

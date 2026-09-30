@@ -1362,6 +1362,7 @@ fn build_probe_usage(
         session_id_source: "none".to_string(),
         request_type: HEALTH_PROBE_REQUEST_TYPE.to_string(),
         device_id: String::new(),
+        end_user: String::new(),
     }
 }
 

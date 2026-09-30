@@ -355,6 +355,16 @@ export function groupShares(groups: { name: string; weight: number; active: bool
 }
 
 /** The keys to show under a tenant: that tenant's, least served against weight first. */
+/**
+ * How a key row is named. An end user of a key with per-end-user fairshare
+ * reads as the key's name and the user the app named, since their row's id
+ * is derived rather than a real key.
+ */
+export function keyRowLabel(k: KeyFairshareView): string {
+  const name = k.name || k.key_id.slice(0, 8);
+  return k.end_user ? `${name} · ${k.end_user}` : name;
+}
+
 export function tenantKeys(keys: KeyFairshareView[] | undefined, tenantId: string): KeyFairshareView[] {
   return (keys ?? []).filter((k) => k.tenant_id === tenantId).sort((a, b) => a.share_score - b.share_score);
 }

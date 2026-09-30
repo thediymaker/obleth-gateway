@@ -92,7 +92,7 @@ impl Store {
                     budget_tokens, budget_cost_usd, budget_period, budget_started_at,
                     disabled, created_at,
                     kind, identity_issuer, identity_subject, identity_claims,
-                    weight, max_in_flight
+                    weight, max_in_flight, end_user_fairshare
              from api_keys order by created_at",
         )
         .fetch_all(&self.pool)
@@ -120,6 +120,7 @@ impl Store {
                 budget_started_at: row.try_get("budget_started_at")?,
                 weight: row.try_get("weight").unwrap_or(100),
                 max_in_flight: row.try_get("max_in_flight").unwrap_or(None),
+                end_user_fairshare: row.try_get("end_user_fairshare").unwrap_or(false),
                 disabled: row.try_get("disabled")?,
                 created_at: row.try_get("created_at")?,
             })
@@ -336,9 +337,9 @@ impl Store {
                 "insert into api_keys (id, tenant_id, name, description, key_prefix, key_hash,
                         budget_tokens, budget_cost_usd, budget_period, budget_started_at,
                         disabled, created_at, kind, identity_issuer, identity_subject,
-                        identity_claims, weight, max_in_flight)
+                        identity_claims, weight, max_in_flight, end_user_fairshare)
                  values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                         $17, $18)
+                         $17, $18, $19)
                  on conflict (id) do update set
                         tenant_id = excluded.tenant_id,
                         name = excluded.name,
@@ -356,6 +357,7 @@ impl Store {
                         identity_claims = excluded.identity_claims,
                         weight = excluded.weight,
                         max_in_flight = excluded.max_in_flight,
+                        end_user_fairshare = excluded.end_user_fairshare,
                         updated_at = now()
                  returning (xmax = 0) as inserted",
             )
@@ -377,6 +379,7 @@ impl Store {
             .bind(k.identity_claims.clone().map(sqlx::types::Json))
             .bind(k.weight)
             .bind(k.max_in_flight)
+            .bind(k.end_user_fairshare)
             .fetch_one(&mut *tx)
             .await
             .map_err(restore_db_error)?;
@@ -863,6 +866,10 @@ mod tests {
             .await
             .expect("create key");
         let hash = obleth_config::hash_api_key(&secret);
+        store
+            .set_key_end_user_fairshare(key.id, true)
+            .await
+            .expect("turn on per-end-user fairshare");
 
         // A model with a non-neutral routing bias and a levelled intent tag.
         // Both are `auto`-router configuration an operator set deliberately, so
@@ -939,6 +946,10 @@ mod tests {
             .find(|k| k.id == key.id)
             .expect("key in export");
         assert_eq!(exported_key.key_hash, hash);
+        assert!(
+            exported_key.end_user_fairshare,
+            "export carries end_user_fairshare"
+        );
         let exported_tenant = data
             .tenants
             .iter()
@@ -985,8 +996,18 @@ mod tests {
             .execute(&store.pool)
             .await
             .expect("drift endpoint concurrency");
+        sqlx::query("update api_keys set end_user_fairshare = false where id = $1")
+            .bind(key.id)
+            .execute(&store.pool)
+            .await
+            .expect("drift end_user_fairshare");
         let report = store.restore_backup_data(&data).await.expect("restore");
         assert!(report.tenants.updated >= 1);
+        let restored_key = store.keys_by_ids(&[key.id]).await.expect("keys by id");
+        assert!(
+            restored_key.first().is_some_and(|k| k.end_user_fairshare),
+            "restore puts end_user_fairshare back"
+        );
         let restored_model = store.get_model(model.id).await.expect("get model");
         assert_eq!(
             restored_model.route_bias, 2.5,

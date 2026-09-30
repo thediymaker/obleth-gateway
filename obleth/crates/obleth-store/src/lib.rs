@@ -99,6 +99,8 @@ const SCHEMA_V29: &str =
     include_str!("../../../../schema/postgres/0029_model_capacity_discovery.sql");
 const SCHEMA_V30: &str = include_str!("../../../../schema/postgres/0030_video_jobs_key_index.sql");
 const SCHEMA_V31: &str = include_str!("../../../../schema/postgres/0031_deployment_launches.sql");
+const SCHEMA_V32: &str =
+    include_str!("../../../../schema/postgres/0032_api_key_end_user_fairshare.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -246,6 +248,7 @@ impl Store {
             sqlx::raw_sql(SCHEMA_V29).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V30).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V31).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V32).execute(&mut *conn).await?;
             Ok(())
         }
         .await;
@@ -659,7 +662,7 @@ impl Store {
              values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
              returning id, tenant_id, name, description, key_prefix,
                     budget_tokens, budget_cost_usd, budget_period, budget_started_at,
-                    disabled, tracing_enabled, created_at, updated_at,
+                    disabled, tracing_enabled, end_user_fairshare, created_at, updated_at,
                     kind, identity_issuer, identity_subject, identity_claims,
                     weight, max_in_flight",
         )
@@ -991,7 +994,7 @@ impl Store {
                 sqlx::query(
                     "select id, tenant_id, name, description, key_prefix,
                             budget_tokens, budget_cost_usd, budget_period, budget_started_at,
-                            disabled, tracing_enabled, created_at, updated_at,
+                            disabled, tracing_enabled, end_user_fairshare, created_at, updated_at,
                             kind, identity_issuer, identity_subject, identity_claims,
                             weight, max_in_flight
                      from api_keys where tenant_id = $1 order by created_at",
@@ -1004,7 +1007,7 @@ impl Store {
                 sqlx::query(
                     "select id, tenant_id, name, description, key_prefix,
                             budget_tokens, budget_cost_usd, budget_period, budget_started_at,
-                            disabled, tracing_enabled, created_at, updated_at,
+                            disabled, tracing_enabled, end_user_fairshare, created_at, updated_at,
                             kind, identity_issuer, identity_subject, identity_claims,
                             weight, max_in_flight
                      from api_keys order by created_at",
@@ -1026,7 +1029,7 @@ impl Store {
         let rows = sqlx::query(
             "select id, tenant_id, name, description, key_prefix,
                     budget_tokens, budget_cost_usd, budget_period, budget_started_at,
-                    disabled, tracing_enabled, created_at, updated_at,
+                    disabled, tracing_enabled, end_user_fairshare, created_at, updated_at,
                     kind, identity_issuer, identity_subject, identity_claims,
                     weight, max_in_flight
              from api_keys where id = any($1)",
@@ -1065,7 +1068,7 @@ impl Store {
              where id = $1
              returning key_hash, id, tenant_id, name, description, key_prefix,
                     budget_tokens, budget_cost_usd, budget_period, budget_started_at,
-                    disabled, tracing_enabled, created_at, updated_at,
+                    disabled, tracing_enabled, end_user_fairshare, created_at, updated_at,
                     kind, identity_issuer, identity_subject, identity_claims,
                     weight, max_in_flight",
         )
@@ -1122,7 +1125,7 @@ impl Store {
              where id = $1
              returning key_hash, id, tenant_id, name, description, key_prefix,
                     budget_tokens, budget_cost_usd, budget_period, budget_started_at,
-                    disabled, tracing_enabled, created_at, updated_at,
+                    disabled, tracing_enabled, end_user_fairshare, created_at, updated_at,
                     kind, identity_issuer, identity_subject, identity_claims,
                     weight, max_in_flight",
         )
@@ -1185,6 +1188,33 @@ impl Store {
         Ok((hash, resolved))
     }
 
+    /// Turn per-end-user fairshare on or off for a key (see
+    /// `ApiKey::end_user_fairshare`). Its own call, like tracing, so the
+    /// whole-key `PUT` (which resets omitted fields) can never switch it off
+    /// by leaving it out.
+    pub async fn set_key_end_user_fairshare(
+        &self,
+        id: Uuid,
+        enabled: bool,
+    ) -> Result<(String, ResolvedKey)> {
+        self.guard_reserved_key(id).await?;
+        let row = sqlx::query(
+            "update api_keys set end_user_fairshare = $2, updated_at = now() \
+             where id = $1 returning key_hash",
+        )
+        .bind(id)
+        .bind(enabled)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+        let hash: String = row.try_get("key_hash")?;
+        let resolved = self
+            .resolved_key_by_hash(&hash)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        Ok((hash, resolved))
+    }
+
     pub async fn set_tenant_tracing(&self, id: Uuid, tracing_enabled: bool) -> Result<()> {
         Self::guard_reserved_tenant(id)?;
         sqlx::query(
@@ -1235,6 +1265,7 @@ impl Store {
                     k.budget_period as key_budget_period,
                     k.budget_started_at as key_budget_started_at,
                     k.weight as key_weight, k.max_in_flight as key_max_in_flight,
+                    k.end_user_fairshare,
                     t.allowed_models,
                     (k.tracing_enabled OR t.tracing_enabled) AS tracing_enabled,
                     t.guardrails_policy,
@@ -1264,6 +1295,7 @@ impl Store {
                     k.budget_period as key_budget_period,
                     k.budget_started_at as key_budget_started_at,
                     k.weight as key_weight, k.max_in_flight as key_max_in_flight,
+                    k.end_user_fairshare,
                     t.allowed_models,
                     (k.tracing_enabled OR t.tracing_enabled) AS tracing_enabled,
                     t.guardrails_policy,
@@ -1297,6 +1329,7 @@ impl Store {
                     k.budget_period as key_budget_period,
                     k.budget_started_at as key_budget_started_at,
                     k.weight as key_weight, k.max_in_flight as key_max_in_flight,
+                    k.end_user_fairshare,
                     t.allowed_models,
                     (k.tracing_enabled OR t.tracing_enabled) AS tracing_enabled,
                     t.guardrails_policy,
@@ -3796,6 +3829,7 @@ fn api_key_from_row(row: &PgRow) -> Result<ApiKey> {
         max_in_flight: row.try_get("max_in_flight").unwrap_or(None),
         disabled: row.try_get("disabled")?,
         tracing_enabled: row.try_get("tracing_enabled").unwrap_or(false),
+        end_user_fairshare: row.try_get("end_user_fairshare").unwrap_or(false),
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -3827,6 +3861,7 @@ fn resolved_from_row(row: &PgRow) -> Result<ResolvedKey> {
         key_budget_started_at: row.try_get("key_budget_started_at")?,
         key_weight: row.try_get("key_weight").unwrap_or(100),
         key_max_in_flight: row.try_get("key_max_in_flight").unwrap_or(None),
+        end_user_fairshare: row.try_get("end_user_fairshare").unwrap_or(false),
         allowed_models: allowed_models_from_row(row)?,
         internal: false,
         tracing_enabled: row.try_get::<bool, _>("tracing_enabled").unwrap_or(false),

@@ -10,7 +10,7 @@ import { Dialog, DialogClose, DialogDescription, DialogOverlay, DialogPortal, Di
 import { setTenantMaxInFlightAction, setWeightAction } from "@/app/actions";
 import type { FairshareLiveView, KeyFairshareView, TenantFairshareView } from "@/lib/obleth";
 import { isWaitingBelowShare } from "@/lib/fairshare";
-import { previewTenantWeight, tenantKeys, tenantPools } from "@/lib/fairshare-model";
+import { keyRowLabel, previewTenantWeight, tenantKeys, tenantPools } from "@/lib/fairshare-model";
 import { Pill, SectionLabel, Sparkline } from "@/components/overview/ui";
 import { cn } from "@/lib/utils";
 import type { TenantSeriesRow } from "./hooks";
@@ -159,7 +159,7 @@ function Body({ tenant, view, keys, series }: { tenant: TenantFairshareView; vie
               <div className="grid grid-cols-[minmax(0,1fr)_3.5rem_3.5rem_4rem_4rem] gap-2.5 py-1.5 text-[11.5px] text-muted-foreground"><span>Key</span><span className="text-right">Weight</span><span className="text-right">Cap</span><span className="text-right">Running</span><span className="text-right">Waiting</span></div>
               {myKeys.map((k) => (
                 <div key={k.key_id} className="grid grid-cols-[minmax(0,1fr)_3.5rem_3.5rem_4rem_4rem] gap-2.5 border-t border-border py-2 text-[13px]">
-                  <span className="truncate" title={k.name}>{k.name || k.key_id.slice(0, 8)}</span>
+                  <span className="truncate" title={keyRowLabel(k)}>{keyRowLabel(k)}</span>
                   <span className="text-right font-mono text-xs">{k.weight}</span>
                   <span className="text-right font-mono text-xs text-muted-foreground">{k.max_in_flight ?? "—"}</span>
                   <span className="text-right font-mono text-xs">{k.in_flight}</span>

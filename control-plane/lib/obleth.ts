@@ -95,6 +95,8 @@ export interface ApiKey {
   budget_started_at: string | null;
   disabled: boolean;
   tracing_enabled: boolean;
+  /** Each end user the key names queues on their own (trusted callers only). */
+  end_user_fairshare: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -938,6 +940,10 @@ export interface KeyFairshareView {
   share_score: number;
   weight_share: number;
   expected_slots: number;
+  /** Set when this row is one end user of a key with per-end-user fairshare. */
+  end_user?: string;
+  /** The real key an end user's row belongs to. */
+  parent_key_id?: string;
 }
 
 export interface ModelPoolView {
@@ -2000,6 +2006,12 @@ export const obleth = {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ tracing_enabled }),
+    }),
+  setKeyEndUserFairshare: (id: string, end_user_fairshare: boolean, options?: AuditOptions) =>
+    api<void>(`/keys/${id}/end-user-fairshare`, {
+      method: "PUT",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify({ end_user_fairshare }),
     }),
   setTenantTracing: (
     id: string,

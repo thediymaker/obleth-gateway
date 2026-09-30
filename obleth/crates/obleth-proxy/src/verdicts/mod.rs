@@ -474,11 +474,13 @@ async fn handler_inner(
         resolved.tenant_id,
         state.session_id_derivation,
     );
+    let end_user = proxy::end_user_for(&resolved, &headers, &json);
     let req_meta = RequestMeta {
         session_id: conversation.value,
         session_id_source: conversation.source.as_str(),
         request_type: surfaced_request_type(&resolved, VERDICTS_PATH, &headers),
         device_id,
+        end_user: end_user.clone().unwrap_or_default(),
     };
     if let Some(t) = tracer.as_mut() {
         t.set_conversation(&req_meta.session_id, req_meta.session_id_source);
@@ -668,6 +670,7 @@ async fn handler_inner(
         Some(&route),
         effective_weight,
         est.total(),
+        end_user.as_deref(),
     ));
     let admitted = match tokio::time::timeout(admit_wait, admit).await {
         Ok(Some(a)) => a,

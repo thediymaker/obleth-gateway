@@ -198,6 +198,10 @@ pub fn router(state: AdminState) -> Router {
         .route("/api/v1/keys/:id/disabled", put(set_key_disabled))
         .route("/api/v1/keys/:id/tenant", put(move_key))
         .route("/api/v1/keys/:id/tracing", put(set_key_tracing_handler))
+        .route(
+            "/api/v1/keys/:id/end-user-fairshare",
+            put(set_key_end_user_fairshare_handler),
+        )
         .route("/api/v1/keys/:id/usage", get(get_key_usage))
         .route("/api/v1/usage", get(get_usage))
         .route("/api/v1/usage/keys", get(get_usage_keys))
@@ -652,6 +656,15 @@ pub struct SetKeyTracing {
     pub tracing_enabled: bool,
 }
 
+/// Body of `PUT /api/v1/keys/{id}/end-user-fairshare`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetKeyEndUserFairshare {
+    /// Whether each end user the key names (`x-obleth-end-user`, else the
+    /// body's `user`) queues on their own. Only for a trusted caller: see
+    /// `ApiKey::end_user_fairshare`.
+    pub end_user_fairshare: bool,
+}
+
 fn normalize_budget_fields(
     budget_tokens: Option<i64>,
     budget_cost_usd: Option<f64>,
@@ -798,6 +811,15 @@ pub struct KeyFairshareView {
     pub share_score: f64,
     pub weight_share: f64,
     pub expected_slots: f64,
+    /// Set when this row is one end user of a key with per-end-user
+    /// fairshare: `key_id` is then derived, `name` is the real key's name,
+    /// and this is the end-user id the caller sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_user: Option<String>,
+    /// The real key an end user's row belongs to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub parent_key_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -4371,6 +4393,43 @@ async fn set_key_tracing_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Turn per-end-user fairshare on or off for one key. Its own route, like
+/// tracing, because `PUT /api/v1/keys/{id}` resets any field it is not sent,
+/// and a bulk budget edit must never switch this off by leaving it out.
+#[utoipa::path(
+    put, path = "/api/v1/keys/{id}/end-user-fairshare", tag = "keys",
+    params(("id" = Uuid, Path, description = "API key id")),
+    request_body = SetKeyEndUserFairshare,
+    responses((status = 204), (status = 404))
+)]
+async fn set_key_end_user_fairshare_handler(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<SetKeyEndUserFairshare>,
+) -> Result<StatusCode> {
+    let (hash, resolved) = state
+        .store
+        .set_key_end_user_fairshare(id, body.end_user_fairshare)
+        .await?;
+    push_key(&state, &hash, &resolved).await?;
+    state
+        .store
+        .record_audit(
+            &audit_actor(&headers),
+            if body.end_user_fairshare {
+                "enable_key_end_user_fairshare"
+            } else {
+                "disable_key_end_user_fairshare"
+            },
+            "api_key",
+            &id.to_string(),
+            serde_json::json!({ "end_user_fairshare": body.end_user_fairshare }),
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[utoipa::path(
     put, path = "/api/v1/tenants/{id}/tracing", tag = "tenants",
     params(("id" = Uuid, Path, description = "Tenant id")),
@@ -5218,6 +5277,8 @@ pub(crate) fn aggregate_pools(
                 share_score: 0.0,
                 weight_share: 0.0,
                 expected_slots: 0.0,
+                end_user: k.end_user.clone(),
+                parent_key_id: k.parent_key_id,
             });
             e.in_flight += k.in_flight;
             e.queued += k.queued;
@@ -5501,7 +5562,11 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
     let key_ids: Vec<Uuid> = snap
         .pools
         .iter()
-        .flat_map(|p| p.keys.iter().map(|k| k.key_id))
+        .flat_map(|p| {
+            p.keys
+                .iter()
+                .map(|k| k.end_user.as_ref().map_or(k.key_id, |e| e.parent_key))
+        })
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
         .collect();
@@ -5626,10 +5691,13 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
                     .map(|k| KeyFairshareView {
                         key_id: k.key_id,
                         tenant_id: k.tenant_id,
-                        name: key_names
-                            .get(&k.key_id)
-                            .cloned()
-                            .unwrap_or_else(|| k.key_id.to_string()),
+                        name: {
+                            let real = k.end_user.as_ref().map_or(k.key_id, |e| e.parent_key);
+                            key_names
+                                .get(&real)
+                                .cloned()
+                                .unwrap_or_else(|| real.to_string())
+                        },
                         weight: k.weight,
                         max_in_flight: k.max_in_flight,
                         in_flight: k.in_flight,
@@ -5638,6 +5706,8 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
                         share_score: k.share_score,
                         weight_share: k.weight_share,
                         expected_slots: k.weight_share * cap as f64,
+                        end_user: k.end_user.as_ref().map(|e| e.name.clone()),
+                        parent_key_id: k.end_user.as_ref().map(|e| e.parent_key),
                     })
                     .collect(),
             }
@@ -9336,6 +9406,100 @@ mod tests {
         assert_eq!(hashes, ["a", "c"]);
     }
 
+    /// Per-end-user fairshare is set through its own route, reaches the key
+    /// the gateway resolves, and survives a whole-key `PUT` that doesn't
+    /// mention it -- the reason it is not one of that `PUT`'s fields.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn end_user_fairshare_has_its_own_route_and_survives_a_key_put() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let tenant = t
+            .store
+            .create_tenant(&format!("t-{}", Uuid::new_v4()), 100, 1000, None, None)
+            .await
+            .expect("create tenant");
+        let request = |method: &str, path: String, body: serde_json::Value| {
+            axum::http::Request::builder()
+                .method(method)
+                .uri(path)
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+                .body(axum::body::Body::from(body.to_string()))
+                .expect("build request")
+        };
+
+        let (_, created) = send(
+            &t.app,
+            request(
+                "POST",
+                format!("/api/v1/tenants/{}/keys", tenant.id),
+                serde_json::json!({ "name": "chatbot" }),
+            ),
+        )
+        .await;
+        let id = created["key"]["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let flag = |on: bool| {
+            request(
+                "PUT",
+                format!("/api/v1/keys/{id}/end-user-fairshare"),
+                serde_json::json!({ "end_user_fairshare": on }),
+            )
+        };
+        let (on_status, _) = send(&t.app, flag(true)).await;
+        let (_, after_put) = send(
+            &t.app,
+            request(
+                "PUT",
+                format!("/api/v1/keys/{id}"),
+                serde_json::json!({ "name": "chatbot", "weight": 300 }),
+            ),
+        )
+        .await;
+        let resolved_on = t
+            .store
+            .all_resolved_keys()
+            .await
+            .expect("resolved keys")
+            .into_iter()
+            .find(|(_, k)| k.key_id.to_string() == id)
+            .map(|(_, k)| k.end_user_fairshare);
+        let (off_status, _) = send(&t.app, flag(false)).await;
+        let listed_off = t
+            .store
+            .keys_by_ids(&[id.parse().expect("key id")])
+            .await
+            .expect("keys by id")
+            .first()
+            .map(|k| k.end_user_fairshare);
+
+        let _ = t.store.delete_tenant(tenant.id).await;
+
+        assert_eq!(
+            created["key"]["end_user_fairshare"],
+            serde_json::json!(false),
+            "off by default"
+        );
+        assert_eq!(on_status, StatusCode::NO_CONTENT);
+        assert_eq!(after_put["weight"], serde_json::json!(300));
+        assert_eq!(
+            after_put["end_user_fairshare"],
+            serde_json::json!(true),
+            "a whole-key PUT without the field must not turn it off"
+        );
+        assert_eq!(
+            resolved_on,
+            Some(true),
+            "the gateway's resolved key carries it"
+        );
+        assert_eq!(off_status, StatusCode::NO_CONTENT);
+        assert_eq!(listed_off, Some(false));
+    }
+
     /// Fairshare weight and per-model cap are set on a key at creation and
     /// edited afterwards, so both have to survive the round trip through the
     /// store and come back on the response the dashboard renders.
@@ -9832,6 +9996,7 @@ mod tests {
             ("/api/v1/resync", "post"),
             ("/api/v1/replicas/{id}/restart", "post"),
             ("/api/v1/keys/{id}/tracing", "put"),
+            ("/api/v1/keys/{id}/end-user-fairshare", "put"),
             ("/api/v1/tenants/{id}/tracing", "put"),
             ("/api/v1/usage/logs/{request_id}/spans", "get"),
             ("/api/v1/models/{id}/managed/provision-error", "patch"),
@@ -9845,6 +10010,7 @@ mod tests {
         for name in [
             "ResyncReport",
             "SetKeyTracing",
+            "SetKeyEndUserFairshare",
             "ProvisionErrorBody",
             "SpanEntry",
         ] {

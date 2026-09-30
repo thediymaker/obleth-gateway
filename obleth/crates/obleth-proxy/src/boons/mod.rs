@@ -1201,6 +1201,7 @@ pub(crate) fn bill_helper_call(
         session_id_source: "none".to_string(),
         request_type: request_type.to_string(),
         device_id: String::new(),
+        end_user: String::new(),
     });
 }
 
@@ -1252,6 +1253,7 @@ pub(crate) fn bill_image_generation(
         session_id_source: "none".to_string(),
         request_type: request_type.to_string(),
         device_id: String::new(),
+        end_user: String::new(),
     });
 }
 
@@ -1427,6 +1429,7 @@ mod tests {
             key_budget_started_at: None,
             key_weight: 100,
             key_max_in_flight: None,
+            end_user_fairshare: false,
             allowed_models: None,
             internal: false,
             tracing_enabled: false,
@@ -1597,6 +1600,7 @@ mod tests {
                 key_budget_started_at: None,
                 key_weight: 100,
                 key_max_in_flight: None,
+                end_user_fairshare: false,
                 allowed_models: None,
                 internal: false,
                 tracing_enabled: false,
