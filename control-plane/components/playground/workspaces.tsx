@@ -9,6 +9,7 @@ import { CharoPanel } from "@/components/charo/charo-panel";
 import { useCharoStream, type ChatTurn } from "@/components/charo/use-charo-stream";
 import { uuid } from "@/lib/uuid";
 import type { ModelRoute } from "@/lib/obleth";
+import { acceptsImages } from "@/lib/models-model";
 import { formatDurationMs } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import type { PendingAction, PlaygroundSession } from "./playground";
@@ -76,23 +77,25 @@ function rowBadges(stats: Map<number, Stats | null>) {
   return out;
 }
 
-export function UnifiedWorkspace({ storageKey, session, update, models, loading, settingsOpen, onOpenSession, pending, onPendingDone }: {
+export function UnifiedWorkspace({ storageKey, session, update, models, loading, settingsOpen, onOpenSession, pending, onPendingDone, visionBoonActive = false }: {
   storageKey: string; session: PlaygroundSession; update: (patch: Partial<PlaygroundSession>) => void; models: ModelRoute[]; loading: boolean;
   settingsOpen: boolean;
   onOpenSession: (seed: Partial<PlaygroundSession>, action?: PendingAction) => void;
   pending?: PendingAction;
   onPendingDone: () => void;
+  visionBoonActive?: boolean;
 }) {
-  // `supportsVision` decides whether a generated image can be replayed to this
-  // slot's model as a real image part or has to stay a text placeholder — see
-  // `toWire`. Undefined while the registry is still loading, which is the
-  // conservative reading.
+  // `supportsVision` decides whether an image -- the user's own, or a generated
+  // one replayed -- goes to this slot's model as a real image part or has to
+  // stay text; see `toWire`. A model opted into the vision boon takes images
+  // while the boon is on, since the gateway describes them for it. Undefined
+  // while the registry is still loading, which is the conservative reading.
   const options = (index: number) => {
     const name = session.models[index];
     return {
       storageKey: `${storageKey}:${index}`,
       model: name === "charo" ? undefined : name,
-      supportsVision: models.find((m) => m.model_name === name)?.supports_vision,
+      supportsVision: acceptsImages(models.find((m) => m.model_name === name), visionBoonActive),
       generation: session.generation,
     };
   };

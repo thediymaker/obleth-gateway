@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  acceptsImages,
   awaitingFirstPass,
   buildModelRows,
   changedFields,
@@ -189,5 +190,26 @@ describe("tracking changes on the settings form", () => {
     expect(touches(["tag_math"], ["tag_"])).toBe(true);
     expect(touches(["route_bias"], ["tag_"])).toBe(false);
     expect(touches(["max_in_flight"], ["max_in_flight"])).toBe(true);
+  });
+});
+
+describe("acceptsImages", () => {
+  const text = { supports_vision: false, boons: [] as string[] };
+  const viaBoon = { supports_vision: false, boons: ["vision", "speculation"] };
+  const native = { supports_vision: true, boons: [] as string[] };
+
+  it("takes images a model reads itself, whatever the boon", () => {
+    expect(acceptsImages(native, false)).toBe(true);
+    expect(acceptsImages(native, true)).toBe(true);
+  });
+
+  it("takes images through the vision boon only while the boon is on", () => {
+    expect(acceptsImages(viaBoon, true)).toBe(true);
+    expect(acceptsImages(viaBoon, false)).toBe(false);
+  });
+
+  it("refuses them for a text-only model, and doesn't guess before the model is known", () => {
+    expect(acceptsImages(text, true)).toBe(false);
+    expect(acceptsImages(undefined, true)).toBeUndefined();
   });
 });

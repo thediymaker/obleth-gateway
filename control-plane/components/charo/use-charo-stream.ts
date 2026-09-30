@@ -79,7 +79,8 @@ const TRACE_POLL_TRIES = 12;
 /**
  * Flatten turns into wire messages.
  *
- * `supportsVision` describes the model this history is bound for, and is
+ * `supportsVision` says whether the model this history is bound for takes
+ * images -- natively, or through the gateway's vision boon -- and is
  * `undefined` when that is not known (the brain path picks its own model):
  *
  * - Generated-image payloads are stripped from assistant text in every case —

@@ -94,11 +94,13 @@ const fresh = (): PlaygroundSession => ({
   launcher: true, updatedAt: Date.now(),
 });
 
-export function Playground({ scope, gatewayBase = "http://localhost:8080", openModel }: {
+export function Playground({ scope, gatewayBase = "http://localhost:8080", openModel, visionBoonActive = false }: {
   scope: string;
   gatewayBase?: string;
   /** From `?model=`: open a new session on this model (the Models page's "Try in Playground"). */
   openModel?: { name: string; type: string };
+  /** The vision boon is on, so models opted into it take images (see `acceptsImages`). */
+  visionBoonActive?: boolean;
 }) {
   const root = `obleth-playground:${encodeURIComponent(scope)}`;
   const [sessions, setSessions] = useState<PlaygroundSession[]>([]);
@@ -265,7 +267,7 @@ export function Playground({ scope, gatewayBase = "http://localhost:8080", openM
             ? <ImageWorkspace storageKey={`${root}:${session.id}:image`} session={session} update={update} models={models} loading={loading} settingsOpen={settingsOpen} />
             : session.mode === "verdicts"
             ? <VerdictsWorkspace session={session} update={update} models={models} loading={loading} />
-            : <UnifiedWorkspace storageKey={`${root}:${session.id}:compare`} session={session} update={update} models={models} loading={loading} settingsOpen={settingsOpen} onOpenSession={openSession} pending={sessionPending} onPendingDone={() => setPending(null)} />}
+            : <UnifiedWorkspace storageKey={`${root}:${session.id}:compare`} session={session} update={update} models={models} loading={loading} settingsOpen={settingsOpen} onOpenSession={openSession} pending={sessionPending} onPendingDone={() => setPending(null)} visionBoonActive={visionBoonActive} />}
         </div>
       </div>
       <GetCode open={codeOpen} onOpenChange={setCodeOpen} session={session} gatewayBase={gatewayBase} />

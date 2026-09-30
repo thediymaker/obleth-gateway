@@ -499,22 +499,26 @@ impl BoonEngine {
             && settings.vision.active()
         {
             let vision_start = crate::tracer::now_ms();
-            let images_described =
-                vision::apply(state, &settings.vision, key, session_id, json).await;
+            let images = vision::apply(state, &settings.vision, key, session_id, json).await;
             if let Some(t) = tracer.as_deref_mut() {
                 t.record_elapsed(
                     "boon:vision",
                     "proxy_request",
                     vision_start,
-                    "ok",
+                    // Any image that only got a note is worth seeing in the trace.
+                    if images.noted > 0 { "error" } else { "ok" },
                     serde_json::json!({
-                        "images": images_described,
+                        "images": images.described,
+                        "noted": images.noted,
                         "describer": settings.vision.fallback_model.as_deref().unwrap_or(""),
                     }),
                 );
             }
-            if images_described > 0 {
+            // Either way the body changed: no image part reaches the model.
+            if images.described + images.noted > 0 {
                 outcome.rewritten = true;
+            }
+            if images.described > 0 {
                 outcome.applied.push("vision");
             }
         }
