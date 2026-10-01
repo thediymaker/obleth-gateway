@@ -85,6 +85,8 @@ services:
       nofile: { soft: 262144, hard: 262144 }
     volumes:
       - "chdata:/var/lib/clickhouse"
+      # Keeps a week of ClickHouse's own logs instead of all of them.
+      - "./clickhouse/system-logs.xml:/etc/clickhouse-server/config.d/system-logs.xml:ro"
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
       interval: 5s
