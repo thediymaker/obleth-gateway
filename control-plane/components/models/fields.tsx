@@ -13,7 +13,7 @@ import { cn, parseTagLevel, TAG_LEVEL_LABELS } from "@/lib/utils";
 
 // Fixed routing-tag vocabulary; mirrors obleth-config `MODEL_TAGS`. Used by the
 // `auto` router to match requests to models.
-export const MODEL_TAGS = ["coding", "general", "reasoning", "math", "vision", "long-context", "fast", "creative"] as const;
+export const MODEL_TAGS = ["coding", "general", "reasoning", "math", "vision", "long-context", "fast", "creative", "writing"] as const;
 
 // Fixed boon vocabulary; mirrors obleth-config `MODEL_BOONS`. A boon grants a
 // capability the model lacks natively. Each boon is configured globally in

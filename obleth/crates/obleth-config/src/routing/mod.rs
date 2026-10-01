@@ -1043,6 +1043,41 @@ pub fn heuristic_intent(json: &serde_json::Value, est_input_tokens: u64) -> Inte
         push("coding");
     }
 
+    // Prose to write or edit. Phrases rather than single words, and never
+    // alongside a code signal: "write" and "email" alone match "write a SQL
+    // query" and "validate an email address" just as well.
+    let writing_signal = !code_signal
+        && [
+            "short story",
+            "poem",
+            "sonnet",
+            "essay",
+            "cover letter",
+            "personal statement",
+            "an email",
+            "email to",
+            "a letter",
+            "blog post",
+            "newsletter",
+            "press release",
+            "linkedin post",
+            "rewrite",
+            "rephrase",
+            "reword",
+            "proofread",
+            "tighten this",
+            "polish this",
+            "edit this",
+            "fix the grammar",
+            "more diplomatic",
+            "more professional",
+        ]
+        .iter()
+        .any(|k| lower.contains(k));
+    if writing_signal {
+        push("writing");
+    }
+
     let math_signal = [
         "solve",
         "equation",
@@ -1576,6 +1611,36 @@ mod tests {
         let body = serde_json::json!({ "messages": [{"role": "user", "content": "hello"}] });
         let tags = heuristic_intent(&body, 40_000).tags;
         assert!(tags.contains(&"long-context".to_string()));
+    }
+
+    #[test]
+    fn heuristic_intent_tags_prose_to_write_or_edit() {
+        for prompt in [
+            "Draft an email to my thesis committee thanking them.",
+            "Can you proofread my cover letter?",
+            "Rewrite this paragraph so it reads more naturally.",
+            "Make this message more diplomatic: you missed the deadline again.",
+        ] {
+            let body = serde_json::json!({ "messages": [{"role": "user", "content": prompt}] });
+            let tags = heuristic_intent(&body, 10).tags;
+            assert_eq!(tags, vec!["writing".to_string()], "{prompt}");
+        }
+    }
+
+    #[test]
+    fn heuristic_intent_does_not_call_code_writing() {
+        for prompt in [
+            "Write a SQL query that counts orders per customer.",
+            "Rewrite this python function to use a generator.",
+            "Write a regex that validates an email address.",
+        ] {
+            let body = serde_json::json!({ "messages": [{"role": "user", "content": prompt}] });
+            let tags = heuristic_intent(&body, 10).tags;
+            assert!(tags.contains(&"coding".to_string()), "{prompt}");
+            assert!(!tags.contains(&"writing".to_string()), "{prompt}");
+        }
+        let body = serde_json::json!({ "messages": [{"role": "user", "content": "What is the capital of France?"}] });
+        assert!(heuristic_intent(&body, 10).tags.is_empty());
     }
 
     #[test]
