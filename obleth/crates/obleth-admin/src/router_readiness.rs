@@ -46,7 +46,7 @@ pub struct RouterReadiness {
 /// than a hole elsewhere: even with the classifier off, requests will be
 /// tagged with them, and an uncovered tag dilutes every candidate's tag score
 /// equally — the ranking silently degrades to price and capacity.
-const HEURISTIC_TAGS: [&str; 4] = ["coding", "math", "vision", "long-context"];
+const HEURISTIC_TAGS: [&str; 5] = ["coding", "math", "vision", "long-context", "writing"];
 
 /// A model whose observed average answer runs past this many tokens is worth
 /// a warning when it sits in the auto pool: per-token prices make it look

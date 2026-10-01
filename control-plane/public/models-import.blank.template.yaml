@@ -83,7 +83,7 @@
 #   tags                      (optional) Routing tags for the auto router.
 #                                        Allowed: coding, general, reasoning,
 #                                        math, vision, long-context, fast,
-#                                        creative. The `vision` tag also marks
+#                                        creative, writing. The `vision` tag also marks
 #                                        native image support (eligible as a
 #                                        system-wide vision describer).
 #   boons                     (optional) Gateway boons granted to this model

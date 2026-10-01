@@ -1376,7 +1376,14 @@ pub const MODEL_TAGS: &[&str] = &[
     "long-context",
     "fast",
     "creative",
+    "writing",
 ];
+
+/// Tag pairs a request should not carry together. "Write" is the verb of both
+/// kinds of request, so an intent classifier asked about `writing` says yes to
+/// "write a SQL query" nearly as readily as to "write a cover letter". When
+/// both clear the threshold, the weaker of the pair is dropped.
+pub const EXCLUSIVE_TAG_PAIRS: &[(&str, &str)] = &[("coding", "writing")];
 
 /// True when `tag` is part of the fixed [`MODEL_TAGS`] vocabulary.
 pub fn is_valid_tag(tag: &str) -> bool {
