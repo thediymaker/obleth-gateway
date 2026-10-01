@@ -89,6 +89,11 @@ obleth:
   modelHealthTimeoutSecs: 30
   modelHealthRetentionDays: 30
   usageRetentionDays: 180
+  # Milliseconds each gateway pod buffers usage rows and trace spans before it
+  # inserts them into ClickHouse (100-60000). ClickHouse rewrites every insert
+  # in later merges, so fewer, larger inserts cost much less disk I/O; rows
+  # reach the dashboard up to this long after a request finishes.
+  telemetryFlushIntervalMs: 5000
   # On shutdown the gateway stops accepting and waits this long for in-flight
   # requests (including streams). Keep it below the pod's
   # terminationGracePeriodSeconds (345) minus the 5s preStop delay, the 20s

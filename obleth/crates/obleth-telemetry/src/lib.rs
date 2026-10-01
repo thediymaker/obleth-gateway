@@ -18,7 +18,10 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 const BATCH_MAX: usize = 500;
-const FLUSH_INTERVAL: Duration = Duration::from_millis(1000);
+/// WAL replay keeps its own one-second cadence, independent of the flush
+/// interval, so a long flush interval doesn't slow recovery after an outage.
+/// Replay batches are already large (up to 1 MiB of rows each).
+const REPLAY_INTERVAL: Duration = Duration::from_secs(1);
 /// Bound on the reachability probe that precedes schema setup: the ClickHouse
 /// client has no connect timeout, and a blackholed host would otherwise hang
 /// boot (or the flusher) for the OS TCP timeout.
@@ -217,6 +220,9 @@ impl TelemetrySink {
     /// retries schema setup with backoff before its first insert. Only an
     /// invalid database name is an error.
     ///
+    /// Rows are inserted every `flush_interval`, or sooner once `BATCH_MAX`
+    /// are buffered.
+    ///
     /// `_fail_open` is ignored: telemetry always spills to the WAL on failure.
     /// `OBLETH_FAIL_OPEN` governs budget admission only, and a ledger outage
     /// must never cost accounting data. Kept so callers compile unchanged.
@@ -226,6 +232,7 @@ impl TelemetrySink {
         user: &str,
         password: &str,
         wal_path: &str,
+        flush_interval: Duration,
         _fail_open: bool,
     ) -> Result<Self, TelemetryError> {
         if !is_valid_identifier(database) {
@@ -261,6 +268,7 @@ impl TelemetrySink {
             schema_ready: schema_ready.clone(),
             wal: wal::Wal::new(wal_path),
             wal_path: wal_path.to_string(),
+            flush_interval,
             backoff: Backoff::default(),
             replay_backoff: Backoff::default(),
             stats: stats.clone(),
@@ -270,6 +278,7 @@ impl TelemetrySink {
         let spans_flusher = SpansFlusher {
             client,
             schema_ready: schema_ready.clone(),
+            flush_interval,
             stats: stats.clone(),
         };
         let (drain, drain_rx) = mpsc::channel(4);
@@ -352,6 +361,7 @@ struct Flusher {
     /// Kept alongside `wal` (which doesn't expose its path) so a persistent
     /// schema failure can name where usage is spilling to.
     wal_path: String,
+    flush_interval: Duration,
     backoff: Backoff,
     replay_backoff: Backoff,
     stats: Arc<TelemetryStats>,
@@ -369,8 +379,15 @@ impl Flusher {
         mut drain: mpsc::Receiver<oneshot::Sender<()>>,
     ) {
         let mut buf: Vec<UsageRecord> = Vec::with_capacity(BATCH_MAX);
-        let mut ticker = tokio::time::interval(FLUSH_INTERVAL);
+        // The first flush is one interval after boot; replay starts at once so
+        // spill left by a previous run goes back to ClickHouse right away.
+        let mut ticker = tokio::time::interval_at(
+            tokio::time::Instant::now() + self.flush_interval,
+            self.flush_interval,
+        );
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut replay = tokio::time::interval(REPLAY_INTERVAL);
+        replay.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 Some(ack) = drain.recv() => {
@@ -402,6 +419,8 @@ impl Flusher {
                 }
                 _ = ticker.tick() => {
                     self.flush(&mut buf, true).await;
+                }
+                _ = replay.tick() => {
                     self.replay_wal().await;
                 }
             }
@@ -585,6 +604,7 @@ impl Backoff {
 struct SpansFlusher {
     client: Client,
     schema_ready: Arc<AtomicBool>,
+    flush_interval: Duration,
     #[allow(dead_code)]
     stats: Arc<TelemetryStats>,
 }
@@ -596,7 +616,7 @@ impl SpansFlusher {
         mut drain: mpsc::Receiver<oneshot::Sender<()>>,
     ) {
         let mut buf: Vec<SpanRecord> = Vec::with_capacity(BATCH_MAX);
-        let mut ticker = tokio::time::interval(FLUSH_INTERVAL);
+        let mut ticker = tokio::time::interval(self.flush_interval);
         loop {
             tokio::select! {
                 Some(ack) = drain.recv() => {
@@ -1152,6 +1172,7 @@ mod conv_tests {
             "default",
             "",
             wal_path.to_str().unwrap(),
+            Duration::from_millis(100),
             true,
         )
         .await
@@ -1179,6 +1200,7 @@ mod conv_tests {
             "default",
             "",
             wal_path.to_str().unwrap(),
+            Duration::from_millis(100),
             true,
         )
         .await
@@ -1196,6 +1218,37 @@ mod conv_tests {
         let _ = tokio::fs::remove_dir_all(&directory).await;
     }
 
+    /// Rows are batched for the flush interval even though WAL replay ticks
+    /// every second; a one-row insert per tick is what floods ClickHouse with
+    /// parts to merge.
+    #[tokio::test]
+    async fn rows_wait_for_the_flush_interval() {
+        let directory =
+            std::env::temp_dir().join(format!("obleth-sink-test-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir(&directory).await.unwrap();
+        let wal_path = directory.join("usage.jsonl");
+        let sink = TelemetrySink::start(
+            "http://127.0.0.1:1",
+            "obleth",
+            "default",
+            "",
+            wal_path.to_str().unwrap(),
+            Duration::from_secs(60),
+            true,
+        )
+        .await
+        .unwrap();
+        for _ in 0..3 {
+            sink.record(record());
+        }
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let stats = sink.stats();
+        assert_eq!(stats.waled.load(Ordering::Relaxed), 0);
+        sink.shutdown().await;
+        assert_eq!(stats.waled.load(Ordering::Relaxed), 3);
+        let _ = tokio::fs::remove_dir_all(&directory).await;
+    }
+
     #[tokio::test]
     async fn spills_even_when_fail_open_is_false() {
         let directory =
@@ -1208,6 +1261,7 @@ mod conv_tests {
             "default",
             "",
             wal_path.to_str().unwrap(),
+            Duration::from_millis(100),
             false,
         )
         .await
@@ -1230,6 +1284,7 @@ mod conv_tests {
             "default",
             "",
             "unused",
+            Duration::from_millis(100),
             true,
         )
         .await;
@@ -1244,6 +1299,7 @@ mod conv_tests {
             "default",
             "",
             "unused",
+            Duration::from_millis(100),
             true,
         )
         .await
@@ -1265,6 +1321,7 @@ mod conv_tests {
             schema_ready: Arc::new(AtomicBool::new(false)),
             wal: wal::Wal::new("unused-test-wal"),
             wal_path: "unused-test-wal".to_string(),
+            flush_interval: Duration::from_millis(100),
             backoff: Backoff::default(),
             replay_backoff: Backoff::default(),
             stats: Arc::default(),
@@ -1454,6 +1511,7 @@ mod clickhouse_tests {
             schema_ready: Arc::new(AtomicBool::new(true)),
             wal: wal::Wal::new("unused-test-wal"),
             wal_path: "unused-test-wal".to_string(),
+            flush_interval: Duration::from_millis(100),
             backoff: Backoff::default(),
             replay_backoff: Backoff::default(),
             stats: Arc::default(),
@@ -1563,6 +1621,7 @@ mod clickhouse_tests {
             "default",
             "",
             wal_path.to_str().unwrap(),
+            Duration::from_millis(100),
             true,
         )
         .await

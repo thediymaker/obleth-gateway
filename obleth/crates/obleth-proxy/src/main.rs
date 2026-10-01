@@ -76,6 +76,7 @@ async fn main() -> anyhow::Result<()> {
         &cfg.clickhouse_user,
         &cfg.clickhouse_password,
         &cfg.wal_path,
+        cfg.telemetry_flush_interval,
         cfg.fail_open,
     )
     .await?;
