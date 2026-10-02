@@ -16,6 +16,7 @@ mod proxy;
 mod replicas;
 mod responses;
 mod router;
+mod search;
 mod state;
 mod verdicts;
 mod videos;
@@ -609,6 +610,18 @@ async fn main() -> anyhow::Result<()> {
         .route(
             verdicts::VERDICTS_PATH,
             axum::routing::post(verdicts::handler),
+        )
+        // Native web search (Perplexity shape), in both spellings LiteLLM
+        // serves. `GET /v1/search/tools` shares the `:tool` pattern.
+        .route(search::SEARCH_PATH, axum::routing::post(search::search))
+        .route(
+            "/v1/search/:tool",
+            axum::routing::post(search::search_named).get(search::tools),
+        )
+        .route("/search", axum::routing::post(search::search))
+        .route(
+            "/search/:tool",
+            axum::routing::post(search::search_named).get(search::tools),
         )
         .route("/mcp/:server", axum::routing::any(mcp::mcp_handler))
         .route("/mcp/:server/*rest", axum::routing::any(mcp::mcp_handler))

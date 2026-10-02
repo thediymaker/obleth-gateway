@@ -28,6 +28,7 @@ export function guessModelType(upstream: string): string {
   if (/tts|speech|kokoro|voice/.test(s)) return "audio_speech";
   if (/wan-?\d|video|hunyuanvideo|ltx|mochi/.test(s)) return "video";
   if (/flux|sdxl|stable-diffusion|diffusion|dall-?e|imagen|qwen-image/.test(s)) return "image";
+  if (/searx/.test(s)) return "search";
   return "chat";
 }
 

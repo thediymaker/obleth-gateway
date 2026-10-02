@@ -77,6 +77,7 @@ describe("types, places and prices", () => {
     expect(typeGroup("audio_speech")).toBe("audio");
     expect(typeGroup("audio_transcription")).toBe("audio");
     expect(typeGroup("image")).toBe("image");
+    expect(typeGroup("search")).toBe("search");
     expect(typeGroup("something-new")).toBe("chat");
   });
 
@@ -92,6 +93,8 @@ describe("types, places and prices", () => {
     expect(priceLabel(model({ model_type: "video", cost_per_video: 2 }))).toBe("$2 / video");
     expect(priceLabel(model({ model_type: "audio_transcription", cost_per_audio_second: 0.0001 }))).toBe("$0.006 / min");
     expect(priceLabel(model())).toBeNull();
+    // A search costs nothing, whatever token prices a row carries.
+    expect(priceLabel(model({ model_type: "search", input_cost_per_token: 0.000001 }))).toBeNull();
   });
 
   it("writes context windows the way people say them", () => {

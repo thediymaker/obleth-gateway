@@ -1791,8 +1791,8 @@ pub struct ModelRouteView {
     pub upstream_header_names: Vec<String>,
     /// Modality from the fixed `MODEL_TYPES` vocabulary. Determines which
     /// OpenAI endpoint this model serves (`chat`, `embedding`,
-    /// `audio_transcription`, `audio_speech`, `image`, `video`). Defaults to
-    /// `chat`.
+    /// `audio_transcription`, `audio_speech`, `image`, `video`, or `search`
+    /// for a web search tool on `/v1/search`). Defaults to `chat`.
     pub model_type: String,
     /// Weight/activation format this deployment serves, from the fixed
     /// `QUANTIZATIONS` vocabulary. Descriptive only — it never affects
