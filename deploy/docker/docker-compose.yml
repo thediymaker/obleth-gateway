@@ -70,6 +70,8 @@ services:
       - "chdata:/var/lib/clickhouse"
       # Built-in Prometheus exposition on :9363/metrics (scraped by Prometheus).
       - "./clickhouse/prometheus.xml:/etc/clickhouse-server/config.d/prometheus.xml:ro"
+      # Keeps a week of ClickHouse's own logs instead of all of them.
+      - "./clickhouse/system-logs.xml:/etc/clickhouse-server/config.d/system-logs.xml:ro"
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
       interval: 3s

@@ -343,6 +343,14 @@ clickhouse:
   resources:
     requests: { cpu: "500m", memory: "2Gi" }
     limits: { cpu: "1", memory: "4Gi" }
+  # ClickHouse's own logs (query_log, part_log, metric_log, text_log, ...).
+  # The stock image keeps them forever and logs at trace, so on a busy
+  # gateway they outgrow the usage ledger many times over. Each system log
+  # table drops days older than this, and text_log keeps warnings and errors.
+  systemLogRetentionDays: 7
+  # Server log level (none, fatal, critical, error, warning, notice,
+  # information, debug, trace).
+  logLevel: information
   # PVC-backed storage for the usage ledger. Disable for ephemeral test envs
   # (usage history is lost on restart).
   persistence:

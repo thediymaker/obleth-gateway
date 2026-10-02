@@ -120,3 +120,35 @@ account.
 {{- $cd := .Values.obleth.capacityDiscovery | default dict -}}
 {{- if and $cd.enabled $cd.namespaces -}}true{{- end -}}
 {{- end -}}
+
+{{/*
+config.d override for the bundled ClickHouse. The stock image logs at trace
+and keeps its own system log tables (query_log, text_log, metric_log, ...)
+forever, which on a busy gateway outgrows the usage ledger many times over.
+Each listed table is partitioned by day and expires after
+clickhouse.systemLogRetentionDays; with ttl_only_drop_parts an expired day is
+dropped whole rather than rewritten. text_log keeps warnings and errors only.
+Tables the image already bounds (asynchronous_insert_log, blob_storage_log)
+and opentelemetry_span_log, whose custom engine takes no TTL, are left alone.
+*/}}
+{{- define "obleth.clickhouseConfig" -}}
+{{- $days := int .Values.clickhouse.systemLogRetentionDays -}}
+{{- if lt $days 1 -}}
+{{- fail "clickhouse.systemLogRetentionDays must be at least 1" -}}
+{{- end -}}
+<clickhouse>
+    <logger>
+        <level>{{ .Values.clickhouse.logLevel | default "information" }}</level>
+    </logger>
+{{- range list "query_log" "query_thread_log" "query_views_log" "part_log" "trace_log" "text_log" "metric_log" "error_log" "asynchronous_metric_log" "processors_profile_log" "backup_log" }}
+    <{{ . }}>
+        <partition_by>event_date</partition_by>
+        <ttl>event_date + INTERVAL {{ $days }} DAY DELETE</ttl>
+        <settings>ttl_only_drop_parts = 1</settings>
+        {{- if eq . "text_log" }}
+        <level>warning</level>
+        {{- end }}
+    </{{ . }}>
+{{- end }}
+</clickhouse>
+{{- end -}}

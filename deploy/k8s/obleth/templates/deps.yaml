@@ -150,6 +150,15 @@ spec:
 {{- end }}
 {{- if .Values.clickhouse.enabled }}
 ---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-clickhouse-config
+  labels: {{- include "obleth.labels" . | nindent 4 }}
+data:
+  obleth.xml: |
+{{ include "obleth.clickhouseConfig" . | indent 4 }}
+---
 {{- if .Values.clickhouse.persistence.enabled }}
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -183,6 +192,8 @@ spec:
         # Restart ClickHouse with the new CLICKHOUSE_PASSWORD when the
         # chart-rendered Secret changes, in step with the gateway.
         checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        # ClickHouse reads its system log settings at startup.
+        checksum/config: {{ include "obleth.clickhouseConfig" . | sha256sum }}
     spec:
       containers:
         - name: clickhouse
@@ -202,8 +213,13 @@ spec:
             periodSeconds: 5
             timeoutSeconds: 3
           resources: {{- toYaml .Values.clickhouse.resources | nindent 12 }}
-          volumeMounts: [{ name: data, mountPath: /var/lib/clickhouse }]
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/clickhouse }
+            - { name: config, mountPath: /etc/clickhouse-server/config.d/obleth.xml, subPath: obleth.xml, readOnly: true }
       volumes:
+        - name: config
+          configMap:
+            name: {{ .Release.Name }}-clickhouse-config
         - name: data
         {{- if .Values.clickhouse.persistence.enabled }}
           persistentVolumeClaim:
