@@ -31,6 +31,30 @@ function deltaText(chunk: unknown): string {
   return typeof delta?.content === "string" ? delta.content : "";
 }
 
+/**
+ * Pull the reasoning delta out of one streaming chunk. Reasoning parsers put
+ * a model's thinking in its own field: `reasoning` on current vLLM and SGLang,
+ * `reasoning_content` on older servers.
+ */
+function deltaReasoning(chunk: unknown): string {
+  if (!chunk || typeof chunk !== "object") return "";
+  const choices = (chunk as { choices?: unknown }).choices;
+  if (!Array.isArray(choices) || choices.length === 0) return "";
+  const delta = (choices[0] as { delta?: { reasoning?: unknown; reasoning_content?: unknown } }).delta;
+  const value = delta?.reasoning ?? delta?.reasoning_content;
+  return typeof value === "string" ? value : "";
+}
+
+/** The reasoning of a non-streaming chat-completion JSON body (see `deltaReasoning`). */
+function messageReasoning(body: unknown): string {
+  if (!body || typeof body !== "object") return "";
+  const choices = (body as { choices?: unknown }).choices;
+  if (!Array.isArray(choices) || choices.length === 0) return "";
+  const message = (choices[0] as { message?: { reasoning?: unknown; reasoning_content?: unknown } }).message;
+  const value = message?.reasoning ?? message?.reasoning_content;
+  return typeof value === "string" ? value : "";
+}
+
 /** Pull the assistant text out of a non-streaming chat-completion JSON body. */
 function messageContent(body: unknown): string {
   if (!body || typeof body !== "object") return "";
@@ -175,10 +199,12 @@ export async function POST(req: NextRequest) {
             /* not JSON */
           }
           const content = messageContent(parsed);
+          const reasoning = messageReasoning(parsed);
           observe(parsed);
-          if (res.ok && content) {
+          if (res.ok && (content || reasoning)) {
             ttftMs = performance.now() - started;
-            send("token", { text: content });
+            if (reasoning) send("reasoning", { text: reasoning });
+            if (content) send("token", { text: content });
           } else {
             send("error", {
               statusCode: res.status,
@@ -211,6 +237,10 @@ export async function POST(req: NextRequest) {
                 try {
                   const parsed = JSON.parse(payload);
                   observe(parsed);
+                  // The first token of either kind is the first token: a
+                  // reasoning model's answer starts after it has thought.
+                  const reasoning = deltaReasoning(parsed);
+                  if (reasoning) { ttftMs ??= performance.now() - started; send("reasoning", { text: reasoning }); }
                   const text = deltaText(parsed);
                   if (text) { ttftMs ??= performance.now() - started; send("token", { text }); }
                 } catch {

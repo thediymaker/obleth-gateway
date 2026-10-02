@@ -15,6 +15,7 @@ import { ActivityCards } from "./activity-launcher";
 import { ensureActivitiesRegistered, getActivity } from "@/lib/charo/activities";
 import { coalesceDocsResults } from "@/lib/charo/docs/coalesce-docs-results";
 import { CharoMarkdown } from "./markdown";
+import { ThinkingBlock } from "./thinking-block";
 import type { useCharoStream } from "./use-charo-stream";
 
 type Stream = ReturnType<typeof useCharoStream>;
@@ -315,7 +316,8 @@ export function CharoPanel({
           const hasLiveCaps = (m.liveCapabilities?.length ?? 0) > 0 && (m.toolResults?.length ?? 0) === 0;
           const hasToolResults = (m.toolResults?.length ?? 0) > 0;
           const showBubble = !!content || !!m.image || (m.images?.length ?? 0) > 0 || !!m.error;
-          if (!showBubble && !hasTrace && !hasLiveBench && !hasLiveCaps && !hasToolResults && !m.pendingConfirm) {
+          const hasReasoning = !!m.reasoning?.trim();
+          if (!showBubble && !hasReasoning && !hasTrace && !hasLiveBench && !hasLiveCaps && !hasToolResults && !m.pendingConfirm) {
             // Streaming but nothing to show yet (waiting on the first token or a
             // tool's first progress event): show the typing indicator, not dead air.
             if (!m.streaming) return null;
@@ -346,6 +348,7 @@ export function CharoPanel({
                 const Renderer = resultRenderer(tr.type);
                 return <div key={i} className="w-full"><Renderer data={tr.data} /></div>;
               })}
+              {hasReasoning && <ThinkingBlock text={m.reasoning!} active={!!m.streaming && !content} ms={m.reasoningMs} />}
               {showBubble && (
                 <div className={assistantBubbleClass}>
                   {m.image && (
@@ -365,7 +368,7 @@ export function CharoPanel({
                   {m.error && <p className="mt-1 text-[13px] text-destructive">{m.error}</p>}
                 </div>
               )}
-              {!content && !m.error && m.streaming && (
+              {!content && !m.error && m.streaming && !hasReasoning && (
                 <div className={assistantBubbleClass}>
                   <TypingDots />
                 </div>
