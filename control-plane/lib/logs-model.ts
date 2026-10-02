@@ -16,7 +16,7 @@ export const LOG_WINDOWS = [
 
 export type LogWindowId = (typeof LOG_WINDOWS)[number]["id"];
 
-export const REQUEST_TYPES = ["chat", "completion", "responses", "embedding", "audio", "image", "video", "rerank", "moderation", "other"] as const;
+export const REQUEST_TYPES = ["chat", "completion", "responses", "embedding", "audio", "image", "video", "rerank", "moderation", "search", "other"] as const;
 
 export interface LogFilters {
   /** A preset window, or `custom` with `sinceMs`/`untilMs` (a drag on the chart). */

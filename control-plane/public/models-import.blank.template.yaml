@@ -35,6 +35,8 @@
 #                                          image               -> /v1/images/generations
 #                                          video               -> /v1/videos (create, poll,
 #                                                                 download, delete, list)
+#                                          search              -> /v1/search (a web search tool:
+#                                                                 api_base is a SearXNG root)
 #                                        Only `chat` models take part in `auto` routing.
 #   input_cost_per_token      (optional) USD per input token.  Default 0.
 #                                        Used by chat + embedding models.

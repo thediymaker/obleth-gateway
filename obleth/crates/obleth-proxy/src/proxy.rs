@@ -1293,6 +1293,17 @@ async fn proxy_handler_inner(
             return error_json(StatusCode::FORBIDDEN, "model is disabled");
         }
     }
+    // A search tool answers only on its own endpoint; forwarding a chat (or
+    // any other) body to the search upstream would come back as its 404.
+    if route
+        .as_ref()
+        .is_some_and(|r| r.model_type == obleth_config::SEARCH_MODEL_TYPE)
+    {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            &format!("'{model}' is a search tool: call POST /v1/search"),
+        );
+    }
     // ---- reject unmapped passthrough (noise / info-leak guard) ----
     // A request that resolved to no registered model (`route` is None) and whose
     // path is not a recognized OpenAI endpoint would otherwise be forwarded
@@ -4080,7 +4091,7 @@ fn registry_models_list(
 ) -> serde_json::Value {
     let mut data: Vec<serde_json::Value> = candidates
         .iter()
-        .filter(|c| c.model.enabled)
+        .filter(|c| c.model.enabled && is_listed_model_type(&c.model.model_type))
         .filter(|c| model_visible(allowed, &c.model.model_name))
         .map(|c| model_entry(&ModelFacts::of(&c.model)))
         .collect();
@@ -4141,6 +4152,10 @@ fn model_facts_index(
 ) -> std::collections::HashMap<String, std::sync::Arc<ModelFacts>> {
     let mut by_name: std::collections::HashMap<String, std::sync::Arc<ModelFacts>> =
         std::collections::HashMap::new();
+    let candidates: Vec<&obleth_config::routing::Candidate> = candidates
+        .iter()
+        .filter(|c| is_listed_model_type(&c.model.model_type))
+        .collect();
     let facts: Vec<std::sync::Arc<ModelFacts>> = candidates
         .iter()
         .map(|c| std::sync::Arc::new(ModelFacts::of(&c.model)))
@@ -4161,6 +4176,13 @@ fn model_facts_index(
         by_name.insert(f.model_name.clone(), f);
     }
     by_name
+}
+
+/// Whether routes of `model_type` appear on the model discovery endpoints.
+/// Search tools do not: they are not models a chat client can call, and are
+/// listed on `GET /v1/search/tools` instead.
+fn is_listed_model_type(model_type: &str) -> bool {
+    model_type != obleth_config::SEARCH_MODEL_TYPE
 }
 
 /// The LiteLLM-convention spelling of a modality, which many OpenAI-compatible
@@ -4241,7 +4263,7 @@ fn model_info_response(state: &AppState, resolved: &ResolvedKey) -> Response<Bod
     let allowed = allowed_models_for(resolved);
     let data: Vec<serde_json::Value> = candidates
         .iter()
-        .filter(|c| c.model.enabled)
+        .filter(|c| c.model.enabled && is_listed_model_type(&c.model.model_type))
         .filter(|c| model_visible(allowed, &c.model.model_name))
         .map(|c| model_info_entry(&c.model, c.healthy))
         .collect();
@@ -4886,6 +4908,8 @@ fn request_type_for_path(path: &str) -> &'static str {
         "rerank"
     } else if path.ends_with("/moderations") {
         "moderation"
+    } else if crate::search::is_search_path(path) {
+        "search"
     } else {
         "other"
     }
@@ -5631,6 +5655,13 @@ mod tests {
         // `/v1/verdicts` is served by its own route (see main.rs), but the
         // ledger label still derives from the path like every other class.
         assert_eq!(request_type_for_path("/v1/verdicts"), "verdict");
+        assert_eq!(request_type_for_path("/v1/search"), "search");
+        assert_eq!(request_type_for_path("/v1/search/web"), "search");
+        // Another API's search sub-resource is not ours.
+        assert_eq!(
+            request_type_for_path("/v1/vector_stores/vs_1/search"),
+            "other"
+        );
         // Not confused with the legacy completions suffix match.
         assert_eq!(request_type_for_path("/v1/completions"), "completion");
     }
@@ -5877,6 +5908,26 @@ mod tests {
         assert_eq!(data[1]["mode"], "image_generation");
         assert_eq!(glm["mode"], "chat");
         assert!(!list.to_string().contains("glm-5-3-mxfp4"));
+    }
+
+    #[test]
+    fn search_tools_are_not_listed_as_models() {
+        use super::{model_facts_index, registry_models_list};
+        let candidates = vec![
+            candidate("glm-5-3", "glm-5-3", "chat", "none", &[], &[]),
+            candidate("web-search", "searxng", "search", "unknown", &[], &[]),
+        ];
+        let ids: Vec<String> = registry_models_list(&candidates, None)["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, vec!["glm-5-3"]);
+        // Nor found by a detail lookup, under its name or its upstream's.
+        let index = model_facts_index(&candidates);
+        assert!(!index.contains_key("web-search"));
+        assert!(!index.contains_key("searxng"));
     }
 
     #[test]

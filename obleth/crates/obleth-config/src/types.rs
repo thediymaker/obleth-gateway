@@ -1463,6 +1463,9 @@ where
 /// Fixed vocabulary of model modalities. Each value maps to a family of
 /// OpenAI-compatible endpoints the model serves (see
 /// `endpoint_matches_model_type` in the proxy). `chat` is the default.
+///
+/// `search` is the odd one out: not a model but a web search tool, served on
+/// `POST /v1/search` from an upstream that speaks the SearXNG JSON API.
 pub const MODEL_TYPES: &[&str] = &[
     "chat",
     "embedding",
@@ -1470,10 +1473,26 @@ pub const MODEL_TYPES: &[&str] = &[
     "audio_speech",
     "image",
     "video",
+    "search",
 ];
 
 /// The default modality assigned to a model when none is specified.
 pub const DEFAULT_MODEL_TYPE: &str = "chat";
+
+/// The modality of web search tools (see [`MODEL_TYPES`]).
+pub const SEARCH_MODEL_TYPE: &str = "search";
+
+/// The SearXNG search URL for a `search` route's `api_base`: the instance root,
+/// with or without a trailing slash, gets `/search` appended; a base that
+/// already ends in `/search` is used as is.
+pub fn search_url(api_base: &str) -> String {
+    let base = api_base.trim_end_matches('/');
+    if base.ends_with("/search") {
+        base.to_string()
+    } else {
+        format!("{base}/search")
+    }
+}
 
 fn default_model_type() -> String {
     DEFAULT_MODEL_TYPE.to_string()
@@ -3766,6 +3785,28 @@ mod tests {
         assert!(parsed.vision.enabled);
         assert!(!parsed.image_generation.enabled);
         assert_eq!(parsed.image_generation.max_images_per_request, 2);
+    }
+
+    #[test]
+    fn search_is_a_model_type_and_survives_storage() {
+        assert!(is_valid_model_type(SEARCH_MODEL_TYPE));
+        assert_eq!(normalize_model_type(" Search "), SEARCH_MODEL_TYPE);
+    }
+
+    #[test]
+    fn search_url_appends_search_to_the_instance_root_once() {
+        assert_eq!(
+            search_url("http://searxng:8080"),
+            "http://searxng:8080/search"
+        );
+        assert_eq!(
+            search_url("http://searxng:8080/"),
+            "http://searxng:8080/search"
+        );
+        assert_eq!(
+            search_url("https://example.org/searxng/search/"),
+            "https://example.org/searxng/search"
+        );
     }
 
     #[test]

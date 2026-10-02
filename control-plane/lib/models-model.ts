@@ -20,7 +20,7 @@ import { parseTagLevel, TAG_LEVEL_LABELS } from "@/lib/utils";
 // Types and where a model runs
 // ---------------------------------------------------------------------------
 
-export type TypeGroup = "chat" | "image" | "video" | "audio" | "embedding";
+export type TypeGroup = "chat" | "image" | "video" | "audio" | "embedding" | "search";
 
 export const TYPE_GROUPS: { value: TypeGroup; label: string }[] = [
   { value: "chat", label: "Chat" },
@@ -28,11 +28,12 @@ export const TYPE_GROUPS: { value: TypeGroup; label: string }[] = [
   { value: "video", label: "Video" },
   { value: "audio", label: "Audio" },
   { value: "embedding", label: "Embed" },
+  { value: "search", label: "Search" },
 ];
 
 export function typeGroup(type: string): TypeGroup {
   if (type === "audio_transcription" || type === "audio_speech") return "audio";
-  if (type === "image" || type === "video" || type === "embedding") return type;
+  if (type === "image" || type === "video" || type === "embedding" || type === "search") return type;
   return "chat";
 }
 
@@ -43,6 +44,7 @@ export const MODEL_TYPE_NAMES: Record<string, string> = {
   audio_speech: "Text to speech",
   image: "Image",
   video: "Video",
+  search: "Web search",
 };
 
 export type RunsOn = "kubernetes" | "slurm" | "endpoint";
@@ -131,6 +133,8 @@ export function priceLabel(model: Pick<ModelRoute, "model_type" | "input_cost_pe
       return model.cost_per_audio_second > 0 ? `${money(model.cost_per_audio_second * 60)} / min` : null;
     case "embedding":
       return model.input_cost_per_token > 0 ? `${perM(model.input_cost_per_token)} / 1M` : null;
+    case "search":
+      return null;
     default:
       if (model.input_cost_per_token <= 0 && model.output_cost_per_token <= 0) return null;
       return `${perM(model.input_cost_per_token)} · ${perM(model.output_cost_per_token)}`;
@@ -263,7 +267,7 @@ export function sortRows(rows: ModelRow[], sort: ModelSort): ModelRow[] {
 }
 
 export function groupCounts(rows: ModelRow[]): Record<TypeGroup | "all", number> {
-  const counts = { all: rows.length, chat: 0, image: 0, video: 0, audio: 0, embedding: 0 };
+  const counts = { all: rows.length, chat: 0, image: 0, video: 0, audio: 0, embedding: 0, search: 0 };
   for (const r of rows) counts[r.group] += 1;
   return counts;
 }
