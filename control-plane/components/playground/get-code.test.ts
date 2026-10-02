@@ -49,6 +49,9 @@ describe("Get code", () => {
     const verdicts = requestFor({ ...base, mode: "verdicts", verdictState: '{"a": 1}', verdictQuestions: [{ id: "ok", type: "boolean", instructions: "Fine?" }] }, 0, new Map());
     expect(verdicts.path).toBe("/v1/verdicts");
     expect(verdicts.body).toEqual({ model: "auto", state: { a: 1 }, questions: { ok: { type: "boolean", instructions: "Fine?" } } });
+    const search = requestFor({ ...base, mode: "search", searchTool: "searxng-search", searchQuery: " rust ", searchDomains: "arxiv.org", searchTimeRange: "month" }, 0, new Map());
+    expect(search.path).toBe("/v1/search");
+    expect(search.body).toEqual({ search_tool_name: "searxng-search", query: "rust", max_results: 5, search_domain_filter: ["arxiv.org"], time_range: "month" });
   });
 
   it("quotes single quotes safely for the shell and writes Python literals", () => {

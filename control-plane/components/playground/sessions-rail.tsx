@@ -25,6 +25,7 @@ function subtitle(s: PlaygroundSession, now: number): string {
   if (s.launcher) detail = "Choose what to try";
   else if (s.mode === "image") detail = s.imageModel ?? "";
   else if (s.mode === "router") detail = s.routerPrompt?.trim() ? "auto" : "";
+  else if (s.mode === "search") detail = s.searchQuery?.trim().slice(0, 40) ?? "";
   else if (s.mode === "verdicts") detail = `${s.verdictQuestions?.length ?? 1} question${(s.verdictQuestions?.length ?? 1) === 1 ? "" : "s"}`;
   else {
     const lanes = (s.recipients ?? s.models.map((_, i) => i)).map((i) => s.models[i]).filter(Boolean);
