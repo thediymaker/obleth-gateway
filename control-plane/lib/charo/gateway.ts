@@ -8,8 +8,7 @@
 //
 // The system key secret is fetched once (cached) from the admin API and never
 // leaves the server. Only server-side route handlers import this — today
-// `app/api/charo/*`, `app/api/live/playground/images`, and
-// `app/api/live/playground/verdicts`.
+// `app/api/charo/*` and `app/api/live/playground/{images,verdicts,search}`.
 
 import { obleth } from "@/lib/obleth";
 
@@ -62,6 +61,15 @@ export interface GatewayVerdictsBody {
   [k: string]: unknown;
 }
 
+export interface GatewaySearchBody {
+  search_tool_name: string;
+  query: string;
+  max_results?: number;
+  search_domain_filter?: string[];
+  time_range?: string;
+  [k: string]: unknown;
+}
+
 /**
  * POST a chat-completions request to the data plane as the reserved tenant.
  * Returns the raw `fetch` Response so callers can read the
@@ -96,6 +104,14 @@ export async function gatewayVerdicts(
   signal?: AbortSignal,
 ): Promise<Response> {
   return gatewayPost("/v1/verdicts", body, signal);
+}
+
+/** POST a web search to the data plane's `/v1/search` as the reserved tenant. */
+export async function gatewaySearch(
+  body: GatewaySearchBody,
+  signal?: AbortSignal,
+): Promise<Response> {
+  return gatewayPost("/v1/search", body, signal);
 }
 
 async function gatewayPost(

@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import type { Conversation } from "@/lib/charo/conversation";
 import type { PlaygroundSession } from "./playground";
+import { DEFAULT_MAX_RESULTS, domainList } from "./search-workspace";
 import { buildQuestions, parseState } from "./verdicts-workspace";
 import { Segmented, modelLabel } from "./ui";
 
@@ -46,6 +47,19 @@ export function requestFor(session: PlaygroundSession, lane: number, lanes: Map<
         model: session.verdictModel ?? "auto",
         state: parseState(session.verdictState ?? ""),
         questions: buildQuestions(session.verdictQuestions ?? []),
+      },
+    };
+  }
+  if (session.mode === "search") {
+    const domains = domainList(session.searchDomains ?? "");
+    return {
+      path: "/v1/search",
+      body: {
+        search_tool_name: session.searchTool ?? "SEARCH_TOOL",
+        query: session.searchQuery?.trim() || "attention is all you need",
+        max_results: session.searchMaxResults ?? DEFAULT_MAX_RESULTS,
+        ...(domains.length ? { search_domain_filter: domains } : {}),
+        ...(session.searchTimeRange ? { time_range: session.searchTimeRange } : {}),
       },
     };
   }

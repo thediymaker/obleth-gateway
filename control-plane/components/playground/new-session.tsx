@@ -11,6 +11,7 @@ const CARDS: Record<string, { blurb: string; example: string }> = {
   image: { blurb: "Generate images from a prompt, then iterate on size, steps and seed.", example: "Check a new image backend end to end" },
   router: { blurb: "See which model auto would pick for a prompt, and try new weights before applying them.", example: "Why did this request go to the small model?" },
   verdicts: { blurb: "Ask yes/no, choice or score questions about text or JSON and get calibrated answers.", example: "Triage a support ticket into a team and urgency" },
+  search: { blurb: "Run a web search through one of the gateway's search tools and see the results a client gets.", example: "Check the SearXNG tool answers before pointing an app at it" },
 };
 
 /** What a new session shows until the person picks a mode or just starts typing. */
