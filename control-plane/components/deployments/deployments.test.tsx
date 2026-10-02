@@ -185,6 +185,14 @@ describe("a Slurm deployment's page", () => {
     const why = host.querySelector('[aria-label="Why it stopped"]')!;
     expect(why.textContent).toContain("The last 3 jobs ended without becoming healthy");
     expect(why.textContent).toContain("FAILED — NonZeroExitCode");
+    expect(why.textContent).toContain("Job 42's output is in logs, in the file ending -42.out");
+  });
+
+  it("says a job's output stayed on its node when Job logs isn't set", async () => {
+    const lost = [1, 2, 3].map(() => replica({ state: "lost", last_message: "FAILED — NonZeroExitCode" }));
+    await render(<ManagedPage modelId="m1" initial={data({ specs: [spec({ log_output_dir: "" })], replicas: lost })} changes={[]} />);
+    expect(host.querySelector('[aria-label="Why it stopped"]')!.textContent).toContain("Job logs isn't set, so job 42's output stayed in Slurm's default place, /tmp on gh-007.");
+    expect(host.querySelector<HTMLInputElement>('input[name="slurm_log_output_dir"]')!.value).toBe("");
   });
 });
 

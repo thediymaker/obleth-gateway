@@ -2571,6 +2571,7 @@ export async function saveDeploymentSettingsAction(formData: FormData): Promise<
       time_limit: nullable("time_limit"),
       constraints: nullable("constraints"),
       exclude: nullable("exclude"),
+      log_output_dir: values.slurm_log_output_dir !== undefined ? text("log_output_dir").replace(/\/+$/, "") : b.log_output_dir,
       serving_port: int("serving_port"),
       health_path: text("health_path") || "/health",
       target_replicas: int("target_replicas"),
