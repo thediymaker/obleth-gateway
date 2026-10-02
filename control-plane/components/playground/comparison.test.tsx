@@ -53,6 +53,23 @@ describe("comparison conversations", () => {
     expect(signals[1].aborted).toBe(true);
   });
 
+  it("keeps a model's thinking apart from its answer, and out of the follow-up request", async () => {
+    const sse = (frames: [string, string][]) => new Response(frames.map(([e, t]) => `event: ${e}\ndata: ${JSON.stringify({ text: t })}\n\n`).join("") + "event: done\ndata: {}\n\n", { headers: { "Content-Type": "text/event-stream" } });
+    const calls: Array<{ messages: { content: string }[] }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (_url, init) => {
+      calls.push(JSON.parse(init.body));
+      // The reasoning field, then an answer that also carries an inline <think> block.
+      return sse([["reasoning", "Check 17. "], ["reasoning", "17 × 23 = 391."], ["token", "<think>double-check</think>"], ["token", "No, 391 = 17 × 23."]]);
+    }));
+    await act(async () => { await lanes[0].send("Is 391 prime?"); });
+    const turn = lanes[0].messages.at(-1)!;
+    expect(turn.content).toBe("No, 391 = 17 × 23.");
+    expect(turn.reasoning).toBe("Check 17. 17 × 23 = 391.\n\ndouble-check");
+    expect(turn.reasoningMs).toBeGreaterThanOrEqual(0);
+    await act(async () => { await lanes[0].send("Why?"); });
+    expect(calls[1].messages.map((m) => m.content)).toEqual(["Is 391 prime?", "No, 391 = 17 × 23.", "Why?"]);
+  });
+
   it("restores saved lane history without launching requests", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => response("saved answer")));
     await act(async () => { await lanes[0].send("remember me"); });

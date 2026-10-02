@@ -22,3 +22,23 @@ it("passes comparison parameters without the assistant persona and returns measu
   expect(mocks.chat.mock.calls[0][0]).toMatchObject({ messages: [{ role: "system", content: "Be brief" }, { role: "user", content: "hi" }], temperature: 0.2, max_tokens: 50 });
   expect(text).toContain('"outputTokens":4'); expect(text).toContain('"requestId":"request-1"'); expect(text).toContain('"text":"answer"');
 });
+it("relays a model's thinking as its own event, from either reasoning field, and times the first token of either kind", async () => {
+  mocks.chat.mockResolvedValue(new Response(
+    'data: {"choices":[{"delta":{"reasoning":"391 = 17 × 23"}}]}\n\n' +
+    'data: {"choices":[{"delta":{"reasoning_content":", so"}}]}\n\n' +
+    'data: {"choices":[{"delta":{"content":"No."}}]}\n\ndata: [DONE]\n\n',
+    { headers: { "Content-Type": "text/event-stream" } },
+  ));
+  const text = await (await POST(request({ model: "m", bare: true, messages: [{ role: "user", content: "Is 391 prime?" }] }))).text();
+  expect(text).toContain('event: reasoning\ndata: {"text":"391 = 17 × 23"}');
+  expect(text).toContain('event: reasoning\ndata: {"text":", so"}');
+  expect(text).toContain('event: token\ndata: {"text":"No."}');
+  expect(text.indexOf("event: reasoning")).toBeLessThan(text.indexOf("event: token"));
+  expect(text).toMatch(/"ttftMs":\d/);
+});
+it("relays the thinking of a buffered (non-streaming) completion", async () => {
+  mocks.chat.mockResolvedValue(new Response(JSON.stringify({ choices: [{ message: { content: "No.", reasoning: "It factors." } }] }), { headers: { "Content-Type": "application/json" } }));
+  const text = await (await POST(request({ model: "m", bare: true, messages: [{ role: "user", content: "Is 391 prime?" }] }))).text();
+  expect(text).toContain('event: reasoning\ndata: {"text":"It factors."}');
+  expect(text).toContain('event: token\ndata: {"text":"No."}');
+});
