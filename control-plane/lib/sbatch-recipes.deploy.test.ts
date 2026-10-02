@@ -39,6 +39,18 @@ describe("buildManagedFromRecipe", () => {
     expect(p.managedBody.script_body).toContain("llama-server -hf repo:Q4");
   });
 
+  it("keeps #SBATCH values in the fields and out of the stored script", () => {
+    const p = buildManagedFromRecipe(parseRecipe("glm", file()));
+    expect(p.managedBody.gres).toBe("gpu:1");
+    expect(p.managedBody.script_body).not.toContain("#SBATCH");
+    expect(p.managedBody.script_body?.startsWith("#!/bin/bash -l\n")).toBe(true);
+  });
+
+  it("stores a script edited at launch with Unix line endings", () => {
+    const p = buildManagedFromRecipe(parseRecipe("glm", file()), { script_body: "#!/bin/bash -l\r\n#SBATCH --mem=500G\r\nllama-server --port 8000\r\n" });
+    expect(p.managedBody.script_body).toBe("#!/bin/bash -l\nllama-server --port 8000\n");
+  });
+
   it("applies api_model_name and target_replicas overrides", () => {
     const p = buildManagedFromRecipe(parseRecipe("glm", file()), {
       api_model_name: "glm-test",

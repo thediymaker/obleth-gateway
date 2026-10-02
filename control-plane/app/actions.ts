@@ -35,6 +35,7 @@ import { requireAdmin } from "@/lib/auth/roles";
 import { validateManagedModelForm } from "@/lib/managed-model-schema";
 import { parseUpstreamHeaders } from "@/lib/upstream-headers";
 import { resolveRecipeById, resolveRecipeText, buildManagedFromRecipe, parseRecipe, type DeployOverrides } from "@/lib/sbatch-recipes";
+import { unixLineEndings } from "@/lib/sbatch-directives";
 import { clusterValuesFrom, inputDefaults, type ClusterValues } from "@/lib/recipe-inputs";
 import { savedRecipeText, type SaveAs } from "@/lib/recipe-save";
 import type { DeployForm } from "@/lib/deploy-form";
@@ -1004,10 +1005,10 @@ export async function createModelAction(
         gres: trimmed(formData.get("slurm_gres")),
         nodes: numOr(formData.get("slurm_nodes"), 1),
         image: trimmed(formData.get("slurm_image")),
-        preamble: trimmed(formData.get("slurm_preamble")),
+        preamble: unixLineEndings(trimmed(formData.get("slurm_preamble"))),
         log_output_dir: trimmed(formData.get("slurm_log_output_dir")),
-        launch_command: trimmed(formData.get("slurm_launch_command")),
-        script_body: trimmed(formData.get("slurm_script_body")),
+        launch_command: unixLineEndings(trimmed(formData.get("slurm_launch_command"))),
+        script_body: unixLineEndings(trimmed(formData.get("slurm_script_body"))),
         cpus_per_task: numOrNull(formData.get("slurm_cpus_per_task")),
         mem: strOrNull(formData.get("slurm_mem")) ?? null,
         serving_port: numOr(formData.get("slurm_serving_port"), 8000),
@@ -2554,7 +2555,8 @@ export async function saveDeploymentSettingsAction(formData: FormData): Promise<
   const nullable = (k: string) => text(k) || null;
   const int = (k: string) => Number(text(k));
   const res = await changeSpec(id, (b) => {
-    const script = values.slurm_script_body ?? b.script_body ?? "";
+    // The browser sends a textarea with CRLF line endings; bash needs LF.
+    const script = unixLineEndings(values.slurm_script_body ?? b.script_body ?? "");
     if (!script.trim() && !(b.launch_command ?? "").trim()) return "The script can't be empty.";
     return {
       ...b,

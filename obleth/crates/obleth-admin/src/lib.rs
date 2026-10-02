@@ -7124,10 +7124,12 @@ async fn put_managed_model(
             cpus_per_task: body.cpus_per_task,
             mem: body.mem,
             image: body.image,
-            preamble: body.preamble,
+            // Stored with Unix line endings: bash reads a `\r` as part of
+            // the line, and a browser textarea sends CRLF.
+            preamble: body.preamble.replace("\r\n", "\n"),
             log_output_dir: body.log_output_dir,
-            launch_command: body.launch_command,
-            script_body: body.script_body,
+            launch_command: body.launch_command.replace("\r\n", "\n"),
+            script_body: body.script_body.replace("\r\n", "\n"),
             serving_port: body.serving_port,
             health_path: body.health_path,
             target_replicas: body.target_replicas,

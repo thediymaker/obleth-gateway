@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  replicaAsk,
   accountsFor,
   slurmErrorText,
   buildDeploymentRows,
@@ -91,6 +92,17 @@ describe("rows", () => {
     ]);
     expect(rows[1].poolCap).toBe(160);
     expect(deploymentsLine(rows)).toBe("1 on Kubernetes, 10 replicas ready · 1 on Slurm, 1 starting");
+  });
+});
+
+describe("what a replica asks for", () => {
+  it("says each value in words", () => {
+    expect(replicaAsk({ nodes: 1, gres: "gpu:1", cpus: "72", mem: "500G" })).toBe("Each replica asks Slurm for 1 node with 1 GPU, 72 CPUs and 500 GB of memory.");
+    expect(replicaAsk({ nodes: 4, gres: "gpu:h100:4", cpus: "1", mem: "0" })).toBe("Each replica asks Slurm for 4 nodes, each with 4 GPUs, 1 CPU and all of its memory.");
+  });
+
+  it("names the default a blank box falls back to", () => {
+    expect(replicaAsk({ nodes: 1, gres: "", cpus: "", mem: "" })).toBe("Each replica asks Slurm for 1 node with no GPUs, Slurm's default CPUs and the partition's default memory.");
   });
 });
 

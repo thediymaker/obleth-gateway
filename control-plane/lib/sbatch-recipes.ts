@@ -1,8 +1,9 @@
 // File-based deployment recipes: a YAML metadata header + the raw `sbatch`
 // script an admin already tested. The header carries routing metadata (engine,
 // model name, port) and optional placement overrides; the body is submitted
-// verbatim as `script_body` while its `#SBATCH` directives are lifted into JSON
-// fields (slurmrestd ignores `#SBATCH` — see ./sbatch-directives).
+// as `script_body` while its `#SBATCH` directives are lifted into JSON fields
+// and left out of the stored script (slurmrestd ignores `#SBATCH` — see
+// ./sbatch-directives).
 //
 // This module owns the new `*.recipe` files (distinct from the former
 // wizard yaml definitions).
@@ -12,7 +13,7 @@ import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 import type { RecipeCard, RecipeDeployPreview } from "@/components/recipes/recipe-card";
 import { toRecipeCards } from "@/components/recipes/recipe-card";
-import { parseSbatchDirectives, type ParsedDirectives } from "./sbatch-directives";
+import { parseSbatchDirectives, stripSbatchDirectives, unixLineEndings, type ParsedDirectives } from "./sbatch-directives";
 import { EMPTY_CLUSTER, renderScript, type ClusterValues, type RecipeInput } from "./recipe-inputs";
 import { splitFrontmatter } from "./recipe-frontmatter";
 import type { PutManagedModel } from "@/lib/obleth";
@@ -412,13 +413,17 @@ export function buildManagedFromRecipe(
     image: "",
     preamble: "",
     launch_command: "",
+    // The #SBATCH lines are already in the fields above, and Slurm doesn't
+    // read them from a submitted script, so the stored script leaves them out.
     script_body: applyChdir(
       applyEnv(
-        renderScript(overrides.script_body ?? recipe.body, h.inputs, overrides.inputs ?? overrides.variables, cluster, {
-          strict,
-          nodes: overrides.nodes ?? placement(h.nodes, d.nodes),
-          builtins: { api_model_name: modelName },
-        }),
+        stripSbatchDirectives(
+          renderScript(unixLineEndings(overrides.script_body ?? recipe.body), h.inputs, overrides.inputs ?? overrides.variables, cluster, {
+            strict,
+            nodes: overrides.nodes ?? placement(h.nodes, d.nodes),
+            builtins: { api_model_name: modelName },
+          }),
+        ),
         overrides.env ?? h.env,
       ),
       d.chdir,

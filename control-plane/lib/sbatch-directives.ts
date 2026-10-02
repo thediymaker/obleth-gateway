@@ -2,8 +2,8 @@
 // obleth sends to slurmrestd. slurmrestd does NOT honor `#SBATCH` comment
 // directives (they are an `sbatch`-CLI feature), so a recipe's job parameters
 // must be parsed out of the script and sent as JSON. This module is pure
-// (no fs / no network) and safe to import anywhere.
-import path from "node:path";
+// (no fs / no network, no Node built-ins) and safe to import anywhere,
+// including the dashboard's client components.
 
 export interface ParsedDirectives {
   partition?: string;
@@ -54,19 +54,82 @@ function splitDirective(rest: string): { key: string; value: string } | null {
   return { key: long, value };
 }
 
+/** POSIX dirname: "logs/serve-%j.out" → "logs", "/a/b.out" → "/a", "b.out" → ".". */
+function dirname(p: string): string {
+  const s = p.replace(/\/+$/, "");
+  const i = s.lastIndexOf("/");
+  if (i === -1) return ".";
+  return s.slice(0, i).replace(/\/+$/, "") || "/";
+}
+
 /** Remove a trailing ` # comment` from a directive line (values here never contain `#`). */
 function stripComment(s: string): string {
   const i = s.search(/\s#/);
   return (i === -1 ? s : s.slice(0, i)).trim();
 }
 
+/** A script with Unix line endings. A browser sends a textarea's text with
+ *  CRLF, and bash reads the `\r` as part of each line: `#!/bin/bash -l\r`
+ *  passes the option `-\r` and the job exits before its first command. */
+export function unixLineEndings(script: string): string {
+  return script.replace(/\r\n/g, "\n");
+}
+
+const isDirective = (line: string) => line.trim().startsWith("#SBATCH");
+
+/** One `#SBATCH` line read into its long-form key and value, or null. */
+function readDirective(line: string): { key: string; value: string } | null {
+  const t = line.trim();
+  if (!t.startsWith("#SBATCH")) return null;
+  return splitDirective(stripComment(t.slice("#SBATCH".length)));
+}
+
+/** The script without its `#SBATCH` lines. obleth sends job settings as
+ *  fields, so in a script that is submitted they are only comments. */
+export function stripSbatchDirectives(script: string): string {
+  return script.split("\n").filter((line) => !isDirective(line)).join("\n");
+}
+
+/** The placement settings a deployment's page edits, by the field they set. */
+export type PlacementKey = "partition" | "gres" | "cpus_per_task" | "mem" | "nodes" | "account" | "qos" | "time_limit" | "constraints" | "exclude";
+
+const PLACEMENT_OF: Record<string, PlacementKey> = {
+  partition: "partition",
+  gres: "gres",
+  "cpus-per-task": "cpus_per_task",
+  mem: "mem",
+  nodes: "nodes",
+  account: "account",
+  qos: "qos",
+  time: "time_limit",
+  constraint: "constraints",
+  exclude: "exclude",
+};
+
+export interface SbatchLine {
+  /** The directive as written, without `#SBATCH`, e.g. "--mem=500G". */
+  text: string;
+  value: string;
+  /** The placement setting it would set; null when obleth has none for it. */
+  setting: PlacementKey | null;
+}
+
+/** Every `#SBATCH` line in a script, with the placement setting each matches. */
+export function sbatchLines(script: string): SbatchLine[] {
+  const out: SbatchLine[] = [];
+  for (const line of script.split("\n")) {
+    if (!isDirective(line)) continue;
+    const text = stripComment(line.trim().slice("#SBATCH".length));
+    const parsed = readDirective(line);
+    out.push({ text, value: parsed?.value ?? "", setting: (parsed && PLACEMENT_OF[parsed.key]) ?? null });
+  }
+  return out;
+}
+
 export function parseSbatchDirectives(script: string): ParsedDirectives {
   const out: ParsedDirectives = { warnings: [] };
   for (const line of script.split("\n")) {
-    const t = line.trim();
-    if (!t.startsWith("#SBATCH")) continue;
-    const rest = stripComment(t.slice("#SBATCH".length));
-    const parsed = splitDirective(rest);
+    const parsed = readDirective(line);
     if (!parsed) continue;
     const { key, value } = parsed;
     switch (key) {
@@ -110,7 +173,7 @@ export function parseSbatchDirectives(script: string): ParsedDirectives {
         break;
       case "output":
       case "error": {
-        const dir = path.posix.dirname(value);
+        const dir = dirname(value);
         if (dir && dir !== ".") out.log_output_dir = dir;
         break;
       }
