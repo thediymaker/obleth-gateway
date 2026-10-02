@@ -41,7 +41,8 @@ pub struct JobSubmit {
     pub exclude: Option<String>,
     /// Slurm `--cpus-per-task`; `None` leaves it to the cluster default.
     pub cpus_per_task: Option<i64>,
-    /// Memory per node in megabytes (slurm `--mem`); `None` leaves it default.
+    /// Memory per node in megabytes (slurm `--mem`); `None` leaves it default
+    /// and `Some(0)` asks for all of each node's memory, as `--mem=0` does.
     pub mem_mb: Option<i64>,
     /// Directory for stdout/stderr files; empty means Slurm default.
     pub log_output_dir: String,

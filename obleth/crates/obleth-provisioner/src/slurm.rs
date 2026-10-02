@@ -63,7 +63,10 @@ pub fn job_submit_from_spec(
     port_base: i64,
     span: i64,
 ) -> JobSubmit {
-    let preamble = spec.preamble.trim();
+    let preamble = unix_line_endings(&spec.preamble);
+    let launch_command = unix_line_endings(&spec.launch_command);
+    let script_body = unix_line_endings(&spec.script_body);
+    let preamble = preamble.trim();
     let preamble_block = if preamble.is_empty() {
         String::new()
     } else {
@@ -81,21 +84,21 @@ pub fn job_submit_from_spec(
     // a bare-metal `llama-server`) rather than an apptainer image.
     let image = spec.image.trim();
     let exec_line = if image.is_empty() {
-        spec.launch_command.clone()
+        launch_command
     } else {
         format!(
             "apptainer exec --nv {image} {cmd}",
             image = shell_quote(image),
-            cmd = spec.launch_command,
+            cmd = launch_command,
         )
     };
     // A non-empty `script_body` is the rendered recipe output and wins: it is
     // submitted verbatim so the recipe author has full control of the job
     // script. Otherwise fall back to the legacy preamble/exec assembly.
-    let assembled = if spec.script_body.trim().is_empty() {
+    let assembled = if script_body.trim().is_empty() {
         format!("#!/bin/bash\nset -euo pipefail\n{preamble_block}{exec_line}\n")
     } else {
-        let body = &spec.script_body;
+        let body = &script_body;
         if body.starts_with("#!") {
             // already a complete script
             if body.ends_with('\n') {
@@ -125,10 +128,19 @@ pub fn job_submit_from_spec(
     }
 }
 
+/// A script with Windows line endings (CRLF) as Unix ones (LF). A browser
+/// sends a textarea's text with CRLF, and bash reads the `\r` as part of each
+/// line: `#!/bin/bash -l\r` passes the option `-\r`, so the job exits with
+/// "invalid option" before its first command runs.
+fn unix_line_endings(s: &str) -> String {
+    s.replace("\r\n", "\n")
+}
+
 /// Parse a Slurm-style memory string (e.g. `560G`, `512000M`, `2T`, `16000`)
 /// into an integer number of **megabytes** for slurmrestd's `memory_per_node`.
-/// A bare number is treated as megabytes (Slurm's default unit). Returns `None`
-/// for empty/unparseable input so the field is omitted entirely.
+/// A bare number is treated as megabytes (Slurm's default unit). Zero is kept:
+/// like `--mem=0`, it asks for all of each node's memory. Returns `None` for
+/// empty/unparseable input so the field is omitted entirely.
 pub fn parse_mem_mb(raw: &str) -> Option<i64> {
     let s = raw.trim();
     if s.is_empty() {
@@ -146,7 +158,10 @@ pub fn parse_mem_mb(raw: &str) -> Option<i64> {
         _ => return None,
     };
     let n: f64 = num_part.trim().parse().ok()?;
-    if n <= 0.0 {
+    if n == 0.0 {
+        return Some(0);
+    }
+    if n < 0.0 {
         return None;
     }
     let mb = (n * mult).round() as i64;
@@ -450,9 +465,10 @@ pub fn submit_body(job: &JobSubmit, hf_token: &str) -> serde_json::Value {
             m.insert("cpus_per_task".into(), serde_json::json!(c));
         }
     }
-    // slurmrestd expects memory_per_node in megabytes (integer).
+    // slurmrestd expects memory_per_node in megabytes (integer). 0 is sent
+    // as is: Slurm reads it as all of each node's memory.
     if let Some(mb) = job.mem_mb {
-        if mb > 0 {
+        if mb >= 0 {
             m.insert("memory_per_node".into(), serde_json::json!(mb));
         }
     }
@@ -990,7 +1006,37 @@ mod tests {
         assert_eq!(parse_mem_mb(""), None);
         assert_eq!(parse_mem_mb("   "), None);
         assert_eq!(parse_mem_mb("lots"), None);
-        assert_eq!(parse_mem_mb("0G"), None);
+        assert_eq!(parse_mem_mb("-4G"), None);
+        // `--mem=0` is all of the node's memory, not "unset".
+        assert_eq!(parse_mem_mb("0"), Some(0));
+        assert_eq!(parse_mem_mb("0G"), Some(0));
+    }
+
+    #[test]
+    fn mem_zero_asks_slurm_for_the_whole_node() {
+        let mut s = spec();
+        s.mem = Some("0".into());
+        let j = job_submit_from_spec(&s, "m", "obleth-", 8000, 1);
+        assert_eq!(submit_body(&j, "")["job"]["memory_per_node"], 0);
+        s.mem = None;
+        let j = job_submit_from_spec(&s, "m", "obleth-", 8000, 1);
+        assert!(submit_body(&j, "")["job"].get("memory_per_node").is_none());
+    }
+
+    #[test]
+    fn windows_line_endings_are_submitted_as_unix_ones() {
+        let mut s = spec();
+        s.script_body = "#!/bin/bash -l\r\nset -euo pipefail\r\nvllm serve m --port \"$OBLETH_SERVING_PORT\"\r\n".into();
+        let j = job_submit_from_spec(&s, "m", "obleth-", 8000, 1);
+        assert!(!j.script.contains('\r'), "no carriage returns reach bash");
+        assert!(j.script.starts_with("#!/bin/bash -l\n# obleth: bind"));
+        assert!(j.script.contains("\nset -euo pipefail\n"));
+        // The legacy assembly gets the same treatment.
+        let mut s = spec();
+        s.preamble = "module load cuda\r\nmodule load apptainer".into();
+        s.launch_command = "llama-server --port 8000\r\n".into();
+        let j = job_submit_from_spec(&s, "m", "obleth-", 8000, 1);
+        assert!(!j.script.contains('\r'));
     }
 
     #[test]
