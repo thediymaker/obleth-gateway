@@ -179,9 +179,12 @@ pub struct UsageLogRow {
     pub device_id: String,
     pub admission: String,
     pub status_code: u16,
+    /// Every prompt token, cached ones included.
     pub input_tokens: u32,
     pub output_tokens: u32,
     pub total_tokens: u64,
+    /// The part of `input_tokens` the upstream served from its prefix cache.
+    pub cached_input_tokens: u32,
     pub queue_wait_ms: u32,
     pub ttft_ms: u32,
     pub total_ms: u32,
@@ -280,7 +283,7 @@ pub async fn query_usage_logs(
         "select request_id, ts_ms, tenant_id, key_id, model, request_type, session_id, session_id_source, device_id, \
          admission, status_code, input_tokens, output_tokens, \
          toUInt64(input_tokens) + toUInt64(output_tokens) as total_tokens, \
-         queue_wait_ms, ttft_ms, total_ms, cache_status, cost_usd, \
+         cached_input_tokens, queue_wait_ms, ttft_ms, total_ms, cache_status, cost_usd, \
          energy_wh, energy_cost_usd, co2_g \
          from usage",
     );

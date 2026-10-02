@@ -72,6 +72,7 @@ struct UsageRow<'a> {
     weight: i64,
     input_tokens: u32,
     output_tokens: u32,
+    cached_input_tokens: u32,
     estimated_tokens: u32,
     queue_wait_ms: u32,
     ttft_ms: u32,
@@ -101,6 +102,7 @@ impl<'a> From<&'a UsageRecord> for UsageRow<'a> {
             weight: r.weight,
             input_tokens: r.input_tokens,
             output_tokens: r.output_tokens,
+            cached_input_tokens: r.cached_input_tokens,
             estimated_tokens: r.estimated_tokens,
             queue_wait_ms: r.queue_wait_ms,
             ttft_ms: r.ttft_ms,
@@ -726,6 +728,7 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
             weight Int64,
             input_tokens UInt32,
             output_tokens UInt32,
+            cached_input_tokens UInt32 DEFAULT 0,
             estimated_tokens UInt32,
             queue_wait_ms UInt32,
             ttft_ms UInt32,
@@ -819,6 +822,14 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
     client
         .query(&format!(
             "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS end_user String DEFAULT ''"
+        ))
+        .execute()
+        .await?;
+    // Idempotent add for databases created before upstream prefix-cache hits
+    // were recorded.
+    client
+        .query(&format!(
+            "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS cached_input_tokens UInt32 DEFAULT 0"
         ))
         .execute()
         .await?;
@@ -1140,6 +1151,7 @@ mod conv_tests {
             weight: 1,
             input_tokens: 1,
             output_tokens: 1,
+            cached_input_tokens: 0,
             estimated_tokens: 2,
             queue_wait_ms: 0,
             ttft_ms: 0,
@@ -1359,6 +1371,7 @@ mod conv_tests {
             weight: 1,
             input_tokens: 0,
             output_tokens: 0,
+            cached_input_tokens: 0,
             estimated_tokens: 0,
             queue_wait_ms: 0,
             ttft_ms: 0,
@@ -1392,6 +1405,7 @@ mod conv_tests {
             weight: 1,
             input_tokens: 0,
             output_tokens: 0,
+            cached_input_tokens: 0,
             estimated_tokens: 0,
             queue_wait_ms: 0,
             ttft_ms: 0,
@@ -1416,6 +1430,16 @@ mod conv_tests {
         assert_eq!(row.energy_wh, 1.5);
         assert_eq!(row.energy_cost_usd, 0.0002);
         assert_eq!(row.co2_g, 0.6);
+    }
+
+    #[test]
+    fn usage_row_mirrors_cached_input_tokens() {
+        let mut rec = record();
+        rec.input_tokens = 120;
+        rec.cached_input_tokens = 96;
+        let row = UsageRow::from(&rec);
+        assert_eq!(row.input_tokens, 120);
+        assert_eq!(row.cached_input_tokens, 96);
     }
 }
 

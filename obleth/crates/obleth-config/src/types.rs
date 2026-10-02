@@ -1016,8 +1016,16 @@ pub struct UsageRecord {
     pub model: String,
     pub admission: String,
     pub weight: i64,
+    /// Every prompt token, cached ones included.
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// The part of `input_tokens` the upstream reported as served from its
+    /// prefix cache (`prompt_tokens_details.cached_tokens`); 0 when it reported
+    /// none or the gateway answered without an upstream call. Unrelated to
+    /// `cache_status`, the gateway's own response cache. `#[serde(default)]`
+    /// keeps older WAL records replayable.
+    #[serde(default)]
+    pub cached_input_tokens: u32,
     pub estimated_tokens: u32,
     pub queue_wait_ms: u32,
     pub ttft_ms: u32,
@@ -3657,6 +3665,25 @@ mod tests {
         assert_eq!(r.energy_wh, 0.0);
         assert_eq!(r.energy_cost_usd, 0.0);
         assert_eq!(r.co2_g, 0.0);
+    }
+
+    #[test]
+    fn usage_record_cached_input_tokens_default_for_old_wal() {
+        // A record serialized before cached prompt tokens were recorded must
+        // replay as "none cached", and a new one must round-trip the count.
+        let old = r#"{"request_id":"00000000-0000-0000-0000-000000000000",
+            "tenant_id":"00000000-0000-0000-0000-000000000000",
+            "key_id":"00000000-0000-0000-0000-000000000000",
+            "model":"m","admission":"fast","weight":1,"input_tokens":100,
+            "output_tokens":1,"estimated_tokens":2,"queue_wait_ms":0,"ttft_ms":0,
+            "total_ms":10,"status_code":200,"cache_status":"off","cost_usd":0.5,
+            "ts_ms":0,"session_id":"s","request_type":"chat"}"#;
+        let mut r: UsageRecord = serde_json::from_str(old).unwrap();
+        assert_eq!(r.cached_input_tokens, 0);
+        assert_eq!(r.input_tokens, 100);
+        r.cached_input_tokens = 80;
+        let back: UsageRecord = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(back.cached_input_tokens, 80);
     }
 
     #[test]

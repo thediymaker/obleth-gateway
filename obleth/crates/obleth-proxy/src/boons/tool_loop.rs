@@ -36,6 +36,7 @@ use serde_json::{json, Value};
 use super::mcp_tools::{self, McpTool};
 use super::respond::TransformResult;
 use super::ResponsePlan;
+use crate::proxy::UpstreamUsage;
 use crate::state::AppState;
 
 /// Cap on a single tool result fed back to the model (bounds context growth).
@@ -385,15 +386,10 @@ pub(super) fn deadline_result(name: &str) -> String {
     )
 }
 
-/// `(prompt_tokens, completion_tokens)` from a completion, read the way the
-/// proxy's settle path reads it (a missing `prompt_tokens` means "no usage").
-fn completion_usage(body: &Value) -> Option<(u32, u32)> {
-    let input = body.pointer("/usage/prompt_tokens")?.as_u64()? as u32;
-    let output = body
-        .pointer("/usage/completion_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
-    Some((input, output))
+/// Usage from a completion, read the way the proxy's settle path reads it (a
+/// missing `prompt_tokens` means "no usage").
+fn completion_usage(body: &Value) -> Option<UpstreamUsage> {
+    crate::proxy::completion_body_usage(body)
 }
 
 /// Attach generated images to the final completion and reconcile the warning.
@@ -816,11 +812,11 @@ fn reported_tokens(completion: &Value) -> (u32, u32) {
 fn turn0_or_estimate(
     state: &AppState,
     loop_plan: &ToolLoopPlan,
-    reported: Option<(u32, u32)>,
-) -> (u32, u32) {
+    reported: Option<UpstreamUsage>,
+) -> UpstreamUsage {
     reported.unwrap_or_else(|| {
         let est = state.tokenizer.estimate_request(&loop_plan.request);
-        (est.input_tokens, est.estimated_output_tokens)
+        UpstreamUsage::uncached(est.input_tokens, est.estimated_output_tokens)
     })
 }
 
@@ -1271,7 +1267,7 @@ mod tests {
     fn completion_usage_reads_like_the_settle_path() {
         assert_eq!(
             completion_usage(&json!({"usage": {"prompt_tokens": 9, "completion_tokens": 4}})),
-            Some((9, 4))
+            Some(UpstreamUsage::uncached(9, 4))
         );
         assert_eq!(
             completion_usage(&json!({"usage": {"completion_tokens": 4}})),

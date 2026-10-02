@@ -370,6 +370,13 @@ pub(crate) fn from_chat_response(chat: &Value, ctx: &ResponseContext) -> Value {
         content.push(tool_use_block(call));
     }
     let usage = chat.get("usage").cloned().unwrap_or(Value::Null);
+    let prompt_tokens = usage.get("prompt_tokens").and_then(Value::as_u64);
+    let output_tokens = usage.get("completion_tokens").and_then(Value::as_u64);
+    let mut out_usage = input_usage(
+        prompt_tokens.unwrap_or(0),
+        crate::proxy::cached_prompt_tokens(&usage),
+    );
+    out_usage["output_tokens"] = json!(output_tokens.unwrap_or(0));
     json!({
         "id": format!("msg_{}", ctx.request_id),
         "type": "message",
@@ -378,10 +385,21 @@ pub(crate) fn from_chat_response(chat: &Value, ctx: &ResponseContext) -> Value {
         "content": content,
         "stop_reason": stop_reason(choice.get("finish_reason").and_then(Value::as_str), !tool_calls.is_empty()),
         "stop_sequence": Value::Null,
-        "usage": {
-            "input_tokens": usage.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
-            "output_tokens": usage.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0),
-        }
+        "usage": out_usage,
+    })
+}
+
+/// Anthropic's input-side `usage` fields for a chat prompt of `prompt` tokens,
+/// `cached` of them served from the upstream's prefix cache. Anthropic counts
+/// cache reads apart from `input_tokens`, so `input_tokens` is the uncached
+/// remainder. An OpenAI-compatible upstream's prefix cache has no separate
+/// write, so `cache_creation_input_tokens` is always 0.
+fn input_usage(prompt: u64, cached: u64) -> Value {
+    let cached = cached.min(prompt);
+    json!({
+        "input_tokens": prompt - cached,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": cached,
     })
 }
 
@@ -471,7 +489,10 @@ pub(crate) struct AnthropicStreamTranslator {
     /// The slot currently open (started, not yet stopped), if any. At most
     /// one at a time: opening a new tool key closes it first.
     open_tool_slot: Option<usize>,
+    /// The chat `prompt_tokens`, cached ones included.
     input_tokens: Option<u64>,
+    /// Cached prompt tokens from the same usage object as `input_tokens`.
+    cached_input_tokens: u64,
     output_tokens: Option<u64>,
     finish_reason: Option<String>,
     saw_tool_call: bool,
@@ -512,6 +533,7 @@ impl AnthropicStreamTranslator {
             tool_index_slots: Default::default(),
             open_tool_slot: None,
             input_tokens: None,
+            cached_input_tokens: 0,
             output_tokens: None,
             finish_reason: None,
             saw_tool_call: false,
@@ -527,6 +549,10 @@ impl AnthropicStreamTranslator {
             return;
         }
         self.started = true;
+        // Usage normally arrives only on the final chunk, so this is all zeros
+        // unless the upstream reported usage on an earlier one.
+        let mut usage = input_usage(self.input_tokens.unwrap_or(0), self.cached_input_tokens);
+        usage["output_tokens"] = json!(0);
         out.push(Self::frame(
             "message_start",
             json!({
@@ -535,7 +561,7 @@ impl AnthropicStreamTranslator {
                     "id": format!("msg_{}", self.ctx.request_id),
                     "type": "message", "role": "assistant", "model": self.ctx.model,
                     "content": [], "stop_reason": Value::Null, "stop_sequence": Value::Null,
-                    "usage": {"input_tokens": self.input_tokens.unwrap_or(0), "output_tokens": 0}
+                    "usage": usage
                 }
             }),
         ));
@@ -654,6 +680,7 @@ impl AnthropicStreamTranslator {
         if let Some(u) = chunk.get("usage").filter(|u| u.is_object()) {
             if let Some(p) = u.get("prompt_tokens").and_then(Value::as_u64) {
                 self.input_tokens = Some(p);
+                self.cached_input_tokens = crate::proxy::cached_prompt_tokens(u);
             }
             if let Some(c) = u.get("completion_tokens").and_then(Value::as_u64) {
                 self.output_tokens = Some(c);
@@ -855,10 +882,13 @@ impl AnthropicStreamTranslator {
         self.start(&mut out);
         self.close_open(&mut out);
         self.finalize_tools(&mut out);
-        let mut usage = json!({"output_tokens": self.output_tokens.unwrap_or(0)});
-        if let Some(p) = self.input_tokens {
-            usage["input_tokens"] = json!(p);
-        }
+        // The real input-side counts go here: `message_start` went out before
+        // the final usage chunk arrived, and clients take these over it.
+        let mut usage = match self.input_tokens {
+            Some(p) => input_usage(p, self.cached_input_tokens),
+            None => json!({}),
+        };
+        usage["output_tokens"] = json!(self.output_tokens.unwrap_or(0));
         out.push(Self::frame(
             "message_delta",
             json!({
@@ -1148,7 +1178,8 @@ mod tests {
         assert_eq!(out["stop_sequence"], Value::Null);
         assert_eq!(
             out["usage"],
-            json!({"input_tokens": 12, "output_tokens": 3})
+            json!({"input_tokens": 12, "cache_creation_input_tokens": 0,
+                   "cache_read_input_tokens": 0, "output_tokens": 3})
         );
     }
 
@@ -1180,7 +1211,11 @@ mod tests {
         );
         assert_eq!(out["content"][1]["type"], "text");
         assert_eq!(out["stop_reason"], "max_tokens");
-        assert_eq!(out["usage"], json!({"input_tokens": 0, "output_tokens": 0}));
+        assert_eq!(
+            out["usage"],
+            json!({"input_tokens": 0, "cache_creation_input_tokens": 0,
+                   "cache_read_input_tokens": 0, "output_tokens": 0})
+        );
     }
 
     #[test]
@@ -1305,7 +1340,8 @@ mod tests {
         );
         assert_eq!(
             ev[5].1["usage"],
-            json!({"input_tokens": 10, "output_tokens": 2})
+            json!({"input_tokens": 10, "cache_creation_input_tokens": 0,
+                   "cache_read_input_tokens": 0, "output_tokens": 2})
         );
         assert!(t.finish().is_empty(), "finish is idempotent");
     }
@@ -1317,6 +1353,56 @@ mod tests {
         first["usage"] = json!({"prompt_tokens": 7, "completion_tokens": 0});
         let ev = parse(&t.on_chunk(&first));
         assert_eq!(ev[0].1["message"]["usage"]["input_tokens"], 7);
+    }
+
+    #[test]
+    fn cached_prompt_tokens_map_to_cache_reads_non_streaming() {
+        let chat = json!({"choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}],
+                          "usage": {"prompt_tokens": 1200, "completion_tokens": 30,
+                                    "prompt_tokens_details": {"cached_tokens": 1024}}});
+        assert_eq!(
+            from_chat_response(&chat, &ctx())["usage"],
+            json!({"input_tokens": 176, "cache_creation_input_tokens": 0,
+                   "cache_read_input_tokens": 1024, "output_tokens": 30})
+        );
+        // `null` details are no cache reads.
+        let chat = json!({"choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}],
+                          "usage": {"prompt_tokens": 12, "completion_tokens": 3,
+                                    "prompt_tokens_details": null}});
+        assert_eq!(
+            from_chat_response(&chat, &ctx())["usage"],
+            json!({"input_tokens": 12, "cache_creation_input_tokens": 0,
+                   "cache_read_input_tokens": 0, "output_tokens": 3})
+        );
+    }
+
+    #[test]
+    fn cached_prompt_tokens_reach_the_final_message_delta() {
+        let mut t = AnthropicStreamTranslator::new(ctx());
+        let mut frames = t.on_chunk(&chunk(json!({"content": "hi"}), None));
+        frames.extend(t.on_chunk(&chunk(json!({}), Some("stop"))));
+        let mut last = usage_chunk(900, 4);
+        last["usage"]["prompt_tokens_details"] = json!({"cached_tokens": 640});
+        frames.extend(t.on_chunk(&last));
+        frames.extend(t.finish());
+        let ev = parse(&frames);
+        // `message_start` went out before usage was known: zeros, in the
+        // full Anthropic shape.
+        assert_eq!(ev[0].0, "message_start");
+        assert_eq!(
+            ev[0].1["message"]["usage"],
+            json!({"input_tokens": 0, "cache_creation_input_tokens": 0,
+                   "cache_read_input_tokens": 0, "output_tokens": 0})
+        );
+        let delta = ev
+            .iter()
+            .find(|(n, _)| n == "message_delta")
+            .expect("message_delta");
+        assert_eq!(
+            delta.1["usage"],
+            json!({"input_tokens": 260, "cache_creation_input_tokens": 0,
+                   "cache_read_input_tokens": 640, "output_tokens": 4})
+        );
     }
 
     #[test]

@@ -1432,6 +1432,7 @@ fn build_probe_usage(
         weight: 0,
         input_tokens,
         output_tokens,
+        cached_input_tokens: 0,
         estimated_tokens: input_tokens,
         queue_wait_ms: 0,
         ttft_ms: 0,

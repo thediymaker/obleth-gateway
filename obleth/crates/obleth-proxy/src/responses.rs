@@ -299,19 +299,26 @@ pub(crate) fn from_chat_response(chat: &Value, id: &str) -> Value {
         "tool_choice": "auto",
         "tools": [],
     });
-    // `usage` is renamed, not reshaped: Responses counts the same tokens under
-    // `input_tokens`/`output_tokens`.
     if let Some(u) = chat.get("usage") {
-        out["usage"] = json!({
-            "input_tokens": u.get("prompt_tokens").and_then(Value::as_i64).unwrap_or(0),
-            "output_tokens": u.get("completion_tokens").and_then(Value::as_i64).unwrap_or(0),
-            "total_tokens": u.get("total_tokens").and_then(Value::as_i64).unwrap_or(0),
-        });
+        out["usage"] = responses_usage(u);
     }
     if finish == "length" {
         out["incomplete_details"] = json!({ "reason": "max_output_tokens" });
     }
     out
+}
+
+/// Chat `usage` as Responses `usage`. It is renamed, not reshaped: Responses
+/// counts the same tokens under `input_tokens`/`output_tokens`, so
+/// `input_tokens` still includes cached prompt tokens, and their share is
+/// reported in `input_tokens_details.cached_tokens`.
+fn responses_usage(u: &Value) -> Value {
+    json!({
+        "input_tokens": u.get("prompt_tokens").and_then(Value::as_i64).unwrap_or(0),
+        "input_tokens_details": { "cached_tokens": crate::proxy::cached_prompt_tokens(u) },
+        "output_tokens": u.get("completion_tokens").and_then(Value::as_i64).unwrap_or(0),
+        "total_tokens": u.get("total_tokens").and_then(Value::as_i64).unwrap_or(0),
+    })
 }
 
 /// A chat `finish_reason` as a Responses `status`. A truncated reply is
@@ -599,11 +606,7 @@ impl StreamTranslator {
     pub(crate) fn on_chunk(&mut self, chunk: &Value) -> Vec<String> {
         let mut out = Vec::new();
         if let Some(u) = chunk.get("usage").filter(|u| !u.is_null()) {
-            self.usage = Some(json!({
-                "input_tokens": u.get("prompt_tokens").and_then(Value::as_i64).unwrap_or(0),
-                "output_tokens": u.get("completion_tokens").and_then(Value::as_i64).unwrap_or(0),
-                "total_tokens": u.get("total_tokens").and_then(Value::as_i64).unwrap_or(0),
-            }));
+            self.usage = Some(responses_usage(u));
         }
         // Both spellings: LiteLLM normalises to `reasoning_content`, a vLLM
         // server straight behind the gateway sends `reasoning`.
@@ -897,7 +900,26 @@ mod tests {
         assert_eq!(
             out["usage"],
             json!({
-            "input_tokens": 11, "output_tokens": 3, "total_tokens": 14 })
+            "input_tokens": 11, "input_tokens_details": { "cached_tokens": 0 },
+            "output_tokens": 3, "total_tokens": 14 })
+        );
+    }
+
+    #[test]
+    fn cached_prompt_tokens_are_reported_in_input_tokens_details() {
+        let mut chat = chat_reply("hello", "stop");
+        chat["usage"]["prompt_tokens_details"] = json!({ "cached_tokens": 8 });
+        // `input_tokens` stays the whole prompt, cached tokens included.
+        assert_eq!(
+            from_chat_response(&chat, "req1")["usage"],
+            json!({
+            "input_tokens": 11, "input_tokens_details": { "cached_tokens": 8 },
+            "output_tokens": 3, "total_tokens": 14 })
+        );
+        chat["usage"]["prompt_tokens_details"] = Value::Null;
+        assert_eq!(
+            from_chat_response(&chat, "req1")["usage"]["input_tokens_details"],
+            json!({ "cached_tokens": 0 })
         );
     }
 
@@ -1038,6 +1060,29 @@ mod tests {
         assert_eq!(done["response"]["status"], "completed");
         assert_eq!(done["response"]["output"][0]["content"][0]["text"], "Hello");
         assert_eq!(done["response"]["usage"]["total_tokens"], 7);
+    }
+
+    #[test]
+    fn the_completed_event_reports_cached_prompt_tokens() {
+        let mut t = StreamTranslator::new("req1", "m");
+        let mut frames = t.on_chunk(&delta("hi"));
+        frames.extend(t.on_chunk(&json!({
+            "choices": [{ "delta": {}, "finish_reason": "stop" }] })));
+        frames.extend(t.on_chunk(&json!({ "choices": [], "usage": {
+            "prompt_tokens": 300, "completion_tokens": 2, "total_tokens": 302,
+            "prompt_tokens_details": { "cached_tokens": 256 } } })));
+        frames.extend(t.finish());
+        let parsed = parse(&frames);
+        let (_, done) = parsed
+            .iter()
+            .find(|(e, _)| e == "response.completed")
+            .expect("completed");
+        assert_eq!(
+            done["response"]["usage"],
+            json!({
+            "input_tokens": 300, "input_tokens_details": { "cached_tokens": 256 },
+            "output_tokens": 2, "total_tokens": 302 })
+        );
     }
 
     #[test]
