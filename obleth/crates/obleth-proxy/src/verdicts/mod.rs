@@ -703,6 +703,7 @@ async fn handler_inner(
                 est,
                 0,
                 0,
+                0,
                 queued_ms,
                 0,
                 request_start.elapsed().as_millis() as u32,
@@ -772,6 +773,7 @@ async fn handler_inner(
             &model,
             Admission::Rejected,
             est,
+            0,
             0,
             0,
             queue_wait_ms,
@@ -1072,7 +1074,7 @@ async fn handler_inner(
 
     let _ = settle_guard
         .complete(accounting.settle(
-            (usage.prompt_tokens, usage.completion_tokens),
+            proxy::UpstreamUsage::uncached(usage.prompt_tokens, usage.completion_tokens),
             ttft_ms,
             total_ms,
             status_code,

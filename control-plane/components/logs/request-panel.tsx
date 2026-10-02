@@ -238,6 +238,7 @@ export function RequestPanel({
         <dl aria-label="Numbers" className="grid grid-cols-2 gap-x-5 sm:grid-cols-4">
           <Fact label="Tokens in" mono>{row.input_tokens.toLocaleString()}</Fact>
           <Fact label="Tokens out" mono>{row.output_tokens.toLocaleString()}</Fact>
+          {row.cached_input_tokens != null && <Fact label="Cached input tokens" mono>{row.cached_input_tokens.toLocaleString()}</Fact>}
           <Fact label="Cost" mono>{cost(row.cost_usd)}</Fact>
           <Fact label="Energy" mono>{row.energy_wh > 0 ? `${row.energy_wh.toFixed(2)} Wh · ${row.co2_g.toFixed(2)} g CO₂` : "—"}</Fact>
           <Fact label="Waited for a slot" mono>{duration(row.queue_wait_ms)}</Fact>

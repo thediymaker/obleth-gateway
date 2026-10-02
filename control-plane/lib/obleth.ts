@@ -722,9 +722,12 @@ export interface UsageLogEntry {
   device_id: string;
   admission: string;
   status_code: number;
+  /** Every prompt token, cached ones included. */
   input_tokens: number;
   output_tokens: number;
   total_tokens: number;
+  /** The part of `input_tokens` the upstream served from its prefix cache. Absent from older gateways. */
+  cached_input_tokens?: number;
   queue_wait_ms: number;
   ttft_ms: number;
   total_ms: number;

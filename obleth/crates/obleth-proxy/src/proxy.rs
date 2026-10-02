@@ -1520,6 +1520,7 @@ async fn proxy_handler_inner(
                     0,
                     0,
                     0,
+                    0,
                     cached.status,
                     "hit",
                     (cached.input_tokens as f64) * in_cost_rate
@@ -1605,6 +1606,7 @@ async fn proxy_handler_inner(
                 &model,
                 Admission::Rejected,
                 est,
+                0,
                 0,
                 0,
                 queued_ms,
@@ -1737,6 +1739,7 @@ async fn proxy_handler_inner(
                     est,
                     0,
                     0,
+                    0,
                     queue_wait_ms,
                     0,
                     0,
@@ -1814,6 +1817,7 @@ async fn proxy_handler_inner(
                     est,
                     0,
                     0,
+                    0,
                     queue_wait_ms,
                     0,
                     0,
@@ -1853,6 +1857,7 @@ async fn proxy_handler_inner(
                     &model,
                     Admission::Rejected,
                     est,
+                    0,
                     0,
                     0,
                     queue_wait_ms,
@@ -1991,7 +1996,7 @@ async fn proxy_handler_inner(
                     let total_ms = request_start.elapsed().as_millis() as u32;
                     let _ = settle_guard
                         .complete(accounting.settle(
-                            (input_tokens, output_tokens),
+                            UpstreamUsage::uncached(input_tokens, output_tokens),
                             total_ms,
                             total_ms,
                             200,
@@ -2035,7 +2040,8 @@ async fn proxy_handler_inner(
                         };
                         let total_ms = request_start.elapsed().as_millis() as u32;
                         let _ = settle_guard.complete(accounting.settle(
-                            (input_tokens, output_tokens), ttft_ms, total_ms, 200, None,
+                            UpstreamUsage::uncached(input_tokens, output_tokens),
+                            ttft_ms, total_ms, 200, None,
                         )).await;
                     };
                     if let Some(t) = tracer.take() {
@@ -2402,7 +2408,7 @@ async fn proxy_handler_inner(
         let total_ms = request_start.elapsed().as_millis() as u32;
         let (tokens, billed) = match extract_usage(&String::from_utf8_lossy(&buf)) {
             Some(tokens) => (tokens, true),
-            None => ((0, 0), false),
+            None => (UpstreamUsage::default(), false),
         };
         let _ = settle_guard
             .complete(accounting.settle_with(tokens, ttft_ms, total_ms, status_code, None, billed))
@@ -2482,7 +2488,7 @@ async fn proxy_handler_inner(
             drop(permit);
             let total_ms = request_start.elapsed().as_millis() as u32;
             let settle = accounting.settle_with(
-                (0, 0),
+                UpstreamUsage::default(),
                 outcome.ttft_ms(),
                 total_ms,
                 outcome.status().as_u16(),
@@ -2564,7 +2570,8 @@ async fn proxy_handler_inner(
                     let total_ms = request_start.elapsed().as_millis() as u32;
                     accounting.monitor(scan_policy.as_ref(), output_monitor);
                     let _ = settle_guard.complete(accounting.settle(
-                        (input_tokens, output_tokens), ttft_ms, total_ms, status_code, None,
+                        UpstreamUsage::uncached(input_tokens, output_tokens),
+                        ttft_ms, total_ms, status_code, None,
                     )).await;
                 };
                 if let Some(t) = tracer.take() {
@@ -2633,7 +2640,7 @@ async fn proxy_handler_inner(
         let mut warning: Option<&'static str> = None;
         // Usage the main row settles with when the buffered tool loop replaced
         // the body (the follow-up turns are billed as helper rows).
-        let mut turn0_usage: Option<(u32, u32)> = None;
+        let mut turn0_usage: Option<UpstreamUsage> = None;
         let mut completion: Option<serde_json::Value> = (!truncated
             && buf.len() <= BOON_BUFFER_MAX)
             .then(|| serde_json::from_slice::<serde_json::Value>(&buf).ok())
@@ -2677,7 +2684,10 @@ async fn proxy_handler_inner(
                             // though the client only sees the block.
                             let tokens = turn0_usage
                                 .or_else(|| completion_body_usage(body_json))
-                                .unwrap_or((est.input_tokens, est.estimated_output_tokens));
+                                .unwrap_or(UpstreamUsage::uncached(
+                                    est.input_tokens,
+                                    est.estimated_output_tokens,
+                                ));
                             let total_ms = request_start.elapsed().as_millis() as u32;
                             let _ = settle_guard
                                 .complete(accounting.settle(
@@ -2720,9 +2730,12 @@ async fn proxy_handler_inner(
         };
         drop(permit);
 
-        let (input_tokens, output_tokens) = turn0_usage
+        let tokens = turn0_usage
             .or_else(|| completion.as_ref().and_then(completion_body_usage))
-            .unwrap_or((est.input_tokens, est.estimated_output_tokens));
+            .unwrap_or(UpstreamUsage::uncached(
+                est.input_tokens,
+                est.estimated_output_tokens,
+            ));
         let total_ms = request_start.elapsed().as_millis() as u32;
 
         // Cache the *transformed* body so cache hits replay exactly what the
@@ -2738,13 +2751,7 @@ async fn proxy_handler_inner(
             _ => None,
         };
         let _ = settle_guard
-            .complete(accounting.settle(
-                (input_tokens, output_tokens),
-                ttft_ms,
-                total_ms,
-                status_code,
-                cache_put,
-            ))
+            .complete(accounting.settle(tokens, ttft_ms, total_ms, status_code, cache_put))
             .await;
 
         let mut builder = Response::builder()
@@ -2878,7 +2885,10 @@ async fn proxy_handler_inner(
             // so the client cannot mistake the truncated body for a whole one.
             yield Err(std::io::Error::other(format!("upstream stream failed: {err}")));
         } else {
-            let tokens = usage.unwrap_or((est.input_tokens, est.estimated_output_tokens));
+            let tokens = usage.unwrap_or(UpstreamUsage::uncached(
+                est.input_tokens,
+                est.estimated_output_tokens,
+            ));
             // store the full response for identical future requests
             let cache_put = if cacheable && status_code == 200 {
                 store_in_cache.as_deref().map(|ck| {
@@ -3153,18 +3163,18 @@ async fn release_term_hold(
 /// ~4 characters per token) on top of the prompt estimate. Nothing streamed
 /// means nothing generated, so it is unbilled.
 fn truncated_stream_billing(
-    usage: Option<(u32, u32)>,
+    usage: Option<UpstreamUsage>,
     streamed_chars: usize,
     est: CostEstimate,
-) -> ((u32, u32), bool) {
+) -> (UpstreamUsage, bool) {
     if let Some(tokens) = usage {
         return (tokens, true);
     }
     if streamed_chars == 0 {
-        return ((0, 0), false);
+        return (UpstreamUsage::default(), false);
     }
     let output = u32::try_from(streamed_chars / 4).unwrap_or(u32::MAX).max(1);
-    ((est.input_tokens, output), true)
+    (UpstreamUsage::uncached(est.input_tokens, output), true)
 }
 
 /// Characters of generated text in one raw response chunk: the string values
@@ -3238,14 +3248,61 @@ fn field_text_chars(chunk: &[u8], key: &[u8]) -> usize {
     total
 }
 
+/// Tokens a request settles with: what the upstream reported, or an estimate
+/// in its place. `input` is the whole prompt, cached tokens included, so totals
+/// and prices keep their meaning; `cached` is the part of it the upstream
+/// served from its prefix cache, never more than `input`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct UpstreamUsage {
+    pub(crate) input: u32,
+    pub(crate) output: u32,
+    pub(crate) cached: u32,
+}
+
+impl UpstreamUsage {
+    pub(crate) fn new(input: u32, output: u32, cached: u32) -> Self {
+        Self {
+            input,
+            output,
+            cached: cached.min(input),
+        }
+    }
+
+    /// Usage with no cached prompt tokens: estimates, cancellations and
+    /// answers the gateway composed itself.
+    pub(crate) const fn uncached(input: u32, output: u32) -> Self {
+        Self {
+            input,
+            output,
+            cached: 0,
+        }
+    }
+}
+
+/// `prompt_tokens_details.cached_tokens` of an OpenAI-style `usage` object,
+/// never more than its `prompt_tokens`. Missing or `null` details count as 0.
+pub(crate) fn cached_prompt_tokens(usage: &serde_json::Value) -> u64 {
+    let prompt = usage
+        .get("prompt_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    usage
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        .min(prompt)
+}
+
 /// Usage a buffered chat completion reports, if any.
-fn completion_body_usage(body: &serde_json::Value) -> Option<(u32, u32)> {
-    let input = body.pointer("/usage/prompt_tokens")?.as_u64()? as u32;
-    let output = body
-        .pointer("/usage/completion_tokens")
+pub(crate) fn completion_body_usage(body: &serde_json::Value) -> Option<UpstreamUsage> {
+    let usage = body.get("usage")?;
+    let input = usage.get("prompt_tokens")?.as_u64()? as u32;
+    let output = usage
+        .get("completion_tokens")
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u32;
-    Some((input, output))
+    let cached = cached_prompt_tokens(usage) as u32;
+    Some(UpstreamUsage::new(input, output, cached))
 }
 
 /// Owned admission snapshot: cancellation bookkeeping must not borrow the body
@@ -3300,13 +3357,13 @@ impl StreamAccounting {
     /// the upstream has answered (nothing generated, billed nothing) and the
     /// estimate afterwards. Runtime shutdown remains best-effort, just like
     /// the asynchronous telemetry sink; a partial answer is never cached.
-    fn on_cancel(&self, tokens: Option<(u32, u32)>) -> impl FnOnce() + Send + 'static {
+    fn on_cancel(&self, tokens: Option<UpstreamUsage>) -> impl FnOnce() + Send + 'static {
         let accounting = self.clone();
         move || {
             let elapsed = accounting.request_start.elapsed().as_millis() as u32;
             let (tokens, billed) = match tokens {
                 Some(tokens) => (tokens, true),
-                None => ((0, 0), false),
+                None => (UpstreamUsage::default(), false),
             };
             tokio::spawn(accounting.settle_with(tokens, 0, elapsed, 499, None, billed));
         }
@@ -3317,7 +3374,7 @@ impl StreamAccounting {
     }
 
     fn arm_estimate(&self, guard: &mut crate::completion::CompletionGuard) {
-        guard.rearm(self.on_cancel(Some((
+        guard.rearm(self.on_cancel(Some(UpstreamUsage::uncached(
             self.est.input_tokens,
             self.est.estimated_output_tokens,
         ))));
@@ -3325,7 +3382,7 @@ impl StreamAccounting {
 
     pub(crate) async fn settle(
         self,
-        tokens: (u32, u32),
+        tokens: UpstreamUsage,
         ttft_ms: u32,
         total_ms: u32,
         status_code: u16,
@@ -3338,13 +3395,20 @@ impl StreamAccounting {
     /// Settle a request that produced nothing billable: zero tokens and
     /// cost, full refund of every reservation (energy is still charged).
     pub(crate) async fn settle_unbilled(self, ttft_ms: u32, total_ms: u32, status_code: u16) {
-        self.settle_with((0, 0), ttft_ms, total_ms, status_code, None, false)
-            .await;
+        self.settle_with(
+            UpstreamUsage::default(),
+            ttft_ms,
+            total_ms,
+            status_code,
+            None,
+            false,
+        )
+        .await;
     }
 
     async fn settle_with(
         self,
-        tokens: (u32, u32),
+        tokens: UpstreamUsage,
         ttft_ms: u32,
         total_ms: u32,
         status_code: u16,
@@ -3361,8 +3425,7 @@ impl StreamAccounting {
             &self.model,
             self.admission,
             self.est,
-            tokens.0,
-            tokens.1,
+            tokens,
             self.queue_wait_ms,
             ttft_ms,
             total_ms,
@@ -3405,8 +3468,7 @@ async fn settle_inner(
     model: &str,
     admission: Admission,
     est: CostEstimate,
-    input_tokens: u32,
-    output_tokens: u32,
+    tokens: UpstreamUsage,
     queue_wait_ms: u32,
     ttft_ms: u32,
     total_ms: u32,
@@ -3423,6 +3485,11 @@ async fn settle_inner(
     holds: TermHolds,
     billed: bool,
 ) {
+    let UpstreamUsage {
+        input: input_tokens,
+        output: output_tokens,
+        cached: cached_input_tokens,
+    } = tokens;
     // Feed the router's per-request cost estimate: one EWMA sample of how
     // long this model's answers actually run. Successful requests only — an
     // error body's usage says nothing about the model's answering behavior.
@@ -3577,6 +3644,7 @@ async fn settle_inner(
         est,
         input_tokens,
         output_tokens,
+        cached_input_tokens,
         queue_wait_ms,
         ttft_ms,
         total_ms,
@@ -4841,15 +4909,79 @@ fn append_tail(tail: &mut Vec<u8>, chunk: &[u8]) {
 ///
 /// Embedding responses report `prompt_tokens` (and `total_tokens`) but no
 /// `completion_tokens`; those are treated as input-only usage.
-fn extract_usage(tail: &str) -> Option<(u32, u32)> {
+///
+/// Cached prompt tokens come from the usage object holding that last
+/// `prompt_tokens`, so a stream that reports usage on several chunks never
+/// pairs one chunk's prompt count with another chunk's cache detail.
+fn extract_usage(tail: &str) -> Option<UpstreamUsage> {
     let input = find_int_after(tail, "\"prompt_tokens\"");
     let output = find_int_after(tail, "\"completion_tokens\"");
-    match (input, output) {
-        (Some(i), Some(o)) => Some((i, o)),
+    let (input, output) = match (input, output) {
+        (Some(i), Some(o)) => (i, o),
         // Embeddings and other input-only modalities: count prompt tokens.
-        (Some(i), None) => Some((i, 0)),
-        _ => None,
+        (Some(i), None) => (i, 0),
+        _ => return None,
+    };
+    Some(UpstreamUsage::new(input, output, tail_cached_tokens(tail)))
+}
+
+/// Cached prompt tokens of the JSON object around the tail's last
+/// `prompt_tokens`; 0 when it reports none, is cut off, or does not parse.
+fn tail_cached_tokens(tail: &str) -> u32 {
+    let Some(at) = tail.rfind("\"prompt_tokens\"") else {
+        return 0;
+    };
+    enclosing_json_object(tail, at)
+        .and_then(|object| serde_json::from_str::<serde_json::Value>(object).ok())
+        .map_or(0, |usage| cached_prompt_tokens(&usage) as u32)
+}
+
+/// The JSON object that byte offset `at` sits in: from the nearest `{` before
+/// it that is still open there, through its matching `}`. The backward walk
+/// counts braces only (a usage object's keys hold none); the forward walk
+/// skips string contents. `None` when either end is outside `text`.
+fn enclosing_json_object(text: &str, at: usize) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut start = None;
+    for i in (0..at).rev() {
+        match bytes[i] {
+            b'}' => depth += 1,
+            b'{' if depth == 0 => {
+                start = Some(i);
+                break;
+            }
+            b'{' => depth -= 1,
+            _ => {}
+        }
     }
+    let start = start?;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, &b) in bytes[start..].iter().enumerate() {
+        if in_string {
+            match b {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&text[start..=start + offset]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn find_int_after(haystack: &str, key: &str) -> Option<u32> {
@@ -5177,6 +5309,7 @@ pub(crate) fn finalize(
     est: CostEstimate,
     input_tokens: u32,
     output_tokens: u32,
+    cached_input_tokens: u32,
     queue_wait_ms: u32,
     ttft_ms: u32,
     total_ms: u32,
@@ -5203,6 +5336,7 @@ pub(crate) fn finalize(
         weight: resolved.weight,
         input_tokens,
         output_tokens,
+        cached_input_tokens,
         estimated_tokens: est.total(),
         queue_wait_ms,
         ttft_ms,
@@ -6151,7 +6285,7 @@ mod tests {
 
     #[test]
     fn append_tail_keeps_last_cap_bytes() {
-        use super::{append_tail, extract_usage, TAIL_CAP};
+        use super::{append_tail, extract_usage, UpstreamUsage, TAIL_CAP};
         let mut tail = Vec::new();
         // Small chunks accumulate verbatim.
         append_tail(&mut tail, b"hello ");
@@ -6169,7 +6303,7 @@ mod tests {
         assert_eq!(tail.len(), TAIL_CAP);
         assert_eq!(
             extract_usage(&String::from_utf8_lossy(&tail)),
-            Some((12, 34))
+            Some(UpstreamUsage::uncached(12, 34))
         );
         // A chunk larger than the cap replaces the buffer with its own tail.
         append_tail(&mut tail, &vec![b'y'; TAIL_CAP * 2]);
@@ -7675,14 +7809,22 @@ mod lifecycle_tests {
         assert_eq!(usage, None);
         let (tokens, billed) = truncated_stream_billing(usage, streamed, est);
         assert!(billed, "delivered text must be billed");
-        assert_eq!(tokens, (30, 5), "prompt estimate + ~4 chars per token");
+        assert_eq!(
+            tokens,
+            UpstreamUsage::uncached(30, 5),
+            "prompt estimate + ~4 chars per token"
+        );
 
         // Reported usage wins; nothing streamed is nothing billed.
+        let reported = UpstreamUsage::new(7, 3, 4);
         assert_eq!(
-            truncated_stream_billing(Some((7, 3)), streamed, est),
-            ((7, 3), true)
+            truncated_stream_billing(Some(reported), streamed, est),
+            (reported, true)
         );
-        assert_eq!(truncated_stream_billing(None, 0, est), ((0, 0), false));
+        assert_eq!(
+            truncated_stream_billing(None, 0, est),
+            (UpstreamUsage::default(), false)
+        );
     }
 
     #[test]
@@ -7750,8 +7892,120 @@ mod lifecycle_tests {
     #[test]
     fn completion_body_usage_reads_openai_usage() {
         let body = serde_json::json!({ "usage": { "prompt_tokens": 4, "completion_tokens": 9 } });
-        assert_eq!(completion_body_usage(&body), Some((4, 9)));
+        assert_eq!(
+            completion_body_usage(&body),
+            Some(UpstreamUsage::uncached(4, 9))
+        );
         assert_eq!(completion_body_usage(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn completion_body_usage_reads_cached_prompt_tokens() {
+        let usage = |details: serde_json::Value| {
+            completion_body_usage(&serde_json::json!({ "usage": {
+                "prompt_tokens": 100, "completion_tokens": 9, "prompt_tokens_details": details,
+            } }))
+        };
+        assert_eq!(
+            usage(serde_json::json!({ "cached_tokens": 64 })),
+            Some(UpstreamUsage::new(100, 9, 64))
+        );
+        // `null` details, details without the count, and a count above the
+        // prompt (clamped) all stay within the prompt.
+        assert_eq!(
+            usage(serde_json::Value::Null),
+            Some(UpstreamUsage::uncached(100, 9))
+        );
+        assert_eq!(
+            usage(serde_json::json!({ "audio_tokens": 0 })),
+            Some(UpstreamUsage::uncached(100, 9))
+        );
+        assert_eq!(
+            usage(serde_json::json!({ "cached_tokens": 500 })).map(|u| u.cached),
+            Some(100)
+        );
+        // An embedding reports prompt tokens only.
+        assert_eq!(
+            completion_body_usage(&serde_json::json!({ "usage": {
+                "prompt_tokens": 12, "total_tokens": 12,
+                "prompt_tokens_details": { "cached_tokens": 8 },
+            } })),
+            Some(UpstreamUsage::new(12, 0, 8))
+        );
+    }
+
+    /// The tail of a streamed chat completion: one content chunk, the final
+    /// usage-only chunk carrying `usage`, then `[DONE]`.
+    fn stream_tail(usage: serde_json::Value) -> String {
+        let content = serde_json::json!({
+            "object": "chat.completion.chunk",
+            "choices": [{ "index": 0, "delta": { "content": "hi" } }],
+        });
+        let last = serde_json::json!({
+            "object": "chat.completion.chunk", "choices": [], "usage": usage,
+        });
+        format!("data: {content}\n\ndata: {last}\n\ndata: [DONE]\n\n")
+    }
+
+    #[test]
+    fn stream_tail_usage_reads_cached_prompt_tokens() {
+        let tail = stream_tail(serde_json::json!({
+            "prompt_tokens": 2048, "total_tokens": 2098, "completion_tokens": 50,
+            "prompt_tokens_details": { "cached_tokens": 1536 },
+        }));
+        assert_eq!(
+            extract_usage(&tail),
+            Some(UpstreamUsage::new(2048, 50, 1536))
+        );
+    }
+
+    #[test]
+    fn stream_tail_usage_without_cache_detail_is_unchanged() {
+        let null = stream_tail(serde_json::json!({
+            "prompt_tokens": 20, "total_tokens": 25, "completion_tokens": 5,
+            "prompt_tokens_details": null,
+        }));
+        assert_eq!(extract_usage(&null), Some(UpstreamUsage::uncached(20, 5)));
+        let absent = stream_tail(serde_json::json!({
+            "prompt_tokens": 20, "total_tokens": 25, "completion_tokens": 5,
+        }));
+        assert_eq!(extract_usage(&absent), Some(UpstreamUsage::uncached(20, 5)));
+        let no_count = stream_tail(serde_json::json!({
+            "prompt_tokens": 20, "completion_tokens": 5,
+            "prompt_tokens_details": { "audio_tokens": 0 },
+        }));
+        assert_eq!(
+            extract_usage(&no_count),
+            Some(UpstreamUsage::uncached(20, 5))
+        );
+    }
+
+    #[test]
+    fn stream_tail_cache_detail_comes_from_the_final_usage_object() {
+        // Usage on every chunk (continuous usage stats): only the last chunk's
+        // cache detail may pair with the last chunk's prompt count, even when
+        // that last chunk reports none and an earlier one did.
+        let early = serde_json::json!({
+            "choices": [{ "index": 0, "delta": { "content": "x" } }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 1,
+                       "prompt_tokens_details": { "cached_tokens": 8 } },
+        });
+        let last = serde_json::json!({
+            "choices": [],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 2, "prompt_tokens_details": null },
+        });
+        let tail = format!("data: {early}\n\ndata: {last}\n\ndata: [DONE]\n\n");
+        assert_eq!(extract_usage(&tail), Some(UpstreamUsage::uncached(10, 2)));
+
+        // Key order does not matter: details before the prompt count still
+        // belong to the same object.
+        let reordered = r#"data: {"choices":[],"usage":{"prompt_tokens_details":{"cached_tokens":3},"completion_tokens":2,"prompt_tokens":10}}"#;
+        assert_eq!(extract_usage(reordered), Some(UpstreamUsage::new(10, 2, 3)));
+
+        // A usage object cut off at the end of the tail reports no cache
+        // detail rather than a guess, and keeps the old prompt reading.
+        let cut = r#"data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"prompt_tokens_details":{"cached_tok"#;
+        assert_eq!(extract_usage(cut), Some(UpstreamUsage::uncached(10, 2)));
     }
 
     #[test]
