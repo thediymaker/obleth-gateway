@@ -278,6 +278,27 @@ export function memToMb(mem: string | null | undefined): number | null {
   return Math.round(mb);
 }
 
+/**
+ * What one replica's job asks Slurm for, as a sentence:
+ * "Each replica asks Slurm for 1 node with 1 GPU, 72 CPUs and 500 GB of memory."
+ * A blank box is said as the default it falls back to.
+ */
+export function replicaAsk({ nodes, gres, cpus, mem }: { nodes: number; gres: string; cpus: string; mem: string }): string {
+  const n = Math.max(1, Math.floor(nodes) || 1);
+  const g = gres.trim();
+  const gpus = gresCount(g);
+  const c = cpus.trim();
+  const m = mem.trim();
+  const mb = memToMb(m);
+  const parts = [
+    !g ? "no GPUs" : gpus ? `${gpus} GPU${gpus === 1 ? "" : "s"}` : g,
+    !c ? "Slurm's default CPUs" : `${c} CPU${c === "1" ? "" : "s"}`,
+    !m ? "the partition's default memory" : mb === 0 ? "all of its memory" : mb ? `${mb >= 1024 ? `${Math.round(mb / 1024)} GB` : `${mb} MB`} of memory` : `${m} of memory`,
+  ];
+  const list = `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}`;
+  return n === 1 ? `Each replica asks Slurm for 1 node with ${list}.` : `Each replica asks Slurm for ${n} nodes, each with ${list}.`;
+}
+
 export function mbLabel(mb: number | null | undefined): string {
   if (!mb) return "—";
   return mb >= 1024 ? `${Math.round(mb / 1024)}G` : `${mb}M`;

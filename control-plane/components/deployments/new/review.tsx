@@ -7,13 +7,15 @@ import { Button } from "@/components/ui/button";
 import type { DeployForm, Problem } from "@/lib/deploy-form";
 import { parseTimeLimit, walltimeLabel } from "@/lib/deployments-model";
 import { renderScript, type ClusterValues } from "@/lib/recipe-inputs";
+import { stripSbatchDirectives } from "@/lib/sbatch-directives";
 import { MODEL_TYPE_NAMES } from "@/lib/models-model";
 import { cn } from "@/lib/utils";
 
-/** The script as the job will run it, env exports included, for the review. */
+/** The script as the job will run it, env exports included, for the review.
+ *  Its #SBATCH lines are left out: their values are the job settings, sent as fields. */
 export function reviewScript(body: string, card: RecipeCard, form: DeployForm, cv: ClusterValues): string {
   const p = card.preview!;
-  const filled = renderScript(body, p.inputs, form.inputs, cv, { nodes: form.slurm.nodes, builtins: { api_model_name: form.name.trim() } });
+  const filled = stripSbatchDirectives(renderScript(body, p.inputs, form.inputs, cv, { nodes: form.slurm.nodes, builtins: { api_model_name: form.name.trim() } }));
   const env = Object.entries(form.env).filter(([k]) => k.trim());
   if (!env.length) return filled;
   const block = env.map(([k, v]) => `export ${k}='${v.replace(/'/g, "'\\''")}'`).join("\n");
@@ -48,10 +50,10 @@ export function Review({ card, form, cv, script, onScript, problems, slurmOn, pe
     <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_380px]">
       <section aria-label="Job script" className="flex min-w-0 flex-col gap-3 rounded-xl border border-border bg-card px-5 py-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <div><span className="text-sm font-semibold">Job script</span><p className="text-xs text-muted-foreground">What each replica&apos;s job runs, with your values filled in. obleth binds the port before it.</p></div>
+          <div><span className="text-sm font-semibold">Job script</span><p className="text-xs text-muted-foreground">What each replica&apos;s job runs, with your values filled in. obleth binds the port before it. The job settings are sent to Slurm separately, below.</p></div>
           <span className="flex gap-2">
             <Button type="button" variant="outline" size="sm" onClick={() => { navigator.clipboard?.writeText(shown); setCopied(true); }}>{copied ? "Copied" : "Copy"}</Button>
-            <Button type="button" variant="outline" size="sm" onClick={() => onScript(script === null ? p.rawBody : null)}>{script === null ? "Edit" : "Undo edits"}</Button>
+            <Button type="button" variant="outline" size="sm" onClick={() => onScript(script === null ? stripSbatchDirectives(p.rawBody) : null)}>{script === null ? "Edit" : "Undo edits"}</Button>
           </span>
         </div>
         {script === null ? (
@@ -63,6 +65,7 @@ export function Review({ card, form, cv, script, onScript, problems, slurmOn, pe
           <>
             <textarea aria-label="Job script" value={script} onChange={(e) => onScript(e.target.value)} rows={22} spellCheck={false} className="w-full rounded-lg border border-input bg-background px-3 py-2.5 font-mono text-[12px] leading-relaxed focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring" />
             <p className="text-[12px] text-muted-foreground">You&apos;re editing the recipe&apos;s script for this launch; {"{{inputs}}"} and {"{{cluster.*}}"} are still filled in.</p>
+            {/^\s*#SBATCH/m.test(script) && <p className="text-[12px] font-medium">#SBATCH lines are dropped at launch, because Slurm doesn&apos;t read them from a script obleth submits. Set GPUs, CPUs and memory on the previous step.</p>}
           </>
         )}
         <div className="flex flex-col gap-1 border-t border-border pt-3">

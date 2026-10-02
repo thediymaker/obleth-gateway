@@ -220,15 +220,18 @@ export function Field({
   );
 }
 
-export function TextArea({ name, label, rows = 3, defaultValue, placeholder, className }: {
+export function TextArea({ name, label, rows = 3, defaultValue, value, onChange, placeholder, className }: {
   name: string; label: string; rows?: number; defaultValue?: string; placeholder?: string; className?: string;
+  /** Controlled when given. */
+  value?: string;
+  onChange?: (value: string) => void;
 }) {
   return (
     <textarea
       name={name}
       aria-label={label}
       rows={rows}
-      defaultValue={defaultValue}
+      {...(value !== undefined ? { value, onChange: (e: ChangeEvent<HTMLTextAreaElement>) => onChange?.(e.target.value) } : { defaultValue })}
       placeholder={placeholder}
       autoCapitalize="none"
       autoCorrect="off"

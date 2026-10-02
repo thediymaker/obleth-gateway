@@ -156,6 +156,29 @@ describe("a Slurm deployment's page", () => {
     expect(setDeploymentReplicasAction).toHaveBeenCalledWith("m1", 3);
   });
 
+  it("moves #SBATCH lines from the script into Placement, where Slurm reads them", async () => {
+    const script = ["#!/bin/bash -l", "#SBATCH --gres=gpu:1", "#SBATCH --cpus-per-task=72", "#SBATCH --mem=500G", "#SBATCH --exclusive", "set -euo pipefail", "vllm serve m"].join("\n");
+    await render(<ManagedPage modelId="m1" initial={data({ specs: [spec({ script_body: script })] })} changes={[]} />);
+    const notice = () => [...host.querySelectorAll('[role="status"]')].find((x) => x.textContent?.includes("#SBATCH"));
+    expect(notice()?.textContent).toContain("Slurm doesn't read these 4 #SBATCH lines");
+    expect(notice()?.textContent).toContain("Placement's memory is 560G; this would make it 500G.");
+    expect(notice()?.textContent).toContain("Placement's GPUs is the same.");
+    expect(host.textContent).toContain("Each replica asks Slurm for 1 node with 1 GPU, 72 CPUs and 560 GB of memory.");
+    await act(async () => button("Move them to Placement").click());
+    expect(host.querySelector<HTMLTextAreaElement>('textarea[name="slurm_script_body"]')!.value).toBe(["#!/bin/bash -l", "set -euo pipefail", "vllm serve m"].join("\n"));
+    expect(host.querySelector<HTMLInputElement>('input[name="slurm_mem"]')!.value).toBe("500G");
+    expect(notice()).toBeUndefined();
+    expect(host.textContent).toContain("Each replica asks Slurm for 1 node with 1 GPU, 72 CPUs and 500 GB of memory.");
+  });
+
+  it("labels what each node gets", async () => {
+    await render(<ManagedPage modelId="m1" initial={data()} changes={[]} />);
+    const row = host.querySelector("#set-resources")!;
+    expect(row.textContent).toContain("On its node");
+    for (const label of ["GPUs", "CPUs", "Memory"]) expect([...row.querySelectorAll("label")].some((l) => l.textContent?.startsWith(label))).toBe(true);
+    expect(host.querySelector("#set-nodes")?.textContent).toContain("Nodes per replica");
+  });
+
   it("says why it stopped after failed launches", async () => {
     const lost = [1, 2, 3].map(() => replica({ state: "lost", last_message: "FAILED — NonZeroExitCode" }));
     await render(<ManagedPage modelId="m1" initial={data({ replicas: lost })} changes={[]} />);
