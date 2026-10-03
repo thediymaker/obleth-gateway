@@ -64,6 +64,22 @@ describe("renderScript", () => {
     expect(renderScript("x {{tools}}", inputs, { tools: "false" }, cv)).toBe("x ");
   });
 
+  it("leaves nothing behind for an optional input with no value", () => {
+    const opt: RecipeInput[] = [
+      { name: "context", type: "number", required: false },
+      { name: "extra", type: "text", required: false },
+    ];
+    const script = 'CONTEXT="{{context}}"\nvllm serve m {{extra}}';
+    expect(renderScript(script, opt, {}, cv, { strict: true })).toBe('CONTEXT=""\nvllm serve m ');
+    expect(renderScript(script, opt, { context: " ", extra: "" }, cv)).toBe('CONTEXT=""\nvllm serve m ');
+  });
+
+  it("keeps a required input's token for the review until it has a value", () => {
+    const model: RecipeInput[] = [{ name: "model", type: "text", required: true }];
+    expect(renderScript("serve {{model}}", model, {}, cv)).toBe("serve {{model}}");
+    expect(() => renderScript("serve {{model}}", model, {}, cv, { strict: true })).toThrow(/model/);
+  });
+
   it("refuses to launch with a cluster default missing", () => {
     expect(() => renderScript("run {{image}}", inputs, {}, EMPTY_CLUSTER, { strict: true })).toThrow(/cluster.image.vllm isn't set/);
   });

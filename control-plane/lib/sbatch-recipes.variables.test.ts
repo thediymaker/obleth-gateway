@@ -94,7 +94,7 @@ describe("recipe variable substitution", () => {
     expect(p.managedBody.script_body).toContain("run /x {{tag}} q4");
   });
 
-  it("leaves an optional variable's token in place when unset and undefaulted", () => {
+  it("drops an optional variable's token when it is unset and undefaulted", () => {
     const r = parseRecipe(
       "t",
       [
@@ -105,6 +105,8 @@ describe("recipe variable substitution", () => {
       ].join("\n"),
     );
     const p = buildManagedFromRecipe(r, { variables: {} });
-    expect(p.managedBody.script_body).toContain("run {{opt}}");
+    // A literal {{opt}} would reach bash and the engine as an argument.
+    expect(p.managedBody.script_body).toContain("run ");
+    expect(p.managedBody.script_body).not.toContain("{{opt}}");
   });
 });
