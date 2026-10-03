@@ -7,7 +7,7 @@ import { Plus } from "lucide-react";
 import { deleteTemplateAction } from "@/app/actions";
 import { Notice } from "@/components/models/ui";
 import { Pill } from "@/components/overview/ui";
-import type { RecipeCard } from "@/components/recipes/recipe-card";
+import { testedSentence, type RecipeCard } from "@/components/recipes/recipe-card";
 import { TemplateEditor } from "@/components/recipes/template-editor";
 import { engineName } from "@/components/deployments/new/picker";
 import { Button } from "@/components/ui/button";
@@ -53,7 +53,7 @@ export function RecipesTab({ recipes, specs, models }: { recipes: RecipeCard[]; 
     const launched = launchedAs(c);
     const toFill = c.preview?.inputs.filter((i) => i.required && !i.default).length ?? 0;
     const based = c.preview?.basedOn ? recipes.find((x) => x.id === c.preview?.basedOn)?.name ?? c.preview.basedOn : null;
-    const sub = !c.valid ? `Can't be read: ${c.error}` : c.source === "db" ? [based ? `From ${based}` : null, c.preview?.model].filter(Boolean).join(" · ") : [c.preview?.model, toFill ? `${toFill} value${toFill === 1 ? "" : "s"} to fill in` : null].filter(Boolean).join(" · ");
+    const sub = !c.valid ? `Can't be read: ${c.error}` : c.source === "db" ? [based ? `From ${based}` : null, c.preview?.model].filter(Boolean).join(" · ") : [c.preview?.model, c.preview?.tested?.[0] ? `served on ${c.preview.tested[0].hardware}` : "not run yet", toFill ? `${toFill} value${toFill === 1 ? "" : "s"} to fill in` : null].filter(Boolean).join(" · ");
     return (
       <div key={`${c.source}:${c.id}`} className={cn("grid min-h-[54px] items-center gap-3.5 border-t border-border px-[18px] py-2 text-[13px]", COLS)}>
         <span className="flex min-w-0 flex-col">
@@ -103,7 +103,7 @@ export function RecipesTab({ recipes, specs, models }: { recipes: RecipeCard[]; 
         <Button type="button" variant="outline" size="sm" className="h-9" onClick={() => setEditor({ open: true })}><Plus className="h-4 w-4" />New recipe</Button>
       </div>
       {table("Saved recipes", "Saved", "Your team's: a library recipe or engine with the values that worked. Save one from a launch, or from a deployment that serves.", saved, "Nothing saved yet. Launch from the Library and tick \u201cAlso save these settings as a recipe\u201d, or save a deployment that serves from its page.")}
-      {table("Library", "Library", "Shipped with obleth in its recipes folder; copy one to change it.", library, "No recipes in the library folder.")}
+      {table("Library", "Library", "Shipped with obleth in its recipes folder, each with where it was run and served; copy one to change it.", library, "No recipes in the library folder.")}
       {engines.length > 0 && (
         <section aria-label="Engines" className="flex flex-col gap-3 rounded-xl border border-border bg-card px-[18px] py-4">
           <div className="flex flex-wrap items-baseline justify-between gap-2"><span className="text-sm font-semibold">Engines</span><span className="text-[12px] text-muted-foreground">For a Hugging Face model with no recipe yet; chosen after the model, from what its files need</span></div>
@@ -112,6 +112,7 @@ export function RecipesTab({ recipes, specs, models }: { recipes: RecipeCard[]; 
               <div key={c.id} className="flex flex-col gap-1.5 rounded-lg border border-border bg-background/40 px-3.5 py-3">
                 <span className="text-[13.5px] font-semibold">{c.name}</span>
                 <span className="text-[12px] leading-relaxed text-muted-foreground">{c.description}</span>
+                {c.preview?.tested?.[0] && <span className="text-[12px] leading-relaxed text-secondary-foreground">{testedSentence(c.preview.tested[0])}</span>}
                 <span className="flex gap-3.5 pt-1 text-[12.5px]">
                   <Link href={`/deployments/new?recipe=${encodeURIComponent(c.id)}`} className="text-secondary-foreground underline underline-offset-[3px] hover:text-foreground">Launch a model</Link>
                   <button type="button" onClick={() => setEditor({ open: true, initial: { name: `${c.name ?? c.id} (copy)`, body: c.body ?? "" } })} className="text-secondary-foreground underline underline-offset-[3px] hover:text-foreground">Copy to edit</button>

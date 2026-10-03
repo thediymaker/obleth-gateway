@@ -68,6 +68,17 @@ export interface RecipeHeader {
   node_notes?: Record<string, string>;
   /** Environment variables exported at the top of the job. */
   env?: Record<string, string>;
+  /** Where the recipe has been run and served, newest first. */
+  tested?: RecipeTest[];
+}
+
+/** One run of a recipe that served: the hardware, the engine build, when, and
+ *  what was seen (time to ready, speed). */
+export interface RecipeTest {
+  hardware: string;
+  engine?: string;
+  date?: string;
+  result?: string;
 }
 
 export interface ParsedRecipe {
@@ -92,6 +103,16 @@ const VariableSchema = z.object({
 });
 
 const scalar = z.union([z.string(), z.number(), z.boolean()]).transform((v) => String(v));
+
+// YAML reads an unquoted 2026-10-03 as a date; keep it as the text written.
+const day = z.union([z.string(), z.date()]).transform((v) => (typeof v === "string" ? v : v.toISOString().slice(0, 10)));
+
+const TestSchema = z.object({
+  hardware: z.string().min(1),
+  engine: z.string().optional(),
+  date: day.optional(),
+  result: z.string().optional(),
+});
 
 const InputSchema = z.object({
   name: z.string().regex(/^[a-zA-Z_][a-zA-Z0-9_]*$/, "invalid input name"),
@@ -152,6 +173,7 @@ const HeaderSchema = z
     node_options: z.array(z.coerce.number().int().positive()).optional(),
     node_notes: z.record(z.string(), z.string()).optional(),
     env: z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/, "invalid environment variable name"), scalar).optional(),
+    tested: z.array(TestSchema).optional(),
   })
   .strip()
   .transform((h) => {
@@ -500,6 +522,7 @@ export function buildDeployPreview(recipe: ParsedRecipe): RecipeDeployPreview | 
     basedOn: recipe.header.based_on,
     env: recipe.header.env,
     description: recipe.header.description,
+    tested: recipe.header.tested,
   };
 }
 

@@ -5,7 +5,7 @@ import { Search } from "lucide-react";
 import { lookupHfModelAction } from "@/app/actions";
 import { Notice } from "@/components/models/ui";
 import { Pill, Segmented } from "@/components/overview/ui";
-import type { RecipeCard } from "@/components/recipes/recipe-card";
+import { testedSentence, type RecipeCard } from "@/components/recipes/recipe-card";
 import { Button } from "@/components/ui/button";
 import { gresCount, memToMb, partitionFits } from "@/lib/deployments-model";
 import type { EngineId, HfModel } from "@/lib/hf-model";
@@ -165,6 +165,19 @@ function Selected({ card, runs, onNext }: { card: RecipeCard; runs: LaunchRecord
         <dt className="text-muted-foreground">Engine</dt><dd>{engineName(p.engine)}{p.requires ? <span className="block text-[12px] text-muted-foreground">{p.requires}</span> : null}</dd>
         {(p.nodeOptions?.length ?? 0) > 1 && <><dt className="text-muted-foreground">Runs on</dt><dd>{p.nodeOptions!.join(", ")} nodes</dd></>}
         {values.length > 0 && <><dt className="text-muted-foreground">{card.source === "db" ? "Saved values" : "Starts with"}</dt><dd className="text-secondary-foreground">{values.join(" · ")}</dd></>}
+        {card.source === "file" && (
+          <>
+            <dt className="text-muted-foreground">Tested</dt>
+            <dd className="flex flex-col gap-1.5">
+              {p.tested?.length ? p.tested.map((t, i) => (
+                <span key={i}>
+                  {testedSentence(t)}
+                  {t.result && <span className="block text-[12px] text-muted-foreground">{t.result}</span>}
+                </span>
+              )) : <span className="text-muted-foreground">Not run yet by the recipe&apos;s authors.</span>}
+            </dd>
+          </>
+        )}
         <dt className="text-muted-foreground">Launched</dt><dd>{runs.length ? `${runs.length} time${runs.length === 1 ? "" : "s"}, ${served} served` : "Not yet"}</dd>
       </dl>
       {p.warnings.length > 0 && <p className="text-xs text-muted-foreground">{p.warnings.join(" ")}</p>}
