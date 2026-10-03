@@ -431,6 +431,32 @@ impl UpstreamFailure {
     }
 }
 
+/// One search run on a chat model's behalf by the web-search boon: the same
+/// upstream call, failover and result shaping as `POST /v1/search`, without the
+/// HTTP envelope. The boon owns everything around it (limits, guardrails, the
+/// ledger row), so this is only the search itself. Returns results in the
+/// Perplexity shape, or the reason the search failed, already free of upstream
+/// addresses and safe to show the model.
+pub(crate) async fn search_for_boon(
+    state: &AppState,
+    route: &ResolvedModel,
+    query: &str,
+    max_results: usize,
+    domains: &[&str],
+    session: &str,
+) -> Result<Vec<Value>, String> {
+    let request = SearchRequest {
+        tool: None,
+        query: query.to_string(),
+        max_results: Some(max_results.max(1)),
+        domains: DomainFilter::parse(&domains[..domains.len().min(MAX_DOMAIN_FILTERS)]),
+        params: Vec::new(),
+    };
+    call_upstream(state, route, &request, session)
+        .await
+        .map_err(|failure| failure.message)
+}
+
 /// Run the search against the route's upstreams in the order the route's
 /// endpoint selection gives, moving on from one that is unreachable or failing
 /// (5xx) and stopping at the first answer.

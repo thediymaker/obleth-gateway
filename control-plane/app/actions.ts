@@ -1904,20 +1904,21 @@ const SETTINGS_PAGE_ORDER: SettingsPageSection[] = ["alerts", "routing", "boons"
 const SETTINGS_PAGE_LABEL: Record<SettingsPageSection, string> = { alerts: "Alerts", routing: "Routing", boons: "Boons", energy: "Energy", assistant: "Assistant", retention: "Data" };
 
 const BOON_BOOLS = [
-  "vision_enabled", "structured_output_enabled", "tool_loop_enabled", "image_generation_enabled", "speculation_enabled",
+  "vision_enabled", "structured_output_enabled", "tool_loop_enabled", "image_generation_enabled", "web_search_enabled", "speculation_enabled",
   "compression_enabled", "compression_code_compaction", "compression_dedup", "compression_compact_logs", "compression_allow_lossy",
 ] as const;
 const BOON_NUMBERS = [
   "vision_max_images", "vision_timeout_ms", "structured_output_max_repair_attempts", "structured_output_timeout_ms",
   "tool_loop_max_turns", "tool_loop_tool_timeout_ms", "tool_loop_deadline_secs",
   "image_generation_max_images_per_request", "image_generation_timeout_ms",
+  "web_search_max_results", "web_search_max_searches_per_request", "web_search_timeout_ms",
   "speculation_agree_min", "speculation_lp_min", "speculation_abort_agree", "speculation_abort_lp", "speculation_first_chunk_tokens",
   "speculation_chunk_tokens", "speculation_decide_by_tokens", "speculation_max_draft_tokens", "speculation_pace_ms", "speculation_timeout_ms",
   "compression_min_tokens", "compression_max_segments", "compression_max_lossy_segments", "compression_original_ttl_secs", "compression_neural_keep_ratio",
 ] as const;
 /** Model pickers: blank means none. */
-const BOON_MODELS = ["vision_fallback_model", "structured_output_fixer_model", "image_generation_model", "speculation_draft_model", "speculation_classify_model"] as const;
-const BOON_TEXTS = ["vision_describe_prompt", "tool_loop_nudge", "image_generation_tool_description", "speculation_verify_url_template"] as const;
+const BOON_MODELS = ["vision_fallback_model", "structured_output_fixer_model", "image_generation_model", "web_search_tool", "speculation_draft_model", "speculation_classify_model"] as const;
+const BOON_TEXTS = ["vision_describe_prompt", "tool_loop_nudge", "image_generation_tool_description", "web_search_tool_description", "speculation_verify_url_template"] as const;
 
 /** The boons section of the Settings form as the gateway's update, or why not. */
 function boonSettingsFromForm(formData: FormData): { ok: true; body: UpdateBoonSettings } | { ok: false; error: string } {
@@ -1959,6 +1960,10 @@ function boonSettingsFromForm(formData: FormData): { ok: true; body: UpdateBoonS
   if (turns !== undefined && (turns < 1 || turns > 8)) return { ok: false, error: "Tool loop: 1 to 8 turns." };
   const images = body.image_generation_max_images_per_request as number | undefined;
   if (images !== undefined && (images < 1 || images > 4)) return { ok: false, error: "Image generation: 1 to 4 images a call." };
+  const results = body.web_search_max_results as number | undefined;
+  if (results !== undefined && (results < 1 || results > 10)) return { ok: false, error: "Web search: 1 to 10 results a search." };
+  const searches = body.web_search_max_searches_per_request as number | undefined;
+  if (searches !== undefined && (searches < 1 || searches > 8)) return { ok: false, error: "Web search: 1 to 8 searches a request." };
   const keep = body.compression_neural_keep_ratio as number | undefined;
   if (keep !== undefined && (keep < 0.05 || keep > 1)) return { ok: false, error: "Compression: keep between 5% and 100% of prose." };
   return { ok: true, body: body as UpdateBoonSettings };

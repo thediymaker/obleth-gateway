@@ -23,7 +23,8 @@ function unset(value: string | null | undefined): boolean {
 /**
  * Which boons cannot currently be granted, and why. Mirrors each
  * `active()` in obleth-config `types.rs`: every boon needs its global switch,
- * and `vision` and `image_generation` additionally need a helper model.
+ * and `vision`, `image_generation` and `web_search` additionally need a
+ * helper model (a search tool, for web search).
  *
  * Both settings objects are optional so the caller can pass whatever `safe()`
  * returned: an admin-API hiccup yields no blockers rather than a form that
@@ -43,6 +44,9 @@ export function boonBlockers(
     if (!boons.image_generation_enabled) blockers.image_generation = OFF_IN_BOONS;
     else if (unset(boons.image_generation_model))
       blockers.image_generation = "no image model is set in Settings → Boons.";
+    if (!boons.web_search_enabled) blockers.web_search = OFF_IN_BOONS;
+    else if (unset(boons.web_search_tool))
+      blockers.web_search = "no search tool is set in Settings → Boons.";
     if (!boons.speculation_enabled) blockers.speculation = OFF_IN_BOONS;
   }
   // Knowledge is the one boon configured on its own page, not the Boons tab.

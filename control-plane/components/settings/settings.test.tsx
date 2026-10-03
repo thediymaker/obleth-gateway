@@ -54,7 +54,7 @@ describe("the Settings page", () => {
     expect(needs.textContent).toContain("Nobody is alerted");
     expect(needs.textContent).toContain("glm-5-3 asks for Vision, which is off");
     expect(host.querySelector("#boon-vision")!.textContent).toContain("1 asks, off");
-    expect(host.querySelector('nav[aria-label="Settings sections"]')!.textContent).toContain("2 of 6 on");
+    expect(host.querySelector('nav[aria-label="Settings sections"]')!.textContent).toContain("2 of 7 on");
   });
 
   it("saves only the section that changed", async () => {

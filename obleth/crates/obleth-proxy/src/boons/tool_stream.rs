@@ -68,6 +68,8 @@ pub struct StreamLoop {
     /// Image-generation boon settings snapshot, present when the boon armed the
     /// loop.
     pub image_gen: Option<obleth_config::ImageGenerationBoonSettings>,
+    /// Web-search boon settings snapshot, present when the boon armed the loop.
+    pub web_search: Option<obleth_config::WebSearchBoonSettings>,
     pub dispatch_timeout: Duration,
     /// Whether the client asked for `stream_options.include_usage`.
     pub client_include_usage: bool,
@@ -102,6 +104,7 @@ pub fn run(
             settings,
             passthrough_unmapped,
             image_gen,
+            web_search,
             dispatch_timeout,
             client_include_usage,
             upstream_start,
@@ -125,6 +128,14 @@ pub fn run(
             session_id: &session_id,
             request_id,
             images: Vec::new(),
+            events: Vec::new(),
+        });
+        let mut search_ctx = web_search.as_ref().map(|cfg| super::web_search::SearchCtx {
+            cfg,
+            key: &key,
+            session_id: &session_id,
+            request_id,
+            searches: 0,
             events: Vec::new(),
         });
 
@@ -361,6 +372,7 @@ pub fn run(
                     &tool_servers,
                     &mut sessions,
                     image_ctx.as_mut(),
+                    search_ctx.as_mut(),
                     &pending,
                     index,
                     &deadline,

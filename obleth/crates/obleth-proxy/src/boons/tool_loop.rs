@@ -122,6 +122,10 @@ pub struct ToolLoopPlan {
     /// the loop. `None` leaves `generate_image` unhandled, which is correct:
     /// the tool is only ever injected alongside this field.
     pub image_gen: Option<obleth_config::ImageGenerationBoonSettings>,
+    /// Web-search boon settings snapshot, present when the boon armed the
+    /// loop. `None` leaves `web_search` to whoever owns the name (a client
+    /// tool or a granted MCP server).
+    pub web_search: Option<obleth_config::WebSearchBoonSettings>,
     /// URL of the upstream that answered turn 0, when the dispatcher records
     /// it. Follow-up turns go to the same endpoint so they reuse its prefix
     /// cache. `None` falls back to the model's endpoint selection with this
@@ -498,6 +502,17 @@ pub async fn run(
             images: Vec::new(),
             events: Vec::new(),
         });
+    let mut search_ctx = loop_plan
+        .web_search
+        .as_ref()
+        .map(|cfg| super::web_search::SearchCtx {
+            cfg,
+            key,
+            session_id,
+            request_id,
+            searches: 0,
+            events: Vec::new(),
+        });
 
     let mut completed_turns: u32 = 0;
     // Deduplicated list of every tool name called across all turns, for the
@@ -600,6 +615,7 @@ pub async fn run(
                 &loop_plan.tool_servers,
                 &mut sessions,
                 image_ctx.as_mut(),
+                search_ctx.as_mut(),
                 call,
                 index,
                 &deadline,
@@ -634,6 +650,23 @@ pub async fn run(
                             "images": event.images,
                             "size": event.size,
                             "model": event.model,
+                        }),
+                    );
+                }
+            }
+        }
+        if let Some(ctx) = search_ctx.as_mut() {
+            for event in ctx.events.drain(..) {
+                if let Some(t) = tracer.as_deref_mut() {
+                    t.record(
+                        "boon:web_search",
+                        "boon:tool_loop",
+                        tool_exec_start,
+                        event.upstream_ms,
+                        if event.ok { "ok" } else { "error" },
+                        serde_json::json!({
+                            "results": event.results,
+                            "tool": event.tool,
                         }),
                     );
                 }
@@ -856,6 +889,7 @@ pub(super) async fn run_one_call(
     tool_servers: &HashMap<String, String>,
     sessions: &mut Sessions,
     image: Option<&mut super::image_gen::ImageCtx<'_>>,
+    search: Option<&mut super::web_search::SearchCtx<'_>>,
     call: &PendingCall,
     index: usize,
     deadline: &LoopDeadline,
@@ -869,6 +903,7 @@ pub(super) async fn run_one_call(
                 tool_servers,
                 sessions,
                 image,
+                search,
                 call,
                 timeout,
                 deadline,
@@ -946,6 +981,7 @@ pub(super) async fn execute_call(
     tool_servers: &HashMap<String, String>,
     sessions: &mut Sessions,
     image: Option<&mut super::image_gen::ImageCtx<'_>>,
+    search: Option<&mut super::web_search::SearchCtx<'_>>,
     call: &PendingCall,
     timeout: Duration,
     deadline: &LoopDeadline,
@@ -977,6 +1013,18 @@ pub(super) async fn execute_call(
             return deadline_result(&call.name);
         };
         return super::image_gen::execute(state, ctx, &call.arguments, image_timeout).await;
+    }
+
+    // Gateway-executed web search, when this boon armed the loop. Without a
+    // context the name belongs to someone else (a granted MCP server's
+    // `web_search`, say), so it falls through to the normal lookup below.
+    if call.name == super::web_search::WEB_SEARCH_TOOL {
+        if let Some(ctx) = search {
+            let Some(search_timeout) = super::web_search::call_timeout(ctx.cfg, deadline) else {
+                return deadline_result(&call.name);
+            };
+            return super::web_search::execute(state, ctx, &call.arguments, search_timeout).await;
+        }
     }
 
     let Some(server_name) = tool_servers.get(&call.name) else {
@@ -1079,6 +1127,7 @@ mod tests {
             settings: ToolLoopSettings::default(),
             passthrough_unmapped: false,
             image_gen: None,
+            web_search: None,
             served_url: Some(format!("{base_b}/chat/completions")),
         };
         let http = reqwest::Client::new();

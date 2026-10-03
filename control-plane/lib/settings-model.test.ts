@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { alerts, boons, model, readiness, router } from "@/components/settings/fixtures";
-import { ROUTER_PROFILES, SPEC_PROFILES, describeResync, modelsAsking, needsYou, routerProfileOf, routerValues, sectionOfField, specProfileOf, specValues } from "./settings-model";
+import { ROUTER_PROFILES, SPEC_PROFILES, boonSummary, describeResync, modelsAsking, needsYou, routerProfileOf, routerValues, sectionOfField, specProfileOf, specValues } from "./settings-model";
 
 const base = { alerts: alerts(), boons: boons(), knowledge: null, models: [], readiness: readiness(), slurm: null, compressor: null, router: router() };
 
@@ -41,6 +41,19 @@ describe("the settings model", () => {
   it("flags an on boon with no model, and router warnings", () => {
     const found = needsYou({ ...base, alerts: null, boons: boons({ speculation_draft_model: null }), readiness: readiness({ findings: [{ code: "no_tags", severity: "warn", title: "No model is tagged", detail: "Tag some." }, { code: "fyi", severity: "info", title: "FYI", detail: "" }] as never }) });
     expect(found.map((f) => f.key)).toEqual(["spec-model", "router-no_tags"]);
+  });
+
+  it("flags web search switched on with no search tool, and summarizes it once picked", () => {
+    const found = needsYou({ ...base, alerts: null, boons: boons({ web_search_enabled: true, web_search_tool: null }) });
+    expect(found.map((f) => f.key)).toEqual(["search-tool"]);
+    expect(found[0].href).toBe("#boon-web_search");
+    expect(boonSummary("web_search", boons({ web_search_tool: "searxng-search" }))).toBe("searxng-search · 5 results a search · up to 3 searches a request");
+    expect(boonSummary("web_search", boons())).toBe("No search tool picked");
+  });
+
+  it("counts a model as asking for web search when it lists the boon", () => {
+    const models = [model("glm-5-3", { boons: ["vision", "image_generation", "web_search"] }), model("b")];
+    expect(modelsAsking("web_search", models)).toEqual(["glm-5-3"]);
   });
 
   it("describes a cache reconcile in words", () => {

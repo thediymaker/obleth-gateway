@@ -56,6 +56,7 @@ const SEARCH: { id: string; label: string; words: string }[] = [
   { id: "boon-structured_output", label: "Structured output", words: "json schema fixer boon" },
   { id: "boon-tool_loop", label: "Tool loop", words: "mcp tools turns boon" },
   { id: "boon-image_generation", label: "Image generation", words: "draw picture flux boon" },
+  { id: "boon-web_search", label: "Web search", words: "search web internet searxng lookup boon" },
   { id: "boon-speculation", label: "Speculation", words: "drafter draft verify gates boon" },
   { id: "boon-compression", label: "Compression", words: "dedup lossy compact boon" },
   { id: "set-energy", label: "Energy", words: "power prometheus watts carbon co2 pue kwh" },
@@ -189,7 +190,7 @@ export function SettingsPage({ data, anchor }: { data: SettingsData; anchor?: st
   const sectionOf = useCallback((n: string) => sectionOfField(n), []);
   const labelOf = useCallback((n: string) => {
     const [section, field = ""] = n.split(".");
-    const words = field.replace(/^(speculation|compression|image_generation|structured_output|tool_loop|vision)_/, "$1 ").replace(/_/g, " ");
+    const words = field.replace(/^(speculation|compression|image_generation|web_search|structured_output|tool_loop|vision)_/, "$1 ").replace(/_/g, " ");
     return `${section === "retention" ? "Data" : section[0].toUpperCase() + section.slice(1)} · ${words}`;
   }, []);
   const onDirty = useCallback((sections: string[]) => setDirty(sections.map((s) => (s === "retention" ? "data" : s))), []);
