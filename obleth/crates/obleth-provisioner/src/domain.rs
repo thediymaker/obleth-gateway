@@ -43,6 +43,8 @@ pub struct JobSubmit {
     pub cpus_per_task: Option<i64>,
     /// Memory per node in megabytes (slurm `--mem`); `None` leaves it default
     /// and `Some(0)` asks for all of each node's memory, as `--mem=0` does.
+    /// The submit turns 0 into the partition's node size, because some
+    /// clusters' submit plugins read 0 as unset and apply a small default.
     pub mem_mb: Option<i64>,
     /// Directory for stdout/stderr files; empty means Slurm default.
     pub log_output_dir: String,
@@ -139,6 +141,10 @@ pub struct NodeInfo {
     pub gres: String,
     pub cpus: Option<i64>,
     pub real_memory_mb: Option<i64>,
+    /// Memory Slurm keeps back for the node's own daemons (MemSpecLimit), so
+    /// a job can ask for at most `real_memory_mb` minus this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub specialized_memory_mb: Option<i64>,
     pub features: Vec<String>,
     /// Slurm's state flags, e.g. `["IDLE"]` or `["MIXED", "DRAIN"]`. Empty
     /// when slurmrestd does not report them.

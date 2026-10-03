@@ -173,6 +173,25 @@ pub fn parse_mem_mb(raw: &str) -> Option<i64> {
 }
 
 /// POSIX single-quote a value for embedding in the generated bash script.
+/// All the memory a job can have on one node of `partition`, in megabytes:
+/// the smallest node's memory less what Slurm keeps back for the node itself.
+/// The smallest node, so the job still fits wherever Slurm places it. `None`
+/// when the partition is unnamed or none of its nodes report their memory.
+pub fn whole_node_mem_mb(nodes: &[NodeInfo], partition: &str) -> Option<i64> {
+    if partition.is_empty() {
+        return None;
+    }
+    nodes
+        .iter()
+        .filter(|n| n.partitions.iter().any(|p| p == partition))
+        .filter_map(|n| {
+            let real = n.real_memory_mb?;
+            Some(real - n.specialized_memory_mb.unwrap_or(0))
+        })
+        .filter(|mb| *mb > 0)
+        .min()
+}
+
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
@@ -375,6 +394,40 @@ impl Slurmrestd {
         self.hf_token = token.trim().to_string();
         self
     }
+    async fn read_nodes(&self) -> anyhow::Result<Vec<NodeInfo>> {
+        let url = format!("{}/slurm/{}/nodes", self.base, self.version);
+        let resp = self.auth(self.http.get(&url)).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            anyhow::bail!("slurm nodes read failed ({status})");
+        }
+        Ok(parse_nodes(&resp.json::<serde_json::Value>().await?))
+    }
+
+    /// `--mem=0` means all of the node's memory, but some sites' submit
+    /// plugins read 0 as unset and give a small default instead. Ask for the
+    /// node's size outright. If it can't be found, 0 is sent as before.
+    async fn with_whole_node_mem(&self, job: &JobSubmit) -> JobSubmit {
+        let mut job = job.clone();
+        if job.mem_mb != Some(0) {
+            return job;
+        }
+        match self.read_nodes().await {
+            Ok(nodes) => match whole_node_mem_mb(&nodes, &job.partition) {
+                Some(mb) => {
+                    tracing::info!(job = %job.name, partition = %job.partition, mem_mb = mb,
+                        "asking for all of the node's memory by size");
+                    job.mem_mb = Some(mb);
+                }
+                None => tracing::warn!(job = %job.name, partition = %job.partition,
+                    "no node memory known for the partition; sending --mem=0"),
+            },
+            Err(e) => tracing::warn!(job = %job.name, error = %e,
+                "could not read node memory; sending --mem=0"),
+        }
+        job
+    }
+
     fn auth(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         rb.header("X-SLURM-USER-NAME", &self.user)
             .header("X-SLURM-USER-TOKEN", &self.jwt)
@@ -465,8 +518,9 @@ pub fn submit_body(job: &JobSubmit, hf_token: &str) -> serde_json::Value {
             m.insert("cpus_per_task".into(), serde_json::json!(c));
         }
     }
-    // slurmrestd expects memory_per_node in megabytes (integer). 0 is sent
-    // as is: Slurm reads it as all of each node's memory.
+    // slurmrestd expects memory_per_node in megabytes (integer). `submit`
+    // has already turned 0 into the node's size where it could; a 0 still
+    // here is sent as is, which Slurm reads as all of each node's memory.
     if let Some(mb) = job.mem_mb {
         if mb >= 0 {
             m.insert("memory_per_node".into(), serde_json::json!(mb));
@@ -490,6 +544,7 @@ pub fn submit_body(job: &JobSubmit, hf_token: &str) -> serde_json::Value {
 #[async_trait]
 impl SlurmClient for Slurmrestd {
     async fn submit(&self, job: &JobSubmit) -> anyhow::Result<String> {
+        let job = &self.with_whole_node_mem(job).await;
         let body = submit_body(job, &self.hf_token);
         let url = format!("{}/slurm/{}/job/submit", self.base, self.version);
         let resp = self.auth(self.http.post(&url)).json(&body).send().await?;
@@ -721,6 +776,7 @@ pub fn parse_nodes(v: &serde_json::Value) -> Vec<NodeInfo> {
                     let real_memory_mb = number("real_memory");
                     Some(NodeInfo {
                         name,
+                        specialized_memory_mb: number("specialized_memory").filter(|m| *m > 0),
                         partitions: str_list(n.get("partitions")),
                         gres: n
                             .get("gres")
@@ -1021,6 +1077,46 @@ mod tests {
         s.mem = None;
         let j = job_submit_from_spec(&s, "m", "obleth-", 8000, 1);
         assert!(submit_body(&j, "")["job"].get("memory_per_node").is_none());
+    }
+
+    fn node(name: &str, partition: &str, real: Option<i64>, spec: Option<i64>) -> NodeInfo {
+        NodeInfo {
+            name: name.into(),
+            partitions: vec![partition.into()],
+            gres: String::new(),
+            cpus: Some(72),
+            real_memory_mb: real,
+            specialized_memory_mb: spec,
+            features: vec![],
+            state: vec!["IDLE".into()],
+            alloc_cpus: None,
+            alloc_memory_mb: None,
+        }
+    }
+
+    #[test]
+    fn whole_node_mem_is_the_smallest_node_less_what_slurm_keeps() {
+        let nodes = vec![
+            node("gh1", "arm", Some(587553), Some(3500)),
+            node("gh2", "arm", Some(587289), Some(3500)),
+            node("gh3", "arm", None, None),
+            node("c1", "general", Some(515516), None),
+        ];
+        assert_eq!(whole_node_mem_mb(&nodes, "arm"), Some(583789));
+        assert_eq!(whole_node_mem_mb(&nodes, "general"), Some(515516));
+        assert_eq!(whole_node_mem_mb(&nodes, "gpu"), None);
+        assert_eq!(whole_node_mem_mb(&nodes, ""), None);
+    }
+
+    #[test]
+    fn parse_nodes_reads_specialized_memory() {
+        let v = serde_json::json!({"nodes": [
+            {"name": "gh1", "partitions": ["arm"], "real_memory": 587289, "specialized_memory": 3500},
+            {"name": "c1", "partitions": ["general"], "real_memory": 515516, "specialized_memory": 0},
+        ]});
+        let nodes = parse_nodes(&v);
+        assert_eq!(nodes[0].specialized_memory_mb, Some(3500));
+        assert_eq!(nodes[1].specialized_memory_mb, None);
     }
 
     #[test]
