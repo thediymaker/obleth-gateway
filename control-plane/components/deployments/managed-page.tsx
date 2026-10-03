@@ -56,7 +56,7 @@ import { cn, getJson } from "@/lib/utils";
 type Card = "script" | "placement" | "service";
 
 function cardOf(name: string): Card | null {
-  if (name === "slurm_script_body") return "script";
+  if (name === "slurm_script_body" || name === "slurm_log_output_dir") return "script";
   if (["slurm_partition", "slurm_gres", "slurm_cpus_per_task", "slurm_mem", "slurm_nodes", "slurm_account", "slurm_qos", "slurm_time_limit", "slurm_constraints", "slurm_exclude"].includes(name)) return "placement";
   if (["slurm_serving_port", "slurm_health_path", "slurm_min_replicas", "slurm_max_job_failures"].includes(name)) return "service";
   return null;
@@ -64,6 +64,7 @@ function cardOf(name: string): Card | null {
 
 const LABELS: Record<string, string> = {
   slurm_script_body: "Job script",
+  slurm_log_output_dir: "Job logs",
   slurm_partition: "Partition",
   slurm_gres: "GPUs",
   slurm_cpus_per_task: "CPUs",
@@ -180,6 +181,10 @@ function ScriptAndPlacement({ spec }: { spec: ManagedModelSpec }) {
           <TextArea name="slurm_script_body" label="Job script" rows={Math.min(24, Math.max(8, script.split("\n").length + 1))} value={script} onChange={setScript} />
           {lines.length > 0 && <SbatchNotice lines={lines} place={place} onMove={moveToPlacement} />}
         </Setting>
+        <Setting id="set-logs" label="Job logs" hint="The folder where Slurm writes each job's output. Use one you can read from a login node, like your scratch." fields={["slurm_log_output_dir"]} was={{ field: "slurm_log_output_dir" }}>
+          <TextField name="slurm_log_output_dir" label="Job logs" defaultValue={spec.log_output_dir ?? ""} placeholder="/scratch/you/logs" mono className="w-full max-w-[520px]" />
+          <span className="text-xs text-muted-foreground">Each job writes its output there as &lt;job name&gt;-&lt;job id&gt;.out, and errors as .err. Left blank, Slurm uses the job&apos;s working directory: /tmp on the node it ran on, which you can only read from that node.</span>
+        </Setting>
       </SettingsCard>
       <SettingsCard id="placement" title="Placement" description="Where Slurm runs each replica and what each job asks for. Choices come from the cluster.">
         <PlacementFields spec={spec} value={place} set={set} />
@@ -283,6 +288,12 @@ function PlacementFields({ spec, value, set }: { spec: ManagedModelSpec; value: 
       </Setting>
     </>
   );
+}
+
+/** Where a job's output went, in a sentence: the Job logs folder, or /tmp on its node. */
+function JobOutput({ dir, job, node }: { dir: string | null | undefined; job?: string; node?: string | null }) {
+  if (dir) return <>{job ? `Job ${job}'s output is in ` : "Each job's output is in "}<span className="font-mono text-[12px]">{dir}</span>{job ? <>, in the file ending <span className="font-mono text-[12px]">-{job}.out</span> (errors in .err).</> : ", as <job name>-<job id>.out and .err."}</>;
+  return <>Job logs isn&apos;t set, so {job ? `job ${job}'s` : "each job's"} output stayed in Slurm&apos;s default place, /tmp on {node ? <span className="font-mono text-[12px]">{node}</span> : "the node it ran on"}. Set Job logs under Script to keep it in a folder you can read.</>;
 }
 
 function RemoveDialog({ open, onClose, name, onRemove, pending }: { open: boolean; onClose: () => void; name: string; onRemove: (deleteModel: boolean) => void; pending: boolean }) {
@@ -481,6 +492,7 @@ export function ManagedPage({ modelId, initial, changes }: { modelId: string; in
           {lost[0] && (
             <p className="max-w-3xl text-[13px]"><b className="font-semibold">What Slurm last said:</b> <span className="font-mono text-[12px]">{lost[0].last_message || "the job was gone"}</span>, after {duration(new Date(lost[0].updated_at).getTime() - new Date(lost[0].created_at).getTime())}.</p>
           )}
+          {lost[0]?.slurm_job_id && <p className="max-w-3xl text-[13px] text-secondary-foreground"><JobOutput dir={spec.log_output_dir} job={lost[0].slurm_job_id} node={lost[0].nodes} /></p>}
           <div className="flex flex-wrap gap-2">
             <Button type="button" size="sm" disabled={pending} onClick={() => run(() => clearLostReplicasAction(modelId), "Cleared. obleth will try again on its next pass.")}>Try once more</Button>
             <Button type="button" size="sm" variant="outline" onClick={() => document.getElementById("script")?.scrollIntoView({ behavior: "smooth" })}>Edit the script</Button>
@@ -545,7 +557,7 @@ export function ManagedPage({ modelId, initial, changes }: { modelId: string; in
                       <span className="font-mono text-[12px] text-muted-foreground">{new Date(r.updated_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
                     </div>
                   ))}
-                  <p className="border-t border-border pt-2 text-xs text-muted-foreground">Job output is in {spec.log_output_dir ? <span className="font-mono">{spec.log_output_dir}</span> : "the job's working directory"} on the cluster.</p>
+                  <p className="border-t border-border pt-2 text-xs text-muted-foreground"><JobOutput dir={spec.log_output_dir} /></p>
                 </div>
               </details>
             )}

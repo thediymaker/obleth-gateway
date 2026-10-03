@@ -146,7 +146,14 @@ pub fn plan(
     }
 
     let target = spec.target_replicas.max(0);
-    let lost_count = replicas.iter().filter(|r| r.state == "lost").count() as i64;
+    // A job found gone on this tick is marked lost by this tick's actions, so
+    // it counts too. Counting only rows already lost let one more job through
+    // than the limit says (limit 2: a third job was submitted).
+    let lost_count = replicas.iter().filter(|r| r.state == "lost").count() as i64
+        + actions
+            .iter()
+            .filter(|a| matches!(a, Action::MarkLost { .. }))
+            .count() as i64;
     let failure_limit_hit = spec.max_job_failures > 0 && lost_count >= spec.max_job_failures;
     if alive < target && !failure_limit_hit {
         for _ in 0..(target - alive) {
@@ -666,6 +673,26 @@ mod tests {
         assert!(
             !actions.contains(&Action::Submit),
             "submit must be suppressed at limit"
+        );
+    }
+
+    #[test]
+    fn failure_limit_counts_the_job_that_just_ended() {
+        // limit = 2: one job already lost, and the replacement's job is gone
+        // on this tick. That is the second failure, so nothing new is submitted.
+        let replicas = vec![rv("lost", "j0", None, 60), rv("pending", "j1", None, 30)];
+        let actions = plan(
+            &spec_with_limit(1, 2),
+            &replicas,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            900,
+        );
+        assert!(actions.iter().any(|a| matches!(a, Action::MarkLost { .. })));
+        assert!(
+            !actions.contains(&Action::Submit),
+            "the second failure reaches a limit of 2"
         );
     }
 
