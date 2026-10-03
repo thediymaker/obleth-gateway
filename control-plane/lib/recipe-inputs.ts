@@ -134,7 +134,8 @@ function rendered(input: RecipeInput, value: string): string {
 
 /**
  * Fill a script: each declared {{input}} gets its value (or default), then the
- * {{cluster.*}} tokens get the cluster's values. Undeclared {{…}} and all shell
+ * {{cluster.*}} tokens get the cluster's values. An optional input with no
+ * value becomes empty, never a literal {{name}}. Undeclared {{…}} and all shell
  * ${…}/$(…) pass through, and filled-in text is never re-scanned for inputs.
  * With `strict`, a required input without a value throws (the server's launch
  * path); without it, the token is left for the review to show.
@@ -152,6 +153,9 @@ export function renderScript(
     const value = given !== undefined && given.trim() !== "" ? given.trim() : inputDefault(input, cv, opts.nodes);
     if (!value && input.type !== "flag") {
       if (input.required && opts.strict) throw new Error(`required input "${input.name}" has no value`);
+      // An optional input left empty adds nothing; a required one keeps its
+      // token so the review shows what still needs a value.
+      if (!input.required) resolved.set(input.name, "");
       continue;
     }
     resolved.set(input.name, resolveClusterTokens(rendered(input, value), cv));
