@@ -4,15 +4,21 @@ description: "GLM-5.2 as a 2-bit GGUF with llama-server on one GH200, MoE expert
 engine: llamacpp
 kind: model
 model: unsloth/GLM-5.2-GGUF:UD-IQ2_M
-requires: "llama-server built for arm64 + CUDA (a native build is the most reliable on GH200)"
+weights_gb: 239
+requires: "llama.cpp with GLM-5.2 support, built for the node (the official server-cuda image has an Arm build)"
 model_type: chat
 api_model_name: glm-5.2
 port: 8000
-target_replicas: 2
+target_replicas: 1
 max_job_failures: 3
 env:
   # Let GPU allocations overflow into the Grace CPU's coherent memory.
   GGML_CUDA_ENABLE_UNIFIED_MEMORY: "1"
+tested:
+  - hardware: "1× GH200 96 GB"
+    engine: "llama.cpp (server-cuda image of 2026-10-03, Arm)"
+    date: 2026-10-03
+    result: "With the defaults: ready in 9 minutes. One request ran at about 20 tokens a second; with 4 at once they shared about 28. It thinks before answering, so a short max_tokens can end before the answer starts."
 inputs:
   - name: cache
     label: Weight cache
@@ -51,7 +57,11 @@ set -euo pipefail
 {{cluster.setup}}
 export LLAMA_CACHE={{cache}}
 IMAGE="{{image}}"
-if [ -n "$IMAGE" ]; then RUN=(apptainer exec --nv --bind {{cache}} "$IMAGE"); else RUN=(); fi
+# The official image keeps llama-server and its libraries in /app, which
+# neither PATH nor the library path includes under apptainer.
+if [ -n "$IMAGE" ]; then
+  RUN=(apptainer exec --nv --bind {{cache}} "$IMAGE" sh -c 'PATH=/app:$PATH LD_LIBRARY_PATH=/app:${LD_LIBRARY_PATH:-} exec "$0" "$@"')
+else RUN=(); fi
 "${RUN[@]}" llama-server -hf unsloth/GLM-5.2-GGUF:UD-IQ2_M \
   --host 0.0.0.0 --port "$OBLETH_SERVING_PORT" --alias {{api_model_name}} \
   -ngl 99 --ctx-size {{context}} --parallel {{parallel}} --threads "$(nproc)" \

@@ -20,4 +20,16 @@ describe("shipped recipe files", () => {
     const parsed = parseRecipe(file.replace(/\.recipe$/, ""), text);
     expect(parsed.valid, parsed.error ?? "invalid recipe").toBe(true);
   });
+
+  // The library is a catalog of recipes that are known to work: each one says
+  // where it was run and served, so nothing untried ships.
+  it.each(files)("%s says where it was run and served", (file) => {
+    const parsed = parseRecipe(file.replace(/\.recipe$/, ""), readFileSync(path.join(dir, file), "utf8"));
+    const tested = parsed.header?.tested ?? [];
+    expect(tested.length, "add a tested: entry after running it").toBeGreaterThan(0);
+    for (const t of tested) {
+      expect(t.hardware).toBeTruthy();
+      expect(t.date).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    }
+  });
 });

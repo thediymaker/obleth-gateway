@@ -12,6 +12,11 @@ target_replicas: 1
 max_job_failures: 2
 env:
   VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+tested:
+  - hardware: "1× A100 80 GB"
+    engine: "vLLM 0.30.1rc1 (nightly)"
+    date: 2026-10-03
+    result: "Served Qwen/Qwen3.5-9B with --enable-auto-tool-choice --tool-call-parser qwen3_coder and thinking off. Ready in 5 minutes. One request ran at about 85 tokens a second; 16 at once reached 1,240. Tool calls worked 3 times out of 3."
 inputs:
   - name: model
     label: Hugging Face model
@@ -40,6 +45,8 @@ inputs:
 ---
 #!/bin/bash -l
 #SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=64G
 set -euo pipefail
 {{cluster.setup}}
 export HF_HOME={{cache}}

@@ -197,7 +197,7 @@ export function SlurmConnection({ settings, replicas, onClose, onSaved }: { sett
                 <label key={e.id} className="contents"><span className="text-secondary-foreground">{e.label}</span><input aria-label={`${e.label} image`} value={images[e.id] ?? ""} onChange={(ev) => setImages((x) => ({ ...x, [e.id]: ev.target.value }))} placeholder={e.placeholder} autoComplete="off" className="h-9 min-w-0 rounded-md border border-input bg-background px-3 font-mono text-[12.5px]" /></label>
               ))}
             </div>
-            <span className="text-xs text-muted-foreground">Build or pull each image on a node of the right architecture (arm64 for Grace Hopper). A recipe says which engine version it needs.</span>
+            <span className="text-xs text-muted-foreground">An image only runs on one kind of CPU. If some partitions are Arm (Grace Hopper) and others x86, keep one image of each and put <code className="font-mono">$(uname -m)</code> in the name, such as <code className="font-mono">vllm-$(uname -m).sif</code>: each job then runs vllm-x86_64.sif or vllm-aarch64.sif to match its node. <code className="font-mono">apptainer pull --arch arm64</code> fetches the Arm image from any node. A recipe says which engine version it needs.</span>
           </Setting>
           <Setting label="Job logs" hint="Where Slurm writes each job's output, unless a recipe says otherwise." fields={["log_dir"]} className="px-6">
             <TextField name="log_dir" label="Job logs" defaultValue={cd.log_dir} placeholder="Slurm's default" mono />

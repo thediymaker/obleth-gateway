@@ -1,0 +1,62 @@
+---
+name: gpt-oss-120b
+description: "OpenAI's open-weight reasoning model, 117B parameters with 5.1B active, in its native MXFP4. One GPU with 80 GB or more holds it. Reasoning effort is set per request."
+engine: vllm
+kind: model
+model: openai/gpt-oss-120b
+weights_gb: 65
+requires: "vLLM 0.10.1 or later"
+model_type: chat
+api_model_name: gpt-oss-120b
+port: 8000
+health_path: /health
+target_replicas: 1
+max_job_failures: 2
+env:
+  VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+tested:
+  - hardware: "1× GH200 96 GB"
+    engine: "vLLM 0.30.1rc1 (nightly, Arm)"
+    date: 2026-10-03
+    result: "With the full 131,072-token context: ready in 6 minutes. One request ran at about 150 tokens a second; 16 at once reached 1,540. Tool calls worked."
+  - hardware: "1× A100 80 GB"
+    engine: "vLLM 0.30.1rc1 (nightly)"
+    date: 2026-10-03
+    result: "With a 65,536-token context: ready in 5 minutes. One request ran at about 75 tokens a second; 16 at once reached 1,070. Tool calls worked."
+inputs:
+  - name: context
+    label: Context length
+    type: choice
+    options: [32768, 65536, 131072]
+    default: 65536
+    help: The full 131072 needs a GPU with 96 GB or more; on 80 GB it runs short of KV cache.
+  - name: tools
+    label: Tool calling
+    type: flag
+    default: true
+    adds: --enable-auto-tool-choice --tool-call-parser openai
+  - name: image
+    label: Container image
+    type: path
+    default: "{{cluster.image.vllm}}"
+    required: true
+  - name: cache
+    label: Weight cache
+    type: path
+    default: "{{cluster.cache}}"
+    required: true
+    help: HF_HOME, where the weights are kept between jobs.
+---
+#!/bin/bash -l
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=96G
+set -euo pipefail
+{{cluster.setup}}
+export HF_HOME={{cache}}
+apptainer exec --nv --bind {{cache}} {{image}} \
+  vllm serve openai/gpt-oss-120b \
+    --served-model-name {{api_model_name}} \
+    --host 0.0.0.0 --port "$OBLETH_SERVING_PORT" \
+    --max-model-len {{context}} \
+    {{tools}}

@@ -10,6 +10,15 @@ port: 8000
 health_path: /health
 target_replicas: 1
 max_job_failures: 2
+tested:
+  - hardware: "1× A100 80 GB"
+    engine: "llama.cpp (server-cuda image of 2026-10-03)"
+    date: 2026-10-03
+    result: "Served unsloth/Qwen3.5-9B-GGUF:Q4_K_M with --reasoning-budget 0. Ready 20 seconds after the job started, with the file already downloaded. One request ran at about 115 tokens a second; 16 at once reached 280."
+  - hardware: "1× GH200 96 GB"
+    engine: "llama.cpp (server-cuda image of 2026-10-03, Arm)"
+    date: 2026-10-03
+    result: "Served unsloth/Qwen3.5-9B-GGUF:Q4_K_M with --reasoning-budget 0. Ready in 40 seconds. The first answer took half a minute while the engine warmed up; after that, about 200 tokens a second for one request and 500 across 16."
 inputs:
   - name: model
     label: GGUF on Hugging Face
@@ -44,11 +53,17 @@ inputs:
 ---
 #!/bin/bash -l
 #SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=64G
 set -euo pipefail
 {{cluster.setup}}
 export LLAMA_CACHE={{cache}}
 IMAGE="{{image}}"
-if [ -n "$IMAGE" ]; then RUN=(apptainer exec --nv --bind {{cache}} "$IMAGE"); else RUN=(); fi
+# The official image keeps llama-server and its libraries in /app, which
+# neither PATH nor the library path includes under apptainer.
+if [ -n "$IMAGE" ]; then
+  RUN=(apptainer exec --nv --bind {{cache}} "$IMAGE" sh -c 'PATH=/app:$PATH LD_LIBRARY_PATH=/app:${LD_LIBRARY_PATH:-} exec "$0" "$@"')
+else RUN=(); fi
 "${RUN[@]}" llama-server -hf {{model}} \
   --host 0.0.0.0 --port "$OBLETH_SERVING_PORT" --alias {{api_model_name}} \
   -ngl 99 --ctx-size {{context}} --parallel {{parallel}} --threads "$(nproc)" \

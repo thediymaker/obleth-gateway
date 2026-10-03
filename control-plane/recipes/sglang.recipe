@@ -10,6 +10,15 @@ port: 8000
 health_path: /health
 target_replicas: 1
 max_job_failures: 2
+tested:
+  - hardware: "1× A100 80 GB"
+    engine: "SGLang 0.5.21"
+    date: 2026-10-03
+    result: "Served openai/gpt-oss-20b with --tool-call-parser gpt-oss --reasoning-parser gpt-oss. Ready in 8.5 minutes. One request ran at about 125 tokens a second; 16 at once reached 430. Tool calls worked 3 times out of 3."
+  - hardware: "1× GH200 96 GB"
+    engine: "SGLang 0.5.21 (Arm)"
+    date: 2026-10-03
+    result: "Served openai/gpt-oss-20b with --tool-call-parser gpt-oss --reasoning-parser gpt-oss --attention-backend triton, since the Arm image lacks FlashAttention 3. Ready in 4 minutes. One request ran at about 245 tokens a second; 16 at once reached 985. Tool calls worked 3 times out of 3."
 inputs:
   - name: model
     label: Hugging Face model
@@ -34,10 +43,12 @@ inputs:
   - name: extra
     label: More SGLang flags
     type: text
-    help: Anything else for sglang.launch_server, e.g. --tool-call-parser qwen25.
+    help: "Anything else for sglang.launch_server, e.g. --tool-call-parser qwen25. With the official Arm image, add --attention-backend triton: it has no FlashAttention 3 kernels."
 ---
 #!/bin/bash -l
 #SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=64G
 set -euo pipefail
 {{cluster.setup}}
 export HF_HOME={{cache}}

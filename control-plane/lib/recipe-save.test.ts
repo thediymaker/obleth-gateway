@@ -6,7 +6,8 @@ import { EMPTY_CLUSTER, inputDefaults } from "./recipe-inputs";
 import { savedName, savedRecipeText } from "./recipe-save";
 import { buildDeployPreview, parseRecipe } from "./sbatch-recipes";
 
-const source = readFileSync(path.join(process.cwd(), "recipes", "nemotron-3-ultra-gh200.recipe"), "utf8");
+// A multi-node recipe with comments in its header, kept here as a fixture.
+const source = readFileSync(path.join(process.cwd(), "lib", "testdata", "multi-node.recipe"), "utf8");
 const cv = { ...EMPTY_CLUSTER, cache: "/scratch/hf", image: { vllm: "/scratch/vllm.sif" } };
 
 describe("save as recipe", () => {
