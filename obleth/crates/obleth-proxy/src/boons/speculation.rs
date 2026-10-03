@@ -51,6 +51,11 @@ use super::tool_stream::{
 };
 use crate::state::AppState;
 
+/// Response header naming the drafter model whose verified text reached the
+/// client. Set only when the cascade committed (released a verified draft);
+/// an abstaining cascade leaves the answer, and the headers, to the target.
+pub const DRAFTED_BY_HEADER: &str = "x-obleth-drafted-by";
+
 /// Request parameters the cascade cannot honor on the draft path. Their
 /// presence makes the request ineligible (the target model serves it normally).
 const BYPASS_KEYS: &[&str] = &[
@@ -109,17 +114,23 @@ pub struct SpecStats {
     pub final_set: bool,
 }
 
-/// What [`run`] decided.
+/// What [`run`] decided. Both committed outcomes carry `drafted_by`, the
+/// drafter whose text reaches the client: the decision is made before any
+/// response header goes out, so the proxy can say so in one.
 pub enum Outcome {
     /// Non-streaming ship: a complete, verified draft as a chat completion.
     ShippedJson {
         body: Value,
         input_tokens: u32,
         output_tokens: u32,
+        drafted_by: String,
     },
     /// Streaming commit: at least one verified span exists; the driver owns
     /// the response from here (release, further verification, escalation).
-    Stream(Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>),
+    Stream {
+        driver: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
+        drafted_by: String,
+    },
     /// No commitment was made; the proxy proceeds exactly as if the boon
     /// never ran.
     Abstain(&'static str),
@@ -808,6 +819,9 @@ pub struct SpecRequest<'a> {
     pub route: Arc<ResolvedModel>,
     pub key: &'a ResolvedKey,
     pub session_id: &'a str,
+    /// The client request being answered; the draft and verify calls are
+    /// billed against it.
+    pub request_id: uuid::Uuid,
     pub dispatch_timeout: Duration,
     pub started: Instant,
 }
@@ -916,9 +930,10 @@ pub async fn run(
         )
         .await
         {
-            Ok(Ok(committed)) => Outcome::Stream(drive_stream(
-                req, plan, gate, drafter, verifier, committed, stats,
-            )),
+            Ok(Ok(committed)) => Outcome::Stream {
+                drafted_by: drafter.model_name.clone(),
+                driver: drive_stream(req, plan, gate, drafter, verifier, committed, stats),
+            },
             Ok(Err(reason)) => abstain(&req, &verifier, reason),
             Err(_) => abstain(&req, &verifier, "pre-release budget exhausted"),
         };
@@ -962,6 +977,7 @@ fn bill_verify(req: &SpecRequest<'_>, verifier: &Verifier) {
             &verifier.model,
             req.key,
             req.session_id,
+            req.request_id,
             "speculation_verify",
             verifier.billed_input,
             verifier.scorings,
@@ -977,6 +993,7 @@ fn bill_draft(req: &SpecRequest<'_>, drafter: &ResolvedModel, usage: Option<(u32
             drafter,
             req.key,
             req.session_id,
+            req.request_id,
             "speculation_draft",
             it,
             ot,
@@ -1080,6 +1097,7 @@ async fn run_nonstream(
         body,
         input_tokens,
         output_tokens,
+        drafted_by: drafter.model_name.clone(),
     }
 }
 
@@ -1216,6 +1234,7 @@ fn drive_stream(
     let route = req.route.clone();
     let key = req.key.clone();
     let session_id = req.session_id.to_string();
+    let request_id = req.request_id;
     let dispatch_timeout = req.dispatch_timeout;
     let started = req.started;
 
@@ -1235,6 +1254,7 @@ fn drive_stream(
             route: route.clone(),
             key: &key,
             session_id: &session_id,
+            request_id,
             dispatch_timeout,
             started,
         };

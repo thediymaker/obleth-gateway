@@ -320,6 +320,7 @@ async fn guard_input(
     settings: &BoonSettings,
     key: &ResolvedKey,
     session_id: &str,
+    request_id: Uuid,
     is_chat: bool,
     json: &mut Value,
     tracer: Option<&mut crate::tracer::SpanRecorder>,
@@ -337,6 +338,7 @@ async fn guard_input(
         policy,
         key,
         session_id,
+        request_id,
         json,
         tracer,
     )
@@ -400,6 +402,7 @@ impl BoonEngine {
         state: &AppState,
         key: &ResolvedKey,
         session_id: &str,
+        request_id: Uuid,
         json: &mut Value,
         tracer: Option<&mut crate::tracer::SpanRecorder>,
     ) -> Result<bool, guardrails::GuardrailsBlock> {
@@ -413,6 +416,7 @@ impl BoonEngine {
             policy,
             key,
             session_id,
+            request_id,
             json,
             tracer,
         )
@@ -427,6 +431,10 @@ impl BoonEngine {
     /// dispatched upstream, and report whether the response must be
     /// intercepted.
     ///
+    /// `request_id` is the client request's own id: every helper call a boon
+    /// makes is billed against it (`parent_request_id`), so the request log
+    /// can show which request a helper row served.
+    ///
     /// `opt_out` is the per-request `x-obleth-boons: off` escape hatch;
     /// `force_lossy` is the per-request `x-obleth-boons: lossy` override that
     /// turns the lossy compression pass on for this request; `is_chat` restricts
@@ -438,6 +446,7 @@ impl BoonEngine {
         route: Option<&ResolvedModel>,
         key: &ResolvedKey,
         session_id: &str,
+        request_id: Uuid,
         opt_out: bool,
         force_lossy: bool,
         is_chat: bool,
@@ -456,6 +465,7 @@ impl BoonEngine {
                 &settings,
                 key,
                 session_id,
+                request_id,
                 is_chat,
                 json,
                 tracer.as_deref_mut(),
@@ -481,6 +491,7 @@ impl BoonEngine {
                 &settings,
                 key,
                 session_id,
+                request_id,
                 is_chat,
                 json,
                 tracer.as_deref_mut(),
@@ -499,7 +510,8 @@ impl BoonEngine {
             && settings.vision.active()
         {
             let vision_start = crate::tracer::now_ms();
-            let images = vision::apply(state, &settings.vision, key, session_id, json).await;
+            let images =
+                vision::apply(state, &settings.vision, key, session_id, request_id, json).await;
             if let Some(t) = tracer.as_deref_mut() {
                 t.record_elapsed(
                     "boon:vision",
@@ -531,6 +543,7 @@ impl BoonEngine {
                 &settings,
                 key,
                 session_id,
+                request_id,
                 is_chat,
                 json,
                 tracer.as_deref_mut(),
@@ -824,6 +837,7 @@ impl BoonEngine {
             &settings,
             key,
             session_id,
+            request_id,
             is_chat,
             json,
             tracer.as_deref_mut(),
@@ -1155,12 +1169,15 @@ fn helper_request_type<'a>(key: &ResolvedKey, label: &'a str) -> &'a str {
 /// boon is attributed and visible in the request log. `request_type` labels
 /// the boon (e.g. `vision_boon`, `structured_output_boon`), unless `key` is a
 /// synthetic tenant, in which case it is stamped `benchmark` instead (see
-/// [`helper_request_type`]).
+/// [`helper_request_type`]). `parent_request_id` is the client request the
+/// call served; the row records it so the request log can link the two.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn bill_helper_call(
     state: &AppState,
     helper: &ResolvedModel,
     key: &ResolvedKey,
     session_id: &str,
+    parent_request_id: Uuid,
     request_type: &str,
     input_tokens: u32,
     output_tokens: u32,
@@ -1178,7 +1195,33 @@ pub(crate) fn bill_helper_call(
         return;
     }
     commit_helper_term_usage(state, key, total_tokens as i64, cost_usd);
-    state.telemetry.record(UsageRecord {
+    state.telemetry.record(helper_usage_record(
+        helper,
+        key,
+        session_id,
+        parent_request_id,
+        request_type,
+        input_tokens,
+        output_tokens,
+        cost_usd,
+    ));
+}
+
+/// The ledger row for one helper call (see [`bill_helper_call`]). Split out so
+/// the row's shape is unit-testable without telemetry.
+#[allow(clippy::too_many_arguments)]
+fn helper_usage_record(
+    helper: &ResolvedModel,
+    key: &ResolvedKey,
+    session_id: &str,
+    parent_request_id: Uuid,
+    request_type: &str,
+    input_tokens: u32,
+    output_tokens: u32,
+    cost_usd: f64,
+) -> UsageRecord {
+    let total_tokens = input_tokens.saturating_add(output_tokens);
+    UsageRecord {
         request_id: Uuid::new_v4(),
         tenant_id: key.tenant_id,
         key_id: key.key_id,
@@ -1207,7 +1250,11 @@ pub(crate) fn bill_helper_call(
         request_type: request_type.to_string(),
         device_id: String::new(),
         end_user: String::new(),
-    });
+        parent_request_id,
+        // A helper row is the helper model's own call; the variant the client
+        // used is recorded on the request's row.
+        model_variant: String::new(),
+    }
 }
 
 /// Record a boon-generated image against the tenant's ledger. Image models are
@@ -1221,6 +1268,7 @@ pub(crate) fn bill_image_generation(
     image_model: &ResolvedModel,
     key: &ResolvedKey,
     session_id: &str,
+    parent_request_id: Uuid,
     images: u32,
 ) {
     let request_type = helper_request_type(key, "image_generation_boon");
@@ -1231,36 +1279,16 @@ pub(crate) fn bill_image_generation(
         return;
     }
     commit_helper_term_usage(state, key, 0, cost_usd);
-    state.telemetry.record(UsageRecord {
-        request_id: Uuid::new_v4(),
-        tenant_id: key.tenant_id,
-        key_id: key.key_id,
-        model: image_model.model_name.clone(),
-        admission: "boon".to_string(),
-        weight: key.weight,
-        input_tokens: 0,
-        output_tokens: 0,
-        cached_input_tokens: 0,
-        estimated_tokens: 0,
-        queue_wait_ms: 0,
-        ttft_ms: 0,
-        total_ms: 0,
-        status_code: 200,
-        cache_status: "off".to_string(),
+    state.telemetry.record(helper_usage_record(
+        image_model,
+        key,
+        session_id,
+        parent_request_id,
+        request_type,
+        0,
+        0,
         cost_usd,
-        // Same reasoning as `bill_helper_call`: no duration is recorded here,
-        // so slot-share energy is zero by construction and the main request's
-        // wall time covers this hardware time.
-        energy_wh: 0.0,
-        energy_cost_usd: 0.0,
-        co2_g: 0.0,
-        ts_ms: now_ms(),
-        session_id: session_id.to_string(),
-        session_id_source: "none".to_string(),
-        request_type: request_type.to_string(),
-        device_id: String::new(),
-        end_user: String::new(),
-    });
+    ));
 }
 
 /// The term-budget counters one helper call must be added to: `(counter id,
@@ -1358,6 +1386,7 @@ mod tests {
         obleth_config::ResolvedModel {
             model_name: "test".to_string(),
             aliases: Vec::new(),
+            variants: Vec::new(),
             quantization: "unknown".into(),
             upstream_model: "test".to_string(),
             api_base: "http://localhost".to_string(),
@@ -1559,6 +1588,54 @@ mod tests {
             !speculation_eligible(&route, &settings, &key),
             "the fleet-default drafter must not be the target either"
         );
+    }
+
+    #[test]
+    fn a_helper_row_names_the_request_it_served() {
+        let mut helper = test_route();
+        helper.model_name = "drafter".into();
+        let key = test_key_with_policy(None);
+        let parent = Uuid::new_v4();
+        let row = helper_usage_record(
+            &helper,
+            &key,
+            "session-1",
+            parent,
+            "speculation_draft",
+            700,
+            112,
+            0.0004,
+        );
+        assert_eq!(row.parent_request_id, parent);
+        // Its own id, the helper model's name, and no variant: the variant the
+        // client used is on the request's own row.
+        assert_ne!(row.request_id, parent);
+        assert_eq!(row.model, "drafter");
+        assert_eq!(row.model_variant, "");
+        assert_eq!(row.admission, "boon");
+        assert_eq!(row.request_type, "speculation_draft");
+        assert_eq!(row.estimated_tokens, 812);
+        assert_eq!(row.session_id, "session-1");
+    }
+
+    #[test]
+    fn every_helper_bill_records_its_parent_request() {
+        // `bill_helper_call` and `bill_image_generation` need a live AppState;
+        // pin that both build their row with the parent's id.
+        let src = include_str!("mod.rs");
+        for f in [
+            "pub(crate) fn bill_helper_call(",
+            "pub(crate) fn bill_image_generation(",
+        ] {
+            let start = src.find(f).expect(f);
+            let end = start + src[start..].find("\n}\n").expect("end of fn");
+            let body: String = src[start..end].split_whitespace().collect();
+            assert!(
+                body.contains("helper_usage_record(")
+                    && body.contains("parent_request_id,request_type"),
+                "{f} must record the parent request"
+            );
+        }
     }
 
     #[test]

@@ -295,6 +295,7 @@ export function ModelPage({
             {chat && <Pill>{model.auto_eligible ? "Eligible for auto" : "Not picked by auto"}</Pill>}
             <Pill>{RUNS_LABELS[runs]}</Pill>
             {(model.aliases?.length ?? 0) > 0 && <span className="text-[12.5px] text-muted-foreground">also answers to <span className="font-mono">{model.aliases.join(", ")}</span></span>}
+            {(model.variants?.length ?? 0) > 0 && <span className="text-[12.5px] text-muted-foreground">variants with extra boons: <span className="font-mono">{(model.variants ?? []).map((v) => v.name).join(", ")}</span></span>}
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-2">

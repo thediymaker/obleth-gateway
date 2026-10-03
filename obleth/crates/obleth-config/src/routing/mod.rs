@@ -1158,6 +1158,7 @@ mod tests {
         ResolvedModel {
             model_name: name.to_string(),
             aliases: Vec::new(),
+            variants: Vec::new(),
             upstream_model: name.to_string(),
             api_base: "http://upstream".to_string(),
             api_key: None,
@@ -1238,6 +1239,40 @@ mod tests {
             1,
         );
         assert!(chosen.is_none());
+    }
+
+    #[test]
+    fn variants_are_never_auto_candidates() {
+        let mut m = model("glm-5-3");
+        m.boons = vec!["vision".into()];
+        m.variants = vec![crate::types::ModelVariant {
+            name: "glm-5-3-spec".into(),
+            description: String::new(),
+            boons: vec!["speculation".into()],
+        }];
+        let candidates = vec![healthy(m)];
+        let pick = |allowed: Option<&[String]>| {
+            select_model(
+                &candidates,
+                &RequestFeatures::default(),
+                &HashMap::new(),
+                &HashMap::new(),
+                allowed,
+                &[],
+                BoonGrants::default(),
+                &RouterWeights::default(),
+                0.0,
+                1,
+            )
+        };
+        // `auto` picks the model itself, with only its own boons.
+        let chosen = pick(None).unwrap();
+        assert_eq!(chosen.model_name, "glm-5-3");
+        assert_eq!(chosen.boons, vec!["vision".to_string()]);
+        // A tenant allowed only the variant has nothing for `auto` to pick:
+        // a variant is a name for a model, not a candidate of its own.
+        let only_variant = vec!["glm-5-3-spec".to_string()];
+        assert!(pick(Some(&only_variant)).is_none());
     }
 
     #[test]

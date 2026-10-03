@@ -115,6 +115,13 @@ export interface ModelRoute {
    * `model_name` is advertised by the gateway's discovery endpoints.
    */
   aliases: string[];
+  /**
+   * More client-facing names for this same model, each with extra boons
+   * turned on (`glm-5-3-spec` = this model with `speculation`). A variant
+   * shares the model's capacity and price; its boons are added to the
+   * model's own. Absent from gateways older than variants.
+   */
+  variants?: ModelVariant[];
   description: string;
   upstream_model: string;
   api_base: string;
@@ -212,11 +219,24 @@ export interface ModelRoute {
  * `upstream_header_names`.
  */
 export type ModelWriteFields = Partial<
-  Omit<ModelRoute, "api_key_set" | "upstream_header_names">
+  Omit<ModelRoute, "api_key_set" | "upstream_header_names" | "variants">
 > & {
   api_key?: string | null;
   upstream_headers?: Record<string, string | null>;
+  /** Replaces the model's variants when present (`[]` removes them all); omit to leave them unchanged. */
+  variants?: ModelVariantInput[];
 };
+
+/** Another name for a model, with extra boons turned on. */
+export interface ModelVariant {
+  name: string;
+  description: string;
+  /** Boons added to the model's own when a request names this variant. */
+  boons: string[];
+}
+
+/** A variant as create and update take it: no description and no extra boons unless given. */
+export type ModelVariantInput = Pick<ModelVariant, "name"> & Partial<Omit<ModelVariant, "name">>;
 
 export interface ModelEndpoint {
   id: string;
@@ -740,6 +760,14 @@ export interface UsageLogEntry {
   key_name: string;
   key_prefix: string;
   has_trace: boolean;
+  /**
+   * On a helper call (a boon's call to another model, such as a speculation
+   * draft or an image description), the id of the client request it served.
+   * The nil UUID on every other row. Absent from older gateways.
+   */
+  parent_request_id?: string;
+  /** The variant the client named, when it called the model through one; `model` is still the model's own name. Absent from older gateways. */
+  model_variant?: string;
 }
 
 /// One recorded span from the flight-recorder tracer for a single request.
@@ -776,6 +804,8 @@ export interface UsageLogParams {
   tracedOnly?: boolean;
   /** When true, include internal traffic (e.g. health probes) hidden by default. */
   includeInternal?: boolean;
+  /** Only the helper calls made while serving this client request. */
+  parentRequestId?: string;
 }
 
 /** One value of a log facet; `label` is a tenant's or key's name. */
@@ -2437,6 +2467,7 @@ export const obleth = {
         limit: params.limit,
         traced_only: params.tracedOnly ? "true" : undefined,
         include_internal: params.includeInternal ? "true" : undefined,
+        parent_request_id: params.parentRequestId,
       })}`,
     ),
   /** Requests and failures per bucket, counted with the log's own filters. */

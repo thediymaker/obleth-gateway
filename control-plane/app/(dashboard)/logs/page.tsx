@@ -28,7 +28,7 @@ export default async function LogsPage({ searchParams }: { searchParams: Promise
 
   // Other pages link here with a filter already chosen (lib/log-links.ts):
   // `status`, `code`, `model`, `team`, `key`, `session`, and a `window` or
-  // exact `since`/`until`.
+  // exact `since`/`until`; or one `requestId`, opened.
   const since = linkTime(q.since, false);
   const until = linkTime(q.until, true);
   const initial: Partial<LogFilters> = {

@@ -36,9 +36,11 @@ export default async function ModelDetailPage({ params }: { params: Promise<{ na
   await requireAdmin();
   const name = decodeURIComponent((await params).name);
   const models = await safe(obleth.listModels(), []);
-  const model = models.find((m) => m.model_name === name) ?? models.find((m) => m.aliases?.includes(name));
+  const model =
+    models.find((m) => m.model_name === name) ??
+    models.find((m) => m.aliases?.includes(name) || m.variants?.some((v) => v.name === name));
   if (!model) notFound();
-  // An alias leads to the model's own name, so there is one address per model.
+  // An alias or variant leads to the model's own name, so there is one address per model.
   if (model.model_name !== name) redirect(modelHref(model.model_name));
 
   const [health, mcpServers, managedSpecs, boonSettings, knowledgeSettings] = await Promise.all([

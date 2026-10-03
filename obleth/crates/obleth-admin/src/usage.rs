@@ -134,6 +134,12 @@ pub struct UsageLogQuery {
     pub status_code: Option<u16>,
     /// Case-insensitive prefix match on the request id, for the search box.
     pub request_id: Option<String>,
+    /// Only the helper calls a boon made for this client request (a
+    /// speculation draft, an image description, ...): the rows whose
+    /// `parent_request_id` is this id. Combine with `since_ms`/`until_ms`
+    /// around the request's own time; the default window is the last 24h.
+    #[schema(value_type = Option<String>)]
+    pub parent_request_id: Option<Uuid>,
     /// Inclusive lower bound, unix epoch millis. Defaults to the last 24h.
     pub since_ms: Option<i64>,
     /// Inclusive upper bound, unix epoch millis. Open-ended by default.
@@ -193,6 +199,14 @@ pub struct UsageLogRow {
     pub energy_wh: f64,
     pub energy_cost_usd: f64,
     pub co2_g: f64,
+    /// On a helper-call row (a boon's call to another model, `admission` =
+    /// `boon`), the client request it served; the nil UUID on every other row.
+    #[serde(with = "clickhouse::serde::uuid")]
+    #[schema(value_type = String)]
+    pub parent_request_id: Uuid,
+    /// The variant name the client called the model by, or empty. `model` is
+    /// the parent model's name either way.
+    pub model_variant: String,
 }
 
 /// A bind value for the request-log filters, in placeholder order.
@@ -250,6 +264,10 @@ fn log_filter_sql(q: &UsageLogQuery, since: i64) -> (String, Vec<LogBind>) {
         sql.push_str(" and startsWith(lower(toString(request_id)), lower(?))");
         binds.push(LogBind::Text(rid.clone()));
     }
+    if let Some(parent) = q.parent_request_id {
+        sql.push_str(" and parent_request_id = toUUID(?)");
+        binds.push(LogBind::Text(parent.to_string()));
+    }
     if q.traced_only == Some(true) {
         sql.push_str(&traced_only_filter(since, q.until_ms));
     }
@@ -269,6 +287,16 @@ fn bind_log_filters(
     query
 }
 
+/// The request log's columns, in [`UsageLogRow`] field order: rows are read
+/// by position, so the two must move together.
+const USAGE_LOG_SELECT: &str =
+    "select request_id, ts_ms, tenant_id, key_id, model, request_type, session_id, session_id_source, device_id, \
+     admission, status_code, input_tokens, output_tokens, \
+     toUInt64(input_tokens) + toUInt64(output_tokens) as total_tokens, \
+     cached_input_tokens, queue_wait_ms, ttft_ms, total_ms, cache_status, cost_usd, \
+     energy_wh, energy_cost_usd, co2_g, parent_request_id, model_variant \
+     from usage";
+
 /// Read individual `usage` rows newest-first, honoring the supplied filters and
 /// keyset cursor.
 pub async fn query_usage_logs(
@@ -279,14 +307,7 @@ pub async fn query_usage_logs(
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
     let (filter, binds) = log_filter_sql(&q, since);
 
-    let mut sql = String::from(
-        "select request_id, ts_ms, tenant_id, key_id, model, request_type, session_id, session_id_source, device_id, \
-         admission, status_code, input_tokens, output_tokens, \
-         toUInt64(input_tokens) + toUInt64(output_tokens) as total_tokens, \
-         cached_input_tokens, queue_wait_ms, ttft_ms, total_ms, cache_status, cost_usd, \
-         energy_wh, energy_cost_usd, co2_g \
-         from usage",
-    );
+    let mut sql = String::from(USAGE_LOG_SELECT);
     sql.push_str(&filter);
     // Keyset cursor: (ts_ms, request_id) tuple strictly less than the cursor.
     // Tuple comparison matches the `order by` below for stable paging.
@@ -1741,6 +1762,7 @@ mod alias_tests {
             status: None,
             status_code: None,
             request_id: None,
+            parent_request_id: None,
             since_ms: None,
             until_ms: None,
             before_ms: None,
@@ -1766,16 +1788,77 @@ mod alias_tests {
             status: Some("error".into()),
             status_code: Some(502),
             request_id: Some("7c1e".into()),
+            parent_request_id: Some(Uuid::nil()),
             until_ms: Some(10),
             traced_only: Some(true),
             ..log_query()
         };
         let (sql, binds) = log_filter_sql(&full, 0);
         assert_eq!(sql.matches('?').count(), binds.len());
-        assert_eq!(binds.len(), 9);
+        assert_eq!(binds.len(), 10);
         assert!(sql.contains("status_code >= 400"));
         assert!(sql.contains("status_code = 502"));
         assert!(sql.contains("FROM spans"));
+    }
+
+    #[test]
+    fn helper_rows_are_fetched_by_their_parent_request() {
+        let parent = Uuid::new_v4();
+        let (sql, binds) = log_filter_sql(
+            &UsageLogQuery {
+                parent_request_id: Some(parent),
+                ..log_query()
+            },
+            0,
+        );
+        assert!(sql.contains(" and parent_request_id = toUUID(?)"));
+        assert_eq!(sql.matches('?').count(), binds.len());
+        assert!(matches!(binds.last(), Some(LogBind::Text(v)) if v == &parent.to_string()));
+    }
+
+    #[test]
+    fn log_columns_follow_the_row_field_order() {
+        // `UsageLogRow` is read by position: a column out of place would land
+        // in the wrong field (or fail the read) without any name check.
+        let select = USAGE_LOG_SELECT
+            .trim_start_matches("select ")
+            .split(" from ")
+            .next()
+            .unwrap();
+        let columns: Vec<&str> = select
+            .split(',')
+            .map(|c| c.rsplit(" as ").next().unwrap().trim())
+            .collect();
+        assert_eq!(
+            columns,
+            [
+                "request_id",
+                "ts_ms",
+                "tenant_id",
+                "key_id",
+                "model",
+                "request_type",
+                "session_id",
+                "session_id_source",
+                "device_id",
+                "admission",
+                "status_code",
+                "input_tokens",
+                "output_tokens",
+                "total_tokens",
+                "cached_input_tokens",
+                "queue_wait_ms",
+                "ttft_ms",
+                "total_ms",
+                "cache_status",
+                "cost_usd",
+                "energy_wh",
+                "energy_cost_usd",
+                "co2_g",
+                "parent_request_id",
+                "model_variant",
+            ]
+        );
     }
 
     #[test]

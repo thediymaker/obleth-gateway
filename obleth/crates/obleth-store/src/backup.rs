@@ -128,7 +128,7 @@ impl Store {
         .collect::<Result<Vec<_>>>()?;
 
         let models = sqlx::query(
-            "select id, model_name, aliases, description, upstream_model, api_base, api_key,
+            "select id, model_name, aliases, variants, description, upstream_model, api_base, api_key,
                     upstream_headers, model_type, quantization,
                     input_cost_per_token, output_cost_per_token, cost_per_image,
                     cost_per_audio_second, cost_per_character, cost_per_video, context_window,
@@ -403,11 +403,11 @@ impl Store {
                         health_maintenance_note, created_at,
                         debug_diagnostics, energy_slots_per_node, aliases, quantization,
                         upstream_headers, cost_per_video, capacity_namespace, capacity_service,
-                        per_replica_max_in_flight, capacity_source, capacity_headroom)
+                        per_replica_max_in_flight, capacity_source, capacity_headroom, variants)
                  values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
                         $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31,
                         $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46,
-                        $47, $48, $49, $50, $51, $52, $53, $54, $55)
+                        $47, $48, $49, $50, $51, $52, $53, $54, $55, $56)
                  on conflict (id) do update set
                         model_name = excluded.model_name,
                         description = excluded.description,
@@ -462,6 +462,7 @@ impl Store {
                         per_replica_max_in_flight = excluded.per_replica_max_in_flight,
                         capacity_source = excluded.capacity_source,
                         capacity_headroom = excluded.capacity_headroom,
+                        variants = excluded.variants,
                         updated_at = now()
                  returning (xmax = 0) as inserted",
             )
@@ -549,6 +550,9 @@ impl Store {
                     1.0
                 },
             )
+            .bind(sqlx::types::Json(obleth_config::normalize_variants(
+                &m.variants,
+            )))
             .fetch_one(&mut *tx)
             .await
             .map_err(restore_db_error)?;
@@ -723,6 +727,10 @@ fn model_backup_from_row(row: &PgRow) -> Result<ModelBackup> {
             .try_get::<sqlx::types::Json<Vec<String>>, _>("aliases")
             .map(|j| j.0)
             .unwrap_or_default(),
+        variants: row
+            .try_get::<sqlx::types::Json<Vec<obleth_config::ModelVariant>>, _>("variants")
+            .map(|j| j.0)
+            .unwrap_or_default(),
         description: row.try_get("description")?,
         upstream_model: row.try_get("upstream_model")?,
         api_base: row.try_get("api_base")?,
@@ -875,6 +883,7 @@ mod tests {
         // Both are `auto`-router configuration an operator set deliberately, so
         // both must survive a backup cycle rather than silently reverting to
         // the neutral 1.0.
+        let variant_name = format!("m-{}-spec", uuid::Uuid::new_v4());
         let model = store
             .create_model(
                 &format!("m-{}", uuid::Uuid::new_v4()),
@@ -919,6 +928,11 @@ mod tests {
                     per_replica_max_in_flight: Some(8),
                     headroom: 1.5,
                 },
+                &[obleth_config::ModelVariant {
+                    name: variant_name.clone(),
+                    description: "the model with speculation".into(),
+                    boons: vec!["speculation".into()],
+                }],
             )
             .await
             .expect("create model");
@@ -975,11 +989,13 @@ mod tests {
             .await
             .expect("update weight");
         // Drift the model's bias the same way, through the same restore.
-        sqlx::query("update models set route_bias = 1.0, auto_eligible = true where id = $1")
-            .bind(model.id)
-            .execute(&store.pool)
-            .await
-            .expect("drift route_bias and auto_eligible");
+        sqlx::query(
+            "update models set route_bias = 1.0, auto_eligible = true, variants = '[]' where id = $1",
+        )
+        .bind(model.id)
+        .execute(&store.pool)
+        .await
+        .expect("drift route_bias, auto_eligible and variants");
         // And its capacity discovery fields, and the endpoint's concurrency.
         sqlx::query(
             "update models set capacity_mode = 'static', capacity_source = 'endpoints',
@@ -1018,6 +1034,15 @@ mod tests {
             "restore must not re-include a model the backup had excluded"
         );
         assert_eq!(restored_model.tags, vec!["coding:3".to_string()]);
+        assert_eq!(
+            restored_model
+                .variants
+                .iter()
+                .map(|v| v.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![variant_name.as_str()],
+            "restore puts the model's variants back"
+        );
         assert_eq!(restored_model.capacity_mode, "discovered");
         assert_eq!(restored_model.capacity_source, "kubernetes");
         assert_eq!(

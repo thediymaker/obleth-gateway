@@ -517,6 +517,9 @@ pub(super) struct ImageCtx<'a> {
     pub cfg: &'a ImageGenerationBoonSettings,
     pub key: &'a ResolvedKey,
     pub session_id: &'a str,
+    /// The client request the images are drawn for; each billed image row
+    /// records it.
+    pub request_id: uuid::Uuid,
     /// Images produced so far — the out-of-band channel that keeps image bytes
     /// out of the model's context.
     pub images: Vec<GeneratedImage>,
@@ -608,6 +611,7 @@ pub(super) async fn execute(
                 &image_model,
                 ctx.key,
                 ctx.session_id,
+                ctx.request_id,
                 count as u32,
             );
             ctx.events.push(ImageGenEvent {

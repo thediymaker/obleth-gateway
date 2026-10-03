@@ -23,7 +23,8 @@ impl RedisStore {
     }
 
     /// Delete every resolved-model entry whose name is not in `known_names`
-    /// (canonical names and aliases of the models that should resolve).
+    /// (canonical names, aliases and variants of the models that should
+    /// resolve).
     pub async fn prune_stale_resolved_models(
         &self,
         known_names: &HashSet<String>,

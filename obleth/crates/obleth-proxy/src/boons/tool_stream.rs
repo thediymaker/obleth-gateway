@@ -53,6 +53,9 @@ pub struct StreamLoop {
     pub route: ResolvedModel,
     pub key: ResolvedKey,
     pub session_id: String,
+    /// The client request this loop answers; every follow-up turn is billed
+    /// against it.
+    pub request_id: uuid::Uuid,
     /// The enriched request body (tools injected) used as the base for
     /// follow-up turns. Its `stream` flag is overwritten per dispatch.
     pub base_request: Value,
@@ -93,6 +96,7 @@ pub fn run(
             route,
             key,
             session_id,
+            request_id,
             base_request,
             tool_servers,
             settings,
@@ -119,6 +123,7 @@ pub fn run(
             cfg,
             key: &key,
             session_id: &session_id,
+            request_id,
             images: Vec::new(),
             events: Vec::new(),
         });
@@ -324,7 +329,9 @@ pub fn run(
             // Gateway-owned tools: bill this turn, surface a visible marker per
             // call, execute, append results, and loop for the next turn.
             if let Some((it, ot)) = usage {
-                super::bill_helper_call(&state, &route, &key, &session_id, "tool_loop", it, ot);
+                super::bill_helper_call(
+                    &state, &route, &key, &session_id, request_id, "tool_loop", it, ot,
+                );
             }
             super::tool_loop::push_message(
                 &mut request,

@@ -89,6 +89,9 @@ struct UsageRow<'a> {
     request_type: &'a str,
     device_id: &'a str,
     end_user: &'a str,
+    #[serde(with = "clickhouse::serde::uuid")]
+    parent_request_id: Uuid,
+    model_variant: &'a str,
 }
 
 impl<'a> From<&'a UsageRecord> for UsageRow<'a> {
@@ -119,6 +122,8 @@ impl<'a> From<&'a UsageRecord> for UsageRow<'a> {
             request_type: &r.request_type,
             device_id: &r.device_id,
             end_user: &r.end_user,
+            parent_request_id: r.parent_request_id,
+            model_variant: &r.model_variant,
         }
     }
 }
@@ -745,6 +750,8 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
             request_type LowCardinality(String) DEFAULT '',
             device_id String DEFAULT '',
             end_user String DEFAULT '',
+            parent_request_id UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
+            model_variant String DEFAULT '',
             ts DateTime64(3) MATERIALIZED fromUnixTimestamp64Milli(ts_ms),
             INDEX idx_ts_ms ts_ms TYPE minmax GRANULARITY 4
         ) ENGINE = MergeTree()
@@ -830,6 +837,20 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
     client
         .query(&format!(
             "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS cached_input_tokens UInt32 DEFAULT 0"
+        ))
+        .execute()
+        .await?;
+    // Idempotent adds for databases created before helper-call rows named the
+    // request they served, and before requests recorded the variant they used.
+    client
+        .query(&format!(
+            "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS parent_request_id UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000')"
+        ))
+        .execute()
+        .await?;
+    client
+        .query(&format!(
+            "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS model_variant String DEFAULT ''"
         ))
         .execute()
         .await?;
@@ -1168,6 +1189,8 @@ mod conv_tests {
             request_type: "chat".into(),
             device_id: String::new(),
             end_user: String::new(),
+            parent_request_id: Uuid::nil(),
+            model_variant: String::new(),
         }
     }
 
@@ -1388,6 +1411,8 @@ mod conv_tests {
             request_type: "chat".into(),
             device_id: "dev-1".into(),
             end_user: String::new(),
+            parent_request_id: Uuid::nil(),
+            model_variant: String::new(),
         };
         let row = UsageRow::from(&rec);
         assert_eq!(row.session_id_source, "derived");
@@ -1422,6 +1447,8 @@ mod conv_tests {
             request_type: "chat".into(),
             device_id: "dev-1".into(),
             end_user: String::new(),
+            parent_request_id: Uuid::nil(),
+            model_variant: String::new(),
         };
         rec.energy_wh = 1.5;
         rec.energy_cost_usd = 0.0002;
@@ -1440,6 +1467,21 @@ mod conv_tests {
         let row = UsageRow::from(&rec);
         assert_eq!(row.input_tokens, 120);
         assert_eq!(row.cached_input_tokens, 96);
+    }
+
+    #[test]
+    fn usage_row_mirrors_the_parent_request_and_variant() {
+        let mut rec = record();
+        let row = UsageRow::from(&rec);
+        assert!(row.parent_request_id.is_nil());
+        assert_eq!(row.model_variant, "");
+
+        let parent = Uuid::new_v4();
+        rec.parent_request_id = parent;
+        rec.model_variant = "glm-5-3-spec".into();
+        let row = UsageRow::from(&rec);
+        assert_eq!(row.parent_request_id, parent);
+        assert_eq!(row.model_variant, "glm-5-3-spec");
     }
 }
 

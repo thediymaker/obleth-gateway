@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use obleth_config::{ResolvedKey, ResolvedModel, STRUCTURED_OUTPUT_MAX_REPAIR_ATTEMPTS};
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 use super::{structured, ResponsePlan, StructuredPlan};
 use crate::state::AppState;
@@ -37,12 +38,22 @@ pub async fn transform_completion(
     route: Option<&ResolvedModel>,
     key: &ResolvedKey,
     session_id: &str,
+    request_id: Uuid,
     body: &mut Value,
 ) -> TransformResult {
     // ---- structured-output boon ----
     let warning = match &plan.structured {
         Some(structured_plan) => {
-            apply_structured(state, structured_plan, route, key, session_id, body).await
+            apply_structured(
+                state,
+                structured_plan,
+                route,
+                key,
+                session_id,
+                request_id,
+                body,
+            )
+            .await
         }
         None => None,
     };
@@ -61,13 +72,14 @@ pub(super) async fn apply_structured(
     route: Option<&ResolvedModel>,
     key: &ResolvedKey,
     session_id: &str,
+    request_id: Uuid,
     body: &mut Value,
 ) -> Option<&'static str> {
     let content = body
         .pointer("/choices/0/message/content")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())?;
-    match enforce_schema(state, plan, route, key, session_id, &content).await {
+    match enforce_schema(state, plan, route, key, session_id, request_id, &content).await {
         Some(canonical) => {
             if let Some(message) = body
                 .pointer_mut("/choices/0/message")
@@ -90,6 +102,7 @@ async fn enforce_schema(
     route: Option<&ResolvedModel>,
     key: &ResolvedKey,
     session_id: &str,
+    request_id: Uuid,
     content: &str,
 ) -> Option<String> {
     let mut errors = match check(plan.schema.as_ref(), content) {
@@ -142,6 +155,7 @@ async fn enforce_schema(
                     &helper,
                     key,
                     session_id,
+                    request_id,
                     "structured_output_boon",
                     reply.input_tokens,
                     reply.output_tokens,

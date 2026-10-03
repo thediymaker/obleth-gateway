@@ -32,6 +32,7 @@ use std::time::Duration;
 use obleth_config::{ResolvedKey, ResolvedModel, ToolLoopSettings};
 use obleth_tokenizer::Tokenizer;
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 use super::mcp_tools::{self, McpTool};
 use super::respond::TransformResult;
@@ -449,13 +450,16 @@ pub async fn run(
     route: Option<&ResolvedModel>,
     key: &ResolvedKey,
     session_id: &str,
+    request_id: Uuid,
     dispatch_timeout: Duration,
     body: &mut Value,
     mut tracer: Option<&mut crate::tracer::SpanRecorder>,
 ) -> TransformResult {
     let Some(loop_plan) = &plan.tool_loop else {
-        return super::respond::transform_completion(state, plan, route, key, session_id, body)
-            .await;
+        return super::respond::transform_completion(
+            state, plan, route, key, session_id, request_id, body,
+        )
+        .await;
     };
     let Some(route) = route else {
         return TransformResult {
@@ -490,6 +494,7 @@ pub async fn run(
             cfg,
             key,
             session_id,
+            request_id,
             images: Vec::new(),
             events: Vec::new(),
         });
@@ -543,6 +548,7 @@ pub async fn run(
                         Some(route),
                         key,
                         session_id,
+                        request_id,
                         body,
                     )
                     .await
@@ -656,6 +662,7 @@ pub async fn run(
                     route,
                     key,
                     session_id,
+                    request_id,
                     "tool_loop",
                     input_tokens,
                     output_tokens,
@@ -760,6 +767,7 @@ pub async fn run(
                 route,
                 key,
                 session_id,
+                request_id,
                 "tool_loop",
                 input_tokens,
                 output_tokens,

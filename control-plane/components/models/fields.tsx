@@ -7,7 +7,7 @@ import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
 import type { BoonBlockers } from "@/lib/boon-availability";
 import { distinctEmbeddingModelCount } from "@/lib/knowledge-format";
-import { touches, type FormSnapshot } from "@/lib/models-model";
+import { MAX_VARIANTS, touches, variantDrafts, variantNameProblem, variantsValue, type FormSnapshot, type VariantDraft } from "@/lib/models-model";
 import type { KnowledgeCollection, McpServer, ModelKnowledgeCollections, ModelRoute } from "@/lib/obleth";
 import { cn, parseTagLevel, TAG_LEVEL_LABELS } from "@/lib/utils";
 
@@ -96,6 +96,9 @@ export const UPSTREAM_HEADERS_HINT =
 
 export const ALIASES_HINT =
   "One name per line. Extra names that resolve to this same route — register the old spelling here when you clean up an API model name, and pinned clients keep working. Only the API model name itself is advertised by /v1/models.";
+
+export const VARIANTS_HINT =
+  "A variant is another name for this model with extra boons turned on: `glm-5-3-spec` could be this model with Speculation. It reaches the same deployment and shares its capacity and price. Its boons are added to the model's own and never turn one off, so callers opt in by asking for the variant while the plain name keeps working as before. A boon that is off in Settings → Boons does nothing here either.";
 
 export function modelTypeHint(type: string): string {
   switch (type) {
@@ -315,7 +318,8 @@ export function ChipCheckbox({
   disabled,
   hint,
 }: {
-  name: string;
+  /** Omit for a chip whose value the surrounding form carries some other way. */
+  name?: string;
   label: string;
   defaultChecked?: boolean;
   checked?: boolean;
@@ -386,6 +390,92 @@ export function TagLevelPicker({ tag, level, onChange }: { tag: string; level: n
         </label>
       ))}
     </span>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Variants
+// ---------------------------------------------------------------------------
+
+const BOON_ORDER = MODEL_BOONS.map((b) => b.value);
+
+function listed(words: string[]): string {
+  return words.length < 2 ? words.join("") : `${words.slice(0, -1).join(", ")} and ${words[words.length - 1]}`;
+}
+
+/**
+ * A model's variants: each row a name, what callers get, and the boons it
+ * adds. The rows submit together as one JSON field, `variants`, so the save
+ * bar sees any edit as one change and the save sends the whole list.
+ */
+export function VariantsField({ model, modelNames = [] }: { model: ModelRoute; modelNames?: string[] }) {
+  const [rows, setRows] = useState<VariantDraft[]>(() => variantDrafts(model));
+  const own = { name: model.model_name, aliases: model.aliases ?? [], otherModels: modelNames.filter((n) => n !== model.model_name) };
+  const edit = (i: number, patch: (row: VariantDraft) => Partial<VariantDraft>) =>
+    setRows((prev) => prev.map((r, j) => (j === i ? { ...r, ...patch(r) } : r)));
+  return (
+    <div className="flex flex-col gap-2">
+      <input type="hidden" name="variants" value={variantsValue(rows, BOON_ORDER)} />
+      {rows.map((v, i) => {
+        const name = v.name.trim();
+        const problem = variantNameProblem(rows, i, own);
+        const added = MODEL_BOONS.filter((b) => v.boons.includes(b.value)).map((b) => b.label);
+        return (
+          <div key={i} className="flex flex-col gap-2 rounded-lg border border-border p-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <Input
+                aria-label="Variant name"
+                value={v.name}
+                onChange={(e) => edit(i, () => ({ name: e.target.value }))}
+                ref={(el) => el?.setCustomValidity(problem ?? "")}
+                aria-invalid={problem ? true : undefined}
+                required
+                placeholder={`${model.model_name}-spec`}
+                autoComplete="off"
+                spellCheck={false}
+                className="h-9 w-56 font-mono text-[12.5px]"
+              />
+              <Input
+                aria-label="Variant description"
+                value={v.description}
+                onChange={(e) => edit(i, () => ({ description: e.target.value }))}
+                placeholder="What callers get (optional)"
+                className="h-9 min-w-0 flex-1 text-[13px]"
+              />
+              <button type="button" onClick={() => setRows((prev) => prev.filter((_, j) => j !== i))} aria-label={`Remove ${name || "this variant"}`} className="text-xs text-muted-foreground underline underline-offset-[3px] hover:text-foreground">Remove</button>
+            </div>
+            <div role="group" aria-label={`Boons ${name || "this variant"} adds`} className="flex flex-wrap gap-1.5">
+              {MODEL_BOONS.map((boon) => (
+                <ChipCheckbox
+                  key={boon.value}
+                  label={boon.label}
+                  hint={boon.description}
+                  checked={v.boons.includes(boon.value)}
+                  onChange={(on) => edit(i, (r) => ({ boons: on ? [...r.boons, boon.value] : r.boons.filter((b) => b !== boon.value) }))}
+                />
+              ))}
+            </div>
+            {problem ? (
+              <p className="text-[11.5px] text-foreground">{problem}</p>
+            ) : (
+              <p className="text-[11.5px] text-muted-foreground">
+                {name ? <span className="font-mono">{name}</span> : "This name"} reaches {model.model_name}
+                {added.length ? ` with ${listed(added)} turned on as well.` : " with no extra boons, the same as an alias."}
+              </p>
+            )}
+          </div>
+        );
+      })}
+      <button
+        type="button"
+        disabled={rows.length >= MAX_VARIANTS}
+        onClick={() => setRows((prev) => [...prev, { name: "", description: "", boons: [] }])}
+        className="self-start text-[12.5px] text-secondary-foreground underline underline-offset-[3px] hover:text-foreground disabled:no-underline disabled:opacity-50"
+      >
+        {rows.length ? "Add another variant" : "Add a variant"}
+      </button>
+      {rows.length >= MAX_VARIANTS && <p className="text-[11.5px] text-muted-foreground">A model can have up to {MAX_VARIANTS} variants.</p>}
+    </div>
   );
 }
 

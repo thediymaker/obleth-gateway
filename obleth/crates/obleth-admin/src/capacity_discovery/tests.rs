@@ -1016,6 +1016,7 @@ fn resolved(name: &str) -> ResolvedModel {
     ResolvedModel {
         model_name: name.to_string(),
         aliases: Vec::new(),
+        variants: Vec::new(),
         quantization: "unknown".into(),
         upstream_model: name.to_string(),
         api_base: "http://upstream".to_string(),

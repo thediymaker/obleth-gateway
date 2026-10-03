@@ -21,6 +21,8 @@ import {
   TextField,
   toPlainDecimal,
   UPSTREAM_HEADERS_HINT,
+  VARIANTS_HINT,
+  VariantsField,
 } from "@/components/models/fields";
 import { Button } from "@/components/ui/button";
 import type { BoonBlockers } from "@/lib/boon-availability";
@@ -295,6 +297,11 @@ export function ModelSettings({
           <Setting id="set-aliases" label="Aliases" hint="Other names that reach this model, one per line." help={ALIASES_HINT} fields={["aliases"]}>
             <TextArea name="aliases" label="Aliases" rows={2} defaultValue={(model.aliases ?? []).join("\n")} placeholder={"old-name\nanother-name"} />
           </Setting>
+          {(chat || (model.variants?.length ?? 0) > 0) && (
+            <Setting id="set-variants" label="Variants" hint="Other names for this model with extra boons turned on." help={VARIANTS_HINT} fields={["variants"]}>
+              <VariantsField model={model} modelNames={modelNames} />
+            </Setting>
+          )}
           <Setting id="set-quantization" label="Quantization" hint="The weights' format, for reference only." help={QUANTIZATION_HINT} fields={["quantization"]} was={{ field: "quantization" }}>
             <div className="max-w-xs"><SelectField name="quantization" label="Quantization" value={quantization} onChange={setQuantization} options={QUANTIZATION_OPTIONS} /></div>
           </Setting>

@@ -96,6 +96,39 @@ describe("saving a model's settings", () => {
     expect(body.tags).toEqual([]);
   });
 
+  it("sends the variant rows in the same PUT, and leaves them alone when the form has none", async () => {
+    mockAdmin();
+    const stored = [{ name: "m-spec", description: "Faster", boons: ["speculation"] }];
+    const obleth = gateway(model({ variants: stored }));
+    const { saveModelSettingsAction } = await import("./actions");
+    const rows = [
+      { name: " m-spec ", description: " Faster answers ", boons: ["speculation", "vision"] },
+      { name: "  ", description: "a row left blank", boons: [] },
+      { name: "m-strict", boons: ["structured_output"] },
+    ];
+    await saveModelSettingsAction(form({ sections: "model", variants: JSON.stringify(rows) }));
+    expect(obleth.updateModel.mock.calls[0][1].variants).toEqual([
+      { name: "m-spec", description: "Faster answers", boons: ["speculation", "vision"] },
+      { name: "m-strict", description: "", boons: ["structured_output"] },
+    ]);
+
+    await saveModelSettingsAction(form({ sections: "model", variants: "[]" }));
+    expect(obleth.updateModel.mock.calls[1][1].variants).toEqual([]);
+
+    // Omitted, the gateway keeps what it has: a save without the field sends none.
+    await saveModelSettingsAction(form({ sections: "model", description: "new" }));
+    expect("variants" in obleth.updateModel.mock.calls[2][1]).toBe(false);
+  });
+
+  it("refuses variants it can't read rather than dropping them", async () => {
+    mockAdmin();
+    const obleth = gateway();
+    const { saveModelSettingsAction } = await import("./actions");
+    const result = await saveModelSettingsAction(form({ sections: "model", variants: "{not json" }));
+    expect(result).toEqual({ ok: false, error: "Model settings: The variants could not be read. Reload the page and try again.", saved: [] });
+    expect(obleth.updateModel).not.toHaveBeenCalled();
+  });
+
   it("sends a new key only when one was typed", async () => {
     mockAdmin();
     const obleth = gateway();
@@ -151,6 +184,7 @@ describe("the serving switch", () => {
     expect(body.enabled).toBe(false);
     expect(body.tags).toEqual(["coding:3"]);
     expect(body.max_in_flight).toBe(16);
+    expect("variants" in body).toBe(false);
   });
 });
 
