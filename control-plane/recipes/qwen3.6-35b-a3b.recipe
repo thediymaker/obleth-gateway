@@ -1,0 +1,74 @@
+---
+name: Qwen3.6 35B-A3B (FP8)
+description: "Qwen's mid-size mixture of experts, 35B parameters with 3B active, in FP8. Reads images, calls tools and thinks before answering. One GPU with 48 GB or more; FP8 runs natively on Hopper and newer."
+engine: vllm
+kind: model
+model: Qwen/Qwen3.6-35B-A3B-FP8
+weights_gb: 38
+requires: "vLLM 0.17.0 or later"
+model_type: chat
+api_model_name: qwen3.6-35b-a3b
+port: 8000
+health_path: /health
+target_replicas: 1
+max_job_failures: 2
+env:
+  VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+tested:
+  - hardware: "1× GH200 96 GB"
+    engine: "vLLM 0.30.1rc1 (nightly, Arm)"
+    date: 2026-10-03
+    result: "Ready in 4 to 7 minutes. One request ran at about 245 tokens a second; 16 at once reached 2,120. Tool calls worked 3 times out of 3, and it read a test image."
+  - hardware: "1× A100 80 GB"
+    engine: "vLLM 0.30.1rc1 (nightly)"
+    date: 2026-10-03
+    result: "Ready in 7 minutes (FP8 runs as 8-bit weights on this older GPU). One request ran at about 160 tokens a second; 16 at once reached 1,300. Tool calls worked 3 times out of 3, and it read a test image."
+inputs:
+  - name: context
+    label: Context length
+    type: choice
+    options: [32768, 131072, 262144]
+    default: 131072
+    help: Most layers use linear attention, so long contexts take little memory.
+  - name: tools
+    label: Tool calling
+    type: flag
+    default: true
+    adds: --enable-auto-tool-choice --tool-call-parser qwen3_coder
+  - name: reasoning
+    label: Reasoning
+    type: flag
+    default: true
+    adds: --reasoning-parser qwen3
+  - name: text_only
+    label: Text only
+    type: flag
+    default: false
+    adds: --language-model-only
+    help: Skip the vision encoder to save memory when no one sends images.
+  - name: image
+    label: Container image
+    type: path
+    default: "{{cluster.image.vllm}}"
+    required: true
+  - name: cache
+    label: Weight cache
+    type: path
+    default: "{{cluster.cache}}"
+    required: true
+    help: HF_HOME, where the weights are kept between jobs.
+---
+#!/bin/bash -l
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=64G
+set -euo pipefail
+{{cluster.setup}}
+export HF_HOME={{cache}}
+apptainer exec --nv --bind {{cache}} {{image}} \
+  vllm serve Qwen/Qwen3.6-35B-A3B-FP8 \
+    --served-model-name {{api_model_name}} \
+    --host 0.0.0.0 --port "$OBLETH_SERVING_PORT" \
+    --trust-remote-code \
+    --max-model-len {{context}} \
+    {{tools}} {{reasoning}} {{text_only}}

@@ -1,0 +1,68 @@
+---
+name: Nemotron 3 Nano 30B-A3B (FP8)
+description: "NVIDIA's small hybrid Mamba and mixture-of-experts model, 30B parameters with 3B active, in FP8. Fast, with tool calling and reasoning. One GPU with 48 GB or more; FP8 runs natively on Hopper and newer."
+engine: vllm
+kind: model
+model: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8
+weights_gb: 33
+requires: "vLLM 0.17.0 or later"
+model_type: chat
+api_model_name: nemotron-3-nano
+port: 8000
+health_path: /health
+target_replicas: 1
+max_job_failures: 2
+env:
+  VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+tested:
+  - hardware: "1× H100 80 GB"
+    engine: "vLLM 0.30.1rc1 (nightly)"
+    date: 2026-10-03
+    result: "Ready in 5 minutes. One request ran at about 300 tokens a second; 16 at once reached 1,900. Tool calls worked 3 times out of 3."
+  - hardware: "1× A100 80 GB"
+    engine: "vLLM 0.30.1rc1 (nightly)"
+    date: 2026-10-03
+    result: "Ready in 4.5 minutes (FP8 runs as 8-bit weights on this older GPU). One request ran at about 210 tokens a second; 16 at once reached 1,190. Tool calls worked 3 times out of 3."
+inputs:
+  - name: context
+    label: Context length
+    type: choice
+    options: [32768, 131072, 262144]
+    default: 131072
+  - name: tools
+    label: Tool calling
+    type: flag
+    default: true
+    adds: --enable-auto-tool-choice --tool-call-parser qwen3_coder
+  - name: reasoning
+    label: Reasoning
+    type: flag
+    default: true
+    adds: --reasoning-parser nemotron_v3
+  - name: image
+    label: Container image
+    type: path
+    default: "{{cluster.image.vllm}}"
+    required: true
+  - name: cache
+    label: Weight cache
+    type: path
+    default: "{{cluster.cache}}"
+    required: true
+    help: HF_HOME, where the weights are kept between jobs.
+---
+#!/bin/bash -l
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=64G
+set -euo pipefail
+{{cluster.setup}}
+export HF_HOME={{cache}}
+apptainer exec --nv --bind {{cache}} {{image}} \
+  vllm serve nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8 \
+    --served-model-name {{api_model_name}} \
+    --host 0.0.0.0 --port "$OBLETH_SERVING_PORT" \
+    --trust-remote-code --async-scheduling \
+    --kv-cache-dtype fp8 \
+    --max-model-len {{context}} \
+    {{tools}} {{reasoning}}

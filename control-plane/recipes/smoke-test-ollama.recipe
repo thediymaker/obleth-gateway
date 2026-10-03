@@ -1,25 +1,31 @@
 ---
-name: Ollama
-description: "Any model in the Ollama library, pulled when the job starts. Quick to try; the model is served under its Ollama tag."
+name: Smoke test (Ollama)
+description: "Qwen2.5 0.5B on Ollama, a 400 MB model, to check that launching works end to end with the official Ollama image: the job starts, pulls the model and serves in a minute or two."
 engine: ollama
-kind: engine
+kind: model
+model: qwen2.5:0.5b
 model_type: chat
-api_model_name: my-model
+api_model_name: qwen2.5:0.5b
 port: 8000
 health_path: /api/tags
 target_replicas: 1
-max_job_failures: 2
+max_job_failures: 1
 tested:
-  - hardware: "1× A100 80 GB"
+  - hardware: an A100 20 GB slice
     engine: "Ollama 0.35.1"
     date: 2026-10-03
-    result: "Served gpt-oss:20b. Ready in 2.5 minutes. The first answer took over a minute while Ollama loaded the model; after that, about 47 tokens a second. Tool calls worked 3 times out of 3."
+    result: "Ready 35 seconds after the job started. The first answer took 6 seconds while Ollama loaded the model; the next came in under 2."
+  - hardware: "1× GH200 96 GB"
+    engine: "Ollama 0.35.1 (Arm)"
+    date: 2026-10-03
+    result: "Ready 14 seconds after the job started. The first answer took 50 seconds while Ollama loaded the model; after that, about 120 tokens a second."
 inputs:
   - name: model
     label: Ollama model
     type: text
+    default: qwen2.5:0.5b
     required: true
-    help: The tag, e.g. qwen2.5:0.5b. The API model name must match it.
+    help: The tag. The API model name must match it.
   - name: image
     label: Container image
     type: path
@@ -30,7 +36,7 @@ inputs:
     type: path
     default: "{{cluster.cache}}"
     required: true
-    help: OLLAMA_MODELS, so pulled models are kept between jobs.
+    help: OLLAMA_MODELS goes in an ollama folder here, so pulled models are kept between jobs.
 ---
 #!/bin/bash -l
 #SBATCH --gres=gpu:1
