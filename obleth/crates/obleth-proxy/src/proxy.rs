@@ -2624,6 +2624,7 @@ async fn run_pipeline(
                         settings: loop_plan.settings.clone(),
                         passthrough_unmapped: loop_plan.passthrough_unmapped,
                         image_gen: loop_plan.image_gen.clone(),
+                        web_search: loop_plan.web_search.clone(),
                         dispatch_timeout: req_timeout,
                         client_include_usage: plan.include_usage,
                         upstream_start,

@@ -10,6 +10,8 @@ const boons = (over: Partial<BoonSettingsView> = {}): BoonSettingsView =>
     compression_enabled: true,
     image_generation_enabled: true,
     image_generation_model: "flux-2",
+    web_search_enabled: true,
+    web_search_tool: "searxng-search",
     speculation_enabled: true,
     ...over,
   }) as BoonSettingsView;
@@ -37,6 +39,11 @@ describe("boonBlockers", () => {
     );
     expect(blockers.image_generation).toContain("no image model");
     expect(blockers.vision).toContain("no describer model");
+  });
+
+  it("names the missing search tool for web search", () => {
+    expect(boonBlockers(boons({ web_search_tool: null }), knowledge(true)).web_search).toContain("no search tool");
+    expect(boonBlockers(boons({ web_search_enabled: false }), knowledge(true)).web_search).toContain("switched off");
   });
 
   it("reads knowledge from its own settings page", () => {

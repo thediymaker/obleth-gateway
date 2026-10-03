@@ -152,13 +152,14 @@ export function specValues(b: BoonSettingsView): SpecValues {
 // Boons
 // ---------------------------------------------------------------------------
 
-export type BoonKey = "vision" | "structured_output" | "tool_loop" | "image_generation" | "speculation" | "compression";
+export type BoonKey = "vision" | "structured_output" | "tool_loop" | "image_generation" | "web_search" | "speculation" | "compression";
 
 export const BOONS: { key: BoonKey; label: string; blurb: string; enabled: keyof BoonSettingsView; modelBoon: string | null }[] = [
   { key: "vision", label: "Vision", blurb: "Describes images for text-only models", enabled: "vision_enabled", modelBoon: "vision" },
   { key: "structured_output", label: "Structured output", blurb: "Holds replies to a JSON schema", enabled: "structured_output_enabled", modelBoon: "structured_output" },
   { key: "tool_loop", label: "Tool loop", blurb: "Runs MCP tools inside the gateway", enabled: "tool_loop_enabled", modelBoon: null },
   { key: "image_generation", label: "Image generation", blurb: "Lets a chat model draw", enabled: "image_generation_enabled", modelBoon: "image_generation" },
+  { key: "web_search", label: "Web search", blurb: "Lets a chat model look things up", enabled: "web_search_enabled", modelBoon: "web_search" },
   { key: "speculation", label: "Speculation", blurb: "Answers from a fast drafter when the model agrees", enabled: "speculation_enabled", modelBoon: "speculation" },
   { key: "compression", label: "Compression", blurb: "Shrinks long inputs before the model reads them", enabled: "compression_enabled", modelBoon: "compression" },
 ];
@@ -184,6 +185,8 @@ export function boonSummary(key: BoonKey, b: BoonSettingsView): string {
       return `${b.tool_loop_max_turns} turns · ${s(b.tool_loop_tool_timeout_ms)} a tool · ${s(b.tool_loop_deadline_secs * 1000)} in all`;
     case "image_generation":
       return b.image_generation_model ? `${b.image_generation_model} · up to ${b.image_generation_max_images_per_request} a call · ${(b.image_generation_allowed_sizes ?? []).join(", ")}` : "No image model picked";
+    case "web_search":
+      return b.web_search_tool ? `${b.web_search_tool} · ${b.web_search_max_results} results a search · up to ${b.web_search_max_searches_per_request} searches a request` : "No search tool picked";
     case "speculation":
       return b.speculation_draft_model ? `drafter ${b.speculation_draft_model} · ${(b.speculation_category_gates ?? []).length} category rules` : "No drafter picked";
     case "compression": {
@@ -233,6 +236,7 @@ export function needsYou(input: {
     }
     if (boons.vision_enabled && !boons.vision_fallback_model) out.push({ key: "vision-model", title: "Vision is on with no describer model", detail: "Pick the model that describes images.", href: "#boon-vision", action: "Pick one" });
     if (boons.image_generation_enabled && !boons.image_generation_model) out.push({ key: "image-model", title: "Image generation is on with no image model", detail: "Pick the model that draws.", href: "#boon-image_generation", action: "Pick one" });
+    if (boons.web_search_enabled && !boons.web_search_tool) out.push({ key: "search-tool", title: "Web search is on with no search tool", detail: "Pick the search tool the models search with.", href: "#boon-web_search", action: "Pick one" });
     if (boons.speculation_enabled && !boons.speculation_draft_model) out.push({ key: "spec-model", title: "Speculation is on with no drafter", detail: "Pick the fast model that drafts.", href: "#boon-speculation", action: "Pick one" });
   }
   if (input.knowledge && !input.knowledge.enabled) {

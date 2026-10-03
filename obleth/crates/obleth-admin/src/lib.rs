@@ -2924,6 +2924,12 @@ pub struct BoonSettingsView {
     pub speculation_category_gates: serde_json::Value,
     pub speculation_unlisted_categories_speculate: bool,
     pub speculation_verify_url_template: String,
+    pub web_search_enabled: bool,
+    pub web_search_tool: Option<String>,
+    pub web_search_tool_description: String,
+    pub web_search_max_results: u32,
+    pub web_search_max_searches_per_request: u32,
+    pub web_search_timeout_ms: u64,
 }
 
 impl BoonSettingsView {
@@ -2981,6 +2987,12 @@ impl BoonSettingsView {
                 .unwrap_or_else(|_| serde_json::Value::Array(Vec::new())),
             speculation_unlisted_categories_speculate: s.speculation.unlisted_categories_speculate,
             speculation_verify_url_template: s.speculation.verify_url_template.clone(),
+            web_search_enabled: s.web_search.enabled,
+            web_search_tool: s.web_search.search_tool.clone(),
+            web_search_tool_description: s.web_search.tool_description.clone(),
+            web_search_max_results: s.web_search.max_results,
+            web_search_max_searches_per_request: s.web_search.max_searches_per_request,
+            web_search_timeout_ms: s.web_search.timeout_ms,
         }
     }
 }
@@ -3142,6 +3154,28 @@ pub struct UpdateBoonSettings {
     /// placeholders). Empty string clears; omitted keeps the current value.
     #[serde(default)]
     pub speculation_verify_url_template: Option<String>,
+    /// Enable or disable the web-search boon globally. Omit to leave unchanged.
+    #[serde(default)]
+    pub web_search_enabled: Option<bool>,
+    /// `model_name` of the registered `search`-type route that runs searches.
+    /// Empty string clears it (which deactivates the boon).
+    #[serde(default)]
+    pub web_search_tool: Option<String>,
+    /// Tool description the model reads. Empty string resets it to the built-in
+    /// default; omit the field to leave it unchanged.
+    #[serde(default)]
+    pub web_search_tool_description: Option<String>,
+    /// Results handed to the model per search, clamped to
+    /// `WEB_SEARCH_MAX_RESULTS`. Omit/zero leaves unchanged.
+    #[serde(default)]
+    pub web_search_max_results: Option<u32>,
+    /// Searches one request may run, clamped to `WEB_SEARCH_MAX_PER_REQUEST`.
+    /// Omit/zero leaves unchanged.
+    #[serde(default)]
+    pub web_search_max_searches_per_request: Option<u32>,
+    /// Timeout for one search (ms). Omit/zero leaves unchanged.
+    #[serde(default)]
+    pub web_search_timeout_ms: Option<u64>,
 }
 
 #[utoipa::path(
@@ -3262,6 +3296,39 @@ async fn put_boon_settings(
         Some("") => obleth_config::DEFAULT_IMAGE_TOOL_DESCRIPTION.to_string(),
         Some(d) => d.to_string(),
         None => existing.image_generation.tool_description.clone(),
+    };
+
+    // Web-search route: same merge-and-validate shape as
+    // `image_generation_model` above, but it must be a `search` route.
+    let search_tool = match body.web_search_tool.as_deref().map(str::trim) {
+        Some("") => None,
+        Some(m) => Some(m.to_string()),
+        None => existing.web_search.search_tool.clone(),
+    };
+    if body.web_search_tool.is_some() {
+        if let Some(name) = search_tool.as_deref() {
+            match state.store.get_model_by_name(name).await {
+                Ok(model) if model.model_type == obleth_config::SEARCH_MODEL_TYPE => {}
+                Ok(model) => {
+                    return Err(AdminError::BadRequest(format!(
+                        "web_search_tool `{name}` has model_type `{}`; it must be `{}`",
+                        model.model_type,
+                        obleth_config::SEARCH_MODEL_TYPE
+                    )))
+                }
+                Err(obleth_store::StoreError::NotFound) => {
+                    return Err(AdminError::BadRequest(format!(
+                        "web_search_tool `{name}` is not a registered model"
+                    )))
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+    let search_tool_description = match body.web_search_tool_description.as_deref().map(str::trim) {
+        Some("") => obleth_config::DEFAULT_WEB_SEARCH_TOOL_DESCRIPTION.to_string(),
+        Some(d) => d.to_string(),
+        None => existing.web_search.tool_description.clone(),
     };
 
     // Speculation helper models: same merge-and-validate shape as
@@ -3506,6 +3573,27 @@ async fn put_boon_settings(
                 .map(|t| t.trim().to_string())
                 .unwrap_or_else(|| existing.speculation.verify_url_template.clone()),
         },
+        web_search: obleth_config::WebSearchBoonSettings {
+            enabled: body
+                .web_search_enabled
+                .unwrap_or(existing.web_search.enabled),
+            search_tool,
+            tool_description: search_tool_description,
+            max_results: body
+                .web_search_max_results
+                .filter(|n| *n > 0)
+                .map(|n| n.min(obleth_config::WEB_SEARCH_MAX_RESULTS))
+                .unwrap_or(existing.web_search.max_results),
+            max_searches_per_request: body
+                .web_search_max_searches_per_request
+                .filter(|n| *n > 0)
+                .map(|n| n.min(obleth_config::WEB_SEARCH_MAX_PER_REQUEST))
+                .unwrap_or(existing.web_search.max_searches_per_request),
+            timeout_ms: body
+                .web_search_timeout_ms
+                .filter(|ms| *ms > 0)
+                .unwrap_or(existing.web_search.timeout_ms),
+        },
     };
 
     // The speculation verifier sends each model's upstream key to this URL, so
@@ -3557,6 +3645,11 @@ async fn put_boon_settings(
                 "speculation_category_gates": settings.speculation.category_gates.len(),
                 "speculation_unlisted_categories_speculate": settings.speculation.unlisted_categories_speculate,
                 "speculation_verify_url_template": settings.speculation.verify_url_template,
+                "web_search_enabled": settings.web_search.enabled,
+                "web_search_tool": settings.web_search.search_tool,
+                "web_search_max_results": settings.web_search.max_results,
+                "web_search_max_searches_per_request": settings.web_search.max_searches_per_request,
+                "web_search_timeout_ms": settings.web_search.timeout_ms,
             }),
         )
         .await?;
@@ -10533,6 +10626,39 @@ mod tests {
         assert_eq!(view.image_generation_max_images_per_request, 3);
         assert_eq!(view.image_generation_timeout_ms, 90_000);
         assert!(!view.image_generation_tool_description.is_empty());
+    }
+
+    #[test]
+    fn boon_view_exposes_web_search_settings() {
+        let s = BoonSettings {
+            web_search: obleth_config::WebSearchBoonSettings {
+                enabled: true,
+                search_tool: Some("web".to_string()),
+                max_results: 7,
+                max_searches_per_request: 2,
+                timeout_ms: 9_000,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let view = BoonSettingsView::from_settings(&s);
+        assert!(view.web_search_enabled);
+        assert_eq!(view.web_search_tool.as_deref(), Some("web"));
+        assert_eq!(view.web_search_max_results, 7);
+        assert_eq!(view.web_search_max_searches_per_request, 2);
+        assert_eq!(view.web_search_timeout_ms, 9_000);
+        assert_eq!(
+            view.web_search_tool_description,
+            obleth_config::DEFAULT_WEB_SEARCH_TOOL_DESCRIPTION
+        );
+        let update: UpdateBoonSettings = serde_json::from_value(serde_json::json!({
+            "web_search_enabled": true,
+            "web_search_tool": "web",
+        }))
+        .unwrap();
+        assert_eq!(update.web_search_enabled, Some(true));
+        assert_eq!(update.web_search_tool.as_deref(), Some("web"));
+        assert_eq!(update.web_search_max_results, None);
     }
 
     #[test]

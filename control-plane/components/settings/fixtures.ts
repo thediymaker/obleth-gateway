@@ -24,6 +24,8 @@ export const boons = (over: Partial<BoonSettingsView> = {}): BoonSettingsView =>
   speculation_draft_chat_template_kwargs: { reasoning: false },
   speculation_category_gates: [{ tag: "coding", speculate: true, agree_min: 0.4, lp_min: -1 }],
   speculation_unlisted_categories_speculate: false, speculation_verify_url_template: null,
+  web_search_enabled: false, web_search_tool: null, web_search_tool_description: "Search.", web_search_max_results: 5,
+  web_search_max_searches_per_request: 3, web_search_timeout_ms: 15000,
   ...over,
 }) as BoonSettingsView;
 

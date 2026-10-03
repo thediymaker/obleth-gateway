@@ -101,6 +101,7 @@ export function BoonsSection({ settings: b, models, knowledge, compressor }: { s
     vision_fallback_model: b.vision_fallback_model ?? "",
     structured_output_fixer_model: b.structured_output_fixer_model ?? "",
     image_generation_model: b.image_generation_model ?? "",
+    web_search_tool: b.web_search_tool ?? "",
     speculation_draft_model: b.speculation_draft_model ?? "",
     speculation_classify_model: b.speculation_classify_model ?? "",
   });
@@ -119,7 +120,7 @@ export function BoonsSection({ settings: b, models, knowledge, compressor }: { s
         blurb={meta.blurb}
         on={on[key]}
         onToggle={(v) => setOn((o) => ({ ...o, [key]: v }))}
-        summary={boonSummary(key, { ...b, ...picks, vision_fallback_model: picks.vision_fallback_model || null, image_generation_model: picks.image_generation_model || null, speculation_draft_model: picks.speculation_draft_model || null, structured_output_fixer_model: picks.structured_output_fixer_model || null, speculation_category_gates: spec.gates })}
+        summary={boonSummary(key, { ...b, ...picks, vision_fallback_model: picks.vision_fallback_model || null, image_generation_model: picks.image_generation_model || null, web_search_tool: picks.web_search_tool || null, speculation_draft_model: picks.speculation_draft_model || null, structured_output_fixer_model: picks.structured_output_fixer_model || null, speculation_category_gates: spec.gates })}
         asking={modelsAsking(key, models)}
         open={open === key}
         onOpen={() => setOpen(open === key ? null : key)}
@@ -177,6 +178,22 @@ export function BoonsSection({ settings: b, models, knowledge, compressor }: { s
         </Setting>
         <Setting label="Tool description" hint="What the chat model is told the drawing tool does." fields={["boons.image_generation_tool_description"]}>
           <TextArea name="boons.image_generation_tool_description" label="Tool description" rows={3} defaultValue={b.image_generation_tool_description} className="font-sans text-[12.5px]" />
+        </Setting>
+      </>)}
+
+      {row("web_search", <>
+        <Setting label="Search tool" hint="The search tool a chat model searches with, one of your Web search models." fields={["boons.web_search_tool"]} was={{ field: "boons.web_search_tool" }}>
+          <div className="w-72"><SelectField name="boons.web_search_tool" label="Search tool" value={picks.web_search_tool} onChange={pick("web_search_tool")} options={modelOptions(models, (m) => m.model_type === "search", "None", b.web_search_tool)} /></div>
+        </Setting>
+        <Setting label="Limits" hint="Results the model reads from each search (up to 10), searches one request may run (up to 8), and how long one search may take." fields={["boons.web_search_max_results", "boons.web_search_max_searches_per_request", "boons.web_search_timeout_ms"]}>
+          <div className="flex flex-wrap gap-3">
+            <NumberField name="web_search_max_results" label="Results per search" value={b.web_search_max_results} unit="results" className="w-20" />
+            <NumberField name="web_search_max_searches_per_request" label="Searches per request" value={b.web_search_max_searches_per_request} unit="searches" className="w-20" />
+            <NumberField name="web_search_timeout_ms" label="Search timeout" value={b.web_search_timeout_ms} unit="ms" />
+          </div>
+        </Setting>
+        <Setting label="Tool description" hint="What the chat model is told the search tool is for, and when not to use it. Blank puts back the default." fields={["boons.web_search_tool_description"]}>
+          <TextArea name="boons.web_search_tool_description" label="Tool description" rows={3} defaultValue={b.web_search_tool_description} className="font-sans text-[12.5px]" />
         </Setting>
       </>)}
 

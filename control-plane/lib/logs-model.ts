@@ -254,6 +254,7 @@ const HELPER_PURPOSES: Record<string, string> = {
   guardrails_boon: "guardrails scan",
   tool_loop: "tool loop turn",
   image_generation_boon: "image generation",
+  web_search_boon: "web search",
 };
 
 /** What a helper call was for, in a few words; any other type as recorded. */

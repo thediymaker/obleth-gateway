@@ -1496,6 +1496,8 @@ pub fn parse_tag_level(raw: &str) -> Option<(String, u8)> {
 /// `speculation` answers with a fast drafter model when the target model itself
 /// verifies the draft (one cheap prefill scores every draft token via
 /// prompt_logprobs); unverified drafts escalate to the target model.
+/// `web_search` injects a gateway-executed `web_search` tool so a chat model can
+/// look things up through a registered `search` route.
 /// Operators opt each model into a subset of these; nothing is granted by default.
 pub const MODEL_BOONS: &[&str] = &[
     "vision",
@@ -1504,6 +1506,7 @@ pub const MODEL_BOONS: &[&str] = &[
     "knowledge",
     "image_generation",
     "speculation",
+    "web_search",
 ];
 
 /// True when `boon` is part of the fixed [`MODEL_BOONS`] vocabulary.
@@ -2242,6 +2245,10 @@ pub struct BoonSettings {
     /// model verifies the draft; escalate to the target otherwise.
     #[serde(default)]
     pub speculation: SpeculationBoonSettings,
+    /// The web-search boon: inject a gateway-executed `web_search` tool so a
+    /// chat model can search the web through a registered `search` route.
+    #[serde(default)]
+    pub web_search: WebSearchBoonSettings,
 }
 
 /// Configuration for the vision boon (image-to-text relay).
@@ -2370,6 +2377,93 @@ impl ImageGenerationBoonSettings {
         self.enabled
             && self
                 .image_model
+                .as_ref()
+                .is_some_and(|m| !m.trim().is_empty())
+    }
+}
+
+/// Default description the model reads when deciding whether to call
+/// `web_search`. It says when NOT to search as plainly as when to: a model told
+/// only that it can search tends to search for everything, which costs a round
+/// trip on answers it already knew.
+pub const DEFAULT_WEB_SEARCH_TOOL_DESCRIPTION: &str =
+    "Search the web. Call this when the answer depends on current or external information \
+     you are not sure of: recent events, prices, schedules, software versions, documentation, \
+     or anything that may have changed since your training. Write a short search-engine \
+     query. Answer directly, without searching, when you already know the answer. Cite the \
+     URLs of the results you rely on.";
+
+/// Hard ceiling on searches one request may run, regardless of what an
+/// operator configures (latency and upstream-load guard).
+pub const WEB_SEARCH_MAX_PER_REQUEST: u32 = 8;
+
+/// Hard ceiling on results handed to the model per search (context guard).
+pub const WEB_SEARCH_MAX_RESULTS: u32 = 10;
+
+fn default_web_search_tool_description() -> String {
+    DEFAULT_WEB_SEARCH_TOOL_DESCRIPTION.to_string()
+}
+
+fn default_web_search_max_results() -> u32 {
+    5
+}
+
+fn default_web_search_max_per_request() -> u32 {
+    3
+}
+
+fn default_web_search_timeout_ms() -> u64 {
+    15_000
+}
+
+/// Configuration for the web-search boon (gateway-executed `web_search` tool
+/// backed by a registered `search`-type route).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WebSearchBoonSettings {
+    /// Master switch. When false, no tool is injected and requests pass through
+    /// unchanged.
+    #[serde(default)]
+    pub enabled: bool,
+    /// `model_name` of the registered `search`-type route that runs the
+    /// searches. `None` disables the boon regardless of `enabled`.
+    #[serde(default)]
+    pub search_tool: Option<String>,
+    /// Tool description the model reads when deciding to call the tool.
+    #[serde(default = "default_web_search_tool_description")]
+    pub tool_description: String,
+    /// Results handed to the model per search, clamped to
+    /// [`WEB_SEARCH_MAX_RESULTS`].
+    #[serde(default = "default_web_search_max_results")]
+    pub max_results: u32,
+    /// Searches one request may run across all of its tool turns, clamped to
+    /// [`WEB_SEARCH_MAX_PER_REQUEST`].
+    #[serde(default = "default_web_search_max_per_request")]
+    pub max_searches_per_request: u32,
+    /// Hard timeout for one search, in milliseconds. On timeout the model is
+    /// told the search failed and answers from what it knows.
+    #[serde(default = "default_web_search_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl Default for WebSearchBoonSettings {
+    fn default() -> Self {
+        WebSearchBoonSettings {
+            enabled: false,
+            search_tool: None,
+            tool_description: default_web_search_tool_description(),
+            max_results: default_web_search_max_results(),
+            max_searches_per_request: default_web_search_max_per_request(),
+            timeout_ms: default_web_search_timeout_ms(),
+        }
+    }
+}
+
+impl WebSearchBoonSettings {
+    /// True when the boon is enabled and points at a search route.
+    pub fn active(&self) -> bool {
+        self.enabled
+            && self
+                .search_tool
                 .as_ref()
                 .is_some_and(|m| !m.trim().is_empty())
     }
@@ -3946,6 +4040,63 @@ mod tests {
         assert!(parsed.vision.enabled);
         assert!(!parsed.image_generation.enabled);
         assert_eq!(parsed.image_generation.max_images_per_request, 2);
+    }
+
+    #[test]
+    fn web_search_boon_is_in_the_vocabulary() {
+        assert!(is_valid_boon("web_search"));
+        assert_eq!(
+            normalize_boons(["Web_Search", "web_search", "vision"]),
+            vec!["web_search".to_string(), "vision".to_string()]
+        );
+    }
+
+    #[test]
+    fn web_search_defaults_are_off_and_bounded() {
+        let s = WebSearchBoonSettings::default();
+        assert!(!s.enabled);
+        assert!(s.search_tool.is_none());
+        assert_eq!(s.max_results, 5);
+        assert_eq!(s.max_searches_per_request, 3);
+        assert_eq!(s.timeout_ms, 15_000);
+        assert!(s.max_results <= WEB_SEARCH_MAX_RESULTS);
+        assert!(s.max_searches_per_request <= WEB_SEARCH_MAX_PER_REQUEST);
+        assert!(!s.tool_description.trim().is_empty());
+        assert!(!s.active());
+    }
+
+    #[test]
+    fn web_search_active_requires_enabled_and_a_search_tool() {
+        let enabled_only = WebSearchBoonSettings {
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(!enabled_only.active());
+        let blank = WebSearchBoonSettings {
+            enabled: true,
+            search_tool: Some("  ".to_string()),
+            ..Default::default()
+        };
+        assert!(!blank.active());
+        let tool_only = WebSearchBoonSettings {
+            search_tool: Some("web".to_string()),
+            ..Default::default()
+        };
+        assert!(!tool_only.active());
+        let on = WebSearchBoonSettings {
+            enabled: true,
+            search_tool: Some("web".to_string()),
+            ..Default::default()
+        };
+        assert!(on.active());
+    }
+
+    #[test]
+    fn a_boons_row_without_web_search_parses_to_the_default() {
+        let older = serde_json::json!({ "image_generation": { "enabled": true } });
+        let parsed: BoonSettings = serde_json::from_value(older).expect("older row parses");
+        assert!(parsed.image_generation.enabled);
+        assert_eq!(parsed.web_search, WebSearchBoonSettings::default());
     }
 
     #[test]

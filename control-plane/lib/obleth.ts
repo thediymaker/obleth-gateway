@@ -1444,6 +1444,12 @@ export interface BoonSettingsView {
   speculation_category_gates: SpeculationCategoryGate[];
   speculation_unlisted_categories_speculate: boolean;
   speculation_verify_url_template: string;
+  web_search_enabled: boolean;
+  web_search_tool: string | null;
+  web_search_tool_description: string;
+  web_search_max_results: number;
+  web_search_max_searches_per_request: number;
+  web_search_timeout_ms: number;
 }
 
 // One per-category gate of the speculation boon. Missing thresholds fall back
@@ -1507,6 +1513,12 @@ export interface UpdateBoonSettings {
   speculation_category_gates?: SpeculationCategoryGate[];
   speculation_unlisted_categories_speculate?: boolean;
   speculation_verify_url_template?: string;
+  web_search_enabled?: boolean;
+  web_search_tool?: string | null;
+  web_search_tool_description?: string;
+  web_search_max_results?: number;
+  web_search_max_searches_per_request?: number;
+  web_search_timeout_ms?: number;
 }
 
 // Live status of the optional neural compression sidecar (a health probe of

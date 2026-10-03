@@ -50,6 +50,12 @@ export const MODEL_BOONS = [
       "Add a generate_image tool this model can call to produce pictures through the image model configured in Settings → Boons. The gateway runs the generation and attaches the result to the reply; the image is billed per image against the caller's tenant. Requires the Function calling capability — without it no tool is injected and the model will say it cannot draw.",
   },
   {
+    value: "web_search",
+    label: "Web search",
+    description:
+      "Add a web_search tool this model can call to look things up through the search tool configured in Settings → Boons. The gateway runs the search and hands the results back to the model, which answers citing the URLs it used. Each search is logged under the request that made it. Requires the Function calling capability — without it no tool is injected. A client that brings its own web_search tool keeps it.",
+  },
+  {
     value: "speculation",
     label: "Speculation",
     description:

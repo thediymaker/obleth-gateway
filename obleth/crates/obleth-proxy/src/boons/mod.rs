@@ -16,6 +16,9 @@
 //!   whenever the target model itself verifies the draft (one prompt_logprobs
 //!   prefill scores every draft token); unverified drafts fall through to the
 //!   target. Runs pre-dispatch in the proxy, not through [`ResponsePlan`].
+//! - **web_search** ([`web_search`]): injects a gateway-executed `web_search`
+//!   tool so a chat model can search the web through a registered `search`
+//!   route. Results come back to the model as a tool result it cites from.
 //!
 //! Vision rewrites only the request. Structured output additionally rewrites the
 //! **response**: when it arms a [`ResponsePlan`], the proxy forces a
@@ -51,6 +54,7 @@ pub mod structured;
 pub mod tool_loop;
 pub mod tool_stream;
 mod vision;
+pub(crate) mod web_search;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -170,6 +174,19 @@ fn image_gen_eligible(
         && route.supports_function_calling
 }
 
+/// The web-search boon is eligible when the model was granted it, the boon is
+/// globally active (enabled with a search route configured), and the model can
+/// actually call functions. As with image generation, the operator's grant is
+/// the opt-in.
+fn web_search_eligible(
+    route: &obleth_config::ResolvedModel,
+    settings: &obleth_config::BoonSettings,
+) -> bool {
+    route.boons.iter().any(|b| b == "web_search")
+        && settings.web_search.active()
+        && route.supports_function_calling
+}
+
 /// The speculation boon is eligible when the model was granted it, the boon is
 /// globally active (enabled with a drafter and a verifier configured), the key
 /// is not an internal probe (probes must measure the target model itself), and
@@ -199,26 +216,32 @@ fn speculation_eligible(
 
 /// Whether a response plan leaves room for the speculation boon.
 ///
-/// `None` always does. A plan built only by the image-generation boon does
-/// too: that boon arms the tool loop on every request to a model granted it,
-/// so treating its presence as "something else owns the response" is what made
-/// the two boons silently exclusive. Speculation abstains by falling through,
-/// so the tool loop still answers whenever the cascade declines.
+/// `None` always does. A plan built only by the gateway-tool boons (image
+/// generation, web search) does too: those boons arm the tool loop on every
+/// request to a model granted them, so treating their presence as "something
+/// else owns the response" is what made them silently exclusive with
+/// speculation. Speculation abstains by falling through, so the tool loop
+/// still answers whenever the cascade declines.
 ///
 /// Nothing else yields. Structured output and output guardrails must see the
-/// target's own answer, and a real MCP tool loop — more than the one synthetic
-/// image entry, or a client passing its own tools through — is the model
-/// actually being given tools to use.
-fn plan_yields_to_speculation(plan: Option<&ResponsePlan>, image_tool_pending: bool) -> bool {
+/// target's own answer, and a real MCP tool loop — any granted server's tool,
+/// or a client passing its own tools through — is the model actually being
+/// given tools to use.
+fn plan_yields_to_speculation(plan: Option<&ResponsePlan>, gateway_tool_pending: bool) -> bool {
     let Some(plan) = plan else {
         return true;
     };
-    if plan.structured.is_some() || plan.guardrails.is_some() || !image_tool_pending {
+    if plan.structured.is_some() || plan.guardrails.is_some() || !gateway_tool_pending {
         return false;
     }
-    plan.tool_loop
-        .as_ref()
-        .is_some_and(|t| t.tool_servers.len() == 1 && !t.passthrough_unmapped)
+    plan.tool_loop.as_ref().is_some_and(|t| {
+        !t.passthrough_unmapped
+            && !t.tool_servers.is_empty()
+            && t.tool_servers.values().all(|server| {
+                server == image_gen::IMAGE_SYNTHETIC_SERVER
+                    || server == web_search::SEARCH_SYNTHETIC_SERVER
+            })
+    })
 }
 
 /// Per-request boon control header (comma-separated tokens), also echoed on
@@ -640,6 +663,10 @@ impl BoonEngine {
             }
         }
 
+        // Whether the MCP tool loop injected (and nudged about) granted tools.
+        // Read before the gateway-tool boons below add their own entries.
+        let mcp_tools_injected = tool_loop_servers.is_some();
+
         // ---- image-generation boon ----
         // Injects a gateway-executed `generate_image` tool and arms the tool
         // loop by inserting its own synthetic-server entry. Deliberately
@@ -695,6 +722,51 @@ impl BoonEngine {
                 model = %route.model_name,
                 "model is granted the image_generation boon but is not flagged \
                  supports_function_calling; no generate_image tool will be injected. \
+                 Enable function calling on this model to use the boon."
+            );
+        }
+
+        // ---- web-search boon ----
+        // Same shape as the image-generation boon above: a gateway-executed
+        // `web_search` tool, armed through its own synthetic-server entry and
+        // independent of the MCP tool loop's global switch. A client's own
+        // `web_search` or a granted MCP server's wins (see
+        // `web_search::collides`).
+        let mut web_search_cfg: Option<obleth_config::WebSearchBoonSettings> = None;
+        if web_search_eligible(route, &settings) {
+            if web_search::collides(json, tool_loop_servers.as_ref()) {
+                tracing::debug!(
+                    tool = %web_search::WEB_SEARCH_TOOL,
+                    model = %route.model_name,
+                    "web_search is owned by a client-supplied tool or a granted MCP tool; \
+                     existing tool wins, web-search boon inactive for this request"
+                );
+            } else {
+                // The image boon's nudge is about drawing, so it does not stand
+                // in for this one; only the MCP loop's generic tools nudge or a
+                // client steering its own tools does.
+                let nudge = !client_sent_tools && !mcp_tools_injected;
+                web_search::inject(
+                    &settings.web_search,
+                    nudge,
+                    route.supports_system_messages,
+                    json,
+                );
+                tool_loop_servers
+                    .get_or_insert_with(std::collections::HashMap::new)
+                    .insert(
+                        web_search::WEB_SEARCH_TOOL.to_string(),
+                        web_search::SEARCH_SYNTHETIC_SERVER.to_string(),
+                    );
+                web_search_cfg = Some(settings.web_search.clone());
+                outcome.rewritten = true;
+                outcome.applied.push("web_search");
+            }
+        } else if route.boons.iter().any(|b| b == "web_search") && settings.web_search.active() {
+            tracing::warn!(
+                model = %route.model_name,
+                "model is granted the web_search boon but is not flagged \
+                 supports_function_calling; no web_search tool will be injected. \
                  Enable function calling on this model to use the boon."
             );
         }
@@ -923,6 +995,7 @@ impl BoonEngine {
                 settings: settings.tool_loop.clone(),
                 passthrough_unmapped: client_sent_tools,
                 image_gen: image_gen_cfg.clone(),
+                web_search: web_search_cfg.clone(),
                 served_url: None,
             }
         });
@@ -959,9 +1032,10 @@ impl BoonEngine {
         // decision is per request rather than per model — the classifier that
         // already gates speculation by category decides, and an unclassified
         // request abstains so the picture is never the thing that goes
-        // missing. See `SpeculationPlan::image_tool_pending`.
-        let image_tool_pending = image_gen_cfg.is_some();
-        if plan_yields_to_speculation(outcome.response_plan.as_ref(), image_tool_pending)
+        // missing. The web-search boon is the same case: a search the cascade
+        // cannot make. See `SpeculationPlan::gateway_tool_pending`.
+        let gateway_tool_pending = image_gen_cfg.is_some() || web_search_cfg.is_some();
+        if plan_yields_to_speculation(outcome.response_plan.as_ref(), gateway_tool_pending)
             && speculation_eligible(route, &settings, key)
         {
             if let Some(messages) = speculation::eligible_messages(json) {
@@ -972,7 +1046,7 @@ impl BoonEngine {
                     settings: settings.speculation.clone(),
                     client_stream,
                     include_usage,
-                    image_tool_pending,
+                    gateway_tool_pending,
                 });
             }
         }
@@ -1291,6 +1365,42 @@ pub(crate) fn bill_image_generation(
     ));
 }
 
+/// Record one search the web-search boon ran for a chat request. A search
+/// carries no tokens and, like `POST /v1/search`, no price; the row exists so
+/// the request's searches show up under it (`parent_request_id`) and in the
+/// search tool's own usage, failures included (`status_code`, `total_ms`).
+/// Synthetic tenants are relabelled `benchmark` and internal probe keys are
+/// unrecorded, exactly as for the other helpers.
+pub(crate) fn bill_web_search(
+    state: &AppState,
+    search_tool: &ResolvedModel,
+    key: &ResolvedKey,
+    session_id: &str,
+    parent_request_id: Uuid,
+    status_code: u16,
+    total_ms: u32,
+) {
+    let request_type = helper_request_type(key, "web_search_boon");
+
+    state.metrics.record_request("boon", status_code, 0, 0);
+    if key.internal {
+        return;
+    }
+    let mut record = helper_usage_record(
+        search_tool,
+        key,
+        session_id,
+        parent_request_id,
+        request_type,
+        0,
+        0,
+        0.0,
+    );
+    record.status_code = status_code;
+    record.total_ms = total_ms;
+    state.telemetry.record(record);
+}
+
 /// The term-budget counters one helper call must be added to: `(counter id,
 /// period key)` for the tenant and for the key, each present only when that
 /// scope has a cumulative cap. Period keys come from the same functions the
@@ -1488,6 +1598,7 @@ mod tests {
             settings: obleth_config::ToolLoopSettings::default(),
             passthrough_unmapped: false,
             image_gen: None,
+            web_search: None,
             served_url: None,
         }
     }
@@ -1540,6 +1651,79 @@ mod tests {
 
         // A plan with no tool loop at all is structured output or guardrails.
         assert!(!plan_yields_to_speculation(Some(&plan_with(None)), true));
+
+        // Web search alongside a real MCP tool is still a real tool loop.
+        let mut mixed = image_only_loop();
+        mixed.tool_servers.insert(
+            web_search::WEB_SEARCH_TOOL.to_string(),
+            web_search::SEARCH_SYNTHETIC_SERVER.to_string(),
+        );
+        mixed
+            .tool_servers
+            .insert("fetch".to_string(), "mcp-fetch".to_string());
+        assert!(!plan_yields_to_speculation(
+            Some(&plan_with(Some(mixed))),
+            true
+        ));
+    }
+
+    #[test]
+    fn gateway_tool_boons_together_leave_room_for_speculation() {
+        // Image generation plus web search: both gateway-executed, both
+        // abstained around by the cascade, so neither disables speculation.
+        let mut both = image_only_loop();
+        both.tool_servers.insert(
+            web_search::WEB_SEARCH_TOOL.to_string(),
+            web_search::SEARCH_SYNTHETIC_SERVER.to_string(),
+        );
+        assert!(plan_yields_to_speculation(
+            Some(&plan_with(Some(both))),
+            true
+        ));
+
+        let mut search_only = image_only_loop();
+        search_only.tool_servers.clear();
+        search_only.tool_servers.insert(
+            web_search::WEB_SEARCH_TOOL.to_string(),
+            web_search::SEARCH_SYNTHETIC_SERVER.to_string(),
+        );
+        assert!(plan_yields_to_speculation(
+            Some(&plan_with(Some(search_only))),
+            true
+        ));
+    }
+
+    #[test]
+    fn web_search_eligible_requires_grant_active_and_function_calling() {
+        let mut settings = obleth_config::BoonSettings {
+            web_search: obleth_config::WebSearchBoonSettings {
+                enabled: true,
+                search_tool: Some("web".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut route = crate::boons::tests::endpoint_only_route("http://unused/v1");
+        route.supports_function_calling = true;
+        route.boons = vec!["web_search".to_string()];
+        assert!(web_search_eligible(&route, &settings));
+
+        route.boons = vec!["image_generation".to_string()];
+        assert!(!web_search_eligible(&route, &settings), "not granted");
+        route.boons = vec!["web_search".to_string()];
+
+        route.supports_function_calling = false;
+        assert!(
+            !web_search_eligible(&route, &settings),
+            "no function calling"
+        );
+        route.supports_function_calling = true;
+
+        settings.web_search.enabled = false;
+        assert!(!web_search_eligible(&route, &settings), "globally off");
+        settings.web_search.enabled = true;
+        settings.web_search.search_tool = None;
+        assert!(!web_search_eligible(&route, &settings), "no search route");
     }
 
     #[test]
@@ -1626,6 +1810,7 @@ mod tests {
         for f in [
             "pub(crate) fn bill_helper_call(",
             "pub(crate) fn bill_image_generation(",
+            "pub(crate) fn bill_web_search(",
         ] {
             let start = src.find(f).expect(f);
             let end = start + src[start..].find("\n}\n").expect("end of fn");
