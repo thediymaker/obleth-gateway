@@ -389,6 +389,12 @@ pub struct ModelRoute {
     /// `model_name` is advertised by the discovery endpoints.
     #[serde(default)]
     pub aliases: Vec<String>,
+    /// Opt-in names for this same route with extra boons on (see
+    /// [`ModelVariant`]). Unlike an alias, a variant changes what the request
+    /// gets, so it is listed by the discovery endpoints. `#[serde(default)]`
+    /// keeps payloads written before variants existed readable as "none".
+    #[serde(default)]
+    pub variants: Vec<ModelVariant>,
     /// Human-facing summary for operators and dashboards.
     pub description: String,
     /// Value sent to the upstream in the `model` field.
@@ -560,6 +566,18 @@ pub struct ModelRoute {
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
+
+impl ModelRoute {
+    /// Every client-facing name this route answers to: `model_name`, its
+    /// aliases, then its variants. The same set
+    /// [`ResolvedModel::addressable_names`] publishes as resolver keys.
+    pub fn addressable_names(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.model_name.as_str())
+            .chain(self.aliases.iter().map(String::as_str))
+            .chain(self.variants.iter().map(|v| v.name.as_str()))
+    }
+}
+
 /// Persisted model-health status. Stored as snake_case text in Postgres so new
 /// UI/API readers can remain forward-compatible with older rows.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -615,6 +633,13 @@ pub struct ResolvedModel {
     /// payloads deserializable as "no aliases".
     #[serde(default)]
     pub aliases: Vec<String>,
+    /// Extra names that resolve to this route with more boons on (see
+    /// [`ModelVariant`]). Each is published as its own resolver key pointing
+    /// at this same route; the proxy adds the variant's boons per request
+    /// ([`ResolvedModel::with_variant`]). `#[serde(default)]` keeps older
+    /// cached payloads deserializable as "no variants".
+    #[serde(default)]
+    pub variants: Vec<ModelVariant>,
     pub upstream_model: String,
     pub api_base: String,
     pub api_key: Option<String>,
@@ -765,11 +790,35 @@ pub struct ResolvedModel {
 
 impl ResolvedModel {
     /// Every client-facing name that must resolve to this route: the canonical
-    /// `model_name` first, then each alias. This is the set of resolver keys a
-    /// warm-up or a cache invalidation has to cover, so publishing and eviction
-    /// stay in step with whatever aliases the model currently declares.
+    /// `model_name` first, then each alias, then each variant. This is the set
+    /// of resolver keys a warm-up or a cache invalidation has to cover, so
+    /// publishing and eviction stay in step with whatever names the model
+    /// currently declares.
     pub fn addressable_names(&self) -> impl Iterator<Item = &str> {
-        std::iter::once(self.model_name.as_str()).chain(self.aliases.iter().map(String::as_str))
+        std::iter::once(self.model_name.as_str())
+            .chain(self.aliases.iter().map(String::as_str))
+            .chain(self.variants.iter().map(|v| v.name.as_str()))
+    }
+
+    /// The variant of this route called `name`, if there is one. Exact,
+    /// case-sensitive match, like every other model name.
+    pub fn variant(&self, name: &str) -> Option<&ModelVariant> {
+        self.variants.iter().find(|v| v.name == name)
+    }
+
+    /// This route as served through its variant `name`: identical in every
+    /// field except `boons`, which gains the variant's boons after the model's
+    /// own. `None` when `name` is not one of this route's variants.
+    ///
+    /// Everything that identifies the backend stays the parent's on purpose —
+    /// `model_name`, the upstream, endpoints, prices and every capacity field
+    /// — so the admission pool, fairshare, discovered capacity and the usage
+    /// ledger all see one model, never two pools for one backend.
+    pub fn with_variant(&self, name: &str) -> Option<ResolvedModel> {
+        let variant = self.variant(name)?;
+        let mut served = self.clone();
+        served.boons = union_boons(&self.boons, &variant.boons);
+        Some(served)
     }
 }
 
@@ -1085,6 +1134,18 @@ pub struct UsageRecord {
     /// replayable.
     #[serde(default)]
     pub end_user: String,
+    /// On a helper-call row (a boon's call to another model: a speculation
+    /// draft, an image description, ...), the `request_id` of the client
+    /// request it served; nil on every other row. `#[serde(default)]` keeps
+    /// older WAL records replayable as "none".
+    #[serde(default)]
+    pub parent_request_id: Uuid,
+    /// The variant name the client asked for when it called the model through
+    /// one ([`ModelVariant`]); empty otherwise. `model` stays the parent
+    /// model's name either way, so per-model reports and pools are unchanged.
+    /// `#[serde(default)]` keeps older WAL records replayable.
+    #[serde(default)]
+    pub model_variant: String,
 }
 
 /// Runtime-configurable retention for the raw per-request `usage` ledger.
@@ -1730,6 +1791,75 @@ where
         }
         if !out.contains(&a) {
             out.push(a);
+        }
+    }
+    out
+}
+
+/// Maximum variants one model may declare. Bounded for the same reason as
+/// aliases: every variant is its own resolver key and discovery entry.
+pub const MAX_MODEL_VARIANTS: usize = 8;
+
+/// A separately named, opt-in way to call a model: the same route (same
+/// backend, capacity, pool and prices) with extra boons turned on, e.g.
+/// `glm-5-3-spec` = `glm-5-3` plus the `speculation` boon.
+///
+/// Exists because boons are otherwise per model: an operator who wants a boon
+/// that changes who writes the answer (speculation) would have to turn it on
+/// for everyone who calls the model. A variant lets callers opt in by name
+/// while the plain name keeps serving the model's own output.
+///
+/// `boons` are added to the model's own — never removed — so a variant always
+/// means "the model, plus these".
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+pub struct ModelVariant {
+    /// The name clients pass in `model`. Unique across every model's name,
+    /// aliases and variants; exact, case-sensitive match.
+    pub name: String,
+    /// What a caller gets from this name, shown in the model listing.
+    #[serde(default)]
+    pub description: String,
+    /// Boons from [`MODEL_BOONS`] turned on in addition to the model's own.
+    #[serde(default)]
+    pub boons: Vec<String>,
+}
+
+/// Normalize a variant list to the canonical storage form, mirroring
+/// [`normalize_aliases`]: names and descriptions trimmed, blank names dropped,
+/// duplicate names dropped (first wins), boons normalized with
+/// [`normalize_boons`], and the list capped at [`MAX_MODEL_VARIANTS`]. The
+/// Management API rejects these cases with an error before they get here;
+/// this is the storage-side backstop for every other write path.
+pub fn normalize_variants<'a, I>(variants: I) -> Vec<ModelVariant>
+where
+    I: IntoIterator<Item = &'a ModelVariant>,
+{
+    let mut out: Vec<ModelVariant> = Vec::new();
+    for v in variants {
+        let name = v.name.trim();
+        if name.is_empty() || out.len() >= MAX_MODEL_VARIANTS {
+            continue;
+        }
+        if out.iter().any(|o| o.name == name) {
+            continue;
+        }
+        out.push(ModelVariant {
+            name: name.to_string(),
+            description: v.description.trim().to_string(),
+            boons: normalize_boons(&v.boons),
+        });
+    }
+    out
+}
+
+/// `base` followed by every boon of `extra` not already in it: the boons a
+/// variant request runs with. Order-stable and de-duplicated, so the model's
+/// own boons keep their order and a variant that repeats one adds nothing.
+pub fn union_boons(base: &[String], extra: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(base.len() + extra.len());
+    for b in base.iter().chain(extra) {
+        if !out.contains(b) {
+            out.push(b.clone());
         }
     }
     out
@@ -3060,6 +3190,10 @@ pub struct ModelBackup {
     /// aliases existed restore as a model with none.
     #[serde(default)]
     pub aliases: Vec<String>,
+    /// Opt-in names with extra boons on. Defaulted so backups taken before
+    /// variants existed restore as a model with none.
+    #[serde(default)]
+    pub variants: Vec<ModelVariant>,
     #[serde(default)]
     pub description: String,
     pub upstream_model: String,
@@ -3940,9 +4074,135 @@ mod tests {
 
     #[test]
     fn addressable_names_lists_the_canonical_name_first() {
-        let mut model = ResolvedModel {
+        let mut model = resolved_fixture();
+        assert_eq!(
+            model.addressable_names().collect::<Vec<_>>(),
+            vec!["glm-5-3", "glm-5-3-fp8", "glm-5-3-mxfp4"]
+        );
+        // A model with no aliases is still addressable by its own name, so a
+        // publish loop over this iterator is never a no-op.
+        model.aliases.clear();
+        assert_eq!(
+            model.addressable_names().collect::<Vec<_>>(),
+            vec!["glm-5-3"]
+        );
+        // Variants are resolver keys too, after the aliases.
+        model.variants = vec![variant("glm-5-3-spec", &["speculation"])];
+        assert_eq!(
+            model.addressable_names().collect::<Vec<_>>(),
+            vec!["glm-5-3", "glm-5-3-spec"]
+        );
+    }
+
+    fn variant(name: &str, boons: &[&str]) -> ModelVariant {
+        ModelVariant {
+            name: name.into(),
+            description: String::new(),
+            boons: boons.iter().map(|b| b.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn normalize_variants_trims_dedupes_caps_and_drops_unknown_boons() {
+        let raw = vec![
+            ModelVariant {
+                name: "  glm-5-3-spec ".into(),
+                description: " drafted, then verified ".into(),
+                boons: vec![
+                    "Speculation".into(),
+                    "teleportation".into(),
+                    "speculation".into(),
+                ],
+            },
+            variant("", &["vision"]),
+            variant("glm-5-3-spec", &["vision"]),
+            // Case is significant, as for every other model name.
+            variant("GLM-5-3-spec", &[]),
+        ];
+        assert_eq!(
+            normalize_variants(&raw),
+            vec![
+                ModelVariant {
+                    name: "glm-5-3-spec".into(),
+                    description: "drafted, then verified".into(),
+                    boons: vec!["speculation".into()],
+                },
+                variant("GLM-5-3-spec", &[]),
+            ]
+        );
+        let many: Vec<ModelVariant> = (0..MAX_MODEL_VARIANTS + 3)
+            .map(|i| variant(&format!("v{i}"), &[]))
+            .collect();
+        assert_eq!(normalize_variants(&many).len(), MAX_MODEL_VARIANTS);
+    }
+
+    #[test]
+    fn union_boons_keeps_the_model_order_and_adds_only_new_ones() {
+        let own = vec!["vision".to_string(), "compression".to_string()];
+        assert_eq!(
+            union_boons(&own, &["speculation".into(), "vision".into()]),
+            vec!["vision", "compression", "speculation"]
+        );
+        // A variant that adds nothing is allowed, and changes nothing.
+        assert_eq!(union_boons(&own, &["compression".into()]), own);
+        assert_eq!(union_boons(&[], &[]), Vec::<String>::new());
+    }
+
+    #[test]
+    fn with_variant_adds_boons_and_keeps_everything_capacity_related() {
+        let mut parent = resolved_fixture();
+        parent.boons = vec!["vision".into()];
+        parent.max_in_flight = Some(12);
+        parent.capacity_mode = "discovered".into();
+        parent.per_replica_max_in_flight = Some(4);
+        parent.input_cost_per_token = 0.000_001;
+        parent.variants = vec![variant("glm-5-3-spec", &["speculation", "vision"])];
+
+        let served = parent.with_variant("glm-5-3-spec").expect("a variant");
+        assert_eq!(served.boons, vec!["vision", "speculation"]);
+        // Every other field is the parent's: the pool key (`model_name`), the
+        // backend, the prices and the capacity all stay one model's.
+        let mut same = served.clone();
+        same.boons = parent.boons.clone();
+        assert_eq!(same, parent);
+        assert_eq!(served.model_name, "glm-5-3");
+
+        // Exact names only: the parent's own name and an alias are not variants.
+        assert!(parent.with_variant("glm-5-3").is_none());
+        assert!(parent.with_variant("glm-5-3-fp8").is_none());
+        assert!(parent.with_variant("GLM-5-3-SPEC").is_none());
+    }
+
+    #[test]
+    fn payloads_written_before_variants_still_deserialize() {
+        // A Redis-cached route from an older build.
+        let mut cached = serde_json::to_value(resolved_fixture()).unwrap();
+        cached.as_object_mut().unwrap().remove("variants");
+        let route: ResolvedModel = serde_json::from_value(cached).unwrap();
+        assert!(route.variants.is_empty());
+
+        // A variant written with only a name.
+        let v: ModelVariant = serde_json::from_str(r#"{"name":"m-spec"}"#).unwrap();
+        assert_eq!(v, variant("m-spec", &[]));
+
+        // A usage record replayed from an older WAL.
+        let rec: UsageRecord = serde_json::from_value(serde_json::json!({
+            "request_id": Uuid::nil(), "tenant_id": Uuid::nil(), "key_id": Uuid::nil(),
+            "model": "m", "admission": "fast", "weight": 1,
+            "input_tokens": 1, "output_tokens": 1, "estimated_tokens": 2,
+            "queue_wait_ms": 0, "ttft_ms": 0, "total_ms": 0, "status_code": 200,
+            "cache_status": "off", "ts_ms": 0,
+        }))
+        .unwrap();
+        assert!(rec.parent_request_id.is_nil());
+        assert_eq!(rec.model_variant, "");
+    }
+
+    fn resolved_fixture() -> ResolvedModel {
+        ResolvedModel {
             model_name: "glm-5-3".into(),
             aliases: vec!["glm-5-3-fp8".into(), "glm-5-3-mxfp4".into()],
+            variants: Vec::new(),
             upstream_model: "glm-5-3-mxfp4".into(),
             api_base: "http://upstream/v1".into(),
             api_key: None,
@@ -3989,18 +4249,7 @@ mod tests {
             verify_api_base: String::new(),
             verify_upstream_model: String::new(),
             endpoints: Vec::new(),
-        };
-        assert_eq!(
-            model.addressable_names().collect::<Vec<_>>(),
-            vec!["glm-5-3", "glm-5-3-fp8", "glm-5-3-mxfp4"]
-        );
-        // A model with no aliases is still addressable by its own name, so a
-        // publish loop over this iterator is never a no-op.
-        model.aliases.clear();
-        assert_eq!(
-            model.addressable_names().collect::<Vec<_>>(),
-            vec!["glm-5-3"]
-        );
+        }
     }
 
     #[test]

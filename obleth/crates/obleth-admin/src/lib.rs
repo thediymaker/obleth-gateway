@@ -916,6 +916,11 @@ pub struct CreateModel {
     /// clients. Each must be unused by any other model's name or aliases.
     #[serde(default)]
     pub aliases: Option<Vec<String>>,
+    /// Opt-in names for this same model with extra boons on, e.g.
+    /// `glm-5-3-spec` with `speculation`. Each name must be unused by any
+    /// model's name, alias or variant; at most 8.
+    #[serde(default)]
+    pub variants: Option<Vec<ModelVariantWrite>>,
     pub upstream_model: String,
     pub api_base: String,
     pub api_key: Option<String>,
@@ -1017,6 +1022,21 @@ pub struct CreateModel {
     pub enabled: Option<bool>,
 }
 
+/// One variant in a model write: a name that resolves to the model with extra
+/// boons on.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct ModelVariantWrite {
+    /// The name clients pass in `model`. Trimmed; case-sensitive.
+    pub name: String,
+    /// What a caller gets from this name, shown in the model listing.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Boons from the fixed `MODEL_BOONS` vocabulary turned on in addition to
+    /// the model's own. An unknown name is rejected.
+    #[serde(default)]
+    pub boons: Vec<String>,
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateModel {
     pub description: Option<String>,
@@ -1024,6 +1044,10 @@ pub struct UpdateModel {
     /// empty list removes every alias, which also evicts their resolver keys.
     #[serde(default)]
     pub aliases: Option<Vec<String>>,
+    /// Replaces the variant list wholesale; omitted leaves it unchanged. An
+    /// empty list removes every variant, which also evicts their resolver keys.
+    #[serde(default)]
+    pub variants: Option<Vec<ModelVariantWrite>>,
     pub upstream_model: String,
     pub api_base: String,
     pub api_key: Option<String>,
@@ -1777,6 +1801,10 @@ pub struct ModelRouteView {
     /// the old `…-fp8` spelling as an alias and it keeps working, while only
     /// `model_name` is advertised by the discovery endpoints.
     pub aliases: Vec<String>,
+    /// Opt-in names for this same route with extra boons on (added to the
+    /// model's own). A variant shares the model's backend, capacity pool and
+    /// prices; unlike an alias it is listed by the discovery endpoints.
+    pub variants: Vec<obleth_config::ModelVariant>,
     /// Human-facing summary for operators and dashboards.
     pub description: String,
     /// Value sent to the upstream in the `model` field.
@@ -1943,6 +1971,7 @@ impl From<ModelRoute> for ModelRouteView {
             id,
             model_name,
             aliases,
+            variants,
             description,
             upstream_model,
             api_base,
@@ -1995,6 +2024,7 @@ impl From<ModelRoute> for ModelRouteView {
             id,
             model_name,
             aliases,
+            variants,
             description,
             upstream_model,
             api_base,
@@ -5684,9 +5714,7 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
     let live_names: std::collections::HashSet<&str> = models
         .iter()
         .filter(|m| m.enabled)
-        .flat_map(|m| {
-            std::iter::once(m.model_name.as_str()).chain(m.aliases.iter().map(String::as_str))
-        })
+        .flat_map(|m| m.addressable_names())
         .collect();
 
     let health_tenant = model_health::health_tenant_id();
@@ -6033,8 +6061,8 @@ async fn resync_models_and_mcp(state: &AdminState) -> Result<(usize, usize, usiz
         models
             .iter()
             .filter(|m| m.enabled)
-            .flat_map(|m| std::iter::once(&m.model_name).chain(m.aliases.iter()))
-            .cloned()
+            .flat_map(|m| m.addressable_names())
+            .map(str::to_string)
             .collect()
     }
     fn server_names(servers: &[McpServer]) -> HashSet<String> {
@@ -6058,9 +6086,9 @@ async fn resync_models_and_mcp(state: &AdminState) -> Result<(usize, usize, usiz
     let fresh_names = model_names(&fresh_models);
     for model in &fresh_models {
         if model.enabled
-            && std::iter::once(&model.model_name)
-                .chain(model.aliases.iter())
-                .any(|n| pruned_models.contains(n))
+            && model
+                .addressable_names()
+                .any(|n| pruned_models.iter().any(|p| p == n))
         {
             sync_model(state, model).await?;
         }
@@ -6229,6 +6257,100 @@ async fn validate_aliases(
     Ok(aliases)
 }
 
+/// The checks on a variant list that need no database: names present, unique
+/// and not the model's own, boons known, the cap respected. Returns the list
+/// in storage form. Stricter than [`obleth_config::normalize_variants`], which
+/// drops what it cannot keep: an operator who typed a name or a boon gets told
+/// why it was refused rather than finding it silently gone.
+fn check_variants(
+    raw: &[ModelVariantWrite],
+    model_name: &str,
+    aliases: &[String],
+) -> Result<Vec<obleth_config::ModelVariant>> {
+    if raw.len() > obleth_config::MAX_MODEL_VARIANTS {
+        return Err(AdminError::BadRequest(format!(
+            "a model can have at most {} variants",
+            obleth_config::MAX_MODEL_VARIANTS
+        )));
+    }
+    let mut out: Vec<obleth_config::ModelVariant> = Vec::with_capacity(raw.len());
+    for v in raw {
+        let name = v.name.trim();
+        if name.is_empty() {
+            return Err(AdminError::BadRequest("a variant needs a name".into()));
+        }
+        if name == model_name {
+            return Err(AdminError::BadRequest(format!(
+                "variant '{name}' is the model's own name"
+            )));
+        }
+        if aliases.iter().any(|a| a == name) {
+            return Err(AdminError::BadRequest(format!(
+                "variant '{name}' is already one of the model's aliases"
+            )));
+        }
+        if name == obleth_config::routing::AUTO_MODEL_NAME {
+            return Err(AdminError::BadRequest(format!(
+                "variant '{name}' is reserved for automatic model selection"
+            )));
+        }
+        if out.iter().any(|o| o.name == name) {
+            return Err(AdminError::BadRequest(format!(
+                "variant '{name}' is listed twice"
+            )));
+        }
+        if let Some(unknown) = v
+            .boons
+            .iter()
+            .find(|b| !obleth_config::is_valid_boon(&b.trim().to_ascii_lowercase()))
+        {
+            return Err(AdminError::BadRequest(format!(
+                "variant '{name}': unknown boon '{unknown}' (expected one of: {})",
+                obleth_config::MODEL_BOONS.join(", ")
+            )));
+        }
+        out.push(obleth_config::ModelVariant {
+            name: name.to_string(),
+            description: v
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            boons: obleth_config::normalize_boons(&v.boons),
+        });
+    }
+    Ok(out)
+}
+
+/// Validate a variant list and reject any name already claimed elsewhere.
+///
+/// A variant is a name a client can send, so it shares one namespace with
+/// every model's `model_name`, aliases and variants (see
+/// [`validate_aliases`]). `editing` is the row being written, whose own
+/// names are not collisions with itself; `aliases` is the alias list this
+/// same write leaves the model with.
+async fn validate_variants(
+    state: &AdminState,
+    raw: &[ModelVariantWrite],
+    editing: Option<Uuid>,
+    model_name: &str,
+    aliases: &[String],
+) -> Result<Vec<obleth_config::ModelVariant>> {
+    let variants = check_variants(raw, model_name, aliases)?;
+    for v in &variants {
+        if let Some((owner_id, owner_name)) = state.store.model_name_owner(&v.name).await? {
+            if Some(owner_id) != editing {
+                return Err(AdminError::BadRequest(format!(
+                    "variant '{}' is already taken by model '{owner_name}'",
+                    v.name
+                )));
+            }
+        }
+    }
+    Ok(variants)
+}
+
 /// Validate a capacity mode against the fixed vocabulary, returning its
 /// canonical form. Rejected rather than normalized: a typo must not quietly
 /// turn a model back to `static`.
@@ -6359,11 +6481,30 @@ async fn create_model(
     }
     validate_verify_api_base(&state, body.verify_api_base.as_deref()).await?;
     let quantization = validate_quantization(body.quantization.as_deref().unwrap_or_default())?;
+    // A new name must not already be another model's alias or variant, or it
+    // would mean two routes. A duplicate `model_name` is left to the store's
+    // unique constraint, which reports it as the conflict it always has.
+    if let Some((_, owner)) = state.store.model_name_owner(&body.model_name).await? {
+        if owner != body.model_name.trim() {
+            return Err(AdminError::BadRequest(format!(
+                "'{}' is already an alias or variant of model '{owner}'",
+                body.model_name.trim()
+            )));
+        }
+    }
     let aliases = validate_aliases(
         &state,
         body.aliases.as_deref().unwrap_or_default(),
         None,
         body.model_name.trim(),
+    )
+    .await?;
+    let variants = validate_variants(
+        &state,
+        body.variants.as_deref().unwrap_or_default(),
+        None,
+        body.model_name.trim(),
+        &aliases,
     )
     .await?;
     let upstream_headers = match &body.upstream_headers {
@@ -6433,6 +6574,7 @@ async fn create_model(
             body.cost_per_video.unwrap_or(0.0),
             &capacity_mode,
             &discovery,
+            &variants,
         )
         .await?;
     // Switched off before the first publish below, so the data plane never
@@ -6519,6 +6661,21 @@ async fn update_model(
         Some(list) => validate_aliases(&state, list, Some(id), &existing.model_name).await?,
         None => existing.aliases.clone(),
     };
+    let variants = match body.variants.as_deref() {
+        Some(list) => {
+            validate_variants(&state, list, Some(id), &existing.model_name, &aliases).await?
+        }
+        // Kept as stored, but a new alias may not take a kept variant's name.
+        None => {
+            if let Some(v) = existing.variants.iter().find(|v| aliases.contains(&v.name)) {
+                return Err(AdminError::BadRequest(format!(
+                    "alias '{}' is already one of the model's variants",
+                    v.name
+                )));
+            }
+            existing.variants.clone()
+        }
+    };
     let upstream_headers = match &body.upstream_headers {
         Some(write) => obleth_config::merge_upstream_headers(&existing.upstream_headers, write)
             .map_err(AdminError::BadRequest)?,
@@ -6598,6 +6755,7 @@ async fn update_model(
             body.cost_per_video.unwrap_or(existing.cost_per_video),
             &capacity_mode,
             &discovery,
+            &variants,
         )
         .await?;
     if model_health::probe_config_changed(&existing, &model) {
@@ -7425,12 +7583,10 @@ async fn delete_model(
 ) -> Result<StatusCode> {
     let model = state.store.get_model(id).await?;
     state.store.delete_model(id).await?;
-    // Aliases are resolver keys of their own, so a delete has to clear all of
-    // them or the model stays reachable under its old names.
+    // Aliases and variants are resolver keys of their own, so a delete has to
+    // clear all of them or the model stays reachable under its old names.
     let mut evict_err = None;
-    for name in
-        std::iter::once(model.model_name.as_str()).chain(model.aliases.iter().map(String::as_str))
-    {
+    for name in model.addressable_names() {
         let evicted = async {
             state.redis.delete_resolved_model(name).await?;
             state
@@ -7936,6 +8092,7 @@ async fn sync_model_from(
     let resolved = ResolvedModel {
         model_name: model.model_name.clone(),
         aliases: model.aliases.clone(),
+        variants: model.variants.clone(),
         upstream_model: model.upstream_model.clone(),
         api_base: model.api_base.clone(),
         api_key: model.api_key.clone(),
@@ -7990,25 +8147,26 @@ async fn sync_model_from(
         verify_upstream_model: model.verify_upstream_model.clone(),
         endpoints,
     };
-    // Aliases the write removed: their keys would otherwise keep resolving to
-    // this model forever. Done before the publish so a name moved from alias to
-    // canonical (or between the two lists) is re-added, not left evicted.
+    // Aliases and variants the write removed: their keys would otherwise keep
+    // resolving to this model forever. Done before the publish so a name moved
+    // between the lists (alias to variant, or to canonical) is re-added, not
+    // left evicted.
     if let Some(previous) = previous {
+        let current: std::collections::HashSet<&str> = model.addressable_names().collect();
         for stale in previous
-            .aliases
-            .iter()
-            .filter(|a| !model.aliases.contains(a))
+            .addressable_names()
+            .filter(|n| !current.contains(n))
         {
             state
                 .redis
                 .delete_resolved_model(stale)
                 .await
-                .map_err(|e| cache_removal_failed("a removed alias", e))?;
+                .map_err(|e| cache_removal_failed("a removed alias or variant", e))?;
             state
                 .redis
                 .publish_invalidation(&format!("model:{stale}"))
                 .await
-                .map_err(|e| cache_removal_failed("a removed alias", e))?;
+                .map_err(|e| cache_removal_failed("a removed alias or variant", e))?;
         }
     }
     // Every name the model answers to gets its own resolver key, so the data
@@ -8231,6 +8389,7 @@ mod tests {
                     0.0,
                     "static",
                     &Default::default(),
+                    &[],
                 )
                 .await
                 .expect("create fixture model")
@@ -10467,6 +10626,7 @@ mod tests {
             id: Uuid::new_v4(),
             model_name: name.to_string(),
             aliases: Vec::new(),
+            variants: Vec::new(),
             description: String::new(),
             upstream_model: name.to_string(),
             api_base: "http://upstream.invalid".to_string(),
@@ -10515,6 +10675,193 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    fn variant_write(name: &str, boons: &[&str]) -> ModelVariantWrite {
+        ModelVariantWrite {
+            name: name.into(),
+            description: None,
+            boons: boons.iter().map(|b| b.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn variants_are_trimmed_and_their_boons_normalized() {
+        let raw = [ModelVariantWrite {
+            name: "  glm-5-3-spec ".into(),
+            description: Some(" drafted, then verified ".into()),
+            boons: vec!["Speculation".into(), "speculation".into()],
+        }];
+        let out = check_variants(&raw, "glm-5-3", &[]).expect("valid");
+        assert_eq!(
+            out,
+            vec![obleth_config::ModelVariant {
+                name: "glm-5-3-spec".into(),
+                description: "drafted, then verified".into(),
+                boons: vec!["speculation".into()],
+            }]
+        );
+        // A variant that adds nothing beyond the model's own boons is pointless
+        // but harmless, and accepted.
+        assert!(check_variants(&[variant_write("glm-5-3-plain", &[])], "glm-5-3", &[]).is_ok());
+        // Names are case-sensitive, like every other model name.
+        assert!(check_variants(&[variant_write("GLM-5-3", &[])], "glm-5-3", &[]).is_ok());
+    }
+
+    #[test]
+    fn variants_that_would_make_a_name_ambiguous_are_refused() {
+        let aliases = vec!["glm-5-3-fp8".to_string()];
+        for (raw, why) in [
+            (vec![variant_write("  ", &[])], "needs a name"),
+            (vec![variant_write("glm-5-3", &[])], "model's own name"),
+            (
+                vec![variant_write(" glm-5-3-fp8 ", &[])],
+                "one of the model's aliases",
+            ),
+            (vec![variant_write("auto", &[])], "reserved"),
+            (
+                vec![variant_write("v", &[]), variant_write(" v", &["vision"])],
+                "listed twice",
+            ),
+            (
+                vec![variant_write("v", &["speculation", "teleportation"])],
+                "unknown boon 'teleportation'",
+            ),
+        ] {
+            match check_variants(&raw, "glm-5-3", &aliases) {
+                Err(AdminError::BadRequest(msg)) => assert!(msg.contains(why), "{msg}"),
+                other => panic!("expected a 400 containing {why:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn variants_are_capped() {
+        let at_cap: Vec<ModelVariantWrite> = (0..obleth_config::MAX_MODEL_VARIANTS)
+            .map(|i| variant_write(&format!("v{i}"), &[]))
+            .collect();
+        assert!(check_variants(&at_cap, "m", &[]).is_ok());
+        let over: Vec<ModelVariantWrite> = (0..=obleth_config::MAX_MODEL_VARIANTS)
+            .map(|i| variant_write(&format!("v{i}"), &[]))
+            .collect();
+        match check_variants(&over, "m", &[]) {
+            Err(AdminError::BadRequest(msg)) => assert!(msg.contains("at most"), "{msg}"),
+            other => panic!("expected a 400, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn model_writes_without_variants_still_parse() {
+        // A client written before variants existed sends neither field.
+        let body: UpdateModel =
+            serde_json::from_str(r#"{"upstream_model":"u","api_base":"http://u/v1"}"#).unwrap();
+        assert!(body.variants.is_none(), "omitted must mean unchanged");
+        let body: UpdateModel = serde_json::from_str(
+            r#"{"upstream_model":"u","api_base":"http://u/v1","variants":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            body.variants.map(|v| v.len()),
+            Some(0),
+            "[] must mean remove all"
+        );
+        let body: CreateModel = serde_json::from_str(
+            r#"{"model_name":"m","upstream_model":"u","api_base":"http://u/v1",
+                "variants":[{"name":"m-spec","boons":["speculation"]}]}"#,
+        )
+        .unwrap();
+        let v = &body.variants.expect("variants")[0];
+        assert_eq!(
+            (v.name.as_str(), v.description.as_deref()),
+            ("m-spec", None)
+        );
+    }
+
+    #[test]
+    fn model_route_view_lists_variants() {
+        let mut route = fixture_model_route("glm-5-3");
+        route.variants = vec![obleth_config::ModelVariant {
+            name: "glm-5-3-spec".into(),
+            description: "drafted, then verified".into(),
+            boons: vec!["speculation".into()],
+        }];
+        let v = serde_json::to_value(ModelRouteView::from(route)).unwrap();
+        assert_eq!(
+            v["variants"],
+            serde_json::json!([{
+                "name": "glm-5-3-spec",
+                "description": "drafted, then verified",
+                "boons": ["speculation"],
+            }])
+        );
+        let v = serde_json::to_value(ModelRouteView::from(fixture_model_route("m"))).unwrap();
+        assert_eq!(v["variants"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn import_refuses_variant_names_another_route_answers_to() {
+        use obleth_store::ModelImportWrite;
+        let mut owner = fixture_model_route("glm-5-3");
+        owner.aliases = vec!["glm-5-3-fp8".into()];
+        owner.variants = vec![obleth_config::ModelVariant {
+            name: "glm-5-3-spec".into(),
+            ..Default::default()
+        }];
+        let existing: std::collections::HashMap<String, ModelRoute> =
+            [("glm-5-3".to_string(), owner)].into();
+        let write = |name: &str, aliases: &[&str], variants: &[&str]| ModelImportWrite {
+            model_name: name.into(),
+            config: obleth_config::ModelConfig {
+                aliases: aliases.iter().map(|a| a.to_string()).collect(),
+                variants: variants
+                    .iter()
+                    .map(|v| obleth_config::ModelVariant {
+                        name: v.to_string(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            endpoints: None,
+        };
+
+        let errors = crate::models_io::name_conflicts(
+            &existing,
+            &[write(
+                "qwen3",
+                &["qwen3-old"],
+                &[
+                    "glm-5-3",
+                    "glm-5-3-fp8",
+                    "glm-5-3-spec",
+                    "qwen3",
+                    "qwen3-old",
+                    "auto",
+                ],
+            )],
+        );
+        assert_eq!(
+            errors,
+            vec![
+                "model 'qwen3': variant 'glm-5-3' is already taken by model 'glm-5-3'",
+                "model 'qwen3': variant 'glm-5-3-fp8' is already taken by model 'glm-5-3'",
+                "model 'qwen3': variant 'glm-5-3-spec' is already taken by model 'glm-5-3'",
+                "model 'qwen3': variant 'qwen3' is the model's own name",
+                "model 'qwen3': variant 'qwen3-old' is already one of the model's aliases",
+                "model 'qwen3': variant 'auto' is reserved for automatic model selection",
+            ]
+        );
+
+        // A file that rewrites the owner may move its variant to another
+        // model: the check runs on the state the file would produce.
+        let errors = crate::models_io::name_conflicts(
+            &existing,
+            &[
+                write("glm-5-3", &["glm-5-3-fp8"], &[]),
+                write("qwen3", &[], &["glm-5-3-spec"]),
+            ],
+        );
+        assert!(errors.is_empty(), "{errors:?}");
     }
 
     #[test]

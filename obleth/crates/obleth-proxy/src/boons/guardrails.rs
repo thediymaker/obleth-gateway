@@ -516,13 +516,15 @@ fn redact_content_in_place(
 
 /// Ask the guard model to classify `text`. The guard-model call is billed to the
 /// tenant's ledger (request_type `guardrails_boon`), exactly like every other
-/// boon helper call. Returns [`HarmScan::Error`] on any failure so the caller
-/// can honor the policy's `fail_open` setting rather than silently passing.
+/// boon helper call, against `request_id`, the client request it scanned for.
+/// Returns [`HarmScan::Error`] on any failure so the caller can honor the
+/// policy's `fail_open` setting rather than silently passing.
 pub(crate) async fn scan_harm(
     state: &AppState,
     settings: &GuardrailsBoonSettings,
     key: &ResolvedKey,
     session_id: &str,
+    request_id: uuid::Uuid,
     guard_model_name: &str,
     text: &str,
 ) -> HarmScan {
@@ -569,6 +571,7 @@ pub(crate) async fn scan_harm(
         &guard_model,
         key,
         session_id,
+        request_id,
         "guardrails_boon",
         completion
             .pointer("/usage/prompt_tokens")
@@ -629,12 +632,14 @@ pub struct GuardrailsInputOutcome {
 /// recorded as an alert and the request passes through unchanged, with the
 /// (network) harm scan dispatched asynchronously so a monitoring posture never
 /// adds latency to the request.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn apply_input(
     state: &AppState,
     settings: &GuardrailsBoonSettings,
     policy: &GuardrailsPolicy,
     key: &ResolvedKey,
     session_id: &str,
+    request_id: uuid::Uuid,
     json: &mut Value,
     tracer: Option<&mut crate::tracer::SpanRecorder>,
 ) -> GuardrailsInputOutcome {
@@ -685,6 +690,7 @@ pub(super) async fn apply_input(
                 policy,
                 key,
                 session_id,
+                request_id,
                 &text,
                 "input",
                 key.tenant_id,
@@ -724,7 +730,7 @@ pub(super) async fn apply_input(
     // ---- tier-2 harm scanner (always blocks; honors fail_open on error) ----
     if policy.input_scanners.iter().any(|s| s == "harm") {
         if let Some(model) = &policy.guard_model {
-            match scan_harm(state, settings, key, session_id, model, &text).await {
+            match scan_harm(state, settings, key, session_id, request_id, model, &text).await {
                 HarmScan::Unsafe { .. } => {
                     record_block(
                         tracer,
@@ -819,12 +825,14 @@ pub enum ApplyOutputResult {
 /// Run all configured output scanners against a buffered completion in place.
 /// Used for `block`/`redact` actions; `log_only` output is scanned
 /// asynchronously after the stream drains (see [`monitor_output`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn apply_output(
     state: &AppState,
     settings: &GuardrailsBoonSettings,
     policy: &GuardrailsPolicy,
     key: &ResolvedKey,
     session_id: &str,
+    request_id: uuid::Uuid,
     completion: &mut Value,
     tracer: Option<&mut crate::tracer::SpanRecorder>,
 ) -> ApplyOutputResult {
@@ -846,7 +854,7 @@ pub(crate) async fn apply_output(
     // ---- tier-2 harm (always blocks; honors fail_open on error) ----
     if policy.output_scanners.iter().any(|s| s == "harm") {
         if let Some(model) = &policy.guard_model {
-            match scan_harm(state, settings, key, session_id, model, &text).await {
+            match scan_harm(state, settings, key, session_id, request_id, model, &text).await {
                 HarmScan::Unsafe { .. } => {
                     record_block(
                         tracer,
@@ -934,6 +942,7 @@ pub(crate) fn monitor_output(
             policy,
             key,
             session_id,
+            request_id,
             &text,
             "output",
             key.tenant_id,
@@ -951,6 +960,7 @@ fn spawn_harm_monitor(
     policy: &GuardrailsPolicy,
     key: &ResolvedKey,
     session_id: &str,
+    request_id: uuid::Uuid,
     text: &str,
     phase: &'static str,
     tenant_id: uuid::Uuid,
@@ -971,8 +981,16 @@ fn spawn_harm_monitor(
         // log_only is a monitoring posture, so the probability is the useful
         // part: it says how close the call was and lets an operator pick a
         // blocking threshold from real traffic before turning enforcement on.
-        if let HarmScan::Unsafe { p_unsafe } =
-            scan_harm(&state, &settings, &key, &session_id, &model, &text).await
+        if let HarmScan::Unsafe { p_unsafe } = scan_harm(
+            &state,
+            &settings,
+            &key,
+            &session_id,
+            request_id,
+            &model,
+            &text,
+        )
+        .await
         {
             state.alerts.issue(
                 format!("guardrails_{phase}_harm_{tenant_id}"),

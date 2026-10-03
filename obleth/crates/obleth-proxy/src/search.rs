@@ -205,6 +205,7 @@ async fn handle(
         request_type: surfaced_request_type(&resolved, SEARCH_PATH, &headers),
         device_id,
         end_user: end_user.clone().unwrap_or_default(),
+        model_variant: String::new(),
     };
 
     // ---- tenant input guardrails ----
@@ -213,7 +214,14 @@ async fn handle(
     let mut scan = json!({ "messages": [{ "role": "user", "content": request.query }] });
     match state
         .boons
-        .scan_input(state, &resolved, &meta.session_id, &mut scan, None)
+        .scan_input(
+            state,
+            &resolved,
+            &meta.session_id,
+            request_id,
+            &mut scan,
+            None,
+        )
         .await
     {
         Err(block) => return error_json(block.status, block.reason),

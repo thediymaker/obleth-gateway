@@ -5,9 +5,13 @@ import {
   DEFAULT_LOG_FILTERS,
   describeRequest,
   fillHistogram,
+  helperCallsParams,
+  helperPurpose,
   loadViews,
+  NIL_REQUEST_ID,
   logParams,
   parseSearch,
+  servedRequest,
   storeViews,
   timeSplit,
   windowRange,
@@ -125,6 +129,34 @@ describe("what happened", () => {
     expect(describeRequest(row({ cache_status: "hit", total_ms: 12 }), spans)).toBe(
       "Admitted straight away. The auto router picked kimi-k2-7-code. Answered from the response cache, without calling the upstream.",
     );
+  });
+});
+
+describe("helper calls", () => {
+  it("says what each helper call was for, and any other type as recorded", () => {
+    expect(helperPurpose("speculation_draft")).toBe("speculation draft");
+    expect(helperPurpose("speculation_verify")).toBe("draft check");
+    expect(helperPurpose("vision_boon")).toBe("image description");
+    expect(helperPurpose("tool_loop")).toBe("tool loop turn");
+    expect(helperPurpose("benchmark")).toBe("benchmark");
+    expect(helperPurpose("chat")).toBe("chat");
+    expect(helperPurpose("")).toBe("other");
+  });
+
+  it("reads the nil id, or none at all, as a request a client made", () => {
+    expect(servedRequest(row({ parent_request_id: "9a2b0000-1111-2222-3333-444455556666" }))).toBe("9a2b0000-1111-2222-3333-444455556666");
+    expect(servedRequest(row({ parent_request_id: NIL_REQUEST_ID }))).toBeNull();
+    expect(servedRequest(row())).toBeNull();
+  });
+
+  it("looks an hour either side of when the request ended, health checks and benchmarks included", () => {
+    expect(Object.fromEntries(helperCallsParams(row({ ts_ms: 10_000_000 })))).toEqual({
+      parent_request_id: "7c1e40a2-0000-0000-0000-000000000000",
+      since_ms: String(10_000_000 - 3_600_000),
+      until_ms: String(10_000_000 + 3_600_000),
+      include_internal: "true",
+      limit: "200",
+    });
   });
 });
 

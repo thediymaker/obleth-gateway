@@ -101,6 +101,7 @@ const SCHEMA_V30: &str = include_str!("../../../../schema/postgres/0030_video_jo
 const SCHEMA_V31: &str = include_str!("../../../../schema/postgres/0031_deployment_launches.sql");
 const SCHEMA_V32: &str =
     include_str!("../../../../schema/postgres/0032_api_key_end_user_fairshare.sql");
+const SCHEMA_V33: &str = include_str!("../../../../schema/postgres/0033_model_variants.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -249,6 +250,7 @@ impl Store {
             sqlx::raw_sql(SCHEMA_V30).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V31).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V32).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V33).execute(&mut *conn).await?;
             Ok(())
         }
         .await;
@@ -1465,6 +1467,7 @@ impl Store {
         cost_per_video: f64,
         capacity_mode: &str,
         discovery: &obleth_config::capacity::DiscoveryFields,
+        variants: &[obleth_config::ModelVariant],
     ) -> Result<ModelRoute> {
         let api_key = cipher().encrypt_opt(api_key);
         let discovery = discovery.normalized();
@@ -1478,9 +1481,10 @@ impl Store {
                 energy_slots_per_node, route_bias, auto_eligible,
                 draft_model, verify_api_base, verify_upstream_model, aliases, quantization,
                 upstream_headers, cost_per_video, capacity_mode, capacity_namespace,
-                capacity_service, per_replica_max_in_flight, capacity_source, capacity_headroom
-             ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39)
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
+                capacity_service, per_replica_max_in_flight, capacity_source, capacity_headroom,
+                variants
+             ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40)
+             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -1532,6 +1536,7 @@ impl Store {
         .bind(discovery.per_replica_max_in_flight.map(|n| n.max(1)))
         .bind(&discovery.source)
         .bind(discovery.headroom)
+        .bind(sqlx::types::Json(obleth_config::normalize_variants(variants)))
         .fetch_one(&self.pool)
         .await?;
         model_from_row(&row)
@@ -1539,7 +1544,7 @@ impl Store {
 
     pub async fn list_models(&self) -> Result<Vec<ModelRoute>> {
         let rows = sqlx::query(
-            "select id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
+            "select id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, quantization,
                     input_cost_per_token, output_cost_per_token,
                     cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                     admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -1559,7 +1564,7 @@ impl Store {
 
     pub async fn get_model(&self, id: Uuid) -> Result<ModelRoute> {
         let row = sqlx::query(
-            "select id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
+            "select id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, quantization,
                     input_cost_per_token, output_cost_per_token,
                     cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                     admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -1581,7 +1586,7 @@ impl Store {
 
     pub async fn get_model_by_name(&self, model_name: &str) -> Result<ModelRoute> {
         let row = sqlx::query(
-            "select id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
+            "select id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, quantization,
                     input_cost_per_token, output_cost_per_token,
                     cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                     admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -1601,14 +1606,15 @@ impl Store {
         model_from_row(&row)
     }
 
-    /// Which model, if any, already answers to `name` — either as its
-    /// `model_name` or as one of its aliases. Returned as `(id, model_name)` so
-    /// a caller validating a write can both skip the row it is editing and name
-    /// the conflicting model in its error.
+    /// Which model, if any, already answers to `name` — as its `model_name`,
+    /// as one of its aliases, or as one of its variants. Returned as
+    /// `(id, model_name)` so a caller validating a write can both skip the row
+    /// it is editing and name the conflicting model in its error.
     ///
-    /// The two namespaces are deliberately checked together: a client sending
-    /// `model: "x"` cannot tell whether `x` is a canonical name or an alias, so
-    /// `x` has to mean exactly one route no matter which column it lives in.
+    /// The three namespaces are deliberately checked together: a client sending
+    /// `model: "x"` cannot tell whether `x` is a canonical name, an alias or a
+    /// variant, so `x` has to mean exactly one route no matter which column it
+    /// lives in.
     pub async fn model_name_owner(&self, name: &str) -> Result<Option<(Uuid, String)>> {
         let name = name.trim();
         if name.is_empty() {
@@ -1617,6 +1623,7 @@ impl Store {
         let row = sqlx::query(
             "select id, model_name from models
              where model_name = $1 or aliases @> to_jsonb($1::text)
+                or variants @> jsonb_build_array(jsonb_build_object('name', $1::text))
              limit 1",
         )
         .bind(name)
@@ -1666,6 +1673,7 @@ impl Store {
         cost_per_video: f64,
         capacity_mode: &str,
         discovery: &obleth_config::capacity::DiscoveryFields,
+        variants: &[obleth_config::ModelVariant],
     ) -> Result<ModelRoute> {
         let api_key = cipher().encrypt_opt(api_key);
         let discovery = discovery.normalized();
@@ -1686,10 +1694,10 @@ impl Store {
                 aliases = $30, quantization = $31, upstream_headers = $32,
                 cost_per_video = $33, capacity_mode = $34, capacity_namespace = $35,
                 capacity_service = $36, per_replica_max_in_flight = $37,
-                capacity_source = $38, capacity_headroom = $39,
+                capacity_source = $38, capacity_headroom = $39, variants = $40,
                 updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
+             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -1741,6 +1749,7 @@ impl Store {
         .bind(discovery.per_replica_max_in_flight.map(|n| n.max(1)))
         .bind(&discovery.source)
         .bind(discovery.headroom)
+        .bind(sqlx::types::Json(obleth_config::normalize_variants(variants)))
         .fetch_optional(&self.pool)
         .await?
         .ok_or(StoreError::NotFound)?;
@@ -1766,7 +1775,7 @@ impl Store {
         let row = sqlx::query(
             "update models set max_in_flight = $2, updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
+             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -1807,7 +1816,7 @@ impl Store {
                     capacity_headroom = case when $3 then $8 else capacity_headroom end,
                     updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
+             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -1854,7 +1863,7 @@ impl Store {
             "update models set max_in_flight = $2, capacity_mode = 'tuned',
                     capacity_tuned_at = now(), updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
+             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -1881,7 +1890,7 @@ impl Store {
         let row = sqlx::query(
             "update models set admission_weight = $2, updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
+             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -1902,7 +1911,7 @@ impl Store {
 
     pub async fn all_resolved_models(&self) -> Result<Vec<(String, ResolvedModel)>> {
         let rows = sqlx::query(
-            "select id, model_name, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization, admission_weight, max_in_flight, enabled,
+            "select id, model_name, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, quantization, admission_weight, max_in_flight, enabled,
                     capacity_mode, capacity_source, capacity_namespace, capacity_service,
                     per_replica_max_in_flight, capacity_headroom,
                     cache_enabled, cache_ttl_secs, input_cost_per_token, output_cost_per_token,
@@ -1966,6 +1975,7 @@ impl Store {
                         .try_get::<sqlx::types::Json<Vec<String>>, _>("aliases")
                         .map(|j| j.0)
                         .unwrap_or_default(),
+                    variants: variants_from_row(row),
                     upstream_model: row.try_get("upstream_model")?,
                     api_base: row.try_get("api_base")?,
                     api_key: cipher().decrypt_opt(row.try_get("api_key")?)?,
@@ -2098,7 +2108,7 @@ impl Store {
         let row = sqlx::query(
             "update models set enabled = $2, updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
+             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -2127,7 +2137,7 @@ impl Store {
         let row = sqlx::query(
             "update models set cache_enabled = $2, cache_ttl_secs = $3, updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
+             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -2164,7 +2174,7 @@ impl Store {
                     retry_backoff_ms = $4, endpoint_selection_mode = $5,
                     debug_diagnostics = $6, updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
+             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -3311,7 +3321,7 @@ impl Store {
             "update models
                 set tool_servers = (tool_servers - $1) || jsonb_build_array($2::text), updated_at = now()
               where tool_servers ? $1
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
+             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -3354,7 +3364,7 @@ impl Store {
             "update models
                 set tool_servers = tool_servers - $1, updated_at = now()
               where tool_servers ? $1
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
+             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -3993,6 +4003,9 @@ fn model_from_row(row: &PgRow) -> Result<ModelRoute> {
             .try_get::<sqlx::types::Json<Vec<String>>, _>("aliases")
             .map(|j| j.0)
             .unwrap_or_default(),
+        // Tolerant read: column added in the variants migration; statements
+        // that don't select it degrade to "no variants", like `aliases`.
+        variants: variants_from_row(row),
         quantization: row
             .try_get::<String, _>("quantization")
             .unwrap_or_else(|_| obleth_config::DEFAULT_QUANTIZATION.to_string()),
@@ -4007,6 +4020,13 @@ fn model_from_row(row: &PgRow) -> Result<ModelRoute> {
 }
 
 /// Encrypt each upstream header value for storage, like `models.api_key`.
+/// Read the `variants` column, tolerating statements that do not select it.
+fn variants_from_row(row: &PgRow) -> Vec<obleth_config::ModelVariant> {
+    row.try_get::<sqlx::types::Json<Vec<obleth_config::ModelVariant>>, _>("variants")
+        .map(|j| j.0)
+        .unwrap_or_default()
+}
+
 pub(crate) fn encrypt_upstream_headers(
     headers: &obleth_config::UpstreamHeaders,
 ) -> sqlx::types::Json<obleth_config::UpstreamHeaders> {
@@ -4507,6 +4527,7 @@ mod tests {
                 0.0,
                 "static",
                 &Default::default(),
+                &[],
             )
             .await
             .expect("create model");
@@ -4550,6 +4571,7 @@ mod tests {
 
         let name = format!("m-{}", Uuid::new_v4());
         let alias = format!("{name}-mxfp4");
+        let variant = format!("{name}-spec");
         let model = store
             .create_model(
                 &name,
@@ -4588,11 +4610,26 @@ mod tests {
                 0.0,
                 "static",
                 &Default::default(),
+                // An unknown boon and a blank variant: normalization drops both.
+                &[
+                    obleth_config::ModelVariant {
+                        name: format!(" {variant} "),
+                        description: "drafted, then verified".into(),
+                        boons: vec!["speculation".into(), "teleportation".into()],
+                    },
+                    obleth_config::ModelVariant::default(),
+                ],
             )
             .await
             .expect("create model");
         fixtures.track_model(model.id);
         assert_eq!(model.aliases, vec![alias.clone()]);
+        let expected_variants = vec![obleth_config::ModelVariant {
+            name: variant.clone(),
+            description: "drafted, then verified".into(),
+            boons: vec!["speculation".into()],
+        }];
+        assert_eq!(model.variants, expected_variants);
         assert_eq!(model.quantization, "fp8");
 
         // Both columns survive the read paths the admin API and the data plane
@@ -4600,8 +4637,10 @@ mod tests {
         let fetched = store.get_model(model.id).await.expect("get model");
         assert_eq!(fetched.aliases, vec![alias.clone()]);
         assert_eq!(fetched.quantization, "fp8");
+        assert_eq!(fetched.variants, expected_variants);
         let by_name = store.get_model_by_name(&name).await.expect("get by name");
         assert_eq!(by_name.aliases, vec![alias.clone()]);
+        assert_eq!(by_name.variants, expected_variants);
 
         // The hot-path view carries them, so the resolver can publish a key per
         // addressable name and the discovery endpoints can report the format.
@@ -4614,10 +4653,11 @@ mod tests {
             .expect("model present")
             .1;
         assert_eq!(resolved.aliases, vec![alias.clone()]);
+        assert_eq!(resolved.variants, expected_variants);
         assert_eq!(resolved.quantization, "fp8");
         assert_eq!(
             resolved.addressable_names().collect::<Vec<_>>(),
-            vec![name.as_str(), alias.as_str()]
+            vec![name.as_str(), alias.as_str(), variant.as_str()]
         );
 
         // A name is looked up across both namespaces, because a client sending
@@ -4628,6 +4668,10 @@ mod tests {
         );
         assert_eq!(
             store.model_name_owner(&name).await.expect("owner"),
+            Some((model.id, name.clone()))
+        );
+        assert_eq!(
+            store.model_name_owner(&variant).await.expect("owner"),
             Some((model.id, name.clone()))
         );
         assert!(store
@@ -4675,13 +4719,20 @@ mod tests {
                 0.0,
                 "static",
                 &Default::default(),
+                &[],
             )
             .await
             .expect("update model");
         assert!(updated.aliases.is_empty());
+        assert!(updated.variants.is_empty());
         assert_eq!(updated.quantization, "mxfp4");
         assert!(store
             .model_name_owner(&alias)
+            .await
+            .expect("owner")
+            .is_none());
+        assert!(store
+            .model_name_owner(&variant)
             .await
             .expect("owner")
             .is_none());
@@ -4747,6 +4798,7 @@ mod tests {
                 0.0,
                 "discovered",
                 &discovery,
+                &[],
             )
             .await
             .expect("create model");
@@ -5040,6 +5092,7 @@ mod tests {
                 0.0,
                 "static",
                 &Default::default(),
+                &[],
             )
             .await
             .expect("create model");
@@ -5366,6 +5419,7 @@ mod tests {
                 0.0,
                 "static",
                 &Default::default(),
+                &[],
             )
             .await
             .expect("create model");
@@ -5507,6 +5561,7 @@ mod tests {
                     0.0,
                     "static",
                     &Default::default(),
+                    &[],
                 )
                 .await
                 .expect("create model");
@@ -5628,6 +5683,7 @@ mod tests {
                 0.0,
                 "static",
                 &Default::default(),
+                &[],
             )
             .await
             .expect("create model");
@@ -5837,6 +5893,7 @@ mod tests {
                 0.0,
                 "static",
                 &Default::default(),
+                &[],
             )
             .await
             .expect("create model");
@@ -5914,6 +5971,7 @@ mod tests {
                 0.0,
                 "static",
                 &Default::default(),
+                &[],
             )
             .await
             .expect("update model");
@@ -6070,6 +6128,7 @@ mod tests {
                 0.0,
                 "static",
                 &Default::default(),
+                &[],
             )
             .await
             .expect("create model");
@@ -6179,6 +6238,7 @@ mod tests {
                 0.0,
                 "static",
                 &Default::default(),
+                &[],
             )
             .await
             .expect("model");
@@ -6289,6 +6349,7 @@ mod tests {
                 0.0,
                 "static",
                 &Default::default(),
+                &[],
             )
             .await
             .expect("create model");
@@ -6533,6 +6594,7 @@ mod tests {
                 0.0,
                 "static",
                 &Default::default(),
+                &[],
             )
             .await
             .expect("create model");
@@ -6668,6 +6730,7 @@ mod tests {
                 0.0,
                 "static",
                 &Default::default(),
+                &[],
             )
             .await
             .expect("create model");
@@ -6884,6 +6947,7 @@ mod tests {
                 0.0,
                 "static",
                 &Default::default(),
+                &[],
             )
             .await
             .expect("create model");
@@ -6965,6 +7029,7 @@ mod tests {
                 0.0,
                 "static",
                 &Default::default(),
+                &[],
             )
             .await
             .expect("create model with both grants");
@@ -7008,6 +7073,7 @@ mod tests {
                 0.0,
                 "static",
                 &Default::default(),
+                &[],
             )
             .await
             .expect("create model with kept grant");
@@ -7088,6 +7154,7 @@ mod tests {
                 0.0,
                 "static",
                 &Default::default(),
+                &[],
             )
             .await
             .expect("create model");
@@ -7169,6 +7236,7 @@ mod tests {
                 0.0,
                 "static",
                 &Default::default(),
+                &[],
             )
             .await
             .expect("create model");
@@ -7346,6 +7414,7 @@ mod tests {
                 0.0,
                 "static",
                 &Default::default(),
+                &[],
             )
             .await
             .expect("create model");
@@ -7424,6 +7493,7 @@ mod tests {
                 0.0,
                 "static",
                 &Default::default(),
+                &[],
             )
             .await
             .expect("create model");
@@ -7522,6 +7592,7 @@ mod tests {
                 0.0,
                 "static",
                 &Default::default(),
+                &[],
             )
             .await
             .expect("create model");
@@ -7640,6 +7711,7 @@ mod tests {
                 0.0,
                 "static",
                 &Default::default(),
+                &[],
             )
             .await
             .expect("create model");
@@ -7744,6 +7816,7 @@ mod tests {
                 0.0,
                 "static",
                 &Default::default(),
+                &[],
             )
             .await
             .expect("create model");
@@ -7826,6 +7899,7 @@ mod tests {
                 0.0,
                 "static",
                 &Default::default(),
+                &[],
             )
             .await
             .expect("create model");
@@ -7929,6 +8003,7 @@ mod tests {
                 0.0,
                 "static",
                 &Default::default(),
+                &[],
             )
             .await
             .expect("create model");
@@ -8002,6 +8077,7 @@ mod tests {
                 0.0,
                 "static",
                 &Default::default(),
+                &[],
             )
             .await
             .expect("create model");

@@ -444,8 +444,9 @@ async fn main() -> anyhow::Result<()> {
         Ok(models) => {
             for (_, resolved) in &models {
                 // One key per addressable name: the canonical `model_name` plus
-                // every alias. Resolution stays a single lookup on whatever
-                // name the client sent, so an alias costs nothing per request.
+                // every alias and variant. Resolution stays a single lookup on
+                // whatever name the client sent, so an alias costs nothing per
+                // request.
                 let shared = Arc::new(resolved.clone());
                 for name in resolved.addressable_names() {
                     if let Err(e) = redis.put_resolved_model(name, resolved).await {
@@ -1244,7 +1245,9 @@ async fn rewarm_keys(store: &Store, redis: &RedisStore) -> Option<usize> {
     push_and_prune_keys(redis, &snapshot, || store.all_resolved_keys()).await
 }
 
-/// Resolved models keyed by every addressable name (canonical name + aliases).
+/// Resolved models keyed by every addressable name (canonical name, aliases and
+/// variants). A variant's key holds its parent's route as is; the proxy adds
+/// the variant's boons per request.
 fn models_by_name(
     models: Vec<(String, obleth_config::ResolvedModel)>,
 ) -> Vec<(String, obleth_config::ResolvedModel)> {
@@ -1535,10 +1538,28 @@ mod registry_refresh_tests {
         assert!(!Arc::ptr_eq(&before, &registry.load()));
     }
 
+    #[test]
+    fn every_variant_gets_a_resolver_key_holding_its_parent_route() {
+        let mut parent = model("glm-5-3", None);
+        parent.aliases = vec!["glm-5-3-fp8".into()];
+        parent.variants = vec![obleth_config::ModelVariant {
+            name: "glm-5-3-spec".into(),
+            description: String::new(),
+            boons: vec!["speculation".into()],
+        }];
+        let keyed = models_by_name(vec![("glm-5-3".into(), parent.clone())]);
+        let names: Vec<&str> = keyed.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["glm-5-3", "glm-5-3-fp8", "glm-5-3-spec"]);
+        // The variant's key holds the parent unchanged; its boons are added per
+        // request, so the cached route never differs between the names.
+        assert!(keyed.iter().all(|(_, m)| m == &parent));
+    }
+
     fn model(name: &str, request_timeout_secs: Option<i64>) -> obleth_config::ResolvedModel {
         obleth_config::ResolvedModel {
             model_name: name.to_string(),
             aliases: Vec::new(),
+            variants: Vec::new(),
             upstream_model: name.to_string(),
             api_base: "http://upstream".to_string(),
             api_key: None,

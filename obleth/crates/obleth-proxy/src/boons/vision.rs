@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use obleth_config::{ResolvedKey, VisionBoonSettings};
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 use crate::state::AppState;
 
@@ -37,6 +38,7 @@ pub(super) async fn apply(
     cfg: &VisionBoonSettings,
     key: &ResolvedKey,
     session_id: &str,
+    request_id: Uuid,
     json: &mut Value,
 ) -> VisionOutcome {
     let Some(model_name) = cfg.fallback_model.as_deref() else {
@@ -91,6 +93,7 @@ pub(super) async fn apply(
                     &describer,
                     key,
                     session_id,
+                    request_id,
                     "vision_boon",
                     result.input_tokens,
                     result.output_tokens,

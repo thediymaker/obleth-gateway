@@ -902,15 +902,67 @@ async fn count_tokens_shim(
         .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
 }
 
+/// Response header naming the variant a request was served through (see
+/// [`obleth_config::ModelVariant`]), on every response after the name resolved.
+pub(crate) const MODEL_VARIANT_HEADER: &str = "x-obleth-model-variant";
+
+/// The pipeline every proxied request runs ([`run_pipeline`]), plus the
+/// response headers that describe how it was served, whichever exit the
+/// pipeline took.
+async fn proxy_handler_inner(
+    state: State<AppState>,
+    req: Request<Body>,
+    request_id: Uuid,
+) -> Response<Body> {
+    let mut variant: Option<String> = None;
+    let resp = run_pipeline(state, req, request_id, &mut variant).await;
+    with_variant_header(resp, variant.as_deref())
+}
+
+/// `resp` with [`MODEL_VARIANT_HEADER`] set when the request named a variant.
+fn with_variant_header(mut resp: Response<Body>, variant: Option<&str>) -> Response<Body> {
+    if let Some(value) = variant.and_then(|v| header::HeaderValue::from_str(v).ok()) {
+        resp.headers_mut().insert(MODEL_VARIANT_HEADER, value);
+    }
+    resp
+}
+
+/// A route as the client named it: the route to serve the request with, and
+/// the variant name the client used, if the name was one.
+///
+/// A variant is served by its parent route with the variant's boons added
+/// ([`ResolvedModel::with_variant`]). Every other field, `model_name` first,
+/// stays the parent's, so the admission pool, budgets, prices and the usage
+/// ledger key on one model however many names it answers to.
+pub(crate) fn serve_as(
+    route: Arc<ResolvedModel>,
+    requested: &str,
+) -> (Arc<ResolvedModel>, Option<String>) {
+    match route.with_variant(requested) {
+        Some(served) => (Arc::new(served), Some(requested.to_string())),
+        None => (route, None),
+    }
+}
+
+/// The pool a routed request is admitted to: one per model, keyed by the
+/// route's own `model_name`, so a variant queues with its parent.
+pub(crate) fn admission_pool(route: Option<&ResolvedModel>) -> obleth_fairshare::PoolKey {
+    match route {
+        Some(r) => obleth_fairshare::PoolKey::Model(r.model_name.clone()),
+        None => obleth_fairshare::PoolKey::Unrouted,
+    }
+}
+
 #[tracing::instrument(
     skip_all,
     name = "proxy_request",
     fields(session.id = tracing::field::Empty, session.id.source = tracing::field::Empty)
 )]
-async fn proxy_handler_inner(
+async fn run_pipeline(
     State(state): State<AppState>,
     req: Request<Body>,
     request_id: Uuid,
+    served_variant: &mut Option<String>,
 ) -> Response<Body> {
     let request_start = Instant::now();
     let proxy_start_ms = crate::tracer::now_ms();
@@ -1103,12 +1155,14 @@ async fn proxy_handler_inner(
         state.session_id_derivation,
     );
     let end_user = end_user_for(&resolved, &headers, &json);
-    let req_meta = RequestMeta {
+    let mut req_meta = RequestMeta {
         session_id: conversation.value,
         session_id_source: conversation.source.as_str(),
         request_type: surfaced_request_type(&resolved, &path, &headers),
         device_id,
         end_user: end_user.clone().unwrap_or_default(),
+        // Set below once the model name resolves.
+        model_variant: String::new(),
     };
     // Surface the conversation id on the OTLP/Jaeger root span for cross-request
     // grouping (the field is declared Empty on the #[instrument] below).
@@ -1128,7 +1182,7 @@ async fn proxy_handler_inner(
     // shape (estimated context size, required capabilities) and live load. From
     // here on, everything downstream — admission, budgets, caching, telemetry,
     // upstream dispatch — sees the concrete model as if the client named it.
-    let route = if model == crate::router::AUTO_MODEL_NAME {
+    let (route, variant) = if model == crate::router::AUTO_MODEL_NAME {
         // Span bookkeeping for the routing decision. Only the traced branch
         // below reads it, so an untraced request does not pay for the clock
         // read — nor does any non-auto request, which never enters this block.
@@ -1252,7 +1306,8 @@ async fn proxy_handler_inner(
             Some(chosen) => {
                 tracing::debug!(chosen = %chosen.model_name, "auto-routed request");
                 model = chosen.model_name.clone();
-                Some(Arc::new(chosen))
+                // Candidates are real models only, never variants.
+                (Some(Arc::new(chosen)), None)
             }
             None => {
                 return error_json(
@@ -1262,22 +1317,36 @@ async fn proxy_handler_inner(
             }
         }
     } else {
-        let route = resolve_model(&state, &model).await;
-        // An alias resolves to the same route as the canonical name, so adopt
-        // the canonical name for everything downstream: admission, budgets, the
-        // response cache, the per-tenant allowlist, and the usage ledger. This
-        // is the same move `auto` makes after it picks — without it, one
+        // A variant resolves to its parent's route with the variant's boons
+        // added (`serve_as`); an alias to the parent's route as it is.
+        let (route, variant) = match resolve_model(&state, &model).await {
+            Some(r) => {
+                let (r, variant) = serve_as(r, &model);
+                (Some(r), variant)
+            }
+            None => (None, None),
+        };
+        // An alias or a variant resolves to the same route as the canonical
+        // name, so adopt the canonical name for everything downstream:
+        // admission, budgets, the response cache (a variant keeps entries of
+        // its own, below), the per-tenant allowlist, and the usage ledger.
+        // This is the same move `auto` makes after it picks — without it, one
         // model's traffic would split across every spelling clients happen to
-        // have pinned, and a tenant allowed `glm-5-3` would be refused for
-        // asking the same model by its old name.
+        // have pinned (and a variant would mint a second pool for the same
+        // backend), and a tenant allowed `glm-5-3` would be refused for asking
+        // the same model by its old name.
         if let Some(r) = route.as_ref() {
             if r.model_name != model {
-                tracing::debug!(alias = %model, model = %r.model_name, "resolved model alias");
+                tracing::debug!(requested = %model, model = %r.model_name, "resolved model alias or variant");
                 model = r.model_name.clone();
             }
         }
-        route
+        (route, variant)
     };
+    // The name the client used, for its usage row and response headers. The
+    // ledger's `model` stays the parent's.
+    req_meta.model_variant = variant.clone().unwrap_or_default();
+    served_variant.clone_from(&variant);
 
     if requires_registered_model(&path) {
         if model == "unknown" {
@@ -1319,9 +1388,14 @@ async fn proxy_handler_inner(
         return error_json(StatusCode::NOT_FOUND, "unknown endpoint");
     }
     // ---- per-tenant model allowlist (Phase 4) ----
+    // A variant is allowed by its parent's name, as an alias is, or by its
+    // own name, so a tenant can be given the variant alone.
     if !resolved.internal {
         if let Some(allowed) = &resolved.allowed_models {
-            if !allowed.iter().any(|m| m == &model) {
+            if !allowed
+                .iter()
+                .any(|m| m == &model || variant.as_deref() == Some(m.as_str()))
+            {
                 return error_json(StatusCode::FORBIDDEN, "model not permitted for tenant");
             }
         }
@@ -1382,6 +1456,7 @@ async fn proxy_handler_inner(
             route.as_deref(),
             &resolved,
             &req_meta.session_id,
+            request_id,
             boons_opt_out,
             boons_force_lossy,
             is_chat_path(&path),
@@ -1477,8 +1552,15 @@ async fn proxy_handler_inner(
     let cache_ttl = route.as_ref().map(|r| r.cache_ttl_secs).unwrap_or(0);
     // TTL <= 0 means "don't cache": nothing is ever written, so a lookup could
     // never hit and would only cost a Redis round-trip.
-    let cache_key = (cache_enabled && cache_ttl > 0)
-        .then(|| obleth_config::cache_key(&resolved.tenant_id.to_string(), &model, &body_bytes));
+    // Keyed by the variant's name when the client used one: its boons can
+    // change the answer, so it must not share entries with its parent.
+    let cache_key = (cache_enabled && cache_ttl > 0).then(|| {
+        obleth_config::cache_key(
+            &resolved.tenant_id.to_string(),
+            variant.as_deref().unwrap_or(&model),
+            &body_bytes,
+        )
+    });
     if let Some(ck) = &cache_key {
         let cache_start = crate::tracer::now_ms();
         let cache_result = state
@@ -1574,11 +1656,7 @@ async fn proxy_handler_inner(
     // Requests with no registered route share one pool, so arbitrary model
     // strings cannot each mint scheduler state.
     let admission_start = crate::tracer::now_ms();
-    let pool = if route.is_some() {
-        obleth_fairshare::PoolKey::Model(model.clone())
-    } else {
-        obleth_fairshare::PoolKey::Unrouted
-    };
+    let pool = admission_pool(route.as_deref());
     let admit_wait = admission_timeout();
     let admit = state.fairshare.admit_to(
         pool,
@@ -1982,6 +2060,7 @@ async fn proxy_handler_inner(
                 route: spec_route,
                 key: &resolved,
                 session_id: &req_meta.session_id,
+                request_id,
                 dispatch_timeout: req_timeout,
                 started: request_start,
             };
@@ -1991,6 +2070,7 @@ async fn proxy_handler_inner(
                     body,
                     input_tokens,
                     output_tokens,
+                    drafted_by,
                 } => {
                     drop(permit);
                     let total_ms = request_start.elapsed().as_millis() as u32;
@@ -2010,6 +2090,7 @@ async fn proxy_handler_inner(
                         .status(StatusCode::OK)
                         .header(header::CONTENT_TYPE, "application/json")
                         .header("x-obleth-request-id", request_id.to_string())
+                        .header(crate::boons::speculation::DRAFTED_BY_HEADER, drafted_by)
                         .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
                     if !boons_applied.is_empty() {
                         builder =
@@ -2021,7 +2102,7 @@ async fn proxy_handler_inner(
                             error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
                         });
                 }
-                crate::boons::speculation::Outcome::Stream(driver) => {
+                crate::boons::speculation::Outcome::Stream { driver, drafted_by } => {
                     accounting.arm_estimate(&mut settle_guard);
                     let body_stream = async_stream::stream! {
                         futures_util::pin_mut!(driver);
@@ -2051,6 +2132,7 @@ async fn proxy_handler_inner(
                         .status(StatusCode::OK)
                         .header(header::CONTENT_TYPE, "text/event-stream")
                         .header("x-obleth-request-id", request_id.to_string())
+                        .header(crate::boons::speculation::DRAFTED_BY_HEADER, drafted_by)
                         .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
                     if !boons_applied.is_empty() {
                         builder =
@@ -2536,6 +2618,7 @@ async fn proxy_handler_inner(
                         route: (*route_owned).clone(),
                         key: (*resolved).clone(),
                         session_id: req_meta.session_id.clone(),
+                        request_id,
                         base_request: loop_plan.request.clone(),
                         tool_servers: loop_plan.tool_servers.clone(),
                         settings: loop_plan.settings.clone(),
@@ -2657,6 +2740,7 @@ async fn proxy_handler_inner(
                     route.as_deref(),
                     &resolved,
                     &req_meta.session_id,
+                    request_id,
                     req_timeout,
                     body_json,
                     tracer.as_mut(),
@@ -2672,6 +2756,7 @@ async fn proxy_handler_inner(
                         &guard_plan.policy,
                         &resolved,
                         &req_meta.session_id,
+                        request_id,
                         body_json,
                         tracer.as_mut(),
                     )
@@ -4153,6 +4238,11 @@ fn model_visible(allowed: Option<&[String]>, model_name: &str) -> bool {
 /// The OpenAI `{object:"list", data:[…]}` listing for a registry snapshot,
 /// sorted by id and limited to `allowed` when set. Pure, so the shape is
 /// unit-testable without a registry.
+///
+/// Each variant is an entry of its own, after its model: unlike an alias it
+/// changes what the caller gets, so it is meant to be found. Variants are
+/// never auto-router candidates; they only appear here because their model
+/// is one.
 fn registry_models_list(
     candidates: &[obleth_config::routing::Candidate],
     allowed: Option<&[String]>,
@@ -4160,17 +4250,27 @@ fn registry_models_list(
     let mut data: Vec<serde_json::Value> = candidates
         .iter()
         .filter(|c| c.model.enabled && is_listed_model_type(&c.model.model_type))
-        .filter(|c| model_visible(allowed, &c.model.model_name))
-        .map(|c| model_entry(&ModelFacts::of(&c.model)))
+        .flat_map(|c| {
+            std::iter::once(ModelFacts::of(&c.model)).chain(
+                c.model
+                    .variants
+                    .iter()
+                    .map(|v| ModelFacts::of_variant(&c.model, v)),
+            )
+        })
+        .filter(|f| f.visible(allowed))
+        .map(|f| model_entry(&f))
         .collect();
     data.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
     data.dedup_by(|a, b| a["id"] == b["id"]);
     serde_json::json!({ "object": "list", "data": data })
 }
 
-/// One discovery entry (`/v1/models` and `/v1/models/{id}`).
+/// One discovery entry (`/v1/models` and `/v1/models/{id}`). A variant's
+/// entry also names the model it is served by, says what it is for, and lists
+/// the boons a request through it runs with.
 fn model_entry(facts: &ModelFacts) -> serde_json::Value {
-    serde_json::json!({
+    let mut entry = serde_json::json!({
         "id": facts.model_name,
         "object": "model",
         "owned_by": "obleth",
@@ -4179,19 +4279,39 @@ fn model_entry(facts: &ModelFacts) -> serde_json::Value {
         "quantization": facts.quantization,
         "tags": facts.tags,
         "aliases": facts.aliases,
-    })
+    });
+    if let (Some(v), Some(obj)) = (&facts.variant, entry.as_object_mut()) {
+        obj.insert("variant_of".into(), v.parent.clone().into());
+        obj.insert("description".into(), v.description.clone().into());
+        obj.insert("boons".into(), v.boons.clone().into());
+    }
+    entry
 }
 
-/// What the gateway knows about one registered route, as the discovery
-/// endpoints report it.
+/// What the gateway knows about one registered route, or one variant of it,
+/// as the discovery endpoints report it.
 #[derive(Debug, Clone, PartialEq)]
 struct ModelFacts {
-    /// The one name the gateway advertises for this route.
+    /// The one name the gateway advertises for this entry: the route's
+    /// `model_name`, or the variant's own name.
     model_name: String,
     model_type: String,
     quantization: String,
     aliases: Vec<String>,
     tags: Vec<String>,
+    /// Set on a variant's entry.
+    variant: Option<VariantFacts>,
+}
+
+/// The variant-only part of a discovery entry.
+#[derive(Debug, Clone, PartialEq)]
+struct VariantFacts {
+    /// The model the variant is served by.
+    parent: String,
+    description: String,
+    /// The boons a request through the variant runs with: the model's own,
+    /// then the variant's.
+    boons: Vec<String>,
 }
 
 impl ModelFacts {
@@ -4202,13 +4322,39 @@ impl ModelFacts {
             quantization: model.quantization.clone(),
             aliases: model.aliases.clone(),
             tags: model.tags.clone(),
+            variant: None,
         }
+    }
+
+    fn of_variant(model: &ResolvedModel, variant: &obleth_config::ModelVariant) -> Self {
+        ModelFacts {
+            model_name: variant.name.clone(),
+            aliases: Vec::new(),
+            variant: Some(VariantFacts {
+                parent: model.model_name.clone(),
+                description: variant.description.clone(),
+                boons: obleth_config::union_boons(&model.boons, &variant.boons),
+            }),
+            ..ModelFacts::of(model)
+        }
+    }
+
+    /// Whether a caller limited to `allowed` may see this entry: by the
+    /// route's name, or for a variant by its parent's name or its own (the
+    /// same rule the request path's allowlist applies).
+    fn visible(&self, allowed: Option<&[String]>) -> bool {
+        model_visible(allowed, &self.model_name)
+            || self
+                .variant
+                .as_ref()
+                .is_some_and(|v| model_visible(allowed, &v.parent))
     }
 }
 
 /// Index every name a registered route can be recognized by — its
 /// `model_name`, its aliases, and the `upstream_model` its backend reports —
-/// onto the facts the gateway advertises for it.
+/// onto the facts the gateway advertises for it, and each of its variants
+/// onto that variant's own entry.
 ///
 /// The `upstream_model` key lets a detail lookup by a backend's own id (a
 /// client that learned `glm-5-3-mxfp4` from the backend) answer with the
@@ -4238,6 +4384,14 @@ fn model_facts_index(
     for (c, f) in candidates.iter().zip(facts.iter()) {
         for alias in &c.model.aliases {
             by_name.entry(alias.clone()).or_insert_with(|| f.clone());
+        }
+    }
+    // A variant answers with its own entry, not its parent's.
+    for c in &candidates {
+        for v in &c.model.variants {
+            by_name
+                .entry(v.name.clone())
+                .or_insert_with(|| std::sync::Arc::new(ModelFacts::of_variant(&c.model, v)));
         }
     }
     for f in facts {
@@ -4294,7 +4448,7 @@ fn registered_model_entry(
     }
     let candidates = state.model_registry.load();
     let facts = model_facts_index(&candidates).get(id)?.clone();
-    if !model_visible(allowed, &facts.model_name) {
+    if !facts.visible(allowed) {
         return Some(Err(()));
     }
     Some(Ok(model_entry(&facts)))
@@ -4368,6 +4522,8 @@ fn model_info_entry(model: &ResolvedModel, healthy: bool) -> serde_json::Value {
             "model_type": model.model_type,
             "quantization": model.quantization,
             "aliases": model.aliases,
+            // Names that serve this model with more boons on.
+            "variants": model.variants,
             "tags": model.tags,
             "boons": model.boons,
             "supports_tool_choice": model.supports_tool_choice,
@@ -5014,6 +5170,9 @@ pub(crate) struct RequestMeta {
     /// The end user the caller named, on keys with `end_user_fairshare` on
     /// (see [`end_user_for`]), else empty.
     pub(crate) end_user: String,
+    /// The variant name the client called the model by, else empty. The
+    /// ledger's `model` is the parent's either way.
+    pub(crate) model_variant: String,
 }
 
 /// Classify a request by its OpenAI-style path suffix. Matching the suffix (not
@@ -5353,6 +5512,9 @@ pub(crate) fn finalize(
         request_type: meta.request_type.to_string(),
         device_id: meta.device_id.clone(),
         end_user: meta.end_user.clone(),
+        // The client request's own row; helper rows carry its id instead.
+        parent_request_id: Uuid::nil(),
+        model_variant: meta.model_variant.clone(),
     });
 }
 
@@ -6217,6 +6379,128 @@ mod tests {
         assert!(!index.contains_key("wildcard-passthrough"));
     }
 
+    fn with_variants(
+        mut c: obleth_config::routing::Candidate,
+    ) -> obleth_config::routing::Candidate {
+        c.model.boons = vec!["vision".into()];
+        c.model.variants = vec![obleth_config::ModelVariant {
+            name: "glm-5-3-spec".into(),
+            description: "Drafted by a small model, verified by this one".into(),
+            boons: vec!["speculation".into()],
+        }];
+        c
+    }
+
+    #[test]
+    fn models_listing_lists_each_variant_as_its_own_entry() {
+        use super::{model_entry, model_facts_index, registry_models_list};
+        let candidates = vec![with_variants(candidate(
+            "glm-5-3",
+            "glm-5-3-mxfp4",
+            "chat",
+            "mxfp4",
+            &["glm-5-3-fp8"],
+            &["coding"],
+        ))];
+        let list = registry_models_list(&candidates, None);
+        let data = list["data"].as_array().unwrap();
+        let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
+        // Aliases stay out of the listing; a variant is listed by its name.
+        assert_eq!(ids, vec!["glm-5-3", "glm-5-3-spec"]);
+        let spec = &data[1];
+        assert_eq!(spec["variant_of"], "glm-5-3");
+        assert_eq!(
+            spec["description"],
+            "Drafted by a small model, verified by this one"
+        );
+        assert_eq!(spec["boons"], serde_json::json!(["vision", "speculation"]));
+        assert_eq!(spec["mode"], "chat");
+        assert_eq!(spec["quantization"], "mxfp4");
+        assert_eq!(spec["aliases"], serde_json::json!([]));
+        // The parent's own entry is unchanged by having variants.
+        assert!(data[0].get("variant_of").is_none());
+        // A detail lookup by the variant's name answers with its entry.
+        let detail = model_entry(&model_facts_index(&candidates)["glm-5-3-spec"]);
+        assert_eq!(&detail, spec);
+    }
+
+    #[test]
+    fn a_variant_is_listed_to_tenants_allowed_its_model_or_its_name() {
+        use super::registry_models_list;
+        let candidates = vec![with_variants(candidate(
+            "glm-5-3",
+            "glm-5-3",
+            "chat",
+            "none",
+            &[],
+            &[],
+        ))];
+        let ids = |allowed: &[&str]| -> Vec<String> {
+            let allowed: Vec<String> = allowed.iter().map(|a| a.to_string()).collect();
+            registry_models_list(&candidates, Some(&allowed))["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(ids(&["glm-5-3"]), vec!["glm-5-3", "glm-5-3-spec"]);
+        assert_eq!(ids(&["glm-5-3-spec"]), vec!["glm-5-3-spec"]);
+        assert!(ids(&["other"]).is_empty());
+    }
+
+    #[test]
+    fn a_variant_is_served_by_its_parent_with_its_boons_added() {
+        use super::{admission_pool, serve_as};
+        let parent = std::sync::Arc::new(
+            with_variants(candidate(
+                "glm-5-3",
+                "glm-5-3-mxfp4",
+                "chat",
+                "mxfp4",
+                &[],
+                &[],
+            ))
+            .model,
+        );
+
+        let (served, variant) = serve_as(parent.clone(), "glm-5-3-spec");
+        assert_eq!(variant.as_deref(), Some("glm-5-3-spec"));
+        assert_eq!(served.boons, vec!["vision", "speculation"]);
+        // One backend, one pool: the variant queues with its parent and keeps
+        // every capacity, pricing and upstream field.
+        assert_eq!(served.model_name, "glm-5-3");
+        assert_eq!(admission_pool(Some(&served)), admission_pool(Some(&parent)));
+        assert_eq!(
+            admission_pool(Some(&served)),
+            obleth_fairshare::PoolKey::Model("glm-5-3".into())
+        );
+        assert_eq!(served.max_in_flight, parent.max_in_flight);
+        assert_eq!(served.capacity_mode, parent.capacity_mode);
+        assert_eq!(served.upstream_model, parent.upstream_model);
+        assert_eq!(served.endpoints, parent.endpoints);
+        assert_eq!(served.input_cost_per_token, parent.input_cost_per_token);
+
+        // The model's own name (and an alias) serve it exactly as it is.
+        for name in ["glm-5-3", "glm-5-3-fp8"] {
+            let (served, variant) = serve_as(parent.clone(), name);
+            assert!(variant.is_none());
+            assert!(std::sync::Arc::ptr_eq(&served, &parent), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_variant_header_is_set_only_for_a_variant() {
+        use super::{error_json, with_variant_header, MODEL_VARIANT_HEADER};
+        let resp = with_variant_header(
+            error_json(StatusCode::SERVICE_UNAVAILABLE, "busy"),
+            Some("glm-5-3-spec"),
+        );
+        assert_eq!(resp.headers()[MODEL_VARIANT_HEADER], "glm-5-3-spec");
+        let resp = with_variant_header(error_json(StatusCode::OK, "ok"), None);
+        assert!(resp.headers().get(MODEL_VARIANT_HEADER).is_none());
+    }
+
     #[test]
     fn model_info_paths_are_recognized_bare_and_under_v1() {
         use super::{is_model_info_endpoint, is_models_endpoint};
@@ -6234,6 +6518,7 @@ mod tests {
         obleth_config::ResolvedModel {
             model_name: "m".into(),
             aliases: Vec::new(),
+            variants: Vec::new(),
             quantization: "unknown".into(),
             upstream_model: "m".into(),
             api_base: "http://primary/v1".into(),
@@ -7229,6 +7514,7 @@ mod tests {
             request_type: "chat",
             device_id: "dev-1".into(),
             end_user: String::new(),
+            model_variant: String::new(),
         };
         assert_eq!(meta.device_id, "dev-1");
     }
@@ -7237,6 +7523,7 @@ mod tests {
         ResolvedModel {
             model_name: name.to_string(),
             aliases: Vec::new(),
+            variants: Vec::new(),
             quantization: "unknown".into(),
             upstream_model: name.to_string(),
             api_base: "http://upstream".to_string(),
@@ -7592,19 +7879,51 @@ mod lifecycle_tests {
         s.chars().filter(|c| !c.is_whitespace()).collect()
     }
 
-    /// `proxy_handler_inner`'s source, for ordering pins (there is no
+    /// `run_pipeline`'s source, for ordering pins (there is no
     /// AppState harness in this crate: it needs live Redis and ClickHouse).
     fn handler() -> &'static str {
         let src = include_str!("proxy.rs");
         let src = &src[..src.find("\nmod tests {").expect("the test module")];
-        let start = src
-            .find("async fn proxy_handler_inner(")
-            .expect("proxy_handler_inner");
+        let start = src.find("async fn run_pipeline(").expect("run_pipeline");
         let end = start
             + src[start..]
                 .find("\n/// Drops the usage-only SSE event")
                 .expect("end of the handler");
         &src[start..end]
+    }
+
+    #[test]
+    fn a_variant_is_admitted_to_its_parents_pool() {
+        let h = squash(handler());
+        let serve = h.find("serve_as(r,&model)").expect("variant resolution");
+        let adopt = h
+            .find("model=r.model_name.clone();")
+            .expect("parent name adopted");
+        let pool = h
+            .find("letpool=admission_pool(route.as_deref());")
+            .expect("pool keyed by the served route");
+        let admit = h.find(".admit_to(").expect("admission");
+        assert!(serve < adopt && adopt < pool && pool < admit);
+        // The ledger and the allowlist see the parent name; the variant rides
+        // on the request's metadata for its usage row and response header.
+        assert!(h[serve..pool].contains("req_meta.model_variant="));
+        assert!(h[serve..pool].contains("served_variant.clone_from(&variant);"));
+    }
+
+    #[test]
+    fn a_committed_cascade_says_who_drafted_the_answer() {
+        let h = squash(handler());
+        let spec = h.find("speculation::run(").expect("speculation");
+        let dispatch = h.find("letprepared_body").expect("normal dispatch");
+        assert_eq!(
+            h[spec..dispatch]
+                .matches(".header(crate::boons::speculation::DRAFTED_BY_HEADER,drafted_by)")
+                .count(),
+            2,
+            "both the buffered and the streamed commit carry the header"
+        );
+        // Nothing after the cascade abstained claims a drafter.
+        assert!(!h[dispatch..].contains("DRAFTED_BY_HEADER"));
     }
 
     #[test]

@@ -39,23 +39,26 @@ let root: Root;
 let host: HTMLDivElement;
 const frame = () => act(async () => { await new Promise((r) => requestAnimationFrame(() => r(null))); });
 
-async function render() {
+async function render(m: ModelRoute = model) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, enabled: false } } });
   await act(async () => {
     root.render(
       <QueryClientProvider client={client}>
-        <ModelSettings model={model} summary={summary} checks={[]} mcpServers={[]} modelNames={["m"]} boonBlockers={{}} load={{ inFlight: 3, cap: 16, queued: 0 }} onStateChange={() => {}} />
+        <ModelSettings model={m} summary={summary} checks={[]} mcpServers={[]} modelNames={["m"]} boonBlockers={{}} load={{ inFlight: 3, cap: 16, queued: 0 }} onStateChange={() => {}} />
       </QueryClientProvider>,
     );
   });
   await frame();
 }
 
-function type(name: string, value: string) {
-  const el = host.querySelector<HTMLInputElement>(`[name="${name}"]`)!;
+function typeInto(el: HTMLInputElement, value: string) {
   const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
   setter.call(el, value);
   el.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+function type(name: string, value: string) {
+  typeInto(host.querySelector<HTMLInputElement>(`[name="${name}"]`)!, value);
 }
 
 const bar = () => host.querySelector('[aria-label="Unsaved changes"]');
@@ -161,5 +164,62 @@ describe("the model settings form", () => {
     await frame();
     expect(host.querySelector<HTMLInputElement>('input[type="hidden"][name="input_cost_per_token"]')!.value).toBe("0.0000012");
     expect(bar()!.textContent).toContain("Price");
+  });
+});
+
+describe("a model's variants", () => {
+  const withVariant: ModelRoute = { ...model, variants: [{ name: "m-spec", description: "Faster answers", boons: ["speculation"] }] };
+  const variantsField = () => JSON.parse(host.querySelector<HTMLInputElement>('input[type="hidden"][name="variants"]')!.value);
+  const nameInputs = () => [...host.querySelectorAll<HTMLInputElement>('[aria-label="Variant name"]')];
+  const chip = (variant: string, boon: string) =>
+    [...host.querySelectorAll(`[aria-label="Boons ${variant} adds"] label`)].find((l) => l.textContent === boon)!.querySelector("input")!;
+
+  it("shows each stored variant, says what it adds, and opens with nothing to save", async () => {
+    await render(withVariant);
+    expect(bar()).toBeNull();
+    expect(nameInputs().map((i) => i.value)).toEqual(["m-spec"]);
+    expect(chip("m-spec", "Speculation").checked).toBe(true);
+    expect(host.querySelector("#set-variants")!.textContent).toContain("m-spec reaches m with Speculation turned on as well.");
+    expect(variantsField()).toEqual([{ name: "m-spec", description: "Faster answers", boons: ["speculation"] }]);
+  });
+
+  it("adds a variant and saves it in the same model save", async () => {
+    await render();
+    await act(async () => button("Add a variant").click());
+    await act(async () => typeInto(nameInputs()[0], "m-spec"));
+    await act(async () => chip("m-spec", "Speculation").click());
+    await frame();
+    expect(bar()!.textContent).toContain("Variants");
+    expect(host.querySelector("#set-variants")!.hasAttribute("data-changed")).toBe(true);
+    await act(async () => button("Save changes").click());
+    await frame();
+    const data = vi.mocked(saveModelSettingsAction).mock.calls[0][0] as FormData;
+    expect(data.get("sections")).toBe("model");
+    expect(JSON.parse(String(data.get("variants")))).toEqual([{ name: "m-spec", description: "", boons: ["speculation"] }]);
+    expect(bar()!.textContent).toContain("Saved.");
+  });
+
+  it("counts a removed variant as a change, and Discard brings it back", async () => {
+    await render(withVariant);
+    await act(async () => button("Remove").click());
+    await frame();
+    expect(variantsField()).toEqual([]);
+    expect(bar()!.textContent).toContain("Variants");
+    await act(async () => button("Discard").click());
+    await frame();
+    expect(bar()).toBeNull();
+    expect(nameInputs().map((i) => i.value)).toEqual(["m-spec"]);
+  });
+
+  it("says why a name is taken and won't save it", async () => {
+    await render();
+    await act(async () => button("Add a variant").click());
+    await act(async () => typeInto(nameInputs()[0], "m"));
+    await frame();
+    expect(host.querySelector("#set-variants")!.textContent).toContain("That is this model's own name.");
+    expect(nameInputs()[0].validity.valid).toBe(false);
+    await act(async () => button("Save changes").click());
+    await frame();
+    expect(saveModelSettingsAction).not.toHaveBeenCalled();
   });
 });

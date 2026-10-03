@@ -1449,6 +1449,8 @@ fn build_probe_usage(
         request_type: HEALTH_PROBE_REQUEST_TYPE.to_string(),
         device_id: String::new(),
         end_user: String::new(),
+        parent_request_id: Uuid::nil(),
+        model_variant: String::new(),
     }
 }
 

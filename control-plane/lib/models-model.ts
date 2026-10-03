@@ -225,11 +225,11 @@ export interface ModelFilters {
 
 export const EMPTY_FILTERS: ModelFilters = { query: "", group: "all", status: "all", runs: "all", benchmarks: false };
 
-/** Name, alias, upstream, description or tag: every word of the query must match one of them. */
+/** Name, alias, variant, upstream, description or tag: every word of the query must match one of them. */
 export function matchesQuery(model: ModelRoute, query: string): boolean {
   const words = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
   if (words.length === 0) return true;
-  const hay = [model.model_name, model.upstream_model, model.description, model.api_base, ...(model.aliases ?? []), ...(model.tags ?? []).map((t) => parseTagLevel(t).base)]
+  const hay = [model.model_name, model.upstream_model, model.description, model.api_base, ...(model.aliases ?? []), ...(model.variants ?? []).map((v) => v.name), ...(model.tags ?? []).map((t) => parseTagLevel(t).base)]
     .join(" ")
     .toLowerCase();
   return words.every((w) => hay.includes(w));
@@ -343,6 +343,7 @@ export const SETTING_INDEX: SettingEntry[] = [
   { id: "set-description", label: "Description", section: "general" },
   { id: "set-type", label: "Model type", section: "general", keywords: "modality endpoint chat embedding image video audio" },
   { id: "set-aliases", label: "Aliases", section: "general", keywords: "other names rename old name" },
+  { id: "set-variants", label: "Variants", section: "general", keywords: "other names extra boons speculation spec", types: CHAT },
   { id: "set-quantization", label: "Quantization", section: "general", keywords: "format fp8 bf16 mxfp4 precision" },
   { id: "set-upstream", label: "Upstream model", section: "connection", keywords: "native name served model" },
   { id: "set-api-base", label: "API base URL", section: "connection", keywords: "url endpoint address host" },
@@ -413,6 +414,7 @@ const FIELD_LABELS: [RegExp, string][] = [
   [/^description$/, "Description"],
   [/^model_type$/, "Model type"],
   [/^aliases$/, "Aliases"],
+  [/^variants$/, "Variants"],
   [/^quantization$/, "Quantization"],
   [/^upstream_model$/, "Upstream model"],
   [/^api_base$/, "API base URL"],
@@ -478,6 +480,61 @@ export function changeSummary(fields: string[]): string[] {
 /** Whether any of a setting's fields (exact names, or prefixes ending in `_`) changed. */
 export function touches(changed: string[], fields: string[]): boolean {
   return changed.some((c) => fields.some((f) => (f.endsWith("_") ? c.startsWith(f) : c === f)));
+}
+
+// ---------------------------------------------------------------------------
+// Variants: more names for a model, each with extra boons on
+// ---------------------------------------------------------------------------
+
+/** The most variants the gateway keeps for one model. */
+export const MAX_VARIANTS = 8;
+
+/** One variant row as the settings page edits it. */
+export interface VariantDraft {
+  name: string;
+  description: string;
+  boons: string[];
+}
+
+export function variantDrafts(model: Pick<ModelRoute, "variants">): VariantDraft[] {
+  return (model.variants ?? []).map((v) => ({ name: v.name, description: v.description ?? "", boons: [...(v.boons ?? [])] }));
+}
+
+/**
+ * The variant rows as the settings form submits them: one JSON field, names
+ * and descriptions trimmed and boons in the editor's order, so an edit put
+ * back reads as no change. Boons the editor doesn't know keep their place at
+ * the end.
+ */
+export function variantsValue(rows: VariantDraft[], boonOrder: readonly string[]): string {
+  const rank = (b: string) => (boonOrder.includes(b) ? boonOrder.indexOf(b) : boonOrder.length);
+  return JSON.stringify(
+    rows.map((r) => ({
+      name: r.name.trim(),
+      description: r.description.trim(),
+      boons: [...new Set(r.boons)].sort((a, b) => rank(a) - rank(b)),
+    })),
+  );
+}
+
+/**
+ * Why row `index`'s name can't be saved, in a sentence, or null. A blank name
+ * is left to the field's own required check. The gateway checks again,
+ * against every model's names, aliases and variants.
+ */
+export function variantNameProblem(
+  rows: VariantDraft[],
+  index: number,
+  own: { name: string; aliases: string[]; otherModels: string[] },
+): string | null {
+  const name = rows[index]?.name.trim() ?? "";
+  if (!name) return null;
+  if (name === "auto") return "auto is the router's own name.";
+  if (name === own.name) return "That is this model's own name.";
+  if (own.aliases.includes(name)) return "That is already one of this model's aliases.";
+  if (own.otherModels.includes(name)) return "Another model is already called that.";
+  if (rows.some((r, i) => i < index && r.name.trim() === name)) return "Another variant already has that name.";
+  return null;
 }
 
 /**

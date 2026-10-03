@@ -481,6 +481,7 @@ async fn handler_inner(
         request_type: surfaced_request_type(&resolved, VERDICTS_PATH, &headers),
         device_id,
         end_user: end_user.clone().unwrap_or_default(),
+        model_variant: String::new(),
     };
     if let Some(t) = tracer.as_mut() {
         t.set_conversation(&req_meta.session_id, req_meta.session_id_source);
@@ -501,6 +502,7 @@ async fn handler_inner(
             &state,
             &resolved,
             &req_meta.session_id,
+            request_id,
             &mut scan_body,
             tracer.as_mut(),
         )

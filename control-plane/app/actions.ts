@@ -20,6 +20,7 @@ import type {
   ModelImportReport,
   ModelManifest,
   ModelRoute,
+  ModelVariantInput,
   RestoreReport,
   ResyncReport,
   UpdateAlertSettings,
@@ -1214,7 +1215,8 @@ async function modelRegistrationWarnings(body: {
 // Full replacement body for PUT /models/{id}, built from the current model so a
 // partial edit re-sends every field the gateway expects. `api_key` is omitted
 // on purpose: it is a write-only secret not returned by listModels, and sending
-// null would clear it. Callers spread this and override only their own fields.
+// null would clear it. `variants` is left out too: omitted, the gateway keeps
+// them. Callers spread this and override only their own fields.
 function toModelUpdateBody(model: ModelRoute) {
   return {
     upstream_model: model.upstream_model,
@@ -1305,6 +1307,7 @@ function modelSettingsBody(formData: FormData, current: ModelRoute) {
     model_type: text("model_type", current.model_type),
     quantization: text("quantization", current.quantization),
     ...(has("aliases") ? { aliases: aliasesFromForm(formData) } : {}),
+    ...(has("variants") ? { variants: variantsFromForm(formData) } : {}),
     upstream_model: text("upstream_model", current.upstream_model),
     api_base: text("api_base", current.api_base),
     ...(newKey ? { api_key: newKey } : {}),
@@ -2368,6 +2371,30 @@ function aliasesFromForm(formData: FormData): string[] {
     .filter((a) => a.length > 0);
 }
 
+// Parses the variants field (the settings page's rows, as JSON) into the list
+// the gateway stores. Rows without a name are dropped, as blank aliases are;
+// the gateway checks the rest (names already taken, unknown boons, the cap),
+// so a variant it refuses surfaces as a save error.
+function variantsFromForm(formData: FormData): ModelVariantInput[] {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(String(formData.get("variants") || "[]"));
+  } catch {
+    raw = null;
+  }
+  if (!Array.isArray(raw)) throw new Error("The variants could not be read. Reload the page and try again.");
+  return raw.flatMap((item: unknown) => {
+    const v = (item && typeof item === "object" ? item : {}) as Record<string, unknown>;
+    const name = typeof v.name === "string" ? v.name.trim() : "";
+    if (!name) return [];
+    return [{
+      name,
+      description: typeof v.description === "string" ? v.description.trim() : "",
+      boons: Array.isArray(v.boons) ? v.boons.filter((b): b is string => typeof b === "string") : [],
+    }];
+  });
+}
+
 // The upstream-headers textarea as an update field, only when the form has
 // one: a form without it (every other model tab) must leave the stored
 // headers alone, which the gateway does when the field is omitted.
@@ -2617,7 +2644,7 @@ export async function launchRecipeAction(recipeId: string, overrides: DeployOver
   try {
     const { createBody, managedBody } = buildManagedFromRecipe(recipe, overrides, await clusterValues());
     const models = await obleth.listModelsFresh();
-    if (models.some((m) => m.model_name === createBody.model_name || m.aliases?.includes(createBody.model_name))) {
+    if (models.some((m) => m.model_name === createBody.model_name || m.aliases?.includes(createBody.model_name) || m.variants?.some((v) => v.name === createBody.model_name))) {
       return { ok: false, error: `A model called ${createBody.model_name} already exists. Pick another name.` };
     }
     if (!managedBody.partition) return { ok: false, error: "Pick a partition." };

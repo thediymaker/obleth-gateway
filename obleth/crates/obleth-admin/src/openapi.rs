@@ -24,7 +24,7 @@ use crate::{
     CreateMcpServer, CreateModel, CreateModelEndpoint, CreateTenant, CreatedKey, EmailSettingsView,
     EnergySettingsView, EnergyTestResult, FairshareHistoryPointView, FairshareHistoryQuery,
     FairshareHistoryView, FairshareLiveView, GroupFairshareView, KeyFairshareView, ListKeysQuery,
-    LiveStats, McpServerView, ModelEndpointView, ModelPoolView, ModelRouteView,
+    LiveStats, McpServerView, ModelEndpointView, ModelPoolView, ModelRouteView, ModelVariantWrite,
     OverviewSummaryView, SetCapacity, SetDisabled, SetModelCache, SetModelCapacity,
     SetModelCapacityMode, SetModelReliability, SetModelWeight, SetTenantAllowlist, SetTenantBudget,
     SetTenantCompression, SetTenantGuardrails, SetTenantSchedule, SetTenantStatus,
@@ -38,7 +38,8 @@ use obleth_config::{
     ConfigBackup, FairshareGroup, FairshareGroupBackup, GuardrailsPolicy, ManagedModelSpec,
     ManifestEndpoint, ManifestModel, McpServerBackup, ModelBackup, ModelEndpointBackup,
     ModelHealthCheck, ModelHealthDetail, ModelHealthSummary, ModelImportEntry, ModelImportReport,
-    ModelManifest, ModelReplica, RestoreCounts, RestoreReport, Tenant, TenantBackup, WeeklyWindow,
+    ModelManifest, ModelReplica, ModelVariant, RestoreCounts, RestoreReport, Tenant, TenantBackup,
+    WeeklyWindow,
 };
 
 #[derive(OpenApi)]
@@ -288,6 +289,8 @@ use obleth_config::{
         ModelPoolView,
         CreateModel,
         UpdateModel,
+        ModelVariantWrite,
+        ModelVariant,
         SetModelCapacity,
         SetModelCapacityMode,
         ApplyAutotuneCapacity,
@@ -413,6 +416,7 @@ mod tests {
         for field in [
             "model_name",
             "aliases",
+            "variants",
             "quantization",
             "route_bias",
             "auto_eligible",
@@ -421,6 +425,38 @@ mod tests {
             assert!(
                 !description.is_empty(),
                 "ModelRouteView.{field} has no description"
+            );
+        }
+    }
+
+    #[test]
+    fn model_writes_document_variants() {
+        let doc = serde_json::to_value(ApiDoc::openapi()).expect("serialize");
+        let schemas = &doc["components"]["schemas"];
+        for write in ["CreateModel", "UpdateModel"] {
+            let description = schemas[write]["properties"]["variants"]["description"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(
+                !description.is_empty(),
+                "{write}.variants has no description"
+            );
+        }
+        for field in ["name", "description", "boons"] {
+            assert!(
+                schemas["ModelVariantWrite"]["properties"][field].is_object(),
+                "ModelVariantWrite.{field} is not documented"
+            );
+            assert!(
+                schemas["ModelVariant"]["properties"][field].is_object(),
+                "ModelVariant.{field} is not documented"
+            );
+        }
+        // The request log documents the new columns.
+        for field in ["parent_request_id", "model_variant"] {
+            assert!(
+                schemas["UsageLogRow"]["properties"][field].is_object(),
+                "UsageLogRow.{field} is not documented"
             );
         }
     }
