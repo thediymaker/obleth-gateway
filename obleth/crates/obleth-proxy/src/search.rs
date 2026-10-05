@@ -344,11 +344,14 @@ fn allowed_for(resolved: &ResolvedKey) -> Option<&[String]> {
     }
 }
 
-/// The enabled search tools a caller may use, sorted.
+/// The enabled search tools a caller may use, sorted. A retired tool is not
+/// one: it would only answer 410.
 fn tool_names(candidates: &[Candidate], allowed: Option<&[String]>) -> Vec<String> {
+    let now = chrono::Utc::now();
     let mut names: Vec<String> = candidates
         .iter()
         .filter(|c| c.model.enabled && c.model.model_type == SEARCH_MODEL_TYPE)
+        .filter(|c| c.model.lifecycle.status_at(now) != obleth_config::ModelStatus::Retired)
         .filter(|c| allowed.is_none_or(|list| list.iter().any(|m| m == &c.model.model_name)))
         .map(|c| c.model.model_name.clone())
         .collect();
@@ -404,6 +407,13 @@ async fn pick_tool(
     if !route.enabled {
         return Err(error_json(StatusCode::FORBIDDEN, "search tool is disabled"));
     }
+    // A retired tool is refused like a retired model, or stood in for by its
+    // replacement; the allowlist below then applies to whichever answers.
+    let route = match crate::lifecycle::gate(state, &route, chrono::Utc::now()).await {
+        crate::lifecycle::Gate::Serve(_) => route,
+        crate::lifecycle::Gate::Redirect(next, _) => next,
+        crate::lifecycle::Gate::Refuse(resp) => return Err(resp),
+    };
     if let Some(allowed) = allowed_for(resolved) {
         if !allowed.iter().any(|m| m == &route.model_name) {
             return Err(error_json(

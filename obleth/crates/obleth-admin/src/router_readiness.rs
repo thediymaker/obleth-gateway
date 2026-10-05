@@ -89,6 +89,8 @@ pub fn build_readiness(
             c.model.enabled
                 && c.model.auto_eligible
                 && c.model.model_type == obleth_config::DEFAULT_MODEL_TYPE
+                && c.model.lifecycle.status_at(chrono::Utc::now())
+                    == obleth_config::ModelStatus::Active
         })
         .collect();
 
@@ -272,6 +274,7 @@ mod tests {
         ResolvedModel {
             model_name: name.to_string(),
             aliases: Vec::new(),
+            lifecycle: Default::default(),
             variants: Vec::new(),
             quantization: "unknown".into(),
             upstream_model: name.to_string(),

@@ -266,7 +266,8 @@ pub async fn check_all(State(state): State<AdminState>) -> Result<Json<BulkModel
             .maintenance_until
             .map(|until| until > now)
             .unwrap_or(false);
-        if !model.enabled || !summary.checks_enabled || in_maintenance {
+        let retired = model.lifecycle.status_at(now) == obleth_config::ModelStatus::Retired;
+        if !model.enabled || !summary.checks_enabled || in_maintenance || retired {
             skipped += 1;
             continue;
         }
@@ -548,6 +549,11 @@ pub fn spawn_worker(state: AdminState) {
 }
 
 async fn run_claimed_check(state: &AdminState, claim: ModelHealthClaim) -> Result<()> {
+    // A retired model is not served, and its backend is usually gone: probing
+    // it would only raise an outage alert for something already switched off.
+    if claim.model.lifecycle.status_at(Utc::now()) == obleth_config::ModelStatus::Retired {
+        return Ok(());
+    }
     let outcome = run_model_health_check(state, claim.model, "scheduled").await?;
     maybe_alert(state, &outcome);
     Ok(())

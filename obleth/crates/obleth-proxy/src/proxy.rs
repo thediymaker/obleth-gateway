@@ -915,8 +915,13 @@ async fn proxy_handler_inner(
     request_id: Uuid,
 ) -> Response<Body> {
     let mut variant: Option<String> = None;
-    let resp = run_pipeline(state, req, request_id, &mut variant).await;
-    with_variant_header(resp, variant.as_deref())
+    let mut lifecycle: Option<crate::lifecycle::Notice> = None;
+    let resp = run_pipeline(state, req, request_id, &mut variant, &mut lifecycle).await;
+    let mut resp = with_variant_header(resp, variant.as_deref());
+    if let Some(notice) = &lifecycle {
+        crate::lifecycle::apply_headers(&mut resp, notice);
+    }
+    resp
 }
 
 /// `resp` with [`MODEL_VARIANT_HEADER`] set when the request named a variant.
@@ -963,6 +968,7 @@ async fn run_pipeline(
     req: Request<Body>,
     request_id: Uuid,
     served_variant: &mut Option<String>,
+    lifecycle_notice: &mut Option<crate::lifecycle::Notice>,
 ) -> Response<Body> {
     let request_start = Instant::now();
     let proxy_start_ms = crate::tracer::now_ms();
@@ -1182,7 +1188,7 @@ async fn run_pipeline(
     // shape (estimated context size, required capabilities) and live load. From
     // here on, everything downstream — admission, budgets, caching, telemetry,
     // upstream dispatch — sees the concrete model as if the client named it.
-    let (route, variant) = if model == crate::router::AUTO_MODEL_NAME {
+    let (mut route, mut variant) = if model == crate::router::AUTO_MODEL_NAME {
         // Span bookkeeping for the routing decision. Only the traced branch
         // below reads it, so an untraced request does not pay for the clock
         // read — nor does any non-auto request, which never enters this block.
@@ -1343,6 +1349,53 @@ async fn run_pipeline(
         }
         (route, variant)
     };
+    // ---- model lifecycle ----
+    // A deprecated model is served with headers saying so; a retired one is
+    // refused with 410 Gone, or answered by its replacement when the operator
+    // asked for that. A redirect drops the variant: it belongs to the retired
+    // model, and the replacement is served as itself. `auto` never gets here
+    // with either, since it does not pick them.
+    if let Some(r) = route.clone() {
+        match crate::lifecycle::gate(&state, &r, chrono::Utc::now()).await {
+            crate::lifecycle::Gate::Serve(notice) => *lifecycle_notice = notice,
+            crate::lifecycle::Gate::Redirect(next, notice) => {
+                tracing::debug!(retired = %model, served = %next.model_name, "retired model redirected to its replacement");
+                model = next.model_name.clone();
+                route = Some(next);
+                variant = None;
+                *lifecycle_notice = Some(notice);
+            }
+            crate::lifecycle::Gate::Refuse(resp) => {
+                // Recorded, so the operator can see who still calls the model
+                // and tell them before the 410s do.
+                req_meta.model_variant = variant.clone().unwrap_or_default();
+                let elapsed = request_start.elapsed().as_millis() as u32;
+                finalize(
+                    &state,
+                    request_id,
+                    &resolved,
+                    &req_meta,
+                    &model,
+                    Admission::Rejected,
+                    CostEstimate {
+                        input_tokens: 0,
+                        estimated_output_tokens: 0,
+                    },
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    elapsed,
+                    StatusCode::GONE.as_u16(),
+                    "off",
+                    0.0,
+                    crate::energy::EnergyFigures::default(),
+                );
+                return resp;
+            }
+        }
+    }
     // The name the client used, for its usage row and response headers. The
     // ledger's `model` stays the parent's.
     req_meta.model_variant = variant.clone().unwrap_or_default();
@@ -4244,6 +4297,10 @@ fn model_visible(allowed: Option<&[String]>, model_name: &str) -> bool {
 /// changes what the caller gets, so it is meant to be found. Variants are
 /// never auto-router candidates; they only appear here because their model
 /// is one.
+///
+/// A retired model is left out (with its variants), since calling it is
+/// refused; a deprecated one is listed, marked. Asking for a retired model by
+/// id still answers, so a caller can find out what replaced it.
 fn registry_models_list(
     candidates: &[obleth_config::routing::Candidate],
     allowed: Option<&[String]>,
@@ -4260,6 +4317,7 @@ fn registry_models_list(
             )
         })
         .filter(|f| f.visible(allowed))
+        .filter(|f| f.status != obleth_config::ModelStatus::Retired)
         .map(|f| model_entry(&f))
         .collect();
     data.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
@@ -4286,7 +4344,34 @@ fn model_entry(facts: &ModelFacts) -> serde_json::Value {
         obj.insert("description".into(), v.description.clone().into());
         obj.insert("boons".into(), v.boons.clone().into());
     }
+    // Only a model on its way out says anything about its lifecycle, so an
+    // active model's entry is unchanged.
+    if facts.status != obleth_config::ModelStatus::Active {
+        if let Some(obj) = entry.as_object_mut() {
+            obj.extend(lifecycle_fields(facts.status, &facts.lifecycle));
+        }
+    }
     entry
+}
+
+/// The lifecycle fields a discovery entry carries for a deprecated or retired
+/// model: `status`, plus `replacement`, `retire_at` and `note` when set.
+fn lifecycle_fields(
+    status: obleth_config::ModelStatus,
+    lifecycle: &obleth_config::ModelLifecycle,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    out.insert("status".into(), status.as_str().into());
+    if !lifecycle.replacement.is_empty() {
+        out.insert("replacement".into(), lifecycle.replacement.clone().into());
+    }
+    if let Some(at) = lifecycle.retired_on() {
+        out.insert("retire_at".into(), at.to_rfc3339().into());
+    }
+    if !lifecycle.note.is_empty() {
+        out.insert("note".into(), lifecycle.note.clone().into());
+    }
+    out
 }
 
 /// What the gateway knows about one registered route, or one variant of it,
@@ -4302,6 +4387,10 @@ struct ModelFacts {
     tags: Vec<String>,
     /// Set on a variant's entry.
     variant: Option<VariantFacts>,
+    /// The lifecycle in force now (a variant's is its model's), and the
+    /// status it gives.
+    lifecycle: obleth_config::ModelLifecycle,
+    status: obleth_config::ModelStatus,
 }
 
 /// The variant-only part of a discovery entry.
@@ -4324,6 +4413,8 @@ impl ModelFacts {
             aliases: model.aliases.clone(),
             tags: model.tags.clone(),
             variant: None,
+            lifecycle: model.lifecycle.clone(),
+            status: model.lifecycle.status_at(chrono::Utc::now()),
         }
     }
 
@@ -4488,6 +4579,9 @@ fn model_info_response(state: &AppState, resolved: &ResolvedKey) -> Response<Bod
         .iter()
         .filter(|c| c.model.enabled && is_listed_model_type(&c.model.model_type))
         .filter(|c| model_visible(allowed, &c.model.model_name))
+        .filter(|c| {
+            c.model.lifecycle.status_at(chrono::Utc::now()) != obleth_config::ModelStatus::Retired
+        })
         .map(|c| model_info_entry(&c.model, c.healthy))
         .collect();
     (
@@ -4500,7 +4594,8 @@ fn model_info_response(state: &AppState, resolved: &ResolvedKey) -> Response<Bod
 /// One `/model/info` entry. Split out so the payload shape is unit-testable
 /// without a registry or a request.
 fn model_info_entry(model: &ResolvedModel, healthy: bool) -> serde_json::Value {
-    serde_json::json!({
+    let status = model.lifecycle.status_at(chrono::Utc::now());
+    let mut entry = serde_json::json!({
         "model_name": model.model_name,
         "obleth_params": {
             // The name the backend serves, which is where a quantization
@@ -4537,8 +4632,17 @@ fn model_info_entry(model: &ResolvedModel, healthy: bool) -> serde_json::Value {
             // registered and addressable but currently failing its probe or
             // held in a maintenance window.
             "healthy": healthy,
+            "status": status.as_str(),
         },
-    })
+    });
+    if status != obleth_config::ModelStatus::Active {
+        if let Some(info) = entry["model_info"].as_object_mut() {
+            let mut fields = lifecycle_fields(status, &model.lifecycle);
+            fields.remove("status");
+            info.extend(fields);
+        }
+    }
+    entry
 }
 
 /// The OpenAI model-discovery endpoints: `GET /v1/models` (list), the
@@ -6317,6 +6421,56 @@ mod tests {
     }
 
     #[test]
+    fn retired_models_leave_the_listing_and_deprecated_ones_are_marked() {
+        use super::{model_entry, model_facts_index, model_info_entry, registry_models_list};
+        let now = chrono::Utc::now();
+        let mut old = candidate("glm-4-5v", "glm-4.5v", "chat", "fp8", &[], &[]);
+        old.model.lifecycle = obleth_config::ModelLifecycle {
+            status: obleth_config::ModelStatus::Deprecated,
+            replacement: "gemma4-31b-it".into(),
+            retire_at: Some(now + chrono::Duration::days(14)),
+            ..Default::default()
+        };
+        let mut gone = candidate("llama2-70b", "llama2", "chat", "fp16", &[], &[]);
+        gone.model.lifecycle.status = obleth_config::ModelStatus::Retired;
+        gone.model.variants = vec![obleth_config::ModelVariant {
+            name: "llama2-70b-spec".into(),
+            ..Default::default()
+        }];
+        let mut overdue = candidate("old-overdue", "x", "chat", "fp8", &[], &[]);
+        overdue.model.lifecycle = obleth_config::ModelLifecycle {
+            status: obleth_config::ModelStatus::Deprecated,
+            retire_at: Some(now - chrono::Duration::hours(1)),
+            ..Default::default()
+        };
+        let active = candidate("gemma4-31b-it", "gemma", "chat", "bf16", &[], &[]);
+        let candidates = vec![old, gone, overdue, active];
+
+        let list = registry_models_list(&candidates, None);
+        let data = list["data"].as_array().unwrap();
+        let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
+        // Retired (by status or by date) is gone, variants included.
+        assert_eq!(ids, vec!["gemma4-31b-it", "glm-4-5v"]);
+        let dep = &data[1];
+        assert_eq!(dep["status"], "deprecated");
+        assert_eq!(dep["replacement"], "gemma4-31b-it");
+        assert!(dep["retire_at"].is_string());
+        // An active model's entry is unchanged.
+        assert!(data[0].get("status").is_none());
+
+        // Asking for a retired model by id still says what became of it.
+        let detail = model_entry(&model_facts_index(&candidates)["llama2-70b"]);
+        assert_eq!(detail["status"], "retired");
+
+        let info = model_info_entry(&candidates[0].model, true);
+        assert_eq!(info["model_info"]["status"], "deprecated");
+        assert_eq!(info["model_info"]["replacement"], "gemma4-31b-it");
+        let info = model_info_entry(&candidates[3].model, true);
+        assert_eq!(info["model_info"]["status"], "active");
+        assert!(info["model_info"].get("replacement").is_none());
+    }
+
+    #[test]
     fn model_info_entry_uses_obleth_params_and_keeps_the_conventional_keys() {
         use super::model_info_entry;
         let mut model = model_with(Vec::new());
@@ -6519,6 +6673,7 @@ mod tests {
         obleth_config::ResolvedModel {
             model_name: "m".into(),
             aliases: Vec::new(),
+            lifecycle: Default::default(),
             variants: Vec::new(),
             quantization: "unknown".into(),
             upstream_model: "m".into(),
@@ -7524,6 +7679,7 @@ mod tests {
         ResolvedModel {
             model_name: name.to_string(),
             aliases: Vec::new(),
+            lifecycle: Default::default(),
             variants: Vec::new(),
             quantization: "unknown".into(),
             upstream_model: name.to_string(),
@@ -7909,6 +8065,35 @@ mod lifecycle_tests {
         // on the request's metadata for its usage row and response header.
         assert!(h[serve..pool].contains("req_meta.model_variant="));
         assert!(h[serve..pool].contains("served_variant.clone_from(&variant);"));
+    }
+
+    #[test]
+    fn the_lifecycle_gate_runs_after_resolution_and_before_the_allowlist() {
+        let h = squash(handler());
+        let serve = h.find("serve_as(r,&model)").expect("variant resolution");
+        let gate = h.find("crate::lifecycle::gate(").expect("lifecycle gate");
+        let allow = h.find("modelnotpermittedfortenant").expect("allowlist");
+        let pool = h
+            .find("letpool=admission_pool(route.as_deref());")
+            .expect("admission pool");
+        // Resolved first (aliases and variants answer for their model), then
+        // gated, so a redirect is allowlisted and admitted as the replacement.
+        assert!(serve < gate && gate < allow && allow < pool);
+        // A refusal is recorded before it is returned.
+        let refuse = h.find("Gate::Refuse(resp)").expect("refusal arm");
+        let ret = refuse + h[refuse..].find("returnresp;").expect("refusal returns");
+        assert!(h[refuse..ret].contains("finalize("));
+        assert!(h[refuse..ret].contains("StatusCode::GONE"));
+    }
+
+    #[test]
+    fn every_proxied_response_carries_the_lifecycle_notice() {
+        let src = squash(include_str!("proxy.rs"));
+        let start = src
+            .find("asyncfnproxy_handler_inner(")
+            .expect("inner handler");
+        let body = &src[start..start + 600];
+        assert!(body.contains("crate::lifecycle::apply_headers(&mutresp,notice)"));
     }
 
     #[test]

@@ -272,6 +272,7 @@ pub fn router(state: AdminState) -> Router {
         )
         .route("/api/v1/models/:id/weight", put(set_model_weight))
         .route("/api/v1/models/:id/capacity", put(set_model_capacity))
+        .route("/api/v1/models/:id/status", put(set_model_status))
         .route(
             "/api/v1/models/:id/capacity-mode",
             put(set_model_capacity_mode),
@@ -1292,6 +1293,31 @@ pub struct SetModelCapacity {
     pub max_in_flight: Option<i64>,
 }
 
+/// A model's lifecycle, replaced whole: an omitted field is cleared, and
+/// `active` clears them all.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetModelStatus {
+    /// `active`, `deprecated` (still served, with Deprecation/Sunset headers)
+    /// or `retired` (refused with 410 Gone, or served by the replacement when
+    /// `redirect` is on).
+    pub status: obleth_config::ModelStatus,
+    /// `model_name` of a registered model of the same type to move callers to.
+    #[serde(default)]
+    pub replacement: Option<String>,
+    /// When a deprecated model stops being served (RFC 3339). Once it passes,
+    /// the model is retired without another write.
+    #[serde(default)]
+    pub retire_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// A sentence for callers, repeated with the status (at most 500
+    /// characters).
+    #[serde(default)]
+    pub note: Option<String>,
+    /// Once retired, serve `replacement` instead of refusing. Needs a
+    /// replacement.
+    #[serde(default)]
+    pub redirect: Option<bool>,
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetModelCapacityMode {
     pub capacity_mode: String,
@@ -1805,6 +1831,12 @@ pub struct ModelRouteView {
     /// model's own). A variant shares the model's backend, capacity pool and
     /// prices; unlike an alias it is listed by the discovery endpoints.
     pub variants: Vec<obleth_config::ModelVariant>,
+    /// Active, deprecated or retired, with the replacement, retirement date
+    /// and note callers are shown. Set with `PUT /api/v1/models/{id}/status`.
+    pub lifecycle: obleth_config::ModelLifecycle,
+    /// The status in force now: a deprecated model past its retirement date
+    /// reads `retired` here while `lifecycle.status` still says `deprecated`.
+    pub effective_status: obleth_config::ModelStatus,
     /// Human-facing summary for operators and dashboards.
     pub description: String,
     /// Value sent to the upstream in the `model` field.
@@ -1972,6 +2004,7 @@ impl From<ModelRoute> for ModelRouteView {
             model_name,
             aliases,
             variants,
+            lifecycle,
             description,
             upstream_model,
             api_base,
@@ -2025,6 +2058,8 @@ impl From<ModelRoute> for ModelRouteView {
             model_name,
             aliases,
             variants,
+            effective_status: lifecycle.status_at(chrono::Utc::now()),
+            lifecycle,
             description,
             upstream_model,
             api_base,
@@ -6900,6 +6935,138 @@ async fn set_model_capacity(
     Ok(Json(model.into()))
 }
 
+/// The lifecycle `body` asks for on `existing`, validated against the model
+/// it names as the replacement (looked up by the caller; `None` when the body
+/// names none). `changed_at` moves only when the status does.
+fn lifecycle_from_request(
+    existing: &ModelRoute,
+    body: SetModelStatus,
+    replacement: Option<&ModelRoute>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<obleth_config::ModelLifecycle> {
+    use obleth_config::{ModelLifecycle, ModelStatus};
+    let changed_at = if body.status == existing.lifecycle.status {
+        existing.lifecycle.changed_at.or(Some(now))
+    } else {
+        Some(now)
+    };
+    if body.status == ModelStatus::Active {
+        return Ok(ModelLifecycle {
+            status: ModelStatus::Active,
+            changed_at,
+            ..Default::default()
+        });
+    }
+    let note = body
+        .note
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
+    if note.chars().count() > obleth_config::MAX_LIFECYCLE_NOTE_CHARS {
+        return Err(AdminError::BadRequest(format!(
+            "note is longer than {} characters",
+            obleth_config::MAX_LIFECYCLE_NOTE_CHARS
+        )));
+    }
+    let replacement_name = body
+        .replacement
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
+    if !replacement_name.is_empty() {
+        let Some(r) = replacement else {
+            return Err(AdminError::BadRequest(format!(
+                "replacement `{replacement_name}` is not a registered model"
+            )));
+        };
+        if r.id == existing.id {
+            return Err(AdminError::BadRequest(
+                "a model cannot be its own replacement".to_string(),
+            ));
+        }
+        if r.model_type != existing.model_type {
+            return Err(AdminError::BadRequest(format!(
+                "replacement `{}` is a `{}` model; it must be `{}` like `{}`",
+                r.model_name, r.model_type, existing.model_type, existing.model_name
+            )));
+        }
+        if r.lifecycle.status_at(now) == ModelStatus::Retired {
+            return Err(AdminError::BadRequest(format!(
+                "replacement `{}` is itself retired",
+                r.model_name
+            )));
+        }
+    }
+    let redirect = body.redirect.unwrap_or(false);
+    if redirect && replacement_name.is_empty() {
+        return Err(AdminError::BadRequest(
+            "redirect needs a replacement to send requests to".to_string(),
+        ));
+    }
+    Ok(ModelLifecycle {
+        status: body.status,
+        // The canonical name, even when the body used an alias.
+        replacement: replacement
+            .map(|r| r.model_name.clone())
+            .unwrap_or_default(),
+        retire_at: body.retire_at,
+        changed_at,
+        note,
+        redirect,
+    })
+}
+
+#[utoipa::path(
+    put, path = "/api/v1/models/{id}/status", tag = "models",
+    params(("id" = Uuid, Path, description = "Model id")),
+    request_body = SetModelStatus,
+    responses((status = 200, body = ModelRouteView))
+)]
+async fn set_model_status(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<SetModelStatus>,
+) -> Result<Json<ModelRouteView>> {
+    let existing = state.store.get_model(id).await?;
+    let replacement = match body
+        .replacement
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty() && body.status != obleth_config::ModelStatus::Active)
+    {
+        Some(name) => match state.store.get_model_by_name(name).await {
+            Ok(m) => Some(m),
+            Err(obleth_store::StoreError::NotFound) => None,
+            Err(e) => return Err(e.into()),
+        },
+        None => None,
+    };
+    let lifecycle =
+        lifecycle_from_request(&existing, body, replacement.as_ref(), chrono::Utc::now())?;
+    let model = state.store.set_model_lifecycle(id, &lifecycle).await?;
+    sync_model(&state, &model).await?;
+    state
+        .store
+        .record_audit(
+            &audit_actor(&headers),
+            "set_model_status",
+            "model",
+            &id.to_string(),
+            serde_json::json!({
+                "model_name": model.model_name,
+                "status": lifecycle.status,
+                "replacement": lifecycle.replacement,
+                "retire_at": lifecycle.retire_at,
+                "redirect": lifecycle.redirect,
+            }),
+        )
+        .await?;
+    Ok(Json(model.into()))
+}
+
 #[utoipa::path(
     put,
     path = "/api/v1/models/{id}/capacity-mode",
@@ -8185,6 +8352,7 @@ async fn sync_model_from(
     let resolved = ResolvedModel {
         model_name: model.model_name.clone(),
         aliases: model.aliases.clone(),
+        lifecycle: Default::default(),
         variants: model.variants.clone(),
         upstream_model: model.upstream_model.clone(),
         api_base: model.api_base.clone(),
@@ -10746,12 +10914,128 @@ mod tests {
 
     /// A model route with every field filled with sane defaults, for tests
     /// that only care about a couple of fields (e.g. `enabled`/`max_in_flight`).
+    fn status_body(status: obleth_config::ModelStatus) -> SetModelStatus {
+        SetModelStatus {
+            status,
+            replacement: None,
+            retire_at: None,
+            note: None,
+            redirect: None,
+        }
+    }
+
+    #[test]
+    fn deprecating_records_when_and_names_the_canonical_replacement() {
+        let now = chrono::Utc::now();
+        let old = fixture_model_route("glm-4-5v");
+        let new = fixture_model_route("gemma4-31b-it");
+        let mut body = status_body(obleth_config::ModelStatus::Deprecated);
+        body.replacement = Some("gemma-alias".into());
+        body.retire_at = Some(now + chrono::Duration::days(14));
+        body.note = Some("  Ask rc@asu.edu.  ".into());
+        let l = lifecycle_from_request(&old, body, Some(&new), now).unwrap();
+        assert_eq!(l.status, obleth_config::ModelStatus::Deprecated);
+        assert_eq!(l.replacement, "gemma4-31b-it", "canonical, not the alias");
+        assert_eq!(l.changed_at, Some(now));
+        assert_eq!(l.note, "Ask rc@asu.edu.");
+        assert!(!l.redirect);
+    }
+
+    #[test]
+    fn changed_at_moves_only_when_the_status_does() {
+        let t0 = chrono::Utc::now();
+        let t1 = t0 + chrono::Duration::days(2);
+        let mut old = fixture_model_route("glm-4-5v");
+        old.lifecycle.status = obleth_config::ModelStatus::Deprecated;
+        old.lifecycle.changed_at = Some(t0);
+        let same = lifecycle_from_request(
+            &old,
+            status_body(obleth_config::ModelStatus::Deprecated),
+            None,
+            t1,
+        )
+        .unwrap();
+        assert_eq!(same.changed_at, Some(t0), "editing the note keeps the date");
+        let retired = lifecycle_from_request(
+            &old,
+            status_body(obleth_config::ModelStatus::Retired),
+            None,
+            t1,
+        )
+        .unwrap();
+        assert_eq!(retired.changed_at, Some(t1));
+    }
+
+    #[test]
+    fn active_clears_everything_else() {
+        let now = chrono::Utc::now();
+        let old = fixture_model_route("glm-4-5v");
+        let mut body = status_body(obleth_config::ModelStatus::Active);
+        body.replacement = Some("anything".into());
+        body.note = Some("ignored".into());
+        body.redirect = Some(true);
+        let l = lifecycle_from_request(&old, body, None, now).unwrap();
+        assert_eq!(l.status, obleth_config::ModelStatus::Active);
+        assert!(l.replacement.is_empty() && l.note.is_empty() && !l.redirect);
+    }
+
+    #[test]
+    fn bad_replacements_and_redirects_are_refused() {
+        let now = chrono::Utc::now();
+        let old = fixture_model_route("glm-4-5v");
+        let refused = |body: SetModelStatus, r: Option<&ModelRoute>| {
+            matches!(
+                lifecycle_from_request(&old, body, r, now),
+                Err(AdminError::BadRequest(_))
+            )
+        };
+        let named = |name: &str| {
+            let mut b = status_body(obleth_config::ModelStatus::Deprecated);
+            b.replacement = Some(name.into());
+            b
+        };
+        // Not registered.
+        assert!(refused(named("ghost"), None));
+        // Itself.
+        assert!(refused(named("glm-4-5v"), Some(&old)));
+        // Another type.
+        let mut emb = fixture_model_route("embedder");
+        emb.model_type = "embedding".into();
+        assert!(refused(named("embedder"), Some(&emb)));
+        // Already retired.
+        let mut gone = fixture_model_route("gone");
+        gone.lifecycle.status = obleth_config::ModelStatus::Retired;
+        assert!(refused(named("gone"), Some(&gone)));
+        // A redirect with nowhere to go.
+        let mut b = status_body(obleth_config::ModelStatus::Retired);
+        b.redirect = Some(true);
+        assert!(refused(b, None));
+        // A note past the limit.
+        let mut b = status_body(obleth_config::ModelStatus::Deprecated);
+        b.note = Some("x".repeat(obleth_config::MAX_LIFECYCLE_NOTE_CHARS + 1));
+        assert!(refused(b, None));
+    }
+
+    #[test]
+    fn the_model_view_reports_the_status_in_force() {
+        let mut m = fixture_model_route("glm-4-5v");
+        m.lifecycle.status = obleth_config::ModelStatus::Deprecated;
+        m.lifecycle.retire_at = Some(chrono::Utc::now() - chrono::Duration::minutes(1));
+        let view: ModelRouteView = m.into();
+        assert_eq!(
+            view.lifecycle.status,
+            obleth_config::ModelStatus::Deprecated
+        );
+        assert_eq!(view.effective_status, obleth_config::ModelStatus::Retired);
+    }
+
     fn fixture_model_route(name: &str) -> ModelRoute {
         let now = chrono::Utc::now();
         ModelRoute {
             id: Uuid::new_v4(),
             model_name: name.to_string(),
             aliases: Vec::new(),
+            lifecycle: Default::default(),
             variants: Vec::new(),
             description: String::new(),
             upstream_model: name.to_string(),

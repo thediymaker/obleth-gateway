@@ -8,6 +8,7 @@ mod completion;
 mod energy;
 mod jwt_auth;
 mod knowledge;
+mod lifecycle;
 mod mcp;
 mod messages;
 mod metrics;
@@ -1559,6 +1560,7 @@ mod registry_refresh_tests {
         obleth_config::ResolvedModel {
             model_name: name.to_string(),
             aliases: Vec::new(),
+            lifecycle: Default::default(),
             variants: Vec::new(),
             upstream_model: name.to_string(),
             api_base: "http://upstream".to_string(),

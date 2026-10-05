@@ -23,6 +23,11 @@ import {
   variantNameProblem,
   variantsValue,
   type VariantDraft,
+  dateInputValue,
+  lifecycleLabel,
+  lifecycleStatus,
+  retireAtFromInput,
+  retiredMessage,
 } from "./models-model";
 import type { ModelHealthSummary, ModelRoute } from "./obleth";
 
@@ -262,5 +267,38 @@ describe("acceptsImages", () => {
   it("refuses them for a text-only model, and doesn't guess before the model is known", () => {
     expect(acceptsImages(text, true)).toBe(false);
     expect(acceptsImages(undefined, true)).toBeUndefined();
+  });
+});
+
+describe("lifecycle", () => {
+  it("reads an older gateway's model as active", () => {
+    expect(lifecycleStatus({})).toBe("active");
+    expect(lifecycleLabel({})).toBeNull();
+  });
+
+  it("prefers the status in force over the stored one", () => {
+    const overdue = { lifecycle: { status: "deprecated" as const, retire_at: "2026-01-01T00:00:00Z" }, effective_status: "retired" as const };
+    expect(lifecycleStatus(overdue)).toBe("retired");
+    expect(lifecycleLabel(overdue)).toBe("Retired");
+  });
+
+  it("labels a deprecation with its date and a redirect with its stand-in", () => {
+    expect(lifecycleLabel({ lifecycle: { status: "deprecated", retire_at: "2026-10-19T00:00:00Z" } })).toBe("Deprecated · retires Oct 19, 2026");
+    expect(lifecycleLabel({ lifecycle: { status: "deprecated" } })).toBe("Deprecated");
+    expect(lifecycleLabel({ lifecycle: { status: "retired", replacement: "gemma4-31b-it", redirect: true } })).toBe("Retired · answered by gemma4-31b-it");
+  });
+
+  it("words the refusal the way the gateway does", () => {
+    expect(retiredMessage("glm-4-5v", { status: "retired", replacement: "gemma4-31b-it", retire_at: "2026-10-19T00:00:00Z", note: "Ask rc." }))
+      .toBe("The model `glm-4-5v` was retired on 2026-10-19. Use `gemma4-31b-it` instead. Ask rc.");
+    expect(retiredMessage("glm-4-5v", { status: "retired", changed_at: "2026-10-20T13:00:00Z" })).toBe("The model `glm-4-5v` was retired on 2026-10-20.");
+    expect(retiredMessage("glm-4-5v", { status: "retired" })).toBe("The model `glm-4-5v` has been retired.");
+  });
+
+  it("maps a date input to midnight UTC and back", () => {
+    expect(retireAtFromInput("2026-10-19")).toBe("2026-10-19T00:00:00Z");
+    expect(retireAtFromInput("")).toBeNull();
+    expect(dateInputValue("2026-10-19T00:00:00Z")).toBe("2026-10-19");
+    expect(dateInputValue(null)).toBe("");
   });
 });
