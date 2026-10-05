@@ -8324,35 +8324,19 @@ async fn sync_model(state: &AdminState, model: &ModelRoute) -> Result<()> {
     sync_model_from(state, model, None).await
 }
 
-/// Republish a model into the resolver cache, evicting the keys it no longer
-/// owns.
-///
-/// `previous` is the row as it was before this write, and is only needed when
-/// aliases may have changed: an alias that was just dropped still has a live
-/// `obleth:model:<alias>` key pointing at this model, and nothing else in the
-/// system would ever clear it. Passing `None` (create, capacity toggle, any
-/// write that cannot touch aliases) publishes without an eviction pass.
-async fn sync_model_from(
-    state: &AdminState,
+/// The data plane's view of `model`, as `sync_model_from` publishes it under
+/// every name the model answers to. Every field the request path reads has to
+/// come from the row here: one left at its default is silently wrong on the
+/// hot path while the registry, read straight from Postgres, looks right.
+fn resolved_model_of(
     model: &ModelRoute,
-    previous: Option<&ModelRoute>,
-) -> Result<()> {
-    // Endpoints carry the per-cluster wire targets and health; the data plane
-    // prefers them over the legacy single api_base/api_key when present.
-    let endpoints = state
-        .store
-        .resolved_endpoints_for(model.id)
-        .await
-        .unwrap_or_default();
-    let knowledge_collections = state
-        .store
-        .model_collection_ids(model.id)
-        .await
-        .unwrap_or_default();
-    let resolved = ResolvedModel {
+    endpoints: Vec<obleth_config::ResolvedEndpoint>,
+    knowledge_collections: Vec<Uuid>,
+) -> ResolvedModel {
+    ResolvedModel {
         model_name: model.model_name.clone(),
         aliases: model.aliases.clone(),
-        lifecycle: Default::default(),
+        lifecycle: model.lifecycle.clone(),
         variants: model.variants.clone(),
         upstream_model: model.upstream_model.clone(),
         api_base: model.api_base.clone(),
@@ -8407,7 +8391,35 @@ async fn sync_model_from(
         verify_api_base: model.verify_api_base.clone(),
         verify_upstream_model: model.verify_upstream_model.clone(),
         endpoints,
-    };
+    }
+}
+
+/// Republish a model into the resolver cache, evicting the keys it no longer
+/// owns.
+///
+/// `previous` is the row as it was before this write, and is only needed when
+/// aliases may have changed: an alias that was just dropped still has a live
+/// `obleth:model:<alias>` key pointing at this model, and nothing else in the
+/// system would ever clear it. Passing `None` (create, capacity toggle, any
+/// write that cannot touch aliases) publishes without an eviction pass.
+async fn sync_model_from(
+    state: &AdminState,
+    model: &ModelRoute,
+    previous: Option<&ModelRoute>,
+) -> Result<()> {
+    // Endpoints carry the per-cluster wire targets and health; the data plane
+    // prefers them over the legacy single api_base/api_key when present.
+    let endpoints = state
+        .store
+        .resolved_endpoints_for(model.id)
+        .await
+        .unwrap_or_default();
+    let knowledge_collections = state
+        .store
+        .model_collection_ids(model.id)
+        .await
+        .unwrap_or_default();
+    let resolved = resolved_model_of(model, endpoints, knowledge_collections);
     // Aliases and variants the write removed: their keys would otherwise keep
     // resolving to this model forever. Done before the publish so a name moved
     // between the lists (alias to variant, or to canonical) is re-added, not
@@ -11014,6 +11026,28 @@ mod tests {
         let mut b = status_body(obleth_config::ModelStatus::Deprecated);
         b.note = Some("x".repeat(obleth_config::MAX_LIFECYCLE_NOTE_CHARS + 1));
         assert!(refused(b, None));
+    }
+
+    #[test]
+    fn the_published_model_carries_its_lifecycle() {
+        // The request path reads the published copy, not Postgres: a
+        // lifecycle left at its default here means a retired model is served.
+        let mut m = fixture_model_route("glm-4-5v");
+        m.lifecycle = obleth_config::ModelLifecycle {
+            status: obleth_config::ModelStatus::Retired,
+            replacement: "gemma4-31b-it".into(),
+            note: "Ask rc.".into(),
+            redirect: true,
+            ..Default::default()
+        };
+        m.variants = vec![obleth_config::ModelVariant {
+            name: "glm-4-5v-spec".into(),
+            ..Default::default()
+        }];
+        let resolved = resolved_model_of(&m, Vec::new(), Vec::new());
+        assert_eq!(resolved.lifecycle, m.lifecycle);
+        assert_eq!(resolved.variants, m.variants);
+        assert_eq!(resolved.model_name, "glm-4-5v");
     }
 
     #[test]
