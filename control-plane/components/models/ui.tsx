@@ -92,10 +92,18 @@ export function Sheet({ open, onClose, title, description, children, footer, wid
   open: boolean; onClose: () => void; title: string; description?: ReactNode; children: ReactNode; footer?: ReactNode; width?: string;
 }) {
   const panel = useRef<HTMLDivElement>(null);
+  // The latest onClose, read at the moment Escape is pressed. Keeping it out of
+  // the effect's dependencies matters: callers often pass a new function each
+  // render, and re-running the effect would pull focus back to the first field
+  // (and away from whatever someone is typing in) on every parent refresh.
+  const close = useRef(onClose);
+  useEffect(() => {
+    close.current = onClose;
+  });
   useEffect(() => {
     if (!open) return;
     const previous = document.activeElement as HTMLElement | null;
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") close.current(); };
     document.addEventListener("keydown", onKey);
     const frame = requestAnimationFrame(() => panel.current?.querySelector<HTMLElement>("input:not([type=hidden]), button, textarea")?.focus());
     return () => {
@@ -103,7 +111,7 @@ export function Sheet({ open, onClose, title, description, children, footer, wid
       cancelAnimationFrame(frame);
       previous?.focus?.();
     };
-  }, [open, onClose]);
+  }, [open]);
   if (!open) return null;
   return (
     <div className="fixed inset-0 z-50">
