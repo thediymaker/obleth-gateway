@@ -282,6 +282,11 @@ describe("lifecycle", () => {
     expect(lifecycleLabel(overdue)).toBe("Retired");
   });
 
+  it("labels a staged model as not listed yet", () => {
+    expect(lifecycleStatus({ lifecycle: { status: "staged" } })).toBe("staged");
+    expect(lifecycleLabel({ lifecycle: { status: "staged" } })).toBe("Staged · not listed yet");
+  });
+
   it("labels a deprecation with its date and a redirect with its stand-in", () => {
     expect(lifecycleLabel({ lifecycle: { status: "deprecated", retire_at: "2026-10-19T00:00:00Z" } })).toBe("Deprecated · retires Oct 19, 2026");
     expect(lifecycleLabel({ lifecycle: { status: "deprecated" } })).toBe("Deprecated");

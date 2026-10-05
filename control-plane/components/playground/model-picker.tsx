@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Braces, Check, Eye, Search, Wrench } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
+import { lifecycleStatus } from "@/lib/models-model";
 import type { FairshareLiveView, ModelRoute } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
 import { ModelAvatar, Pill, SectionLabel, capabilities, formatTokens, modelLabel, perMillion } from "./ui";
@@ -69,7 +70,13 @@ export function ModelPicker({ open, onOpenChange, models, selected, locked, onCh
     ];
     const registry = models
       .filter((m) => ["chat", "image"].includes(m.model_type) && !["auto", "charo"].includes(m.model_name))
-      .map<Entry>((m) => ({ name: m.model_name, label: m.model_name, detail: m.model_type === "image" ? "Image model" : "Chat model", kind: m.model_type === "image" ? "image" : "chat", model: m }));
+      .map<Entry>((m) => ({
+        name: m.model_name,
+        label: m.model_name,
+        detail: `${m.model_type === "image" ? "Image model" : "Chat model"}${lifecycleStatus(m) === "staged" ? " · staged, not listed yet" : ""}`,
+        kind: m.model_type === "image" ? "image" : "chat",
+        model: m,
+      }));
     return [...special, ...registry];
   }, [models]);
 

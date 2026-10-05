@@ -14,6 +14,7 @@ const models: LifecycleCandidate[] = [
   { name: "gemma4-31b-it", type: "chat", status: "active" },
   { name: "qwen3-vl-32b-instruct", type: "chat", status: "deprecated" },
   { name: "llama2-70b", type: "chat", status: "retired" },
+  { name: "qwen4-72b", type: "chat", status: "staged" },
   { name: "qwen3-embedding-8b", type: "embedding", status: "active" },
 ];
 
@@ -43,7 +44,7 @@ const radio = (value: string) => host.querySelector<HTMLInputElement>(`input[nam
 const saveButton = () => [...host.querySelectorAll("button")].find((b) => b.textContent?.includes("Save lifecycle"))!;
 
 describe("replacementOptions", () => {
-  it("offers same-type models that are still served, never the model itself", () => {
+  it("offers same-type models that are still served and listed, never the model itself", () => {
     expect(replacementOptions(base, models)).toEqual([
       { value: "gemma4-31b-it", label: "gemma4-31b-it" },
       { value: "qwen3-vl-32b-instruct", label: "qwen3-vl-32b-instruct (deprecated)" },
@@ -90,6 +91,30 @@ describe("LifecycleSection", () => {
     } as unknown as ModelRoute;
     await render(retired);
     expect(host.textContent).toContain("410 · The model `glm-4-5v` was retired on 2026-10-19. Use `gemma4-31b-it` instead. Ask rc.");
+  });
+
+  it("asks before making a staged model live", async () => {
+    const staged = { ...base, auto_eligible: true, lifecycle: { status: "staged" } } as unknown as ModelRoute;
+    const onChanged = await render(staged);
+    expect(radio("staged").checked).toBe(true);
+    expect(host.textContent).toContain("answers 404, as if it did not exist");
+    expect(host.textContent).not.toContain("Replacement");
+    await act(async () => radio("active").click());
+    await act(async () => saveButton().click());
+    expect(document.querySelector('[role="dialog"]')?.textContent).toContain("Make glm-4-5v live?");
+    expect(setModelStatusAction).not.toHaveBeenCalled();
+    const makeLive = [...document.querySelectorAll("button")].find((b) => b.textContent?.trim() === "Make live")!;
+    await act(async () => makeLive.click());
+    expect(setModelStatusAction).toHaveBeenCalledWith("u", { status: "active", replacement: null, retire_at: null, note: null, redirect: false });
+    expect(onChanged).toHaveBeenCalled();
+  });
+
+  it("stages an active model without asking", async () => {
+    await render();
+    await act(async () => radio("staged").click());
+    await act(async () => saveButton().click());
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(setModelStatusAction).toHaveBeenCalledWith("u", { status: "staged", replacement: null, retire_at: null, note: null, redirect: false });
   });
 
   it("lists who called it, and says so when nobody did", async () => {

@@ -345,13 +345,14 @@ fn allowed_for(resolved: &ResolvedKey) -> Option<&[String]> {
 }
 
 /// The enabled search tools a caller may use, sorted. A retired tool is not
-/// one: it would only answer 410.
+/// one: it would only answer 410. A staged tool is not listed either, and so
+/// is never the default; it answers only when named.
 fn tool_names(candidates: &[Candidate], allowed: Option<&[String]>) -> Vec<String> {
     let now = chrono::Utc::now();
     let mut names: Vec<String> = candidates
         .iter()
         .filter(|c| c.model.enabled && c.model.model_type == SEARCH_MODEL_TYPE)
-        .filter(|c| c.model.lifecycle.status_at(now) != obleth_config::ModelStatus::Retired)
+        .filter(|c| c.model.lifecycle.status_at(now).listed())
         .filter(|c| allowed.is_none_or(|list| list.iter().any(|m| m == &c.model.model_name)))
         .map(|c| c.model.model_name.clone())
         .collect();
@@ -1002,6 +1003,15 @@ mod tests {
         assert_eq!(tool_names(&candidates, None), vec!["news", "web"]);
         let allowed = vec!["web".to_string(), "glm-5-3".to_string()];
         assert_eq!(tool_names(&candidates, Some(&allowed)), vec!["web"]);
+    }
+
+    #[test]
+    fn a_staged_tool_is_neither_listed_nor_the_default() {
+        let mut staged = search_candidate("beta", "search", true);
+        staged.model.lifecycle.status = obleth_config::ModelStatus::Staged;
+        let candidates = vec![search_candidate("web", "search", true), staged];
+        // With "beta" listed there would be two tools and no default.
+        assert_eq!(tool_names(&candidates, None), vec!["web"]);
     }
 
     #[test]

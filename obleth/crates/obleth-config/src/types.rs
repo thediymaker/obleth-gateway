@@ -395,8 +395,8 @@ pub struct ModelRoute {
     /// keeps payloads written before variants existed readable as "none".
     #[serde(default)]
     pub variants: Vec<ModelVariant>,
-    /// Active, deprecated or retired, with the replacement and retirement
-    /// date (see [`ModelLifecycle`]). `#[serde(default)]` reads older payloads
+    /// Staged, active, deprecated or retired, with the replacement and
+    /// retirement date (see [`ModelLifecycle`]). `#[serde(default)]` reads older payloads
     /// as active.
     #[serde(default)]
     pub lifecycle: ModelLifecycle,
@@ -1869,6 +1869,10 @@ where
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelStatus {
+    /// Served by name, but not advertised: left out of `/v1/models`,
+    /// `/model/info` and the search tool list, and never picked by `auto`.
+    /// For trying a new model before callers can find it.
+    Staged,
     /// Served normally.
     #[default]
     Active,
@@ -1885,10 +1889,17 @@ pub enum ModelStatus {
 impl ModelStatus {
     pub fn as_str(self) -> &'static str {
         match self {
+            ModelStatus::Staged => "staged",
             ModelStatus::Active => "active",
             ModelStatus::Deprecated => "deprecated",
             ModelStatus::Retired => "retired",
         }
+    }
+
+    /// Whether the discovery endpoints advertise a model in this status: a
+    /// staged model is not advertised yet, and a retired one no longer is.
+    pub fn listed(self) -> bool {
+        matches!(self, ModelStatus::Active | ModelStatus::Deprecated)
     }
 }
 
@@ -4365,6 +4376,23 @@ mod tests {
             serde_json::to_value(&parsed).unwrap(),
             serde_json::json!({ "status": "active" })
         );
+    }
+
+    #[test]
+    fn a_staged_model_stays_staged_and_is_not_listed() {
+        let parsed: ModelLifecycle =
+            serde_json::from_value(serde_json::json!({ "status": "staged" })).unwrap();
+        assert_eq!(parsed.status, ModelStatus::Staged);
+        // A stray date does not move a staged model anywhere.
+        let dated = ModelLifecycle {
+            retire_at: Some(chrono::Utc::now() - chrono::Duration::days(1)),
+            ..parsed
+        };
+        assert_eq!(dated.status_at(chrono::Utc::now()), ModelStatus::Staged);
+        assert!(!ModelStatus::Staged.listed());
+        assert!(ModelStatus::Active.listed());
+        assert!(ModelStatus::Deprecated.listed());
+        assert!(!ModelStatus::Retired.listed());
     }
 
     #[test]
