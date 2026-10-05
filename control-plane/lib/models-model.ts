@@ -562,18 +562,28 @@ export function lifecycleDate(iso: string): string {
   return new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric", timeZone: "UTC" });
 }
 
+/** The one-word badge for each status in the models list. */
+export const LIFECYCLE_BADGES: Record<LifecycleStatus, string> = {
+  staged: "Staged",
+  active: "Active",
+  deprecated: "Deprecated",
+  retired: "Retired",
+};
+
 /** The status in force now, defaulting to active on a gateway without lifecycles. */
 export function lifecycleStatus(model: Pick<ModelRoute, "lifecycle" | "effective_status">): LifecycleStatus {
   return model.effective_status ?? model.lifecycle?.status ?? "active";
 }
 
 /**
- * The header pill for a model on its way out, or null when it is active:
- * "Deprecated · retires Oct 19, 2026", "Retired", "Retired · answered by gemma4-31b-it".
+ * The header pill for a model that is not plainly active, or null when it is:
+ * "Staged · not listed yet", "Deprecated · retires Oct 19, 2026", "Retired",
+ * "Retired · answered by gemma4-31b-it".
  */
 export function lifecycleLabel(model: Pick<ModelRoute, "lifecycle" | "effective_status">): string | null {
   const status = lifecycleStatus(model);
   const l = model.lifecycle;
+  if (status === "staged") return "Staged · not listed yet";
   if (status === "deprecated") return l?.retire_at ? `Deprecated · retires ${lifecycleDate(l.retire_at)}` : "Deprecated";
   if (status === "retired") return l?.redirect && l.replacement ? `Retired · answered by ${l.replacement}` : "Retired";
   return null;

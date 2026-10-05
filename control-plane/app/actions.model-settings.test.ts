@@ -210,6 +210,20 @@ describe("creating a model", () => {
     expect(result).toMatchObject({ ok: true, model: { id: "new-1", name: "fresh" }, enabled: true, check: null });
   });
 
+  it("creates it staged when the form asks, and active when it does not", async () => {
+    mockAdmin();
+    const obleth = gateway(model(), {
+      activateModel: vi.fn().mockResolvedValue({ enabled: true, activated: true, detail: { summary: { status: "healthy", last_message: null }, checks: [] } }),
+    });
+    const { createModelAction } = await import("./actions");
+    const staged = createForm();
+    staged.set("staged", "on");
+    await createModelAction(staged);
+    expect(obleth.createModel.mock.calls[0][0]).toMatchObject({ status: "staged" });
+    await createModelAction(createForm());
+    expect("status" in obleth.createModel.mock.calls[1][0]).toBe(false);
+  });
+
   it("leaves it off with the check's reason when the check fails", async () => {
     mockAdmin();
     gateway(model(), {

@@ -6,7 +6,7 @@ import { useRouter } from "next/navigation";
 import { ChevronDown, Upload } from "lucide-react";
 import { applyModelManifestAction, createModelAction, listUpstreamModelsAction } from "@/app/actions";
 import { ManifestPreview, ManifestResultBanner } from "@/components/model-import-review";
-import { Field, fromPerMillion, MODEL_TYPE_OPTIONS, SelectField, TextArea, UPSTREAM_HEADERS_HINT } from "@/components/models/fields";
+import { Field, fromPerMillion, MODEL_TYPE_OPTIONS, SelectField, Switch, TextArea, UPSTREAM_HEADERS_HINT } from "@/components/models/fields";
 import { Notice, Sheet } from "@/components/models/ui";
 import { Segmented } from "@/components/overview/ui";
 import { ProviderImportWizard } from "@/components/provider-import-wizard";
@@ -299,6 +299,12 @@ function ConnectForm({ models, onClose }: { models: ModelRoute[]; onClose: () =>
             <textarea name="description" aria-label="Description" rows={2} placeholder="What it's good for" className="flex w-full rounded-md border border-input bg-background px-3 py-2 text-[13px] shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring" />
           </div>
         </div>
+        <Switch name="staged" label="Start staged" defaultChecked>
+          <span className="block">Start staged</span>
+          <span className="block text-[11.5px] text-muted-foreground">
+            Only someone who sends its name can call it: it stays out of /v1/models and auto never picks it. Make it active on its page once you have tested it.
+          </span>
+        </Switch>
       </Group>
 
       <Group

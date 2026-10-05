@@ -18,7 +18,12 @@ export interface LifecycleCandidate {
 }
 
 const STATUSES: { value: LifecycleStatus; label: string; hint: string }[] = [
-  { value: "active", label: "Active", hint: "Served as usual." },
+  {
+    value: "staged",
+    label: "Staged",
+    hint: "Answers anyone who sends its name, but it is left out of /v1/models, /model/info and the portal, and auto never picks it. Test it in the Playground or with your own key, then make it active.",
+  },
+  { value: "active", label: "Active", hint: "Served as usual, and listed for everyone who may call it." },
   {
     value: "deprecated",
     label: "Deprecated",
@@ -31,10 +36,10 @@ const STATUSES: { value: LifecycleStatus; label: string; hint: string }[] = [
   },
 ];
 
-/** The models that may replace `model`: same type, someone else, still served. */
+/** The models that may replace `model`: same type, someone else, still served and listed. */
 export function replacementOptions(model: Pick<ModelRoute, "model_name" | "model_type">, models: LifecycleCandidate[]) {
   return models
-    .filter((m) => m.name !== model.model_name && m.type === model.model_type && m.status !== "retired")
+    .filter((m) => m.name !== model.model_name && m.type === model.model_type && (m.status === "active" || m.status === "deprecated"))
     .map((m) => ({ value: m.name, label: m.status === "deprecated" ? `${m.name} (deprecated)` : m.name }))
     .sort((a, b) => a.value.localeCompare(b.value));
 }
@@ -74,7 +79,7 @@ export function LifecycleSection({
     date !== dateInputValue(stored.retire_at) ||
     note !== (stored.note ?? "") ||
     redirect !== !!stored.redirect;
-  const leaving = status !== "active";
+  const leaving = status === "deprecated" || status === "retired";
   const retireAt = retireAtFromInput(date);
   const pastDate = !!retireAt && new Date(retireAt).getTime() <= Date.now();
 
@@ -97,6 +102,16 @@ export function LifecycleSection({
             ? `Requests naming it are answered by ${replacement} from now on.`
             : "Requests naming it start failing with a 410 error straight away.",
           confirmLabel: "Retire",
+        });
+        if (!ok) return;
+      }
+      if (stored.status === "staged" && status === "active") {
+        const ok = await confirm({
+          title: `Make ${model.model_name} live?`,
+          description: model.auto_eligible
+            ? "It appears in /v1/models and the portal, and auto can start sending it requests."
+            : "It appears in /v1/models and the portal. Auto still skips it, as its routing settings say.",
+          confirmLabel: "Make live",
         });
         if (!ok) return;
       }
@@ -123,7 +138,7 @@ export function LifecycleSection({
         <div>
           <h2 className="text-sm font-semibold">Lifecycle</h2>
           <p className="mt-0.5 text-xs text-muted-foreground">
-            Take a model out of service without surprising anyone: deprecate it with a date and a replacement, then let it retire. Saved on its own, and applies within a few seconds.
+            Stage a new model to test it before anyone can find it, then make it active. Take one out of service without surprising anyone: deprecate it with a date and a replacement, then let it retire. Saved on its own, and applies within a few seconds.
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -148,6 +163,15 @@ export function LifecycleSection({
           <span className="text-[12px] text-muted-foreground">Its retirement date has passed, so it is already retired.</span>
         )}
       </Setting>
+
+      {status === "staged" && (
+        <Setting label="What callers see" hint="Only people you give the name to can reach it.">
+          <p className="text-[12.5px] text-secondary-foreground">
+            A request that names <span className="font-mono">{model.model_name}</span> is served as usual. Looking it up with{" "}
+            <span className="font-mono">GET /v1/models/{model.model_name}</span> answers 404, as if it did not exist.
+          </p>
+        </Setting>
+      )}
 
       {leaving && (
         <>

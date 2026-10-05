@@ -300,8 +300,9 @@ impl BoonGrants {
 /// Every hard-filter reason string, in the order the filters are applied. A
 /// candidate is attributed to the *first* filter it fails, so this order is
 /// part of the explanation's contract, not just presentation.
-const REJECTION_REASONS: [&str; 12] = [
+const REJECTION_REASONS: [&str; 13] = [
     "disabled",
+    "staged",
     "retiring",
     "auto_excluded",
     "unhealthy",
@@ -489,11 +490,16 @@ fn evaluate<'a>(
         if !c.model.enabled {
             return Some("disabled");
         }
-        // A deprecated model is still served by name, but `auto` must not
-        // start sending traffic to something on its way out; a retired one is
-        // not served at all.
-        if c.model.lifecycle.status_at(chrono::Utc::now()) != crate::ModelStatus::Active {
-            return Some("retiring");
+        // A staged model is served by name for testing, but `auto` must not
+        // send traffic to it before it goes live. A deprecated model is still
+        // served by name, but `auto` must not start sending traffic to
+        // something on its way out; a retired one is not served at all.
+        match c.model.lifecycle.status_at(chrono::Utc::now()) {
+            crate::ModelStatus::Active => {}
+            crate::ModelStatus::Staged => return Some("staged"),
+            crate::ModelStatus::Deprecated | crate::ModelStatus::Retired => {
+                return Some("retiring")
+            }
         }
         // Operator policy, checked ahead of health so the explanation reads as
         // a deliberate exclusion rather than a transient outage. The model stays
@@ -1463,6 +1469,30 @@ mod tests {
                 .map(|r| r.reason);
             assert_eq!(reason, Some("retiring"), "{status:?}");
         }
+    }
+
+    #[test]
+    fn auto_never_picks_a_staged_model() {
+        let mut new = model("new");
+        new.lifecycle.status = crate::ModelStatus::Staged;
+        let explain = explain_selection(
+            &[healthy(new), healthy(model("live"))],
+            &RequestFeatures::default(),
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            &[],
+            BoonGrants::default(),
+            &RouterWeights::default(),
+            0.0,
+            &Intent::default(),
+        );
+        let reason = explain
+            .rejected
+            .iter()
+            .find(|r| r.models.iter().any(|m| m == "new"))
+            .map(|r| r.reason);
+        assert_eq!(reason, Some("staged"));
     }
 
     #[test]

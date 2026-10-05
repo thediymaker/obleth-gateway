@@ -1,6 +1,9 @@
 //! Model lifecycle at the request edge: what a caller gets from a model that
 //! is on its way out ([`obleth_config::ModelLifecycle`]).
 //!
+//! - **Staged**: served as usual, with nothing on the response. Only the
+//!   discovery endpoints and `auto` treat it differently: it is not listed and
+//!   never picked, so callers find it only by name.
 //! - **Deprecated**: served as usual, and every response says so. The
 //!   standard headers carry it — `Deprecation` (RFC 9745), `Sunset` (RFC
 //!   8594) once a retirement date is set, and a `Link` to the replacement
@@ -66,7 +69,7 @@ pub(crate) async fn gate(state: &AppState, route: &ResolvedModel, now: DateTime<
         redirected,
     };
     match status {
-        ModelStatus::Active => Gate::Serve(None),
+        ModelStatus::Staged | ModelStatus::Active => Gate::Serve(None),
         ModelStatus::Deprecated => Gate::Serve(Some(notice(false))),
         ModelStatus::Retired => {
             if lifecycle.redirect && !lifecycle.replacement.is_empty() {
@@ -87,12 +90,13 @@ pub(crate) async fn gate(state: &AppState, route: &ResolvedModel, now: DateTime<
 }
 
 /// Whether `next` may answer for the retired `route`: enabled, of the same
-/// type, and not itself retired (a redirect never chains).
+/// type, and listed (not itself retired, so a redirect never chains, and not
+/// staged, so callers are never sent to a model they cannot find).
 fn can_stand_in(route: &ResolvedModel, next: &ResolvedModel, now: DateTime<Utc>) -> bool {
     next.enabled
         && next.model_type == route.model_type
         && next.model_name != route.model_name
-        && next.lifecycle.status_at(now) != ModelStatus::Retired
+        && next.lifecycle.status_at(now).listed()
 }
 
 /// The sentence a caller reads in a refusal.
@@ -290,7 +294,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stand_in_must_be_live_of_the_same_type_and_not_retired() {
+    fn a_stand_in_must_be_live_of_the_same_type_and_listed() {
         let now = Utc::now();
         let mut old = crate::boons::test_support::endpoint_only_route("http://unused/v1");
         old.model_name = "glm-4-5v".into();
@@ -309,6 +313,11 @@ mod tests {
         let mut retired = next.clone();
         retired.lifecycle.status = ModelStatus::Retired;
         assert!(!can_stand_in(&old, &retired, now));
+
+        // Callers could not find a staged model to move to.
+        let mut staged = next.clone();
+        staged.lifecycle.status = ModelStatus::Staged;
+        assert!(!can_stand_in(&old, &staged, now));
 
         // A deprecated stand-in is fine: it still answers.
         let mut deprecated = next;

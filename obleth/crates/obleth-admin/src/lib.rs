@@ -1021,6 +1021,12 @@ pub struct CreateModel {
     /// health check passes. Omitted = on.
     #[serde(default)]
     pub enabled: Option<bool>,
+    /// `staged` creates the model served by name only: not listed on the
+    /// discovery endpoints and never picked by `auto`, until
+    /// `PUT /models/{id}/status` makes it `active`. Omitted = `active`; a new
+    /// model cannot start deprecated or retired.
+    #[serde(default)]
+    pub status: Option<obleth_config::ModelStatus>,
 }
 
 /// One variant in a model write: a name that resolves to the model with extra
@@ -1294,9 +1300,10 @@ pub struct SetModelCapacity {
 }
 
 /// A model's lifecycle, replaced whole: an omitted field is cleared, and
-/// `active` clears them all.
+/// `staged` or `active` clears them all.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetModelStatus {
+    /// `staged` (served by name, but not listed and never picked by `auto`),
     /// `active`, `deprecated` (still served, with Deprecation/Sunset headers)
     /// or `retired` (refused with 410 Gone, or served by the replacement when
     /// `redirect` is on).
@@ -6601,6 +6608,7 @@ async fn create_model(
     headers: HeaderMap,
     Json(body): Json<CreateModel>,
 ) -> Result<Json<ModelRouteView>> {
+    let initial_status = initial_model_status(body.status)?;
     // A blank api_base is allowed: Slurm-provisioned models have no static
     // upstream until a replica is promoted into the endpoint rotation. Only
     // validate a non-empty URL.
@@ -6709,6 +6717,20 @@ async fn create_model(
     // sees the route on.
     let model = if body.enabled == Some(false) {
         state.store.set_model_enabled(model.id, false).await?
+    } else {
+        model
+    };
+    // Staged the same way, before the first publish.
+    let model = if initial_status == obleth_config::ModelStatus::Staged {
+        let lifecycle = obleth_config::ModelLifecycle {
+            status: initial_status,
+            changed_at: Some(chrono::Utc::now()),
+            ..Default::default()
+        };
+        state
+            .store
+            .set_model_lifecycle(model.id, &lifecycle)
+            .await?
     } else {
         model
     };
@@ -6935,6 +6957,22 @@ async fn set_model_capacity(
     Ok(Json(model.into()))
 }
 
+/// The status a new model starts in: `active` unless the request asks for
+/// `staged`. Deprecating or retiring something nobody has called yet means
+/// nothing, so those are refused rather than stored.
+fn initial_model_status(
+    requested: Option<obleth_config::ModelStatus>,
+) -> Result<obleth_config::ModelStatus> {
+    use obleth_config::ModelStatus;
+    match requested.unwrap_or_default() {
+        status @ (ModelStatus::Staged | ModelStatus::Active) => Ok(status),
+        other => Err(AdminError::BadRequest(format!(
+            "a new model starts `active` or `staged`, not `{}`",
+            other.as_str()
+        ))),
+    }
+}
+
 /// The lifecycle `body` asks for on `existing`, validated against the model
 /// it names as the replacement (looked up by the caller; `None` when the body
 /// names none). `changed_at` moves only when the status does.
@@ -6950,9 +6988,9 @@ fn lifecycle_from_request(
     } else {
         Some(now)
     };
-    if body.status == ModelStatus::Active {
+    if matches!(body.status, ModelStatus::Staged | ModelStatus::Active) {
         return Ok(ModelLifecycle {
-            status: ModelStatus::Active,
+            status: body.status,
             changed_at,
             ..Default::default()
         });
@@ -6992,11 +7030,20 @@ fn lifecycle_from_request(
                 r.model_name, r.model_type, existing.model_type, existing.model_name
             )));
         }
-        if r.lifecycle.status_at(now) == ModelStatus::Retired {
-            return Err(AdminError::BadRequest(format!(
-                "replacement `{}` is itself retired",
-                r.model_name
-            )));
+        match r.lifecycle.status_at(now) {
+            ModelStatus::Retired => {
+                return Err(AdminError::BadRequest(format!(
+                    "replacement `{}` is itself retired",
+                    r.model_name
+                )));
+            }
+            ModelStatus::Staged => {
+                return Err(AdminError::BadRequest(format!(
+                    "replacement `{}` is staged, so callers cannot find it; make it active first",
+                    r.model_name
+                )));
+            }
+            ModelStatus::Active | ModelStatus::Deprecated => {}
         }
     }
     let redirect = body.redirect.unwrap_or(false);
@@ -7031,12 +7078,13 @@ async fn set_model_status(
     Json(body): Json<SetModelStatus>,
 ) -> Result<Json<ModelRouteView>> {
     let existing = state.store.get_model(id).await?;
-    let replacement = match body
-        .replacement
-        .as_deref()
-        .map(str::trim)
-        .filter(|r| !r.is_empty() && body.status != obleth_config::ModelStatus::Active)
-    {
+    let replacement = match body.replacement.as_deref().map(str::trim).filter(|r| {
+        !r.is_empty()
+            && matches!(
+                body.status,
+                obleth_config::ModelStatus::Deprecated | obleth_config::ModelStatus::Retired
+            )
+    }) {
         Some(name) => match state.store.get_model_by_name(name).await {
             Ok(m) => Some(m),
             Err(obleth_store::StoreError::NotFound) => None,
@@ -10992,6 +11040,47 @@ mod tests {
     }
 
     #[test]
+    fn staging_clears_everything_else_and_promoting_dates_the_change() {
+        let t0 = chrono::Utc::now();
+        let t1 = t0 + chrono::Duration::days(3);
+        let mut old = fixture_model_route("qwen4-72b");
+        let mut body = status_body(obleth_config::ModelStatus::Staged);
+        body.note = Some("ignored".into());
+        body.retire_at = Some(t1);
+        let staged = lifecycle_from_request(&old, body, None, t0).unwrap();
+        assert_eq!(staged.status, obleth_config::ModelStatus::Staged);
+        assert_eq!(staged.changed_at, Some(t0));
+        assert!(staged.note.is_empty() && staged.retire_at.is_none());
+
+        old.lifecycle = staged;
+        let live = lifecycle_from_request(
+            &old,
+            status_body(obleth_config::ModelStatus::Active),
+            None,
+            t1,
+        )
+        .unwrap();
+        assert_eq!(live.status, obleth_config::ModelStatus::Active);
+        assert_eq!(live.changed_at, Some(t1));
+    }
+
+    #[test]
+    fn a_new_model_starts_active_or_staged() {
+        use obleth_config::ModelStatus;
+        assert_eq!(initial_model_status(None).unwrap(), ModelStatus::Active);
+        assert_eq!(
+            initial_model_status(Some(ModelStatus::Staged)).unwrap(),
+            ModelStatus::Staged
+        );
+        for status in [ModelStatus::Deprecated, ModelStatus::Retired] {
+            assert!(matches!(
+                initial_model_status(Some(status)),
+                Err(AdminError::BadRequest(_))
+            ));
+        }
+    }
+
+    #[test]
     fn bad_replacements_and_redirects_are_refused() {
         let now = chrono::Utc::now();
         let old = fixture_model_route("glm-4-5v");
@@ -11018,6 +11107,10 @@ mod tests {
         let mut gone = fixture_model_route("gone");
         gone.lifecycle.status = obleth_config::ModelStatus::Retired;
         assert!(refused(named("gone"), Some(&gone)));
+        // Staged, so callers could not find it.
+        let mut staged = fixture_model_route("staged");
+        staged.lifecycle.status = obleth_config::ModelStatus::Staged;
+        assert!(refused(named("staged"), Some(&staged)));
         // A redirect with nowhere to go.
         let mut b = status_body(obleth_config::ModelStatus::Retired);
         b.redirect = Some(true);

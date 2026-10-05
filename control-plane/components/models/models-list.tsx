@@ -19,6 +19,7 @@ import {
   EMPTY_FILTERS,
   filterRows,
   groupCounts,
+  LIFECYCLE_BADGES,
   lifecycleLabel,
   lifecycleStatus,
   MODEL_TYPE_NAMES,
@@ -370,7 +371,7 @@ function Row({ row, selected, onToggle, onOpen }: { row: ModelRow; selected: boo
               </Link>
               {lifecycleStatus(m) !== "active" && (
                 <span title={lifecycleLabel(m) ?? undefined} className={cn("shrink-0 rounded-full border px-1.5 text-[10.5px] leading-[16px]", lifecycleStatus(m) === "retired" ? "border-foreground bg-foreground text-background" : "border-border text-muted-foreground")}>
-                  {lifecycleStatus(m) === "retired" ? "Retired" : "Deprecated"}
+                  {LIFECYCLE_BADGES[lifecycleStatus(m)]}
                 </span>
               )}
             </span>

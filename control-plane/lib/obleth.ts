@@ -106,7 +106,7 @@ export interface CreatedKey {
   secret: string;
 }
 
-export type LifecycleStatus = "active" | "deprecated" | "retired";
+export type LifecycleStatus = "staged" | "active" | "deprecated" | "retired";
 
 /** A model's lifecycle as the gateway stores it; empty fields are omitted. */
 export interface ModelLifecycle {
@@ -149,9 +149,10 @@ export interface ModelRoute {
    */
   variants?: ModelVariant[];
   /**
-   * Where the model is in its life: active, deprecated (still served, with
-   * headers saying so) or retired (refused with 410, or answered by the
-   * replacement). Absent from gateways older than the field.
+   * Where the model is in its life: staged (served by name, but not listed
+   * and never picked by auto), active, deprecated (still served, with headers
+   * saying so) or retired (refused with 410, or answered by the replacement).
+   * Absent from gateways older than the field.
    */
   lifecycle?: ModelLifecycle;
   /** The status in force now: a deprecated model past its date reads `retired`. */
@@ -2136,6 +2137,8 @@ export const obleth = {
       model_name: string;
       upstream_model: string;
       api_base: string;
+      /** `staged` keeps it out of the model list and auto until it is made active. Omitted = active. */
+      status?: Extract<LifecycleStatus, "staged" | "active">;
     },
     options?: AuditOptions,
   ) =>

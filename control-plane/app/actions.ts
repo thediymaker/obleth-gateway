@@ -998,6 +998,7 @@ export async function createModelAction(
       boons: boonsFromForm(formData),
       tool_servers: toolServersFromForm(formData),
       ...(isSlurm ? {} : { enabled: false }),
+      ...(formData.get("staged") === "on" ? { status: "staged" as const } : {}),
     }, { auditActor: session.email });
 
     if (isSlurm) {
@@ -2679,11 +2680,14 @@ export async function launchRecipeAction(recipeId: string, overrides: DeployOver
       return { ok: false, error: `A model called ${createBody.model_name} already exists. Pick another name.` };
     }
     if (!managedBody.partition) return { ok: false, error: "Pick a partition." };
+    // A launched model starts staged, like one added by hand: it is made
+    // active on its page once it has been tried.
     const created = await obleth.createModel({
       model_name: createBody.model_name,
       upstream_model: createBody.upstream_model,
       api_base: createBody.api_base,
       model_type: createBody.model_type,
+      status: "staged",
     }, { auditActor: session.email });
     await obleth.putManagedModel(created.id, managedBody, { auditActor: session.email });
     refreshDeployments();
@@ -2772,11 +2776,14 @@ export async function deployRecipeAction(
 
   try {
     const { createBody, managedBody } = buildManagedFromRecipe(recipe, overrides);
+    // A launched model starts staged, like one added by hand: it is made
+    // active on its page once it has been tried.
     const created = await obleth.createModel({
       model_name: createBody.model_name,
       upstream_model: createBody.upstream_model,
       api_base: createBody.api_base,
       model_type: createBody.model_type,
+      status: "staged",
     }, { auditActor: session.email });
     await obleth.putManagedModel(created.id, managedBody, { auditActor: session.email });
   } catch (e) {

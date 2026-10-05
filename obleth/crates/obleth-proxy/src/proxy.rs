@@ -4300,7 +4300,9 @@ fn model_visible(allowed: Option<&[String]>, model_name: &str) -> bool {
 ///
 /// A retired model is left out (with its variants), since calling it is
 /// refused; a deprecated one is listed, marked. Asking for a retired model by
-/// id still answers, so a caller can find out what replaced it.
+/// id still answers, so a caller can find out what replaced it. A staged model
+/// is left out too, and so is its id: it is served by name, for whoever was
+/// told it, and is not advertised until it goes live.
 fn registry_models_list(
     candidates: &[obleth_config::routing::Candidate],
     allowed: Option<&[String]>,
@@ -4317,7 +4319,7 @@ fn registry_models_list(
             )
         })
         .filter(|f| f.visible(allowed))
-        .filter(|f| f.status != obleth_config::ModelStatus::Retired)
+        .filter(|f| f.status.listed())
         .map(|f| model_entry(&f))
         .collect();
     data.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
@@ -4441,6 +4443,13 @@ impl ModelFacts {
                 .as_ref()
                 .is_some_and(|v| model_visible(allowed, &v.parent))
     }
+
+    /// Whether `GET /v1/models/{id}` answers for this entry: when the caller
+    /// may see it and it is not staged. A retired model still answers, so a
+    /// caller can find out what replaced it.
+    fn answers_by_id(&self, allowed: Option<&[String]>) -> bool {
+        self.visible(allowed) && self.status != obleth_config::ModelStatus::Staged
+    }
 }
 
 /// Index every name a registered route can be recognized by — its
@@ -4527,9 +4536,10 @@ fn is_models_collection(path: &str) -> bool {
 /// omitted rather than fabricated — the hot-path view of a route does not
 /// carry a registration timestamp.
 ///
-/// `Some(Err(()))` when a route claims the name but it is outside `allowed`:
-/// the caller answers that like an unknown model, without forwarding the id,
-/// so the detail lookup reveals no more than the filtered listing does.
+/// `Some(Err(()))` when a route claims the name but it is outside `allowed`,
+/// or staged: the caller answers that like an unknown model, without
+/// forwarding the id, so the detail lookup reveals no more than the filtered
+/// listing does.
 fn registered_model_entry(
     state: &AppState,
     id: &str,
@@ -4540,7 +4550,7 @@ fn registered_model_entry(
     }
     let candidates = state.model_registry.load();
     let facts = model_facts_index(&candidates).get(id)?.clone();
-    if !facts.visible(allowed) {
+    if !facts.answers_by_id(allowed) {
         return Some(Err(()));
     }
     Some(Ok(model_entry(&facts)))
@@ -4574,21 +4584,28 @@ fn registered_model_entry(
 /// model a caller would be refused would be advertising a 403.
 fn model_info_response(state: &AppState, resolved: &ResolvedKey) -> Response<Body> {
     let candidates = state.model_registry.load();
-    let allowed = allowed_models_for(resolved);
-    let data: Vec<serde_json::Value> = candidates
-        .iter()
-        .filter(|c| c.model.enabled && is_listed_model_type(&c.model.model_type))
-        .filter(|c| model_visible(allowed, &c.model.model_name))
-        .filter(|c| {
-            c.model.lifecycle.status_at(chrono::Utc::now()) != obleth_config::ModelStatus::Retired
-        })
-        .map(|c| model_info_entry(&c.model, c.healthy))
-        .collect();
+    let data = registry_model_info(&candidates, allowed_models_for(resolved));
     (
         StatusCode::OK,
         axum::Json(serde_json::json!({ "data": data })),
     )
         .into_response()
+}
+
+/// The `/model/info` entries for a registry snapshot: every enabled, listed
+/// route `allowed` lets the caller see. Pure, like [`registry_models_list`].
+fn registry_model_info(
+    candidates: &[obleth_config::routing::Candidate],
+    allowed: Option<&[String]>,
+) -> Vec<serde_json::Value> {
+    let now = chrono::Utc::now();
+    candidates
+        .iter()
+        .filter(|c| c.model.enabled && is_listed_model_type(&c.model.model_type))
+        .filter(|c| model_visible(allowed, &c.model.model_name))
+        .filter(|c| c.model.lifecycle.status_at(now).listed())
+        .map(|c| model_info_entry(&c.model, c.healthy))
+        .collect()
 }
 
 /// One `/model/info` entry. Split out so the payload shape is unit-testable
@@ -6468,6 +6485,44 @@ mod tests {
         let info = model_info_entry(&candidates[3].model, true);
         assert_eq!(info["model_info"]["status"], "active");
         assert!(info["model_info"].get("replacement").is_none());
+    }
+
+    #[test]
+    fn staged_models_are_served_by_name_but_never_advertised() {
+        use super::{model_facts_index, registry_model_info, registry_models_list};
+        let mut staged = candidate("qwen4-72b", "qwen4", "chat", "fp8", &["qwen4"], &[]);
+        staged.model.lifecycle.status = obleth_config::ModelStatus::Staged;
+        staged.model.variants = vec![obleth_config::ModelVariant {
+            name: "qwen4-72b-spec".into(),
+            ..Default::default()
+        }];
+        let live = candidate("gemma4-31b-it", "gemma", "chat", "bf16", &[], &[]);
+        let candidates = vec![staged, live];
+
+        // Not in the listing, variants included, whatever the allowlist says.
+        for allowed in [None, Some(&["qwen4-72b".to_string()][..])] {
+            let list = registry_models_list(&candidates, allowed);
+            let ids: Vec<&str> = list["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["id"].as_str().unwrap())
+                .collect();
+            assert!(!ids.iter().any(|id| id.starts_with("qwen4")), "{ids:?}");
+        }
+        // Not on /model/info.
+        let info = registry_model_info(&candidates, None);
+        let names: Vec<&str> = info
+            .iter()
+            .map(|m| m["model_name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["gemma4-31b-it"]);
+        // A lookup by any of its names answers like an unknown model.
+        let index = model_facts_index(&candidates);
+        for id in ["qwen4-72b", "qwen4", "qwen4-72b-spec"] {
+            assert!(!index[id].answers_by_id(None), "{id}");
+        }
+        assert!(index["gemma4-31b-it"].answers_by_id(None));
     }
 
     #[test]

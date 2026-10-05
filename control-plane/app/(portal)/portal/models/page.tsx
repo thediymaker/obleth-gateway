@@ -1,6 +1,7 @@
 import { PortalModels } from "@/components/portal/portal-models";
 import { toPortalModelSummary } from "@/components/portal/portal-model-summary";
 import { requireUser } from "@/lib/auth/roles";
+import { lifecycleStatus } from "@/lib/models-model";
 import { obleth, type ModelRoute, type Tenant } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
 
@@ -16,6 +17,8 @@ export default async function PortalModelsPage() {
   const allowed = tenant?.allowed_models?.filter(Boolean) ?? [];
   const visible = models
     .filter((model) => model.enabled)
+    // Staged models are not advertised yet; retired ones no longer are.
+    .filter((model) => ["active", "deprecated"].includes(lifecycleStatus(model)))
     .filter((model) => allowed.length === 0 || allowed.includes(model.model_name))
     .sort((a, b) => a.model_name.localeCompare(b.model_name))
     // Allowlisted DTO: the full route carries upstream URLs and secrets.
