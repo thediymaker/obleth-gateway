@@ -447,6 +447,7 @@ mod tests {
         ResolvedModel {
             model_name: "brain-test".to_string(),
             aliases: Vec::new(),
+            lifecycle: Default::default(),
             variants: Vec::new(),
             quantization: "unknown".into(),
             upstream_model: "brain-upstream".to_string(),

@@ -300,8 +300,9 @@ impl BoonGrants {
 /// Every hard-filter reason string, in the order the filters are applied. A
 /// candidate is attributed to the *first* filter it fails, so this order is
 /// part of the explanation's contract, not just presentation.
-const REJECTION_REASONS: [&str; 11] = [
+const REJECTION_REASONS: [&str; 12] = [
     "disabled",
+    "retiring",
     "auto_excluded",
     "unhealthy",
     "model_type",
@@ -487,6 +488,12 @@ fn evaluate<'a>(
     let hard_reject = |c: &Candidate| -> Option<&'static str> {
         if !c.model.enabled {
             return Some("disabled");
+        }
+        // A deprecated model is still served by name, but `auto` must not
+        // start sending traffic to something on its way out; a retired one is
+        // not served at all.
+        if c.model.lifecycle.status_at(chrono::Utc::now()) != crate::ModelStatus::Active {
+            return Some("retiring");
         }
         // Operator policy, checked ahead of health so the explanation reads as
         // a deliberate exclusion rather than a transient outage. The model stays
@@ -1158,6 +1165,7 @@ mod tests {
         ResolvedModel {
             model_name: name.to_string(),
             aliases: Vec::new(),
+            lifecycle: Default::default(),
             variants: Vec::new(),
             upstream_model: name.to_string(),
             api_base: "http://upstream".to_string(),
@@ -1429,6 +1437,32 @@ mod tests {
             .map(|r| r.reason)
             .expect("alpha must appear in the rejection list");
         assert_eq!(reason, "auto_excluded");
+    }
+
+    #[test]
+    fn auto_never_picks_a_deprecated_or_retired_model() {
+        for status in [crate::ModelStatus::Deprecated, crate::ModelStatus::Retired] {
+            let mut old = model("old");
+            old.lifecycle.status = status;
+            let explain = explain_selection(
+                &[healthy(old), healthy(model("new"))],
+                &RequestFeatures::default(),
+                &HashMap::new(),
+                &HashMap::new(),
+                None,
+                &[],
+                BoonGrants::default(),
+                &RouterWeights::default(),
+                0.0,
+                &Intent::default(),
+            );
+            let reason = explain
+                .rejected
+                .iter()
+                .find(|r| r.models.iter().any(|m| m == "old"))
+                .map(|r| r.reason);
+            assert_eq!(reason, Some("retiring"), "{status:?}");
+        }
     }
 
     #[test]

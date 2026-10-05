@@ -638,6 +638,16 @@ async fn handler_inner(
     if !route.enabled {
         return error_json(StatusCode::FORBIDDEN, "model is disabled");
     }
+    // A retired model is refused (or stood in for by its replacement) here as
+    // on every other endpoint.
+    let route = match crate::lifecycle::gate(&state, &route, chrono::Utc::now()).await {
+        crate::lifecycle::Gate::Serve(_) => route,
+        crate::lifecycle::Gate::Redirect(next, _) => {
+            model = next.model_name.clone();
+            next
+        }
+        crate::lifecycle::Gate::Refuse(resp) => return resp,
+    };
     // verdicts reads chat-completions logprobs; only chat routes can serve it.
     if route.model_type != "chat" {
         return error_json(

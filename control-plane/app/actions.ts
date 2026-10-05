@@ -20,6 +20,7 @@ import type {
   ModelImportReport,
   ModelManifest,
   ModelRoute,
+  SetModelStatus,
   ModelVariantInput,
   RestoreReport,
   ResyncReport,
@@ -1459,6 +1460,31 @@ export async function setModelEnabledAction(id: string, enabled: boolean): Promi
   if (!current) return { ok: false, error: "Model not found." };
   try {
     await obleth.updateModel(id, { ...toModelUpdateBody(current), enabled }, { auditActor: session.email });
+  } catch (e) {
+    return actionError(e);
+  }
+  updateTag(CACHE_TAGS.models);
+  revalidatePath("/models");
+  revalidatePath("/");
+  return { ok: true };
+}
+
+/**
+ * Set a model's lifecycle from the Lifecycle section: active, deprecated or
+ * retired, with the replacement, retirement date, note and redirect. The
+ * gateway validates the replacement and replaces the lifecycle whole.
+ */
+export async function setModelStatusAction(id: string, body: SetModelStatus): Promise<ActionResult> {
+  const session = await requireAdmin();
+  const note = body.note?.trim() ?? "";
+  if (note.length > 500) return { ok: false, error: "Keep the note to 500 characters; callers see it with every refusal." };
+  if (body.redirect && !body.replacement) return { ok: false, error: "Pick a replacement to answer in its place." };
+  try {
+    await obleth.setModelStatus(
+      id,
+      body.status === "active" ? { status: "active" } : { ...body, note: note || null, replacement: body.replacement || null },
+      { auditActor: session.email },
+    );
   } catch (e) {
     return actionError(e);
   }

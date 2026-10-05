@@ -106,6 +106,32 @@ export interface CreatedKey {
   secret: string;
 }
 
+export type LifecycleStatus = "active" | "deprecated" | "retired";
+
+/** A model's lifecycle as the gateway stores it; empty fields are omitted. */
+export interface ModelLifecycle {
+  status: LifecycleStatus;
+  /** The model callers are told to move to. */
+  replacement?: string;
+  /** When a deprecated model stops being served (RFC 3339). */
+  retire_at?: string | null;
+  /** When the status last changed. */
+  changed_at?: string | null;
+  /** The operator's sentence to callers. */
+  note?: string;
+  /** Once retired, answer with the replacement instead of refusing. */
+  redirect?: boolean;
+}
+
+/** `PUT /models/{id}/status`: replaces the lifecycle whole. */
+export interface SetModelStatus {
+  status: LifecycleStatus;
+  replacement?: string | null;
+  retire_at?: string | null;
+  note?: string | null;
+  redirect?: boolean;
+}
+
 export interface ModelRoute {
   id: string;
   model_name: string;
@@ -122,6 +148,14 @@ export interface ModelRoute {
    * model's own. Absent from gateways older than variants.
    */
   variants?: ModelVariant[];
+  /**
+   * Where the model is in its life: active, deprecated (still served, with
+   * headers saying so) or retired (refused with 410, or answered by the
+   * replacement). Absent from gateways older than the field.
+   */
+  lifecycle?: ModelLifecycle;
+  /** The status in force now: a deprecated model past its date reads `retired`. */
+  effective_status?: LifecycleStatus;
   description: string;
   upstream_model: string;
   api_base: string;
@@ -219,7 +253,7 @@ export interface ModelRoute {
  * `upstream_header_names`.
  */
 export type ModelWriteFields = Partial<
-  Omit<ModelRoute, "api_key_set" | "upstream_header_names" | "variants">
+  Omit<ModelRoute, "api_key_set" | "upstream_header_names" | "variants" | "lifecycle" | "effective_status">
 > & {
   api_key?: string | null;
   upstream_headers?: Record<string, string | null>;
@@ -2162,6 +2196,12 @@ export const obleth = {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ admission_weight }),
+    }),
+  setModelStatus: (id: string, body: SetModelStatus, options?: AuditOptions) =>
+    api<ModelRoute>(`/models/${id}/status`, {
+      method: "PUT",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify(body),
     }),
   setModelCapacity: (
     id: string,

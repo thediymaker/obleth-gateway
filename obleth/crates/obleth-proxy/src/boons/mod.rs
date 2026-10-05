@@ -1496,6 +1496,7 @@ mod tests {
         obleth_config::ResolvedModel {
             model_name: "test".to_string(),
             aliases: Vec::new(),
+            lifecycle: Default::default(),
             variants: Vec::new(),
             quantization: "unknown".into(),
             upstream_model: "test".to_string(),

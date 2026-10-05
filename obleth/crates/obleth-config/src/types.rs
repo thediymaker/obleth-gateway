@@ -395,6 +395,11 @@ pub struct ModelRoute {
     /// keeps payloads written before variants existed readable as "none".
     #[serde(default)]
     pub variants: Vec<ModelVariant>,
+    /// Active, deprecated or retired, with the replacement and retirement
+    /// date (see [`ModelLifecycle`]). `#[serde(default)]` reads older payloads
+    /// as active.
+    #[serde(default)]
+    pub lifecycle: ModelLifecycle,
     /// Human-facing summary for operators and dashboards.
     pub description: String,
     /// Value sent to the upstream in the `model` field.
@@ -640,6 +645,11 @@ pub struct ResolvedModel {
     /// cached payloads deserializable as "no variants".
     #[serde(default)]
     pub variants: Vec<ModelVariant>,
+    /// See [`ModelRoute::lifecycle`]. Read per request: the proxy refuses a
+    /// retired model and marks a deprecated one's responses. `#[serde(default)]`
+    /// keeps older cached payloads deserializable as "active".
+    #[serde(default)]
+    pub lifecycle: ModelLifecycle,
     pub upstream_model: String,
     pub api_base: String,
     pub api_key: Option<String>,
@@ -1853,6 +1863,94 @@ where
         });
     }
     out
+}
+
+/// Where a model is in its life. See [`ModelLifecycle`].
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelStatus {
+    /// Served normally.
+    #[default]
+    Active,
+    /// Still served, but every response says so (`Deprecation`, and `Sunset`
+    /// once a retirement date is set) and names the replacement. Listed in
+    /// `/v1/models` as deprecated; never picked by `auto`.
+    Deprecated,
+    /// No longer served: requests are refused with `410 Gone` naming the
+    /// replacement, or answered by the replacement when `redirect` is on.
+    /// Hidden from `/v1/models`.
+    Retired,
+}
+
+impl ModelStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ModelStatus::Active => "active",
+            ModelStatus::Deprecated => "deprecated",
+            ModelStatus::Retired => "retired",
+        }
+    }
+}
+
+/// Longest operator note carried with a lifecycle status. It is repeated in
+/// every refusal of a retired model, so it is kept to a sentence or two.
+pub const MAX_LIFECYCLE_NOTE_CHARS: usize = 500;
+
+/// A model's lifecycle: whether it is still served, what replaces it, and
+/// when it goes away. Stored as one JSON object on the model (like
+/// `variants`), so a field added later needs no migration, and the default
+/// (`{}`) is an active model with nothing to say.
+///
+/// A deprecated model whose `retire_at` has passed is retired: the operator
+/// sets the date once and the gateway retires the model on time
+/// ([`ModelLifecycle::status_at`]).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+pub struct ModelLifecycle {
+    #[serde(default)]
+    pub status: ModelStatus,
+    /// `model_name` of the model callers should move to. Empty when none is
+    /// named.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub replacement: String,
+    /// When the model stops being served. Sent as the `Sunset` header while
+    /// deprecated; once it passes, the model is retired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retire_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the status last changed. Sent as the `Deprecation` date.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The operator's word to callers, repeated with the status (why, or where
+    /// to ask).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
+    /// Once retired, answer with `replacement` instead of refusing. The
+    /// response still says it was redirected; off by default because a
+    /// different model can answer differently, and a caller pinned to this
+    /// one should find out.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub redirect: bool,
+}
+
+impl ModelLifecycle {
+    /// The status in force at `now`: the stored one, except that a
+    /// deprecated model whose retirement date has passed is retired.
+    pub fn status_at(&self, now: chrono::DateTime<chrono::Utc>) -> ModelStatus {
+        match self.status {
+            ModelStatus::Deprecated if self.retire_at.is_some_and(|at| at <= now) => {
+                ModelStatus::Retired
+            }
+            status => status,
+        }
+    }
+
+    /// When the model was (or will be) retired, for messages: the retirement
+    /// date if one was set, otherwise the moment it was marked retired.
+    pub fn retired_on(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.retire_at.or(match self.status {
+            ModelStatus::Retired => self.changed_at,
+            _ => None,
+        })
+    }
 }
 
 /// `base` followed by every boon of `extra` not already in it: the boons a
@@ -3288,6 +3386,10 @@ pub struct ModelBackup {
     /// variants existed restore as a model with none.
     #[serde(default)]
     pub variants: Vec<ModelVariant>,
+    /// `#[serde(default)]`: a backup taken before lifecycles existed restores
+    /// every model as active.
+    #[serde(default)]
+    pub lifecycle: ModelLifecycle,
     #[serde(default)]
     pub description: String,
     pub upstream_model: String,
@@ -4254,6 +4356,75 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_defaults_to_active_and_reads_an_empty_object() {
+        let parsed: ModelLifecycle = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(parsed, ModelLifecycle::default());
+        assert_eq!(parsed.status, ModelStatus::Active);
+        // An active lifecycle stores as just its status.
+        assert_eq!(
+            serde_json::to_value(&parsed).unwrap(),
+            serde_json::json!({ "status": "active" })
+        );
+    }
+
+    #[test]
+    fn a_deprecated_model_retires_itself_when_its_date_passes() {
+        let now = chrono::Utc::now();
+        let mut l = ModelLifecycle {
+            status: ModelStatus::Deprecated,
+            retire_at: Some(now + chrono::Duration::days(14)),
+            ..Default::default()
+        };
+        assert_eq!(l.status_at(now), ModelStatus::Deprecated);
+        assert_eq!(
+            l.status_at(now + chrono::Duration::days(14)),
+            ModelStatus::Retired
+        );
+        l.retire_at = None;
+        assert_eq!(
+            l.status_at(now + chrono::Duration::days(400)),
+            ModelStatus::Deprecated
+        );
+        // A date on an active model means nothing.
+        l.status = ModelStatus::Active;
+        l.retire_at = Some(now - chrono::Duration::days(1));
+        assert_eq!(l.status_at(now), ModelStatus::Active);
+    }
+
+    #[test]
+    fn retired_on_prefers_the_retirement_date_then_the_change() {
+        let t1 = chrono::Utc::now();
+        let t2 = t1 + chrono::Duration::days(3);
+        let retired = ModelLifecycle {
+            status: ModelStatus::Retired,
+            changed_at: Some(t1),
+            ..Default::default()
+        };
+        assert_eq!(retired.retired_on(), Some(t1));
+        let scheduled = ModelLifecycle {
+            status: ModelStatus::Deprecated,
+            retire_at: Some(t2),
+            changed_at: Some(t1),
+            ..Default::default()
+        };
+        assert_eq!(scheduled.retired_on(), Some(t2));
+        let deprecated = ModelLifecycle {
+            status: ModelStatus::Deprecated,
+            changed_at: Some(t1),
+            ..Default::default()
+        };
+        assert_eq!(deprecated.retired_on(), None);
+    }
+
+    #[test]
+    fn payloads_written_before_lifecycle_read_as_active() {
+        let mut v = serde_json::to_value(resolved_fixture()).unwrap();
+        v.as_object_mut().unwrap().remove("lifecycle");
+        let m: ResolvedModel = serde_json::from_value(v).expect("older payload");
+        assert_eq!(m.lifecycle.status, ModelStatus::Active);
+    }
+
+    #[test]
     fn normalize_variants_trims_dedupes_caps_and_drops_unknown_boons() {
         let raw = vec![
             ModelVariant {
@@ -4353,6 +4524,7 @@ mod tests {
         ResolvedModel {
             model_name: "glm-5-3".into(),
             aliases: vec!["glm-5-3-fp8".into(), "glm-5-3-mxfp4".into()],
+            lifecycle: Default::default(),
             variants: Vec::new(),
             upstream_model: "glm-5-3-mxfp4".into(),
             api_base: "http://upstream/v1".into(),

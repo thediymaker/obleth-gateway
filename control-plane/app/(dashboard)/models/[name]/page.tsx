@@ -2,7 +2,7 @@ import { notFound, redirect } from "next/navigation";
 import { ModelPage } from "@/components/models/model-page";
 import { requireAdmin } from "@/lib/auth/roles";
 import { boonBlockers } from "@/lib/boon-availability";
-import { modelHref } from "@/lib/models-model";
+import { lifecycleStatus, modelHref } from "@/lib/models-model";
 import { obleth, type BoonSettingsView, type KnowledgeSettingsView, type McpServer, type ModelHealthSummary, type ModelRoute } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
 
@@ -43,12 +43,14 @@ export default async function ModelDetailPage({ params }: { params: Promise<{ na
   // An alias or variant leads to the model's own name, so there is one address per model.
   if (model.model_name !== name) redirect(modelHref(model.model_name));
 
-  const [health, mcpServers, managedSpecs, boonSettings, knowledgeSettings] = await Promise.all([
+  const [health, mcpServers, managedSpecs, boonSettings, knowledgeSettings, facets] = await Promise.all([
     safe<ModelHealthSummary[]>(obleth.modelHealth(), []),
     safe<McpServer[]>(obleth.listMcpServers(), []),
     safe(obleth.listManagedModels(), []),
     safe<BoonSettingsView | null>(obleth.getBoonSettings(), null),
     safe<KnowledgeSettingsView | null>(obleth.getKnowledgeSettings(), null),
+    // Who would notice it going away: the keys that called it in 30 days.
+    safe(obleth.usageLogFacets({ model: model.model_name, sinceMs: Date.now() - 30 * 86_400_000 }), null),
   ]);
 
   return (
@@ -60,6 +62,8 @@ export default async function ModelDetailPage({ params }: { params: Promise<{ na
       mcpServers={mcpServers}
       modelNames={models.map((m) => m.model_name)}
       boonBlockers={boonBlockers(boonSettings, knowledgeSettings)}
+      lifecycleModels={models.map((m) => ({ name: m.model_name, type: m.model_type, status: lifecycleStatus(m) }))}
+      callers={facets?.keys ?? null}
     />
   );
 }

@@ -449,20 +449,25 @@ pub struct DiscoveryTarget {
 
 impl DiscoveryTarget {
     /// The target for a resolved model, or `None` unless it is `discovered`.
+    /// A retired model is not a target: it is not served, and its Service is
+    /// usually scaled to nothing, which would only be reported as a problem.
     pub fn from_resolved(m: &ResolvedModel, healthy: bool) -> Option<Self> {
-        (m.capacity_mode == obleth_config::DISCOVERED_CAPACITY_MODE).then(|| DiscoveryTarget {
-            model_name: m.model_name.clone(),
-            upstream_model: m.upstream_model.clone(),
-            static_max_in_flight: m.max_in_flight.filter(|c| *c > 0),
-            source: m.capacity_source.clone(),
-            namespace: m.capacity_namespace.clone(),
-            service: m.capacity_service.clone(),
-            per_replica_max_in_flight: m.per_replica_max_in_flight.filter(|c| *c > 0),
-            headroom: m.capacity_headroom,
-            healthy,
-            api_base: m.api_base.clone(),
-            endpoint_selection_mode: m.endpoint_selection_mode.clone(),
-            endpoints: m.endpoints.clone(),
+        let retired = m.lifecycle.status_at(Utc::now()) == obleth_config::ModelStatus::Retired;
+        (m.capacity_mode == obleth_config::DISCOVERED_CAPACITY_MODE && !retired).then(|| {
+            DiscoveryTarget {
+                model_name: m.model_name.clone(),
+                upstream_model: m.upstream_model.clone(),
+                static_max_in_flight: m.max_in_flight.filter(|c| *c > 0),
+                source: m.capacity_source.clone(),
+                namespace: m.capacity_namespace.clone(),
+                service: m.capacity_service.clone(),
+                per_replica_max_in_flight: m.per_replica_max_in_flight.filter(|c| *c > 0),
+                headroom: m.capacity_headroom,
+                healthy,
+                api_base: m.api_base.clone(),
+                endpoint_selection_mode: m.endpoint_selection_mode.clone(),
+                endpoints: m.endpoints.clone(),
+            }
         })
     }
 }

@@ -128,7 +128,7 @@ impl Store {
         .collect::<Result<Vec<_>>>()?;
 
         let models = sqlx::query(
-            "select id, model_name, aliases, variants, description, upstream_model, api_base, api_key,
+            "select id, model_name, aliases, variants, lifecycle, description, upstream_model, api_base, api_key,
                     upstream_headers, model_type, quantization,
                     input_cost_per_token, output_cost_per_token, cost_per_image,
                     cost_per_audio_second, cost_per_character, cost_per_video, context_window,
@@ -403,11 +403,12 @@ impl Store {
                         health_maintenance_note, created_at,
                         debug_diagnostics, energy_slots_per_node, aliases, quantization,
                         upstream_headers, cost_per_video, capacity_namespace, capacity_service,
-                        per_replica_max_in_flight, capacity_source, capacity_headroom, variants)
+                        per_replica_max_in_flight, capacity_source, capacity_headroom, variants,
+                        lifecycle)
                  values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
                         $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31,
                         $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46,
-                        $47, $48, $49, $50, $51, $52, $53, $54, $55, $56)
+                        $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57)
                  on conflict (id) do update set
                         model_name = excluded.model_name,
                         description = excluded.description,
@@ -463,6 +464,7 @@ impl Store {
                         capacity_source = excluded.capacity_source,
                         capacity_headroom = excluded.capacity_headroom,
                         variants = excluded.variants,
+                        lifecycle = excluded.lifecycle,
                         updated_at = now()
                  returning (xmax = 0) as inserted",
             )
@@ -553,6 +555,7 @@ impl Store {
             .bind(sqlx::types::Json(obleth_config::normalize_variants(
                 &m.variants,
             )))
+            .bind(sqlx::types::Json(&m.lifecycle))
             .fetch_one(&mut *tx)
             .await
             .map_err(restore_db_error)?;
@@ -729,6 +732,10 @@ fn model_backup_from_row(row: &PgRow) -> Result<ModelBackup> {
             .unwrap_or_default(),
         variants: row
             .try_get::<sqlx::types::Json<Vec<obleth_config::ModelVariant>>, _>("variants")
+            .map(|j| j.0)
+            .unwrap_or_default(),
+        lifecycle: row
+            .try_get::<sqlx::types::Json<obleth_config::ModelLifecycle>, _>("lifecycle")
             .map(|j| j.0)
             .unwrap_or_default(),
         description: row.try_get("description")?,
@@ -938,6 +945,16 @@ mod tests {
             .expect("create model");
         fixtures.track_model(model.id);
         assert_eq!(model.route_bias, 2.5);
+        let lifecycle = obleth_config::ModelLifecycle {
+            status: obleth_config::ModelStatus::Deprecated,
+            replacement: "gemma4-31b-it".into(),
+            changed_at: Some(chrono::Utc::now()),
+            ..Default::default()
+        };
+        store
+            .set_model_lifecycle(model.id, &lifecycle)
+            .await
+            .expect("set lifecycle");
         let endpoint = store
             .create_model_endpoint(
                 model.id,
@@ -976,6 +993,10 @@ mod tests {
             .find(|m| m.id == model.id)
             .expect("model in export");
         assert_eq!(exported_model.route_bias, 2.5, "export carries route_bias");
+        assert_eq!(
+            exported_model.lifecycle, lifecycle,
+            "export carries the lifecycle"
+        );
         assert!(
             !exported_model.auto_eligible,
             "export carries auto_eligible"
@@ -990,7 +1011,7 @@ mod tests {
             .expect("update weight");
         // Drift the model's bias the same way, through the same restore.
         sqlx::query(
-            "update models set route_bias = 1.0, auto_eligible = true, variants = '[]' where id = $1",
+            "update models set route_bias = 1.0, auto_eligible = true, variants = '[]', lifecycle = '{}' where id = $1",
         )
         .bind(model.id)
         .execute(&store.pool)
@@ -1042,6 +1063,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![variant_name.as_str()],
             "restore puts the model's variants back"
+        );
+        assert_eq!(
+            restored_model.lifecycle, lifecycle,
+            "restore puts the model's lifecycle back"
         );
         assert_eq!(restored_model.capacity_mode, "discovered");
         assert_eq!(restored_model.capacity_source, "kubernetes");

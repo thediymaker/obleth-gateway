@@ -2,7 +2,9 @@ import type {
   AuditEntry,
   CapacityDiscoveryView,
   FairshareLiveView,
+  LifecycleStatus,
   ModelHealthSummary,
+  ModelLifecycle,
   ModelRoute,
   ModelUsageTimePoint,
   UsageModelAgg,
@@ -549,4 +551,53 @@ export function acceptsImages(
 ): boolean | undefined {
   if (!model) return undefined;
   return model.supports_vision || (visionBoonActive && (model.boons ?? []).includes("vision"));
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle
+// ---------------------------------------------------------------------------
+
+/** "Oct 19, 2026", read in UTC like the gateway's dates. */
+export function lifecycleDate(iso: string): string {
+  return new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric", timeZone: "UTC" });
+}
+
+/** The status in force now, defaulting to active on a gateway without lifecycles. */
+export function lifecycleStatus(model: Pick<ModelRoute, "lifecycle" | "effective_status">): LifecycleStatus {
+  return model.effective_status ?? model.lifecycle?.status ?? "active";
+}
+
+/**
+ * The header pill for a model on its way out, or null when it is active:
+ * "Deprecated · retires Oct 19, 2026", "Retired", "Retired · answered by gemma4-31b-it".
+ */
+export function lifecycleLabel(model: Pick<ModelRoute, "lifecycle" | "effective_status">): string | null {
+  const status = lifecycleStatus(model);
+  const l = model.lifecycle;
+  if (status === "deprecated") return l?.retire_at ? `Deprecated · retires ${lifecycleDate(l.retire_at)}` : "Deprecated";
+  if (status === "retired") return l?.redirect && l.replacement ? `Retired · answered by ${l.replacement}` : "Retired";
+  return null;
+}
+
+/**
+ * What a caller is told when a retired model refuses them. Mirrors
+ * `retired_message` in the gateway's `lifecycle.rs`, so the page can show it
+ * before anyone sees it for real.
+ */
+export function retiredMessage(modelName: string, l: Pick<ModelLifecycle, "status" | "replacement" | "retire_at" | "changed_at" | "note">): string {
+  const on = l.retire_at ?? (l.status === "retired" ? l.changed_at : null);
+  let msg = on ? `The model \`${modelName}\` was retired on ${on.slice(0, 10)}.` : `The model \`${modelName}\` has been retired.`;
+  if (l.replacement) msg += ` Use \`${l.replacement}\` instead.`;
+  if (l.note) msg += ` ${l.note}`;
+  return msg;
+}
+
+/** A stored RFC 3339 date as a date input's value (YYYY-MM-DD, UTC). */
+export function dateInputValue(iso?: string | null): string {
+  return iso ? iso.slice(0, 10) : "";
+}
+
+/** A date input's value as the start of that day in UTC, or null when blank. */
+export function retireAtFromInput(value: string): string | null {
+  return /^\d{4}-\d{2}-\d{2}$/.test(value) ? `${value}T00:00:00Z` : null;
 }

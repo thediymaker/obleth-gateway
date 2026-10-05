@@ -1184,6 +1184,7 @@ mod tests {
             id: uuid::Uuid::new_v4(),
             model_name: name.to_string(),
             aliases: Vec::new(),
+            lifecycle: Default::default(),
             variants: Vec::new(),
             description: "original".into(),
             upstream_model: "upstream/original".into(),
