@@ -30,6 +30,7 @@ inputs:
     type: flag
     default: true
     adds: --enable-auto-tool-choice --tool-call-parser openai
+    capabilities: [function_calling, tool_choice]
   - name: image
     label: Container image
     type: path

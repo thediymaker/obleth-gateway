@@ -136,6 +136,43 @@ describe("buildManagedFromRecipe", () => {
     expect(p.managedBody.launcher_spec).toMatchObject({ engine: "ollama" });
   });
 
+  describe("model capabilities from flags", () => {
+    const tools = [
+      "inputs:",
+      "  - name: tools",
+      "    type: flag",
+      "    default: true",
+      "    adds: --enable-auto-tool-choice --tool-call-parser hermes",
+      "    capabilities: [function_calling, tool_choice]",
+    ].join("\n");
+    const toolsBody = ["#!/bin/bash -l", "#SBATCH -p arm", "vllm serve m --port 8000 {{tools}}"].join("\n");
+
+    it("turns on what a flag that is on declares", () => {
+      const p = buildManagedFromRecipe(parseRecipe("t", file(tools, toolsBody)));
+      expect(p.createBody).toMatchObject({ supports_function_calling: true, supports_tool_choice: true });
+      expect(p.managedBody.script_body).toContain("--enable-auto-tool-choice");
+    });
+
+    it("leaves them off when the flag is turned off at launch", () => {
+      const p = buildManagedFromRecipe(parseRecipe("t", file(tools, toolsBody)), { inputs: { tools: "false" } });
+      expect(p.createBody).not.toHaveProperty("supports_function_calling");
+      expect(p.createBody).not.toHaveProperty("supports_tool_choice");
+      expect(p.managedBody.script_body).not.toContain("--enable-auto-tool-choice");
+    });
+
+    it("adds nothing for a recipe that declares none", () => {
+      expect(Object.keys(buildManagedFromRecipe(parseRecipe("glm", file())).createBody).sort()).toEqual(["api_base", "model_name", "model_type", "upstream_model"]);
+    });
+
+    it("refuses capabilities on an input that isn't a flag, or one it doesn't know", () => {
+      const onText = parseRecipe("t", file(["inputs:", "  - name: extra", "    capabilities: [function_calling]"].join("\n")));
+      expect(onText.valid).toBe(false);
+      expect(onText.error).toContain("capabilities only go on a flag input");
+      const unknown = parseRecipe("t", file(tools.replace("[function_calling, tool_choice]", "[telepathy]")));
+      expect(unknown.valid).toBe(false);
+    });
+  });
+
   it("throws on an invalid recipe", () => {
     expect(() => buildManagedFromRecipe({ id: "x", valid: false, error: "bad", warnings: [] })).toThrow();
   });

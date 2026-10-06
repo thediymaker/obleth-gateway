@@ -30,7 +30,7 @@ describe("the settings model", () => {
   });
 
   it("says what needs you, and nothing when all is well", () => {
-    const models = [model("glm-5-3", { boons: ["vision", "image_generation", "speculation", "knowledge"] })];
+    const models = [model("glm-5-3", { boons: ["vision", "image_generation", "speculation", "knowledge"], supports_function_calling: true })];
     const found = needsYou({ ...base, models, knowledge: { enabled: false } as never, slurm: { enabled: true, provisioner_running: false } as never, compressor: { configured: true, reachable: false, url: "", model: null, revision: null, error: null } });
     expect(found.map((f) => f.key)).toEqual(["alerts", "boon-vision", "knowledge", "provisioner", "compressor"]);
     expect(found[1]).toMatchObject({ title: "glm-5-3 asks for Vision, which is off", href: "#boon-vision" });
@@ -49,6 +49,14 @@ describe("the settings model", () => {
     expect(found[0].href).toBe("#boon-web_search");
     expect(boonSummary("web_search", boons({ web_search_tool: "searxng-search" }))).toBe("searxng-search · 5 results a search · up to 3 searches a request");
     expect(boonSummary("web_search", boons())).toBe("No search tool picked");
+  });
+
+  it("flags a model holding tool boons while Function calling is off", () => {
+    const one = needsYou({ ...base, alerts: null, models: [model("nemotron-3-nano", { boons: ["image_generation"], supports_function_calling: false })] });
+    expect(one).toEqual([expect.objectContaining({ key: "boons-need-function-calling", title: "nemotron-3-nano has Image generation, but Function calling is off", href: "/models/nemotron-3-nano#set-native" })]);
+    const two = needsYou({ ...base, alerts: null, models: [model("a", { boons: ["web_search"] }), model("b", { boons: ["image_generation", "web_search"] }), model("c", { boons: ["web_search"], supports_function_calling: true })] }).filter((f) => f.key === "boons-need-function-calling");
+    expect(two).toEqual([expect.objectContaining({ title: "2 models have tool boons, but Function calling is off", href: "/models" })]);
+    expect(two[0].detail).toMatch(/^a, b\. /);
   });
 
   it("counts a model as asking for web search when it lists the boon", () => {

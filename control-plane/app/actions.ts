@@ -2681,14 +2681,9 @@ export async function launchRecipeAction(recipeId: string, overrides: DeployOver
     }
     if (!managedBody.partition) return { ok: false, error: "Pick a partition." };
     // A launched model starts staged, like one added by hand: it is made
-    // active on its page once it has been tried.
-    const created = await obleth.createModel({
-      model_name: createBody.model_name,
-      upstream_model: createBody.upstream_model,
-      api_base: createBody.api_base,
-      model_type: createBody.model_type,
-      status: "staged",
-    }, { auditActor: session.email });
+    // active on its page once it has been tried. It can already do what the
+    // recipe's flags turned on, e.g. function calling.
+    const created = await obleth.createModel({ ...createBody, status: "staged" }, { auditActor: session.email });
     await obleth.putManagedModel(created.id, managedBody, { auditActor: session.email });
     refreshDeployments();
     return { ok: true, name: created.model_name };
@@ -2777,14 +2772,9 @@ export async function deployRecipeAction(
   try {
     const { createBody, managedBody } = buildManagedFromRecipe(recipe, overrides);
     // A launched model starts staged, like one added by hand: it is made
-    // active on its page once it has been tried.
-    const created = await obleth.createModel({
-      model_name: createBody.model_name,
-      upstream_model: createBody.upstream_model,
-      api_base: createBody.api_base,
-      model_type: createBody.model_type,
-      status: "staged",
-    }, { auditActor: session.email });
+    // active on its page once it has been tried. It can already do what the
+    // recipe's flags turned on, e.g. function calling.
+    const created = await obleth.createModel({ ...createBody, status: "staged" }, { auditActor: session.email });
     await obleth.putManagedModel(created.id, managedBody, { auditActor: session.email });
   } catch (e) {
     return actionError(e);

@@ -9,6 +9,10 @@
 
 export type InputType = "text" | "choice" | "number" | "path" | "flag";
 
+/** The model flags a recipe input can turn on, named as in a recipe. */
+export const MODEL_CAPABILITIES = ["function_calling", "tool_choice", "response_schema", "vision"] as const;
+export type ModelCapability = (typeof MODEL_CAPABILITIES)[number];
+
 export interface RecipeInput {
   name: string;
   label?: string;
@@ -26,6 +30,9 @@ export interface RecipeInput {
   unit?: string;
   /** flag: what {{name}} becomes when on (empty when off). */
   adds?: string;
+  /** flag: what the launched model can do when it's on, e.g. a tool parser
+   *  means function calling. Set on the model it creates. */
+  capabilities?: ModelCapability[];
   /** Default per node count ("1" → "270"), for values that follow Runs on. */
   by_nodes?: Record<string, string>;
 }
@@ -124,6 +131,23 @@ export function inputProblem(input: RecipeInput, value: string | undefined): str
 /** Every problem with a set of values, in input order. */
 export function inputProblems(inputs: RecipeInput[], values: Record<string, string>): string[] {
   return inputs.map((i) => inputProblem(i, values[i.name])).filter((p): p is string => !!p);
+}
+
+/** The capabilities the flags that are on give the launched model, in
+ *  MODEL_CAPABILITIES order. A flag left unset follows its default. */
+export function inputCapabilities(
+  inputs: RecipeInput[],
+  values: Record<string, string> | undefined,
+  cv: ClusterValues,
+  nodes?: number,
+): ModelCapability[] {
+  const on = new Set<ModelCapability>();
+  for (const input of inputs) {
+    if (input.type !== "flag" || !input.capabilities?.length) continue;
+    const given = values?.[input.name]?.trim();
+    if (isOn(given ? given : inputDefault(input, cv, nodes))) for (const c of input.capabilities) on.add(c);
+  }
+  return MODEL_CAPABILITIES.filter((c) => on.has(c));
 }
 
 /** What {{name}} becomes for one input and value. */

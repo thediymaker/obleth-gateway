@@ -205,7 +205,7 @@ export function Configure(props: ConfigureProps) {
                   </Row>
                 ))}
                 {flags.length > 0 && (
-                  <Row label="Features" hint="Each adds its flags to the command." source={flags.some((f) => changed.has(`inputs.${f.name}`)) ? "changed" : "recipe"} saved={saved}>
+                  <Row label="Features" hint={flags.some((f) => f.capabilities?.length) ? "Each adds its flags to the command. Some also tell obleth what the model can do, like call functions, which the image and search boons need." : "Each adds its flags to the command."} source={flags.some((f) => changed.has(`inputs.${f.name}`)) ? "changed" : "recipe"} saved={saved}>
                     <div className="flex flex-wrap gap-x-5 gap-y-2 pt-1.5 text-[13px]">
                       {flags.map((f) => (
                         <label key={f.name} className="flex items-center gap-2" title={f.adds}>

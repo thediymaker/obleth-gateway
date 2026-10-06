@@ -5,7 +5,7 @@ import { Check, ChevronDown } from "lucide-react";
 import { HelpTip } from "@/components/fairshare/help";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
-import type { BoonBlockers } from "@/lib/boon-availability";
+import { FUNCTION_CALLING_BOONS, type BoonBlockers } from "@/lib/boon-availability";
 import { distinctEmbeddingModelCount } from "@/lib/knowledge-format";
 import { MAX_VARIANTS, touches, variantDrafts, variantNameProblem, variantsValue, type FormSnapshot, type VariantDraft } from "@/lib/models-model";
 import type { KnowledgeCollection, McpServer, ModelKnowledgeCollections, ModelRoute } from "@/lib/obleth";
@@ -47,13 +47,13 @@ export const MODEL_BOONS = [
     value: "image_generation",
     label: "Image generation",
     description:
-      "Add a generate_image tool this model can call to produce pictures through the image model configured in Settings → Boons. The gateway runs the generation and attaches the result to the reply; the image is billed per image against the caller's tenant. Requires the Function calling capability — without it no tool is injected and the model will say it cannot draw.",
+      "Add a generate_image tool this model can call to produce pictures through the image model configured in Settings → Boons. The gateway runs the generation and attaches the result to the reply; the image is billed per image against the caller's tenant. Needs Function calling under Native, because the model calls the tool itself; turning Function calling off turns this off.",
   },
   {
     value: "web_search",
     label: "Web search",
     description:
-      "Add a web_search tool this model can call to look things up through the search tool configured in Settings → Boons. The gateway runs the search and hands the results back to the model, which answers citing the URLs it used. Each search is logged under the request that made it. Requires the Function calling capability — without it no tool is injected. A client that brings its own web_search tool keeps it.",
+      "Add a web_search tool this model can call to look things up through the search tool configured in Settings → Boons. The gateway runs the search and hands the results back to the model, which answers citing the URLs it used. Each search is logged under the request that made it. Needs Function calling under Native, because the model calls the tool itself; turning Function calling off turns this off. A client that brings its own web_search tool keeps it.",
   },
   {
     value: "speculation",
@@ -540,7 +540,8 @@ export function RoutingTagsField({ model }: { model?: ModelRoute }) {
 // depend on native function calling + tool choice: without them the gateway
 // can't run the tool loop and silently drops the tools (the model then claims
 // it can't search). So the tool servers are disabled until both are on, and
-// any grants are cleared the moment either is turned off. Carries
+// any grants are cleared the moment either is turned off. The tool boons
+// (FUNCTION_CALLING_BOONS) follow Function calling the same way. Carries
 // `has_capabilities` so a save with every switch off still applies.
 export function ChatCapabilityFields({
   model,
@@ -565,9 +566,27 @@ export function ChatCapabilityFields({
   // switches are controlled; the others stay uncontrolled.
   const [knowledgeChecked, setKnowledgeChecked] = useState(model?.boons?.includes("knowledge") ?? false);
   const [speculationChecked, setSpeculationChecked] = useState(model?.boons?.includes("speculation") ?? false);
+  // The tool boons are controlled too: turning Function calling off clears them.
+  const [toolBoons, setToolBoons] = useState<Set<string>>(() => new Set((model?.boons ?? []).filter((b) => FUNCTION_CALLING_BOONS.includes(b))));
   const [draftModel, setDraftModel] = useState(model?.draft_model ?? "");
   const [specWiringOpen, setSpecWiringOpen] = useState(false);
   const toolsReady = fnCalling && toolChoice;
+  // Cleared on the switch, not in an effect: a model saved with a tool boon
+  // and Function calling off keeps that grant on load, so an unrelated save
+  // doesn't drop it. It shows as inactive until Function calling is on.
+  const changeFnCalling = (on: boolean) => {
+    setFnCalling(on);
+    if (!on) setToolBoons(new Set());
+  };
+  const setToolBoon = (value: string, on: boolean) =>
+    setToolBoons((prev) => {
+      const next = new Set(prev);
+      if (on) next.add(value);
+      else next.delete(value);
+      return next;
+    });
+  // Tool boons held while Function calling is off: granted, but no tool is added.
+  const waitingBoons = MODEL_BOONS.filter((boon) => !fnCalling && toolBoons.has(boon.value));
   // Boons whose global switch (or helper model) is missing in Settings. The
   // grant alone does nothing in that state, so the form says so rather than
   // letting the misconfiguration surface later as "the model says it can't".
@@ -583,7 +602,7 @@ export function ChatCapabilityFields({
 
   const native = (
     <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
-      <Switch name="supports_function_calling" label="Function calling" checked={fnCalling} onChange={setFnCalling}>Function calling</Switch>
+      <Switch name="supports_function_calling" label="Function calling" checked={fnCalling} onChange={changeFnCalling}>Function calling</Switch>
       <Switch name="supports_tool_choice" label="Tool choice" checked={toolChoice} onChange={setToolChoice}>Tool choice</Switch>
       <Switch name="supports_response_schema" label="Response schema" defaultChecked={model?.supports_response_schema ?? false}>Response schema</Switch>
       <Switch name="supports_system_messages" label="System messages" defaultChecked={model ? model.supports_system_messages : true}>System messages</Switch>
@@ -601,16 +620,23 @@ export function ChatCapabilityFields({
           // a disabled checkbox submits nothing — which would silently revoke
           // the grant on the next unrelated save. Only a NEW grant is refused,
           // since it would be inert the moment it was made.
-          const disabled = Boolean(blocked) && !held;
+          // A tool boon follows Function calling: off, it can't be newly
+          // granted, and one still held from before stays operable to ungrant.
+          const toolBoon = FUNCTION_CALLING_BOONS.includes(boon.value);
+          const on = toolBoon ? toolBoons.has(boon.value) : held;
+          const needsFn = toolBoon && !fnCalling;
+          const disabled = (Boolean(blocked) && !held) || (needsFn && !on);
           const control =
             boon.value === "knowledge" ? { checked: knowledgeChecked, onChange: setKnowledgeChecked }
             : boon.value === "speculation" ? { checked: speculationChecked, onChange: setSpeculationChecked }
+            : toolBoon ? { checked: on, onChange: (c: boolean) => setToolBoon(boon.value, c) }
             : { defaultChecked: held };
+          const why = [blocked && "off in Settings", needsFn && "needs Function calling"].filter(Boolean).join(" · ");
           return (
             <div key={boon.value} className="flex items-center gap-2">
               <Switch name={`boon_${boon.value}`} label={boon.label} disabled={disabled} className="flex-1" {...control}>
                 <span className="block">{boon.label}</span>
-                {blocked && <span className="block text-[11px] text-muted-foreground">{held ? "on here · off in Settings" : "off in Settings"}</span>}
+                {why && <span className="block text-[11px] text-muted-foreground">{on ? `on here · ${why}` : why}</span>}
               </Switch>
               <HelpTip label={`About ${boon.label}`} align="right">{boon.description}</HelpTip>
             </div>
@@ -624,6 +650,15 @@ export function ChatCapabilityFields({
               <span className="font-medium text-foreground">{boon.label}</span>
               {boon.held ? " is granted but inactive — " : " can’t be granted — "}
               {boon.reason}
+            </li>
+          ))}
+        </ul>
+      )}
+      {waitingBoons.length > 0 && (
+        <ul className="max-w-prose space-y-0.5 text-[11.5px] leading-snug text-muted-foreground">
+          {waitingBoons.map((boon) => (
+            <li key={boon.value}>
+              <span className="font-medium text-foreground">{boon.label}</span> is granted but does nothing while Function calling is off. The model calls the tool itself, so turn Function calling on under Native, or turn the boon off.
             </li>
           ))}
         </ul>

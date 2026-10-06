@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { EMPTY_CLUSTER, inputDefault, inputProblem, inputSource, missingClusterValues, renderScript, resolveClusterTokens, type ClusterValues, type RecipeInput } from "./recipe-inputs";
+import { EMPTY_CLUSTER, inputCapabilities, inputDefault, inputProblem, inputSource, missingClusterValues, renderScript, resolveClusterTokens, type ClusterValues, type RecipeInput } from "./recipe-inputs";
 
 const cv: ClusterValues = { cache: "/scratch/hf", images: "/scratch/images", logs: "/scratch/logs", setup: "module load apptainer", image: { vllm: "vllm.sif", sglang: "/opt/sglang.sif" } };
 
@@ -82,5 +82,22 @@ describe("renderScript", () => {
 
   it("refuses to launch with a cluster default missing", () => {
     expect(() => renderScript("run {{image}}", inputs, {}, EMPTY_CLUSTER, { strict: true })).toThrow(/cluster.image.vllm isn't set/);
+  });
+});
+
+describe("inputCapabilities", () => {
+  const tools: RecipeInput = { name: "tools", type: "flag", default: "true", required: false, adds: "--enable-auto-tool-choice", capabilities: ["tool_choice", "function_calling"] };
+  const schema: RecipeInput = { name: "json", type: "flag", default: "false", required: false, adds: "--guided", capabilities: ["response_schema"] };
+
+  it("follows each flag's default, in a fixed order", () => {
+    expect(inputCapabilities([tools, schema], undefined, cv)).toEqual(["function_calling", "tool_choice"]);
+  });
+
+  it("follows the values given at launch", () => {
+    expect(inputCapabilities([tools, schema], { tools: "false", json: "on" }, cv)).toEqual(["response_schema"]);
+  });
+
+  it("ignores inputs that declare none", () => {
+    expect(inputCapabilities([{ name: "x", type: "flag", default: "true", required: false, adds: "--x" }], undefined, cv)).toEqual([]);
   });
 });

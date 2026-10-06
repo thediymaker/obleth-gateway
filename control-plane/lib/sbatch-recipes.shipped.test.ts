@@ -21,6 +21,17 @@ describe("shipped recipe files", () => {
     expect(parsed.valid, parsed.error ?? "invalid recipe").toBe(true);
   });
 
+  // A flag that starts a tool parser must say so, or the model it launches
+  // isn't flagged for function calling and its tool boons stay off.
+  it.each(files)("%s declares function calling on any flag that turns tools on", (file) => {
+    const parsed = parseRecipe(file.replace(/\.recipe$/, ""), readFileSync(path.join(dir, file), "utf8"));
+    for (const input of parsed.header?.inputs ?? []) {
+      if (input.type === "flag" && /--tool-call-parser|--enable-auto-tool-choice/.test(input.adds ?? "")) {
+        expect(input.capabilities, `${input.name} adds a tool parser`).toEqual(expect.arrayContaining(["function_calling", "tool_choice"]));
+      }
+    }
+  });
+
   // The library is a catalog of recipes that are known to work: each one says
   // where it was run and served, so nothing untried ships.
   it.each(files)("%s says where it was run and served", (file) => {
