@@ -44,6 +44,11 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
           env:
+            # Next.js standalone (`node server.js`) binds to $HOSTNAME, which
+            # Kubernetes sets to the pod name -> it would listen only on the
+            # pod IP, and `kubectl port-forward` (which connects over the pod's
+            # localhost) could not reach it. Listen on all interfaces.
+            - { name: HOSTNAME, value: "0.0.0.0" }
             - { name: OBLETH_ADMIN_BASE_URL, value: "http://{{ include "obleth.fullname" . }}:9180" }
             - { name: OBLETH_PROXY_BASE_URL, value: "http://{{ include "obleth.fullname" . }}:8080" }
             - name: OBLETH_ADMIN_TOKEN
