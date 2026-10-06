@@ -13,9 +13,12 @@ import type { ManagedModelSpec, ModelReplica, ModelRoute } from "@/lib/obleth";
 
 vi.mock("@/app/actions", () => ({
   launchRecipeAction: vi.fn(async () => ({ ok: true, name: "glm-own" })),
+  saveRecipeFromFormAction: vi.fn(async () => ({ ok: true, id: "r1" })),
+  lookupHfModelAction: vi.fn(async () => ({ ok: false, error: "offline" })),
   setDeploymentEnabledAction: vi.fn(async () => ({ ok: true })),
   setDeploymentReplicasAction: vi.fn(async () => ({ ok: true })),
   saveDeploymentSettingsAction: vi.fn(async () => ({ ok: true })),
+  saveRecipeFromDeploymentAction: vi.fn(async () => ({ ok: true, id: "r1" })),
   removeDeploymentAction: vi.fn(async () => ({ ok: true })),
   restartReplicaAction: vi.fn(async () => ({ ok: true })),
   clearLostReplicasAction: vi.fn(async () => ({ ok: true })),
@@ -115,7 +118,21 @@ describe("the Slurm connection", () => {
     await type(sheet.querySelector<HTMLInputElement>('input[name="user"]')!, "svc-obleth");
     await act(async () => { await new Promise((r) => requestAnimationFrame(r)); });
     await act(async () => button("Save changes").click());
-    expect(setSlurmSettingsAction).toHaveBeenCalledWith({ enabled: true, slurmrestd_url: "http://slurm:6820", slurmrestd_api_version: "v0.0.40", slurm_user: "svc-obleth", node_aliases: [{ host: "gh-007", ip: "10.0.0.7" }] });
+    expect(setSlurmSettingsAction).toHaveBeenCalledWith({ enabled: true, slurmrestd_url: "http://slurm:6820", slurmrestd_api_version: "v0.0.40", slurm_user: "svc-obleth", node_aliases: [{ host: "gh-007", ip: "10.0.0.7" }], cluster_defaults: { cache_dir: "", images_dir: "", log_dir: "", setup: "", images: {} } });
+  });
+
+  it("saves cluster defaults with the connection, and never sends an untouched token", async () => {
+    const withDefaults = { ...slurm, cluster_defaults: { cache_dir: "/scratch/hf", images_dir: "/scratch/images", log_dir: "", setup: "", images: { vllm: "vllm.sif" } }, hf_token_set: true, hf_token_last4: "9f3c" } as DeploymentsData["slurm"];
+    await render(<DeploymentsList initial={data({ slurm: withDefaults })} recipes={[]} tab="deployments" slurmSheet />);
+    await act(async () => button("Cluster defaults").click());
+    const sheet = document.querySelector('[role="dialog"][aria-label="Slurm connection"]')!;
+    expect(sheet.textContent).toContain("A token ending 9f3c is set");
+    await type(sheet.querySelector<HTMLInputElement>('input[aria-label="Ollama image"]')!, "ollama.sif");
+    await act(async () => { await new Promise((r) => requestAnimationFrame(r)); });
+    await act(async () => button("Save changes").click());
+    const body = vi.mocked(setSlurmSettingsAction).mock.calls[0][0];
+    expect(body.cluster_defaults).toEqual({ cache_dir: "/scratch/hf", images_dir: "/scratch/images", log_dir: "", setup: "", images: { vllm: "vllm.sif", ollama: "ollama.sif" } });
+    expect(body).not.toHaveProperty("hf_token");
   });
 
   it("asks before turning Slurm off while jobs run", async () => {
@@ -139,32 +156,125 @@ describe("a Slurm deployment's page", () => {
     expect(setDeploymentReplicasAction).toHaveBeenCalledWith("m1", 3);
   });
 
+  it("moves #SBATCH lines from the script into Placement, where Slurm reads them", async () => {
+    const script = ["#!/bin/bash -l", "#SBATCH --gres=gpu:1", "#SBATCH --cpus-per-task=72", "#SBATCH --mem=500G", "#SBATCH --exclusive", "set -euo pipefail", "vllm serve m"].join("\n");
+    await render(<ManagedPage modelId="m1" initial={data({ specs: [spec({ script_body: script })] })} changes={[]} />);
+    const notice = () => [...host.querySelectorAll('[role="status"]')].find((x) => x.textContent?.includes("#SBATCH"));
+    expect(notice()?.textContent).toContain("Slurm doesn't read these 4 #SBATCH lines");
+    expect(notice()?.textContent).toContain("Placement's memory is 560G; this would make it 500G.");
+    expect(notice()?.textContent).toContain("Placement's GPUs is the same.");
+    expect(host.textContent).toContain("Each replica asks Slurm for 1 node with 1 GPU, 72 CPUs and 560 GB of memory.");
+    await act(async () => button("Move them to Placement").click());
+    expect(host.querySelector<HTMLTextAreaElement>('textarea[name="slurm_script_body"]')!.value).toBe(["#!/bin/bash -l", "set -euo pipefail", "vllm serve m"].join("\n"));
+    expect(host.querySelector<HTMLInputElement>('input[name="slurm_mem"]')!.value).toBe("500G");
+    expect(notice()).toBeUndefined();
+    expect(host.textContent).toContain("Each replica asks Slurm for 1 node with 1 GPU, 72 CPUs and 500 GB of memory.");
+  });
+
+  it("labels what each node gets", async () => {
+    await render(<ManagedPage modelId="m1" initial={data()} changes={[]} />);
+    const row = host.querySelector("#set-resources")!;
+    expect(row.textContent).toContain("On its node");
+    for (const label of ["GPUs", "CPUs", "Memory"]) expect([...row.querySelectorAll("label")].some((l) => l.textContent?.startsWith(label))).toBe(true);
+    expect(host.querySelector("#set-nodes")?.textContent).toContain("Nodes per replica");
+  });
+
   it("says why it stopped after failed launches", async () => {
     const lost = [1, 2, 3].map(() => replica({ state: "lost", last_message: "FAILED — NonZeroExitCode" }));
     await render(<ManagedPage modelId="m1" initial={data({ replicas: lost })} changes={[]} />);
     const why = host.querySelector('[aria-label="Why it stopped"]')!;
     expect(why.textContent).toContain("The last 3 jobs ended without becoming healthy");
     expect(why.textContent).toContain("FAILED — NonZeroExitCode");
+    expect(why.textContent).toContain("Job 42's output is in logs, in the file ending -42.out");
+  });
+
+  it("says a job's output stayed on its node when Job logs isn't set", async () => {
+    const lost = [1, 2, 3].map(() => replica({ state: "lost", last_message: "FAILED — NonZeroExitCode" }));
+    await render(<ManagedPage modelId="m1" initial={data({ specs: [spec({ log_output_dir: "" })], replicas: lost })} changes={[]} />);
+    expect(host.querySelector('[aria-label="Why it stopped"]')!.textContent).toContain("Job logs isn't set, so job 42's output stayed in Slurm's default place, /tmp on gh-007.");
+    expect(host.querySelector<HTMLInputElement>('input[name="slurm_log_output_dir"]')!.value).toBe("");
   });
 });
 
 describe("a new deployment", () => {
-  const recipe: RecipeCard = {
-    id: "glm-5.2-multiuser", valid: true, name: "Deploy llama.cpp", engine: "llama.cpp", modelType: "chat", apiModelName: "glm-5.2", warnings: [], source: "file",
-    preview: { apiModelName: "glm-5.2", modelType: "chat", engine: "llama.cpp", port: 8000, healthPath: "/health", targetReplicas: 2, maxJobFailures: 3, partition: "gh200", gres: "gpu:1", cpusPerTask: 72, mem: "560G", timeLimit: "1-00:00:00", scriptBody: "", rawBody: "export LLAMA_CACHE={{cache}}\nllama-server", warnings: [], variables: [{ name: "cache", label: "Weight cache directory", required: true }] },
+  const preview = {
+    apiModelName: "glm-5.2", modelType: "chat", engine: "llamacpp", port: 8000, healthPath: "/health", targetReplicas: 2, maxJobFailures: 3, partition: "gh200", gres: "gpu:1", cpusPerTask: 72, mem: "560G", timeLimit: "1-00:00:00",
+    scriptBody: "", rawBody: "export LLAMA_CACHE={{cache}}\nllama-server --ctx-size {{context}} {{fa}}", warnings: [], kind: "model" as const,
+    inputs: [
+      { name: "cache", label: "Weight cache", type: "path" as const, default: "{{cluster.cache}}", required: true },
+      { name: "context", label: "Context length", type: "choice" as const, options: ["131072", "1048576"], default: "131072", required: false },
+      { name: "fa", label: "Flash attention", type: "flag" as const, default: "true", adds: "--flash-attn on", required: false },
+    ],
   };
+  const recipe: RecipeCard = { id: "glm-5.2-multiuser", valid: true, name: "GLM-5.2", engine: "llamacpp", modelType: "chat", apiModelName: "glm-5.2", warnings: [], source: "file", preview };
+  const cluster = { cache: "/scratch/hf", images: "", logs: "", setup: "", image: {} };
+  const launch = (over: Record<string, unknown>) => ({ id: Math.random().toString(36), model_name: "glm-a", recipe_id: "glm-5.2-multiuser", partition: "gh200", account: "ai-research", qos: null, time_limit: "1-00:00:00", nodes_requested: 1, nodes: "gh-007", submitted_at: new Date(Date.now() - 3_600_000).toISOString(), started_at: null, healthy_at: null, ended_at: null, end_state: null, queued_secs: 120, load_secs: 900, ...over });
 
-  it("asks for the recipe's values, then launches under the name you give it", async () => {
-    await render(<NewDeployment recipes={[recipe]} takenNames={["glm-5.2"]} slurmOn initialRecipe="glm-5.2-multiuser" />);
-    expect(button("Fill in Weight cache directory").disabled).toBe(true);
-    await type(document.querySelector<HTMLInputElement>('input[name="var_cache"]')!, "/scratch/me/glm");
+  it("starts from the recipe and cluster defaults, then launches under the name you give it", async () => {
+    await render(<NewDeployment recipes={[recipe]} takenNames={["glm-5.2"]} slurmOn initialRecipe="glm-5.2-multiuser" cluster={cluster} />);
     await act(async () => button("Choose where it runs →").click());
-    await act(async () => button("Review →").click());
-    expect(host.textContent).toContain("A model with this name already exists");
-    await type(document.querySelector<HTMLInputElement>('input[name="api_model_name"]')!, "glm-own");
-    expect(host.textContent).toContain("export LLAMA_CACHE=/scratch/me/glm");
+    // The taken name gets a free variant, and the cache comes from the cluster default.
+    expect(host.querySelector<HTMLInputElement>('input[aria-label="API model name"]')!.value).toBe("glm-5.2-2");
+    expect(host.querySelector<HTMLInputElement>('input[aria-label="Weight cache"]')!.value).toBe("/scratch/hf");
+    expect(host.textContent).toContain("Cluster default");
+    await type(host.querySelector<HTMLInputElement>('input[aria-label="API model name"]')!, "glm-own");
+    await act(async () => button("1M").click());
+    await act(async () => button("Review the script →").click());
+    expect(host.textContent).toContain("export LLAMA_CACHE=/scratch/hf");
+    expect(host.textContent).toContain("--ctx-size 1048576 --flash-attn on");
     await act(async () => button("Launch 2 replicas").click());
-    expect(launchRecipeAction).toHaveBeenCalledWith("glm-5.2-multiuser", expect.objectContaining({ api_model_name: "glm-own", partition: "gh200", variables: { cache: "/scratch/me/glm" }, target_replicas: 2 }));
+    expect(launchRecipeAction).toHaveBeenCalledWith("glm-5.2-multiuser", expect.objectContaining({ api_model_name: "glm-own", partition: "gh200", inputs: { cache: "/scratch/hf", context: "1048576", fa: "true" }, target_replicas: 2 }));
     expect(push).toHaveBeenCalledWith("/deployments/glm-own");
+  });
+
+  it("won't go on while a required value has no cluster default", async () => {
+    await render(<NewDeployment recipes={[recipe]} takenNames={[]} slurmOn initialRecipe="glm-5.2-multiuser" />);
+    await act(async () => button("Choose where it runs →").click());
+    expect(host.textContent).toContain("Weight cache uses a cluster default that isn't set");
+    expect(button("Review the script →").disabled).toBe(true);
+    await type(host.querySelector<HTMLInputElement>('input[aria-label="Weight cache"]')!, "/scratch/me");
+    expect(button("Review the script →").disabled).toBe(false);
+  });
+
+  it("fills in what recent launches agreed on, and says so", async () => {
+    await render(<NewDeployment recipes={[recipe]} takenNames={[]} slurmOn initialRecipe="glm-5.2-multiuser" cluster={cluster} launches={[launch({}), launch({})]} />);
+    await act(async () => button("Choose where it runs →").click());
+    expect(host.querySelector<HTMLInputElement>('input[aria-label="Account"]')!.value).toBe("ai-research");
+    expect(host.textContent).toContain("The last 2 launches of this recipe used ai-research.");
+    expect(host.textContent).toContain("Learned");
+  });
+
+  it("moves a per-node value with Runs on, and offers the recipe's value back after an edit", async () => {
+    const multi: RecipeCard = { ...recipe, preview: { ...preview, nodes: 1, nodeOptions: [1, 4], inputs: [...preview.inputs, { name: "offload_gb", label: "Weights in Grace memory", type: "number" as const, unit: "GiB per node", default: "270", by_nodes: { "1": "270", "4": "10" }, required: false }] } };
+    await render(<NewDeployment recipes={[multi]} takenNames={[]} slurmOn initialRecipe="glm-5.2-multiuser" cluster={cluster} />);
+    await act(async () => button("Choose where it runs →").click());
+    const box = () => host.querySelector<HTMLInputElement>('input[aria-label="Weights in Grace memory"]')!;
+    expect(host.textContent).toContain("The recipe's value for 1 node; it updates when you change Runs on.");
+    await act(async () => button("4 nodes").click());
+    expect(box().value).toBe("10");
+    await type(box(), "20");
+    expect(host.textContent).toContain("The recipe suggests 10 for 4 nodes.");
+    await act(async () => button("Use 10").click());
+    expect(box().value).toBe("10");
+  });
+
+  it("edits the same deployment as YAML", async () => {
+    await render(<NewDeployment recipes={[recipe]} takenNames={[]} slurmOn initialRecipe="glm-5.2-multiuser" cluster={cluster} />);
+    await act(async () => button("Choose where it runs →").click());
+    await act(async () => button("YAML").click());
+    const area = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Deployment YAML"]')!;
+    expect(area.value).toContain("recipe: glm-5.2-multiuser");
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(area, "recipe: glm-5.2-multiuser\nname: from-yaml\nslurm:\n  qos: long\n  reservation: x\n");
+      area.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    expect(host.textContent).toContain("reservation isn't a slurm setting");
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(area, "recipe: glm-5.2-multiuser\nname: from-yaml\nslurm:\n  qos: long\n");
+      area.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => button("Form").click());
+    expect(host.querySelector<HTMLInputElement>('input[aria-label="API model name"]')!.value).toBe("from-yaml");
+    expect(host.querySelector<HTMLInputElement>('input[aria-label="QoS"]')!.value).toBe("long");
   });
 });

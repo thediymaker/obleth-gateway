@@ -24,10 +24,10 @@ use crate::{
     CreateMcpServer, CreateModel, CreateModelEndpoint, CreateTenant, CreatedKey, EmailSettingsView,
     EnergySettingsView, EnergyTestResult, FairshareHistoryPointView, FairshareHistoryQuery,
     FairshareHistoryView, FairshareLiveView, GroupFairshareView, KeyFairshareView, ListKeysQuery,
-    LiveStats, McpServerView, ModelEndpointView, ModelPoolView, ModelRouteView,
+    LiveStats, McpServerView, ModelEndpointView, ModelPoolView, ModelRouteView, ModelVariantWrite,
     OverviewSummaryView, SetCapacity, SetDisabled, SetModelCache, SetModelCapacity,
-    SetModelCapacityMode, SetModelReliability, SetModelWeight, SetTenantAllowlist, SetTenantBudget,
-    SetTenantCompression, SetTenantGuardrails, SetTenantSchedule, SetTenantStatus,
+    SetModelCapacityMode, SetModelReliability, SetModelStatus, SetModelWeight, SetTenantAllowlist,
+    SetTenantBudget, SetTenantCompression, SetTenantGuardrails, SetTenantSchedule, SetTenantStatus,
     SetTenantSynthetic, TenantFairshareView, TestAlertResult, TestEnergyQuery, UpdateAlertSettings,
     UpdateAutoRouterSettings, UpdateBoonSettings, UpdateEmailSettings, UpdateEnergySettings,
     UpdateGroupWeight, UpdateKey, UpdateMcpServer, UpdateModel, UpdateModelEndpoint, UpdateQuota,
@@ -38,7 +38,8 @@ use obleth_config::{
     ConfigBackup, FairshareGroup, FairshareGroupBackup, GuardrailsPolicy, ManagedModelSpec,
     ManifestEndpoint, ManifestModel, McpServerBackup, ModelBackup, ModelEndpointBackup,
     ModelHealthCheck, ModelHealthDetail, ModelHealthSummary, ModelImportEntry, ModelImportReport,
-    ModelManifest, ModelReplica, RestoreCounts, RestoreReport, Tenant, TenantBackup, WeeklyWindow,
+    ModelManifest, ModelReplica, ModelVariant, RestoreCounts, RestoreReport, Tenant, TenantBackup,
+    WeeklyWindow,
 };
 
 #[derive(OpenApi)]
@@ -77,6 +78,7 @@ use obleth_config::{
         crate::delete_key,
         crate::set_key_disabled,
         crate::set_key_tracing_handler,
+        crate::set_key_end_user_fairshare_handler,
         crate::get_key_usage,
         // usage & costs
         crate::get_usage,
@@ -112,6 +114,7 @@ use obleth_config::{
         crate::update_model,
         crate::delete_model,
         crate::set_model_capacity,
+        crate::set_model_status,
         crate::set_model_capacity_mode,
         crate::autotune_model,
         crate::apply_autotune_capacity,
@@ -137,6 +140,7 @@ use obleth_config::{
         crate::restart_replica,
         crate::delete_replica,
         crate::clear_lost_replicas,
+        crate::list_deployment_launches,
         crate::model_health::list_health,
         crate::model_health::get_health,
         crate::model_health::check_one,
@@ -286,7 +290,12 @@ use obleth_config::{
         ModelPoolView,
         CreateModel,
         UpdateModel,
+        ModelVariantWrite,
+        ModelVariant,
         SetModelCapacity,
+        SetModelStatus,
+        obleth_config::ModelLifecycle,
+        obleth_config::ModelStatus,
         SetModelCapacityMode,
         ApplyAutotuneCapacity,
         SetModelWeight,
@@ -296,6 +305,8 @@ use obleth_config::{
         UpdateModelEndpoint,
         ManagedModelSpec,
         ModelReplica,
+        obleth_config::DeploymentLaunch,
+        crate::DeploymentLaunchesQuery,
         crate::PutManagedModel,
         crate::CreateReplica,
         crate::PatchReplica,
@@ -341,6 +352,7 @@ use obleth_config::{
         CharoSettingsView,
         obleth_config::SlurmSettings,
         obleth_config::NodeAlias,
+        obleth_config::ClusterDefaults,
         crate::slurm_settings::SlurmSettingsView,
         crate::slurm_settings::UpdateSlurmSettings,
         crate::slurm_settings::SlurmHealthView,
@@ -372,6 +384,7 @@ use obleth_config::{
         crate::VersionInfo,
         crate::ResyncReport,
         crate::SetKeyTracing,
+        crate::SetKeyEndUserFairshare,
         crate::ProvisionErrorBody,
         crate::usage::SpanEntry,
         crate::recipes::RecipeView,
@@ -407,6 +420,7 @@ mod tests {
         for field in [
             "model_name",
             "aliases",
+            "variants",
             "quantization",
             "route_bias",
             "auto_eligible",
@@ -415,6 +429,38 @@ mod tests {
             assert!(
                 !description.is_empty(),
                 "ModelRouteView.{field} has no description"
+            );
+        }
+    }
+
+    #[test]
+    fn model_writes_document_variants() {
+        let doc = serde_json::to_value(ApiDoc::openapi()).expect("serialize");
+        let schemas = &doc["components"]["schemas"];
+        for write in ["CreateModel", "UpdateModel"] {
+            let description = schemas[write]["properties"]["variants"]["description"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(
+                !description.is_empty(),
+                "{write}.variants has no description"
+            );
+        }
+        for field in ["name", "description", "boons"] {
+            assert!(
+                schemas["ModelVariantWrite"]["properties"][field].is_object(),
+                "ModelVariantWrite.{field} is not documented"
+            );
+            assert!(
+                schemas["ModelVariant"]["properties"][field].is_object(),
+                "ModelVariant.{field} is not documented"
+            );
+        }
+        // The request log documents the new columns.
+        for field in ["parent_request_id", "model_variant"] {
+            assert!(
+                schemas["UsageLogRow"]["properties"][field].is_object(),
+                "UsageLogRow.{field} is not documented"
             );
         }
     }

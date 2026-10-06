@@ -16,7 +16,7 @@ export const LOG_WINDOWS = [
 
 export type LogWindowId = (typeof LOG_WINDOWS)[number]["id"];
 
-export const REQUEST_TYPES = ["chat", "completion", "responses", "embedding", "audio", "image", "video", "rerank", "moderation", "other"] as const;
+export const REQUEST_TYPES = ["chat", "completion", "responses", "embedding", "audio", "image", "video", "rerank", "moderation", "search", "other"] as const;
 
 export interface LogFilters {
   /** A preset window, or `custom` with `sinceMs`/`untilMs` (a drag on the chart). */
@@ -237,6 +237,50 @@ export function cost(usd: number): string {
   if (!usd) return "$0";
   if (usd < 0.0001) return "< $0.0001";
   return `$${usd < 1 ? usd.toFixed(4) : usd.toFixed(2)}`;
+}
+
+// ---------------------------------------------------------------------------
+// Helper calls: a boon's own calls to other models
+// ---------------------------------------------------------------------------
+
+/** The id a row carries when it served no other request. */
+export const NIL_REQUEST_ID = "00000000-0000-0000-0000-000000000000";
+
+const HELPER_PURPOSES: Record<string, string> = {
+  speculation_draft: "speculation draft",
+  speculation_verify: "draft check",
+  vision_boon: "image description",
+  structured_output_boon: "structured output repair",
+  guardrails_boon: "guardrails scan",
+  tool_loop: "tool loop turn",
+  image_generation_boon: "image generation",
+  web_search_boon: "web search",
+};
+
+/** What a helper call was for, in a few words; any other type as recorded. */
+export function helperPurpose(requestType: string): string {
+  return HELPER_PURPOSES[requestType] ?? (requestType || "other");
+}
+
+/** The client request a helper call served, or null for a request a client made. */
+export function servedRequest(row: Pick<UsageLogEntry, "parent_request_id">): string | null {
+  const id = row.parent_request_id ?? "";
+  return id && id !== NIL_REQUEST_ID ? id : null;
+}
+
+/**
+ * The query for a request's helper calls. They are written while it runs and
+ * now and then just after it ends (`ts_ms` is when it ended), so an hour
+ * either side finds them all. Health checks and benchmarks have helpers too.
+ */
+export function helperCallsParams(row: Pick<UsageLogEntry, "request_id" | "ts_ms">): URLSearchParams {
+  return new URLSearchParams({
+    parent_request_id: row.request_id,
+    since_ms: String(row.ts_ms - 3_600_000),
+    until_ms: String(row.ts_ms + 3_600_000),
+    include_internal: "true",
+    limit: "200",
+  });
 }
 
 export const HTTP_REASONS: Record<number, string> = {

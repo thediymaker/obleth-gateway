@@ -10,6 +10,7 @@ import { useEnabledModels } from "@/components/charo/use-enabled-models";
 import { UnifiedWorkspace } from "./workspaces";
 import { RouterWorkspace } from "./router-workspace";
 import { ImageWorkspace } from "./image-workspace";
+import { SearchWorkspace } from "./search-workspace";
 import { VerdictsWorkspace } from "./verdicts-workspace";
 import { NewSession } from "./new-session";
 import { GetCode } from "./get-code";
@@ -33,7 +34,7 @@ export const ROUTER_PROMPT_MAX_LENGTH = 100_000;
 // duplicating the schema, and so its cap can be checked against
 // ROUTER_PROMPT_MAX_LENGTH directly rather than by re-deriving it.
 export const sessionSchema = z.object({
-  id: z.string(), title: z.string(), mode: z.enum(["chat", "compare", "router", "image", "verdicts"]),
+  id: z.string(), title: z.string(), mode: z.enum(["chat", "compare", "router", "image", "verdicts", "search"]),
   models: z.array(z.string()).min(1).max(4), generation: generationSchema,
   recipients: z.array(z.number().int().min(0).max(3)).optional(),
   // Last touched, for ordering and grouping the session rail.
@@ -83,6 +84,13 @@ export const sessionSchema = z.object({
     trueDesc: z.string().max(1000).optional(),
     falseDesc: z.string().max(1000).optional(),
   })).max(32).optional(),
+  // Search mode's form draft, kept on the session for the same reason; the
+  // results are memory-only.
+  searchTool: z.string().max(200).optional(),
+  searchQuery: z.string().max(2000).optional(),
+  searchMaxResults: z.number().int().min(1).max(20).optional(),
+  searchDomains: z.string().max(10_000).optional(),
+  searchTimeRange: z.enum(["day", "week", "month", "year"]).optional(),
 });
 export type PlaygroundSession = z.infer<typeof sessionSchema>;
 
@@ -94,11 +102,13 @@ const fresh = (): PlaygroundSession => ({
   launcher: true, updatedAt: Date.now(),
 });
 
-export function Playground({ scope, gatewayBase = "http://localhost:8080", openModel }: {
+export function Playground({ scope, gatewayBase = "http://localhost:8080", openModel, visionBoonActive = false }: {
   scope: string;
   gatewayBase?: string;
   /** From `?model=`: open a new session on this model (the Models page's "Try in Playground"). */
   openModel?: { name: string; type: string };
+  /** The vision boon is on, so models opted into it take images (see `acceptsImages`). */
+  visionBoonActive?: boolean;
 }) {
   const root = `obleth-playground:${encodeURIComponent(scope)}`;
   const [sessions, setSessions] = useState<PlaygroundSession[]>([]);
@@ -132,13 +142,15 @@ export function Playground({ scope, gatewayBase = "http://localhost:8080", openM
     if (!openModel || opened.current || !sessions.length) return;
     opened.current = true;
     const image = openModel.type === "image";
+    const search = openModel.type === "search";
     const next: PlaygroundSession = {
       ...fresh(),
       title: openModel.name,
       launcher: false,
-      mode: image ? "image" : "chat",
-      models: [openModel.name],
+      mode: image ? "image" : search ? "search" : "chat",
+      models: [search ? "auto" : openModel.name],
       ...(image ? { imageModel: openModel.name } : {}),
+      ...(search ? { searchTool: openModel.name } : {}),
     };
     setSessions((all) => [next, ...all]);
     setActive(next.id);
@@ -193,7 +205,7 @@ export function Playground({ scope, gatewayBase = "http://localhost:8080", openM
     } catch { setNotice("Could not import that file."); }
   };
   if (!session) return <PlaygroundSkeleton />;
-  const hasSettings = !session.launcher && session.mode !== "verdicts";
+  const hasSettings = !session.launcher && session.mode !== "verdicts" && session.mode !== "search";
   const tabActive = (mode: PlaygroundSession["mode"]) => !session.launcher && (session.mode === mode || (mode === "compare" && session.mode === "chat"));
   const sessionPending = pending?.sessionId === session.id ? pending : undefined;
   return (
@@ -265,7 +277,9 @@ export function Playground({ scope, gatewayBase = "http://localhost:8080", openM
             ? <ImageWorkspace storageKey={`${root}:${session.id}:image`} session={session} update={update} models={models} loading={loading} settingsOpen={settingsOpen} />
             : session.mode === "verdicts"
             ? <VerdictsWorkspace session={session} update={update} models={models} loading={loading} />
-            : <UnifiedWorkspace storageKey={`${root}:${session.id}:compare`} session={session} update={update} models={models} loading={loading} settingsOpen={settingsOpen} onOpenSession={openSession} pending={sessionPending} onPendingDone={() => setPending(null)} />}
+            : session.mode === "search"
+            ? <SearchWorkspace session={session} update={update} models={models} loading={loading} />
+            : <UnifiedWorkspace storageKey={`${root}:${session.id}:compare`} session={session} update={update} models={models} loading={loading} settingsOpen={settingsOpen} onOpenSession={openSession} pending={sessionPending} onPendingDone={() => setPending(null)} visionBoonActive={visionBoonActive} />}
         </div>
       </div>
       <GetCode open={codeOpen} onOpenChange={setCodeOpen} session={session} gatewayBase={gatewayBase} />

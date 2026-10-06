@@ -27,5 +27,6 @@ export function logParamsFrom(sp: URLSearchParams): UsageLogParams {
     limit: num("limit"),
     tracedOnly: sp.get("traced_only") === "true" ? true : undefined,
     includeInternal: sp.get("include_internal") === "true" ? true : undefined,
+    parentRequestId: str("parent_request_id"),
   };
 }

@@ -8,8 +8,8 @@
 //!    (they may be stale, and acting on them would suppress the very probe that
 //!    would clear them), so they fall through to step 2.
 //! 2. **Active minimal inference** — a real forward pass per modality: one-token
-//!    chat completion, one-string embedding, one-character speech, or a
-//!    generated 0.1 s silence WAV transcription. Probe tokens are accounted
+//!    chat completion, one-string embedding, one-character speech, a
+//!    generated 0.1 s silence WAV transcription, or one web search. Probe tokens are accounted
 //!    under the internal `health_probe` tenant so they never appear in client
 //!    billing.
 //! 3. **Catalog existence** — for types with no cheap inference probe (image),
@@ -266,7 +266,8 @@ pub async fn check_all(State(state): State<AdminState>) -> Result<Json<BulkModel
             .maintenance_until
             .map(|until| until > now)
             .unwrap_or(false);
-        if !model.enabled || !summary.checks_enabled || in_maintenance {
+        let retired = model.lifecycle.status_at(now) == obleth_config::ModelStatus::Retired;
+        if !model.enabled || !summary.checks_enabled || in_maintenance || retired {
             skipped += 1;
             continue;
         }
@@ -384,6 +385,16 @@ pub async fn validate_model(
     }
     state.ssrf.validate(&body.api_base).await?;
 
+    let is_search = body.model_type.as_deref().is_some_and(|t| {
+        t.trim()
+            .eq_ignore_ascii_case(obleth_config::SEARCH_MODEL_TYPE)
+    });
+    if is_search {
+        return Ok(Json(
+            validate_search_upstream(&state, &body, warnings).await,
+        ));
+    }
+
     match fetch_catalog_direct(
         &state,
         &body.api_base,
@@ -434,6 +445,64 @@ pub async fn validate_model(
     }
 }
 
+/// [`validate_model`] for a `search` route: a search upstream has no `/models`
+/// catalog, so it is checked with one real query instead. `listed` stays
+/// `null`; there is no model id to look for.
+async fn validate_search_upstream(
+    state: &AdminState,
+    body: &ValidateModelRequest,
+    mut warnings: Vec<String>,
+) -> ValidateModelResult {
+    let url = format!(
+        "{}?q=ping&format=json",
+        obleth_config::search_url(&body.api_base)
+    );
+    let mut request = state
+        .health
+        .http
+        .get(&url)
+        .timeout(Duration::from_secs(state.health.timeout_secs.max(1)));
+    if let Some(key) = body.api_key.as_deref().filter(|k| !k.is_empty()) {
+        request = request.bearer_auth(key);
+    }
+    let reachable = match request.send().await {
+        Ok(res) if res.status().is_success() => {
+            let json: Option<serde_json::Value> = res.json().await.ok();
+            if !json.is_some_and(|j| j.get("results").is_some_and(|r| r.is_array())) {
+                warnings.push(
+                    "the search upstream answered, but not with SearXNG JSON results".to_string(),
+                );
+            }
+            true
+        }
+        Ok(res) if res.status() == reqwest::StatusCode::FORBIDDEN => {
+            warnings.push(
+                "the search upstream refused format=json (HTTP 403): enable `json` under \
+                 `search.formats` in the SearXNG settings"
+                    .to_string(),
+            );
+            true
+        }
+        Ok(res) => {
+            warnings.push(format!(
+                "the search upstream answered HTTP {}",
+                res.status().as_u16()
+            ));
+            true
+        }
+        Err(error) => {
+            warnings.push(format!("the search upstream is unreachable: {error}"));
+            false
+        }
+    };
+    ValidateModelResult {
+        reachable,
+        wildcard: false,
+        listed: None,
+        warnings,
+    }
+}
+
 pub fn spawn_worker(state: AdminState) {
     if !state.health.scheduled_enabled {
         tracing::info!("model health scheduler disabled");
@@ -480,6 +549,11 @@ pub fn spawn_worker(state: AdminState) {
 }
 
 async fn run_claimed_check(state: &AdminState, claim: ModelHealthClaim) -> Result<()> {
+    // A retired model is not served, and its backend is usually gone: probing
+    // it would only raise an outage alert for something already switched off.
+    if claim.model.lifecycle.status_at(Utc::now()) == obleth_config::ModelStatus::Retired {
+        return Ok(());
+    }
     let outcome = run_model_health_check(state, claim.model, "scheduled").await?;
     maybe_alert(state, &outcome);
     Ok(())
@@ -960,7 +1034,7 @@ async fn inference_probe(
                 // 400/404/422 conflate "model gone" with "wrong endpoint for
                 // this modality" — let the catalog tell them apart (401/403
                 // skip: bad credentials fail /models identically).
-                if status == "unhealthy" && matches!(code, 400 | 404 | 422) {
+                if status == "unhealthy" && matches!(code, 400 | 404 | 422) && req.has_catalog() {
                     return disambiguate_rejection(
                         state,
                         model,
@@ -1174,13 +1248,23 @@ enum ProbeRequest {
         model: String,
         wav: Vec<u8>,
     },
+    /// A query-string GET: a web search against a `search` route.
+    Get { url: String },
 }
 
 impl ProbeRequest {
     fn url(&self) -> &str {
         match self {
-            ProbeRequest::Json { url, .. } | ProbeRequest::Multipart { url, .. } => url,
+            ProbeRequest::Json { url, .. }
+            | ProbeRequest::Multipart { url, .. }
+            | ProbeRequest::Get { url } => url,
         }
+    }
+
+    /// Whether a rejection can be told apart through the upstream's `/models`
+    /// catalog. A search upstream has no catalog: its rejection is the answer.
+    fn has_catalog(&self) -> bool {
+        !matches!(self, ProbeRequest::Get { .. })
     }
 
     /// Assemble the reqwest builder for one attempt.
@@ -1197,6 +1281,7 @@ impl ProbeRequest {
                     .part("file", file);
                 client.post(url).timeout(timeout).multipart(form)
             }
+            ProbeRequest::Get { url } => client.get(url).timeout(timeout),
         }
     }
 }
@@ -1227,7 +1312,8 @@ fn probe_silence_wav() -> Vec<u8> {
 }
 
 /// Build the minimal real inference request used to verify a model actually
-/// serves. `api_base` already includes the `/v1` suffix. Returns `None` for
+/// serves. `api_base` already includes the `/v1` suffix (for a `search` route
+/// it is the search instance's root instead). Returns `None` for
 /// `image` (a "minimal" generation is still costly), `video` (a probe would be
 /// a multi-minute render holding a card) and unrecognized types — those fall
 /// back to the catalog existence check.
@@ -1267,6 +1353,11 @@ fn build_probe_request(
             url: format!("{base}/audio/transcriptions"),
             model: upstream_model.to_string(),
             wav: probe_silence_wav(),
+        }),
+        // One real search. `format=json` is the part an instance can refuse
+        // (it is off in SearXNG's default settings), so the probe asks for it.
+        obleth_config::SEARCH_MODEL_TYPE => Some(ProbeRequest::Get {
+            url: format!("{}?q=ping&format=json", obleth_config::search_url(base)),
         }),
         _ => None,
     }
@@ -1347,6 +1438,7 @@ fn build_probe_usage(
         weight: 0,
         input_tokens,
         output_tokens,
+        cached_input_tokens: 0,
         estimated_tokens: input_tokens,
         queue_wait_ms: 0,
         ttft_ms: 0,
@@ -1362,6 +1454,9 @@ fn build_probe_usage(
         session_id_source: "none".to_string(),
         request_type: HEALTH_PROBE_REQUEST_TYPE.to_string(),
         device_id: String::new(),
+        end_user: String::new(),
+        parent_request_id: Uuid::nil(),
+        model_variant: String::new(),
     }
 }
 
@@ -1737,7 +1832,9 @@ mod tests {
     fn expect_json(req: ProbeRequest) -> (String, serde_json::Value) {
         match req {
             ProbeRequest::Json { url, body } => (url, body),
-            ProbeRequest::Multipart { .. } => panic!("expected a JSON probe request"),
+            ProbeRequest::Multipart { .. } | ProbeRequest::Get { .. } => {
+                panic!("expected a JSON probe request")
+            }
         }
     }
 
@@ -1789,6 +1886,20 @@ mod tests {
         assert_eq!(u32::from_le_bytes(wav[40..44].try_into().unwrap()), 1600);
         // Silence: every PCM sample is zero.
         assert!(wav[44..].iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn probe_request_search_is_one_json_search_with_no_catalog() {
+        let r = build_probe_request("http://searxng:8080/", "search", "searxng").expect("probe");
+        assert!(!r.has_catalog());
+        let ProbeRequest::Get { url } = r else {
+            panic!("expected a GET probe request");
+        };
+        assert_eq!(url, "http://searxng:8080/search?q=ping&format=json");
+        // Modalities with a /models catalog keep the rejection disambiguation.
+        assert!(build_probe_request("https://up/v1", "chat", "m")
+            .expect("chat probe")
+            .has_catalog());
     }
 
     #[test]

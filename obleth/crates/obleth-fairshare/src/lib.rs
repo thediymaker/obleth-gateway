@@ -204,6 +204,10 @@ pub struct KeyFairshare {
     /// Share of the whole pool: the tenant's `weight_share` split across the
     /// tenant's active keys by key weight.
     pub weight_share: f64,
+    /// Set when this entry is one end user of a key with per-end-user
+    /// fairshare, so `key_id` is derived rather than a real key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_user: Option<EndUser>,
 }
 
 /// One model's scheduling pool.
@@ -281,6 +285,19 @@ fn local_mode() -> String {
     SlotMode::Local.as_str().into()
 }
 
+/// The end user a scheduler key stands for. When a key with per-end-user
+/// fairshare admits on behalf of one of its users, the scheduler key is
+/// derived from the real key and the end user, so each user queues on their
+/// own. The scheduler treats that derived key like any other; this only lets
+/// dashboards show whose it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndUser {
+    /// The real API key the end user came through.
+    pub parent_key: Uuid,
+    /// The end-user id the caller sent.
+    pub name: String,
+}
+
 /// Context passed to the scheduler for a single admission attempt.
 #[derive(Debug, Clone)]
 pub struct AdmitRequest {
@@ -295,6 +312,8 @@ pub struct AdmitRequest {
     pub tenant_max_in_flight: Option<usize>,
     pub key_max_in_flight: Option<usize>,
     pub cost: u32,
+    /// Set when `key` is an end user's derived key (see [`EndUser`]).
+    pub end_user: Option<EndUser>,
 }
 
 impl AdmitRequest {
@@ -318,6 +337,7 @@ impl AdmitRequest {
             tenant_max_in_flight: None,
             key_max_in_flight: None,
             cost,
+            end_user: None,
         }
     }
 
@@ -354,6 +374,14 @@ impl AdmitRequest {
 
     pub fn key_cap(mut self, cap: usize) -> Self {
         self.key_max_in_flight = Some(cap);
+        self
+    }
+
+    pub fn end_user(mut self, parent_key: Uuid, name: impl Into<String>) -> Self {
+        self.end_user = Some(EndUser {
+            parent_key,
+            name: name.into(),
+        });
         self
     }
 }
@@ -610,6 +638,7 @@ struct Waiter {
     tenant_max_in_flight: Option<usize>,
     key_max_in_flight: Option<usize>,
     cost: u32,
+    end_user: Option<EndUser>,
     enqueued: Instant,
     /// The local fast path would have admitted it on arrival; in shared mode
     /// it is still reported as fast if its first claim succeeds.
@@ -703,6 +732,8 @@ struct Pool {
     /// Configured per-key caps; enforced as this replica's share.
     key_cap: HashMap<Uuid, usize>,
     key_tenant: HashMap<Uuid, Uuid>,
+    /// Which end user a derived key stands for (dashboards only).
+    key_end_user: HashMap<Uuid, EndUser>,
     virtual_time: f64,
     /// When the pool last became idle (no permits, no waiters); `None` while
     /// it is in use.
@@ -751,6 +782,7 @@ impl Pool {
             key_weight: HashMap::new(),
             key_cap: HashMap::new(),
             key_tenant: HashMap::new(),
+            key_end_user: HashMap::new(),
             virtual_time: 0.0,
             idle_since: None,
             pending: HashMap::new(),
@@ -802,6 +834,14 @@ impl Pool {
             .insert(req.group.clone(), req.group_weight.max(1));
         self.key_weight.insert(req.key, req.key_weight.max(1));
         self.key_tenant.insert(req.key, req.tenant);
+        match &req.end_user {
+            Some(end_user) => {
+                self.key_end_user.insert(req.key, end_user.clone());
+            }
+            None => {
+                self.key_end_user.remove(&req.key);
+            }
+        }
         match req.tenant_max_in_flight.filter(|c| *c > 0) {
             Some(cap) => {
                 self.tenant_cap.insert(req.tenant, cap);
@@ -827,6 +867,14 @@ impl Pool {
             .insert(w.group.clone(), w.group_weight.max(1));
         self.key_weight.insert(key, w.key_weight.max(1));
         self.key_tenant.insert(key, tenant);
+        match &w.end_user {
+            Some(end_user) => {
+                self.key_end_user.insert(key, end_user.clone());
+            }
+            None => {
+                self.key_end_user.remove(&key);
+            }
+        }
         match w.tenant_max_in_flight.filter(|c| *c > 0) {
             Some(cap) => {
                 self.tenant_cap.insert(tenant, cap);
@@ -1076,6 +1124,7 @@ impl Pool {
                 tenant_max_in_flight: req.tenant_max_in_flight,
                 key_max_in_flight: req.key_max_in_flight,
                 cost: req.cost,
+                end_user: req.end_user,
                 enqueued,
                 fast,
                 respond,
@@ -1409,6 +1458,7 @@ impl Pool {
         self.key_weight.remove(key);
         self.key_cap.remove(key);
         self.key_tenant.remove(key);
+        self.key_end_user.remove(key);
     }
 
     /// Only called for a tenant with no in-flight slot and an empty queue.
@@ -1452,6 +1502,7 @@ impl Pool {
         self.key_weight.clear();
         self.key_cap.clear();
         self.key_tenant.clear();
+        self.key_end_user.clear();
         self.virtual_time = 0.0;
     }
 
@@ -1681,6 +1732,7 @@ impl Pool {
                     served_tokens,
                     share_score: served_tokens / weight as f64,
                     weight_share,
+                    end_user: self.key_end_user.get(&key_id).cloned(),
                 })
             })
             .collect();

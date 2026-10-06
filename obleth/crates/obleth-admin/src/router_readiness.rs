@@ -46,7 +46,7 @@ pub struct RouterReadiness {
 /// than a hole elsewhere: even with the classifier off, requests will be
 /// tagged with them, and an uncovered tag dilutes every candidate's tag score
 /// equally — the ranking silently degrades to price and capacity.
-const HEURISTIC_TAGS: [&str; 4] = ["coding", "math", "vision", "long-context"];
+const HEURISTIC_TAGS: [&str; 5] = ["coding", "math", "vision", "long-context", "writing"];
 
 /// A model whose observed average answer runs past this many tokens is worth
 /// a warning when it sits in the auto pool: per-token prices make it look
@@ -89,6 +89,8 @@ pub fn build_readiness(
             c.model.enabled
                 && c.model.auto_eligible
                 && c.model.model_type == obleth_config::DEFAULT_MODEL_TYPE
+                && c.model.lifecycle.status_at(chrono::Utc::now())
+                    == obleth_config::ModelStatus::Active
         })
         .collect();
 
@@ -272,6 +274,8 @@ mod tests {
         ResolvedModel {
             model_name: name.to_string(),
             aliases: Vec::new(),
+            lifecycle: Default::default(),
+            variants: Vec::new(),
             quantization: "unknown".into(),
             upstream_model: name.to_string(),
             api_base: "http://upstream".to_string(),

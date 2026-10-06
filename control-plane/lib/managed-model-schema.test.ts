@@ -56,6 +56,12 @@ describe("GRES_RE / MEM_RE", () => {
 });
 
 describe("validateManagedModelForm", () => {
+  it("takes Job logs as a full path or blank", () => {
+    expect(validateManagedModelForm(base({ slurm_log_output_dir: "/scratch/me/logs" }))).toEqual({});
+    expect(validateManagedModelForm(base({ slurm_log_output_dir: "" }))).toEqual({});
+    expect(validateManagedModelForm(base({ slurm_log_output_dir: "logs" })).slurm_log_output_dir).toContain("full path");
+  });
+
   it("returns no errors for a valid form", () => {
     expect(validateManagedModelForm(base())).toEqual({});
   });

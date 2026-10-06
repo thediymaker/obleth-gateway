@@ -276,59 +276,8 @@ pub(crate) async fn import_models(
         });
     }
 
-    // ---- alias uniqueness, judged against the post-import state ----
-    //
-    // A name a client can send has to identify exactly one route, so an alias
-    // may not collide with any `model_name` or with another model's alias. The
-    // check runs on the state the file *would* produce, not on today's rows: a
-    // manifest may legitimately move an alias from one model to another in a
-    // single file, which a check against the current rows alone would read as a
-    // collision with the row it is moving off.
-    //
-    // Names held by models this file does not touch form the fixed backdrop.
-    // Conflicts already present among those rows are not this import's fault
-    // and are not reported against it.
-    {
-        let touched: HashSet<&str> = writes.iter().map(|w| w.model_name.as_str()).collect();
-        let mut owner: HashMap<String, String> = HashMap::new();
-        for m in existing.values() {
-            owner.insert(m.model_name.clone(), m.model_name.clone());
-            if !touched.contains(m.model_name.as_str()) {
-                for alias in &m.aliases {
-                    owner.insert(alias.clone(), m.model_name.clone());
-                }
-            }
-        }
-        for w in &writes {
-            owner.insert(w.model_name.clone(), w.model_name.clone());
-        }
-        // Sorted so a file with several conflicts reports them in a stable
-        // order rather than in hash order.
-        let mut incoming: Vec<&ModelImportWrite> = writes.iter().collect();
-        incoming.sort_by(|a, b| a.model_name.cmp(&b.model_name));
-        for w in incoming {
-            let model = &w.model_name;
-            for alias in &w.config.aliases {
-                if alias == obleth_config::routing::AUTO_MODEL_NAME {
-                    errors.push(format!(
-                        "model '{model}': alias '{alias}' is reserved for automatic model selection"
-                    ));
-                    continue;
-                }
-                match owner.get(alias) {
-                    Some(other) if other == model => errors.push(format!(
-                        "model '{model}': alias '{alias}' is the model's own name"
-                    )),
-                    Some(other) => errors.push(format!(
-                        "model '{model}': alias '{alias}' is already taken by model '{other}'"
-                    )),
-                    None => {
-                        owner.insert(alias.clone(), model.clone());
-                    }
-                }
-            }
-        }
-    }
+    // ---- alias and variant uniqueness, judged against the post-import state ----
+    errors.extend(name_conflicts(&existing, &writes));
 
     if !errors.is_empty() {
         return Err(AdminError::BadRequest(format!(
@@ -410,4 +359,93 @@ pub(crate) async fn import_models(
 
     report.dry_run = false;
     Ok(Json(report))
+}
+
+/// Every alias or variant in `writes` that would make a client-facing name
+/// mean more than one route once the import is applied, as one message each.
+///
+/// A name a client can send has to identify exactly one route, so an alias
+/// or a variant may not collide with any `model_name` or with another
+/// model's alias or variant. The check runs on the state the file *would*
+/// produce, not on today's rows: a manifest may legitimately move an alias
+/// from one model to another in a single file, which a check against the
+/// current rows alone would read as a collision with the row it is moving
+/// off.
+///
+/// Names held by models this file does not touch form the fixed backdrop.
+/// Conflicts already present among those rows are not this import's fault
+/// and are not reported against it.
+pub(crate) fn name_conflicts(
+    existing: &HashMap<String, ModelRoute>,
+    writes: &[ModelImportWrite],
+) -> Vec<String> {
+    let mut errors: Vec<String> = Vec::new();
+    let touched: HashSet<&str> = writes.iter().map(|w| w.model_name.as_str()).collect();
+    let mut owner: HashMap<String, String> = HashMap::new();
+    for m in existing.values() {
+        owner.insert(m.model_name.clone(), m.model_name.clone());
+        if !touched.contains(m.model_name.as_str()) {
+            for name in m.addressable_names().skip(1) {
+                owner.insert(name.to_string(), m.model_name.clone());
+            }
+        }
+    }
+    for w in writes {
+        owner.insert(w.model_name.clone(), w.model_name.clone());
+    }
+    // Sorted so a file with several conflicts reports them in a stable
+    // order rather than in hash order.
+    let mut incoming: Vec<&ModelImportWrite> = writes.iter().collect();
+    incoming.sort_by(|a, b| a.model_name.cmp(&b.model_name));
+    for w in &incoming {
+        let model = &w.model_name;
+        for alias in &w.config.aliases {
+            if alias == obleth_config::routing::AUTO_MODEL_NAME {
+                errors.push(format!(
+                    "model '{model}': alias '{alias}' is reserved for automatic model selection"
+                ));
+                continue;
+            }
+            match owner.get(alias) {
+                Some(other) if other == model => errors.push(format!(
+                    "model '{model}': alias '{alias}' is the model's own name"
+                )),
+                Some(other) => errors.push(format!(
+                    "model '{model}': alias '{alias}' is already taken by model '{other}'"
+                )),
+                None => {
+                    owner.insert(alias.clone(), model.clone());
+                }
+            }
+        }
+    }
+    // Variants after every alias is placed, so a variant that takes an
+    // alias's name is reported whichever model the alias belongs to.
+    for w in &incoming {
+        let model = &w.model_name;
+        for variant in &w.config.variants {
+            let name = &variant.name;
+            if name == obleth_config::routing::AUTO_MODEL_NAME {
+                errors.push(format!(
+                    "model '{model}': variant '{name}' is reserved for automatic model selection"
+                ));
+                continue;
+            }
+            match owner.get(name) {
+                Some(other) if other == model && name == model => errors.push(format!(
+                    "model '{model}': variant '{name}' is the model's own name"
+                )),
+                Some(other) if other == model => errors.push(format!(
+                    "model '{model}': variant '{name}' is already one of the model's aliases"
+                )),
+                Some(other) => errors.push(format!(
+                    "model '{model}': variant '{name}' is already taken by model '{other}'"
+                )),
+                None => {
+                    owner.insert(name.clone(), model.clone());
+                }
+            }
+        }
+    }
+    errors
 }

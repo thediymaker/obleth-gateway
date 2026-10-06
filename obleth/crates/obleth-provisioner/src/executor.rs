@@ -106,6 +106,8 @@ pub async fn apply(
         Action::MarkLost {
             replica_id,
             endpoint_id,
+            raw_state,
+            reason,
         } => {
             if let Some(ep) = endpoint_id {
                 // best-effort: a missing endpoint is fine, but log real failures so
@@ -114,8 +116,9 @@ pub async fn apply(
                     tracing::warn!(endpoint_id = %ep, error = %e, "failed to deregister endpoint on mark-lost");
                 }
             }
+            let message = lost_message(raw_state.as_deref(), reason.as_deref());
             obleth
-                .patch_replica(*replica_id, Some("lost"), None, None, Some("job gone"))
+                .patch_replica(*replica_id, Some("lost"), None, None, Some(&message))
                 .await?;
         }
         Action::Cancel {
@@ -402,6 +405,8 @@ mod tests {
             &Action::MarkLost {
                 replica_id: rid,
                 endpoint_id: Some(ep),
+                raw_state: None,
+                reason: None,
             },
             Uuid::new_v4(),
             "nemotron",
@@ -420,6 +425,41 @@ mod tests {
         assert!(patched
             .iter()
             .any(|p| p.0 == rid && p.1.as_deref() == Some("lost")));
+        let patches = obleth.patches.lock().unwrap();
+        assert_eq!(patches.last().unwrap().3.as_deref(), Some("job gone"));
+    }
+
+    #[tokio::test]
+    async fn mark_lost_records_slurm_terminal_state_in_message() {
+        let slurm = mock_slurm();
+        let obleth = MockObleth::default();
+        let rid = Uuid::new_v4();
+        apply(
+            &Action::MarkLost {
+                replica_id: rid,
+                endpoint_id: None,
+                raw_state: Some("OUT_OF_MEMORY".into()),
+                reason: Some("OutOfMemory".into()),
+            },
+            Uuid::new_v4(),
+            "nemotron",
+            None,
+            "obleth-",
+            8,
+            8000,
+            &slurm,
+            &obleth,
+            &resolver(),
+        )
+        .await
+        .unwrap();
+        let patches = obleth.patches.lock().unwrap();
+        let p = patches.last().unwrap();
+        assert_eq!(p.1.as_deref(), Some("lost"));
+        assert_eq!(
+            p.3.as_deref(),
+            Some("job ended: OUT_OF_MEMORY (OutOfMemory)")
+        );
     }
 
     #[tokio::test]

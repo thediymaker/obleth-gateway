@@ -2,7 +2,9 @@ import type {
   AuditEntry,
   CapacityDiscoveryView,
   FairshareLiveView,
+  LifecycleStatus,
   ModelHealthSummary,
+  ModelLifecycle,
   ModelRoute,
   ModelUsageTimePoint,
   UsageModelAgg,
@@ -20,7 +22,7 @@ import { parseTagLevel, TAG_LEVEL_LABELS } from "@/lib/utils";
 // Types and where a model runs
 // ---------------------------------------------------------------------------
 
-export type TypeGroup = "chat" | "image" | "video" | "audio" | "embedding";
+export type TypeGroup = "chat" | "image" | "video" | "audio" | "embedding" | "search";
 
 export const TYPE_GROUPS: { value: TypeGroup; label: string }[] = [
   { value: "chat", label: "Chat" },
@@ -28,11 +30,12 @@ export const TYPE_GROUPS: { value: TypeGroup; label: string }[] = [
   { value: "video", label: "Video" },
   { value: "audio", label: "Audio" },
   { value: "embedding", label: "Embed" },
+  { value: "search", label: "Search" },
 ];
 
 export function typeGroup(type: string): TypeGroup {
   if (type === "audio_transcription" || type === "audio_speech") return "audio";
-  if (type === "image" || type === "video" || type === "embedding") return type;
+  if (type === "image" || type === "video" || type === "embedding" || type === "search") return type;
   return "chat";
 }
 
@@ -43,6 +46,7 @@ export const MODEL_TYPE_NAMES: Record<string, string> = {
   audio_speech: "Text to speech",
   image: "Image",
   video: "Video",
+  search: "Web search",
 };
 
 export type RunsOn = "kubernetes" | "slurm" | "endpoint";
@@ -131,6 +135,8 @@ export function priceLabel(model: Pick<ModelRoute, "model_type" | "input_cost_pe
       return model.cost_per_audio_second > 0 ? `${money(model.cost_per_audio_second * 60)} / min` : null;
     case "embedding":
       return model.input_cost_per_token > 0 ? `${perM(model.input_cost_per_token)} / 1M` : null;
+    case "search":
+      return null;
     default:
       if (model.input_cost_per_token <= 0 && model.output_cost_per_token <= 0) return null;
       return `${perM(model.input_cost_per_token)} · ${perM(model.output_cost_per_token)}`;
@@ -221,11 +227,11 @@ export interface ModelFilters {
 
 export const EMPTY_FILTERS: ModelFilters = { query: "", group: "all", status: "all", runs: "all", benchmarks: false };
 
-/** Name, alias, upstream, description or tag: every word of the query must match one of them. */
+/** Name, alias, variant, upstream, description or tag: every word of the query must match one of them. */
 export function matchesQuery(model: ModelRoute, query: string): boolean {
   const words = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
   if (words.length === 0) return true;
-  const hay = [model.model_name, model.upstream_model, model.description, model.api_base, ...(model.aliases ?? []), ...(model.tags ?? []).map((t) => parseTagLevel(t).base)]
+  const hay = [model.model_name, model.upstream_model, model.description, model.api_base, ...(model.aliases ?? []), ...(model.variants ?? []).map((v) => v.name), ...(model.tags ?? []).map((t) => parseTagLevel(t).base)]
     .join(" ")
     .toLowerCase();
   return words.every((w) => hay.includes(w));
@@ -263,7 +269,7 @@ export function sortRows(rows: ModelRow[], sort: ModelSort): ModelRow[] {
 }
 
 export function groupCounts(rows: ModelRow[]): Record<TypeGroup | "all", number> {
-  const counts = { all: rows.length, chat: 0, image: 0, video: 0, audio: 0, embedding: 0 };
+  const counts = { all: rows.length, chat: 0, image: 0, video: 0, audio: 0, embedding: 0, search: 0 };
   for (const r of rows) counts[r.group] += 1;
   return counts;
 }
@@ -339,6 +345,7 @@ export const SETTING_INDEX: SettingEntry[] = [
   { id: "set-description", label: "Description", section: "general" },
   { id: "set-type", label: "Model type", section: "general", keywords: "modality endpoint chat embedding image video audio" },
   { id: "set-aliases", label: "Aliases", section: "general", keywords: "other names rename old name" },
+  { id: "set-variants", label: "Variants", section: "general", keywords: "other names extra boons speculation spec", types: CHAT },
   { id: "set-quantization", label: "Quantization", section: "general", keywords: "format fp8 bf16 mxfp4 precision" },
   { id: "set-upstream", label: "Upstream model", section: "connection", keywords: "native name served model" },
   { id: "set-api-base", label: "API base URL", section: "connection", keywords: "url endpoint address host" },
@@ -409,6 +416,7 @@ const FIELD_LABELS: [RegExp, string][] = [
   [/^description$/, "Description"],
   [/^model_type$/, "Model type"],
   [/^aliases$/, "Aliases"],
+  [/^variants$/, "Variants"],
   [/^quantization$/, "Quantization"],
   [/^upstream_model$/, "Upstream model"],
   [/^api_base$/, "API base URL"],
@@ -474,4 +482,132 @@ export function changeSummary(fields: string[]): string[] {
 /** Whether any of a setting's fields (exact names, or prefixes ending in `_`) changed. */
 export function touches(changed: string[], fields: string[]): boolean {
   return changed.some((c) => fields.some((f) => (f.endsWith("_") ? c.startsWith(f) : c === f)));
+}
+
+// ---------------------------------------------------------------------------
+// Variants: more names for a model, each with extra boons on
+// ---------------------------------------------------------------------------
+
+/** The most variants the gateway keeps for one model. */
+export const MAX_VARIANTS = 8;
+
+/** One variant row as the settings page edits it. */
+export interface VariantDraft {
+  name: string;
+  description: string;
+  boons: string[];
+}
+
+export function variantDrafts(model: Pick<ModelRoute, "variants">): VariantDraft[] {
+  return (model.variants ?? []).map((v) => ({ name: v.name, description: v.description ?? "", boons: [...(v.boons ?? [])] }));
+}
+
+/**
+ * The variant rows as the settings form submits them: one JSON field, names
+ * and descriptions trimmed and boons in the editor's order, so an edit put
+ * back reads as no change. Boons the editor doesn't know keep their place at
+ * the end.
+ */
+export function variantsValue(rows: VariantDraft[], boonOrder: readonly string[]): string {
+  const rank = (b: string) => (boonOrder.includes(b) ? boonOrder.indexOf(b) : boonOrder.length);
+  return JSON.stringify(
+    rows.map((r) => ({
+      name: r.name.trim(),
+      description: r.description.trim(),
+      boons: [...new Set(r.boons)].sort((a, b) => rank(a) - rank(b)),
+    })),
+  );
+}
+
+/**
+ * Why row `index`'s name can't be saved, in a sentence, or null. A blank name
+ * is left to the field's own required check. The gateway checks again,
+ * against every model's names, aliases and variants.
+ */
+export function variantNameProblem(
+  rows: VariantDraft[],
+  index: number,
+  own: { name: string; aliases: string[]; otherModels: string[] },
+): string | null {
+  const name = rows[index]?.name.trim() ?? "";
+  if (!name) return null;
+  if (name === "auto") return "auto is the router's own name.";
+  if (name === own.name) return "That is this model's own name.";
+  if (own.aliases.includes(name)) return "That is already one of this model's aliases.";
+  if (own.otherModels.includes(name)) return "Another model is already called that.";
+  if (rows.some((r, i) => i < index && r.name.trim() === name)) return "Another variant already has that name.";
+  return null;
+}
+
+/**
+ * Whether a model can take an image in a chat request: it reads images itself,
+ * or it opted into the vision boon and the boon is on, so the gateway describes
+ * each image for it. The auto router uses the same rule. `undefined` while the
+ * model isn't known yet, so callers can hold back or not.
+ */
+export function acceptsImages(
+  model: Pick<ModelRoute, "supports_vision" | "boons"> | undefined,
+  visionBoonActive: boolean,
+): boolean | undefined {
+  if (!model) return undefined;
+  return model.supports_vision || (visionBoonActive && (model.boons ?? []).includes("vision"));
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle
+// ---------------------------------------------------------------------------
+
+/** "Oct 19, 2026", read in UTC like the gateway's dates. */
+export function lifecycleDate(iso: string): string {
+  return new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric", timeZone: "UTC" });
+}
+
+/** The one-word badge for each status in the models list. */
+export const LIFECYCLE_BADGES: Record<LifecycleStatus, string> = {
+  staged: "Staged",
+  active: "Active",
+  deprecated: "Deprecated",
+  retired: "Retired",
+};
+
+/** The status in force now, defaulting to active on a gateway without lifecycles. */
+export function lifecycleStatus(model: Pick<ModelRoute, "lifecycle" | "effective_status">): LifecycleStatus {
+  return model.effective_status ?? model.lifecycle?.status ?? "active";
+}
+
+/**
+ * The header pill for a model that is not plainly active, or null when it is:
+ * "Staged · not listed yet", "Deprecated · retires Oct 19, 2026", "Retired",
+ * "Retired · answered by gemma4-31b-it".
+ */
+export function lifecycleLabel(model: Pick<ModelRoute, "lifecycle" | "effective_status">): string | null {
+  const status = lifecycleStatus(model);
+  const l = model.lifecycle;
+  if (status === "staged") return "Staged · not listed yet";
+  if (status === "deprecated") return l?.retire_at ? `Deprecated · retires ${lifecycleDate(l.retire_at)}` : "Deprecated";
+  if (status === "retired") return l?.redirect && l.replacement ? `Retired · answered by ${l.replacement}` : "Retired";
+  return null;
+}
+
+/**
+ * What a caller is told when a retired model refuses them. Mirrors
+ * `retired_message` in the gateway's `lifecycle.rs`, so the page can show it
+ * before anyone sees it for real.
+ */
+export function retiredMessage(modelName: string, l: Pick<ModelLifecycle, "status" | "replacement" | "retire_at" | "changed_at" | "note">): string {
+  const on = l.retire_at ?? (l.status === "retired" ? l.changed_at : null);
+  let msg = on ? `The model \`${modelName}\` was retired on ${on.slice(0, 10)}.` : `The model \`${modelName}\` has been retired.`;
+  if (l.replacement) msg += ` Use \`${l.replacement}\` instead.`;
+  if (l.note) msg += ` ${l.note}`;
+  return msg;
+}
+
+/** A stored RFC 3339 date as a date input's value (YYYY-MM-DD, UTC). */
+export function dateInputValue(iso?: string | null): string {
+  return iso ? iso.slice(0, 10) : "";
+}
+
+/** A date input's value as the start of that day in UTC, or null when blank. */
+export function retireAtFromInput(value: string): string | null {
+  return /^\d{4}-\d{2}-\d{2}$/.test(value) ? `${value}T00:00:00Z` : null;
 }

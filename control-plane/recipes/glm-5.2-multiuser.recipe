@@ -1,37 +1,71 @@
 ---
-name: Deploy llama.cpp (multi-user)
-description: "Serve any GGUF model with llama-server (sample: GLM-5.2 on GH200). Edit the model, image/build, and GH200 sizing for your hardware."
+name: GLM-5.2 on Grace Hopper (llama.cpp)
+description: "GLM-5.2 as a 2-bit GGUF with llama-server on one GH200, MoE experts in Grace memory, 4 requests at once."
 engine: llamacpp
+kind: model
+model: unsloth/GLM-5.2-GGUF:UD-IQ2_M
+weights_gb: 239
+requires: "llama.cpp with GLM-5.2 support, built for the node (the official server-cuda image has an Arm build)"
 model_type: chat
 api_model_name: glm-5.2
 port: 8000
-target_replicas: 2
+target_replicas: 1
 max_job_failures: 3
+env:
+  # Let GPU allocations overflow into the Grace CPU's coherent memory.
+  GGML_CUDA_ENABLE_UNIFIED_MEMORY: "1"
+tested:
+  - hardware: "1× GH200 96 GB"
+    engine: "llama.cpp (server-cuda image of 2026-10-03, Arm)"
+    date: 2026-10-03
+    result: "With the defaults: ready in 9 minutes. One request ran at about 20 tokens a second; with 4 at once they shared about 28. It thinks before answering, so a short max_tokens can end before the answer starts."
+inputs:
+  - name: cache
+    label: Weight cache
+    type: path
+    default: "{{cluster.cache}}"
+    required: true
+    help: LLAMA_CACHE. Node-local scratch is fastest.
+  - name: image
+    label: Container image
+    type: path
+    default: "{{cluster.image.llamacpp}}"
+    help: Leave empty to run the llama-server on the node's PATH.
+  - name: context
+    label: Context length
+    type: choice
+    options: [131072, 262144, 524288, 1048576]
+    default: 1048576
+  - name: parallel
+    label: Requests at once
+    type: number
+    min: 1
+    max: 16
+    default: 4
+  - name: cpu_moe
+    label: MoE layers in Grace memory
+    type: number
+    min: 0
+    max: 92
+    default: 68
 ---
 #!/bin/bash -l
-# Partition / QoS / time limit are set at deploy (Deploy overrides) — left out
-# here so the recipe stays cluster-agnostic.
 #SBATCH --gres=gpu:1                 # one GH200 superchip
 #SBATCH --cpus-per-task=72
 #SBATCH --mem=560G
-#SBATCH --output=logs/serve-%j.out
 set -euo pipefail
-# EDIT FOR YOUR CLUSTER: node-local scratch path for weight caching.
-export LLAMA_CACHE=/path/to/job_tmp/glm52
-# Let GPU allocations overflow into the Grace CPU's coherent LPDDR (GH200 only).
-export GGML_CUDA_ENABLE_UNIFIED_MEMORY=1
-# This assumes `llama-server` is on $PATH — built for your GPU (GH200 = arm64+CUDA)
-# or provided by a `module load`. On GH200 a native build is the most reliable path.
-# CONTAINER ALTERNATIVE: if you have no native build, wrap the launch in Apptainer
-# (like the Qwen recipe). You must supply an arm64+CUDA llama.cpp image — the public
-# ghcr.io/ggml-org/llama.cpp CUDA images are x86 — e.g. build one and cache the .sif:
-#   apptainer exec --nv /path/to/llamacpp-cuda.sif \
-#     llama-server -hf unsloth/GLM-5.2-GGUF:UD-IQ2_M \
-#       --host 0.0.0.0 --port "$OBLETH_SERVING_PORT" --alias glm-5.2 ... (same flags as below)
-llama-server -hf unsloth/GLM-5.2-GGUF:UD-IQ2_M \
-  --host 0.0.0.0 --port "$OBLETH_SERVING_PORT" --alias glm-5.2 \
-  -ngl 99 --ctx-size 1048576 --parallel 4 --threads "$(nproc)" \
-  --n-cpu-moe 68 \
+{{cluster.setup}}
+export LLAMA_CACHE={{cache}}
+IMAGE="{{image}}"
+# The official image keeps llama-server and its libraries in /app, which
+# neither PATH nor the library path includes under apptainer.
+if [ -n "$IMAGE" ]; then
+  RUN=(apptainer exec --nv --bind {{cache}} "$IMAGE" sh -c 'PATH=/app:$PATH LD_LIBRARY_PATH=/app:${LD_LIBRARY_PATH:-} exec "$0" "$@"')
+else RUN=(); fi
+"${RUN[@]}" llama-server -hf unsloth/GLM-5.2-GGUF:UD-IQ2_M \
+  --host 0.0.0.0 --port "$OBLETH_SERVING_PORT" --alias {{api_model_name}} \
+  -ngl 99 --ctx-size {{context}} --parallel {{parallel}} --threads "$(nproc)" \
+  --n-cpu-moe {{cpu_moe}} \
   --batch-size 2048 --ubatch-size 512 \
   --cache-type-k q8_0 --cache-type-v q8_0 \
   --temp 1.0 --top-p 0.95 --min-p 0.01 \

@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  replicaAsk,
+  accountsFor,
+  slurmErrorText,
   buildDeploymentRows,
   countReplicas,
   deploymentsLine,
@@ -92,6 +95,17 @@ describe("rows", () => {
   });
 });
 
+describe("what a replica asks for", () => {
+  it("says each value in words", () => {
+    expect(replicaAsk({ nodes: 1, gres: "gpu:1", cpus: "72", mem: "500G" })).toBe("Each replica asks Slurm for 1 node with 1 GPU, 72 CPUs and 500 GB of memory.");
+    expect(replicaAsk({ nodes: 4, gres: "gpu:h100:4", cpus: "1", mem: "0" })).toBe("Each replica asks Slurm for 4 nodes, each with 4 GPUs, 1 CPU and all of its memory.");
+  });
+
+  it("names the default a blank box falls back to", () => {
+    expect(replicaAsk({ nodes: 1, gres: "", cpus: "", mem: "" })).toBe("Each replica asks Slurm for 1 node with no GPUs, Slurm's default CPUs and the partition's default memory.");
+  });
+});
+
 describe("Slurm arithmetic", () => {
   it("counts GPUs and reads memory", () => {
     expect(gresCount("gpu:1")).toBe(1);
@@ -155,5 +169,22 @@ describe("Slurm arithmetic", () => {
       "Your Slurm user has no association with other",
       "A model called glm-5.2 already exists",
     ]);
+  });
+});
+
+describe("accounts a partition takes", () => {
+  const base = { nodes: [], accounts: ["grp_rcadmins", "grp_ml"], qos: [] };
+  it("uses associations for the partition and the partition's own rules", () => {
+    const r = { ...base, partitions: [{ name: "arm", nodes: [], default_time: null, max_time: null, allowed_accounts: ["grp_ml"] }, { name: "gh200", nodes: [], default_time: null, max_time: null }], associations: [{ account: "grp_rcadmins", partition: null, qos: [] }, { account: "grp_ml", partition: "arm", qos: [] }] };
+    expect(accountsFor(r, "arm")).toEqual(["grp_ml"]);
+    expect(accountsFor(r, "gh200")).toEqual(["grp_rcadmins"]);
+  });
+  it("can't tell without associations or partition rules", () => {
+    expect(accountsFor({ ...base, partitions: [{ name: "arm", nodes: [], default_time: null, max_time: null }] }, "arm")).toBeNull();
+  });
+  it("pulls Slurm's own words out of a slurmrestd error", () => {
+    const raw = 'slurmrestd submit failed (500 Internal Server Error): {"errors":[{"description":"Batch job submission failed","error":"Invalid account or account/partition combination specified","error_number":2045}],"warnings":[{"description":"Expected OpenAPI type=array"}]}';
+    expect(slurmErrorText(raw)).toBe("Invalid account or account/partition combination specified");
+    expect(slurmErrorText("connection refused")).toBe("connection refused");
   });
 });

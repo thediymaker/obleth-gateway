@@ -9,6 +9,7 @@ import { activateModelAction, checkModelHealthAction, deleteModelAction, setMode
 import { useCapacityDiscovery, useFairshareLive } from "@/components/fairshare/hooks";
 import { EndpointsSection } from "@/components/models/endpoints";
 import { Switch } from "@/components/models/fields";
+import { LifecycleSection, type LifecycleCandidate } from "@/components/models/lifecycle";
 import { ModelOverview } from "@/components/models/model-overview";
 import { ModelSettings, type SettingsState } from "@/components/models/model-settings";
 import { Notice, ProviderMark, StatusMark } from "@/components/models/ui";
@@ -21,6 +22,8 @@ import { deploymentHref } from "@/lib/deployments-model";
 import {
   awaitingFirstPass,
   contextLabel,
+  lifecycleLabel,
+  lifecycleStatus,
   MODEL_TYPE_NAMES,
   modelStatus,
   RUNS_LABELS,
@@ -31,11 +34,11 @@ import {
   type SettingEntry,
   type SettingsSectionId,
 } from "@/lib/models-model";
-import type { McpServer, ModelEndpoint, ModelHealthDetail, ModelHealthSummary, ModelRoute } from "@/lib/obleth";
+import type { McpServer, ModelEndpoint, ModelHealthDetail, ModelHealthSummary, ModelRoute, UsageLogFacet } from "@/lib/obleth";
 import { poolOccupancy } from "@/lib/overview-model";
 import { cn, getJson } from "@/lib/utils";
 
-type NavId = "overview" | SettingsSectionId | "activity";
+type NavId = "overview" | SettingsSectionId | "lifecycle" | "activity";
 
 function flash(el: HTMLElement) {
   el.classList.remove("setting-flash");
@@ -146,6 +149,8 @@ export function ModelPage({
   mcpServers,
   modelNames,
   boonBlockers,
+  lifecycleModels = [],
+  callers = null,
 }: {
   model: ModelRoute;
   summary: ModelHealthSummary;
@@ -153,6 +158,10 @@ export function ModelPage({
   mcpServers: McpServer[];
   modelNames: string[];
   boonBlockers: BoonBlockers;
+  /** Every model, for the Lifecycle section's replacement picker. */
+  lifecycleModels?: LifecycleCandidate[];
+  /** Keys that called this model in the last 30 days; null when unknown. */
+  callers?: UsageLogFacet[] | null;
 }) {
   const router = useRouter();
   const queryClient = useQueryClient();
@@ -243,7 +252,7 @@ export function ModelPage({
 
   // Which part of the page is on screen, for the section list.
   useEffect(() => {
-    const ids: NavId[] = ["overview", "general", "connection", "routing", "capabilities", "pricing", "capacity", "health", "endpoints", "deployment", "activity"];
+    const ids: NavId[] = ["overview", "general", "connection", "routing", "capabilities", "pricing", "capacity", "health", "endpoints", "deployment", "lifecycle", "activity"];
     const els = ids.map((id) => document.getElementById(id)).filter((e): e is HTMLElement => !!e);
     const observer = new IntersectionObserver(
       (entries) => {
@@ -275,6 +284,7 @@ export function ModelPage({
     { id: "health", label: "Health" },
     { id: "endpoints", label: "Endpoints", count: endpoints.length || undefined },
     { id: "deployment", label: "Deployment" },
+    { id: "lifecycle", label: "Lifecycle", count: lifecycleStatus(model) === "active" ? undefined : lifecycleStatus(model) },
   ];
   const onSettings = useCallback((s: SettingsState) => setSettings(s), []);
 
@@ -289,12 +299,14 @@ export function ModelPage({
             <span className="truncate">{model.model_name}</span>
           </h1>
           <div className="flex flex-wrap items-center gap-2">
+            {lifecycleLabel(model) && <Pill inverted={lifecycleStatus(model) === "retired"}>{lifecycleLabel(model)}</Pill>}
             {status === "down" ? <Pill inverted>Failing health checks</Pill> : <Pill><StatusMark status={status} /></Pill>}
             <Pill>{MODEL_TYPE_NAMES[model.model_type] ?? model.model_type}{textual ? ` · ${contextLabel(model.context_window)} context` : ""}</Pill>
             <Pill>{model.capacity_mode === "discovered" ? "Discovered capacity" : model.capacity_mode === "tuned" ? "Tuned capacity" : model.max_in_flight ? `${model.max_in_flight} slots` : "No slot cap"}</Pill>
             {chat && <Pill>{model.auto_eligible ? "Eligible for auto" : "Not picked by auto"}</Pill>}
             <Pill>{RUNS_LABELS[runs]}</Pill>
             {(model.aliases?.length ?? 0) > 0 && <span className="text-[12.5px] text-muted-foreground">also answers to <span className="font-mono">{model.aliases.join(", ")}</span></span>}
+            {(model.variants?.length ?? 0) > 0 && <span className="text-[12.5px] text-muted-foreground">variants with extra boons: <span className="font-mono">{(model.variants ?? []).map((v) => v.name).join(", ")}</span></span>}
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -378,6 +390,7 @@ export function ModelPage({
           />
           <EndpointsSection model={model} endpoints={endpoints} onChanged={() => router.refresh()} />
           <DeploymentSection model={model} managed={managed} runs={runs} />
+          <LifecycleSection model={model} models={lifecycleModels} callers={callers} onChanged={() => router.refresh()} />
         </div>
       </div>
     </div>

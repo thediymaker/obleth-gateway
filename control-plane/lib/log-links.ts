@@ -15,6 +15,8 @@ export interface LogsLink {
   window?: "15m" | "1h" | "24h" | "7d" | "30d";
   since?: number | string;
   until?: number | string;
+  /** One request, opened: the page looks back 30 days for it. */
+  requestId?: string;
 }
 
 export function logsHref(link: LogsLink): string {

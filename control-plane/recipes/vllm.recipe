@@ -1,0 +1,60 @@
+---
+name: vLLM
+description: "Any Hugging Face model vLLM supports, from its safetensors. Tensor-parallel across the GPUs the job gets on one node."
+engine: vllm
+kind: engine
+requires: "A vLLM image that supports the model's architecture"
+model_type: chat
+api_model_name: my-model
+port: 8000
+health_path: /health
+target_replicas: 1
+max_job_failures: 2
+env:
+  VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+tested:
+  - hardware: "1× A100 80 GB"
+    engine: "vLLM 0.30.1rc1 (nightly)"
+    date: 2026-10-03
+    result: "Served Qwen/Qwen3.5-9B with --enable-auto-tool-choice --tool-call-parser qwen3_coder and thinking off. Ready in 5 minutes. One request ran at about 85 tokens a second; 16 at once reached 1,240. Tool calls worked 3 times out of 3."
+inputs:
+  - name: model
+    label: Hugging Face model
+    type: text
+    required: true
+    help: The repo id, e.g. Qwen/Qwen3-32B.
+  - name: context
+    label: Context length
+    type: number
+    min: 1024
+    help: Leave empty for the model's own maximum.
+  - name: image
+    label: Container image
+    type: path
+    default: "{{cluster.image.vllm}}"
+    required: true
+  - name: cache
+    label: Weight cache
+    type: path
+    default: "{{cluster.cache}}"
+    required: true
+  - name: extra
+    label: More vLLM flags
+    type: text
+    help: Anything else for vllm serve, e.g. --enable-auto-tool-choice --tool-call-parser hermes.
+---
+#!/bin/bash -l
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=64G
+set -euo pipefail
+{{cluster.setup}}
+export HF_HOME={{cache}}
+CONTEXT="{{context}}"
+apptainer exec --nv --bind {{cache}} {{image}} \
+  vllm serve {{model}} \
+    --served-model-name {{api_model_name}} \
+    --host 0.0.0.0 --port "$OBLETH_SERVING_PORT" \
+    --tensor-parallel-size "${SLURM_GPUS_ON_NODE:-1}" \
+    ${CONTEXT:+--max-model-len "$CONTEXT"} \
+    {{extra}}

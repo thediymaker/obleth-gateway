@@ -474,11 +474,14 @@ async fn handler_inner(
         resolved.tenant_id,
         state.session_id_derivation,
     );
+    let end_user = proxy::end_user_for(&resolved, &headers, &json);
     let req_meta = RequestMeta {
         session_id: conversation.value,
         session_id_source: conversation.source.as_str(),
         request_type: surfaced_request_type(&resolved, VERDICTS_PATH, &headers),
         device_id,
+        end_user: end_user.clone().unwrap_or_default(),
+        model_variant: String::new(),
     };
     if let Some(t) = tracer.as_mut() {
         t.set_conversation(&req_meta.session_id, req_meta.session_id_source);
@@ -499,6 +502,7 @@ async fn handler_inner(
             &state,
             &resolved,
             &req_meta.session_id,
+            request_id,
             &mut scan_body,
             tracer.as_mut(),
         )
@@ -634,6 +638,16 @@ async fn handler_inner(
     if !route.enabled {
         return error_json(StatusCode::FORBIDDEN, "model is disabled");
     }
+    // A retired model is refused (or stood in for by its replacement) here as
+    // on every other endpoint.
+    let route = match crate::lifecycle::gate(&state, &route, chrono::Utc::now()).await {
+        crate::lifecycle::Gate::Serve(_) => route,
+        crate::lifecycle::Gate::Redirect(next, _) => {
+            model = next.model_name.clone();
+            next
+        }
+        crate::lifecycle::Gate::Refuse(resp) => return resp,
+    };
     // verdicts reads chat-completions logprobs; only chat routes can serve it.
     if route.model_type != "chat" {
         return error_json(
@@ -668,6 +682,7 @@ async fn handler_inner(
         Some(&route),
         effective_weight,
         est.total(),
+        end_user.as_deref(),
     ));
     let admitted = match tokio::time::timeout(admit_wait, admit).await {
         Ok(Some(a)) => a,
@@ -698,6 +713,7 @@ async fn handler_inner(
                 &model,
                 Admission::Rejected,
                 est,
+                0,
                 0,
                 0,
                 queued_ms,
@@ -769,6 +785,7 @@ async fn handler_inner(
             &model,
             Admission::Rejected,
             est,
+            0,
             0,
             0,
             queue_wait_ms,
@@ -1069,7 +1086,7 @@ async fn handler_inner(
 
     let _ = settle_guard
         .complete(accounting.settle(
-            (usage.prompt_tokens, usage.completion_tokens),
+            proxy::UpstreamUsage::uncached(usage.prompt_tokens, usage.completion_tokens),
             ttft_ms,
             total_ms,
             status_code,

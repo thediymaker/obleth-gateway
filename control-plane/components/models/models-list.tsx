@@ -19,6 +19,9 @@ import {
   EMPTY_FILTERS,
   filterRows,
   groupCounts,
+  LIFECYCLE_BADGES,
+  lifecycleLabel,
+  lifecycleStatus,
   MODEL_TYPE_NAMES,
   modelHref,
   RUNS_LABELS,
@@ -362,9 +365,16 @@ function Row({ row, selected, onToggle, onOpen }: { row: ModelRow; selected: boo
         <div className="flex min-w-0 items-center gap-2.5">
           <ProviderMark name={row.name} upstream={m.upstream_model} className={cn(off && "opacity-50")} />
           <div className="min-w-0">
-            <Link href={modelHref(row.name)} onClick={(e) => e.stopPropagation()} className={cn("block truncate font-medium hover:underline", off ? "text-secondary-foreground" : "text-foreground")}>
-              {row.name}
-            </Link>
+            <span className="flex min-w-0 items-center gap-1.5">
+              <Link href={modelHref(row.name)} onClick={(e) => e.stopPropagation()} className={cn("truncate font-medium hover:underline", off ? "text-secondary-foreground" : "text-foreground")}>
+                {row.name}
+              </Link>
+              {lifecycleStatus(m) !== "active" && (
+                <span title={lifecycleLabel(m) ?? undefined} className={cn("shrink-0 rounded-full border px-1.5 text-[10.5px] leading-[16px]", lifecycleStatus(m) === "retired" ? "border-foreground bg-foreground text-background" : "border-border text-muted-foreground")}>
+                  {LIFECYCLE_BADGES[lifecycleStatus(m)]}
+                </span>
+              )}
+            </span>
             <span className="block truncate font-mono text-[11.5px] text-muted-foreground" title={m.upstream_model}>
               {(m.aliases?.length ?? 0) > 0 ? `also ${m.aliases.join(", ")} · ` : ""}{m.upstream_model}
             </span>

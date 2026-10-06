@@ -20,6 +20,8 @@ import type {
   ModelImportReport,
   ModelManifest,
   ModelRoute,
+  SetModelStatus,
+  ModelVariantInput,
   RestoreReport,
   ResyncReport,
   UpdateAlertSettings,
@@ -34,7 +36,12 @@ import type {
 import { requireAdmin } from "@/lib/auth/roles";
 import { validateManagedModelForm } from "@/lib/managed-model-schema";
 import { parseUpstreamHeaders } from "@/lib/upstream-headers";
-import { resolveRecipeById, buildManagedFromRecipe, parseRecipe, type DeployOverrides } from "@/lib/sbatch-recipes";
+import { resolveRecipeById, resolveRecipeText, buildManagedFromRecipe, parseRecipe, type DeployOverrides } from "@/lib/sbatch-recipes";
+import { unixLineEndings } from "@/lib/sbatch-directives";
+import { clusterValuesFrom, inputDefaults, type ClusterValues } from "@/lib/recipe-inputs";
+import { savedRecipeText, type SaveAs } from "@/lib/recipe-save";
+import type { DeployForm } from "@/lib/deploy-form";
+import { lookupHfModel, type HfModel } from "@/lib/hf-model";
 import { parseUpstreamModelList, normalizeBase, type UpstreamModel } from "@/lib/provider-import";
 import { blockedHostReason } from "@/lib/ssrf";
 import { tagsInclude } from "@/lib/utils";
@@ -697,7 +704,7 @@ export async function saveTenantSettingsAction(formData: FormData): Promise<Sett
   return { ok: true };
 }
 
-export type KeySettingsSection = "key" | "tracing";
+export type KeySettingsSection = "key" | "tracing" | "end_user";
 
 /** Save a key's panel: its fields (one update) and its tracing switch, each only when changed. */
 export async function saveKeySettingsAction(formData: FormData): Promise<SettingsSaveResult<KeySettingsSection>> {
@@ -718,6 +725,14 @@ export async function saveKeySettingsAction(formData: FormData): Promise<Setting
       return { ok: false, error: `Tracing: ${actionError(e).error}`, saved };
     }
     saved.push("tracing");
+  }
+  if (wanted.has("end_user")) {
+    try {
+      await obleth.setKeyEndUserFairshare(id, formData.get("end_user_fairshare") === "on", { auditActor: session.email });
+    } catch (e) {
+      return { ok: false, error: `Per-user fairshare: ${actionError(e).error}`, saved };
+    }
+    saved.push("end_user");
   }
   updateTag(CACHE_TAGS.keys);
   revalidatePath("/keys");
@@ -862,6 +877,7 @@ export async function replaceKeyAction(id: string): Promise<{ ok: true; secret: 
       budget_started_at: old.budget_started_at,
     }, { auditActor: session.email });
     if (old.tracing_enabled) await obleth.setKeyTracing(created.key.id, true, { auditActor: session.email });
+    if (old.end_user_fairshare) await obleth.setKeyEndUserFairshare(created.key.id, true, { auditActor: session.email });
     updateTag(CACHE_TAGS.keys);
     revalidatePath("/keys");
     return { ok: true, secret: created.secret, key: created.key };
@@ -982,6 +998,7 @@ export async function createModelAction(
       boons: boonsFromForm(formData),
       tool_servers: toolServersFromForm(formData),
       ...(isSlurm ? {} : { enabled: false }),
+      ...(formData.get("staged") === "on" ? { status: "staged" as const } : {}),
     }, { auditActor: session.email });
 
     if (isSlurm) {
@@ -991,10 +1008,10 @@ export async function createModelAction(
         gres: trimmed(formData.get("slurm_gres")),
         nodes: numOr(formData.get("slurm_nodes"), 1),
         image: trimmed(formData.get("slurm_image")),
-        preamble: trimmed(formData.get("slurm_preamble")),
+        preamble: unixLineEndings(trimmed(formData.get("slurm_preamble"))),
         log_output_dir: trimmed(formData.get("slurm_log_output_dir")),
-        launch_command: trimmed(formData.get("slurm_launch_command")),
-        script_body: trimmed(formData.get("slurm_script_body")),
+        launch_command: unixLineEndings(trimmed(formData.get("slurm_launch_command"))),
+        script_body: unixLineEndings(trimmed(formData.get("slurm_script_body"))),
         cpus_per_task: numOrNull(formData.get("slurm_cpus_per_task")),
         mem: strOrNull(formData.get("slurm_mem")) ?? null,
         serving_port: numOr(formData.get("slurm_serving_port"), 8000),
@@ -1200,7 +1217,8 @@ async function modelRegistrationWarnings(body: {
 // Full replacement body for PUT /models/{id}, built from the current model so a
 // partial edit re-sends every field the gateway expects. `api_key` is omitted
 // on purpose: it is a write-only secret not returned by listModels, and sending
-// null would clear it. Callers spread this and override only their own fields.
+// null would clear it. `variants` is left out too: omitted, the gateway keeps
+// them. Callers spread this and override only their own fields.
 function toModelUpdateBody(model: ModelRoute) {
   return {
     upstream_model: model.upstream_model,
@@ -1291,6 +1309,7 @@ function modelSettingsBody(formData: FormData, current: ModelRoute) {
     model_type: text("model_type", current.model_type),
     quantization: text("quantization", current.quantization),
     ...(has("aliases") ? { aliases: aliasesFromForm(formData) } : {}),
+    ...(has("variants") ? { variants: variantsFromForm(formData) } : {}),
     upstream_model: text("upstream_model", current.upstream_model),
     api_base: text("api_base", current.api_base),
     ...(newKey ? { api_key: newKey } : {}),
@@ -1442,6 +1461,31 @@ export async function setModelEnabledAction(id: string, enabled: boolean): Promi
   if (!current) return { ok: false, error: "Model not found." };
   try {
     await obleth.updateModel(id, { ...toModelUpdateBody(current), enabled }, { auditActor: session.email });
+  } catch (e) {
+    return actionError(e);
+  }
+  updateTag(CACHE_TAGS.models);
+  revalidatePath("/models");
+  revalidatePath("/");
+  return { ok: true };
+}
+
+/**
+ * Set a model's lifecycle from the Lifecycle section: active, deprecated or
+ * retired, with the replacement, retirement date, note and redirect. The
+ * gateway validates the replacement and replaces the lifecycle whole.
+ */
+export async function setModelStatusAction(id: string, body: SetModelStatus): Promise<ActionResult> {
+  const session = await requireAdmin();
+  const note = body.note?.trim() ?? "";
+  if (note.length > 500) return { ok: false, error: "Keep the note to 500 characters; callers see it with every refusal." };
+  if (body.redirect && !body.replacement) return { ok: false, error: "Pick a replacement to answer in its place." };
+  try {
+    await obleth.setModelStatus(
+      id,
+      body.status === "active" ? { status: "active" } : { ...body, note: note || null, replacement: body.replacement || null },
+      { auditActor: session.email },
+    );
   } catch (e) {
     return actionError(e);
   }
@@ -1887,20 +1931,21 @@ const SETTINGS_PAGE_ORDER: SettingsPageSection[] = ["alerts", "routing", "boons"
 const SETTINGS_PAGE_LABEL: Record<SettingsPageSection, string> = { alerts: "Alerts", routing: "Routing", boons: "Boons", energy: "Energy", assistant: "Assistant", retention: "Data" };
 
 const BOON_BOOLS = [
-  "vision_enabled", "structured_output_enabled", "tool_loop_enabled", "image_generation_enabled", "speculation_enabled",
+  "vision_enabled", "structured_output_enabled", "tool_loop_enabled", "image_generation_enabled", "web_search_enabled", "speculation_enabled",
   "compression_enabled", "compression_code_compaction", "compression_dedup", "compression_compact_logs", "compression_allow_lossy",
 ] as const;
 const BOON_NUMBERS = [
   "vision_max_images", "vision_timeout_ms", "structured_output_max_repair_attempts", "structured_output_timeout_ms",
   "tool_loop_max_turns", "tool_loop_tool_timeout_ms", "tool_loop_deadline_secs",
   "image_generation_max_images_per_request", "image_generation_timeout_ms",
+  "web_search_max_results", "web_search_max_searches_per_request", "web_search_timeout_ms",
   "speculation_agree_min", "speculation_lp_min", "speculation_abort_agree", "speculation_abort_lp", "speculation_first_chunk_tokens",
   "speculation_chunk_tokens", "speculation_decide_by_tokens", "speculation_max_draft_tokens", "speculation_pace_ms", "speculation_timeout_ms",
   "compression_min_tokens", "compression_max_segments", "compression_max_lossy_segments", "compression_original_ttl_secs", "compression_neural_keep_ratio",
 ] as const;
 /** Model pickers: blank means none. */
-const BOON_MODELS = ["vision_fallback_model", "structured_output_fixer_model", "image_generation_model", "speculation_draft_model", "speculation_classify_model"] as const;
-const BOON_TEXTS = ["vision_describe_prompt", "tool_loop_nudge", "image_generation_tool_description", "speculation_verify_url_template"] as const;
+const BOON_MODELS = ["vision_fallback_model", "structured_output_fixer_model", "image_generation_model", "web_search_tool", "speculation_draft_model", "speculation_classify_model"] as const;
+const BOON_TEXTS = ["vision_describe_prompt", "tool_loop_nudge", "image_generation_tool_description", "web_search_tool_description", "speculation_verify_url_template"] as const;
 
 /** The boons section of the Settings form as the gateway's update, or why not. */
 function boonSettingsFromForm(formData: FormData): { ok: true; body: UpdateBoonSettings } | { ok: false; error: string } {
@@ -1942,6 +1987,10 @@ function boonSettingsFromForm(formData: FormData): { ok: true; body: UpdateBoonS
   if (turns !== undefined && (turns < 1 || turns > 8)) return { ok: false, error: "Tool loop: 1 to 8 turns." };
   const images = body.image_generation_max_images_per_request as number | undefined;
   if (images !== undefined && (images < 1 || images > 4)) return { ok: false, error: "Image generation: 1 to 4 images a call." };
+  const results = body.web_search_max_results as number | undefined;
+  if (results !== undefined && (results < 1 || results > 10)) return { ok: false, error: "Web search: 1 to 10 results a search." };
+  const searches = body.web_search_max_searches_per_request as number | undefined;
+  if (searches !== undefined && (searches < 1 || searches > 8)) return { ok: false, error: "Web search: 1 to 8 searches a request." };
   const keep = body.compression_neural_keep_ratio as number | undefined;
   if (keep !== undefined && (keep < 0.05 || keep > 1)) return { ok: false, error: "Compression: keep between 5% and 100% of prose." };
   return { ok: true, body: body as UpdateBoonSettings };
@@ -2354,6 +2403,30 @@ function aliasesFromForm(formData: FormData): string[] {
     .filter((a) => a.length > 0);
 }
 
+// Parses the variants field (the settings page's rows, as JSON) into the list
+// the gateway stores. Rows without a name are dropped, as blank aliases are;
+// the gateway checks the rest (names already taken, unknown boons, the cap),
+// so a variant it refuses surfaces as a save error.
+function variantsFromForm(formData: FormData): ModelVariantInput[] {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(String(formData.get("variants") || "[]"));
+  } catch {
+    raw = null;
+  }
+  if (!Array.isArray(raw)) throw new Error("The variants could not be read. Reload the page and try again.");
+  return raw.flatMap((item: unknown) => {
+    const v = (item && typeof item === "object" ? item : {}) as Record<string, unknown>;
+    const name = typeof v.name === "string" ? v.name.trim() : "";
+    if (!name) return [];
+    return [{
+      name,
+      description: typeof v.description === "string" ? v.description.trim() : "",
+      boons: Array.isArray(v.boons) ? v.boons.filter((b): b is string => typeof b === "string") : [],
+    }];
+  });
+}
+
 // The upstream-headers textarea as an update field, only when the form has
 // one: a form without it (every other model tab) must leave the stored
 // headers alone, which the gateway does when the field is omitted.
@@ -2541,7 +2614,8 @@ export async function saveDeploymentSettingsAction(formData: FormData): Promise<
   const nullable = (k: string) => text(k) || null;
   const int = (k: string) => Number(text(k));
   const res = await changeSpec(id, (b) => {
-    const script = values.slurm_script_body ?? b.script_body ?? "";
+    // The browser sends a textarea with CRLF line endings; bash needs LF.
+    const script = unixLineEndings(values.slurm_script_body ?? b.script_body ?? "");
     if (!script.trim() && !(b.launch_command ?? "").trim()) return "The script can't be empty.";
     return {
       ...b,
@@ -2556,6 +2630,7 @@ export async function saveDeploymentSettingsAction(formData: FormData): Promise<
       time_limit: nullable("time_limit"),
       constraints: nullable("constraints"),
       exclude: nullable("exclude"),
+      log_output_dir: values.slurm_log_output_dir !== undefined ? text("log_output_dir").replace(/\/+$/, "") : b.log_output_dir,
       serving_port: int("serving_port"),
       health_path: text("health_path") || "/health",
       target_replicas: int("target_replicas"),
@@ -2584,29 +2659,104 @@ export async function removeDeploymentAction(modelId: string, deleteModel: boole
  * choose (a recipe can be launched more than once); placement overrides win
  * over the recipe's. Returns the new model's name, for its page.
  */
+/** The cluster defaults recipes fill {{cluster.*}} from; empty when unreadable. */
+async function clusterValues(): Promise<ClusterValues> {
+  try {
+    return clusterValuesFrom((await obleth.getSlurmSettings()).cluster_defaults);
+  } catch {
+    return clusterValuesFrom(null);
+  }
+}
+
 export async function launchRecipeAction(recipeId: string, overrides: DeployOverrides): Promise<{ ok: true; name: string } | { ok: false; error: string }> {
   const session = await requireAdmin();
   const recipe = await resolveRecipeById(recipeId);
   if (!recipe) return { ok: false, error: "That recipe no longer exists." };
   if (!recipe.valid) return { ok: false, error: recipe.error ?? "The recipe can't be read." };
   try {
-    const { createBody, managedBody } = buildManagedFromRecipe(recipe, overrides);
-    const models = await obleth.listModels();
-    if (models.some((m) => m.model_name === createBody.model_name || m.aliases?.includes(createBody.model_name))) {
+    const { createBody, managedBody } = buildManagedFromRecipe(recipe, overrides, await clusterValues());
+    const models = await obleth.listModelsFresh();
+    if (models.some((m) => m.model_name === createBody.model_name || m.aliases?.includes(createBody.model_name) || m.variants?.some((v) => v.name === createBody.model_name))) {
       return { ok: false, error: `A model called ${createBody.model_name} already exists. Pick another name.` };
     }
     if (!managedBody.partition) return { ok: false, error: "Pick a partition." };
-    const created = await obleth.createModel({
-      model_name: createBody.model_name,
-      upstream_model: createBody.upstream_model,
-      api_base: createBody.api_base,
-      model_type: createBody.model_type,
-    }, { auditActor: session.email });
+    // A launched model starts staged, like one added by hand: it is made
+    // active on its page once it has been tried. It can already do what the
+    // recipe's flags turned on, e.g. function calling.
+    const created = await obleth.createModel({ ...createBody, status: "staged" }, { auditActor: session.email });
     await obleth.putManagedModel(created.id, managedBody, { auditActor: session.email });
     refreshDeployments();
     return { ok: true, name: created.model_name };
   } catch (e) {
     return actionError(e);
+  }
+}
+
+/** Save a filled-in launch as a recipe under Saved, with its values as defaults. */
+export async function saveRecipeFromFormAction(recipeId: string, form: DeployForm, as: Omit<SaveAs, "basedOn" | "clusterResolved">): Promise<{ ok: true; id: string } | { ok: false; error: string }> {
+  const session = await requireAdmin();
+  const [text, recipe] = await Promise.all([resolveRecipeText(recipeId), resolveRecipeById(recipeId)]);
+  if (!text || !recipe?.header) return { ok: false, error: "That recipe no longer exists." };
+  const name = as.name.trim();
+  if (!name) return { ok: false, error: "Name the recipe." };
+  try {
+    const cv = await clusterValues();
+    const body = savedRecipeText(text, form, { ...as, name, basedOn: recipeId, clusterResolved: inputDefaults(recipe.header.inputs, cv, form.slurm.nodes) });
+    const check = parseRecipe("saved", body);
+    if (!check.valid) return { ok: false, error: `The saved recipe wouldn't be valid: ${check.error}` };
+    const row = await obleth.createRecipe({ name, body }, { auditActor: session.email });
+    revalidatePath("/deployments");
+    return { ok: true, id: row.id };
+  } catch (e) {
+    return actionError(e);
+  }
+}
+
+/** Save a running deployment's settings as a recipe. */
+export async function saveRecipeFromDeploymentAction(modelId: string, name: string): Promise<{ ok: true; id: string } | { ok: false; error: string }> {
+  await requireAdmin();
+  try {
+    const [spec, models] = await Promise.all([obleth.getManagedModel(modelId), obleth.listModels()]);
+    const model = models.find((m) => m.id === modelId);
+    if (!model || !spec) return { ok: false, error: "That deployment no longer exists." };
+    const ls = (spec.launcher_spec ?? {}) as { recipe_id?: string; inputs?: Record<string, string>; env?: Record<string, string> };
+    if (!ls.recipe_id) return { ok: false, error: "This deployment wasn't launched from a recipe." };
+    const recipe = await resolveRecipeById(ls.recipe_id);
+    if (!recipe?.header) return { ok: false, error: "The recipe it was launched from no longer exists." };
+    const form: DeployForm = {
+      recipe: ls.recipe_id,
+      name: model.model_name,
+      inputs: { ...(ls.inputs ?? {}) },
+      slurm: {
+        partition: spec.partition,
+        account: spec.account ?? "",
+        qos: spec.qos ?? "",
+        time_limit: spec.time_limit ?? "",
+        nodes: spec.nodes || 1,
+        gres: spec.gres ?? "",
+        cpus_per_task: spec.cpus_per_task ? String(spec.cpus_per_task) : "",
+        mem: spec.mem ?? "",
+        constraints: spec.constraints ?? "",
+        exclude: spec.exclude ?? "",
+        log_output_dir: spec.log_output_dir ?? "",
+      },
+      env: { ...(ls.env ?? recipe.header.env ?? {}) },
+      serving: { keep_running: spec.target_replicas, serve_from: spec.min_replicas, stop_after_failed_launches: spec.max_job_failures, health_path: spec.health_path },
+    };
+    const model_ = recipe.header.kind === "engine" ? ls.inputs?.model : undefined;
+    return await saveRecipeFromFormAction(ls.recipe_id, form, { name, model: model_ });
+  } catch (e) {
+    return actionError(e);
+  }
+}
+
+/** What a Hugging Face repo holds and which engines can run it. */
+export async function lookupHfModelAction(input: string): Promise<{ ok: true; model: HfModel } | { ok: false; error: string }> {
+  await requireAdmin();
+  try {
+    return { ok: true, model: await lookupHfModel(input) };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
   }
 }
 
@@ -2621,12 +2771,10 @@ export async function deployRecipeAction(
 
   try {
     const { createBody, managedBody } = buildManagedFromRecipe(recipe, overrides);
-    const created = await obleth.createModel({
-      model_name: createBody.model_name,
-      upstream_model: createBody.upstream_model,
-      api_base: createBody.api_base,
-      model_type: createBody.model_type,
-    }, { auditActor: session.email });
+    // A launched model starts staged, like one added by hand: it is made
+    // active on its page once it has been tried. It can already do what the
+    // recipe's flags turned on, e.g. function calling.
+    const created = await obleth.createModel({ ...createBody, status: "staged" }, { auditActor: session.email });
     await obleth.putManagedModel(created.id, managedBody, { auditActor: session.email });
   } catch (e) {
     return actionError(e);

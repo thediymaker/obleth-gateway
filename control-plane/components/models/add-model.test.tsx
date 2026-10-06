@@ -51,6 +51,7 @@ describe("guessing from the upstream name", () => {
     ["hexgrad/Kokoro-82M-tts", "audio_speech"],
     ["black-forest-labs/FLUX.2-dev", "image"],
     ["Wan-AI/Wan2.2-T2V", "video"],
+    ["searxng", "search"],
     ["Qwen/Qwen3-235B-A22B", "chat"],
   ])("reads %s as %s", (upstream, type) => {
     expect(guessModelType(upstream)).toBe(type);

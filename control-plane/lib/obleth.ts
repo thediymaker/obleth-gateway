@@ -95,6 +95,8 @@ export interface ApiKey {
   budget_started_at: string | null;
   disabled: boolean;
   tracing_enabled: boolean;
+  /** Each end user the key names queues on their own (trusted callers only). */
+  end_user_fairshare: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -102,6 +104,32 @@ export interface ApiKey {
 export interface CreatedKey {
   key: ApiKey;
   secret: string;
+}
+
+export type LifecycleStatus = "staged" | "active" | "deprecated" | "retired";
+
+/** A model's lifecycle as the gateway stores it; empty fields are omitted. */
+export interface ModelLifecycle {
+  status: LifecycleStatus;
+  /** The model callers are told to move to. */
+  replacement?: string;
+  /** When a deprecated model stops being served (RFC 3339). */
+  retire_at?: string | null;
+  /** When the status last changed. */
+  changed_at?: string | null;
+  /** The operator's sentence to callers. */
+  note?: string;
+  /** Once retired, answer with the replacement instead of refusing. */
+  redirect?: boolean;
+}
+
+/** `PUT /models/{id}/status`: replaces the lifecycle whole. */
+export interface SetModelStatus {
+  status: LifecycleStatus;
+  replacement?: string | null;
+  retire_at?: string | null;
+  note?: string | null;
+  redirect?: boolean;
 }
 
 export interface ModelRoute {
@@ -113,6 +141,22 @@ export interface ModelRoute {
    * `model_name` is advertised by the gateway's discovery endpoints.
    */
   aliases: string[];
+  /**
+   * More client-facing names for this same model, each with extra boons
+   * turned on (`glm-5-3-spec` = this model with `speculation`). A variant
+   * shares the model's capacity and price; its boons are added to the
+   * model's own. Absent from gateways older than variants.
+   */
+  variants?: ModelVariant[];
+  /**
+   * Where the model is in its life: staged (served by name, but not listed
+   * and never picked by auto), active, deprecated (still served, with headers
+   * saying so) or retired (refused with 410, or answered by the replacement).
+   * Absent from gateways older than the field.
+   */
+  lifecycle?: ModelLifecycle;
+  /** The status in force now: a deprecated model past its date reads `retired`. */
+  effective_status?: LifecycleStatus;
   description: string;
   upstream_model: string;
   api_base: string;
@@ -210,11 +254,24 @@ export interface ModelRoute {
  * `upstream_header_names`.
  */
 export type ModelWriteFields = Partial<
-  Omit<ModelRoute, "api_key_set" | "upstream_header_names">
+  Omit<ModelRoute, "api_key_set" | "upstream_header_names" | "variants" | "lifecycle" | "effective_status">
 > & {
   api_key?: string | null;
   upstream_headers?: Record<string, string | null>;
+  /** Replaces the model's variants when present (`[]` removes them all); omit to leave them unchanged. */
+  variants?: ModelVariantInput[];
 };
+
+/** Another name for a model, with extra boons turned on. */
+export interface ModelVariant {
+  name: string;
+  description: string;
+  /** Boons added to the model's own when a request names this variant. */
+  boons: string[];
+}
+
+/** A variant as create and update take it: no description and no extra boons unless given. */
+export type ModelVariantInput = Pick<ModelVariant, "name"> & Partial<Omit<ModelVariant, "name">>;
 
 export interface ModelEndpoint {
   id: string;
@@ -390,6 +447,9 @@ export type ClusterResources = {
     nodes: string[];
     default_time: string | null;
     max_time: string | null;
+    /** AllowAccounts; empty means any. Absent from older gateways. */
+    allowed_accounts?: string[];
+    denied_accounts?: string[];
   }[];
   nodes: {
     name: string;
@@ -405,6 +465,8 @@ export type ClusterResources = {
   }[];
   accounts: string[];
   qos: string[];
+  /** The Slurm user's associations; `partition` null covers every partition. Absent from older gateways. */
+  associations?: { account: string; partition: string | null; qos: string[] }[];
 };
 
 export interface ModelReplica {
@@ -418,6 +480,52 @@ export interface ModelReplica {
   cancel_requested?: boolean;
   created_at: string;
   updated_at: string;
+}
+
+// One past or current launch of a Slurm-backed replica. Outlives the replica
+// row (which is garbage-collected); id is the replica id.
+export interface DeploymentLaunch {
+  id: string;
+  model_id: string;
+  model_name: string;
+  recipe_id: string | null;
+  slurm_job_id: string;
+  // Managed spec as submitted.
+  partition: string | null;
+  account: string | null;
+  qos: string | null;
+  time_limit: string | null;
+  gres: string | null;
+  nodes_requested: number | null;
+  cpus_per_task: number | null;
+  mem: string | null;
+  exclude: string | null;
+  constraints: string | null;
+  launcher_spec: Record<string, unknown> | null;
+  // Allocated node hostnames (comma-separated), once the job ran.
+  nodes: string | null;
+  submitted_at: string;
+  started_at: string | null;
+  healthy_at: string | null;
+  ended_at: string | null;
+  // Slurm's terminal state (TIMEOUT, OUT_OF_MEMORY, NODE_FAIL, FAILED, ...),
+  // "gone" when the job vanished from slurmrestd, "cancelled:scale-down" |
+  // "cancelled:restart" | "cancelled:probe-failed" when obleth cancelled it,
+  // or "deleted" when the replica row was removed while still open.
+  end_state: string | null;
+  end_reason: string | null;
+  updated_at: string;
+  // Submit → start, start → healthy, start → end (or now while running).
+  queued_secs: number | null;
+  load_secs: number | null;
+  ran_secs: number | null;
+}
+
+export interface DeploymentLaunchesParams {
+  model_id?: string;
+  recipe_id?: string;
+  // Default 50, at most 500.
+  limit?: number;
 }
 
 export type AutotuneKneeReason =
@@ -669,9 +777,12 @@ export interface UsageLogEntry {
   device_id: string;
   admission: string;
   status_code: number;
+  /** Every prompt token, cached ones included. */
   input_tokens: number;
   output_tokens: number;
   total_tokens: number;
+  /** The part of `input_tokens` the upstream served from its prefix cache. Absent from older gateways. */
+  cached_input_tokens?: number;
   queue_wait_ms: number;
   ttft_ms: number;
   total_ms: number;
@@ -684,6 +795,14 @@ export interface UsageLogEntry {
   key_name: string;
   key_prefix: string;
   has_trace: boolean;
+  /**
+   * On a helper call (a boon's call to another model, such as a speculation
+   * draft or an image description), the id of the client request it served.
+   * The nil UUID on every other row. Absent from older gateways.
+   */
+  parent_request_id?: string;
+  /** The variant the client named, when it called the model through one; `model` is still the model's own name. Absent from older gateways. */
+  model_variant?: string;
 }
 
 /// One recorded span from the flight-recorder tracer for a single request.
@@ -720,6 +839,8 @@ export interface UsageLogParams {
   tracedOnly?: boolean;
   /** When true, include internal traffic (e.g. health probes) hidden by default. */
   includeInternal?: boolean;
+  /** Only the helper calls made while serving this client request. */
+  parentRequestId?: string;
 }
 
 /** One value of a log facet; `label` is a tenant's or key's name. */
@@ -887,10 +1008,16 @@ export interface KeyFairshareView {
   share_score: number;
   weight_share: number;
   expected_slots: number;
+  /** Set when this row is one end user of a key with per-end-user fairshare. */
+  end_user?: string;
+  /** The real key an end user's row belongs to. */
+  parent_key_id?: string;
 }
 
 export interface ModelPoolView {
   model: string;
+  /** The model has nowhere to send a request right now; the totals leave its pool out. */
+  no_servers?: boolean;
   /** Slots the answering gateway enforces: `configured_cap`, or its share
    *  of it in split and fallback mode. */
   cap: number;
@@ -928,6 +1055,10 @@ export interface FairshareLiveView {
   /** Enabled models' pool sizes as configured, summed: the cluster-wide
    *  capacity. */
   configured_max_in_flight?: number;
+  /** How many enabled models the slot totals add up: those with servers right now. */
+  models_with_servers?: number;
+  /** Enabled models left out of the totals because they have no servers right now. */
+  models_without_servers?: string[];
   /** Default per-model in-flight cap applied when a model has none configured. */
   default_model_max_in_flight?: number;
   /** Live gateway replicas. */
@@ -1073,6 +1204,11 @@ export interface SlurmSettingsView {
   // node names unreliably, these take DNS out of the loop (endpoints register by
   // IP). Echoed back in full so the form can render and edit them.
   node_aliases: NodeAlias[];
+  // Cluster-wide paths, setup lines and engine images recipes fill into jobs.
+  cluster_defaults: ClusterDefaults;
+  // Hugging Face token: never returned; presence + last 4 chars only.
+  hf_token_set: boolean;
+  hf_token_last4: string | null;
   // Seconds since the provisioner last polled, or null if never seen since the
   // gateway started. provisioner_running is true within the freshness window.
   provisioner_last_seen_secs: number | null;
@@ -1105,6 +1241,26 @@ export interface UpdateSlurmSettings {
   // Full replacement set of node hostname → IP overrides. Blank rows are dropped
   // server-side; a non-blank host must map to a real IP literal.
   node_aliases?: NodeAlias[];
+  // Replaces the stored block wholesale when present; omit to keep it.
+  cluster_defaults?: ClusterDefaults;
+  // Write-only: omit/null keeps the stored token, "" clears it, any other
+  // value replaces it. Passed to jobs as HF_TOKEN / HUGGING_FACE_HUB_TOKEN.
+  hf_token?: string | null;
+}
+
+// Cluster-wide defaults for recipe job scripts. Empty strings mean unset.
+export interface ClusterDefaults {
+  // Shared model-weight cache, used as HF_HOME.
+  cache_dir: string;
+  // Directory holding container images (e.g. .sif files).
+  images_dir: string;
+  // Directory for job stdout/stderr files.
+  log_dir: string;
+  // Shell lines run at the top of every job (module loads, PATH, ...).
+  setup: string;
+  // Engine name → image path or file name (e.g. "vllm" → "vllm.sif"); a bare
+  // file name is relative to images_dir.
+  images: Record<string, string>;
 }
 
 // One compute-node hostname → IP override for the Slurm provisioner.
@@ -1323,6 +1479,12 @@ export interface BoonSettingsView {
   speculation_category_gates: SpeculationCategoryGate[];
   speculation_unlisted_categories_speculate: boolean;
   speculation_verify_url_template: string;
+  web_search_enabled: boolean;
+  web_search_tool: string | null;
+  web_search_tool_description: string;
+  web_search_max_results: number;
+  web_search_max_searches_per_request: number;
+  web_search_timeout_ms: number;
 }
 
 // One per-category gate of the speculation boon. Missing thresholds fall back
@@ -1386,6 +1548,12 @@ export interface UpdateBoonSettings {
   speculation_category_gates?: SpeculationCategoryGate[];
   speculation_unlisted_categories_speculate?: boolean;
   speculation_verify_url_template?: string;
+  web_search_enabled?: boolean;
+  web_search_tool?: string | null;
+  web_search_tool_description?: string;
+  web_search_max_results?: number;
+  web_search_max_searches_per_request?: number;
+  web_search_timeout_ms?: number;
 }
 
 // Live status of the optional neural compression sidecar (a health probe of
@@ -1925,6 +2093,12 @@ export const obleth = {
       headers: auditActorHeaders(options),
       body: JSON.stringify({ tracing_enabled }),
     }),
+  setKeyEndUserFairshare: (id: string, end_user_fairshare: boolean, options?: AuditOptions) =>
+    api<void>(`/keys/${id}/end-user-fairshare`, {
+      method: "PUT",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify({ end_user_fairshare }),
+    }),
   setTenantTracing: (
     id: string,
     tracing_enabled: boolean,
@@ -1954,11 +2128,17 @@ export const obleth = {
     api<ModelRoute[]>("/models", {
       next: { revalidate: LIST_REVALIDATE_SECS, tags: [CACHE_TAGS.models] },
     }),
+  /** The model list uncached. Each dashboard replica has its own Data Cache,
+   *  and a tag revalidated on one doesn't reach the others, so a page that
+   *  must see a model created a moment ago (on any replica) reads this. */
+  listModelsFresh: () => api<ModelRoute[]>("/models"),
   createModel: (
     body: ModelWriteFields & {
       model_name: string;
       upstream_model: string;
       api_base: string;
+      /** `staged` keeps it out of the model list and auto until it is made active. Omitted = active. */
+      status?: Extract<LifecycleStatus, "staged" | "active">;
     },
     options?: AuditOptions,
   ) =>
@@ -2019,6 +2199,12 @@ export const obleth = {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ admission_weight }),
+    }),
+  setModelStatus: (id: string, body: SetModelStatus, options?: AuditOptions) =>
+    api<ModelRoute>(`/models/${id}/status`, {
+      method: "PUT",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify(body),
     }),
   setModelCapacity: (
     id: string,
@@ -2156,6 +2342,9 @@ export const obleth = {
       method: "POST",
       headers: auditActorHeaders(options),
     }),
+  /** Launch history of Slurm-backed replicas, newest first (limit default 50, max 500). */
+  listDeploymentLaunches: (params: DeploymentLaunchesParams = {}) =>
+    api<DeploymentLaunch[]>(`/deployments/launches${qs({ ...params })}`),
   restartReplica: (replicaId: string, options?: AuditOptions) =>
     api<{ ok: boolean }>(`/replicas/${replicaId}/restart`, {
       method: "POST",
@@ -2333,6 +2522,7 @@ export const obleth = {
         limit: params.limit,
         traced_only: params.tracedOnly ? "true" : undefined,
         include_internal: params.includeInternal ? "true" : undefined,
+        parent_request_id: params.parentRequestId,
       })}`,
     ),
   /** Requests and failures per bucket, counted with the log's own filters. */

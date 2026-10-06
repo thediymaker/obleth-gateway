@@ -232,6 +232,15 @@ pub struct ApiKey {
     pub max_in_flight: Option<i64>,
     pub disabled: bool,
     pub tracing_enabled: bool,
+    /// The key fronts many end users (a chatbot or other shared front end)
+    /// and names each one per request (`x-obleth-end-user`, else the body's
+    /// `user`). Each named end user then takes their own place in the fair
+    /// queue, as if they held their own key: the key's weight and in-flight
+    /// cap apply to each of them, while budgets stay on the key. Trusted:
+    /// only set it for a caller that names its users honestly, since a caller
+    /// could otherwise split itself into many users to jump the queue.
+    #[serde(default)]
+    pub end_user_fairshare: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -314,6 +323,10 @@ pub struct ResolvedKey {
     /// Per-model in-flight ceiling for the key. `None` = no cap.
     #[serde(default)]
     pub key_max_in_flight: Option<i64>,
+    /// Each named end user of this key queues separately (see
+    /// `ApiKey::end_user_fairshare`).
+    #[serde(default)]
+    pub end_user_fairshare: bool,
     /// Optional per-tenant model allowlist. Empty/`None` = all models permitted.
     #[serde(default)]
     pub allowed_models: Option<Vec<String>>,
@@ -376,6 +389,17 @@ pub struct ModelRoute {
     /// `model_name` is advertised by the discovery endpoints.
     #[serde(default)]
     pub aliases: Vec<String>,
+    /// Opt-in names for this same route with extra boons on (see
+    /// [`ModelVariant`]). Unlike an alias, a variant changes what the request
+    /// gets, so it is listed by the discovery endpoints. `#[serde(default)]`
+    /// keeps payloads written before variants existed readable as "none".
+    #[serde(default)]
+    pub variants: Vec<ModelVariant>,
+    /// Staged, active, deprecated or retired, with the replacement and
+    /// retirement date (see [`ModelLifecycle`]). `#[serde(default)]` reads older payloads
+    /// as active.
+    #[serde(default)]
+    pub lifecycle: ModelLifecycle,
     /// Human-facing summary for operators and dashboards.
     pub description: String,
     /// Value sent to the upstream in the `model` field.
@@ -547,6 +571,18 @@ pub struct ModelRoute {
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
+
+impl ModelRoute {
+    /// Every client-facing name this route answers to: `model_name`, its
+    /// aliases, then its variants. The same set
+    /// [`ResolvedModel::addressable_names`] publishes as resolver keys.
+    pub fn addressable_names(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.model_name.as_str())
+            .chain(self.aliases.iter().map(String::as_str))
+            .chain(self.variants.iter().map(|v| v.name.as_str()))
+    }
+}
+
 /// Persisted model-health status. Stored as snake_case text in Postgres so new
 /// UI/API readers can remain forward-compatible with older rows.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -602,6 +638,18 @@ pub struct ResolvedModel {
     /// payloads deserializable as "no aliases".
     #[serde(default)]
     pub aliases: Vec<String>,
+    /// Extra names that resolve to this route with more boons on (see
+    /// [`ModelVariant`]). Each is published as its own resolver key pointing
+    /// at this same route; the proxy adds the variant's boons per request
+    /// ([`ResolvedModel::with_variant`]). `#[serde(default)]` keeps older
+    /// cached payloads deserializable as "no variants".
+    #[serde(default)]
+    pub variants: Vec<ModelVariant>,
+    /// See [`ModelRoute::lifecycle`]. Read per request: the proxy refuses a
+    /// retired model and marks a deprecated one's responses. `#[serde(default)]`
+    /// keeps older cached payloads deserializable as "active".
+    #[serde(default)]
+    pub lifecycle: ModelLifecycle,
     pub upstream_model: String,
     pub api_base: String,
     pub api_key: Option<String>,
@@ -752,11 +800,35 @@ pub struct ResolvedModel {
 
 impl ResolvedModel {
     /// Every client-facing name that must resolve to this route: the canonical
-    /// `model_name` first, then each alias. This is the set of resolver keys a
-    /// warm-up or a cache invalidation has to cover, so publishing and eviction
-    /// stay in step with whatever aliases the model currently declares.
+    /// `model_name` first, then each alias, then each variant. This is the set
+    /// of resolver keys a warm-up or a cache invalidation has to cover, so
+    /// publishing and eviction stay in step with whatever names the model
+    /// currently declares.
     pub fn addressable_names(&self) -> impl Iterator<Item = &str> {
-        std::iter::once(self.model_name.as_str()).chain(self.aliases.iter().map(String::as_str))
+        std::iter::once(self.model_name.as_str())
+            .chain(self.aliases.iter().map(String::as_str))
+            .chain(self.variants.iter().map(|v| v.name.as_str()))
+    }
+
+    /// The variant of this route called `name`, if there is one. Exact,
+    /// case-sensitive match, like every other model name.
+    pub fn variant(&self, name: &str) -> Option<&ModelVariant> {
+        self.variants.iter().find(|v| v.name == name)
+    }
+
+    /// This route as served through its variant `name`: identical in every
+    /// field except `boons`, which gains the variant's boons after the model's
+    /// own. `None` when `name` is not one of this route's variants.
+    ///
+    /// Everything that identifies the backend stays the parent's on purpose —
+    /// `model_name`, the upstream, endpoints, prices and every capacity field
+    /// — so the admission pool, fairshare, discovered capacity and the usage
+    /// ledger all see one model, never two pools for one backend.
+    pub fn with_variant(&self, name: &str) -> Option<ResolvedModel> {
+        let variant = self.variant(name)?;
+        let mut served = self.clone();
+        served.boons = union_boons(&self.boons, &variant.boons);
+        Some(served)
     }
 }
 
@@ -906,6 +978,53 @@ pub struct ModelReplica {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// One past or current launch of a Slurm-backed replica, from the durable
+/// launch history (`deployment_launches`). Outlives the replica row, which is
+/// garbage-collected. `id` is the replica id.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DeploymentLaunch {
+    #[schema(value_type = String)]
+    pub id: Uuid,
+    #[schema(value_type = String)]
+    pub model_id: Uuid,
+    pub model_name: String,
+    /// `launcher_spec.recipe_id` at submit time, when launched from a recipe.
+    pub recipe_id: Option<String>,
+    pub slurm_job_id: String,
+    // Managed spec as submitted.
+    pub partition: Option<String>,
+    pub account: Option<String>,
+    pub qos: Option<String>,
+    pub time_limit: Option<String>,
+    pub gres: Option<String>,
+    pub nodes_requested: Option<i64>,
+    pub cpus_per_task: Option<i64>,
+    pub mem: Option<String>,
+    pub exclude: Option<String>,
+    pub constraints: Option<String>,
+    #[schema(value_type = Option<Object>)]
+    pub launcher_spec: Option<serde_json::Value>,
+    /// Allocated node hostnames (comma-separated), once the job ran.
+    pub nodes: Option<String>,
+    pub submitted_at: chrono::DateTime<chrono::Utc>,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub healthy_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub ended_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Slurm's terminal state (`TIMEOUT`, `OUT_OF_MEMORY`, `NODE_FAIL`,
+    /// `FAILED`, ...), `gone` when the job vanished from slurmrestd,
+    /// `cancelled:scale-down|restart|probe-failed` when obleth cancelled it,
+    /// or `deleted` when the replica row was removed while still open.
+    pub end_state: Option<String>,
+    pub end_reason: Option<String>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    /// Seconds from submit to start (time in the queue).
+    pub queued_secs: Option<i64>,
+    /// Seconds from start to healthy (weights load and warm-up).
+    pub load_secs: Option<i64>,
+    /// Seconds from start to end, or to now while still running.
+    pub ran_secs: Option<i64>,
+}
+
 /// Valid `ModelReplica::state` values, in lifecycle order.
 pub const REPLICA_STATES: [&str; 5] = ["pending", "starting", "healthy", "draining", "lost"];
 
@@ -956,8 +1075,16 @@ pub struct UsageRecord {
     pub model: String,
     pub admission: String,
     pub weight: i64,
+    /// Every prompt token, cached ones included.
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// The part of `input_tokens` the upstream reported as served from its
+    /// prefix cache (`prompt_tokens_details.cached_tokens`); 0 when it reported
+    /// none or the gateway answered without an upstream call. Unrelated to
+    /// `cache_status`, the gateway's own response cache. `#[serde(default)]`
+    /// keeps older WAL records replayable.
+    #[serde(default)]
+    pub cached_input_tokens: u32,
     pub estimated_tokens: u32,
     pub queue_wait_ms: u32,
     pub ttft_ms: u32,
@@ -1011,6 +1138,24 @@ pub struct UsageRecord {
     /// replayable.
     #[serde(default)]
     pub device_id: String,
+    /// The end user a shared front end named for this request, on keys with
+    /// `end_user_fairshare` on (`x-obleth-end-user` header or the body's
+    /// `user`); empty otherwise. `#[serde(default)]` keeps older WAL records
+    /// replayable.
+    #[serde(default)]
+    pub end_user: String,
+    /// On a helper-call row (a boon's call to another model: a speculation
+    /// draft, an image description, ...), the `request_id` of the client
+    /// request it served; nil on every other row. `#[serde(default)]` keeps
+    /// older WAL records replayable as "none".
+    #[serde(default)]
+    pub parent_request_id: Uuid,
+    /// The variant name the client asked for when it called the model through
+    /// one ([`ModelVariant`]); empty otherwise. `model` stays the parent
+    /// model's name either way, so per-model reports and pools are unchanged.
+    /// `#[serde(default)]` keeps older WAL records replayable.
+    #[serde(default)]
+    pub model_variant: String,
 }
 
 /// Runtime-configurable retention for the raw per-request `usage` ledger.
@@ -1100,6 +1245,39 @@ pub struct SlurmSettings {
     /// default). Entries whose host or ip is blank are ignored.
     #[serde(default)]
     pub node_aliases: Vec<NodeAlias>,
+    /// Cluster-wide paths and shell setup that recipes fill into the job
+    /// scripts they render. Informational to the provisioner: it never
+    /// rewrites a stored script from these.
+    #[serde(default)]
+    pub cluster_defaults: ClusterDefaults,
+    /// Hugging Face access token. When set, the provisioner passes it to every
+    /// job it submits as `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` in the job
+    /// environment (never in the script body). Encrypted at rest by the store
+    /// and masked in the public settings API, like the JWT.
+    #[serde(default)]
+    pub hf_token: String,
+}
+
+/// Cluster-wide defaults for job scripts, part of `SlurmSettings`. Every field
+/// is optional; empty means "not configured".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default, ToSchema)]
+pub struct ClusterDefaults {
+    /// Shared model-weight cache, used as `HF_HOME` in rendered jobs.
+    #[serde(default)]
+    pub cache_dir: String,
+    /// Directory holding container images (e.g. `.sif` files).
+    #[serde(default)]
+    pub images_dir: String,
+    /// Directory for job stdout/stderr files.
+    #[serde(default)]
+    pub log_dir: String,
+    /// Shell lines run at the top of every job (module loads, PATH, ...).
+    #[serde(default)]
+    pub setup: String,
+    /// Engine name → image path or file name (e.g. `vllm` → `vllm.sif`). A
+    /// bare file name is relative to `images_dir`.
+    #[serde(default)]
+    pub images: BTreeMap<String, String>,
 }
 
 /// One compute-node hostname → IP override for `SlurmSettings::node_aliases`.
@@ -1277,7 +1455,14 @@ pub const MODEL_TAGS: &[&str] = &[
     "long-context",
     "fast",
     "creative",
+    "writing",
 ];
+
+/// Tag pairs a request should not carry together. "Write" is the verb of both
+/// kinds of request, so an intent classifier asked about `writing` says yes to
+/// "write a SQL query" nearly as readily as to "write a cover letter". When
+/// both clear the threshold, the weaker of the pair is dropped.
+pub const EXCLUSIVE_TAG_PAIRS: &[(&str, &str)] = &[("coding", "writing")];
 
 /// True when `tag` is part of the fixed [`MODEL_TAGS`] vocabulary.
 pub fn is_valid_tag(tag: &str) -> bool {
@@ -1321,6 +1506,8 @@ pub fn parse_tag_level(raw: &str) -> Option<(String, u8)> {
 /// `speculation` answers with a fast drafter model when the target model itself
 /// verifies the draft (one cheap prefill scores every draft token via
 /// prompt_logprobs); unverified drafts escalate to the target model.
+/// `web_search` injects a gateway-executed `web_search` tool so a chat model can
+/// look things up through a registered `search` route.
 /// Operators opt each model into a subset of these; nothing is granted by default.
 pub const MODEL_BOONS: &[&str] = &[
     "vision",
@@ -1329,6 +1516,7 @@ pub const MODEL_BOONS: &[&str] = &[
     "knowledge",
     "image_generation",
     "speculation",
+    "web_search",
 ];
 
 /// True when `boon` is part of the fixed [`MODEL_BOONS`] vocabulary.
@@ -1357,6 +1545,9 @@ where
 /// Fixed vocabulary of model modalities. Each value maps to a family of
 /// OpenAI-compatible endpoints the model serves (see
 /// `endpoint_matches_model_type` in the proxy). `chat` is the default.
+///
+/// `search` is the odd one out: not a model but a web search tool, served on
+/// `POST /v1/search` from an upstream that speaks the SearXNG JSON API.
 pub const MODEL_TYPES: &[&str] = &[
     "chat",
     "embedding",
@@ -1364,10 +1555,26 @@ pub const MODEL_TYPES: &[&str] = &[
     "audio_speech",
     "image",
     "video",
+    "search",
 ];
 
 /// The default modality assigned to a model when none is specified.
 pub const DEFAULT_MODEL_TYPE: &str = "chat";
+
+/// The modality of web search tools (see [`MODEL_TYPES`]).
+pub const SEARCH_MODEL_TYPE: &str = "search";
+
+/// The SearXNG search URL for a `search` route's `api_base`: the instance root,
+/// with or without a trailing slash, gets `/search` appended; a base that
+/// already ends in `/search` is used as is.
+pub fn search_url(api_base: &str) -> String {
+    let base = api_base.trim_end_matches('/');
+    if base.ends_with("/search") {
+        base.to_string()
+    } else {
+        format!("{base}/search")
+    }
+}
 
 fn default_model_type() -> String {
     DEFAULT_MODEL_TYPE.to_string()
@@ -1597,6 +1804,174 @@ where
         }
         if !out.contains(&a) {
             out.push(a);
+        }
+    }
+    out
+}
+
+/// Maximum variants one model may declare. Bounded for the same reason as
+/// aliases: every variant is its own resolver key and discovery entry.
+pub const MAX_MODEL_VARIANTS: usize = 8;
+
+/// A separately named, opt-in way to call a model: the same route (same
+/// backend, capacity, pool and prices) with extra boons turned on, e.g.
+/// `glm-5-3-spec` = `glm-5-3` plus the `speculation` boon.
+///
+/// Exists because boons are otherwise per model: an operator who wants a boon
+/// that changes who writes the answer (speculation) would have to turn it on
+/// for everyone who calls the model. A variant lets callers opt in by name
+/// while the plain name keeps serving the model's own output.
+///
+/// `boons` are added to the model's own — never removed — so a variant always
+/// means "the model, plus these".
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+pub struct ModelVariant {
+    /// The name clients pass in `model`. Unique across every model's name,
+    /// aliases and variants; exact, case-sensitive match.
+    pub name: String,
+    /// What a caller gets from this name, shown in the model listing.
+    #[serde(default)]
+    pub description: String,
+    /// Boons from [`MODEL_BOONS`] turned on in addition to the model's own.
+    #[serde(default)]
+    pub boons: Vec<String>,
+}
+
+/// Normalize a variant list to the canonical storage form, mirroring
+/// [`normalize_aliases`]: names and descriptions trimmed, blank names dropped,
+/// duplicate names dropped (first wins), boons normalized with
+/// [`normalize_boons`], and the list capped at [`MAX_MODEL_VARIANTS`]. The
+/// Management API rejects these cases with an error before they get here;
+/// this is the storage-side backstop for every other write path.
+pub fn normalize_variants<'a, I>(variants: I) -> Vec<ModelVariant>
+where
+    I: IntoIterator<Item = &'a ModelVariant>,
+{
+    let mut out: Vec<ModelVariant> = Vec::new();
+    for v in variants {
+        let name = v.name.trim();
+        if name.is_empty() || out.len() >= MAX_MODEL_VARIANTS {
+            continue;
+        }
+        if out.iter().any(|o| o.name == name) {
+            continue;
+        }
+        out.push(ModelVariant {
+            name: name.to_string(),
+            description: v.description.trim().to_string(),
+            boons: normalize_boons(&v.boons),
+        });
+    }
+    out
+}
+
+/// Where a model is in its life. See [`ModelLifecycle`].
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelStatus {
+    /// Served by name, but not advertised: left out of `/v1/models`,
+    /// `/model/info` and the search tool list, and never picked by `auto`.
+    /// For trying a new model before callers can find it.
+    Staged,
+    /// Served normally.
+    #[default]
+    Active,
+    /// Still served, but every response says so (`Deprecation`, and `Sunset`
+    /// once a retirement date is set) and names the replacement. Listed in
+    /// `/v1/models` as deprecated; never picked by `auto`.
+    Deprecated,
+    /// No longer served: requests are refused with `410 Gone` naming the
+    /// replacement, or answered by the replacement when `redirect` is on.
+    /// Hidden from `/v1/models`.
+    Retired,
+}
+
+impl ModelStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ModelStatus::Staged => "staged",
+            ModelStatus::Active => "active",
+            ModelStatus::Deprecated => "deprecated",
+            ModelStatus::Retired => "retired",
+        }
+    }
+
+    /// Whether the discovery endpoints advertise a model in this status: a
+    /// staged model is not advertised yet, and a retired one no longer is.
+    pub fn listed(self) -> bool {
+        matches!(self, ModelStatus::Active | ModelStatus::Deprecated)
+    }
+}
+
+/// Longest operator note carried with a lifecycle status. It is repeated in
+/// every refusal of a retired model, so it is kept to a sentence or two.
+pub const MAX_LIFECYCLE_NOTE_CHARS: usize = 500;
+
+/// A model's lifecycle: whether it is still served, what replaces it, and
+/// when it goes away. Stored as one JSON object on the model (like
+/// `variants`), so a field added later needs no migration, and the default
+/// (`{}`) is an active model with nothing to say.
+///
+/// A deprecated model whose `retire_at` has passed is retired: the operator
+/// sets the date once and the gateway retires the model on time
+/// ([`ModelLifecycle::status_at`]).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+pub struct ModelLifecycle {
+    #[serde(default)]
+    pub status: ModelStatus,
+    /// `model_name` of the model callers should move to. Empty when none is
+    /// named.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub replacement: String,
+    /// When the model stops being served. Sent as the `Sunset` header while
+    /// deprecated; once it passes, the model is retired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retire_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the status last changed. Sent as the `Deprecation` date.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The operator's word to callers, repeated with the status (why, or where
+    /// to ask).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
+    /// Once retired, answer with `replacement` instead of refusing. The
+    /// response still says it was redirected; off by default because a
+    /// different model can answer differently, and a caller pinned to this
+    /// one should find out.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub redirect: bool,
+}
+
+impl ModelLifecycle {
+    /// The status in force at `now`: the stored one, except that a
+    /// deprecated model whose retirement date has passed is retired.
+    pub fn status_at(&self, now: chrono::DateTime<chrono::Utc>) -> ModelStatus {
+        match self.status {
+            ModelStatus::Deprecated if self.retire_at.is_some_and(|at| at <= now) => {
+                ModelStatus::Retired
+            }
+            status => status,
+        }
+    }
+
+    /// When the model was (or will be) retired, for messages: the retirement
+    /// date if one was set, otherwise the moment it was marked retired.
+    pub fn retired_on(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.retire_at.or(match self.status {
+            ModelStatus::Retired => self.changed_at,
+            _ => None,
+        })
+    }
+}
+
+/// `base` followed by every boon of `extra` not already in it: the boons a
+/// variant request runs with. Order-stable and de-duplicated, so the model's
+/// own boons keep their order and a variant that repeats one adds nothing.
+pub fn union_boons(base: &[String], extra: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(base.len() + extra.len());
+    for b in base.iter().chain(extra) {
+        if !out.contains(b) {
+            out.push(b.clone());
         }
     }
     out
@@ -1979,6 +2354,10 @@ pub struct BoonSettings {
     /// model verifies the draft; escalate to the target otherwise.
     #[serde(default)]
     pub speculation: SpeculationBoonSettings,
+    /// The web-search boon: inject a gateway-executed `web_search` tool so a
+    /// chat model can search the web through a registered `search` route.
+    #[serde(default)]
+    pub web_search: WebSearchBoonSettings,
 }
 
 /// Configuration for the vision boon (image-to-text relay).
@@ -2107,6 +2486,93 @@ impl ImageGenerationBoonSettings {
         self.enabled
             && self
                 .image_model
+                .as_ref()
+                .is_some_and(|m| !m.trim().is_empty())
+    }
+}
+
+/// Default description the model reads when deciding whether to call
+/// `web_search`. It says when NOT to search as plainly as when to: a model told
+/// only that it can search tends to search for everything, which costs a round
+/// trip on answers it already knew.
+pub const DEFAULT_WEB_SEARCH_TOOL_DESCRIPTION: &str =
+    "Search the web. Call this when the answer depends on current or external information \
+     you are not sure of: recent events, prices, schedules, software versions, documentation, \
+     or anything that may have changed since your training. Write a short search-engine \
+     query. Answer directly, without searching, when you already know the answer. Cite the \
+     URLs of the results you rely on.";
+
+/// Hard ceiling on searches one request may run, regardless of what an
+/// operator configures (latency and upstream-load guard).
+pub const WEB_SEARCH_MAX_PER_REQUEST: u32 = 8;
+
+/// Hard ceiling on results handed to the model per search (context guard).
+pub const WEB_SEARCH_MAX_RESULTS: u32 = 10;
+
+fn default_web_search_tool_description() -> String {
+    DEFAULT_WEB_SEARCH_TOOL_DESCRIPTION.to_string()
+}
+
+fn default_web_search_max_results() -> u32 {
+    5
+}
+
+fn default_web_search_max_per_request() -> u32 {
+    3
+}
+
+fn default_web_search_timeout_ms() -> u64 {
+    15_000
+}
+
+/// Configuration for the web-search boon (gateway-executed `web_search` tool
+/// backed by a registered `search`-type route).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WebSearchBoonSettings {
+    /// Master switch. When false, no tool is injected and requests pass through
+    /// unchanged.
+    #[serde(default)]
+    pub enabled: bool,
+    /// `model_name` of the registered `search`-type route that runs the
+    /// searches. `None` disables the boon regardless of `enabled`.
+    #[serde(default)]
+    pub search_tool: Option<String>,
+    /// Tool description the model reads when deciding to call the tool.
+    #[serde(default = "default_web_search_tool_description")]
+    pub tool_description: String,
+    /// Results handed to the model per search, clamped to
+    /// [`WEB_SEARCH_MAX_RESULTS`].
+    #[serde(default = "default_web_search_max_results")]
+    pub max_results: u32,
+    /// Searches one request may run across all of its tool turns, clamped to
+    /// [`WEB_SEARCH_MAX_PER_REQUEST`].
+    #[serde(default = "default_web_search_max_per_request")]
+    pub max_searches_per_request: u32,
+    /// Hard timeout for one search, in milliseconds. On timeout the model is
+    /// told the search failed and answers from what it knows.
+    #[serde(default = "default_web_search_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl Default for WebSearchBoonSettings {
+    fn default() -> Self {
+        WebSearchBoonSettings {
+            enabled: false,
+            search_tool: None,
+            tool_description: default_web_search_tool_description(),
+            max_results: default_web_search_max_results(),
+            max_searches_per_request: default_web_search_max_per_request(),
+            timeout_ms: default_web_search_timeout_ms(),
+        }
+    }
+}
+
+impl WebSearchBoonSettings {
+    /// True when the boon is enabled and points at a search route.
+    pub fn active(&self) -> bool {
+        self.enabled
+            && self
+                .search_tool
                 .as_ref()
                 .is_some_and(|m| !m.trim().is_empty())
     }
@@ -2906,6 +3372,10 @@ pub struct ApiKeyBackup {
     /// Per-model in-flight ceiling for this key. `None` = no cap.
     #[serde(default)]
     pub max_in_flight: Option<i64>,
+    /// See `ApiKey::end_user_fairshare`. Defaults to off for backups taken
+    /// before the column existed.
+    #[serde(default)]
+    pub end_user_fairshare: bool,
     pub disabled: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
@@ -2923,6 +3393,14 @@ pub struct ModelBackup {
     /// aliases existed restore as a model with none.
     #[serde(default)]
     pub aliases: Vec<String>,
+    /// Opt-in names with extra boons on. Defaulted so backups taken before
+    /// variants existed restore as a model with none.
+    #[serde(default)]
+    pub variants: Vec<ModelVariant>,
+    /// `#[serde(default)]`: a backup taken before lifecycles existed restores
+    /// every model as active.
+    #[serde(default)]
+    pub lifecycle: ModelLifecycle,
     #[serde(default)]
     pub description: String,
     pub upstream_model: String,
@@ -3203,6 +3681,23 @@ mod tests {
         let s: SlurmSettings = serde_json::from_str("{}").expect("legacy blob deserializes");
         assert!(s.node_aliases.is_empty());
         assert!(s.node_alias_map().is_empty());
+    }
+
+    #[test]
+    fn slurm_settings_legacy_blob_has_empty_cluster_defaults_and_no_hf_token() {
+        let s: SlurmSettings =
+            serde_json::from_str(r#"{"enabled":true,"slurm_user":"svc"}"#).expect("parses");
+        assert_eq!(s.cluster_defaults, ClusterDefaults::default());
+        assert!(s.hf_token.is_empty());
+        // A partial cluster_defaults object fills the rest with defaults.
+        let s: SlurmSettings =
+            serde_json::from_str(r#"{"cluster_defaults":{"images":{"vllm":"vllm.sif"}}}"#)
+                .expect("parses");
+        assert_eq!(
+            s.cluster_defaults.images.get("vllm").map(String::as_str),
+            Some("vllm.sif")
+        );
+        assert!(s.cluster_defaults.cache_dir.is_empty());
     }
 
     #[test]
@@ -3514,6 +4009,25 @@ mod tests {
     }
 
     #[test]
+    fn usage_record_cached_input_tokens_default_for_old_wal() {
+        // A record serialized before cached prompt tokens were recorded must
+        // replay as "none cached", and a new one must round-trip the count.
+        let old = r#"{"request_id":"00000000-0000-0000-0000-000000000000",
+            "tenant_id":"00000000-0000-0000-0000-000000000000",
+            "key_id":"00000000-0000-0000-0000-000000000000",
+            "model":"m","admission":"fast","weight":1,"input_tokens":100,
+            "output_tokens":1,"estimated_tokens":2,"queue_wait_ms":0,"ttft_ms":0,
+            "total_ms":10,"status_code":200,"cache_status":"off","cost_usd":0.5,
+            "ts_ms":0,"session_id":"s","request_type":"chat"}"#;
+        let mut r: UsageRecord = serde_json::from_str(old).unwrap();
+        assert_eq!(r.cached_input_tokens, 0);
+        assert_eq!(r.input_tokens, 100);
+        r.cached_input_tokens = 80;
+        let back: UsageRecord = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(back.cached_input_tokens, 80);
+    }
+
+    #[test]
     fn charo_settings_defaults() {
         let s = CharoSettings::default();
         assert!(s.enabled);
@@ -3642,6 +4156,85 @@ mod tests {
     }
 
     #[test]
+    fn web_search_boon_is_in_the_vocabulary() {
+        assert!(is_valid_boon("web_search"));
+        assert_eq!(
+            normalize_boons(["Web_Search", "web_search", "vision"]),
+            vec!["web_search".to_string(), "vision".to_string()]
+        );
+    }
+
+    #[test]
+    fn web_search_defaults_are_off_and_bounded() {
+        let s = WebSearchBoonSettings::default();
+        assert!(!s.enabled);
+        assert!(s.search_tool.is_none());
+        assert_eq!(s.max_results, 5);
+        assert_eq!(s.max_searches_per_request, 3);
+        assert_eq!(s.timeout_ms, 15_000);
+        assert!(s.max_results <= WEB_SEARCH_MAX_RESULTS);
+        assert!(s.max_searches_per_request <= WEB_SEARCH_MAX_PER_REQUEST);
+        assert!(!s.tool_description.trim().is_empty());
+        assert!(!s.active());
+    }
+
+    #[test]
+    fn web_search_active_requires_enabled_and_a_search_tool() {
+        let enabled_only = WebSearchBoonSettings {
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(!enabled_only.active());
+        let blank = WebSearchBoonSettings {
+            enabled: true,
+            search_tool: Some("  ".to_string()),
+            ..Default::default()
+        };
+        assert!(!blank.active());
+        let tool_only = WebSearchBoonSettings {
+            search_tool: Some("web".to_string()),
+            ..Default::default()
+        };
+        assert!(!tool_only.active());
+        let on = WebSearchBoonSettings {
+            enabled: true,
+            search_tool: Some("web".to_string()),
+            ..Default::default()
+        };
+        assert!(on.active());
+    }
+
+    #[test]
+    fn a_boons_row_without_web_search_parses_to_the_default() {
+        let older = serde_json::json!({ "image_generation": { "enabled": true } });
+        let parsed: BoonSettings = serde_json::from_value(older).expect("older row parses");
+        assert!(parsed.image_generation.enabled);
+        assert_eq!(parsed.web_search, WebSearchBoonSettings::default());
+    }
+
+    #[test]
+    fn search_is_a_model_type_and_survives_storage() {
+        assert!(is_valid_model_type(SEARCH_MODEL_TYPE));
+        assert_eq!(normalize_model_type(" Search "), SEARCH_MODEL_TYPE);
+    }
+
+    #[test]
+    fn search_url_appends_search_to_the_instance_root_once() {
+        assert_eq!(
+            search_url("http://searxng:8080"),
+            "http://searxng:8080/search"
+        );
+        assert_eq!(
+            search_url("http://searxng:8080/"),
+            "http://searxng:8080/search"
+        );
+        assert_eq!(
+            search_url("https://example.org/searxng/search/"),
+            "https://example.org/searxng/search"
+        );
+    }
+
+    #[test]
     fn quantization_vocabulary_values_are_all_valid() {
         for q in QUANTIZATIONS {
             assert!(is_valid_quantization(q), "{q}");
@@ -3745,9 +4338,222 @@ mod tests {
 
     #[test]
     fn addressable_names_lists_the_canonical_name_first() {
-        let mut model = ResolvedModel {
+        let mut model = resolved_fixture();
+        assert_eq!(
+            model.addressable_names().collect::<Vec<_>>(),
+            vec!["glm-5-3", "glm-5-3-fp8", "glm-5-3-mxfp4"]
+        );
+        // A model with no aliases is still addressable by its own name, so a
+        // publish loop over this iterator is never a no-op.
+        model.aliases.clear();
+        assert_eq!(
+            model.addressable_names().collect::<Vec<_>>(),
+            vec!["glm-5-3"]
+        );
+        // Variants are resolver keys too, after the aliases.
+        model.variants = vec![variant("glm-5-3-spec", &["speculation"])];
+        assert_eq!(
+            model.addressable_names().collect::<Vec<_>>(),
+            vec!["glm-5-3", "glm-5-3-spec"]
+        );
+    }
+
+    fn variant(name: &str, boons: &[&str]) -> ModelVariant {
+        ModelVariant {
+            name: name.into(),
+            description: String::new(),
+            boons: boons.iter().map(|b| b.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn lifecycle_defaults_to_active_and_reads_an_empty_object() {
+        let parsed: ModelLifecycle = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(parsed, ModelLifecycle::default());
+        assert_eq!(parsed.status, ModelStatus::Active);
+        // An active lifecycle stores as just its status.
+        assert_eq!(
+            serde_json::to_value(&parsed).unwrap(),
+            serde_json::json!({ "status": "active" })
+        );
+    }
+
+    #[test]
+    fn a_staged_model_stays_staged_and_is_not_listed() {
+        let parsed: ModelLifecycle =
+            serde_json::from_value(serde_json::json!({ "status": "staged" })).unwrap();
+        assert_eq!(parsed.status, ModelStatus::Staged);
+        // A stray date does not move a staged model anywhere.
+        let dated = ModelLifecycle {
+            retire_at: Some(chrono::Utc::now() - chrono::Duration::days(1)),
+            ..parsed
+        };
+        assert_eq!(dated.status_at(chrono::Utc::now()), ModelStatus::Staged);
+        assert!(!ModelStatus::Staged.listed());
+        assert!(ModelStatus::Active.listed());
+        assert!(ModelStatus::Deprecated.listed());
+        assert!(!ModelStatus::Retired.listed());
+    }
+
+    #[test]
+    fn a_deprecated_model_retires_itself_when_its_date_passes() {
+        let now = chrono::Utc::now();
+        let mut l = ModelLifecycle {
+            status: ModelStatus::Deprecated,
+            retire_at: Some(now + chrono::Duration::days(14)),
+            ..Default::default()
+        };
+        assert_eq!(l.status_at(now), ModelStatus::Deprecated);
+        assert_eq!(
+            l.status_at(now + chrono::Duration::days(14)),
+            ModelStatus::Retired
+        );
+        l.retire_at = None;
+        assert_eq!(
+            l.status_at(now + chrono::Duration::days(400)),
+            ModelStatus::Deprecated
+        );
+        // A date on an active model means nothing.
+        l.status = ModelStatus::Active;
+        l.retire_at = Some(now - chrono::Duration::days(1));
+        assert_eq!(l.status_at(now), ModelStatus::Active);
+    }
+
+    #[test]
+    fn retired_on_prefers_the_retirement_date_then_the_change() {
+        let t1 = chrono::Utc::now();
+        let t2 = t1 + chrono::Duration::days(3);
+        let retired = ModelLifecycle {
+            status: ModelStatus::Retired,
+            changed_at: Some(t1),
+            ..Default::default()
+        };
+        assert_eq!(retired.retired_on(), Some(t1));
+        let scheduled = ModelLifecycle {
+            status: ModelStatus::Deprecated,
+            retire_at: Some(t2),
+            changed_at: Some(t1),
+            ..Default::default()
+        };
+        assert_eq!(scheduled.retired_on(), Some(t2));
+        let deprecated = ModelLifecycle {
+            status: ModelStatus::Deprecated,
+            changed_at: Some(t1),
+            ..Default::default()
+        };
+        assert_eq!(deprecated.retired_on(), None);
+    }
+
+    #[test]
+    fn payloads_written_before_lifecycle_read_as_active() {
+        let mut v = serde_json::to_value(resolved_fixture()).unwrap();
+        v.as_object_mut().unwrap().remove("lifecycle");
+        let m: ResolvedModel = serde_json::from_value(v).expect("older payload");
+        assert_eq!(m.lifecycle.status, ModelStatus::Active);
+    }
+
+    #[test]
+    fn normalize_variants_trims_dedupes_caps_and_drops_unknown_boons() {
+        let raw = vec![
+            ModelVariant {
+                name: "  glm-5-3-spec ".into(),
+                description: " drafted, then verified ".into(),
+                boons: vec![
+                    "Speculation".into(),
+                    "teleportation".into(),
+                    "speculation".into(),
+                ],
+            },
+            variant("", &["vision"]),
+            variant("glm-5-3-spec", &["vision"]),
+            // Case is significant, as for every other model name.
+            variant("GLM-5-3-spec", &[]),
+        ];
+        assert_eq!(
+            normalize_variants(&raw),
+            vec![
+                ModelVariant {
+                    name: "glm-5-3-spec".into(),
+                    description: "drafted, then verified".into(),
+                    boons: vec!["speculation".into()],
+                },
+                variant("GLM-5-3-spec", &[]),
+            ]
+        );
+        let many: Vec<ModelVariant> = (0..MAX_MODEL_VARIANTS + 3)
+            .map(|i| variant(&format!("v{i}"), &[]))
+            .collect();
+        assert_eq!(normalize_variants(&many).len(), MAX_MODEL_VARIANTS);
+    }
+
+    #[test]
+    fn union_boons_keeps_the_model_order_and_adds_only_new_ones() {
+        let own = vec!["vision".to_string(), "compression".to_string()];
+        assert_eq!(
+            union_boons(&own, &["speculation".into(), "vision".into()]),
+            vec!["vision", "compression", "speculation"]
+        );
+        // A variant that adds nothing is allowed, and changes nothing.
+        assert_eq!(union_boons(&own, &["compression".into()]), own);
+        assert_eq!(union_boons(&[], &[]), Vec::<String>::new());
+    }
+
+    #[test]
+    fn with_variant_adds_boons_and_keeps_everything_capacity_related() {
+        let mut parent = resolved_fixture();
+        parent.boons = vec!["vision".into()];
+        parent.max_in_flight = Some(12);
+        parent.capacity_mode = "discovered".into();
+        parent.per_replica_max_in_flight = Some(4);
+        parent.input_cost_per_token = 0.000_001;
+        parent.variants = vec![variant("glm-5-3-spec", &["speculation", "vision"])];
+
+        let served = parent.with_variant("glm-5-3-spec").expect("a variant");
+        assert_eq!(served.boons, vec!["vision", "speculation"]);
+        // Every other field is the parent's: the pool key (`model_name`), the
+        // backend, the prices and the capacity all stay one model's.
+        let mut same = served.clone();
+        same.boons = parent.boons.clone();
+        assert_eq!(same, parent);
+        assert_eq!(served.model_name, "glm-5-3");
+
+        // Exact names only: the parent's own name and an alias are not variants.
+        assert!(parent.with_variant("glm-5-3").is_none());
+        assert!(parent.with_variant("glm-5-3-fp8").is_none());
+        assert!(parent.with_variant("GLM-5-3-SPEC").is_none());
+    }
+
+    #[test]
+    fn payloads_written_before_variants_still_deserialize() {
+        // A Redis-cached route from an older build.
+        let mut cached = serde_json::to_value(resolved_fixture()).unwrap();
+        cached.as_object_mut().unwrap().remove("variants");
+        let route: ResolvedModel = serde_json::from_value(cached).unwrap();
+        assert!(route.variants.is_empty());
+
+        // A variant written with only a name.
+        let v: ModelVariant = serde_json::from_str(r#"{"name":"m-spec"}"#).unwrap();
+        assert_eq!(v, variant("m-spec", &[]));
+
+        // A usage record replayed from an older WAL.
+        let rec: UsageRecord = serde_json::from_value(serde_json::json!({
+            "request_id": Uuid::nil(), "tenant_id": Uuid::nil(), "key_id": Uuid::nil(),
+            "model": "m", "admission": "fast", "weight": 1,
+            "input_tokens": 1, "output_tokens": 1, "estimated_tokens": 2,
+            "queue_wait_ms": 0, "ttft_ms": 0, "total_ms": 0, "status_code": 200,
+            "cache_status": "off", "ts_ms": 0,
+        }))
+        .unwrap();
+        assert!(rec.parent_request_id.is_nil());
+        assert_eq!(rec.model_variant, "");
+    }
+
+    fn resolved_fixture() -> ResolvedModel {
+        ResolvedModel {
             model_name: "glm-5-3".into(),
             aliases: vec!["glm-5-3-fp8".into(), "glm-5-3-mxfp4".into()],
+            lifecycle: Default::default(),
+            variants: Vec::new(),
             upstream_model: "glm-5-3-mxfp4".into(),
             api_base: "http://upstream/v1".into(),
             api_key: None,
@@ -3794,18 +4600,7 @@ mod tests {
             verify_api_base: String::new(),
             verify_upstream_model: String::new(),
             endpoints: Vec::new(),
-        };
-        assert_eq!(
-            model.addressable_names().collect::<Vec<_>>(),
-            vec!["glm-5-3", "glm-5-3-fp8", "glm-5-3-mxfp4"]
-        );
-        // A model with no aliases is still addressable by its own name, so a
-        // publish loop over this iterator is never a no-op.
-        model.aliases.clear();
-        assert_eq!(
-            model.addressable_names().collect::<Vec<_>>(),
-            vec!["glm-5-3"]
-        );
+        }
     }
 
     #[test]

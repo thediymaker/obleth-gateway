@@ -38,8 +38,8 @@ use obleth_config::routing::{
     RequestFeatures, RouterWeights,
 };
 use obleth_config::{
-    hash_api_key, ApiKey, FairshareGroup, ManagedModelSpec, McpServer, ModelEndpoint, ModelReplica,
-    ModelRoute, ResolvedKey, ResolvedMcpServer, ResolvedModel, Tenant,
+    hash_api_key, ApiKey, DeploymentLaunch, FairshareGroup, ManagedModelSpec, McpServer,
+    ModelEndpoint, ModelReplica, ModelRoute, ResolvedKey, ResolvedMcpServer, ResolvedModel, Tenant,
 };
 use obleth_config::{
     AlertSettings, AutoRouterSettings, BoonSettings, EmailSettings, StructuredOutputBoonSettings,
@@ -198,6 +198,10 @@ pub fn router(state: AdminState) -> Router {
         .route("/api/v1/keys/:id/disabled", put(set_key_disabled))
         .route("/api/v1/keys/:id/tenant", put(move_key))
         .route("/api/v1/keys/:id/tracing", put(set_key_tracing_handler))
+        .route(
+            "/api/v1/keys/:id/end-user-fairshare",
+            put(set_key_end_user_fairshare_handler),
+        )
         .route("/api/v1/keys/:id/usage", get(get_key_usage))
         .route("/api/v1/usage", get(get_usage))
         .route("/api/v1/usage/keys", get(get_usage_keys))
@@ -268,6 +272,7 @@ pub fn router(state: AdminState) -> Router {
         )
         .route("/api/v1/models/:id/weight", put(set_model_weight))
         .route("/api/v1/models/:id/capacity", put(set_model_capacity))
+        .route("/api/v1/models/:id/status", put(set_model_status))
         .route(
             "/api/v1/models/:id/capacity-mode",
             put(set_model_capacity_mode),
@@ -351,6 +356,10 @@ pub fn router(state: AdminState) -> Router {
         .route(
             "/api/v1/models/:id/replicas/clear-lost",
             post(clear_lost_replicas),
+        )
+        .route(
+            "/api/v1/deployments/launches",
+            get(list_deployment_launches),
         )
         .route(
             "/api/v1/models/:id/endpoints",
@@ -648,6 +657,15 @@ pub struct SetKeyTracing {
     pub tracing_enabled: bool,
 }
 
+/// Body of `PUT /api/v1/keys/{id}/end-user-fairshare`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetKeyEndUserFairshare {
+    /// Whether each end user the key names (`x-obleth-end-user`, else the
+    /// body's `user`) queues on their own. Only for a trusted caller: see
+    /// `ApiKey::end_user_fairshare`.
+    pub end_user_fairshare: bool,
+}
+
 fn normalize_budget_fields(
     budget_tokens: Option<i64>,
     budget_cost_usd: Option<f64>,
@@ -794,11 +812,24 @@ pub struct KeyFairshareView {
     pub share_score: f64,
     pub weight_share: f64,
     pub expected_slots: f64,
+    /// Set when this row is one end user of a key with per-end-user
+    /// fairshare: `key_id` is then derived, `name` is the real key's name,
+    /// and this is the end-user id the caller sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_user: Option<String>,
+    /// The real key an end user's row belongs to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub parent_key_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ModelPoolView {
     pub model: String,
+    /// The model has nowhere to send a request right now (see
+    /// [`models_with_servers`]). Its pool keeps its size for when servers
+    /// return, but the capacity totals leave it out.
+    pub no_servers: bool,
     /// Slots this replica enforces: `configured_cap` in `shared` and `local`
     /// mode, its share of it in `split` and `fallback` mode.
     pub cap: usize,
@@ -827,9 +858,15 @@ pub struct FairshareLiveView {
     /// snapshot*, so the two can differ until every enabled model has been
     /// used at least once.
     pub max_in_flight: usize,
-    /// The enabled models' pool sizes as configured, summed: the
-    /// cluster-wide capacity.
+    /// The enabled models' pool sizes as configured, summed over the models
+    /// that have servers: the cluster-wide capacity.
     pub configured_max_in_flight: usize,
+    /// How many enabled models the two totals above add up: those with
+    /// servers right now (see [`models_with_servers`]).
+    pub models_with_servers: usize,
+    /// The enabled models left out of the totals because they have no
+    /// servers right now, by name.
+    pub models_without_servers: Vec<String>,
     /// Total in-flight ceiling across all pools as this replica enforces it:
     /// `OBLETH_GLOBAL_MAX_IN_FLIGHT` in `shared` and `local` mode, this
     /// replica's share of it in `split` and `fallback` mode.
@@ -880,6 +917,11 @@ pub struct CreateModel {
     /// clients. Each must be unused by any other model's name or aliases.
     #[serde(default)]
     pub aliases: Option<Vec<String>>,
+    /// Opt-in names for this same model with extra boons on, e.g.
+    /// `glm-5-3-spec` with `speculation`. Each name must be unused by any
+    /// model's name, alias or variant; at most 8.
+    #[serde(default)]
+    pub variants: Option<Vec<ModelVariantWrite>>,
     pub upstream_model: String,
     pub api_base: String,
     pub api_key: Option<String>,
@@ -979,6 +1021,27 @@ pub struct CreateModel {
     /// health check passes. Omitted = on.
     #[serde(default)]
     pub enabled: Option<bool>,
+    /// `staged` creates the model served by name only: not listed on the
+    /// discovery endpoints and never picked by `auto`, until
+    /// `PUT /models/{id}/status` makes it `active`. Omitted = `active`; a new
+    /// model cannot start deprecated or retired.
+    #[serde(default)]
+    pub status: Option<obleth_config::ModelStatus>,
+}
+
+/// One variant in a model write: a name that resolves to the model with extra
+/// boons on.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct ModelVariantWrite {
+    /// The name clients pass in `model`. Trimmed; case-sensitive.
+    pub name: String,
+    /// What a caller gets from this name, shown in the model listing.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Boons from the fixed `MODEL_BOONS` vocabulary turned on in addition to
+    /// the model's own. An unknown name is rejected.
+    #[serde(default)]
+    pub boons: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -988,6 +1051,10 @@ pub struct UpdateModel {
     /// empty list removes every alias, which also evicts their resolver keys.
     #[serde(default)]
     pub aliases: Option<Vec<String>>,
+    /// Replaces the variant list wholesale; omitted leaves it unchanged. An
+    /// empty list removes every variant, which also evicts their resolver keys.
+    #[serde(default)]
+    pub variants: Option<Vec<ModelVariantWrite>>,
     pub upstream_model: String,
     pub api_base: String,
     pub api_key: Option<String>,
@@ -1230,6 +1297,32 @@ pub(crate) struct PatchReplica {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetModelCapacity {
     pub max_in_flight: Option<i64>,
+}
+
+/// A model's lifecycle, replaced whole: an omitted field is cleared, and
+/// `staged` or `active` clears them all.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetModelStatus {
+    /// `staged` (served by name, but not listed and never picked by `auto`),
+    /// `active`, `deprecated` (still served, with Deprecation/Sunset headers)
+    /// or `retired` (refused with 410 Gone, or served by the replacement when
+    /// `redirect` is on).
+    pub status: obleth_config::ModelStatus,
+    /// `model_name` of a registered model of the same type to move callers to.
+    #[serde(default)]
+    pub replacement: Option<String>,
+    /// When a deprecated model stops being served (RFC 3339). Once it passes,
+    /// the model is retired without another write.
+    #[serde(default)]
+    pub retire_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// A sentence for callers, repeated with the status (at most 500
+    /// characters).
+    #[serde(default)]
+    pub note: Option<String>,
+    /// Once retired, serve `replacement` instead of refusing. Needs a
+    /// replacement.
+    #[serde(default)]
+    pub redirect: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1741,6 +1834,16 @@ pub struct ModelRouteView {
     /// the old `…-fp8` spelling as an alias and it keeps working, while only
     /// `model_name` is advertised by the discovery endpoints.
     pub aliases: Vec<String>,
+    /// Opt-in names for this same route with extra boons on (added to the
+    /// model's own). A variant shares the model's backend, capacity pool and
+    /// prices; unlike an alias it is listed by the discovery endpoints.
+    pub variants: Vec<obleth_config::ModelVariant>,
+    /// Active, deprecated or retired, with the replacement, retirement date
+    /// and note callers are shown. Set with `PUT /api/v1/models/{id}/status`.
+    pub lifecycle: obleth_config::ModelLifecycle,
+    /// The status in force now: a deprecated model past its retirement date
+    /// reads `retired` here while `lifecycle.status` still says `deprecated`.
+    pub effective_status: obleth_config::ModelStatus,
     /// Human-facing summary for operators and dashboards.
     pub description: String,
     /// Value sent to the upstream in the `model` field.
@@ -1755,8 +1858,8 @@ pub struct ModelRouteView {
     pub upstream_header_names: Vec<String>,
     /// Modality from the fixed `MODEL_TYPES` vocabulary. Determines which
     /// OpenAI endpoint this model serves (`chat`, `embedding`,
-    /// `audio_transcription`, `audio_speech`, `image`, `video`). Defaults to
-    /// `chat`.
+    /// `audio_transcription`, `audio_speech`, `image`, `video`, or `search`
+    /// for a web search tool on `/v1/search`). Defaults to `chat`.
     pub model_type: String,
     /// Weight/activation format this deployment serves, from the fixed
     /// `QUANTIZATIONS` vocabulary. Descriptive only — it never affects
@@ -1907,6 +2010,8 @@ impl From<ModelRoute> for ModelRouteView {
             id,
             model_name,
             aliases,
+            variants,
+            lifecycle,
             description,
             upstream_model,
             api_base,
@@ -1959,6 +2064,9 @@ impl From<ModelRoute> for ModelRouteView {
             id,
             model_name,
             aliases,
+            variants,
+            effective_status: lifecycle.status_at(chrono::Utc::now()),
+            lifecycle,
             description,
             upstream_model,
             api_base,
@@ -2858,6 +2966,12 @@ pub struct BoonSettingsView {
     pub speculation_category_gates: serde_json::Value,
     pub speculation_unlisted_categories_speculate: bool,
     pub speculation_verify_url_template: String,
+    pub web_search_enabled: bool,
+    pub web_search_tool: Option<String>,
+    pub web_search_tool_description: String,
+    pub web_search_max_results: u32,
+    pub web_search_max_searches_per_request: u32,
+    pub web_search_timeout_ms: u64,
 }
 
 impl BoonSettingsView {
@@ -2915,6 +3029,12 @@ impl BoonSettingsView {
                 .unwrap_or_else(|_| serde_json::Value::Array(Vec::new())),
             speculation_unlisted_categories_speculate: s.speculation.unlisted_categories_speculate,
             speculation_verify_url_template: s.speculation.verify_url_template.clone(),
+            web_search_enabled: s.web_search.enabled,
+            web_search_tool: s.web_search.search_tool.clone(),
+            web_search_tool_description: s.web_search.tool_description.clone(),
+            web_search_max_results: s.web_search.max_results,
+            web_search_max_searches_per_request: s.web_search.max_searches_per_request,
+            web_search_timeout_ms: s.web_search.timeout_ms,
         }
     }
 }
@@ -3076,6 +3196,28 @@ pub struct UpdateBoonSettings {
     /// placeholders). Empty string clears; omitted keeps the current value.
     #[serde(default)]
     pub speculation_verify_url_template: Option<String>,
+    /// Enable or disable the web-search boon globally. Omit to leave unchanged.
+    #[serde(default)]
+    pub web_search_enabled: Option<bool>,
+    /// `model_name` of the registered `search`-type route that runs searches.
+    /// Empty string clears it (which deactivates the boon).
+    #[serde(default)]
+    pub web_search_tool: Option<String>,
+    /// Tool description the model reads. Empty string resets it to the built-in
+    /// default; omit the field to leave it unchanged.
+    #[serde(default)]
+    pub web_search_tool_description: Option<String>,
+    /// Results handed to the model per search, clamped to
+    /// `WEB_SEARCH_MAX_RESULTS`. Omit/zero leaves unchanged.
+    #[serde(default)]
+    pub web_search_max_results: Option<u32>,
+    /// Searches one request may run, clamped to `WEB_SEARCH_MAX_PER_REQUEST`.
+    /// Omit/zero leaves unchanged.
+    #[serde(default)]
+    pub web_search_max_searches_per_request: Option<u32>,
+    /// Timeout for one search (ms). Omit/zero leaves unchanged.
+    #[serde(default)]
+    pub web_search_timeout_ms: Option<u64>,
 }
 
 #[utoipa::path(
@@ -3196,6 +3338,39 @@ async fn put_boon_settings(
         Some("") => obleth_config::DEFAULT_IMAGE_TOOL_DESCRIPTION.to_string(),
         Some(d) => d.to_string(),
         None => existing.image_generation.tool_description.clone(),
+    };
+
+    // Web-search route: same merge-and-validate shape as
+    // `image_generation_model` above, but it must be a `search` route.
+    let search_tool = match body.web_search_tool.as_deref().map(str::trim) {
+        Some("") => None,
+        Some(m) => Some(m.to_string()),
+        None => existing.web_search.search_tool.clone(),
+    };
+    if body.web_search_tool.is_some() {
+        if let Some(name) = search_tool.as_deref() {
+            match state.store.get_model_by_name(name).await {
+                Ok(model) if model.model_type == obleth_config::SEARCH_MODEL_TYPE => {}
+                Ok(model) => {
+                    return Err(AdminError::BadRequest(format!(
+                        "web_search_tool `{name}` has model_type `{}`; it must be `{}`",
+                        model.model_type,
+                        obleth_config::SEARCH_MODEL_TYPE
+                    )))
+                }
+                Err(obleth_store::StoreError::NotFound) => {
+                    return Err(AdminError::BadRequest(format!(
+                        "web_search_tool `{name}` is not a registered model"
+                    )))
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+    let search_tool_description = match body.web_search_tool_description.as_deref().map(str::trim) {
+        Some("") => obleth_config::DEFAULT_WEB_SEARCH_TOOL_DESCRIPTION.to_string(),
+        Some(d) => d.to_string(),
+        None => existing.web_search.tool_description.clone(),
     };
 
     // Speculation helper models: same merge-and-validate shape as
@@ -3440,6 +3615,27 @@ async fn put_boon_settings(
                 .map(|t| t.trim().to_string())
                 .unwrap_or_else(|| existing.speculation.verify_url_template.clone()),
         },
+        web_search: obleth_config::WebSearchBoonSettings {
+            enabled: body
+                .web_search_enabled
+                .unwrap_or(existing.web_search.enabled),
+            search_tool,
+            tool_description: search_tool_description,
+            max_results: body
+                .web_search_max_results
+                .filter(|n| *n > 0)
+                .map(|n| n.min(obleth_config::WEB_SEARCH_MAX_RESULTS))
+                .unwrap_or(existing.web_search.max_results),
+            max_searches_per_request: body
+                .web_search_max_searches_per_request
+                .filter(|n| *n > 0)
+                .map(|n| n.min(obleth_config::WEB_SEARCH_MAX_PER_REQUEST))
+                .unwrap_or(existing.web_search.max_searches_per_request),
+            timeout_ms: body
+                .web_search_timeout_ms
+                .filter(|ms| *ms > 0)
+                .unwrap_or(existing.web_search.timeout_ms),
+        },
     };
 
     // The speculation verifier sends each model's upstream key to this URL, so
@@ -3491,6 +3687,11 @@ async fn put_boon_settings(
                 "speculation_category_gates": settings.speculation.category_gates.len(),
                 "speculation_unlisted_categories_speculate": settings.speculation.unlisted_categories_speculate,
                 "speculation_verify_url_template": settings.speculation.verify_url_template,
+                "web_search_enabled": settings.web_search.enabled,
+                "web_search_tool": settings.web_search.search_tool,
+                "web_search_max_results": settings.web_search.max_results,
+                "web_search_max_searches_per_request": settings.web_search.max_searches_per_request,
+                "web_search_timeout_ms": settings.web_search.timeout_ms,
             }),
         )
         .await?;
@@ -4367,6 +4568,43 @@ async fn set_key_tracing_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Turn per-end-user fairshare on or off for one key. Its own route, like
+/// tracing, because `PUT /api/v1/keys/{id}` resets any field it is not sent,
+/// and a bulk budget edit must never switch this off by leaving it out.
+#[utoipa::path(
+    put, path = "/api/v1/keys/{id}/end-user-fairshare", tag = "keys",
+    params(("id" = Uuid, Path, description = "API key id")),
+    request_body = SetKeyEndUserFairshare,
+    responses((status = 204), (status = 404))
+)]
+async fn set_key_end_user_fairshare_handler(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<SetKeyEndUserFairshare>,
+) -> Result<StatusCode> {
+    let (hash, resolved) = state
+        .store
+        .set_key_end_user_fairshare(id, body.end_user_fairshare)
+        .await?;
+    push_key(&state, &hash, &resolved).await?;
+    state
+        .store
+        .record_audit(
+            &audit_actor(&headers),
+            if body.end_user_fairshare {
+                "enable_key_end_user_fairshare"
+            } else {
+                "disable_key_end_user_fairshare"
+            },
+            "api_key",
+            &id.to_string(),
+            serde_json::json!({ "end_user_fairshare": body.end_user_fairshare }),
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[utoipa::path(
     put, path = "/api/v1/tenants/{id}/tracing", tag = "tenants",
     params(("id" = Uuid, Path, description = "Tenant id")),
@@ -5046,6 +5284,55 @@ pub fn enabled_pool_share_with(
         .sum()
 }
 
+/// Names of the enabled models that have somewhere to send a request right
+/// now: a fixed `api_base` or at least one enabled endpoint, and not a model
+/// whose discovered backend currently has no ready replica. The scheduler
+/// keeps a pool for the others, at its last or configured size so a brief
+/// outage doesn't shrink it, but adding those slots to a capacity total
+/// shows capacity that isn't there.
+///
+/// `with_endpoint` is the ids of models with an enabled endpoint;
+/// `none_ready` the names discovery last saw with no ready replica.
+pub fn models_with_servers(
+    models: &[ModelRoute],
+    with_endpoint: &std::collections::HashSet<Uuid>,
+    none_ready: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<String> {
+    models
+        .iter()
+        .filter(|m| m.enabled)
+        .filter(|m| !m.api_base.trim().is_empty() || with_endpoint.contains(&m.id))
+        .filter(|m| !none_ready.contains(&m.model_name))
+        .map(|m| m.model_name.clone())
+        .collect()
+}
+
+/// The models [`models_with_servers`] counts, for a capacity total.
+fn served_models(
+    state: &AdminState,
+    models: Vec<ModelRoute>,
+    endpoints: &[obleth_config::ModelEndpoint],
+) -> (Vec<ModelRoute>, std::collections::HashSet<String>) {
+    let with_endpoint = endpoints
+        .iter()
+        .filter(|e| e.enabled)
+        .map(|e| e.model_id)
+        .collect();
+    let none_ready = state
+        .capacity_discovery
+        .statuses()
+        .into_iter()
+        .filter(|s| s.ready_replicas == Some(0))
+        .map(|s| s.model_name)
+        .collect();
+    let serving = models_with_servers(&models, &with_endpoint, &none_ready);
+    let counted = models
+        .into_iter()
+        .filter(|m| serving.contains(&m.model_name))
+        .collect();
+    (counted, serving)
+}
+
 /// How the answering replica enforces the limits right now: its mode, the
 /// live replica count, and what configured limits are divided by in that
 /// mode (1 unless the split applies).
@@ -5214,6 +5501,8 @@ pub(crate) fn aggregate_pools(
                 share_score: 0.0,
                 weight_share: 0.0,
                 expected_slots: 0.0,
+                end_user: k.end_user.clone(),
+                parent_key_id: k.parent_key_id,
             });
             e.in_flight += k.in_flight;
             e.queued += k.queued;
@@ -5263,12 +5552,19 @@ async fn get_stats(State(state): State<AdminState>) -> Json<LiveStats> {
     // should degrade the capacity number, not fail the poll.
     let (mode, replicas, divisor) = enforcement(&state);
     let discovered = state.capacity_discovery.effective_caps();
+    let endpoints = state.store.all_model_endpoints().await.unwrap_or_default();
     let capacity = state
         .store
         .list_models()
         .await
         .map(|m| {
-            enabled_pool_share_with(&m, state.default_model_max_in_flight, divisor, &discovered)
+            let (counted, _) = served_models(&state, m, &endpoints);
+            enabled_pool_share_with(
+                &counted,
+                state.default_model_max_in_flight,
+                divisor,
+                &discovered,
+            )
         })
         .unwrap_or(0);
     Json(LiveStats {
@@ -5497,7 +5793,11 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
     let key_ids: Vec<Uuid> = snap
         .pools
         .iter()
-        .flat_map(|p| p.keys.iter().map(|k| k.key_id))
+        .flat_map(|p| {
+            p.keys
+                .iter()
+                .map(|k| k.end_user.as_ref().map_or(k.key_id, |e| e.parent_key))
+        })
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
         .collect();
@@ -5509,16 +5809,23 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
         .map(|k| (k.id, k.name))
         .collect();
     let models = state.store.list_models().await?;
+    let endpoints = state.store.all_model_endpoints().await?;
     let discovered = state.capacity_discovery.effective_caps();
     let (mode, _, divisor) = enforcement(&state);
+    let (counted, serving) = served_models(&state, models.clone(), &endpoints);
     let configured_capacity =
-        enabled_pool_share_with(&models, state.default_model_max_in_flight, 1, &discovered);
+        enabled_pool_share_with(&counted, state.default_model_max_in_flight, 1, &discovered);
     let capacity = enabled_pool_share_with(
-        &models,
+        &counted,
         state.default_model_max_in_flight,
         divisor,
         &discovered,
     );
+    let enabled_names: std::collections::HashSet<&str> = models
+        .iter()
+        .filter(|m| m.enabled)
+        .map(|m| m.model_name.as_str())
+        .collect();
     let pool_keys: Vec<PoolKey> = snap
         .pools
         .iter()
@@ -5542,9 +5849,7 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
     let live_names: std::collections::HashSet<&str> = models
         .iter()
         .filter(|m| m.enabled)
-        .flat_map(|m| {
-            std::iter::once(m.model_name.as_str()).chain(m.aliases.iter().map(String::as_str))
-        })
+        .flat_map(|m| m.addressable_names())
         .collect();
 
     let health_tenant = model_health::health_tenant_id();
@@ -5566,6 +5871,7 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
             hidden_queued += h_q;
             ModelPoolView {
                 model: p.model.clone(),
+                no_servers: enabled_names.contains(p.model.as_str()) && !serving.contains(&p.model),
                 cap,
                 configured_cap: p.configured_cap,
                 in_flight: p.in_flight.saturating_sub(h_in),
@@ -5622,10 +5928,13 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
                     .map(|k| KeyFairshareView {
                         key_id: k.key_id,
                         tenant_id: k.tenant_id,
-                        name: key_names
-                            .get(&k.key_id)
-                            .cloned()
-                            .unwrap_or_else(|| k.key_id.to_string()),
+                        name: {
+                            let real = k.end_user.as_ref().map_or(k.key_id, |e| e.parent_key);
+                            key_names
+                                .get(&real)
+                                .cloned()
+                                .unwrap_or_else(|| real.to_string())
+                        },
                         weight: k.weight,
                         max_in_flight: k.max_in_flight,
                         in_flight: k.in_flight,
@@ -5634,6 +5943,8 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
                         share_score: k.share_score,
                         weight_share: k.weight_share,
                         expected_slots: k.weight_share * cap as f64,
+                        end_user: k.end_user.as_ref().map(|e| e.name.clone()),
+                        parent_key_id: k.end_user.as_ref().map(|e| e.parent_key),
                     })
                     .collect(),
             }
@@ -5652,6 +5963,16 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
             configured_capacity
         } else {
             snap.configured_max_in_flight
+        },
+        models_with_servers: serving.len(),
+        models_without_servers: {
+            let mut names: Vec<String> = enabled_names
+                .iter()
+                .filter(|n| !serving.contains(**n))
+                .map(|n| n.to_string())
+                .collect();
+            names.sort_unstable();
+            names
         },
         hard_ceiling: snap.max_in_flight,
         configured_hard_ceiling: snap.configured_max_in_flight,
@@ -5875,8 +6196,8 @@ async fn resync_models_and_mcp(state: &AdminState) -> Result<(usize, usize, usiz
         models
             .iter()
             .filter(|m| m.enabled)
-            .flat_map(|m| std::iter::once(&m.model_name).chain(m.aliases.iter()))
-            .cloned()
+            .flat_map(|m| m.addressable_names())
+            .map(str::to_string)
             .collect()
     }
     fn server_names(servers: &[McpServer]) -> HashSet<String> {
@@ -5900,9 +6221,9 @@ async fn resync_models_and_mcp(state: &AdminState) -> Result<(usize, usize, usiz
     let fresh_names = model_names(&fresh_models);
     for model in &fresh_models {
         if model.enabled
-            && std::iter::once(&model.model_name)
-                .chain(model.aliases.iter())
-                .any(|n| pruned_models.contains(n))
+            && model
+                .addressable_names()
+                .any(|n| pruned_models.iter().any(|p| p == n))
         {
             sync_model(state, model).await?;
         }
@@ -6071,6 +6392,100 @@ async fn validate_aliases(
     Ok(aliases)
 }
 
+/// The checks on a variant list that need no database: names present, unique
+/// and not the model's own, boons known, the cap respected. Returns the list
+/// in storage form. Stricter than [`obleth_config::normalize_variants`], which
+/// drops what it cannot keep: an operator who typed a name or a boon gets told
+/// why it was refused rather than finding it silently gone.
+fn check_variants(
+    raw: &[ModelVariantWrite],
+    model_name: &str,
+    aliases: &[String],
+) -> Result<Vec<obleth_config::ModelVariant>> {
+    if raw.len() > obleth_config::MAX_MODEL_VARIANTS {
+        return Err(AdminError::BadRequest(format!(
+            "a model can have at most {} variants",
+            obleth_config::MAX_MODEL_VARIANTS
+        )));
+    }
+    let mut out: Vec<obleth_config::ModelVariant> = Vec::with_capacity(raw.len());
+    for v in raw {
+        let name = v.name.trim();
+        if name.is_empty() {
+            return Err(AdminError::BadRequest("a variant needs a name".into()));
+        }
+        if name == model_name {
+            return Err(AdminError::BadRequest(format!(
+                "variant '{name}' is the model's own name"
+            )));
+        }
+        if aliases.iter().any(|a| a == name) {
+            return Err(AdminError::BadRequest(format!(
+                "variant '{name}' is already one of the model's aliases"
+            )));
+        }
+        if name == obleth_config::routing::AUTO_MODEL_NAME {
+            return Err(AdminError::BadRequest(format!(
+                "variant '{name}' is reserved for automatic model selection"
+            )));
+        }
+        if out.iter().any(|o| o.name == name) {
+            return Err(AdminError::BadRequest(format!(
+                "variant '{name}' is listed twice"
+            )));
+        }
+        if let Some(unknown) = v
+            .boons
+            .iter()
+            .find(|b| !obleth_config::is_valid_boon(&b.trim().to_ascii_lowercase()))
+        {
+            return Err(AdminError::BadRequest(format!(
+                "variant '{name}': unknown boon '{unknown}' (expected one of: {})",
+                obleth_config::MODEL_BOONS.join(", ")
+            )));
+        }
+        out.push(obleth_config::ModelVariant {
+            name: name.to_string(),
+            description: v
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            boons: obleth_config::normalize_boons(&v.boons),
+        });
+    }
+    Ok(out)
+}
+
+/// Validate a variant list and reject any name already claimed elsewhere.
+///
+/// A variant is a name a client can send, so it shares one namespace with
+/// every model's `model_name`, aliases and variants (see
+/// [`validate_aliases`]). `editing` is the row being written, whose own
+/// names are not collisions with itself; `aliases` is the alias list this
+/// same write leaves the model with.
+async fn validate_variants(
+    state: &AdminState,
+    raw: &[ModelVariantWrite],
+    editing: Option<Uuid>,
+    model_name: &str,
+    aliases: &[String],
+) -> Result<Vec<obleth_config::ModelVariant>> {
+    let variants = check_variants(raw, model_name, aliases)?;
+    for v in &variants {
+        if let Some((owner_id, owner_name)) = state.store.model_name_owner(&v.name).await? {
+            if Some(owner_id) != editing {
+                return Err(AdminError::BadRequest(format!(
+                    "variant '{}' is already taken by model '{owner_name}'",
+                    v.name
+                )));
+            }
+        }
+    }
+    Ok(variants)
+}
+
 /// Validate a capacity mode against the fixed vocabulary, returning its
 /// canonical form. Rejected rather than normalized: a typo must not quietly
 /// turn a model back to `static`.
@@ -6193,6 +6608,7 @@ async fn create_model(
     headers: HeaderMap,
     Json(body): Json<CreateModel>,
 ) -> Result<Json<ModelRouteView>> {
+    let initial_status = initial_model_status(body.status)?;
     // A blank api_base is allowed: Slurm-provisioned models have no static
     // upstream until a replica is promoted into the endpoint rotation. Only
     // validate a non-empty URL.
@@ -6201,11 +6617,30 @@ async fn create_model(
     }
     validate_verify_api_base(&state, body.verify_api_base.as_deref()).await?;
     let quantization = validate_quantization(body.quantization.as_deref().unwrap_or_default())?;
+    // A new name must not already be another model's alias or variant, or it
+    // would mean two routes. A duplicate `model_name` is left to the store's
+    // unique constraint, which reports it as the conflict it always has.
+    if let Some((_, owner)) = state.store.model_name_owner(&body.model_name).await? {
+        if owner != body.model_name.trim() {
+            return Err(AdminError::BadRequest(format!(
+                "'{}' is already an alias or variant of model '{owner}'",
+                body.model_name.trim()
+            )));
+        }
+    }
     let aliases = validate_aliases(
         &state,
         body.aliases.as_deref().unwrap_or_default(),
         None,
         body.model_name.trim(),
+    )
+    .await?;
+    let variants = validate_variants(
+        &state,
+        body.variants.as_deref().unwrap_or_default(),
+        None,
+        body.model_name.trim(),
+        &aliases,
     )
     .await?;
     let upstream_headers = match &body.upstream_headers {
@@ -6275,12 +6710,27 @@ async fn create_model(
             body.cost_per_video.unwrap_or(0.0),
             &capacity_mode,
             &discovery,
+            &variants,
         )
         .await?;
     // Switched off before the first publish below, so the data plane never
     // sees the route on.
     let model = if body.enabled == Some(false) {
         state.store.set_model_enabled(model.id, false).await?
+    } else {
+        model
+    };
+    // Staged the same way, before the first publish.
+    let model = if initial_status == obleth_config::ModelStatus::Staged {
+        let lifecycle = obleth_config::ModelLifecycle {
+            status: initial_status,
+            changed_at: Some(chrono::Utc::now()),
+            ..Default::default()
+        };
+        state
+            .store
+            .set_model_lifecycle(model.id, &lifecycle)
+            .await?
     } else {
         model
     };
@@ -6361,6 +6811,21 @@ async fn update_model(
         Some(list) => validate_aliases(&state, list, Some(id), &existing.model_name).await?,
         None => existing.aliases.clone(),
     };
+    let variants = match body.variants.as_deref() {
+        Some(list) => {
+            validate_variants(&state, list, Some(id), &existing.model_name, &aliases).await?
+        }
+        // Kept as stored, but a new alias may not take a kept variant's name.
+        None => {
+            if let Some(v) = existing.variants.iter().find(|v| aliases.contains(&v.name)) {
+                return Err(AdminError::BadRequest(format!(
+                    "alias '{}' is already one of the model's variants",
+                    v.name
+                )));
+            }
+            existing.variants.clone()
+        }
+    };
     let upstream_headers = match &body.upstream_headers {
         Some(write) => obleth_config::merge_upstream_headers(&existing.upstream_headers, write)
             .map_err(AdminError::BadRequest)?,
@@ -6440,6 +6905,7 @@ async fn update_model(
             body.cost_per_video.unwrap_or(existing.cost_per_video),
             &capacity_mode,
             &discovery,
+            &variants,
         )
         .await?;
     if model_health::probe_config_changed(&existing, &model) {
@@ -6486,6 +6952,164 @@ async fn set_model_capacity(
             "model",
             &id.to_string(),
             serde_json::json!({ "max_in_flight": model.max_in_flight }),
+        )
+        .await?;
+    Ok(Json(model.into()))
+}
+
+/// The status a new model starts in: `active` unless the request asks for
+/// `staged`. Deprecating or retiring something nobody has called yet means
+/// nothing, so those are refused rather than stored.
+fn initial_model_status(
+    requested: Option<obleth_config::ModelStatus>,
+) -> Result<obleth_config::ModelStatus> {
+    use obleth_config::ModelStatus;
+    match requested.unwrap_or_default() {
+        status @ (ModelStatus::Staged | ModelStatus::Active) => Ok(status),
+        other => Err(AdminError::BadRequest(format!(
+            "a new model starts `active` or `staged`, not `{}`",
+            other.as_str()
+        ))),
+    }
+}
+
+/// The lifecycle `body` asks for on `existing`, validated against the model
+/// it names as the replacement (looked up by the caller; `None` when the body
+/// names none). `changed_at` moves only when the status does.
+fn lifecycle_from_request(
+    existing: &ModelRoute,
+    body: SetModelStatus,
+    replacement: Option<&ModelRoute>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<obleth_config::ModelLifecycle> {
+    use obleth_config::{ModelLifecycle, ModelStatus};
+    let changed_at = if body.status == existing.lifecycle.status {
+        existing.lifecycle.changed_at.or(Some(now))
+    } else {
+        Some(now)
+    };
+    if matches!(body.status, ModelStatus::Staged | ModelStatus::Active) {
+        return Ok(ModelLifecycle {
+            status: body.status,
+            changed_at,
+            ..Default::default()
+        });
+    }
+    let note = body
+        .note
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
+    if note.chars().count() > obleth_config::MAX_LIFECYCLE_NOTE_CHARS {
+        return Err(AdminError::BadRequest(format!(
+            "note is longer than {} characters",
+            obleth_config::MAX_LIFECYCLE_NOTE_CHARS
+        )));
+    }
+    let replacement_name = body
+        .replacement
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
+    if !replacement_name.is_empty() {
+        let Some(r) = replacement else {
+            return Err(AdminError::BadRequest(format!(
+                "replacement `{replacement_name}` is not a registered model"
+            )));
+        };
+        if r.id == existing.id {
+            return Err(AdminError::BadRequest(
+                "a model cannot be its own replacement".to_string(),
+            ));
+        }
+        if r.model_type != existing.model_type {
+            return Err(AdminError::BadRequest(format!(
+                "replacement `{}` is a `{}` model; it must be `{}` like `{}`",
+                r.model_name, r.model_type, existing.model_type, existing.model_name
+            )));
+        }
+        match r.lifecycle.status_at(now) {
+            ModelStatus::Retired => {
+                return Err(AdminError::BadRequest(format!(
+                    "replacement `{}` is itself retired",
+                    r.model_name
+                )));
+            }
+            ModelStatus::Staged => {
+                return Err(AdminError::BadRequest(format!(
+                    "replacement `{}` is staged, so callers cannot find it; make it active first",
+                    r.model_name
+                )));
+            }
+            ModelStatus::Active | ModelStatus::Deprecated => {}
+        }
+    }
+    let redirect = body.redirect.unwrap_or(false);
+    if redirect && replacement_name.is_empty() {
+        return Err(AdminError::BadRequest(
+            "redirect needs a replacement to send requests to".to_string(),
+        ));
+    }
+    Ok(ModelLifecycle {
+        status: body.status,
+        // The canonical name, even when the body used an alias.
+        replacement: replacement
+            .map(|r| r.model_name.clone())
+            .unwrap_or_default(),
+        retire_at: body.retire_at,
+        changed_at,
+        note,
+        redirect,
+    })
+}
+
+#[utoipa::path(
+    put, path = "/api/v1/models/{id}/status", tag = "models",
+    params(("id" = Uuid, Path, description = "Model id")),
+    request_body = SetModelStatus,
+    responses((status = 200, body = ModelRouteView))
+)]
+async fn set_model_status(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<SetModelStatus>,
+) -> Result<Json<ModelRouteView>> {
+    let existing = state.store.get_model(id).await?;
+    let replacement = match body.replacement.as_deref().map(str::trim).filter(|r| {
+        !r.is_empty()
+            && matches!(
+                body.status,
+                obleth_config::ModelStatus::Deprecated | obleth_config::ModelStatus::Retired
+            )
+    }) {
+        Some(name) => match state.store.get_model_by_name(name).await {
+            Ok(m) => Some(m),
+            Err(obleth_store::StoreError::NotFound) => None,
+            Err(e) => return Err(e.into()),
+        },
+        None => None,
+    };
+    let lifecycle =
+        lifecycle_from_request(&existing, body, replacement.as_ref(), chrono::Utc::now())?;
+    let model = state.store.set_model_lifecycle(id, &lifecycle).await?;
+    sync_model(&state, &model).await?;
+    state
+        .store
+        .record_audit(
+            &audit_actor(&headers),
+            "set_model_status",
+            "model",
+            &id.to_string(),
+            serde_json::json!({
+                "model_name": model.model_name,
+                "status": lifecycle.status,
+                "replacement": lifecycle.replacement,
+                "retire_at": lifecycle.retire_at,
+                "redirect": lifecycle.redirect,
+            }),
         )
         .await?;
     Ok(Json(model.into()))
@@ -6966,10 +7590,12 @@ async fn put_managed_model(
             cpus_per_task: body.cpus_per_task,
             mem: body.mem,
             image: body.image,
-            preamble: body.preamble,
+            // Stored with Unix line endings: bash reads a `\r` as part of
+            // the line, and a browser textarea sends CRLF.
+            preamble: body.preamble.replace("\r\n", "\n"),
             log_output_dir: body.log_output_dir,
-            launch_command: body.launch_command,
-            script_body: body.script_body,
+            launch_command: body.launch_command.replace("\r\n", "\n"),
+            script_body: body.script_body.replace("\r\n", "\n"),
             serving_port: body.serving_port,
             health_path: body.health_path,
             target_replicas: body.target_replicas,
@@ -7217,6 +7843,42 @@ pub async fn clear_lost_replicas(
     Ok(Json(serde_json::json!({ "deleted": n })))
 }
 
+#[derive(Debug, Deserialize, utoipa::IntoParams, ToSchema)]
+pub struct DeploymentLaunchesQuery {
+    /// Only launches of this model.
+    #[param(value_type = Option<String>)]
+    #[schema(value_type = Option<String>)]
+    pub model_id: Option<Uuid>,
+    /// Only launches from this recipe (`launcher_spec.recipe_id`).
+    pub recipe_id: Option<String>,
+    /// Rows to return, newest first. Default 50, at most 500.
+    pub limit: Option<i64>,
+}
+
+/// Launch history of Slurm-backed replicas, newest first. Rows outlive the
+/// replica rows they describe; `queued_secs`, `load_secs` and `ran_secs` are
+/// computed (ran counts to now while the launch is still going).
+#[utoipa::path(get, path = "/api/v1/deployments/launches",
+    params(DeploymentLaunchesQuery),
+    responses((status = 200, body = [DeploymentLaunch])))]
+async fn list_deployment_launches(
+    State(state): State<AdminState>,
+    Query(q): Query<DeploymentLaunchesQuery>,
+) -> Result<Json<Vec<DeploymentLaunch>>> {
+    let recipe_id = q
+        .recipe_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty());
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    Ok(Json(
+        state
+            .store
+            .list_deployment_launches(q.model_id, recipe_id, limit)
+            .await?,
+    ))
+}
+
 #[utoipa::path(
     delete, path = "/api/v1/models/{id}", tag = "models",
     params(("id" = Uuid, Path, description = "Model id")),
@@ -7229,12 +7891,10 @@ async fn delete_model(
 ) -> Result<StatusCode> {
     let model = state.store.get_model(id).await?;
     state.store.delete_model(id).await?;
-    // Aliases are resolver keys of their own, so a delete has to clear all of
-    // them or the model stays reachable under its old names.
+    // Aliases and variants are resolver keys of their own, so a delete has to
+    // clear all of them or the model stays reachable under its old names.
     let mut evict_err = None;
-    for name in
-        std::iter::once(model.model_name.as_str()).chain(model.aliases.iter().map(String::as_str))
-    {
+    for name in model.addressable_names() {
         let evicted = async {
             state.redis.delete_resolved_model(name).await?;
             state
@@ -7712,34 +8372,20 @@ async fn sync_model(state: &AdminState, model: &ModelRoute) -> Result<()> {
     sync_model_from(state, model, None).await
 }
 
-/// Republish a model into the resolver cache, evicting the keys it no longer
-/// owns.
-///
-/// `previous` is the row as it was before this write, and is only needed when
-/// aliases may have changed: an alias that was just dropped still has a live
-/// `obleth:model:<alias>` key pointing at this model, and nothing else in the
-/// system would ever clear it. Passing `None` (create, capacity toggle, any
-/// write that cannot touch aliases) publishes without an eviction pass.
-async fn sync_model_from(
-    state: &AdminState,
+/// The data plane's view of `model`, as `sync_model_from` publishes it under
+/// every name the model answers to. Every field the request path reads has to
+/// come from the row here: one left at its default is silently wrong on the
+/// hot path while the registry, read straight from Postgres, looks right.
+fn resolved_model_of(
     model: &ModelRoute,
-    previous: Option<&ModelRoute>,
-) -> Result<()> {
-    // Endpoints carry the per-cluster wire targets and health; the data plane
-    // prefers them over the legacy single api_base/api_key when present.
-    let endpoints = state
-        .store
-        .resolved_endpoints_for(model.id)
-        .await
-        .unwrap_or_default();
-    let knowledge_collections = state
-        .store
-        .model_collection_ids(model.id)
-        .await
-        .unwrap_or_default();
-    let resolved = ResolvedModel {
+    endpoints: Vec<obleth_config::ResolvedEndpoint>,
+    knowledge_collections: Vec<Uuid>,
+) -> ResolvedModel {
+    ResolvedModel {
         model_name: model.model_name.clone(),
         aliases: model.aliases.clone(),
+        lifecycle: model.lifecycle.clone(),
+        variants: model.variants.clone(),
         upstream_model: model.upstream_model.clone(),
         api_base: model.api_base.clone(),
         api_key: model.api_key.clone(),
@@ -7793,26 +8439,55 @@ async fn sync_model_from(
         verify_api_base: model.verify_api_base.clone(),
         verify_upstream_model: model.verify_upstream_model.clone(),
         endpoints,
-    };
-    // Aliases the write removed: their keys would otherwise keep resolving to
-    // this model forever. Done before the publish so a name moved from alias to
-    // canonical (or between the two lists) is re-added, not left evicted.
+    }
+}
+
+/// Republish a model into the resolver cache, evicting the keys it no longer
+/// owns.
+///
+/// `previous` is the row as it was before this write, and is only needed when
+/// aliases may have changed: an alias that was just dropped still has a live
+/// `obleth:model:<alias>` key pointing at this model, and nothing else in the
+/// system would ever clear it. Passing `None` (create, capacity toggle, any
+/// write that cannot touch aliases) publishes without an eviction pass.
+async fn sync_model_from(
+    state: &AdminState,
+    model: &ModelRoute,
+    previous: Option<&ModelRoute>,
+) -> Result<()> {
+    // Endpoints carry the per-cluster wire targets and health; the data plane
+    // prefers them over the legacy single api_base/api_key when present.
+    let endpoints = state
+        .store
+        .resolved_endpoints_for(model.id)
+        .await
+        .unwrap_or_default();
+    let knowledge_collections = state
+        .store
+        .model_collection_ids(model.id)
+        .await
+        .unwrap_or_default();
+    let resolved = resolved_model_of(model, endpoints, knowledge_collections);
+    // Aliases and variants the write removed: their keys would otherwise keep
+    // resolving to this model forever. Done before the publish so a name moved
+    // between the lists (alias to variant, or to canonical) is re-added, not
+    // left evicted.
     if let Some(previous) = previous {
+        let current: std::collections::HashSet<&str> = model.addressable_names().collect();
         for stale in previous
-            .aliases
-            .iter()
-            .filter(|a| !model.aliases.contains(a))
+            .addressable_names()
+            .filter(|n| !current.contains(n))
         {
             state
                 .redis
                 .delete_resolved_model(stale)
                 .await
-                .map_err(|e| cache_removal_failed("a removed alias", e))?;
+                .map_err(|e| cache_removal_failed("a removed alias or variant", e))?;
             state
                 .redis
                 .publish_invalidation(&format!("model:{stale}"))
                 .await
-                .map_err(|e| cache_removal_failed("a removed alias", e))?;
+                .map_err(|e| cache_removal_failed("a removed alias or variant", e))?;
         }
     }
     // Every name the model answers to gets its own resolver key, so the data
@@ -8035,6 +8710,7 @@ mod tests {
                     0.0,
                     "static",
                     &Default::default(),
+                    &[],
                 )
                 .await
                 .expect("create fixture model")
@@ -9296,6 +9972,100 @@ mod tests {
         assert_eq!(hashes, ["a", "c"]);
     }
 
+    /// Per-end-user fairshare is set through its own route, reaches the key
+    /// the gateway resolves, and survives a whole-key `PUT` that doesn't
+    /// mention it -- the reason it is not one of that `PUT`'s fields.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn end_user_fairshare_has_its_own_route_and_survives_a_key_put() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let tenant = t
+            .store
+            .create_tenant(&format!("t-{}", Uuid::new_v4()), 100, 1000, None, None)
+            .await
+            .expect("create tenant");
+        let request = |method: &str, path: String, body: serde_json::Value| {
+            axum::http::Request::builder()
+                .method(method)
+                .uri(path)
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+                .body(axum::body::Body::from(body.to_string()))
+                .expect("build request")
+        };
+
+        let (_, created) = send(
+            &t.app,
+            request(
+                "POST",
+                format!("/api/v1/tenants/{}/keys", tenant.id),
+                serde_json::json!({ "name": "chatbot" }),
+            ),
+        )
+        .await;
+        let id = created["key"]["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let flag = |on: bool| {
+            request(
+                "PUT",
+                format!("/api/v1/keys/{id}/end-user-fairshare"),
+                serde_json::json!({ "end_user_fairshare": on }),
+            )
+        };
+        let (on_status, _) = send(&t.app, flag(true)).await;
+        let (_, after_put) = send(
+            &t.app,
+            request(
+                "PUT",
+                format!("/api/v1/keys/{id}"),
+                serde_json::json!({ "name": "chatbot", "weight": 300 }),
+            ),
+        )
+        .await;
+        let resolved_on = t
+            .store
+            .all_resolved_keys()
+            .await
+            .expect("resolved keys")
+            .into_iter()
+            .find(|(_, k)| k.key_id.to_string() == id)
+            .map(|(_, k)| k.end_user_fairshare);
+        let (off_status, _) = send(&t.app, flag(false)).await;
+        let listed_off = t
+            .store
+            .keys_by_ids(&[id.parse().expect("key id")])
+            .await
+            .expect("keys by id")
+            .first()
+            .map(|k| k.end_user_fairshare);
+
+        let _ = t.store.delete_tenant(tenant.id).await;
+
+        assert_eq!(
+            created["key"]["end_user_fairshare"],
+            serde_json::json!(false),
+            "off by default"
+        );
+        assert_eq!(on_status, StatusCode::NO_CONTENT);
+        assert_eq!(after_put["weight"], serde_json::json!(300));
+        assert_eq!(
+            after_put["end_user_fairshare"],
+            serde_json::json!(true),
+            "a whole-key PUT without the field must not turn it off"
+        );
+        assert_eq!(
+            resolved_on,
+            Some(true),
+            "the gateway's resolved key carries it"
+        );
+        assert_eq!(off_status, StatusCode::NO_CONTENT);
+        assert_eq!(listed_off, Some(false));
+    }
+
     /// Fairshare weight and per-model cap are set on a key at creation and
     /// edited afterwards, so both have to survive the round trip through the
     /// store and come back on the response the dashboard renders.
@@ -9792,6 +10562,7 @@ mod tests {
             ("/api/v1/resync", "post"),
             ("/api/v1/replicas/{id}/restart", "post"),
             ("/api/v1/keys/{id}/tracing", "put"),
+            ("/api/v1/keys/{id}/end-user-fairshare", "put"),
             ("/api/v1/tenants/{id}/tracing", "put"),
             ("/api/v1/usage/logs/{request_id}/spans", "get"),
             ("/api/v1/models/{id}/managed/provision-error", "patch"),
@@ -9805,6 +10576,7 @@ mod tests {
         for name in [
             "ResyncReport",
             "SetKeyTracing",
+            "SetKeyEndUserFairshare",
             "ProvisionErrorBody",
             "SpanEntry",
         ] {
@@ -10085,6 +10857,39 @@ mod tests {
     }
 
     #[test]
+    fn boon_view_exposes_web_search_settings() {
+        let s = BoonSettings {
+            web_search: obleth_config::WebSearchBoonSettings {
+                enabled: true,
+                search_tool: Some("web".to_string()),
+                max_results: 7,
+                max_searches_per_request: 2,
+                timeout_ms: 9_000,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let view = BoonSettingsView::from_settings(&s);
+        assert!(view.web_search_enabled);
+        assert_eq!(view.web_search_tool.as_deref(), Some("web"));
+        assert_eq!(view.web_search_max_results, 7);
+        assert_eq!(view.web_search_max_searches_per_request, 2);
+        assert_eq!(view.web_search_timeout_ms, 9_000);
+        assert_eq!(
+            view.web_search_tool_description,
+            obleth_config::DEFAULT_WEB_SEARCH_TOOL_DESCRIPTION
+        );
+        let update: UpdateBoonSettings = serde_json::from_value(serde_json::json!({
+            "web_search_enabled": true,
+            "web_search_tool": "web",
+        }))
+        .unwrap();
+        assert_eq!(update.web_search_enabled, Some(true));
+        assert_eq!(update.web_search_tool.as_deref(), Some("web"));
+        assert_eq!(update.web_search_max_results, None);
+    }
+
+    #[test]
     fn image_generation_sizes_are_normalised() {
         // Blank and duplicate entries are dropped; an all-blank list falls back
         // to the default rather than leaving the tool schema with an empty enum.
@@ -10169,12 +10974,196 @@ mod tests {
 
     /// A model route with every field filled with sane defaults, for tests
     /// that only care about a couple of fields (e.g. `enabled`/`max_in_flight`).
+    fn status_body(status: obleth_config::ModelStatus) -> SetModelStatus {
+        SetModelStatus {
+            status,
+            replacement: None,
+            retire_at: None,
+            note: None,
+            redirect: None,
+        }
+    }
+
+    #[test]
+    fn deprecating_records_when_and_names_the_canonical_replacement() {
+        let now = chrono::Utc::now();
+        let old = fixture_model_route("glm-4-5v");
+        let new = fixture_model_route("gemma4-31b-it");
+        let mut body = status_body(obleth_config::ModelStatus::Deprecated);
+        body.replacement = Some("gemma-alias".into());
+        body.retire_at = Some(now + chrono::Duration::days(14));
+        body.note = Some("  Ask rc@asu.edu.  ".into());
+        let l = lifecycle_from_request(&old, body, Some(&new), now).unwrap();
+        assert_eq!(l.status, obleth_config::ModelStatus::Deprecated);
+        assert_eq!(l.replacement, "gemma4-31b-it", "canonical, not the alias");
+        assert_eq!(l.changed_at, Some(now));
+        assert_eq!(l.note, "Ask rc@asu.edu.");
+        assert!(!l.redirect);
+    }
+
+    #[test]
+    fn changed_at_moves_only_when_the_status_does() {
+        let t0 = chrono::Utc::now();
+        let t1 = t0 + chrono::Duration::days(2);
+        let mut old = fixture_model_route("glm-4-5v");
+        old.lifecycle.status = obleth_config::ModelStatus::Deprecated;
+        old.lifecycle.changed_at = Some(t0);
+        let same = lifecycle_from_request(
+            &old,
+            status_body(obleth_config::ModelStatus::Deprecated),
+            None,
+            t1,
+        )
+        .unwrap();
+        assert_eq!(same.changed_at, Some(t0), "editing the note keeps the date");
+        let retired = lifecycle_from_request(
+            &old,
+            status_body(obleth_config::ModelStatus::Retired),
+            None,
+            t1,
+        )
+        .unwrap();
+        assert_eq!(retired.changed_at, Some(t1));
+    }
+
+    #[test]
+    fn active_clears_everything_else() {
+        let now = chrono::Utc::now();
+        let old = fixture_model_route("glm-4-5v");
+        let mut body = status_body(obleth_config::ModelStatus::Active);
+        body.replacement = Some("anything".into());
+        body.note = Some("ignored".into());
+        body.redirect = Some(true);
+        let l = lifecycle_from_request(&old, body, None, now).unwrap();
+        assert_eq!(l.status, obleth_config::ModelStatus::Active);
+        assert!(l.replacement.is_empty() && l.note.is_empty() && !l.redirect);
+    }
+
+    #[test]
+    fn staging_clears_everything_else_and_promoting_dates_the_change() {
+        let t0 = chrono::Utc::now();
+        let t1 = t0 + chrono::Duration::days(3);
+        let mut old = fixture_model_route("qwen4-72b");
+        let mut body = status_body(obleth_config::ModelStatus::Staged);
+        body.note = Some("ignored".into());
+        body.retire_at = Some(t1);
+        let staged = lifecycle_from_request(&old, body, None, t0).unwrap();
+        assert_eq!(staged.status, obleth_config::ModelStatus::Staged);
+        assert_eq!(staged.changed_at, Some(t0));
+        assert!(staged.note.is_empty() && staged.retire_at.is_none());
+
+        old.lifecycle = staged;
+        let live = lifecycle_from_request(
+            &old,
+            status_body(obleth_config::ModelStatus::Active),
+            None,
+            t1,
+        )
+        .unwrap();
+        assert_eq!(live.status, obleth_config::ModelStatus::Active);
+        assert_eq!(live.changed_at, Some(t1));
+    }
+
+    #[test]
+    fn a_new_model_starts_active_or_staged() {
+        use obleth_config::ModelStatus;
+        assert_eq!(initial_model_status(None).unwrap(), ModelStatus::Active);
+        assert_eq!(
+            initial_model_status(Some(ModelStatus::Staged)).unwrap(),
+            ModelStatus::Staged
+        );
+        for status in [ModelStatus::Deprecated, ModelStatus::Retired] {
+            assert!(matches!(
+                initial_model_status(Some(status)),
+                Err(AdminError::BadRequest(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn bad_replacements_and_redirects_are_refused() {
+        let now = chrono::Utc::now();
+        let old = fixture_model_route("glm-4-5v");
+        let refused = |body: SetModelStatus, r: Option<&ModelRoute>| {
+            matches!(
+                lifecycle_from_request(&old, body, r, now),
+                Err(AdminError::BadRequest(_))
+            )
+        };
+        let named = |name: &str| {
+            let mut b = status_body(obleth_config::ModelStatus::Deprecated);
+            b.replacement = Some(name.into());
+            b
+        };
+        // Not registered.
+        assert!(refused(named("ghost"), None));
+        // Itself.
+        assert!(refused(named("glm-4-5v"), Some(&old)));
+        // Another type.
+        let mut emb = fixture_model_route("embedder");
+        emb.model_type = "embedding".into();
+        assert!(refused(named("embedder"), Some(&emb)));
+        // Already retired.
+        let mut gone = fixture_model_route("gone");
+        gone.lifecycle.status = obleth_config::ModelStatus::Retired;
+        assert!(refused(named("gone"), Some(&gone)));
+        // Staged, so callers could not find it.
+        let mut staged = fixture_model_route("staged");
+        staged.lifecycle.status = obleth_config::ModelStatus::Staged;
+        assert!(refused(named("staged"), Some(&staged)));
+        // A redirect with nowhere to go.
+        let mut b = status_body(obleth_config::ModelStatus::Retired);
+        b.redirect = Some(true);
+        assert!(refused(b, None));
+        // A note past the limit.
+        let mut b = status_body(obleth_config::ModelStatus::Deprecated);
+        b.note = Some("x".repeat(obleth_config::MAX_LIFECYCLE_NOTE_CHARS + 1));
+        assert!(refused(b, None));
+    }
+
+    #[test]
+    fn the_published_model_carries_its_lifecycle() {
+        // The request path reads the published copy, not Postgres: a
+        // lifecycle left at its default here means a retired model is served.
+        let mut m = fixture_model_route("glm-4-5v");
+        m.lifecycle = obleth_config::ModelLifecycle {
+            status: obleth_config::ModelStatus::Retired,
+            replacement: "gemma4-31b-it".into(),
+            note: "Ask rc.".into(),
+            redirect: true,
+            ..Default::default()
+        };
+        m.variants = vec![obleth_config::ModelVariant {
+            name: "glm-4-5v-spec".into(),
+            ..Default::default()
+        }];
+        let resolved = resolved_model_of(&m, Vec::new(), Vec::new());
+        assert_eq!(resolved.lifecycle, m.lifecycle);
+        assert_eq!(resolved.variants, m.variants);
+        assert_eq!(resolved.model_name, "glm-4-5v");
+    }
+
+    #[test]
+    fn the_model_view_reports_the_status_in_force() {
+        let mut m = fixture_model_route("glm-4-5v");
+        m.lifecycle.status = obleth_config::ModelStatus::Deprecated;
+        m.lifecycle.retire_at = Some(chrono::Utc::now() - chrono::Duration::minutes(1));
+        let view: ModelRouteView = m.into();
+        assert_eq!(
+            view.lifecycle.status,
+            obleth_config::ModelStatus::Deprecated
+        );
+        assert_eq!(view.effective_status, obleth_config::ModelStatus::Retired);
+    }
+
     fn fixture_model_route(name: &str) -> ModelRoute {
         let now = chrono::Utc::now();
         ModelRoute {
             id: Uuid::new_v4(),
             model_name: name.to_string(),
             aliases: Vec::new(),
+            lifecycle: Default::default(),
+            variants: Vec::new(),
             description: String::new(),
             upstream_model: name.to_string(),
             api_base: "http://upstream.invalid".to_string(),
@@ -10223,6 +11212,193 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    fn variant_write(name: &str, boons: &[&str]) -> ModelVariantWrite {
+        ModelVariantWrite {
+            name: name.into(),
+            description: None,
+            boons: boons.iter().map(|b| b.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn variants_are_trimmed_and_their_boons_normalized() {
+        let raw = [ModelVariantWrite {
+            name: "  glm-5-3-spec ".into(),
+            description: Some(" drafted, then verified ".into()),
+            boons: vec!["Speculation".into(), "speculation".into()],
+        }];
+        let out = check_variants(&raw, "glm-5-3", &[]).expect("valid");
+        assert_eq!(
+            out,
+            vec![obleth_config::ModelVariant {
+                name: "glm-5-3-spec".into(),
+                description: "drafted, then verified".into(),
+                boons: vec!["speculation".into()],
+            }]
+        );
+        // A variant that adds nothing beyond the model's own boons is pointless
+        // but harmless, and accepted.
+        assert!(check_variants(&[variant_write("glm-5-3-plain", &[])], "glm-5-3", &[]).is_ok());
+        // Names are case-sensitive, like every other model name.
+        assert!(check_variants(&[variant_write("GLM-5-3", &[])], "glm-5-3", &[]).is_ok());
+    }
+
+    #[test]
+    fn variants_that_would_make_a_name_ambiguous_are_refused() {
+        let aliases = vec!["glm-5-3-fp8".to_string()];
+        for (raw, why) in [
+            (vec![variant_write("  ", &[])], "needs a name"),
+            (vec![variant_write("glm-5-3", &[])], "model's own name"),
+            (
+                vec![variant_write(" glm-5-3-fp8 ", &[])],
+                "one of the model's aliases",
+            ),
+            (vec![variant_write("auto", &[])], "reserved"),
+            (
+                vec![variant_write("v", &[]), variant_write(" v", &["vision"])],
+                "listed twice",
+            ),
+            (
+                vec![variant_write("v", &["speculation", "teleportation"])],
+                "unknown boon 'teleportation'",
+            ),
+        ] {
+            match check_variants(&raw, "glm-5-3", &aliases) {
+                Err(AdminError::BadRequest(msg)) => assert!(msg.contains(why), "{msg}"),
+                other => panic!("expected a 400 containing {why:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn variants_are_capped() {
+        let at_cap: Vec<ModelVariantWrite> = (0..obleth_config::MAX_MODEL_VARIANTS)
+            .map(|i| variant_write(&format!("v{i}"), &[]))
+            .collect();
+        assert!(check_variants(&at_cap, "m", &[]).is_ok());
+        let over: Vec<ModelVariantWrite> = (0..=obleth_config::MAX_MODEL_VARIANTS)
+            .map(|i| variant_write(&format!("v{i}"), &[]))
+            .collect();
+        match check_variants(&over, "m", &[]) {
+            Err(AdminError::BadRequest(msg)) => assert!(msg.contains("at most"), "{msg}"),
+            other => panic!("expected a 400, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn model_writes_without_variants_still_parse() {
+        // A client written before variants existed sends neither field.
+        let body: UpdateModel =
+            serde_json::from_str(r#"{"upstream_model":"u","api_base":"http://u/v1"}"#).unwrap();
+        assert!(body.variants.is_none(), "omitted must mean unchanged");
+        let body: UpdateModel = serde_json::from_str(
+            r#"{"upstream_model":"u","api_base":"http://u/v1","variants":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            body.variants.map(|v| v.len()),
+            Some(0),
+            "[] must mean remove all"
+        );
+        let body: CreateModel = serde_json::from_str(
+            r#"{"model_name":"m","upstream_model":"u","api_base":"http://u/v1",
+                "variants":[{"name":"m-spec","boons":["speculation"]}]}"#,
+        )
+        .unwrap();
+        let v = &body.variants.expect("variants")[0];
+        assert_eq!(
+            (v.name.as_str(), v.description.as_deref()),
+            ("m-spec", None)
+        );
+    }
+
+    #[test]
+    fn model_route_view_lists_variants() {
+        let mut route = fixture_model_route("glm-5-3");
+        route.variants = vec![obleth_config::ModelVariant {
+            name: "glm-5-3-spec".into(),
+            description: "drafted, then verified".into(),
+            boons: vec!["speculation".into()],
+        }];
+        let v = serde_json::to_value(ModelRouteView::from(route)).unwrap();
+        assert_eq!(
+            v["variants"],
+            serde_json::json!([{
+                "name": "glm-5-3-spec",
+                "description": "drafted, then verified",
+                "boons": ["speculation"],
+            }])
+        );
+        let v = serde_json::to_value(ModelRouteView::from(fixture_model_route("m"))).unwrap();
+        assert_eq!(v["variants"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn import_refuses_variant_names_another_route_answers_to() {
+        use obleth_store::ModelImportWrite;
+        let mut owner = fixture_model_route("glm-5-3");
+        owner.aliases = vec!["glm-5-3-fp8".into()];
+        owner.variants = vec![obleth_config::ModelVariant {
+            name: "glm-5-3-spec".into(),
+            ..Default::default()
+        }];
+        let existing: std::collections::HashMap<String, ModelRoute> =
+            [("glm-5-3".to_string(), owner)].into();
+        let write = |name: &str, aliases: &[&str], variants: &[&str]| ModelImportWrite {
+            model_name: name.into(),
+            config: obleth_config::ModelConfig {
+                aliases: aliases.iter().map(|a| a.to_string()).collect(),
+                variants: variants
+                    .iter()
+                    .map(|v| obleth_config::ModelVariant {
+                        name: v.to_string(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            endpoints: None,
+        };
+
+        let errors = crate::models_io::name_conflicts(
+            &existing,
+            &[write(
+                "qwen3",
+                &["qwen3-old"],
+                &[
+                    "glm-5-3",
+                    "glm-5-3-fp8",
+                    "glm-5-3-spec",
+                    "qwen3",
+                    "qwen3-old",
+                    "auto",
+                ],
+            )],
+        );
+        assert_eq!(
+            errors,
+            vec![
+                "model 'qwen3': variant 'glm-5-3' is already taken by model 'glm-5-3'",
+                "model 'qwen3': variant 'glm-5-3-fp8' is already taken by model 'glm-5-3'",
+                "model 'qwen3': variant 'glm-5-3-spec' is already taken by model 'glm-5-3'",
+                "model 'qwen3': variant 'qwen3' is the model's own name",
+                "model 'qwen3': variant 'qwen3-old' is already one of the model's aliases",
+                "model 'qwen3': variant 'auto' is reserved for automatic model selection",
+            ]
+        );
+
+        // A file that rewrites the owner may move its variant to another
+        // model: the check runs on the state the file would produce.
+        let errors = crate::models_io::name_conflicts(
+            &existing,
+            &[
+                write("glm-5-3", &["glm-5-3-fp8"], &[]),
+                write("qwen3", &[], &["glm-5-3-spec"]),
+            ],
+        );
+        assert!(errors.is_empty(), "{errors:?}");
     }
 
     #[test]
@@ -10396,6 +11572,7 @@ mod tests {
         let in_flight = tenants.iter().map(|t| t.in_flight).sum();
         ModelPoolView {
             model: model.into(),
+            no_servers: false,
             cap,
             configured_cap: cap,
             in_flight,
@@ -10478,6 +11655,35 @@ mod tests {
                 m
             })
             .collect()
+    }
+
+    #[test]
+    fn capacity_totals_count_only_models_with_servers() {
+        use std::collections::HashSet;
+        let fixed = fixture_model_route("fixed"); // has an api_base
+        let mut managed = fixture_model_route("managed"); // endpoints only
+        managed.api_base = String::new();
+        let mut unplaced = fixture_model_route("unplaced"); // neither: nowhere to go
+        unplaced.api_base = "  ".into();
+        let scaled_down = fixture_model_route("scaled-down"); // discovered, 0 ready
+        let mut off = fixture_model_route("off");
+        off.enabled = false;
+        let models = vec![fixed, managed.clone(), unplaced, scaled_down, off];
+        let with_endpoint: HashSet<Uuid> = [managed.id].into_iter().collect();
+        let none_ready: HashSet<String> = ["scaled-down".to_string()].into_iter().collect();
+
+        let serving = models_with_servers(&models, &with_endpoint, &none_ready);
+        let mut names: Vec<&str> = serving.iter().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["fixed", "managed"]);
+
+        // Without its endpoint the managed model has nowhere to go either.
+        let serving = models_with_servers(&models, &HashSet::new(), &HashSet::new());
+        assert!(!serving.contains("managed"));
+        assert!(
+            serving.contains("scaled-down"),
+            "no discovery verdict: counted by its api_base"
+        );
     }
 
     #[test]

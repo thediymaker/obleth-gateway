@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseSbatchDirectives } from "./sbatch-directives";
+import { parseSbatchDirectives, sbatchLines, stripSbatchDirectives, unixLineEndings } from "./sbatch-directives";
 
 describe("parseSbatchDirectives", () => {
   it("handles --key=value, --key value, and -k value forms", () => {
@@ -73,6 +73,9 @@ describe("parseSbatchDirectives", () => {
   it("extracts the directory from --output and --error", () => {
     const d = parseSbatchDirectives("#SBATCH --output=logs/serve-%j.out");
     expect(d.log_output_dir).toBe("logs");
+    expect(parseSbatchDirectives("#SBATCH --output=/scratch/me/logs/%j.out").log_output_dir).toBe("/scratch/me/logs");
+    expect(parseSbatchDirectives("#SBATCH --output=/%j.out").log_output_dir).toBe("/");
+    expect(parseSbatchDirectives("#SBATCH --output=%j.out").log_output_dir).toBeUndefined();
   });
 
   it("records --chdir for the deploy builder", () => {
@@ -134,5 +137,36 @@ describe("parseSbatchDirectives", () => {
     expect(d1.log_output_dir).toBe("logs");
     const d2 = parseSbatchDirectives("#SBATCH -e errors/e.out");
     expect(d2.log_output_dir).toBe("errors");
+  });
+});
+
+describe("unixLineEndings", () => {
+  it("turns a textarea's CRLF into LF, so bash doesn't read a \\r", () => {
+    expect(unixLineEndings("#!/bin/bash -l\r\nset -e\r\nvllm serve m\r\n")).toBe("#!/bin/bash -l\nset -e\nvllm serve m\n");
+    expect(unixLineEndings("already\nunix\n")).toBe("already\nunix\n");
+  });
+});
+
+describe("stripSbatchDirectives", () => {
+  it("drops only the #SBATCH lines", () => {
+    const script = ["#!/bin/bash -l", "#SBATCH --gres=gpu:1", "  #SBATCH --mem=500G   # all of it", "# a comment", "set -euo pipefail"].join("\n");
+    expect(stripSbatchDirectives(script)).toBe(["#!/bin/bash -l", "# a comment", "set -euo pipefail"].join("\n"));
+  });
+});
+
+describe("sbatchLines", () => {
+  it("names the placement setting each line matches, and null when there is none", () => {
+    const lines = sbatchLines(["#!/bin/bash -l", "#SBATCH --gres=gpu:1", "#SBATCH -c 72", "#SBATCH --mem=500G # most of it", "#SBATCH -t 1-00:00:00", "#SBATCH --exclusive", "echo hi"].join("\n"));
+    expect(lines).toEqual([
+      { text: "--gres=gpu:1", value: "gpu:1", setting: "gres" },
+      { text: "-c 72", value: "72", setting: "cpus_per_task" },
+      { text: "--mem=500G", value: "500G", setting: "mem" },
+      { text: "-t 1-00:00:00", value: "1-00:00:00", setting: "time_limit" },
+      { text: "--exclusive", value: "", setting: null },
+    ]);
+  });
+
+  it("is empty for a script without directives", () => {
+    expect(sbatchLines("#!/bin/bash\nvllm serve m\n")).toEqual([]);
   });
 });

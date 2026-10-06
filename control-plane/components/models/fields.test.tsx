@@ -145,6 +145,53 @@ describe("boons that are not configured globally", () => {
   });
 });
 
+describe("tool boons follow Function calling", () => {
+  const fnSwitch = () => host.querySelector<HTMLInputElement>('[name="supports_function_calling"]')!;
+  const boon = (name: string) => host.querySelector<HTMLInputElement>(`[name="boon_${name}"]`)!;
+
+  it("refuses a new image or search grant while Function calling is off", async () => {
+    await renderFields(model({ supports_function_calling: false, boons: [] }));
+    expect(boon("image_generation").disabled).toBe(true);
+    expect(boon("web_search").disabled).toBe(true);
+    expect(host.textContent).toContain("needs Function calling");
+    // Boons that don't call tools are unaffected.
+    expect(boon("vision").disabled).toBe(false);
+  });
+
+  it("turns the tool boons off when Function calling is switched off", async () => {
+    await renderFields(model({ supports_function_calling: true, boons: ["image_generation", "web_search", "vision"] }));
+    expect(boon("image_generation").checked).toBe(true);
+    await act(async () => fnSwitch().click());
+    expect(boon("image_generation").checked).toBe(false);
+    expect(boon("image_generation").disabled).toBe(true);
+    expect(boon("web_search").checked).toBe(false);
+    const data = new FormData(host.querySelector("form")!);
+    expect(data.get("boon_image_generation")).toBeNull();
+    expect(data.get("boon_web_search")).toBeNull();
+    expect(data.get("boon_vision")).toBe("on");
+  });
+
+  it("lets them be granted again once Function calling is back on", async () => {
+    await renderFields(model({ supports_function_calling: false, boons: [] }));
+    await act(async () => fnSwitch().click());
+    expect(boon("image_generation").disabled).toBe(false);
+    await act(async () => boon("image_generation").click());
+    expect(new FormData(host.querySelector("form")!).get("boon_image_generation")).toBe("on");
+  });
+
+  it("keeps a grant saved before Function calling was off, and says it does nothing", async () => {
+    // An unrelated save must not drop it; the switch stays operable to ungrant.
+    await renderFields(model({ supports_function_calling: false, boons: ["image_generation"] }));
+    expect(boon("image_generation").checked).toBe(true);
+    expect(boon("image_generation").disabled).toBe(false);
+    expect(new FormData(host.querySelector("form")!).get("boon_image_generation")).toBe("on");
+    expect(host.textContent).toContain("does nothing while Function calling is off");
+    await act(async () => boon("image_generation").click());
+    expect(boon("image_generation").disabled).toBe(true);
+    expect(host.textContent).not.toContain("does nothing while Function calling is off");
+  });
+});
+
 describe("the section markers", () => {
   it("marks the tags and capabilities as present, so clearing every box still saves", async () => {
     await renderFields(model({ tags: [], supports_function_calling: false }));

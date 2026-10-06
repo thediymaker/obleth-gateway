@@ -8,6 +8,7 @@ mod completion;
 mod energy;
 mod jwt_auth;
 mod knowledge;
+mod lifecycle;
 mod mcp;
 mod messages;
 mod metrics;
@@ -16,6 +17,7 @@ mod proxy;
 mod replicas;
 mod responses;
 mod router;
+mod search;
 mod state;
 mod verdicts;
 mod videos;
@@ -76,6 +78,7 @@ async fn main() -> anyhow::Result<()> {
         &cfg.clickhouse_user,
         &cfg.clickhouse_password,
         &cfg.wal_path,
+        cfg.telemetry_flush_interval,
         cfg.fail_open,
     )
     .await?;
@@ -442,8 +445,9 @@ async fn main() -> anyhow::Result<()> {
         Ok(models) => {
             for (_, resolved) in &models {
                 // One key per addressable name: the canonical `model_name` plus
-                // every alias. Resolution stays a single lookup on whatever
-                // name the client sent, so an alias costs nothing per request.
+                // every alias and variant. Resolution stays a single lookup on
+                // whatever name the client sent, so an alias costs nothing per
+                // request.
                 let shared = Arc::new(resolved.clone());
                 for name in resolved.addressable_names() {
                     if let Err(e) = redis.put_resolved_model(name, resolved).await {
@@ -608,6 +612,18 @@ async fn main() -> anyhow::Result<()> {
         .route(
             verdicts::VERDICTS_PATH,
             axum::routing::post(verdicts::handler),
+        )
+        // Native web search (Perplexity shape), in both spellings LiteLLM
+        // serves. `GET /v1/search/tools` shares the `:tool` pattern.
+        .route(search::SEARCH_PATH, axum::routing::post(search::search))
+        .route(
+            "/v1/search/:tool",
+            axum::routing::post(search::search_named).get(search::tools),
+        )
+        .route("/search", axum::routing::post(search::search))
+        .route(
+            "/search/:tool",
+            axum::routing::post(search::search_named).get(search::tools),
         )
         .route("/mcp/:server", axum::routing::any(mcp::mcp_handler))
         .route("/mcp/:server/*rest", axum::routing::any(mcp::mcp_handler))
@@ -1230,7 +1246,9 @@ async fn rewarm_keys(store: &Store, redis: &RedisStore) -> Option<usize> {
     push_and_prune_keys(redis, &snapshot, || store.all_resolved_keys()).await
 }
 
-/// Resolved models keyed by every addressable name (canonical name + aliases).
+/// Resolved models keyed by every addressable name (canonical name, aliases and
+/// variants). A variant's key holds its parent's route as is; the proxy adds
+/// the variant's boons per request.
 fn models_by_name(
     models: Vec<(String, obleth_config::ResolvedModel)>,
 ) -> Vec<(String, obleth_config::ResolvedModel)> {
@@ -1521,10 +1539,29 @@ mod registry_refresh_tests {
         assert!(!Arc::ptr_eq(&before, &registry.load()));
     }
 
+    #[test]
+    fn every_variant_gets_a_resolver_key_holding_its_parent_route() {
+        let mut parent = model("glm-5-3", None);
+        parent.aliases = vec!["glm-5-3-fp8".into()];
+        parent.variants = vec![obleth_config::ModelVariant {
+            name: "glm-5-3-spec".into(),
+            description: String::new(),
+            boons: vec!["speculation".into()],
+        }];
+        let keyed = models_by_name(vec![("glm-5-3".into(), parent.clone())]);
+        let names: Vec<&str> = keyed.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["glm-5-3", "glm-5-3-fp8", "glm-5-3-spec"]);
+        // The variant's key holds the parent unchanged; its boons are added per
+        // request, so the cached route never differs between the names.
+        assert!(keyed.iter().all(|(_, m)| m == &parent));
+    }
+
     fn model(name: &str, request_timeout_secs: Option<i64>) -> obleth_config::ResolvedModel {
         obleth_config::ResolvedModel {
             model_name: name.to_string(),
             aliases: Vec::new(),
+            lifecycle: Default::default(),
+            variants: Vec::new(),
             upstream_model: name.to_string(),
             api_base: "http://upstream".to_string(),
             api_key: None,
@@ -1849,6 +1886,7 @@ mod shutdown_tests {
             key_budget_started_at: None,
             key_weight: 100,
             key_max_in_flight: None,
+            end_user_fairshare: false,
             allowed_models: None,
             internal: false,
             tracing_enabled: false,

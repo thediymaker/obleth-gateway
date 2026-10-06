@@ -41,7 +41,10 @@ pub struct JobSubmit {
     pub exclude: Option<String>,
     /// Slurm `--cpus-per-task`; `None` leaves it to the cluster default.
     pub cpus_per_task: Option<i64>,
-    /// Memory per node in megabytes (slurm `--mem`); `None` leaves it default.
+    /// Memory per node in megabytes (slurm `--mem`); `None` leaves it default
+    /// and `Some(0)` asks for all of each node's memory, as `--mem=0` does.
+    /// The submit turns 0 into the partition's node size, because some
+    /// clusters' submit plugins read 0 as unset and apply a small default.
     pub mem_mb: Option<i64>,
     /// Directory for stdout/stderr files; empty means Slurm default.
     pub log_output_dir: String,
@@ -102,6 +105,19 @@ pub struct ClusterResources {
     pub nodes: Vec<NodeInfo>,
     pub accounts: Vec<String>,
     pub qos: Vec<String>,
+    /// The caller's associations, one per account (and partition, when the
+    /// association names one), so the launcher can tell which accounts a
+    /// partition takes before Slurm refuses the job.
+    #[serde(default)]
+    pub associations: Vec<AssociationInfo>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct AssociationInfo {
+    pub account: String,
+    /// None when the association covers every partition.
+    pub partition: Option<String>,
+    pub qos: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -110,6 +126,12 @@ pub struct PartitionInfo {
     pub nodes: Vec<String>,
     pub default_time: Option<String>,
     pub max_time: Option<String>,
+    /// The partition's AllowAccounts; empty means any account.
+    #[serde(default)]
+    pub allowed_accounts: Vec<String>,
+    /// The partition's DenyAccounts.
+    #[serde(default)]
+    pub denied_accounts: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -119,6 +141,10 @@ pub struct NodeInfo {
     pub gres: String,
     pub cpus: Option<i64>,
     pub real_memory_mb: Option<i64>,
+    /// Memory Slurm keeps back for the node's own daemons (MemSpecLimit), so
+    /// a job can ask for at most `real_memory_mb` minus this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub specialized_memory_mb: Option<i64>,
     pub features: Vec<String>,
     /// Slurm's state flags, e.g. `["IDLE"]` or `["MIXED", "DRAIN"]`. Empty
     /// when slurmrestd does not report them.
@@ -136,9 +162,14 @@ pub enum Action {
     /// Job is running + healthy: register endpoint + mark replica healthy.
     Promote { replica_id: Uuid, api_base: String },
     /// Job vanished/terminal: deregister endpoint (if any) + mark replica lost.
+    /// `raw_state`/`reason` are Slurm's terminal state and reason when the job
+    /// is still visible in slurmrestd (e.g. `TIMEOUT`, `OUT_OF_MEMORY`); both
+    /// `None` when the job is gone from the listing. See [`lost_message`].
     MarkLost {
         replica_id: Uuid,
         endpoint_id: Option<Uuid>,
+        raw_state: Option<String>,
+        reason: Option<String>,
     },
     /// Excess/restarted replica: deregister its endpoint, cancel its job, mark
     /// draining. `endpoint_id` is the linked endpoint to remove from rotation up
@@ -151,6 +182,20 @@ pub enum Action {
     },
     /// GC a long-dead `lost` replica row.
     Delete { replica_id: Uuid },
+}
+
+/// The replica message recorded with a `lost` state: `job ended: <STATE>`,
+/// plus ` (<reason>)` when Slurm gave one, while the job is still visible in
+/// slurmrestd; `job gone` once it is not. The store parses this into the
+/// launch history's `end_state`/`end_reason`, so keep the two in step.
+pub fn lost_message(raw_state: Option<&str>, reason: Option<&str>) -> String {
+    match raw_state.map(str::trim).filter(|s| !s.is_empty()) {
+        None => "job gone".to_string(),
+        Some(state) => match reason.map(str::trim).filter(|r| !r.is_empty()) {
+            Some(r) => format!("job ended: {state} ({r})"),
+            None => format!("job ended: {state}"),
+        },
+    }
 }
 
 /// Why a replica's job is being cancelled — recorded on the replica row so the

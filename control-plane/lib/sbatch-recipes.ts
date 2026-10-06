@@ -1,8 +1,9 @@
 // File-based deployment recipes: a YAML metadata header + the raw `sbatch`
 // script an admin already tested. The header carries routing metadata (engine,
 // model name, port) and optional placement overrides; the body is submitted
-// verbatim as `script_body` while its `#SBATCH` directives are lifted into JSON
-// fields (slurmrestd ignores `#SBATCH` — see ./sbatch-directives).
+// as `script_body` while its `#SBATCH` directives are lifted into JSON fields
+// and left out of the stored script (slurmrestd ignores `#SBATCH` — see
+// ./sbatch-directives).
 //
 // This module owns the new `*.recipe` files (distinct from the former
 // wizard yaml definitions).
@@ -12,7 +13,8 @@ import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 import type { RecipeCard, RecipeDeployPreview } from "@/components/recipes/recipe-card";
 import { toRecipeCards } from "@/components/recipes/recipe-card";
-import { parseSbatchDirectives, type ParsedDirectives } from "./sbatch-directives";
+import { parseSbatchDirectives, stripSbatchDirectives, unixLineEndings, type ParsedDirectives } from "./sbatch-directives";
+import { EMPTY_CLUSTER, inputCapabilities, MODEL_CAPABILITIES, renderScript, type ClusterValues, type ModelCapability, type RecipeInput } from "./recipe-inputs";
 import { splitFrontmatter } from "./recipe-frontmatter";
 import type { PutManagedModel } from "@/lib/obleth";
 import { obleth } from "@/lib/obleth";
@@ -45,7 +47,38 @@ export interface RecipeHeader {
   qos?: string;
   constraints?: string;
   exclude?: string;
+  /** Folder for job logs; overrides an `#SBATCH --output` directory. */
+  log_output_dir?: string;
+  /** For a saved recipe: the recipe it was saved from. */
+  based_on?: string;
   variables?: RecipeVariable[];
+  /** Typed inputs; `variables` are folded in here as text inputs. */
+  inputs: RecipeInput[];
+  /** "engine": a template for any model (asks for `model`); "model": one model. */
+  kind: "model" | "engine";
+  /** Hugging Face repo the recipe serves, for the picker and fit check. */
+  model?: string;
+  /** Weights on disk, in GB, for the fit check. */
+  weights_gb?: number;
+  /** What the image must provide, e.g. "vLLM 0.22.0 or later". */
+  requires?: string;
+  /** Node counts offered as "Runs on"; `nodes` is the default. */
+  node_options?: number[];
+  /** A sentence per node count saying what it means for this model. */
+  node_notes?: Record<string, string>;
+  /** Environment variables exported at the top of the job. */
+  env?: Record<string, string>;
+  /** Where the recipe has been run and served, newest first. */
+  tested?: RecipeTest[];
+}
+
+/** One run of a recipe that served: the hardware, the engine build, when, and
+ *  what was seen (time to ready, speed). */
+export interface RecipeTest {
+  hardware: string;
+  engine?: string;
+  date?: string;
+  result?: string;
 }
 
 export interface ParsedRecipe {
@@ -69,6 +102,45 @@ const VariableSchema = z.object({
   required: z.coerce.boolean().default(false),
 });
 
+const scalar = z.union([z.string(), z.number(), z.boolean()]).transform((v) => String(v));
+
+// YAML reads an unquoted 2026-10-03 as a date; keep it as the text written.
+const day = z.union([z.string(), z.date()]).transform((v) => (typeof v === "string" ? v : v.toISOString().slice(0, 10)));
+
+const TestSchema = z.object({
+  hardware: z.string().min(1),
+  engine: z.string().optional(),
+  date: day.optional(),
+  result: z.string().optional(),
+});
+
+const InputSchema = z.object({
+  name: z.string().regex(/^[a-zA-Z_][a-zA-Z0-9_]*$/, "invalid input name"),
+  label: z.string().optional(),
+  type: z.enum(["text", "choice", "number", "path", "flag"]).default("text"),
+  default: scalar.optional(),
+  required: z.coerce.boolean().default(false),
+  help: z.string().optional(),
+  options: z.array(scalar).optional(),
+  min: z.coerce.number().optional(),
+  max: z.coerce.number().optional(),
+  unit: z.string().optional(),
+  adds: z.string().optional(),
+  capabilities: z.array(z.enum(MODEL_CAPABILITIES)).optional(),
+  by_nodes: z.record(z.string(), scalar).optional(),
+}).refine((i) => !i.capabilities?.length || i.type === "flag", { message: "capabilities only go on a flag input" });
+
+function uniqueNames(what: string) {
+  return (items: { name: string }[] | undefined, ctx: z.RefinementCtx) => {
+    if (!items) return;
+    const seen = new Set<string>();
+    for (const v of items) {
+      if (seen.has(v.name)) ctx.addIssue({ code: z.ZodIssueCode.custom, message: `duplicate ${what} "${v.name}"` });
+      seen.add(v.name);
+    }
+  };
+}
+
 const HeaderSchema = z
   .object({
     name: z.string().min(1),
@@ -91,21 +163,27 @@ const HeaderSchema = z
     qos: z.string().optional(),
     constraints: z.string().optional(),
     exclude: z.string().optional(),
-    variables: z
-      .array(VariableSchema)
-      .optional()
-      .superRefine((vars, ctx) => {
-        if (!vars) return;
-        const seen = new Set<string>();
-        for (const v of vars) {
-          if (seen.has(v.name)) {
-            ctx.addIssue({ code: z.ZodIssueCode.custom, message: `duplicate variable "${v.name}"` });
-          }
-          seen.add(v.name);
-        }
-      }),
+    log_output_dir: z.string().optional(),
+    based_on: z.string().optional(),
+    variables: z.array(VariableSchema).optional().superRefine(uniqueNames("variable")),
+    inputs: z.array(InputSchema).optional().superRefine(uniqueNames("input")),
+    kind: z.enum(["model", "engine"]).default("model"),
+    model: z.string().optional(),
+    weights_gb: z.coerce.number().positive().optional(),
+    requires: z.string().optional(),
+    node_options: z.array(z.coerce.number().int().positive()).optional(),
+    node_notes: z.record(z.string(), z.string()).optional(),
+    env: z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/, "invalid environment variable name"), scalar).optional(),
+    tested: z.array(TestSchema).optional(),
   })
-  .strip();
+  .strip()
+  .transform((h) => {
+    // `variables` (the older, text-only form) become text inputs, so everything
+    // downstream deals with one list. A name in both keeps the typed input.
+    const typed = h.inputs ?? [];
+    const legacy = (h.variables ?? []).filter((v) => !typed.some((i) => i.name === v.name)).map((v): RecipeInput => ({ ...v, type: "text" }));
+    return { ...h, inputs: [...typed, ...legacy] };
+  });
 
 export function parseRecipe(id: string, text: string): ParsedRecipe {
   const split = splitFrontmatter(text);
@@ -212,6 +290,21 @@ export function getRecipe(id: string): ParsedRecipe | null {
   }
 }
 
+/** A recipe's full text (header and script) by id, from either source. */
+export async function resolveRecipeText(id: string): Promise<string | null> {
+  try {
+    return readRecipeText(id);
+  } catch {
+    // not a file recipe
+  }
+  try {
+    const rows = await obleth.listRecipes();
+    return rows.find((r) => r.id === id)?.body ?? null;
+  } catch {
+    return null;
+  }
+}
+
 /** Resolve a recipe by id across both sources, mirroring `loadRecipeCards`:
  *  file recipes (filename stem) first, then DB templates (UUID id) fetched from
  *  the admin API. Saved templates live only in the database, so callers that
@@ -245,9 +338,18 @@ export interface DeployOverrides {
   gres?: string;
   mem?: string;
   cpus_per_task?: number | null;
+  nodes?: number;
+  constraints?: string;
+  exclude?: string;
+  log_output_dir?: string;
+  health_path?: string;
   min_replicas?: number;
   max_job_failures?: number;
+  /** Input values by name. `variables` is the older name for the same thing. */
+  inputs?: Record<string, string>;
   variables?: Record<string, string>;
+  /** Environment for the job, replacing the recipe's `env:` when given. */
+  env?: Record<string, string>;
   /** When set, replaces the recipe's script body before variable substitution.
    *  Carries a deploy-time edit (e.g. a fixed image path) through the normal
    *  pipeline so variables and chdir still apply. */
@@ -260,7 +362,7 @@ export interface DeployPayload {
     upstream_model: string;
     api_base: string;
     model_type: string;
-  };
+  } & Partial<Record<`supports_${ModelCapability}`, true>>;
   managedBody: PutManagedModel;
 }
 
@@ -277,28 +379,15 @@ function overrideString(override: string | undefined, recipeValue: string | unde
   return trimmed === "" ? undefined : trimmed;
 }
 
-/** Replace declared {{name}} tokens with their resolved values in a single pass.
- *  Only declared names are touched; undeclared {{...}} and all shell ${...}/$(...)
- *  pass through, and substituted text is never re-scanned. Throws when a required
- *  variable has neither a submitted value nor a default. */
-function substituteVariables(
-  body: string,
-  declared: RecipeVariable[] | undefined,
-  values: Record<string, string> | undefined,
-): string {
-  if (!declared || declared.length === 0) return body;
-  const resolved = new Map<string, string>();
-  for (const v of declared) {
-    const value = values?.[v.name]?.trim() || v.default;
-    if (value === undefined || value === "") {
-      if (v.required) throw new Error(`required variable "${v.name}" has no value`);
-      continue; // optional + unset: leave the {{token}} in place
-    }
-    resolved.set(v.name, value);
-  }
-  return body.replace(/\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}/g, (match, name) =>
-    resolved.has(name) ? (resolved.get(name) as string) : match,
-  );
+/** Export the job's environment right after the shebang (before any chdir
+ *  guard is added, so the guard still comes first). Values are single-quoted. */
+function applyEnv(body: string, env: Record<string, string> | undefined): string {
+  const entries = Object.entries(env ?? {}).filter(([k]) => k.trim());
+  if (!entries.length) return body;
+  const block = entries.map(([k, v]) => `export ${k}='${v.replace(/'/g, "'\\''")}'`).join("\n");
+  const lines = body.split("\n");
+  if (lines[0]?.startsWith("#!")) return [lines[0], block, ...lines.slice(1)].join("\n");
+  return [block, ...lines].join("\n");
 }
 
 /** If the recipe declares --chdir, guard the script with a `cd` after the shebang. */
@@ -320,6 +409,8 @@ function applyChdir(body: string, chdir: string | undefined): string {
 export function buildManagedFromRecipe(
   recipe: ParsedRecipe,
   overrides: DeployOverrides = {},
+  cluster: ClusterValues = EMPTY_CLUSTER,
+  { strict = true }: { strict?: boolean } = {},
 ): DeployPayload {
   if (!recipe.valid || !recipe.header || !recipe.body || !recipe.directives) {
     throw new Error(`cannot deploy invalid recipe "${recipe.id}": ${recipe.error ?? "unknown"}`);
@@ -333,24 +424,35 @@ export function buildManagedFromRecipe(
     enabled: true,
     partition: overrideString(overrides.partition, placement(h.partition, d.partition)) ?? "",
     gres: overrideString(overrides.gres, placement(h.gres, d.gres)),
-    nodes: placement(h.nodes, d.nodes),
+    nodes: overrides.nodes ?? placement(h.nodes, d.nodes),
     cpus_per_task: overrides.cpus_per_task !== undefined ? overrides.cpus_per_task : placement(h.cpus_per_task, d.cpus_per_task) ?? null,
     mem: overrideString(overrides.mem, placement(h.mem, d.mem)) ?? null,
     time_limit: overrideString(overrides.time_limit, placement(h.time_limit, d.time_limit)) ?? null,
     account: overrideString(overrides.account, placement(h.account, d.account)) ?? null,
     qos: overrideString(overrides.qos, placement(h.qos, d.qos)) ?? null,
-    constraints: placement(h.constraints, d.constraints) ?? null,
-    exclude: placement(h.exclude, d.exclude) ?? null,
-    log_output_dir: d.log_output_dir ?? "",
+    constraints: overrideString(overrides.constraints, placement(h.constraints, d.constraints)) ?? null,
+    exclude: overrideString(overrides.exclude, placement(h.exclude, d.exclude)) ?? null,
+    log_output_dir: overrideString(overrides.log_output_dir, h.log_output_dir ?? d.log_output_dir ?? (cluster.logs || undefined)) ?? "",
     image: "",
     preamble: "",
     launch_command: "",
+    // The #SBATCH lines are already in the fields above, and Slurm doesn't
+    // read them from a submitted script, so the stored script leaves them out.
     script_body: applyChdir(
-      substituteVariables(overrides.script_body ?? recipe.body, h.variables, overrides.variables),
+      applyEnv(
+        stripSbatchDirectives(
+          renderScript(unixLineEndings(overrides.script_body ?? recipe.body), h.inputs, overrides.inputs ?? overrides.variables, cluster, {
+            strict,
+            nodes: overrides.nodes ?? placement(h.nodes, d.nodes),
+            builtins: { api_model_name: modelName },
+          }),
+        ),
+        overrides.env ?? h.env,
+      ),
       d.chdir,
     ),
     serving_port: h.port,
-    health_path: h.health_path?.trim() || defaultHealthPath(h.engine),
+    health_path: overrides.health_path?.trim() || h.health_path?.trim() || defaultHealthPath(h.engine),
     min_replicas: overrides.min_replicas ?? h.min_replicas ?? 1,
     target_replicas: targetReplicas,
     max_job_failures: overrides.max_job_failures ?? h.max_job_failures ?? 3,
@@ -359,8 +461,15 @@ export function buildManagedFromRecipe(
       recipe_id: recipe.id,
       engine: h.engine,
       name: h.name,
+      // Kept so "Save as recipe" on the deployment can write the same values back.
+      ...(Object.keys(overrides.inputs ?? overrides.variables ?? {}).length ? { inputs: overrides.inputs ?? overrides.variables } : {}),
+      ...(overrides.env ? { env: overrides.env } : {}),
     },
   };
+
+  // What the flags that are on tell us the model can do, e.g. a tool parser
+  // means function calling, so its tool boons work without a second step.
+  const capabilities = inputCapabilities(h.inputs, overrides.inputs ?? overrides.variables, cluster, overrides.nodes ?? placement(h.nodes, d.nodes));
 
   return {
     createBody: {
@@ -368,6 +477,7 @@ export function buildManagedFromRecipe(
       upstream_model: modelName,
       api_base: "",
       model_type: h.model_type,
+      ...Object.fromEntries(capabilities.map((c) => [`supports_${c}`, true])),
     },
     managedBody,
   };
@@ -379,7 +489,8 @@ export function buildDeployPreview(recipe: ParsedRecipe): RecipeDeployPreview | 
   if (!recipe.valid || !recipe.header) return undefined;
   let payload;
   try {
-    payload = buildManagedFromRecipe(recipe);
+    // Not strict: an engine recipe's model has no default until someone picks one.
+    payload = buildManagedFromRecipe(recipe, {}, EMPTY_CLUSTER, { strict: false });
   } catch {
     return undefined;
   }
@@ -407,6 +518,17 @@ export function buildDeployPreview(recipe: ParsedRecipe): RecipeDeployPreview | 
     rawBody: recipe.body ?? "",
     warnings: recipe.warnings,
     variables: recipe.header.variables,
+    inputs: recipe.header.inputs,
+    kind: recipe.header.kind,
+    model: recipe.header.model,
+    weightsGb: recipe.header.weights_gb,
+    requires: recipe.header.requires,
+    nodeOptions: recipe.header.node_options,
+    nodeNotes: recipe.header.node_notes,
+    basedOn: recipe.header.based_on,
+    env: recipe.header.env,
+    description: recipe.header.description,
+    tested: recipe.header.tested,
   };
 }
 

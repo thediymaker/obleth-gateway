@@ -12,6 +12,7 @@ import {
   saveDeploymentSettingsAction,
   setDeploymentEnabledAction,
   setDeploymentReplicasAction,
+  saveRecipeFromDeploymentAction,
 } from "@/app/actions";
 import { SettingsForm } from "@/components/access/settings-form";
 import { SettingsCard } from "@/components/access/ui";
@@ -36,23 +37,26 @@ import {
   parseTimeLimit,
   partitionFits,
   replicaPhase,
+  slurmErrorText,
   slurmStatus,
   walltimeChoices,
   walltimeLabel,
   formatTimeLimit,
+  replicaAsk,
   type ReplicaPhase,
 } from "@/lib/deployments-model";
 import { logsHref } from "@/lib/log-links";
 import { modelHref } from "@/lib/models-model";
 import type { AuditEntry, ManagedModelSpec, ModelReplica } from "@/lib/obleth";
 import { compact } from "@/lib/overview-model";
+import { sbatchLines, stripSbatchDirectives, type PlacementKey, type SbatchLine } from "@/lib/sbatch-directives";
 import { useClusterResources } from "@/lib/use-cluster-resources";
 import { cn, getJson } from "@/lib/utils";
 
 type Card = "script" | "placement" | "service";
 
 function cardOf(name: string): Card | null {
-  if (name === "slurm_script_body") return "script";
+  if (name === "slurm_script_body" || name === "slurm_log_output_dir") return "script";
   if (["slurm_partition", "slurm_gres", "slurm_cpus_per_task", "slurm_mem", "slurm_nodes", "slurm_account", "slurm_qos", "slurm_time_limit", "slurm_constraints", "slurm_exclude"].includes(name)) return "placement";
   if (["slurm_serving_port", "slurm_health_path", "slurm_min_replicas", "slurm_max_job_failures"].includes(name)) return "service";
   return null;
@@ -60,6 +64,7 @@ function cardOf(name: string): Card | null {
 
 const LABELS: Record<string, string> = {
   slurm_script_body: "Job script",
+  slurm_log_output_dir: "Job logs",
   slurm_partition: "Partition",
   slurm_gres: "GPUs",
   slurm_cpus_per_task: "CPUs",
@@ -119,75 +124,176 @@ function ReplicaCard({ r, letter, onRestart, pending }: { r: ModelReplica; lette
   );
 }
 
-function PlacementFields({ spec }: { spec: ManagedModelSpec }) {
+type Placement = Record<PlacementKey, string>;
+
+const SETTING_NAME: Record<PlacementKey, string> = {
+  partition: "partition",
+  gres: "GPUs",
+  cpus_per_task: "CPUs",
+  mem: "memory",
+  nodes: "nodes",
+  account: "account",
+  qos: "QoS",
+  time_limit: "walltime",
+  constraints: "constraints",
+  exclude: "excluded nodes",
+};
+
+function placementOf(spec: ManagedModelSpec): Placement {
+  return {
+    partition: spec.partition,
+    gres: spec.gres,
+    cpus_per_task: spec.cpus_per_task ? String(spec.cpus_per_task) : "",
+    mem: spec.mem ?? "",
+    nodes: String(spec.nodes),
+    account: spec.account ?? "",
+    qos: spec.qos ?? "",
+    time_limit: spec.time_limit ?? "",
+    constraints: spec.constraints ?? "",
+    exclude: spec.exclude ?? "",
+  };
+}
+
+/**
+ * The job script and where it runs, edited together: a script pasted with
+ * `#SBATCH` lines can hand their values to Placement, which is what Slurm
+ * actually gets.
+ */
+function ScriptAndPlacement({ spec }: { spec: ManagedModelSpec }) {
+  const [script, setScript] = useState(spec.script_body ?? "");
+  const [place, setPlace] = useState<Placement>(() => placementOf(spec));
+  const set = useCallback((key: PlacementKey, v: string) => setPlace((p) => ({ ...p, [key]: v })), []);
+  const lines = useMemo(() => sbatchLines(script), [script]);
+
+  function moveToPlacement() {
+    setPlace((p) => {
+      const next = { ...p };
+      for (const l of lines) if (l.setting && l.value) next[l.setting] = l.value;
+      return next;
+    });
+    setScript(stripSbatchDirectives(script));
+  }
+
+  return (
+    <>
+      <SettingsCard id="script" title="Script" description="What each replica's job runs. obleth adds the port binding before it; the server must listen on $OBLETH_SERVING_PORT. GPUs, CPUs and memory are set under Placement.">
+        <Setting id="set-script" label="Job script" hint="A change applies to jobs started after you save." fields={["slurm_script_body"]}>
+          <TextArea name="slurm_script_body" label="Job script" rows={Math.min(24, Math.max(8, script.split("\n").length + 1))} value={script} onChange={setScript} />
+          {lines.length > 0 && <SbatchNotice lines={lines} place={place} onMove={moveToPlacement} />}
+        </Setting>
+        <Setting id="set-logs" label="Job logs" hint="The folder where Slurm writes each job's output. Use one you can read from a login node, like your scratch." fields={["slurm_log_output_dir"]} was={{ field: "slurm_log_output_dir" }}>
+          <TextField name="slurm_log_output_dir" label="Job logs" defaultValue={spec.log_output_dir ?? ""} placeholder="/scratch/you/logs" mono className="w-full max-w-[520px]" />
+          <span className="text-xs text-muted-foreground">Each job writes its output there as &lt;job name&gt;-&lt;job id&gt;.out, and errors as .err. Left blank, Slurm uses the job&apos;s working directory: /tmp on the node it ran on, which you can only read from that node.</span>
+        </Setting>
+      </SettingsCard>
+      <SettingsCard id="placement" title="Placement" description="Where Slurm runs each replica and what each job asks for. Choices come from the cluster.">
+        <PlacementFields spec={spec} value={place} set={set} />
+      </SettingsCard>
+    </>
+  );
+}
+
+/** Why a script's #SBATCH lines do nothing, and a way to move them where they count. */
+function SbatchNotice({ lines, place, onMove }: { lines: SbatchLine[]; place: Placement; onMove: () => void }) {
+  const n = lines.length;
+  return (
+    <div role="status" className="flex flex-col gap-2 rounded-lg border border-foreground px-3.5 py-3 text-[12.5px]">
+      <p className="font-medium">Slurm doesn&apos;t read {n === 1 ? "this #SBATCH line" : `these ${n} #SBATCH lines`}</p>
+      <p className="leading-relaxed text-secondary-foreground">obleth submits each job through Slurm&apos;s REST API, which ignores #SBATCH lines. Jobs get their GPUs, CPUs, memory and the rest from Placement below, so editing {n === 1 ? "this line" : "these lines"} changes nothing.</p>
+      <ul className="flex flex-col gap-1">
+        {lines.map((l, i) => {
+          const now = l.setting ? place[l.setting].trim() : "";
+          return (
+            <li key={i} className="grid gap-x-3 sm:grid-cols-[minmax(0,220px)_minmax(0,1fr)]">
+              <span className="truncate font-mono text-[12px]">{l.text}</span>
+              <span className="text-secondary-foreground">
+                {!l.setting ? "obleth has no setting for this, so it has no effect. It comes out with the others." : now === l.value ? `Placement's ${SETTING_NAME[l.setting]} is the same.` : <>Placement&apos;s {SETTING_NAME[l.setting]} is {now ? <span className="font-mono text-[12px]">{now}</span> : "blank"}; this would make it <span className="font-mono text-[12px]">{l.value}</span>.</>}
+              </span>
+            </li>
+          );
+        })}
+      </ul>
+      <div className="flex flex-wrap items-center gap-3 pt-0.5">
+        <Button type="button" size="sm" variant="outline" onClick={onMove}>Move them to Placement</Button>
+        <span className="text-[12px] text-muted-foreground">Placement takes their values and the lines come out of the script. Nothing changes until you save.</span>
+      </div>
+    </div>
+  );
+}
+
+function PlacementFields({ spec, value, set }: { spec: ManagedModelSpec; value: Placement; set: (key: PlacementKey, v: string) => void }) {
   const resources = useClusterResources();
-  const [partition, setPartition] = useState(spec.partition);
-  const [gres, setGres] = useState(spec.gres);
-  const [cpus, setCpus] = useState(spec.cpus_per_task ? String(spec.cpus_per_task) : "");
-  const [mem, setMem] = useState(spec.mem ?? "");
-  const [time, setTime] = useState(spec.time_limit ?? "");
-  const [account, setAccount] = useState(spec.account ?? "");
-  const [qos, setQos] = useState(spec.qos ?? "");
+  const { partition, gres, cpus_per_task: cpus, mem, time_limit: time, account, qos } = value;
+  const nodes = Number(value.nodes) || 1;
   const fits = useMemo(() => partitionFits(resources, { gpus: gresCount(gres), cpus: cpus ? Number(cpus) : null, memMb: memToMb(mem) }), [resources, gres, cpus, mem]);
   const fit = fits.find((f) => f.name === partition);
   const minutes = parseTimeLimit(time);
-  const partitions = [...new Set([spec.partition, ...resources.partitions.map((p) => p.name)])].filter(Boolean);
+  const partitions = [...new Set([partition, spec.partition, ...resources.partitions.map((p) => p.name)])].filter(Boolean);
   const pick = (list: string[], current: string) => [...new Set([current, ...list])].filter(Boolean);
+  const box = "flex flex-col gap-1 text-[12px] text-muted-foreground";
 
   return (
     <>
       <Setting id="set-partition" label="Partition" hint="Where Slurm runs each replica." fields={["slurm_partition"]} was={{ field: "slurm_partition" }}>
         <div className="flex flex-wrap items-center gap-2.5">
           {resources.partitions.length ? (
-            <div className="w-56"><Select name="slurm_partition" aria-label="Partition" value={partition} onValueChange={setPartition} className="h-9 text-[13px]" options={partitions.map((p) => ({ value: p, label: p }))} /></div>
+            <div className="w-56"><Select name="slurm_partition" aria-label="Partition" value={partition} onValueChange={(v) => set("partition", v)} className="h-9 text-[13px]" options={partitions.map((p) => ({ value: p, label: p }))} /></div>
           ) : (
-            <TextField name="slurm_partition" label="Partition" required value={partition} onChange={(e) => setPartition(e.target.value)} mono className="w-56" />
+            <TextField name="slurm_partition" label="Partition" required value={partition} onChange={(e) => set("partition", e.target.value)} mono className="w-56" />
           )}
           {fit && <span className={cn("text-xs", fit.fits ? "text-muted-foreground" : "font-medium text-foreground")}>{fit.fits ? `${fit.shape} · ${fit.nodes.length} nodes${fit.idleFitting != null ? ` · ${fit.idleFitting} idle that fit` : ""}${fit.maxMinutes ? ` · max ${walltimeLabel(fit.maxMinutes)}` : ""}` : `Won't fit: ${fit.reason}`}</span>}
         </div>
       </Setting>
-      <Setting id="set-resources" label="Each replica gets" hint="GPUs as gres, CPUs, and memory per node. Blank uses the partition's default." fields={["slurm_gres", "slurm_cpus_per_task", "slurm_mem", "slurm_nodes"]}>
-        <div className="flex flex-wrap items-center gap-2">
-          <TextField name="slurm_gres" label="GPUs (gres)" value={gres} onChange={(e) => setGres(e.target.value)} placeholder="gpu:1" mono className="w-28" />
-          <TextField name="slurm_cpus_per_task" label="CPUs" inputMode="numeric" value={cpus} onChange={(e) => setCpus(e.target.value)} placeholder="CPUs" mono className="w-24" />
-          <TextField name="slurm_mem" label="Memory" value={mem} onChange={(e) => setMem(e.target.value)} placeholder="560G" mono className="w-24" />
-          <TextField name="slurm_nodes" label="Nodes" inputMode="numeric" defaultValue={spec.nodes} mono className="w-20" />
-          <span className="text-xs text-muted-foreground">nodes per job</span>
+      <Setting id="set-nodes" label="Nodes per replica" hint="Each replica is one Slurm job. Use more than 1 only when the script spreads the model across nodes." fields={["slurm_nodes"]} was={{ field: "slurm_nodes" }}>
+        <TextField name="slurm_nodes" label="Nodes per replica" inputMode="numeric" value={value.nodes} onChange={(e) => set("nodes", e.target.value)} mono className="w-20" />
+      </Setting>
+      <Setting id="set-resources" label={nodes > 1 ? "On each node" : "On its node"} hint="What the job asks Slurm for. Leave a box empty to take the default." fields={["slurm_gres", "slurm_cpus_per_task", "slurm_mem"]}>
+        <div className="grid max-w-[520px] gap-2.5 sm:grid-cols-3">
+          <label className={box}>GPUs<TextField name="slurm_gres" label="GPUs" value={gres} onChange={(e) => set("gres", e.target.value)} placeholder="gpu:1" mono className="text-foreground" /><span className="text-[11.5px]">As Slurm gres, like gpu:1 or gpu:h100:4</span></label>
+          <label className={box}>CPUs<TextField name="slurm_cpus_per_task" label="CPUs" inputMode="numeric" value={cpus} onChange={(e) => set("cpus_per_task", e.target.value)} placeholder="Slurm default" mono className="text-foreground" /><span className="text-[11.5px]">A whole number, like 72</span></label>
+          <label className={box}>Memory<TextField name="slurm_mem" label="Memory" value={mem} onChange={(e) => set("mem", e.target.value)} placeholder="Partition default" mono className="text-foreground" /><span className="text-[11.5px]">Like 500G, or 0 for all of it</span></label>
         </div>
+        <p className="text-[12.5px] text-secondary-foreground">{replicaAsk({ nodes, gres, cpus, mem })}{fit && !fit.fits ? ` That's more than a ${fit.name} node has: ${fit.reason}.` : ""}</p>
       </Setting>
       <Setting id="set-account" label="Account · QoS" hint="Blank uses your Slurm user's defaults." fields={["slurm_account", "slurm_qos"]}>
         <div className="flex flex-wrap gap-2">
           {resources.accounts.length ? (
-            <div className="w-48"><Select name="slurm_account" aria-label="Account" value={account} onValueChange={setAccount} className="h-9 text-[13px]" options={[{ value: "", label: "Default account" }, ...pick(resources.accounts, account).map((a) => ({ value: a, label: a }))]} /></div>
+            <div className="w-48"><Select name="slurm_account" aria-label="Account" value={account} onValueChange={(v) => set("account", v)} className="h-9 text-[13px]" options={[{ value: "", label: "Default account" }, ...pick(resources.accounts, account).map((a) => ({ value: a, label: a }))]} /></div>
           ) : (
-            <TextField name="slurm_account" label="Account" value={account} onChange={(e) => setAccount(e.target.value)} placeholder="Default account" mono className="w-48" />
+            <TextField name="slurm_account" label="Account" value={account} onChange={(e) => set("account", e.target.value)} placeholder="Default account" mono className="w-48" />
           )}
           {resources.qos.length ? (
-            <div className="w-40"><Select name="slurm_qos" aria-label="QoS" value={qos} onValueChange={setQos} className="h-9 text-[13px]" options={[{ value: "", label: "Default QoS" }, ...pick(resources.qos, qos).map((a) => ({ value: a, label: a }))]} /></div>
+            <div className="w-40"><Select name="slurm_qos" aria-label="QoS" value={qos} onValueChange={(v) => set("qos", v)} className="h-9 text-[13px]" options={[{ value: "", label: "Default QoS" }, ...pick(resources.qos, qos).map((a) => ({ value: a, label: a }))]} /></div>
           ) : (
-            <TextField name="slurm_qos" label="QoS" value={qos} onChange={(e) => setQos(e.target.value)} placeholder="Default QoS" mono className="w-40" />
+            <TextField name="slurm_qos" label="QoS" value={qos} onChange={(e) => set("qos", e.target.value)} placeholder="Default QoS" mono className="w-40" />
           )}
         </div>
       </Setting>
       <Setting id="set-walltime" label="Walltime per job" hint="When a job's time is up, obleth submits a new one." fields={["slurm_time_limit"]} was={{ field: "slurm_time_limit" }}>
         <div className="flex flex-wrap items-center gap-1.5">
           {walltimeChoices(fit?.maxMinutes ?? null).map((m, i, all) => (
-            <button key={m} type="button" aria-pressed={minutes === m} onClick={() => setTime(formatTimeLimit(m))} className={cn("inline-flex h-8 items-center rounded-full border px-3 text-[12.5px]", minutes === m ? "border-foreground bg-secondary text-foreground" : "border-border text-muted-foreground hover:text-foreground")}>
+            <button key={m} type="button" aria-pressed={minutes === m} onClick={() => set("time_limit", formatTimeLimit(m))} className={cn("inline-flex h-8 items-center rounded-full border px-3 text-[12.5px]", minutes === m ? "border-foreground bg-secondary text-foreground" : "border-border text-muted-foreground hover:text-foreground")}>
               {walltimeLabel(m)}{fit?.maxMinutes && i === all.length - 1 ? " · most" : ""}
             </button>
           ))}
-          <TextField name="slurm_time_limit" label="Walltime" value={time} onChange={(e) => setTime(e.target.value)} placeholder="D-HH:MM:SS" mono className="ml-1 w-36" />
+          <TextField name="slurm_time_limit" label="Walltime" value={time} onChange={(e) => set("time_limit", e.target.value)} placeholder="D-HH:MM:SS" mono className="ml-1 w-36" />
         </div>
         {fit?.maxMinutes && minutes && minutes > fit.maxMinutes ? <span className="text-xs font-medium">Over {partition}&apos;s {walltimeLabel(fit.maxMinutes)} limit: Slurm will refuse it.</span> : null}
       </Setting>
       <Setting id="set-constraints" label="Constraints · excluded nodes" hint="Node features to require, and nodes to keep off." fields={["slurm_constraints", "slurm_exclude"]}>
         <div className="flex flex-wrap gap-2">
-          <TextField name="slurm_constraints" label="Constraints" defaultValue={spec.constraints ?? ""} placeholder="e.g. h200&nvlink" mono className="w-56" />
-          <TextField name="slurm_exclude" label="Excluded nodes" defaultValue={spec.exclude ?? ""} placeholder="e.g. node[01-04]" mono className="w-56" />
+          <TextField name="slurm_constraints" label="Constraints" value={value.constraints} onChange={(e) => set("constraints", e.target.value)} placeholder="e.g. h200&nvlink" mono className="w-56" />
+          <TextField name="slurm_exclude" label="Excluded nodes" value={value.exclude} onChange={(e) => set("exclude", e.target.value)} placeholder="e.g. node[01-04]" mono className="w-56" />
         </div>
       </Setting>
     </>
   );
+}
+
+/** Where a job's output went, in a sentence: the Job logs folder, or /tmp on its node. */
+function JobOutput({ dir, job, node }: { dir: string | null | undefined; job?: string; node?: string | null }) {
+  if (dir) return <>{job ? `Job ${job}'s output is in ` : "Each job's output is in "}<span className="font-mono text-[12px]">{dir}</span>{job ? <>, in the file ending <span className="font-mono text-[12px]">-{job}.out</span> (errors in .err).</> : ", as <job name>-<job id>.out and .err."}</>;
+  return <>Job logs isn&apos;t set, so {job ? `job ${job}'s` : "each job's"} output stayed in Slurm&apos;s default place, /tmp on {node ? <span className="font-mono text-[12px]">{node}</span> : "the node it ran on"}. Set Job logs under Script to keep it in a folder you can read.</>;
 }
 
 function RemoveDialog({ open, onClose, name, onRemove, pending }: { open: boolean; onClose: () => void; name: string; onRemove: (deleteModel: boolean) => void; pending: boolean }) {
@@ -216,6 +322,7 @@ export function ManagedPage({ modelId, initial, changes }: { modelId: string; in
   const [pending, start] = useTransition();
   const [notice, setNotice] = useState<{ text: string; strong?: boolean } | null>(null);
   const [removing, setRemoving] = useState(false);
+  const [saveName, setSaveName] = useState<string | null>(null);
   const [dirty, setDirty] = useState<string[]>([]);
   const [active, setActive] = useState("replicas");
   const live = useQuery({ queryKey: ["deployments"], queryFn: () => getJson<DeploymentsData>("/api/live/deployments"), initialData: initial, refetchInterval: 10_000 });
@@ -233,6 +340,7 @@ export function ManagedPage({ modelId, initial, changes }: { modelId: string; in
   const queued = fairshare.data?.model_queued?.[model.model_name] ?? 0;
   const cap = model.max_in_flight ?? 0;
   const engine = typeof spec.launcher_spec?.name === "string" ? (spec.launcher_spec.name as string) : null;
+  const fromRecipe = typeof spec.launcher_spec?.recipe_id === "string";
   const provisionerOk = !!data.slurm?.enabled && !!data.slurm.provisioner_running;
 
   const refresh = useCallback(async () => {
@@ -338,12 +446,26 @@ export function ManagedPage({ modelId, initial, changes }: { modelId: string; in
               <DropdownMenuItem onSelect={() => router.push(modelHref(model.model_name))}>Model settings</DropdownMenuItem>
               {model.enabled && <DropdownMenuItem onSelect={() => router.push(`/playground?model=${encodeURIComponent(model.model_name)}`)}>Try in Playground</DropdownMenuItem>}
               <DropdownMenuItem disabled={current.length === 0} onSelect={restartAll}>Restart all replicas…</DropdownMenuItem>
+              {fromRecipe && <DropdownMenuItem onSelect={() => setSaveName(`${engine ?? model.model_name} · ${spec.partition}${spec.nodes > 1 ? ` · ${spec.nodes} nodes` : ""}`)}>Save as recipe…</DropdownMenuItem>}
               <DropdownMenuSeparator />
               <DropdownMenuItem onSelect={() => setRemoving(true)}>Remove deployment…</DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
         </div>
       </div>
+
+      {fromRecipe && counts.healthy > 0 && saveName === null && (
+        <p className="text-[12.5px] text-muted-foreground">It serves. <button type="button" onClick={() => setSaveName(`${engine ?? model.model_name} · ${spec.partition}${spec.nodes > 1 ? ` · ${spec.nodes} nodes` : ""}`)} className="text-secondary-foreground underline underline-offset-[3px] hover:text-foreground">Save these settings as a recipe</button> to launch it the same way again.</p>
+      )}
+      {saveName !== null && (
+        <form onSubmit={(e) => { e.preventDefault(); run(async () => { const res = await saveRecipeFromDeploymentAction(modelId, saveName); if (res.ok) setSaveName(null); return res; }, "Saved. It's under Recipes › Saved, and first in New deployment."); }} aria-label="Save as recipe" className="flex flex-wrap items-center gap-2 rounded-xl border border-border bg-card px-4 py-3">
+          <span className="text-[13px] font-medium">Save as recipe</span>
+          <input aria-label="Recipe name" value={saveName} onChange={(e) => setSaveName(e.target.value)} className="h-9 min-w-[260px] flex-1 rounded-lg border border-input bg-background px-3 text-[13px]" />
+          <Button type="submit" size="sm" className="h-9" disabled={pending || !saveName.trim()}>Save</Button>
+          <Button type="button" variant="ghost" size="sm" className="h-9" onClick={() => setSaveName(null)}>Cancel</Button>
+          <span className="basis-full text-[12px] text-muted-foreground">Keeps the partition, account, QoS, walltime, replica counts and the recipe&apos;s values this deployment runs with.</span>
+        </form>
+      )}
 
       {!provisionerOk && (
         <Notice strong>
@@ -356,7 +478,11 @@ export function ManagedPage({ modelId, initial, changes }: { modelId: string; in
         <section aria-label="Why it stopped" className="flex flex-col gap-3 rounded-xl border-[1.5px] border-foreground bg-card px-5 py-4">
           <p className="text-[15px] font-semibold">obleth stopped launching {model.model_name}</p>
           {spec.last_provision_error && counts.lost < spec.max_job_failures ? (
-            <p className="max-w-3xl text-[13px] text-secondary-foreground">Slurm refused the job when it was submitted: <span className="font-mono text-[12px] text-foreground">{spec.last_provision_error}</span></p>
+            <div className="flex max-w-3xl flex-col gap-1.5 text-[13px] text-secondary-foreground">
+              <p>Slurm refused the job when it was submitted: <b className="font-semibold text-foreground">{slurmErrorText(spec.last_provision_error)}</b></p>
+              {/invalid account|account\/partition/i.test(spec.last_provision_error) && <p>The account {spec.account ? <span className="font-mono text-[12px]">{spec.account}</span> : "(your default)"} can&apos;t run jobs on <span className="font-mono text-[12px]">{spec.partition}</span>. Change the account or the partition under Placement, then try once more.</p>}
+              <details className="text-[12px]"><summary className="cursor-pointer text-muted-foreground">Slurm&apos;s full answer</summary><pre className="mt-1.5 whitespace-pre-wrap break-all font-mono text-[11.5px] text-muted-foreground">{spec.last_provision_error}</pre></details>
+            </div>
           ) : (
             <p className="max-w-3xl text-[13px] text-secondary-foreground">
               The last {counts.lost} job{counts.lost === 1 ? "" : "s"} ended without becoming healthy, so it stopped submitting new ones (the limit is {spec.max_job_failures} failed jobs on record; each is forgotten 15 minutes after it ends).
@@ -366,6 +492,7 @@ export function ManagedPage({ modelId, initial, changes }: { modelId: string; in
           {lost[0] && (
             <p className="max-w-3xl text-[13px]"><b className="font-semibold">What Slurm last said:</b> <span className="font-mono text-[12px]">{lost[0].last_message || "the job was gone"}</span>, after {duration(new Date(lost[0].updated_at).getTime() - new Date(lost[0].created_at).getTime())}.</p>
           )}
+          {lost[0]?.slurm_job_id && <p className="max-w-3xl text-[13px] text-secondary-foreground"><JobOutput dir={spec.log_output_dir} job={lost[0].slurm_job_id} node={lost[0].nodes} /></p>}
           <div className="flex flex-wrap gap-2">
             <Button type="button" size="sm" disabled={pending} onClick={() => run(() => clearLostReplicasAction(modelId), "Cleared. obleth will try again on its next pass.")}>Try once more</Button>
             <Button type="button" size="sm" variant="outline" onClick={() => document.getElementById("script")?.scrollIntoView({ behavior: "smooth" })}>Edit the script</Button>
@@ -430,7 +557,7 @@ export function ManagedPage({ modelId, initial, changes }: { modelId: string; in
                       <span className="font-mono text-[12px] text-muted-foreground">{new Date(r.updated_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
                     </div>
                   ))}
-                  <p className="border-t border-border pt-2 text-xs text-muted-foreground">Job output is in {spec.log_output_dir ? <span className="font-mono">{spec.log_output_dir}</span> : "the job's working directory"} on the cluster.</p>
+                  <p className="border-t border-border pt-2 text-xs text-muted-foreground"><JobOutput dir={spec.log_output_dir} /></p>
                 </div>
               </details>
             )}
@@ -449,14 +576,7 @@ export function ManagedPage({ modelId, initial, changes }: { modelId: string; in
             ariaLabel={`${model.model_name} launch settings`}
           >
             <input type="hidden" name="slurm_target_replicas" value={String(spec.target_replicas)} />
-            <SettingsCard id="script" title="Script" description="What each replica's job runs. obleth adds the port binding before it; the server must listen on $OBLETH_SERVING_PORT.">
-              <Setting id="set-script" label="Job script" hint="A change applies to jobs started after you save." fields={["slurm_script_body"]}>
-                <TextArea name="slurm_script_body" label="Job script" rows={Math.min(24, Math.max(8, (spec.script_body || "").split("\n").length + 1))} defaultValue={spec.script_body} />
-              </Setting>
-            </SettingsCard>
-            <SettingsCard id="placement" title="Placement" description="Where Slurm runs each replica. Choices come from the cluster.">
-              <PlacementFields spec={spec} />
-            </SettingsCard>
+            <ScriptAndPlacement spec={spec} />
             <SettingsCard id="service" title="Service" description="How obleth checks a replica, and when it gives up.">
               <Setting id="set-port" label="Port · health path" hint="The port the server listens on in the job, and the path obleth checks." fields={["slurm_serving_port", "slurm_health_path"]}>
                 <div className="flex gap-2">

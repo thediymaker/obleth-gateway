@@ -1152,6 +1152,7 @@ mod pipeline_tests {
             "default",
             "",
             wal_dir.join("usage.wal").to_str().unwrap(),
+            std::time::Duration::from_millis(100),
             true,
         )
         .await

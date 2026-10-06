@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  acceptsImages,
   awaitingFirstPass,
   buildModelRows,
   changedFields,
@@ -18,6 +19,15 @@ import {
   statusLine,
   touches,
   typeGroup,
+  variantDrafts,
+  variantNameProblem,
+  variantsValue,
+  type VariantDraft,
+  dateInputValue,
+  lifecycleLabel,
+  lifecycleStatus,
+  retireAtFromInput,
+  retiredMessage,
 } from "./models-model";
 import type { ModelHealthSummary, ModelRoute } from "./obleth";
 
@@ -76,6 +86,7 @@ describe("types, places and prices", () => {
     expect(typeGroup("audio_speech")).toBe("audio");
     expect(typeGroup("audio_transcription")).toBe("audio");
     expect(typeGroup("image")).toBe("image");
+    expect(typeGroup("search")).toBe("search");
     expect(typeGroup("something-new")).toBe("chat");
   });
 
@@ -91,6 +102,8 @@ describe("types, places and prices", () => {
     expect(priceLabel(model({ model_type: "video", cost_per_video: 2 }))).toBe("$2 / video");
     expect(priceLabel(model({ model_type: "audio_transcription", cost_per_audio_second: 0.0001 }))).toBe("$0.006 / min");
     expect(priceLabel(model())).toBeNull();
+    // A search costs nothing, whatever token prices a row carries.
+    expect(priceLabel(model({ model_type: "search", input_cost_per_token: 0.000001 }))).toBeNull();
   });
 
   it("writes context windows the way people say them", () => {
@@ -103,7 +116,7 @@ describe("types, places and prices", () => {
 
 describe("finding a model in the list", () => {
   const models = [
-    model({ id: "a", model_name: "kimi-k2-7-code", upstream_model: "moonshot/Kimi-K2.7", aliases: ["kimi-code"], tags: ["coding:3"] }),
+    model({ id: "a", model_name: "kimi-k2-7-code", upstream_model: "moonshot/Kimi-K2.7", aliases: ["kimi-code"], tags: ["coding:3"], variants: [{ name: "kimi-k2-7-code-spec", description: "", boons: ["speculation"] }] }),
     model({ id: "b", model_name: "flux-2", model_type: "image" }),
     model({ id: "c", model_name: "gemma4", enabled: false }),
     model({ id: "d", model_name: "benchmark-endpoint-1" }),
@@ -111,9 +124,10 @@ describe("finding a model in the list", () => {
   ];
   const rows = buildModelRows(models, [health("a", "healthy"), health("b", "unhealthy")], {});
 
-  it("matches every word against the name, aliases, upstream and tags", () => {
+  it("matches every word against the name, aliases, variants, upstream and tags", () => {
     const names = (q: string) => filterRows(rows, { ...EMPTY_FILTERS, query: q }).map((r) => r.name);
     expect(names("kimi-code")).toEqual(["kimi-k2-7-code"]);
+    expect(names("code-spec")).toEqual(["kimi-k2-7-code"]);
     expect(names("moonshot coding")).toEqual(["kimi-k2-7-code"]);
     expect(names("nothing-like-it")).toEqual([]);
   });
@@ -147,6 +161,8 @@ describe("finding a setting", () => {
 
   it("leaves out settings a type doesn't have", () => {
     expect(searchSettings("router tags", "chat").map((r) => r.label)).toContain("Router tags");
+    expect(searchSettings("variants", "chat").map((r) => r.label)).toContain("Variants");
+    expect(searchSettings("variants", "image").map((r) => r.label)).not.toContain("Variants");
     expect(searchSettings("router tags", "image").map((r) => r.label)).not.toContain("Router tags");
     expect(searchSettings("", "chat")).toEqual([]);
   });
@@ -183,11 +199,111 @@ describe("tracking changes on the settings form", () => {
 
   it("summarises the changes once each, in page order", () => {
     expect(changeSummary(["route_bias", "tag_level_math", "tag_math", "description"])).toEqual(["Description", "Router tags", "Routing bias"]);
+    expect(changeSummary(["route_bias", "variants", "aliases"])).toEqual(["Aliases", "Variants", "Routing bias"]);
+    expect(fieldSection("variants")).toBe("model");
   });
 
   it("matches a setting's fields by name or by prefix", () => {
     expect(touches(["tag_math"], ["tag_"])).toBe(true);
     expect(touches(["route_bias"], ["tag_"])).toBe(false);
     expect(touches(["max_in_flight"], ["max_in_flight"])).toBe(true);
+  });
+});
+
+describe("a model's variants", () => {
+  const order = ["vision", "structured_output", "compression", "knowledge", "image_generation", "speculation"];
+  const stored = model({ model_name: "glm-5-3", aliases: ["glm-latest"], variants: [{ name: "glm-5-3-spec", description: "Faster answers", boons: ["speculation", "vision"] }] });
+
+  it("submits the stored rows in the editor's order, so opening the page is no change", () => {
+    const drafts = variantDrafts(stored);
+    expect(drafts).toEqual([{ name: "glm-5-3-spec", description: "Faster answers", boons: ["speculation", "vision"] }]);
+    expect(JSON.parse(variantsValue(drafts, order))).toEqual([{ name: "glm-5-3-spec", description: "Faster answers", boons: ["vision", "speculation"] }]);
+    expect(variantDrafts(model())).toEqual([]);
+    expect(variantsValue([], order)).toBe("[]");
+  });
+
+  it("reads an edit put back as no change", () => {
+    const before = variantsValue(variantDrafts(stored), order);
+    const toggled: VariantDraft[] = [{ name: "glm-5-3-spec ", description: " Faster answers", boons: ["vision", "speculation", "compression"] }];
+    expect(variantsValue(toggled, order)).not.toBe(before);
+    toggled[0].boons = toggled[0].boons.filter((b) => b !== "compression");
+    expect(variantsValue(toggled, order)).toBe(before);
+  });
+
+  it("keeps a boon the editor doesn't know, at the end", () => {
+    expect(JSON.parse(variantsValue([{ name: "v", description: "", boons: ["future_boon", "speculation"] }], order))[0].boons).toEqual(["speculation", "future_boon"]);
+  });
+
+  it("says why a name can't be saved", () => {
+    const own = { name: "glm-5-3", aliases: ["glm-latest"], otherModels: ["kimi-k2-7-code"] };
+    const rows = (...names: string[]): VariantDraft[] => names.map((name) => ({ name, description: "", boons: [] }));
+    expect(variantNameProblem(rows("glm-5-3-spec"), 0, own)).toBeNull();
+    expect(variantNameProblem(rows(""), 0, own)).toBeNull();
+    expect(variantNameProblem(rows("auto"), 0, own)).toMatch(/router/);
+    expect(variantNameProblem(rows("glm-5-3"), 0, own)).toMatch(/own name/);
+    expect(variantNameProblem(rows("glm-latest"), 0, own)).toMatch(/aliases/);
+    expect(variantNameProblem(rows("kimi-k2-7-code"), 0, own)).toMatch(/Another model/);
+    const twice = rows("glm-5-3-spec", " glm-5-3-spec");
+    expect(variantNameProblem(twice, 0, own)).toBeNull();
+    expect(variantNameProblem(twice, 1, own)).toMatch(/Another variant/);
+  });
+});
+
+describe("acceptsImages", () => {
+  const text = { supports_vision: false, boons: [] as string[] };
+  const viaBoon = { supports_vision: false, boons: ["vision", "speculation"] };
+  const native = { supports_vision: true, boons: [] as string[] };
+
+  it("takes images a model reads itself, whatever the boon", () => {
+    expect(acceptsImages(native, false)).toBe(true);
+    expect(acceptsImages(native, true)).toBe(true);
+  });
+
+  it("takes images through the vision boon only while the boon is on", () => {
+    expect(acceptsImages(viaBoon, true)).toBe(true);
+    expect(acceptsImages(viaBoon, false)).toBe(false);
+  });
+
+  it("refuses them for a text-only model, and doesn't guess before the model is known", () => {
+    expect(acceptsImages(text, true)).toBe(false);
+    expect(acceptsImages(undefined, true)).toBeUndefined();
+  });
+});
+
+describe("lifecycle", () => {
+  it("reads an older gateway's model as active", () => {
+    expect(lifecycleStatus({})).toBe("active");
+    expect(lifecycleLabel({})).toBeNull();
+  });
+
+  it("prefers the status in force over the stored one", () => {
+    const overdue = { lifecycle: { status: "deprecated" as const, retire_at: "2026-01-01T00:00:00Z" }, effective_status: "retired" as const };
+    expect(lifecycleStatus(overdue)).toBe("retired");
+    expect(lifecycleLabel(overdue)).toBe("Retired");
+  });
+
+  it("labels a staged model as not listed yet", () => {
+    expect(lifecycleStatus({ lifecycle: { status: "staged" } })).toBe("staged");
+    expect(lifecycleLabel({ lifecycle: { status: "staged" } })).toBe("Staged · not listed yet");
+  });
+
+  it("labels a deprecation with its date and a redirect with its stand-in", () => {
+    expect(lifecycleLabel({ lifecycle: { status: "deprecated", retire_at: "2026-10-19T00:00:00Z" } })).toBe("Deprecated · retires Oct 19, 2026");
+    expect(lifecycleLabel({ lifecycle: { status: "deprecated" } })).toBe("Deprecated");
+    expect(lifecycleLabel({ lifecycle: { status: "retired", replacement: "gemma4-31b-it", redirect: true } })).toBe("Retired · answered by gemma4-31b-it");
+  });
+
+  it("words the refusal the way the gateway does", () => {
+    expect(retiredMessage("glm-4-5v", { status: "retired", replacement: "gemma4-31b-it", retire_at: "2026-10-19T00:00:00Z", note: "Ask rc." }))
+      .toBe("The model `glm-4-5v` was retired on 2026-10-19. Use `gemma4-31b-it` instead. Ask rc.");
+    expect(retiredMessage("glm-4-5v", { status: "retired", changed_at: "2026-10-20T13:00:00Z" })).toBe("The model `glm-4-5v` was retired on 2026-10-20.");
+    expect(retiredMessage("glm-4-5v", { status: "retired" })).toBe("The model `glm-4-5v` has been retired.");
+  });
+
+  it("maps a date input to midnight UTC and back", () => {
+    expect(retireAtFromInput("2026-10-19")).toBe("2026-10-19T00:00:00Z");
+    expect(retireAtFromInput("")).toBeNull();
+    expect(dateInputValue("2026-10-19T00:00:00Z")).toBe("2026-10-19");
+    expect(dateInputValue(null)).toBe("");
   });
 });

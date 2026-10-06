@@ -6,8 +6,9 @@ import { useQuery } from "@tanstack/react-query";
 import { ChevronDown, ChevronUp, Copy, X } from "lucide-react";
 import { RouteExplainPanel } from "@/components/playground/route-explain";
 import { Button } from "@/components/ui/button";
+import { logsHref } from "@/lib/log-links";
 import { modelHref } from "@/lib/model-links";
-import { cost, describeRequest, duration, HTTP_REASONS, isFailure, timeSplit, type LogFilters } from "@/lib/logs-model";
+import { cost, describeRequest, duration, helperCallsParams, helperPurpose, HTTP_REASONS, isFailure, servedRequest, timeSplit, type LogFilters } from "@/lib/logs-model";
 import type { SpanEntry, UsageLogEntry } from "@/lib/obleth";
 import { parseAttrs, parseRouteExplain, spanHint, spanLabel, timeline, type SpanNode } from "@/lib/trace-model";
 import { cn } from "@/lib/utils";
@@ -23,9 +24,9 @@ function title(row: UsageLogEntry): string {
   return `Answered in ${duration(row.total_ms)}`;
 }
 
-function Fact({ label, children, mono }: { label: string; children: React.ReactNode; mono?: boolean }) {
+function Fact({ label, children, mono, wide }: { label: string; children: React.ReactNode; mono?: boolean; wide?: boolean }) {
   return (
-    <div className="flex min-w-0 flex-col gap-0.5 border-t border-border py-2.5">
+    <div className={cn("flex min-w-0 flex-col gap-0.5 border-t border-border py-2.5", wide && "col-span-2")}>
       <dt className="text-[11.5px] text-muted-foreground">{label}</dt>
       <dd className={cn("truncate text-[13px]", mono && "font-mono text-[12.5px]")}>{children}</dd>
     </div>
@@ -124,6 +125,19 @@ export function RequestPanel({
     },
     staleTime: 60_000,
     enabled: row.has_trace,
+  });
+  // A client request lists the calls its boons made to other models; a
+  // gateway too old to record them has no parent field at all.
+  const served = servedRequest(row);
+  const { data: helpers } = useQuery({
+    queryKey: ["helper-calls", row.request_id],
+    queryFn: async () => {
+      const res = await fetch(`/api/live/usage/logs?${helperCallsParams(row)}`);
+      const rows = res.ok ? ((await res.json()) as UsageLogEntry[]) : [];
+      return rows.sort((a, b) => a.ts_ms - b.ts_ms);
+    },
+    staleTime: 60_000,
+    enabled: !served && row.parent_request_id !== undefined,
   });
   useEffect(() => setSelected(null), [row.request_id]);
   useEffect(() => {
@@ -235,15 +249,51 @@ export function RequestPanel({
 
         {selectedStep && <StepDetail node={selectedStep} onClose={() => setSelected(null)} />}
 
+        {helpers && helpers.length > 0 && (
+          <section aria-label="Helper calls" className="space-y-1.5">
+            <div className="flex items-baseline justify-between gap-3">
+              <p className="text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">Helper calls</p>
+              <p className="text-[11.5px] text-muted-foreground">Calls the gateway made to other models while serving this request</p>
+            </div>
+            <ul className="space-y-0.5">
+              {helpers.map((h) => (
+                <li key={h.request_id}>
+                  <Link href={logsHref({ requestId: h.request_id })} className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 rounded-md px-1.5 py-1 text-[12.5px] hover:bg-muted/40">
+                    <span className="truncate">
+                      <span className="font-mono">{h.model}</span> · {helperPurpose(h.request_type)}
+                      {isFailure(h) && <span className="font-semibold"> · failed with HTTP {h.status_code}</span>}
+                    </span>
+                    <span className="font-mono text-xs text-muted-foreground">{h.total_tokens.toLocaleString()} {h.total_tokens === 1 ? "token" : "tokens"} · {cost(h.cost_usd)}</span>
+                  </Link>
+                </li>
+              ))}
+            </ul>
+          </section>
+        )}
+
         <dl aria-label="Numbers" className="grid grid-cols-2 gap-x-5 sm:grid-cols-4">
           <Fact label="Tokens in" mono>{row.input_tokens.toLocaleString()}</Fact>
           <Fact label="Tokens out" mono>{row.output_tokens.toLocaleString()}</Fact>
+          {row.cached_input_tokens != null && <Fact label="Cached input tokens" mono>{row.cached_input_tokens.toLocaleString()}</Fact>}
           <Fact label="Cost" mono>{cost(row.cost_usd)}</Fact>
           <Fact label="Energy" mono>{row.energy_wh > 0 ? `${row.energy_wh.toFixed(2)} Wh · ${row.co2_g.toFixed(2)} g CO₂` : "—"}</Fact>
           <Fact label="Waited for a slot" mono>{duration(row.queue_wait_ms)}</Fact>
           <Fact label="First token" mono>{row.ttft_ms > 0 ? duration(row.ttft_ms) : "—"}</Fact>
           <Fact label="Total" mono>{duration(row.total_ms)}</Fact>
-          <Fact label="Type">{row.request_type || "other"}</Fact>
+          <Fact label="Type">{helperPurpose(row.request_type)}</Fact>
+          {row.model_variant && (
+            <Fact label="Variant" wide>
+              <span className="font-mono">{row.model_variant}</span>, a variant of <span className="font-mono">{row.model}</span> with extra boons
+            </Fact>
+          )}
+          {served && (
+            <Fact label="Helper call for" wide>
+              <Link href={logsHref({ requestId: served })} title={served} className="underline underline-offset-[3px] hover:text-foreground">
+                request <span className="font-mono">{served.slice(0, 8)}</span>
+              </Link>
+              , the client request this call served
+            </Fact>
+          )}
           <Fact label="Session" mono>{row.session_id ? <span title={row.session_id}>{row.session_id}</span> : "—"}</Fact>
           <Fact label="Session came from">{row.session_id_source === "client" ? "the client" : row.session_id_source === "derived" ? "derived by the gateway" : "—"}</Fact>
           <Fact label="Cache">{row.cache_status || "—"}</Fact>

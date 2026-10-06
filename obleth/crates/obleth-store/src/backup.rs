@@ -92,7 +92,7 @@ impl Store {
                     budget_tokens, budget_cost_usd, budget_period, budget_started_at,
                     disabled, created_at,
                     kind, identity_issuer, identity_subject, identity_claims,
-                    weight, max_in_flight
+                    weight, max_in_flight, end_user_fairshare
              from api_keys order by created_at",
         )
         .fetch_all(&self.pool)
@@ -120,6 +120,7 @@ impl Store {
                 budget_started_at: row.try_get("budget_started_at")?,
                 weight: row.try_get("weight").unwrap_or(100),
                 max_in_flight: row.try_get("max_in_flight").unwrap_or(None),
+                end_user_fairshare: row.try_get("end_user_fairshare").unwrap_or(false),
                 disabled: row.try_get("disabled")?,
                 created_at: row.try_get("created_at")?,
             })
@@ -127,7 +128,7 @@ impl Store {
         .collect::<Result<Vec<_>>>()?;
 
         let models = sqlx::query(
-            "select id, model_name, aliases, description, upstream_model, api_base, api_key,
+            "select id, model_name, aliases, variants, lifecycle, description, upstream_model, api_base, api_key,
                     upstream_headers, model_type, quantization,
                     input_cost_per_token, output_cost_per_token, cost_per_image,
                     cost_per_audio_second, cost_per_character, cost_per_video, context_window,
@@ -336,9 +337,9 @@ impl Store {
                 "insert into api_keys (id, tenant_id, name, description, key_prefix, key_hash,
                         budget_tokens, budget_cost_usd, budget_period, budget_started_at,
                         disabled, created_at, kind, identity_issuer, identity_subject,
-                        identity_claims, weight, max_in_flight)
+                        identity_claims, weight, max_in_flight, end_user_fairshare)
                  values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                         $17, $18)
+                         $17, $18, $19)
                  on conflict (id) do update set
                         tenant_id = excluded.tenant_id,
                         name = excluded.name,
@@ -356,6 +357,7 @@ impl Store {
                         identity_claims = excluded.identity_claims,
                         weight = excluded.weight,
                         max_in_flight = excluded.max_in_flight,
+                        end_user_fairshare = excluded.end_user_fairshare,
                         updated_at = now()
                  returning (xmax = 0) as inserted",
             )
@@ -377,6 +379,7 @@ impl Store {
             .bind(k.identity_claims.clone().map(sqlx::types::Json))
             .bind(k.weight)
             .bind(k.max_in_flight)
+            .bind(k.end_user_fairshare)
             .fetch_one(&mut *tx)
             .await
             .map_err(restore_db_error)?;
@@ -400,11 +403,12 @@ impl Store {
                         health_maintenance_note, created_at,
                         debug_diagnostics, energy_slots_per_node, aliases, quantization,
                         upstream_headers, cost_per_video, capacity_namespace, capacity_service,
-                        per_replica_max_in_flight, capacity_source, capacity_headroom)
+                        per_replica_max_in_flight, capacity_source, capacity_headroom, variants,
+                        lifecycle)
                  values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
                         $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31,
                         $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46,
-                        $47, $48, $49, $50, $51, $52, $53, $54, $55)
+                        $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57)
                  on conflict (id) do update set
                         model_name = excluded.model_name,
                         description = excluded.description,
@@ -459,6 +463,8 @@ impl Store {
                         per_replica_max_in_flight = excluded.per_replica_max_in_flight,
                         capacity_source = excluded.capacity_source,
                         capacity_headroom = excluded.capacity_headroom,
+                        variants = excluded.variants,
+                        lifecycle = excluded.lifecycle,
                         updated_at = now()
                  returning (xmax = 0) as inserted",
             )
@@ -546,6 +552,10 @@ impl Store {
                     1.0
                 },
             )
+            .bind(sqlx::types::Json(obleth_config::normalize_variants(
+                &m.variants,
+            )))
+            .bind(sqlx::types::Json(&m.lifecycle))
             .fetch_one(&mut *tx)
             .await
             .map_err(restore_db_error)?;
@@ -720,6 +730,14 @@ fn model_backup_from_row(row: &PgRow) -> Result<ModelBackup> {
             .try_get::<sqlx::types::Json<Vec<String>>, _>("aliases")
             .map(|j| j.0)
             .unwrap_or_default(),
+        variants: row
+            .try_get::<sqlx::types::Json<Vec<obleth_config::ModelVariant>>, _>("variants")
+            .map(|j| j.0)
+            .unwrap_or_default(),
+        lifecycle: row
+            .try_get::<sqlx::types::Json<obleth_config::ModelLifecycle>, _>("lifecycle")
+            .map(|j| j.0)
+            .unwrap_or_default(),
         description: row.try_get("description")?,
         upstream_model: row.try_get("upstream_model")?,
         api_base: row.try_get("api_base")?,
@@ -863,11 +881,16 @@ mod tests {
             .await
             .expect("create key");
         let hash = obleth_config::hash_api_key(&secret);
+        store
+            .set_key_end_user_fairshare(key.id, true)
+            .await
+            .expect("turn on per-end-user fairshare");
 
         // A model with a non-neutral routing bias and a levelled intent tag.
         // Both are `auto`-router configuration an operator set deliberately, so
         // both must survive a backup cycle rather than silently reverting to
         // the neutral 1.0.
+        let variant_name = format!("m-{}-spec", uuid::Uuid::new_v4());
         let model = store
             .create_model(
                 &format!("m-{}", uuid::Uuid::new_v4()),
@@ -912,11 +935,26 @@ mod tests {
                     per_replica_max_in_flight: Some(8),
                     headroom: 1.5,
                 },
+                &[obleth_config::ModelVariant {
+                    name: variant_name.clone(),
+                    description: "the model with speculation".into(),
+                    boons: vec!["speculation".into()],
+                }],
             )
             .await
             .expect("create model");
         fixtures.track_model(model.id);
         assert_eq!(model.route_bias, 2.5);
+        let lifecycle = obleth_config::ModelLifecycle {
+            status: obleth_config::ModelStatus::Deprecated,
+            replacement: "gemma4-31b-it".into(),
+            changed_at: Some(chrono::Utc::now()),
+            ..Default::default()
+        };
+        store
+            .set_model_lifecycle(model.id, &lifecycle)
+            .await
+            .expect("set lifecycle");
         let endpoint = store
             .create_model_endpoint(
                 model.id,
@@ -939,6 +977,10 @@ mod tests {
             .find(|k| k.id == key.id)
             .expect("key in export");
         assert_eq!(exported_key.key_hash, hash);
+        assert!(
+            exported_key.end_user_fairshare,
+            "export carries end_user_fairshare"
+        );
         let exported_tenant = data
             .tenants
             .iter()
@@ -951,6 +993,10 @@ mod tests {
             .find(|m| m.id == model.id)
             .expect("model in export");
         assert_eq!(exported_model.route_bias, 2.5, "export carries route_bias");
+        assert_eq!(
+            exported_model.lifecycle, lifecycle,
+            "export carries the lifecycle"
+        );
         assert!(
             !exported_model.auto_eligible,
             "export carries auto_eligible"
@@ -964,11 +1010,13 @@ mod tests {
             .await
             .expect("update weight");
         // Drift the model's bias the same way, through the same restore.
-        sqlx::query("update models set route_bias = 1.0, auto_eligible = true where id = $1")
-            .bind(model.id)
-            .execute(&store.pool)
-            .await
-            .expect("drift route_bias and auto_eligible");
+        sqlx::query(
+            "update models set route_bias = 1.0, auto_eligible = true, variants = '[]', lifecycle = '{}' where id = $1",
+        )
+        .bind(model.id)
+        .execute(&store.pool)
+        .await
+        .expect("drift route_bias, auto_eligible and variants");
         // And its capacity discovery fields, and the endpoint's concurrency.
         sqlx::query(
             "update models set capacity_mode = 'static', capacity_source = 'endpoints',
@@ -985,8 +1033,18 @@ mod tests {
             .execute(&store.pool)
             .await
             .expect("drift endpoint concurrency");
+        sqlx::query("update api_keys set end_user_fairshare = false where id = $1")
+            .bind(key.id)
+            .execute(&store.pool)
+            .await
+            .expect("drift end_user_fairshare");
         let report = store.restore_backup_data(&data).await.expect("restore");
         assert!(report.tenants.updated >= 1);
+        let restored_key = store.keys_by_ids(&[key.id]).await.expect("keys by id");
+        assert!(
+            restored_key.first().is_some_and(|k| k.end_user_fairshare),
+            "restore puts end_user_fairshare back"
+        );
         let restored_model = store.get_model(model.id).await.expect("get model");
         assert_eq!(
             restored_model.route_bias, 2.5,
@@ -997,6 +1055,19 @@ mod tests {
             "restore must not re-include a model the backup had excluded"
         );
         assert_eq!(restored_model.tags, vec!["coding:3".to_string()]);
+        assert_eq!(
+            restored_model
+                .variants
+                .iter()
+                .map(|v| v.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![variant_name.as_str()],
+            "restore puts the model's variants back"
+        );
+        assert_eq!(
+            restored_model.lifecycle, lifecycle,
+            "restore puts the model's lifecycle back"
+        );
         assert_eq!(restored_model.capacity_mode, "discovered");
         assert_eq!(restored_model.capacity_source, "kubernetes");
         assert_eq!(

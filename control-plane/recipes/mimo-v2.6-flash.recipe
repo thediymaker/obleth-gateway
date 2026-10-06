@@ -1,0 +1,75 @@
+---
+name: MiMo-V2.6-Flash on one Grace Hopper
+description: "Xiaomi's 309B mixture of experts, 15B active, stored in MXFP4 (178 GB). On one GH200 the GPU keeps what it can and the rest is read from the Grace CPU's memory over the fast chip-to-chip link. Tool calling and reasoning."
+engine: vllm
+kind: model
+model: XiaomiMiMo/MiMo-V2.6-Flash-RL
+weights_gb: 178
+requires: "A vLLM nightly built after 2026-09-20 (vllm-project/vllm#57784)"
+model_type: chat
+api_model_name: mimo-v2.6-flash
+port: 8000
+health_path: /health
+target_replicas: 1
+max_job_failures: 2
+env:
+  VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+tested:
+  - hardware: "1× GH200 96 GB"
+    engine: "vLLM 0.30.1rc1 (nightly, Arm)"
+    date: 2026-10-03
+    result: "With 100 GiB in CPU memory and a 65,536-token context: ready in 13 minutes. One request ran at about 39 tokens a second; 16 at once reached 165. Tool calls worked 3 times out of 3. The GPU peaked at 86 GB and the node's memory at about 300 GB."
+inputs:
+  - name: context
+    label: Context length
+    type: choice
+    options: [32768, 65536, 131072]
+    default: 65536
+  - name: offload
+    label: Kept in CPU memory
+    type: number
+    min: 0
+    max: 400
+    unit: GiB
+    default: 100
+    help: How much of the weights waits in CPU memory. Lower it on a GPU with more memory; raise it if loading runs out of GPU memory.
+  - name: tools
+    label: Tool calling
+    type: flag
+    default: true
+    adds: --enable-auto-tool-choice --tool-call-parser mimo
+    capabilities: [function_calling, tool_choice]
+  - name: reasoning
+    label: Reasoning
+    type: flag
+    default: true
+    adds: --reasoning-parser mimo
+  - name: image
+    label: Container image
+    type: path
+    default: "{{cluster.image.vllm}}"
+    required: true
+  - name: cache
+    label: Weight cache
+    type: path
+    default: "{{cluster.cache}}"
+    required: true
+    help: HF_HOME, where the weights are kept between jobs.
+---
+#!/bin/bash -l
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=72
+#SBATCH --mem=0
+set -euo pipefail
+{{cluster.setup}}
+export HF_HOME={{cache}}
+apptainer exec --nv --bind {{cache}} {{image}} \
+  vllm serve XiaomiMiMo/MiMo-V2.6-Flash-RL \
+    --served-model-name {{api_model_name}} \
+    --host 0.0.0.0 --port "$OBLETH_SERVING_PORT" \
+    --trust-remote-code --generation-config vllm \
+    --max-model-len {{context}} \
+    --cpu-offload-gb {{offload}} \
+    --gpu-memory-utilization 0.92 \
+    {{tools}} {{reasoning}}

@@ -1,4 +1,16 @@
-import type { BoonSettingsView, KnowledgeSettingsView } from "@/lib/obleth";
+import type { BoonSettingsView, KnowledgeSettingsView, ModelRoute } from "@/lib/obleth";
+
+// Boons that work by handing the model a tool it has to call. The gateway adds
+// their tool only to a model flagged for function calling (`image_gen_eligible`
+// and `web_search_eligible` in obleth-proxy `boons/mod.rs`), so they follow
+// that switch: off means the boons are off too.
+export const FUNCTION_CALLING_BOONS: readonly string[] = ["image_generation", "web_search"];
+
+/** The boons this model holds that do nothing because Function calling is off. */
+export function boonsWaitingOnFunctionCalling(model: Pick<ModelRoute, "boons" | "supports_function_calling">): string[] {
+  if (model.supports_function_calling) return [];
+  return (model.boons ?? []).filter((b) => FUNCTION_CALLING_BOONS.includes(b));
+}
 
 // Why a boon can't take effect, keyed by the boon's vocabulary value. A boon
 // missing from the map is ready to grant.
@@ -23,7 +35,8 @@ function unset(value: string | null | undefined): boolean {
 /**
  * Which boons cannot currently be granted, and why. Mirrors each
  * `active()` in obleth-config `types.rs`: every boon needs its global switch,
- * and `vision` and `image_generation` additionally need a helper model.
+ * and `vision`, `image_generation` and `web_search` additionally need a
+ * helper model (a search tool, for web search).
  *
  * Both settings objects are optional so the caller can pass whatever `safe()`
  * returned: an admin-API hiccup yields no blockers rather than a form that
@@ -43,6 +56,9 @@ export function boonBlockers(
     if (!boons.image_generation_enabled) blockers.image_generation = OFF_IN_BOONS;
     else if (unset(boons.image_generation_model))
       blockers.image_generation = "no image model is set in Settings → Boons.";
+    if (!boons.web_search_enabled) blockers.web_search = OFF_IN_BOONS;
+    else if (unset(boons.web_search_tool))
+      blockers.web_search = "no search tool is set in Settings → Boons.";
     if (!boons.speculation_enabled) blockers.speculation = OFF_IN_BOONS;
   }
   // Knowledge is the one boon configured on its own page, not the Boons tab.

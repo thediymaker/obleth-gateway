@@ -93,6 +93,11 @@ pub struct Config {
     pub fail_open: bool,
     /// Path to the local write-ahead log used as telemetry fallback.
     pub wal_path: String,
+    /// How long each replica buffers usage rows and trace spans before it
+    /// inserts them into ClickHouse. Every insert becomes a part that
+    /// ClickHouse later rewrites in merges, so fewer, larger inserts cost far
+    /// less disk I/O than one small insert a second.
+    pub telemetry_flush_interval: Duration,
 
     /// Enable the scheduled model-health worker. Manual health checks remain
     /// available through the Management API even when this is false.
@@ -324,6 +329,11 @@ impl Config {
             capacity_discovery: CapacityDiscoveryConfig::from_env(),
             fail_open: require_bool("OBLETH_FAIL_OPEN", true),
             wal_path: env_or("OBLETH_WAL_PATH", "./obleth-telemetry.wal"),
+            telemetry_flush_interval: telemetry_flush_interval(
+                env::var("OBLETH_TELEMETRY_FLUSH_INTERVAL_MS")
+                    .ok()
+                    .as_deref(),
+            ),
             model_health_enabled: bool_or("OBLETH_MODEL_HEALTH_ENABLED", true),
             model_health_interval_secs: parse_or("OBLETH_MODEL_HEALTH_INTERVAL_SECS", 900),
             model_health_timeout_secs: parse_or("OBLETH_MODEL_HEALTH_TIMEOUT_SECS", 30),
@@ -410,6 +420,21 @@ fn require_secret(key: &str) -> String {
 fn upstream_read_timeout_secs(raw: Option<&str>, upstream_timeout_secs: u64) -> u64 {
     raw.and_then(|v| v.trim().parse().ok())
         .unwrap_or(upstream_timeout_secs.max(120))
+}
+
+/// Default gap between telemetry inserts. ClickHouse advises about one insert
+/// per second per table across all writers; 5s keeps several replicas under it.
+pub const DEFAULT_TELEMETRY_FLUSH_INTERVAL_MS: u64 = 5_000;
+
+/// Missing or unparseable values take the default. Others are clamped to
+/// 100ms..=60s: zero would panic the flusher's ticker, and a long gap holds
+/// more rows in memory, which a crash (not a graceful shutdown) would lose.
+fn telemetry_flush_interval(raw: Option<&str>) -> Duration {
+    let ms = raw
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_TELEMETRY_FLUSH_INTERVAL_MS)
+        .clamp(100, 60_000);
+    Duration::from_millis(ms)
 }
 
 fn parse_or<T: std::str::FromStr>(key: &str, default: T) -> T {
@@ -515,6 +540,27 @@ mod tests {
         assert_eq!(t.connect, Duration::from_millis(500));
         let t = RedisTimeouts::from_values(Some("nope"), None);
         assert_eq!(t, RedisTimeouts::default());
+    }
+
+    #[test]
+    fn telemetry_flush_interval_defaults_and_clamps() {
+        assert_eq!(telemetry_flush_interval(None), Duration::from_secs(5));
+        assert_eq!(
+            telemetry_flush_interval(Some("nope")),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            telemetry_flush_interval(Some(" 1000 ")),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            telemetry_flush_interval(Some("0")),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            telemetry_flush_interval(Some("600000")),
+            Duration::from_secs(60)
+        );
     }
 
     #[test]

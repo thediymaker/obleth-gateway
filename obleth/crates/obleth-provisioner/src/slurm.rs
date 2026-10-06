@@ -1,4 +1,6 @@
-use crate::domain::{ClusterResources, JobInfo, JobState, JobSubmit, NodeInfo, PartitionInfo};
+use crate::domain::{
+    AssociationInfo, ClusterResources, JobInfo, JobState, JobSubmit, NodeInfo, PartitionInfo,
+};
 use async_trait::async_trait;
 use obleth_config::ManagedModelSpec;
 
@@ -61,7 +63,10 @@ pub fn job_submit_from_spec(
     port_base: i64,
     span: i64,
 ) -> JobSubmit {
-    let preamble = spec.preamble.trim();
+    let preamble = unix_line_endings(&spec.preamble);
+    let launch_command = unix_line_endings(&spec.launch_command);
+    let script_body = unix_line_endings(&spec.script_body);
+    let preamble = preamble.trim();
     let preamble_block = if preamble.is_empty() {
         String::new()
     } else {
@@ -79,21 +84,21 @@ pub fn job_submit_from_spec(
     // a bare-metal `llama-server`) rather than an apptainer image.
     let image = spec.image.trim();
     let exec_line = if image.is_empty() {
-        spec.launch_command.clone()
+        launch_command
     } else {
         format!(
             "apptainer exec --nv {image} {cmd}",
             image = shell_quote(image),
-            cmd = spec.launch_command,
+            cmd = launch_command,
         )
     };
     // A non-empty `script_body` is the rendered recipe output and wins: it is
     // submitted verbatim so the recipe author has full control of the job
     // script. Otherwise fall back to the legacy preamble/exec assembly.
-    let assembled = if spec.script_body.trim().is_empty() {
+    let assembled = if script_body.trim().is_empty() {
         format!("#!/bin/bash\nset -euo pipefail\n{preamble_block}{exec_line}\n")
     } else {
-        let body = &spec.script_body;
+        let body = &script_body;
         if body.starts_with("#!") {
             // already a complete script
             if body.ends_with('\n') {
@@ -123,10 +128,19 @@ pub fn job_submit_from_spec(
     }
 }
 
+/// A script with Windows line endings (CRLF) as Unix ones (LF). A browser
+/// sends a textarea's text with CRLF, and bash reads the `\r` as part of each
+/// line: `#!/bin/bash -l\r` passes the option `-\r`, so the job exits with
+/// "invalid option" before its first command runs.
+fn unix_line_endings(s: &str) -> String {
+    s.replace("\r\n", "\n")
+}
+
 /// Parse a Slurm-style memory string (e.g. `560G`, `512000M`, `2T`, `16000`)
 /// into an integer number of **megabytes** for slurmrestd's `memory_per_node`.
-/// A bare number is treated as megabytes (Slurm's default unit). Returns `None`
-/// for empty/unparseable input so the field is omitted entirely.
+/// A bare number is treated as megabytes (Slurm's default unit). Zero is kept:
+/// like `--mem=0`, it asks for all of each node's memory. Returns `None` for
+/// empty/unparseable input so the field is omitted entirely.
 pub fn parse_mem_mb(raw: &str) -> Option<i64> {
     let s = raw.trim();
     if s.is_empty() {
@@ -144,7 +158,10 @@ pub fn parse_mem_mb(raw: &str) -> Option<i64> {
         _ => return None,
     };
     let n: f64 = num_part.trim().parse().ok()?;
-    if n <= 0.0 {
+    if n == 0.0 {
+        return Some(0);
+    }
+    if n < 0.0 {
         return None;
     }
     let mb = (n * mult).round() as i64;
@@ -156,6 +173,25 @@ pub fn parse_mem_mb(raw: &str) -> Option<i64> {
 }
 
 /// POSIX single-quote a value for embedding in the generated bash script.
+/// All the memory a job can have on one node of `partition`, in megabytes:
+/// the smallest node's memory less what Slurm keeps back for the node itself.
+/// The smallest node, so the job still fits wherever Slurm places it. `None`
+/// when the partition is unnamed or none of its nodes report their memory.
+pub fn whole_node_mem_mb(nodes: &[NodeInfo], partition: &str) -> Option<i64> {
+    if partition.is_empty() {
+        return None;
+    }
+    nodes
+        .iter()
+        .filter(|n| n.partitions.iter().any(|p| p == partition))
+        .filter_map(|n| {
+            let real = n.real_memory_mb?;
+            Some(real - n.specialized_memory_mb.unwrap_or(0))
+        })
+        .filter(|mb| *mb > 0)
+        .min()
+}
+
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
@@ -331,6 +367,9 @@ pub struct Slurmrestd {
     version: String,
     user: String,
     jwt: String,
+    /// Hugging Face token passed to submitted jobs via their environment.
+    /// Empty = none. (No `Debug` derive on this struct: it holds secrets.)
+    hf_token: String,
 }
 
 impl Slurmrestd {
@@ -345,94 +384,168 @@ impl Slurmrestd {
             version: version.to_string(),
             user: user.to_string(),
             jwt: jwt.to_string(),
+            hf_token: String::new(),
         }
     }
+    /// Pass a Hugging Face token to every job this client submits (as
+    /// `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` in the job environment). Empty
+    /// leaves the environment without it.
+    pub fn with_hf_token(mut self, token: &str) -> Self {
+        self.hf_token = token.trim().to_string();
+        self
+    }
+    async fn read_nodes(&self) -> anyhow::Result<Vec<NodeInfo>> {
+        let url = format!("{}/slurm/{}/nodes", self.base, self.version);
+        let resp = self.auth(self.http.get(&url)).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            anyhow::bail!("slurm nodes read failed ({status})");
+        }
+        Ok(parse_nodes(&resp.json::<serde_json::Value>().await?))
+    }
+
+    /// `--mem=0` means all of the node's memory, but some sites' submit
+    /// plugins read 0 as unset and give a small default instead. Ask for the
+    /// node's size outright. If it can't be found, 0 is sent as before.
+    async fn with_whole_node_mem(&self, job: &JobSubmit) -> JobSubmit {
+        let mut job = job.clone();
+        if job.mem_mb != Some(0) {
+            return job;
+        }
+        match self.read_nodes().await {
+            Ok(nodes) => match whole_node_mem_mb(&nodes, &job.partition) {
+                Some(mb) => {
+                    tracing::info!(job = %job.name, partition = %job.partition, mem_mb = mb,
+                        "asking for all of the node's memory by size");
+                    job.mem_mb = Some(mb);
+                }
+                None => tracing::warn!(job = %job.name, partition = %job.partition,
+                    "no node memory known for the partition; sending --mem=0"),
+            },
+            Err(e) => tracing::warn!(job = %job.name, error = %e,
+                "could not read node memory; sending --mem=0"),
+        }
+        job
+    }
+
     fn auth(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         rb.header("X-SLURM-USER-NAME", &self.user)
             .header("X-SLURM-USER-TOKEN", &self.jwt)
     }
 }
 
+/// Render the slurmrestd `job/submit` request body for `job`. Pure (no HTTP)
+/// so the payload shape is unit-testable.
+///
+/// A non-empty `hf_token` is passed to the job as `HF_TOKEN` and
+/// `HUGGING_FACE_HUB_TOKEN` in the job `environment` — never in the script
+/// body, which Slurm keeps on disk and shows in `scontrol write batch_script`.
+///
+/// NOTE: verify this body against your slurmrestd version's schema
+/// (`/openapi/v3`). Fields below are common to v0.0.39/40/41. Optional fields
+/// are omitted when None so they don't override cluster defaults.
+pub fn submit_body(job: &JobSubmit, hf_token: &str) -> serde_json::Value {
+    // slurmrestd requires a non-empty environment. Use a broad PATH that
+    // covers where apptainer/singularity typically live across clusters
+    // (/usr/local/bin, /opt, sbin dirs) rather than a minimal one that would
+    // fail if the launcher isn't under /usr/bin. Operators whose cluster needs
+    // more can prepend it inside launch_command.
+    //
+    // slurmrestd v0.0.39 and later take the environment as a list of
+    // `NAME=value` strings. An object is only warned about ("Expected OpenAPI
+    // type=array") and then dropped, which silently loses every variable.
+    let mut environment = vec![
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/apptainer/bin:/opt/singularity/bin".to_string(),
+    ];
+    let hf_token = hf_token.trim();
+    if !hf_token.is_empty() {
+        environment.push(format!("HF_TOKEN={hf_token}"));
+        environment.push(format!("HUGGING_FACE_HUB_TOKEN={hf_token}"));
+    }
+    let mut spec = serde_json::json!({
+        "name": job.name,
+        "partition": job.partition,
+        "nodes": job.nodes.to_string(),
+        "tasks": 1,
+        "current_working_directory": "/tmp",
+        "environment": environment,
+    });
+    let m = spec.as_object_mut().unwrap();
+    // Multi-node jobs (e.g. vLLM over Ray) start one worker per node with
+    // `srun` inside the batch script, which needs one task per node in the
+    // allocation. `tasks` and `tasks_per_node` are both job_desc_msg fields in
+    // slurmrestd v0.0.39 through v0.0.41. Single-node jobs keep `tasks: 1`.
+    if job.nodes > 1 {
+        m.insert("tasks".into(), serde_json::json!(job.nodes));
+        m.insert("tasks_per_node".into(), serde_json::json!(1));
+    }
+    if !job.gres.is_empty() {
+        m.insert(
+            "tres_per_node".into(),
+            serde_json::json!(format!("gres/{}", job.gres)),
+        );
+    }
+    if let Some(t) = &job.time_limit {
+        // slurmrestd's `time_limit` is an integer number of minutes, not a
+        // Slurm walltime string: submitting `"0-04:00:00"` fails with
+        // `Expected integer ... Unable to convert Date type` (500). Parse the
+        // operator's Slurm-format walltime into minutes here. If it doesn't
+        // parse, omit the field rather than send a value slurmrestd rejects —
+        // the cluster's partition default applies.
+        if let Some(mins) = time_limit_to_minutes(t) {
+            m.insert("time_limit".into(), serde_json::json!(mins));
+        } else {
+            tracing::warn!(
+                time_limit = %t,
+                "unparseable time_limit; omitting so the partition default applies"
+            );
+        }
+    }
+    if let Some(a) = &job.account {
+        m.insert("account".into(), serde_json::json!(a));
+    }
+    if let Some(q) = &job.qos {
+        m.insert("qos".into(), serde_json::json!(q));
+    }
+    if let Some(c) = &job.constraints {
+        m.insert("constraints".into(), serde_json::json!(c));
+    }
+    if let Some(e) = &job.exclude {
+        m.insert("excluded_nodes".into(), serde_json::json!(e));
+    }
+    if let Some(c) = job.cpus_per_task {
+        if c > 0 {
+            m.insert("cpus_per_task".into(), serde_json::json!(c));
+        }
+    }
+    // slurmrestd expects memory_per_node in megabytes (integer). `submit`
+    // has already turned 0 into the node's size where it could; a 0 still
+    // here is sent as is, which Slurm reads as all of each node's memory.
+    if let Some(mb) = job.mem_mb {
+        if mb >= 0 {
+            m.insert("memory_per_node".into(), serde_json::json!(mb));
+        }
+    }
+    if !job.log_output_dir.is_empty() {
+        let dir = job.log_output_dir.trim_end_matches('/');
+        m.insert(
+            "standard_output".into(),
+            serde_json::json!(format!("{dir}/{}-%j.out", job.name)),
+        );
+        m.insert(
+            "standard_error".into(),
+            serde_json::json!(format!("{dir}/{}-%j.err", job.name)),
+        );
+    }
+
+    serde_json::json!({ "job": spec, "script": job.script })
+}
+
 #[async_trait]
 impl SlurmClient for Slurmrestd {
     async fn submit(&self, job: &JobSubmit) -> anyhow::Result<String> {
-        // NOTE: verify this body against your slurmrestd version's schema
-        // (`/openapi/v3`). Fields below are common to v0.0.39/40. Optional
-        // fields are omitted when None so they don't override cluster defaults.
-        let mut spec = serde_json::json!({
-            "name": job.name,
-            "partition": job.partition,
-            "nodes": job.nodes.to_string(),
-            "tasks": 1,
-            "current_working_directory": "/tmp",
-            // slurmrestd requires a non-empty environment. Use a broad PATH that
-            // covers where apptainer/singularity typically live across clusters
-            // (/usr/local/bin, /opt, sbin dirs) rather than a minimal one that
-            // would fail if the launcher isn't under /usr/bin. Operators whose
-            // cluster needs more can prepend it inside launch_command.
-            "environment": {
-                "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/apptainer/bin:/opt/singularity/bin"
-            },
-        });
-        let m = spec.as_object_mut().unwrap();
-        if !job.gres.is_empty() {
-            m.insert(
-                "tres_per_node".into(),
-                serde_json::json!(format!("gres/{}", job.gres)),
-            );
-        }
-        if let Some(t) = &job.time_limit {
-            // slurmrestd's `time_limit` is an integer number of minutes, not a
-            // Slurm walltime string: submitting `"0-04:00:00"` fails with
-            // `Expected integer ... Unable to convert Date type` (500). Parse the
-            // operator's Slurm-format walltime into minutes here. If it doesn't
-            // parse, omit the field rather than send a value slurmrestd rejects —
-            // the cluster's partition default applies.
-            if let Some(mins) = time_limit_to_minutes(t) {
-                m.insert("time_limit".into(), serde_json::json!(mins));
-            } else {
-                tracing::warn!(
-                    time_limit = %t,
-                    "unparseable time_limit; omitting so the partition default applies"
-                );
-            }
-        }
-        if let Some(a) = &job.account {
-            m.insert("account".into(), serde_json::json!(a));
-        }
-        if let Some(q) = &job.qos {
-            m.insert("qos".into(), serde_json::json!(q));
-        }
-        if let Some(c) = &job.constraints {
-            m.insert("constraints".into(), serde_json::json!(c));
-        }
-        if let Some(e) = &job.exclude {
-            m.insert("excluded_nodes".into(), serde_json::json!(e));
-        }
-        if let Some(c) = job.cpus_per_task {
-            if c > 0 {
-                m.insert("cpus_per_task".into(), serde_json::json!(c));
-            }
-        }
-        // slurmrestd expects memory_per_node in megabytes (integer).
-        if let Some(mb) = job.mem_mb {
-            if mb > 0 {
-                m.insert("memory_per_node".into(), serde_json::json!(mb));
-            }
-        }
-        if !job.log_output_dir.is_empty() {
-            let dir = job.log_output_dir.trim_end_matches('/');
-            m.insert(
-                "standard_output".into(),
-                serde_json::json!(format!("{dir}/{}-%j.out", job.name)),
-            );
-            m.insert(
-                "standard_error".into(),
-                serde_json::json!(format!("{dir}/{}-%j.err", job.name)),
-            );
-        }
-
-        let body = serde_json::json!({ "job": spec, "script": job.script });
+        let job = &self.with_whole_node_mem(job).await;
+        let body = submit_body(job, &self.hf_token);
         let url = format!("{}/slurm/{}/job/submit", self.base, self.version);
         let resp = self.auth(self.http.post(&url)).json(&body).send().await?;
         let status = resp.status();
@@ -505,6 +618,7 @@ impl SlurmClient for Slurmrestd {
                     let (a, q) = parse_associations(&v);
                     out.accounts = a;
                     out.qos = q;
+                    out.associations = parse_association_list(&v);
                 }
                 Err(e) => tracing::warn!(error=%e, "slurm associations body not JSON"),
             },
@@ -631,6 +745,14 @@ pub fn parse_partitions(v: &serde_json::Value) -> Vec<PartitionInfo> {
                             .get("maximums")
                             .and_then(|d| d.get("time"))
                             .and_then(time_minutes),
+                        // slurmrestd reports AllowAccounts as "ALL" when unset.
+                        allowed_accounts: str_list(
+                            p.get("accounts").and_then(|a| a.get("allowed")),
+                        )
+                        .into_iter()
+                        .filter(|a| !a.eq_ignore_ascii_case("ALL"))
+                        .collect(),
+                        denied_accounts: str_list(p.get("accounts").and_then(|a| a.get("deny"))),
                     })
                 })
                 .collect()
@@ -654,6 +776,7 @@ pub fn parse_nodes(v: &serde_json::Value) -> Vec<NodeInfo> {
                     let real_memory_mb = number("real_memory");
                     Some(NodeInfo {
                         name,
+                        specialized_memory_mb: number("specialized_memory").filter(|m| *m > 0),
                         partitions: str_list(n.get("partitions")),
                         gres: n
                             .get("gres")
@@ -677,6 +800,39 @@ pub fn parse_nodes(v: &serde_json::Value) -> Vec<NodeInfo> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Each association's account, partition (None = all) and QoS, deduplicated.
+pub fn parse_association_list(v: &serde_json::Value) -> Vec<AssociationInfo> {
+    let mut out: Vec<AssociationInfo> = Vec::new();
+    for a in v
+        .get("associations")
+        .and_then(|x| x.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let Some(account) = a
+            .get("account")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let partition = a
+            .get("partition")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        let info = AssociationInfo {
+            account: account.to_string(),
+            partition,
+            qos: str_list(a.get("qos")),
+        };
+        if !out.contains(&info) {
+            out.push(info);
+        }
+    }
+    out
 }
 
 pub fn parse_associations(v: &serde_json::Value) -> (Vec<String>, Vec<String>) {
@@ -731,6 +887,57 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
+    }
+
+    #[test]
+    fn submit_body_carries_hf_token_in_environment_only_when_set() {
+        let job = job_submit_from_spec(&spec(), "nemotron", "obleth-", 8000, 8);
+        let with = submit_body(&job, " hf_secret ");
+        let env: Vec<&str> = with["job"]["environment"]
+            .as_array()
+            .expect("environment is a list of NAME=value strings")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(env.contains(&"HF_TOKEN=hf_secret"));
+        assert!(env.contains(&"HUGGING_FACE_HUB_TOKEN=hf_secret"));
+        assert!(
+            env.iter().any(|e| e.starts_with("PATH=")),
+            "PATH is still set"
+        );
+        assert!(
+            !with["script"].as_str().unwrap().contains("hf_secret"),
+            "token must not be written into the script"
+        );
+
+        let without = submit_body(&job, "");
+        let env: Vec<&str> = without["job"]["environment"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(!env
+            .iter()
+            .any(|e| e.starts_with("HF_TOKEN=") || e.starts_with("HUGGING_FACE_HUB_TOKEN=")));
+        assert!(env.iter().any(|e| e.starts_with("PATH=")));
+    }
+
+    #[test]
+    fn submit_body_asks_for_one_task_per_node_on_multi_node_jobs() {
+        let single = job_submit_from_spec(&spec(), "m", "obleth-", 8000, 8);
+        let body = submit_body(&single, "");
+        assert_eq!(body["job"]["nodes"], "1");
+        assert_eq!(body["job"]["tasks"], 1);
+        assert!(body["job"].get("tasks_per_node").is_none());
+
+        let mut s = spec();
+        s.nodes = 4;
+        let multi = job_submit_from_spec(&s, "m", "obleth-", 8000, 8);
+        let body = submit_body(&multi, "");
+        assert_eq!(body["job"]["nodes"], "4");
+        assert_eq!(body["job"]["tasks"], 4);
+        assert_eq!(body["job"]["tasks_per_node"], 1);
     }
 
     #[test]
@@ -855,7 +1062,77 @@ mod tests {
         assert_eq!(parse_mem_mb(""), None);
         assert_eq!(parse_mem_mb("   "), None);
         assert_eq!(parse_mem_mb("lots"), None);
-        assert_eq!(parse_mem_mb("0G"), None);
+        assert_eq!(parse_mem_mb("-4G"), None);
+        // `--mem=0` is all of the node's memory, not "unset".
+        assert_eq!(parse_mem_mb("0"), Some(0));
+        assert_eq!(parse_mem_mb("0G"), Some(0));
+    }
+
+    #[test]
+    fn mem_zero_asks_slurm_for_the_whole_node() {
+        let mut s = spec();
+        s.mem = Some("0".into());
+        let j = job_submit_from_spec(&s, "m", "obleth-", 8000, 1);
+        assert_eq!(submit_body(&j, "")["job"]["memory_per_node"], 0);
+        s.mem = None;
+        let j = job_submit_from_spec(&s, "m", "obleth-", 8000, 1);
+        assert!(submit_body(&j, "")["job"].get("memory_per_node").is_none());
+    }
+
+    fn node(name: &str, partition: &str, real: Option<i64>, spec: Option<i64>) -> NodeInfo {
+        NodeInfo {
+            name: name.into(),
+            partitions: vec![partition.into()],
+            gres: String::new(),
+            cpus: Some(72),
+            real_memory_mb: real,
+            specialized_memory_mb: spec,
+            features: vec![],
+            state: vec!["IDLE".into()],
+            alloc_cpus: None,
+            alloc_memory_mb: None,
+        }
+    }
+
+    #[test]
+    fn whole_node_mem_is_the_smallest_node_less_what_slurm_keeps() {
+        let nodes = vec![
+            node("gh1", "arm", Some(587553), Some(3500)),
+            node("gh2", "arm", Some(587289), Some(3500)),
+            node("gh3", "arm", None, None),
+            node("c1", "general", Some(515516), None),
+        ];
+        assert_eq!(whole_node_mem_mb(&nodes, "arm"), Some(583789));
+        assert_eq!(whole_node_mem_mb(&nodes, "general"), Some(515516));
+        assert_eq!(whole_node_mem_mb(&nodes, "gpu"), None);
+        assert_eq!(whole_node_mem_mb(&nodes, ""), None);
+    }
+
+    #[test]
+    fn parse_nodes_reads_specialized_memory() {
+        let v = serde_json::json!({"nodes": [
+            {"name": "gh1", "partitions": ["arm"], "real_memory": 587289, "specialized_memory": 3500},
+            {"name": "c1", "partitions": ["general"], "real_memory": 515516, "specialized_memory": 0},
+        ]});
+        let nodes = parse_nodes(&v);
+        assert_eq!(nodes[0].specialized_memory_mb, Some(3500));
+        assert_eq!(nodes[1].specialized_memory_mb, None);
+    }
+
+    #[test]
+    fn windows_line_endings_are_submitted_as_unix_ones() {
+        let mut s = spec();
+        s.script_body = "#!/bin/bash -l\r\nset -euo pipefail\r\nvllm serve m --port \"$OBLETH_SERVING_PORT\"\r\n".into();
+        let j = job_submit_from_spec(&s, "m", "obleth-", 8000, 1);
+        assert!(!j.script.contains('\r'), "no carriage returns reach bash");
+        assert!(j.script.starts_with("#!/bin/bash -l\n# obleth: bind"));
+        assert!(j.script.contains("\nset -euo pipefail\n"));
+        // The legacy assembly gets the same treatment.
+        let mut s = spec();
+        s.preamble = "module load cuda\r\nmodule load apptainer".into();
+        s.launch_command = "llama-server --port 8000\r\n".into();
+        let j = job_submit_from_spec(&s, "m", "obleth-", 8000, 1);
+        assert!(!j.script.contains('\r'));
     }
 
     #[test]
@@ -1114,6 +1391,42 @@ mod tests {
         assert_eq!(n[0].alloc_cpus, Some(36));
         assert_eq!(n[0].alloc_memory_mb, Some(262144));
         assert_eq!(n[1].state, vec!["IDLE"]);
+    }
+
+    #[test]
+    fn parse_association_list_keeps_partitions() {
+        let v = serde_json::json!({"associations":[
+            {"account":"grp_a","partition":"gh200","qos":["normal"]},
+            {"account":"grp_a","partition":"gh200","qos":["normal"]},
+            {"account":"grp_b","partition":"","qos":"public"}
+        ]});
+        assert_eq!(
+            parse_association_list(&v),
+            vec![
+                AssociationInfo {
+                    account: "grp_a".into(),
+                    partition: Some("gh200".into()),
+                    qos: vec!["normal".into()]
+                },
+                AssociationInfo {
+                    account: "grp_b".into(),
+                    partition: None,
+                    qos: vec!["public".into()]
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_partitions_reads_allowed_and_denied_accounts() {
+        let v = serde_json::json!({"partitions":[
+            {"name":"gh200","accounts":{"allowed":"grp_a,grp_b","deny":""}},
+            {"name":"general","accounts":{"allowed":"ALL","deny":"grp_x"}}
+        ]});
+        let p = parse_partitions(&v);
+        assert_eq!(p[0].allowed_accounts, vec!["grp_a", "grp_b"]);
+        assert!(p[1].allowed_accounts.is_empty());
+        assert_eq!(p[1].denied_accounts, vec!["grp_x"]);
     }
 
     #[test]

@@ -32,10 +32,12 @@ use std::time::Duration;
 use obleth_config::{ResolvedKey, ResolvedModel, ToolLoopSettings};
 use obleth_tokenizer::Tokenizer;
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 use super::mcp_tools::{self, McpTool};
 use super::respond::TransformResult;
 use super::ResponsePlan;
+use crate::proxy::UpstreamUsage;
 use crate::state::AppState;
 
 /// Cap on a single tool result fed back to the model (bounds context growth).
@@ -120,6 +122,10 @@ pub struct ToolLoopPlan {
     /// the loop. `None` leaves `generate_image` unhandled, which is correct:
     /// the tool is only ever injected alongside this field.
     pub image_gen: Option<obleth_config::ImageGenerationBoonSettings>,
+    /// Web-search boon settings snapshot, present when the boon armed the
+    /// loop. `None` leaves `web_search` to whoever owns the name (a client
+    /// tool or a granted MCP server).
+    pub web_search: Option<obleth_config::WebSearchBoonSettings>,
     /// URL of the upstream that answered turn 0, when the dispatcher records
     /// it. Follow-up turns go to the same endpoint so they reuse its prefix
     /// cache. `None` falls back to the model's endpoint selection with this
@@ -385,15 +391,10 @@ pub(super) fn deadline_result(name: &str) -> String {
     )
 }
 
-/// `(prompt_tokens, completion_tokens)` from a completion, read the way the
-/// proxy's settle path reads it (a missing `prompt_tokens` means "no usage").
-fn completion_usage(body: &Value) -> Option<(u32, u32)> {
-    let input = body.pointer("/usage/prompt_tokens")?.as_u64()? as u32;
-    let output = body
-        .pointer("/usage/completion_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
-    Some((input, output))
+/// Usage from a completion, read the way the proxy's settle path reads it (a
+/// missing `prompt_tokens` means "no usage").
+fn completion_usage(body: &Value) -> Option<UpstreamUsage> {
+    crate::proxy::completion_body_usage(body)
 }
 
 /// Attach generated images to the final completion and reconcile the warning.
@@ -453,13 +454,16 @@ pub async fn run(
     route: Option<&ResolvedModel>,
     key: &ResolvedKey,
     session_id: &str,
+    request_id: Uuid,
     dispatch_timeout: Duration,
     body: &mut Value,
     mut tracer: Option<&mut crate::tracer::SpanRecorder>,
 ) -> TransformResult {
     let Some(loop_plan) = &plan.tool_loop else {
-        return super::respond::transform_completion(state, plan, route, key, session_id, body)
-            .await;
+        return super::respond::transform_completion(
+            state, plan, route, key, session_id, request_id, body,
+        )
+        .await;
     };
     let Some(route) = route else {
         return TransformResult {
@@ -494,7 +498,19 @@ pub async fn run(
             cfg,
             key,
             session_id,
+            request_id,
             images: Vec::new(),
+            events: Vec::new(),
+        });
+    let mut search_ctx = loop_plan
+        .web_search
+        .as_ref()
+        .map(|cfg| super::web_search::SearchCtx {
+            cfg,
+            key,
+            session_id,
+            request_id,
+            searches: 0,
             events: Vec::new(),
         });
 
@@ -547,6 +563,7 @@ pub async fn run(
                         Some(route),
                         key,
                         session_id,
+                        request_id,
                         body,
                     )
                     .await
@@ -598,6 +615,7 @@ pub async fn run(
                 &loop_plan.tool_servers,
                 &mut sessions,
                 image_ctx.as_mut(),
+                search_ctx.as_mut(),
                 call,
                 index,
                 &deadline,
@@ -637,6 +655,23 @@ pub async fn run(
                 }
             }
         }
+        if let Some(ctx) = search_ctx.as_mut() {
+            for event in ctx.events.drain(..) {
+                if let Some(t) = tracer.as_deref_mut() {
+                    t.record(
+                        "boon:web_search",
+                        "boon:tool_loop",
+                        tool_exec_start,
+                        event.upstream_ms,
+                        if event.ok { "ok" } else { "error" },
+                        serde_json::json!({
+                            "results": event.results,
+                            "tool": event.tool,
+                        }),
+                    );
+                }
+            }
+        }
         let tool_exec_ms = (crate::tracer::now_ms() - tool_exec_start) as u32;
 
         let model_call_start = crate::tracer::now_ms();
@@ -660,6 +695,7 @@ pub async fn run(
                     route,
                     key,
                     session_id,
+                    request_id,
                     "tool_loop",
                     input_tokens,
                     output_tokens,
@@ -764,6 +800,7 @@ pub async fn run(
                 route,
                 key,
                 session_id,
+                request_id,
                 "tool_loop",
                 input_tokens,
                 output_tokens,
@@ -816,11 +853,11 @@ fn reported_tokens(completion: &Value) -> (u32, u32) {
 fn turn0_or_estimate(
     state: &AppState,
     loop_plan: &ToolLoopPlan,
-    reported: Option<(u32, u32)>,
-) -> (u32, u32) {
+    reported: Option<UpstreamUsage>,
+) -> UpstreamUsage {
     reported.unwrap_or_else(|| {
         let est = state.tokenizer.estimate_request(&loop_plan.request);
-        (est.input_tokens, est.estimated_output_tokens)
+        UpstreamUsage::uncached(est.input_tokens, est.estimated_output_tokens)
     })
 }
 
@@ -852,6 +889,7 @@ pub(super) async fn run_one_call(
     tool_servers: &HashMap<String, String>,
     sessions: &mut Sessions,
     image: Option<&mut super::image_gen::ImageCtx<'_>>,
+    search: Option<&mut super::web_search::SearchCtx<'_>>,
     call: &PendingCall,
     index: usize,
     deadline: &LoopDeadline,
@@ -865,6 +903,7 @@ pub(super) async fn run_one_call(
                 tool_servers,
                 sessions,
                 image,
+                search,
                 call,
                 timeout,
                 deadline,
@@ -942,6 +981,7 @@ pub(super) async fn execute_call(
     tool_servers: &HashMap<String, String>,
     sessions: &mut Sessions,
     image: Option<&mut super::image_gen::ImageCtx<'_>>,
+    search: Option<&mut super::web_search::SearchCtx<'_>>,
     call: &PendingCall,
     timeout: Duration,
     deadline: &LoopDeadline,
@@ -973,6 +1013,18 @@ pub(super) async fn execute_call(
             return deadline_result(&call.name);
         };
         return super::image_gen::execute(state, ctx, &call.arguments, image_timeout).await;
+    }
+
+    // Gateway-executed web search, when this boon armed the loop. Without a
+    // context the name belongs to someone else (a granted MCP server's
+    // `web_search`, say), so it falls through to the normal lookup below.
+    if call.name == super::web_search::WEB_SEARCH_TOOL {
+        if let Some(ctx) = search {
+            let Some(search_timeout) = super::web_search::call_timeout(ctx.cfg, deadline) else {
+                return deadline_result(&call.name);
+            };
+            return super::web_search::execute(state, ctx, &call.arguments, search_timeout).await;
+        }
     }
 
     let Some(server_name) = tool_servers.get(&call.name) else {
@@ -1075,6 +1127,7 @@ mod tests {
             settings: ToolLoopSettings::default(),
             passthrough_unmapped: false,
             image_gen: None,
+            web_search: None,
             served_url: Some(format!("{base_b}/chat/completions")),
         };
         let http = reqwest::Client::new();
@@ -1271,7 +1324,7 @@ mod tests {
     fn completion_usage_reads_like_the_settle_path() {
         assert_eq!(
             completion_usage(&json!({"usage": {"prompt_tokens": 9, "completion_tokens": 4}})),
-            Some((9, 4))
+            Some(UpstreamUsage::uncached(9, 4))
         );
         assert_eq!(
             completion_usage(&json!({"usage": {"completion_tokens": 4}})),

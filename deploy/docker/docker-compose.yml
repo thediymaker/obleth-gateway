@@ -70,6 +70,8 @@ services:
       - "chdata:/var/lib/clickhouse"
       # Built-in Prometheus exposition on :9363/metrics (scraped by Prometheus).
       - "./clickhouse/prometheus.xml:/etc/clickhouse-server/config.d/prometheus.xml:ro"
+      # Keeps a week of ClickHouse's own logs instead of all of them.
+      - "./clickhouse/system-logs.xml:/etc/clickhouse-server/config.d/system-logs.xml:ro"
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
       interval: 3s
@@ -179,6 +181,9 @@ services:
       # Days of raw per-request usage history kept before pruning (whole
       # day-partitions are dropped). The permanent daily rollup is never pruned.
       OBLETH_USAGE_RETENTION_DAYS: ${OBLETH_USAGE_RETENTION_DAYS:-180}
+      # Milliseconds each gateway buffers usage rows before inserting them into
+      # ClickHouse. Each insert is a part ClickHouse later rewrites in merges.
+      OBLETH_TELEMETRY_FLUSH_INTERVAL_MS: ${OBLETH_TELEMETRY_FLUSH_INTERVAL_MS:-5000}
       # OTLP/HTTP trace export (base URL). Empty disables tracing; the
       # observability profile ships a Jaeger collector on :4318.
       OBLETH_OTEL_ENDPOINT: ${OBLETH_OTEL_ENDPOINT:-}

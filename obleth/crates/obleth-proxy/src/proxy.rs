@@ -902,15 +902,73 @@ async fn count_tokens_shim(
         .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
 }
 
+/// Response header naming the variant a request was served through (see
+/// [`obleth_config::ModelVariant`]), on every response after the name resolved.
+pub(crate) const MODEL_VARIANT_HEADER: &str = "x-obleth-model-variant";
+
+/// The pipeline every proxied request runs ([`run_pipeline`]), plus the
+/// response headers that describe how it was served, whichever exit the
+/// pipeline took.
+async fn proxy_handler_inner(
+    state: State<AppState>,
+    req: Request<Body>,
+    request_id: Uuid,
+) -> Response<Body> {
+    let mut variant: Option<String> = None;
+    let mut lifecycle: Option<crate::lifecycle::Notice> = None;
+    let resp = run_pipeline(state, req, request_id, &mut variant, &mut lifecycle).await;
+    let mut resp = with_variant_header(resp, variant.as_deref());
+    if let Some(notice) = &lifecycle {
+        crate::lifecycle::apply_headers(&mut resp, notice);
+    }
+    resp
+}
+
+/// `resp` with [`MODEL_VARIANT_HEADER`] set when the request named a variant.
+fn with_variant_header(mut resp: Response<Body>, variant: Option<&str>) -> Response<Body> {
+    if let Some(value) = variant.and_then(|v| header::HeaderValue::from_str(v).ok()) {
+        resp.headers_mut().insert(MODEL_VARIANT_HEADER, value);
+    }
+    resp
+}
+
+/// A route as the client named it: the route to serve the request with, and
+/// the variant name the client used, if the name was one.
+///
+/// A variant is served by its parent route with the variant's boons added
+/// ([`ResolvedModel::with_variant`]). Every other field, `model_name` first,
+/// stays the parent's, so the admission pool, budgets, prices and the usage
+/// ledger key on one model however many names it answers to.
+pub(crate) fn serve_as(
+    route: Arc<ResolvedModel>,
+    requested: &str,
+) -> (Arc<ResolvedModel>, Option<String>) {
+    match route.with_variant(requested) {
+        Some(served) => (Arc::new(served), Some(requested.to_string())),
+        None => (route, None),
+    }
+}
+
+/// The pool a routed request is admitted to: one per model, keyed by the
+/// route's own `model_name`, so a variant queues with its parent.
+pub(crate) fn admission_pool(route: Option<&ResolvedModel>) -> obleth_fairshare::PoolKey {
+    match route {
+        Some(r) => obleth_fairshare::PoolKey::Model(r.model_name.clone()),
+        None => obleth_fairshare::PoolKey::Unrouted,
+    }
+}
+
 #[tracing::instrument(
     skip_all,
     name = "proxy_request",
     fields(session.id = tracing::field::Empty, session.id.source = tracing::field::Empty)
 )]
-async fn proxy_handler_inner(
+async fn run_pipeline(
     State(state): State<AppState>,
     req: Request<Body>,
     request_id: Uuid,
+    served_variant: &mut Option<String>,
+    lifecycle_notice: &mut Option<crate::lifecycle::Notice>,
 ) -> Response<Body> {
     let request_start = Instant::now();
     let proxy_start_ms = crate::tracer::now_ms();
@@ -1102,11 +1160,15 @@ async fn proxy_handler_inner(
         resolved.tenant_id,
         state.session_id_derivation,
     );
-    let req_meta = RequestMeta {
+    let end_user = end_user_for(&resolved, &headers, &json);
+    let mut req_meta = RequestMeta {
         session_id: conversation.value,
         session_id_source: conversation.source.as_str(),
         request_type: surfaced_request_type(&resolved, &path, &headers),
         device_id,
+        end_user: end_user.clone().unwrap_or_default(),
+        // Set below once the model name resolves.
+        model_variant: String::new(),
     };
     // Surface the conversation id on the OTLP/Jaeger root span for cross-request
     // grouping (the field is declared Empty on the #[instrument] below).
@@ -1126,7 +1188,7 @@ async fn proxy_handler_inner(
     // shape (estimated context size, required capabilities) and live load. From
     // here on, everything downstream — admission, budgets, caching, telemetry,
     // upstream dispatch — sees the concrete model as if the client named it.
-    let route = if model == crate::router::AUTO_MODEL_NAME {
+    let (mut route, mut variant) = if model == crate::router::AUTO_MODEL_NAME {
         // Span bookkeeping for the routing decision. Only the traced branch
         // below reads it, so an untraced request does not pay for the clock
         // read — nor does any non-auto request, which never enters this block.
@@ -1250,7 +1312,8 @@ async fn proxy_handler_inner(
             Some(chosen) => {
                 tracing::debug!(chosen = %chosen.model_name, "auto-routed request");
                 model = chosen.model_name.clone();
-                Some(Arc::new(chosen))
+                // Candidates are real models only, never variants.
+                (Some(Arc::new(chosen)), None)
             }
             None => {
                 return error_json(
@@ -1260,22 +1323,83 @@ async fn proxy_handler_inner(
             }
         }
     } else {
-        let route = resolve_model(&state, &model).await;
-        // An alias resolves to the same route as the canonical name, so adopt
-        // the canonical name for everything downstream: admission, budgets, the
-        // response cache, the per-tenant allowlist, and the usage ledger. This
-        // is the same move `auto` makes after it picks — without it, one
+        // A variant resolves to its parent's route with the variant's boons
+        // added (`serve_as`); an alias to the parent's route as it is.
+        let (route, variant) = match resolve_model(&state, &model).await {
+            Some(r) => {
+                let (r, variant) = serve_as(r, &model);
+                (Some(r), variant)
+            }
+            None => (None, None),
+        };
+        // An alias or a variant resolves to the same route as the canonical
+        // name, so adopt the canonical name for everything downstream:
+        // admission, budgets, the response cache (a variant keeps entries of
+        // its own, below), the per-tenant allowlist, and the usage ledger.
+        // This is the same move `auto` makes after it picks — without it, one
         // model's traffic would split across every spelling clients happen to
-        // have pinned, and a tenant allowed `glm-5-3` would be refused for
-        // asking the same model by its old name.
+        // have pinned (and a variant would mint a second pool for the same
+        // backend), and a tenant allowed `glm-5-3` would be refused for asking
+        // the same model by its old name.
         if let Some(r) = route.as_ref() {
             if r.model_name != model {
-                tracing::debug!(alias = %model, model = %r.model_name, "resolved model alias");
+                tracing::debug!(requested = %model, model = %r.model_name, "resolved model alias or variant");
                 model = r.model_name.clone();
             }
         }
-        route
+        (route, variant)
     };
+    // ---- model lifecycle ----
+    // A deprecated model is served with headers saying so; a retired one is
+    // refused with 410 Gone, or answered by its replacement when the operator
+    // asked for that. A redirect drops the variant: it belongs to the retired
+    // model, and the replacement is served as itself. `auto` never gets here
+    // with either, since it does not pick them.
+    if let Some(r) = route.clone() {
+        match crate::lifecycle::gate(&state, &r, chrono::Utc::now()).await {
+            crate::lifecycle::Gate::Serve(notice) => *lifecycle_notice = notice,
+            crate::lifecycle::Gate::Redirect(next, notice) => {
+                tracing::debug!(retired = %model, served = %next.model_name, "retired model redirected to its replacement");
+                model = next.model_name.clone();
+                route = Some(next);
+                variant = None;
+                *lifecycle_notice = Some(notice);
+            }
+            crate::lifecycle::Gate::Refuse(resp) => {
+                // Recorded, so the operator can see who still calls the model
+                // and tell them before the 410s do.
+                req_meta.model_variant = variant.clone().unwrap_or_default();
+                let elapsed = request_start.elapsed().as_millis() as u32;
+                finalize(
+                    &state,
+                    request_id,
+                    &resolved,
+                    &req_meta,
+                    &model,
+                    Admission::Rejected,
+                    CostEstimate {
+                        input_tokens: 0,
+                        estimated_output_tokens: 0,
+                    },
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    elapsed,
+                    StatusCode::GONE.as_u16(),
+                    "off",
+                    0.0,
+                    crate::energy::EnergyFigures::default(),
+                );
+                return resp;
+            }
+        }
+    }
+    // The name the client used, for its usage row and response headers. The
+    // ledger's `model` stays the parent's.
+    req_meta.model_variant = variant.clone().unwrap_or_default();
+    served_variant.clone_from(&variant);
 
     if requires_registered_model(&path) {
         if model == "unknown" {
@@ -1290,6 +1414,17 @@ async fn proxy_handler_inner(
         if !route.enabled {
             return error_json(StatusCode::FORBIDDEN, "model is disabled");
         }
+    }
+    // A search tool answers only on its own endpoint; forwarding a chat (or
+    // any other) body to the search upstream would come back as its 404.
+    if route
+        .as_ref()
+        .is_some_and(|r| r.model_type == obleth_config::SEARCH_MODEL_TYPE)
+    {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            &format!("'{model}' is a search tool: call POST /v1/search"),
+        );
     }
     // ---- reject unmapped passthrough (noise / info-leak guard) ----
     // A request that resolved to no registered model (`route` is None) and whose
@@ -1306,9 +1441,14 @@ async fn proxy_handler_inner(
         return error_json(StatusCode::NOT_FOUND, "unknown endpoint");
     }
     // ---- per-tenant model allowlist (Phase 4) ----
+    // A variant is allowed by its parent's name, as an alias is, or by its
+    // own name, so a tenant can be given the variant alone.
     if !resolved.internal {
         if let Some(allowed) = &resolved.allowed_models {
-            if !allowed.iter().any(|m| m == &model) {
+            if !allowed
+                .iter()
+                .any(|m| m == &model || variant.as_deref() == Some(m.as_str()))
+            {
                 return error_json(StatusCode::FORBIDDEN, "model not permitted for tenant");
             }
         }
@@ -1369,6 +1509,7 @@ async fn proxy_handler_inner(
             route.as_deref(),
             &resolved,
             &req_meta.session_id,
+            request_id,
             boons_opt_out,
             boons_force_lossy,
             is_chat_path(&path),
@@ -1464,8 +1605,15 @@ async fn proxy_handler_inner(
     let cache_ttl = route.as_ref().map(|r| r.cache_ttl_secs).unwrap_or(0);
     // TTL <= 0 means "don't cache": nothing is ever written, so a lookup could
     // never hit and would only cost a Redis round-trip.
-    let cache_key = (cache_enabled && cache_ttl > 0)
-        .then(|| obleth_config::cache_key(&resolved.tenant_id.to_string(), &model, &body_bytes));
+    // Keyed by the variant's name when the client used one: its boons can
+    // change the answer, so it must not share entries with its parent.
+    let cache_key = (cache_enabled && cache_ttl > 0).then(|| {
+        obleth_config::cache_key(
+            &resolved.tenant_id.to_string(),
+            variant.as_deref().unwrap_or(&model),
+            &body_bytes,
+        )
+    });
     if let Some(ck) = &cache_key {
         let cache_start = crate::tracer::now_ms();
         let cache_result = state
@@ -1504,6 +1652,7 @@ async fn proxy_handler_inner(
                     est,
                     cached.input_tokens,
                     cached.output_tokens,
+                    0,
                     0,
                     0,
                     0,
@@ -1560,11 +1709,7 @@ async fn proxy_handler_inner(
     // Requests with no registered route share one pool, so arbitrary model
     // strings cannot each mint scheduler state.
     let admission_start = crate::tracer::now_ms();
-    let pool = if route.is_some() {
-        obleth_fairshare::PoolKey::Model(model.clone())
-    } else {
-        obleth_fairshare::PoolKey::Unrouted
-    };
+    let pool = admission_pool(route.as_deref());
     let admit_wait = admission_timeout();
     let admit = state.fairshare.admit_to(
         pool,
@@ -1574,6 +1719,7 @@ async fn proxy_handler_inner(
             route.as_deref(),
             effective_weight,
             est.total(),
+            end_user.as_deref(),
         ),
     );
     let admitted = match timeout(admit_wait, admit).await {
@@ -1591,6 +1737,7 @@ async fn proxy_handler_inner(
                 &model,
                 Admission::Rejected,
                 est,
+                0,
                 0,
                 0,
                 queued_ms,
@@ -1723,6 +1870,7 @@ async fn proxy_handler_inner(
                     est,
                     0,
                     0,
+                    0,
                     queue_wait_ms,
                     0,
                     0,
@@ -1800,6 +1948,7 @@ async fn proxy_handler_inner(
                     est,
                     0,
                     0,
+                    0,
                     queue_wait_ms,
                     0,
                     0,
@@ -1839,6 +1988,7 @@ async fn proxy_handler_inner(
                     &model,
                     Admission::Rejected,
                     est,
+                    0,
                     0,
                     0,
                     queue_wait_ms,
@@ -1963,6 +2113,7 @@ async fn proxy_handler_inner(
                 route: spec_route,
                 key: &resolved,
                 session_id: &req_meta.session_id,
+                request_id,
                 dispatch_timeout: req_timeout,
                 started: request_start,
             };
@@ -1972,12 +2123,13 @@ async fn proxy_handler_inner(
                     body,
                     input_tokens,
                     output_tokens,
+                    drafted_by,
                 } => {
                     drop(permit);
                     let total_ms = request_start.elapsed().as_millis() as u32;
                     let _ = settle_guard
                         .complete(accounting.settle(
-                            (input_tokens, output_tokens),
+                            UpstreamUsage::uncached(input_tokens, output_tokens),
                             total_ms,
                             total_ms,
                             200,
@@ -1991,6 +2143,7 @@ async fn proxy_handler_inner(
                         .status(StatusCode::OK)
                         .header(header::CONTENT_TYPE, "application/json")
                         .header("x-obleth-request-id", request_id.to_string())
+                        .header(crate::boons::speculation::DRAFTED_BY_HEADER, drafted_by)
                         .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
                     if !boons_applied.is_empty() {
                         builder =
@@ -2002,7 +2155,7 @@ async fn proxy_handler_inner(
                             error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
                         });
                 }
-                crate::boons::speculation::Outcome::Stream(driver) => {
+                crate::boons::speculation::Outcome::Stream { driver, drafted_by } => {
                     accounting.arm_estimate(&mut settle_guard);
                     let body_stream = async_stream::stream! {
                         futures_util::pin_mut!(driver);
@@ -2021,7 +2174,8 @@ async fn proxy_handler_inner(
                         };
                         let total_ms = request_start.elapsed().as_millis() as u32;
                         let _ = settle_guard.complete(accounting.settle(
-                            (input_tokens, output_tokens), ttft_ms, total_ms, 200, None,
+                            UpstreamUsage::uncached(input_tokens, output_tokens),
+                            ttft_ms, total_ms, 200, None,
                         )).await;
                     };
                     if let Some(t) = tracer.take() {
@@ -2031,6 +2185,7 @@ async fn proxy_handler_inner(
                         .status(StatusCode::OK)
                         .header(header::CONTENT_TYPE, "text/event-stream")
                         .header("x-obleth-request-id", request_id.to_string())
+                        .header(crate::boons::speculation::DRAFTED_BY_HEADER, drafted_by)
                         .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
                     if !boons_applied.is_empty() {
                         builder =
@@ -2388,7 +2543,7 @@ async fn proxy_handler_inner(
         let total_ms = request_start.elapsed().as_millis() as u32;
         let (tokens, billed) = match extract_usage(&String::from_utf8_lossy(&buf)) {
             Some(tokens) => (tokens, true),
-            None => ((0, 0), false),
+            None => (UpstreamUsage::default(), false),
         };
         let _ = settle_guard
             .complete(accounting.settle_with(tokens, ttft_ms, total_ms, status_code, None, billed))
@@ -2468,7 +2623,7 @@ async fn proxy_handler_inner(
             drop(permit);
             let total_ms = request_start.elapsed().as_millis() as u32;
             let settle = accounting.settle_with(
-                (0, 0),
+                UpstreamUsage::default(),
                 outcome.ttft_ms(),
                 total_ms,
                 outcome.status().as_u16(),
@@ -2516,11 +2671,13 @@ async fn proxy_handler_inner(
                         route: (*route_owned).clone(),
                         key: (*resolved).clone(),
                         session_id: req_meta.session_id.clone(),
+                        request_id,
                         base_request: loop_plan.request.clone(),
                         tool_servers: loop_plan.tool_servers.clone(),
                         settings: loop_plan.settings.clone(),
                         passthrough_unmapped: loop_plan.passthrough_unmapped,
                         image_gen: loop_plan.image_gen.clone(),
+                        web_search: loop_plan.web_search.clone(),
                         dispatch_timeout: req_timeout,
                         client_include_usage: plan.include_usage,
                         upstream_start,
@@ -2550,7 +2707,8 @@ async fn proxy_handler_inner(
                     let total_ms = request_start.elapsed().as_millis() as u32;
                     accounting.monitor(scan_policy.as_ref(), output_monitor);
                     let _ = settle_guard.complete(accounting.settle(
-                        (input_tokens, output_tokens), ttft_ms, total_ms, status_code, None,
+                        UpstreamUsage::uncached(input_tokens, output_tokens),
+                        ttft_ms, total_ms, status_code, None,
                     )).await;
                 };
                 if let Some(t) = tracer.take() {
@@ -2619,7 +2777,7 @@ async fn proxy_handler_inner(
         let mut warning: Option<&'static str> = None;
         // Usage the main row settles with when the buffered tool loop replaced
         // the body (the follow-up turns are billed as helper rows).
-        let mut turn0_usage: Option<(u32, u32)> = None;
+        let mut turn0_usage: Option<UpstreamUsage> = None;
         let mut completion: Option<serde_json::Value> = (!truncated
             && buf.len() <= BOON_BUFFER_MAX)
             .then(|| serde_json::from_slice::<serde_json::Value>(&buf).ok())
@@ -2636,6 +2794,7 @@ async fn proxy_handler_inner(
                     route.as_deref(),
                     &resolved,
                     &req_meta.session_id,
+                    request_id,
                     req_timeout,
                     body_json,
                     tracer.as_mut(),
@@ -2651,6 +2810,7 @@ async fn proxy_handler_inner(
                         &guard_plan.policy,
                         &resolved,
                         &req_meta.session_id,
+                        request_id,
                         body_json,
                         tracer.as_mut(),
                     )
@@ -2663,7 +2823,10 @@ async fn proxy_handler_inner(
                             // though the client only sees the block.
                             let tokens = turn0_usage
                                 .or_else(|| completion_body_usage(body_json))
-                                .unwrap_or((est.input_tokens, est.estimated_output_tokens));
+                                .unwrap_or(UpstreamUsage::uncached(
+                                    est.input_tokens,
+                                    est.estimated_output_tokens,
+                                ));
                             let total_ms = request_start.elapsed().as_millis() as u32;
                             let _ = settle_guard
                                 .complete(accounting.settle(
@@ -2706,9 +2869,12 @@ async fn proxy_handler_inner(
         };
         drop(permit);
 
-        let (input_tokens, output_tokens) = turn0_usage
+        let tokens = turn0_usage
             .or_else(|| completion.as_ref().and_then(completion_body_usage))
-            .unwrap_or((est.input_tokens, est.estimated_output_tokens));
+            .unwrap_or(UpstreamUsage::uncached(
+                est.input_tokens,
+                est.estimated_output_tokens,
+            ));
         let total_ms = request_start.elapsed().as_millis() as u32;
 
         // Cache the *transformed* body so cache hits replay exactly what the
@@ -2724,13 +2890,7 @@ async fn proxy_handler_inner(
             _ => None,
         };
         let _ = settle_guard
-            .complete(accounting.settle(
-                (input_tokens, output_tokens),
-                ttft_ms,
-                total_ms,
-                status_code,
-                cache_put,
-            ))
+            .complete(accounting.settle(tokens, ttft_ms, total_ms, status_code, cache_put))
             .await;
 
         let mut builder = Response::builder()
@@ -2864,7 +3024,10 @@ async fn proxy_handler_inner(
             // so the client cannot mistake the truncated body for a whole one.
             yield Err(std::io::Error::other(format!("upstream stream failed: {err}")));
         } else {
-            let tokens = usage.unwrap_or((est.input_tokens, est.estimated_output_tokens));
+            let tokens = usage.unwrap_or(UpstreamUsage::uncached(
+                est.input_tokens,
+                est.estimated_output_tokens,
+            ));
             // store the full response for identical future requests
             let cache_put = if cacheable && status_code == 200 {
                 store_in_cache.as_deref().map(|ck| {
@@ -3139,18 +3302,18 @@ async fn release_term_hold(
 /// ~4 characters per token) on top of the prompt estimate. Nothing streamed
 /// means nothing generated, so it is unbilled.
 fn truncated_stream_billing(
-    usage: Option<(u32, u32)>,
+    usage: Option<UpstreamUsage>,
     streamed_chars: usize,
     est: CostEstimate,
-) -> ((u32, u32), bool) {
+) -> (UpstreamUsage, bool) {
     if let Some(tokens) = usage {
         return (tokens, true);
     }
     if streamed_chars == 0 {
-        return ((0, 0), false);
+        return (UpstreamUsage::default(), false);
     }
     let output = u32::try_from(streamed_chars / 4).unwrap_or(u32::MAX).max(1);
-    ((est.input_tokens, output), true)
+    (UpstreamUsage::uncached(est.input_tokens, output), true)
 }
 
 /// Characters of generated text in one raw response chunk: the string values
@@ -3224,14 +3387,61 @@ fn field_text_chars(chunk: &[u8], key: &[u8]) -> usize {
     total
 }
 
+/// Tokens a request settles with: what the upstream reported, or an estimate
+/// in its place. `input` is the whole prompt, cached tokens included, so totals
+/// and prices keep their meaning; `cached` is the part of it the upstream
+/// served from its prefix cache, never more than `input`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct UpstreamUsage {
+    pub(crate) input: u32,
+    pub(crate) output: u32,
+    pub(crate) cached: u32,
+}
+
+impl UpstreamUsage {
+    pub(crate) fn new(input: u32, output: u32, cached: u32) -> Self {
+        Self {
+            input,
+            output,
+            cached: cached.min(input),
+        }
+    }
+
+    /// Usage with no cached prompt tokens: estimates, cancellations and
+    /// answers the gateway composed itself.
+    pub(crate) const fn uncached(input: u32, output: u32) -> Self {
+        Self {
+            input,
+            output,
+            cached: 0,
+        }
+    }
+}
+
+/// `prompt_tokens_details.cached_tokens` of an OpenAI-style `usage` object,
+/// never more than its `prompt_tokens`. Missing or `null` details count as 0.
+pub(crate) fn cached_prompt_tokens(usage: &serde_json::Value) -> u64 {
+    let prompt = usage
+        .get("prompt_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    usage
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        .min(prompt)
+}
+
 /// Usage a buffered chat completion reports, if any.
-fn completion_body_usage(body: &serde_json::Value) -> Option<(u32, u32)> {
-    let input = body.pointer("/usage/prompt_tokens")?.as_u64()? as u32;
-    let output = body
-        .pointer("/usage/completion_tokens")
+pub(crate) fn completion_body_usage(body: &serde_json::Value) -> Option<UpstreamUsage> {
+    let usage = body.get("usage")?;
+    let input = usage.get("prompt_tokens")?.as_u64()? as u32;
+    let output = usage
+        .get("completion_tokens")
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u32;
-    Some((input, output))
+    let cached = cached_prompt_tokens(usage) as u32;
+    Some(UpstreamUsage::new(input, output, cached))
 }
 
 /// Owned admission snapshot: cancellation bookkeeping must not borrow the body
@@ -3286,13 +3496,13 @@ impl StreamAccounting {
     /// the upstream has answered (nothing generated, billed nothing) and the
     /// estimate afterwards. Runtime shutdown remains best-effort, just like
     /// the asynchronous telemetry sink; a partial answer is never cached.
-    fn on_cancel(&self, tokens: Option<(u32, u32)>) -> impl FnOnce() + Send + 'static {
+    fn on_cancel(&self, tokens: Option<UpstreamUsage>) -> impl FnOnce() + Send + 'static {
         let accounting = self.clone();
         move || {
             let elapsed = accounting.request_start.elapsed().as_millis() as u32;
             let (tokens, billed) = match tokens {
                 Some(tokens) => (tokens, true),
-                None => ((0, 0), false),
+                None => (UpstreamUsage::default(), false),
             };
             tokio::spawn(accounting.settle_with(tokens, 0, elapsed, 499, None, billed));
         }
@@ -3303,7 +3513,7 @@ impl StreamAccounting {
     }
 
     fn arm_estimate(&self, guard: &mut crate::completion::CompletionGuard) {
-        guard.rearm(self.on_cancel(Some((
+        guard.rearm(self.on_cancel(Some(UpstreamUsage::uncached(
             self.est.input_tokens,
             self.est.estimated_output_tokens,
         ))));
@@ -3311,7 +3521,7 @@ impl StreamAccounting {
 
     pub(crate) async fn settle(
         self,
-        tokens: (u32, u32),
+        tokens: UpstreamUsage,
         ttft_ms: u32,
         total_ms: u32,
         status_code: u16,
@@ -3324,13 +3534,20 @@ impl StreamAccounting {
     /// Settle a request that produced nothing billable: zero tokens and
     /// cost, full refund of every reservation (energy is still charged).
     pub(crate) async fn settle_unbilled(self, ttft_ms: u32, total_ms: u32, status_code: u16) {
-        self.settle_with((0, 0), ttft_ms, total_ms, status_code, None, false)
-            .await;
+        self.settle_with(
+            UpstreamUsage::default(),
+            ttft_ms,
+            total_ms,
+            status_code,
+            None,
+            false,
+        )
+        .await;
     }
 
     async fn settle_with(
         self,
-        tokens: (u32, u32),
+        tokens: UpstreamUsage,
         ttft_ms: u32,
         total_ms: u32,
         status_code: u16,
@@ -3347,8 +3564,7 @@ impl StreamAccounting {
             &self.model,
             self.admission,
             self.est,
-            tokens.0,
-            tokens.1,
+            tokens,
             self.queue_wait_ms,
             ttft_ms,
             total_ms,
@@ -3391,8 +3607,7 @@ async fn settle_inner(
     model: &str,
     admission: Admission,
     est: CostEstimate,
-    input_tokens: u32,
-    output_tokens: u32,
+    tokens: UpstreamUsage,
     queue_wait_ms: u32,
     ttft_ms: u32,
     total_ms: u32,
@@ -3409,6 +3624,11 @@ async fn settle_inner(
     holds: TermHolds,
     billed: bool,
 ) {
+    let UpstreamUsage {
+        input: input_tokens,
+        output: output_tokens,
+        cached: cached_input_tokens,
+    } = tokens;
     // Feed the router's per-request cost estimate: one EWMA sample of how
     // long this model's answers actually run. Successful requests only — an
     // error body's usage says nothing about the model's answering behavior.
@@ -3563,6 +3783,7 @@ async fn settle_inner(
         est,
         input_tokens,
         output_tokens,
+        cached_input_tokens,
         queue_wait_ms,
         ttft_ms,
         total_ms,
@@ -3790,17 +4011,33 @@ pub(crate) fn effective_admission_weight(tenant_weight: i64, route: Option<&Reso
 /// short window after a tenant's quota changes, two keys of the same tenant can
 /// carry different tenant caps and the last admit wins for that pool. It
 /// self-corrects once the cached keys refresh.
+///
+/// `end_user` is the end user [`end_user_for`] found (always `None` unless the
+/// key has `end_user_fairshare` on). With one, the scheduler key is derived
+/// from the key and the end user, so that user queues on their own, and the
+/// key's weight and cap apply to them alone.
 pub(crate) fn admit_request_for(
     resolved: &ResolvedKey,
     model: &str,
     route: Option<&ResolvedModel>,
     weight: i64,
     cost: u32,
+    end_user: Option<&str>,
 ) -> obleth_fairshare::AdmitRequest {
     let positive = |c: Option<i64>| c.and_then(|c| usize::try_from(c).ok()).filter(|c| *c > 0);
+    let (key, end_user) = match end_user {
+        Some(name) => (
+            obleth_config::end_user_key_id(resolved.key_id, name),
+            Some(obleth_fairshare::EndUser {
+                parent_key: resolved.key_id,
+                name: name.to_string(),
+            }),
+        ),
+        None => (resolved.key_id, None),
+    };
     obleth_fairshare::AdmitRequest {
         tenant: resolved.tenant_id,
-        key: resolved.key_id,
+        key,
         weight,
         key_weight: resolved.key_weight.max(1),
         group: resolved.fairshare_group.clone(),
@@ -3810,7 +4047,36 @@ pub(crate) fn admit_request_for(
         tenant_max_in_flight: positive(resolved.max_in_flight),
         key_max_in_flight: positive(resolved.key_max_in_flight),
         cost,
+        end_user,
     }
+}
+
+/// Header a shared front end names each request's end user with, for keys
+/// with `end_user_fairshare` on. A gateway directive, never sent upstream.
+pub(crate) const END_USER_HEADER: &str = "x-obleth-end-user";
+
+/// The end user a request names, for a key with `end_user_fairshare` on:
+/// the `x-obleth-end-user` header, else the body's OpenAI `user` field, else
+/// Anthropic's `metadata.user_id`. Always `None` for other keys, so an
+/// ordinary caller cannot split itself into many places in the queue.
+pub(crate) fn end_user_for(
+    resolved: &ResolvedKey,
+    headers: &HeaderMap,
+    json: &serde_json::Value,
+) -> Option<String> {
+    if !resolved.end_user_fairshare {
+        return None;
+    }
+    headers
+        .get(END_USER_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(obleth_config::normalize_end_user)
+        .or_else(|| {
+            json.get("user")
+                .or_else(|| json.pointer("/metadata/user_id"))
+                .and_then(serde_json::Value::as_str)
+                .and_then(obleth_config::normalize_end_user)
+        })
 }
 
 /// OpenAI-style endpoints that must resolve to a registered model route.
@@ -4026,24 +4292,46 @@ fn model_visible(allowed: Option<&[String]>, model_name: &str) -> bool {
 /// The OpenAI `{object:"list", data:[…]}` listing for a registry snapshot,
 /// sorted by id and limited to `allowed` when set. Pure, so the shape is
 /// unit-testable without a registry.
+///
+/// Each variant is an entry of its own, after its model: unlike an alias it
+/// changes what the caller gets, so it is meant to be found. Variants are
+/// never auto-router candidates; they only appear here because their model
+/// is one.
+///
+/// A retired model is left out (with its variants), since calling it is
+/// refused; a deprecated one is listed, marked. Asking for a retired model by
+/// id still answers, so a caller can find out what replaced it. A staged model
+/// is left out too, and so is its id: it is served by name, for whoever was
+/// told it, and is not advertised until it goes live.
 fn registry_models_list(
     candidates: &[obleth_config::routing::Candidate],
     allowed: Option<&[String]>,
 ) -> serde_json::Value {
     let mut data: Vec<serde_json::Value> = candidates
         .iter()
-        .filter(|c| c.model.enabled)
-        .filter(|c| model_visible(allowed, &c.model.model_name))
-        .map(|c| model_entry(&ModelFacts::of(&c.model)))
+        .filter(|c| c.model.enabled && is_listed_model_type(&c.model.model_type))
+        .flat_map(|c| {
+            std::iter::once(ModelFacts::of(&c.model)).chain(
+                c.model
+                    .variants
+                    .iter()
+                    .map(|v| ModelFacts::of_variant(&c.model, v)),
+            )
+        })
+        .filter(|f| f.visible(allowed))
+        .filter(|f| f.status.listed())
+        .map(|f| model_entry(&f))
         .collect();
     data.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
     data.dedup_by(|a, b| a["id"] == b["id"]);
     serde_json::json!({ "object": "list", "data": data })
 }
 
-/// One discovery entry (`/v1/models` and `/v1/models/{id}`).
+/// One discovery entry (`/v1/models` and `/v1/models/{id}`). A variant's
+/// entry also names the model it is served by, says what it is for, and lists
+/// the boons a request through it runs with.
 fn model_entry(facts: &ModelFacts) -> serde_json::Value {
-    serde_json::json!({
+    let mut entry = serde_json::json!({
         "id": facts.model_name,
         "object": "model",
         "owned_by": "obleth",
@@ -4052,19 +4340,70 @@ fn model_entry(facts: &ModelFacts) -> serde_json::Value {
         "quantization": facts.quantization,
         "tags": facts.tags,
         "aliases": facts.aliases,
-    })
+    });
+    if let (Some(v), Some(obj)) = (&facts.variant, entry.as_object_mut()) {
+        obj.insert("variant_of".into(), v.parent.clone().into());
+        obj.insert("description".into(), v.description.clone().into());
+        obj.insert("boons".into(), v.boons.clone().into());
+    }
+    // Only a model on its way out says anything about its lifecycle, so an
+    // active model's entry is unchanged.
+    if facts.status != obleth_config::ModelStatus::Active {
+        if let Some(obj) = entry.as_object_mut() {
+            obj.extend(lifecycle_fields(facts.status, &facts.lifecycle));
+        }
+    }
+    entry
 }
 
-/// What the gateway knows about one registered route, as the discovery
-/// endpoints report it.
+/// The lifecycle fields a discovery entry carries for a deprecated or retired
+/// model: `status`, plus `replacement`, `retire_at` and `note` when set.
+fn lifecycle_fields(
+    status: obleth_config::ModelStatus,
+    lifecycle: &obleth_config::ModelLifecycle,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    out.insert("status".into(), status.as_str().into());
+    if !lifecycle.replacement.is_empty() {
+        out.insert("replacement".into(), lifecycle.replacement.clone().into());
+    }
+    if let Some(at) = lifecycle.retired_on() {
+        out.insert("retire_at".into(), at.to_rfc3339().into());
+    }
+    if !lifecycle.note.is_empty() {
+        out.insert("note".into(), lifecycle.note.clone().into());
+    }
+    out
+}
+
+/// What the gateway knows about one registered route, or one variant of it,
+/// as the discovery endpoints report it.
 #[derive(Debug, Clone, PartialEq)]
 struct ModelFacts {
-    /// The one name the gateway advertises for this route.
+    /// The one name the gateway advertises for this entry: the route's
+    /// `model_name`, or the variant's own name.
     model_name: String,
     model_type: String,
     quantization: String,
     aliases: Vec<String>,
     tags: Vec<String>,
+    /// Set on a variant's entry.
+    variant: Option<VariantFacts>,
+    /// The lifecycle in force now (a variant's is its model's), and the
+    /// status it gives.
+    lifecycle: obleth_config::ModelLifecycle,
+    status: obleth_config::ModelStatus,
+}
+
+/// The variant-only part of a discovery entry.
+#[derive(Debug, Clone, PartialEq)]
+struct VariantFacts {
+    /// The model the variant is served by.
+    parent: String,
+    description: String,
+    /// The boons a request through the variant runs with: the model's own,
+    /// then the variant's.
+    boons: Vec<String>,
 }
 
 impl ModelFacts {
@@ -4075,13 +4414,48 @@ impl ModelFacts {
             quantization: model.quantization.clone(),
             aliases: model.aliases.clone(),
             tags: model.tags.clone(),
+            variant: None,
+            lifecycle: model.lifecycle.clone(),
+            status: model.lifecycle.status_at(chrono::Utc::now()),
         }
+    }
+
+    fn of_variant(model: &ResolvedModel, variant: &obleth_config::ModelVariant) -> Self {
+        ModelFacts {
+            model_name: variant.name.clone(),
+            aliases: Vec::new(),
+            variant: Some(VariantFacts {
+                parent: model.model_name.clone(),
+                description: variant.description.clone(),
+                boons: obleth_config::union_boons(&model.boons, &variant.boons),
+            }),
+            ..ModelFacts::of(model)
+        }
+    }
+
+    /// Whether a caller limited to `allowed` may see this entry: by the
+    /// route's name, or for a variant by its parent's name or its own (the
+    /// same rule the request path's allowlist applies).
+    fn visible(&self, allowed: Option<&[String]>) -> bool {
+        model_visible(allowed, &self.model_name)
+            || self
+                .variant
+                .as_ref()
+                .is_some_and(|v| model_visible(allowed, &v.parent))
+    }
+
+    /// Whether `GET /v1/models/{id}` answers for this entry: when the caller
+    /// may see it and it is not staged. A retired model still answers, so a
+    /// caller can find out what replaced it.
+    fn answers_by_id(&self, allowed: Option<&[String]>) -> bool {
+        self.visible(allowed) && self.status != obleth_config::ModelStatus::Staged
     }
 }
 
 /// Index every name a registered route can be recognized by — its
 /// `model_name`, its aliases, and the `upstream_model` its backend reports —
-/// onto the facts the gateway advertises for it.
+/// onto the facts the gateway advertises for it, and each of its variants
+/// onto that variant's own entry.
 ///
 /// The `upstream_model` key lets a detail lookup by a backend's own id (a
 /// client that learned `glm-5-3-mxfp4` from the backend) answer with the
@@ -4093,6 +4467,10 @@ fn model_facts_index(
 ) -> std::collections::HashMap<String, std::sync::Arc<ModelFacts>> {
     let mut by_name: std::collections::HashMap<String, std::sync::Arc<ModelFacts>> =
         std::collections::HashMap::new();
+    let candidates: Vec<&obleth_config::routing::Candidate> = candidates
+        .iter()
+        .filter(|c| is_listed_model_type(&c.model.model_type))
+        .collect();
     let facts: Vec<std::sync::Arc<ModelFacts>> = candidates
         .iter()
         .map(|c| std::sync::Arc::new(ModelFacts::of(&c.model)))
@@ -4109,10 +4487,25 @@ fn model_facts_index(
             by_name.entry(alias.clone()).or_insert_with(|| f.clone());
         }
     }
+    // A variant answers with its own entry, not its parent's.
+    for c in &candidates {
+        for v in &c.model.variants {
+            by_name
+                .entry(v.name.clone())
+                .or_insert_with(|| std::sync::Arc::new(ModelFacts::of_variant(&c.model, v)));
+        }
+    }
     for f in facts {
         by_name.insert(f.model_name.clone(), f);
     }
     by_name
+}
+
+/// Whether routes of `model_type` appear on the model discovery endpoints.
+/// Search tools do not: they are not models a chat client can call, and are
+/// listed on `GET /v1/search/tools` instead.
+fn is_listed_model_type(model_type: &str) -> bool {
+    model_type != obleth_config::SEARCH_MODEL_TYPE
 }
 
 /// The LiteLLM-convention spelling of a modality, which many OpenAI-compatible
@@ -4143,9 +4536,10 @@ fn is_models_collection(path: &str) -> bool {
 /// omitted rather than fabricated — the hot-path view of a route does not
 /// carry a registration timestamp.
 ///
-/// `Some(Err(()))` when a route claims the name but it is outside `allowed`:
-/// the caller answers that like an unknown model, without forwarding the id,
-/// so the detail lookup reveals no more than the filtered listing does.
+/// `Some(Err(()))` when a route claims the name but it is outside `allowed`,
+/// or staged: the caller answers that like an unknown model, without
+/// forwarding the id, so the detail lookup reveals no more than the filtered
+/// listing does.
 fn registered_model_entry(
     state: &AppState,
     id: &str,
@@ -4156,7 +4550,7 @@ fn registered_model_entry(
     }
     let candidates = state.model_registry.load();
     let facts = model_facts_index(&candidates).get(id)?.clone();
-    if !model_visible(allowed, &facts.model_name) {
+    if !facts.answers_by_id(allowed) {
         return Some(Err(()));
     }
     Some(Ok(model_entry(&facts)))
@@ -4190,13 +4584,7 @@ fn registered_model_entry(
 /// model a caller would be refused would be advertising a 403.
 fn model_info_response(state: &AppState, resolved: &ResolvedKey) -> Response<Body> {
     let candidates = state.model_registry.load();
-    let allowed = allowed_models_for(resolved);
-    let data: Vec<serde_json::Value> = candidates
-        .iter()
-        .filter(|c| c.model.enabled)
-        .filter(|c| model_visible(allowed, &c.model.model_name))
-        .map(|c| model_info_entry(&c.model, c.healthy))
-        .collect();
+    let data = registry_model_info(&candidates, allowed_models_for(resolved));
     (
         StatusCode::OK,
         axum::Json(serde_json::json!({ "data": data })),
@@ -4204,10 +4592,27 @@ fn model_info_response(state: &AppState, resolved: &ResolvedKey) -> Response<Bod
         .into_response()
 }
 
+/// The `/model/info` entries for a registry snapshot: every enabled, listed
+/// route `allowed` lets the caller see. Pure, like [`registry_models_list`].
+fn registry_model_info(
+    candidates: &[obleth_config::routing::Candidate],
+    allowed: Option<&[String]>,
+) -> Vec<serde_json::Value> {
+    let now = chrono::Utc::now();
+    candidates
+        .iter()
+        .filter(|c| c.model.enabled && is_listed_model_type(&c.model.model_type))
+        .filter(|c| model_visible(allowed, &c.model.model_name))
+        .filter(|c| c.model.lifecycle.status_at(now).listed())
+        .map(|c| model_info_entry(&c.model, c.healthy))
+        .collect()
+}
+
 /// One `/model/info` entry. Split out so the payload shape is unit-testable
 /// without a registry or a request.
 fn model_info_entry(model: &ResolvedModel, healthy: bool) -> serde_json::Value {
-    serde_json::json!({
+    let status = model.lifecycle.status_at(chrono::Utc::now());
+    let mut entry = serde_json::json!({
         "model_name": model.model_name,
         "obleth_params": {
             // The name the backend serves, which is where a quantization
@@ -4230,6 +4635,8 @@ fn model_info_entry(model: &ResolvedModel, healthy: bool) -> serde_json::Value {
             "model_type": model.model_type,
             "quantization": model.quantization,
             "aliases": model.aliases,
+            // Names that serve this model with more boons on.
+            "variants": model.variants,
             "tags": model.tags,
             "boons": model.boons,
             "supports_tool_choice": model.supports_tool_choice,
@@ -4242,8 +4649,17 @@ fn model_info_entry(model: &ResolvedModel, healthy: bool) -> serde_json::Value {
             // registered and addressable but currently failing its probe or
             // held in a maintenance window.
             "healthy": healthy,
+            "status": status.as_str(),
         },
-    })
+    });
+    if status != obleth_config::ModelStatus::Active {
+        if let Some(info) = entry["model_info"].as_object_mut() {
+            let mut fields = lifecycle_fields(status, &model.lifecycle);
+            fields.remove("status");
+            info.extend(fields);
+        }
+    }
+    entry
 }
 
 /// The OpenAI model-discovery endpoints: `GET /v1/models` (list), the
@@ -4738,7 +5154,7 @@ pub(crate) fn forward_headers(headers: &HeaderMap) -> HeaderMap {
             // strip hop-by-hop / auth / encoding so the body stays inspectable;
             // x-obleth-boons is a gateway directive, not an upstream header
             "host" | "content-length" | "authorization" | "x-api-key" | "accept-encoding"
-            | "connection" | "x-obleth-boons" => continue,
+            | "connection" | "x-obleth-boons" | END_USER_HEADER => continue,
             _ => {
                 out.insert(name.clone(), value.clone());
             }
@@ -4771,15 +5187,79 @@ fn append_tail(tail: &mut Vec<u8>, chunk: &[u8]) {
 ///
 /// Embedding responses report `prompt_tokens` (and `total_tokens`) but no
 /// `completion_tokens`; those are treated as input-only usage.
-fn extract_usage(tail: &str) -> Option<(u32, u32)> {
+///
+/// Cached prompt tokens come from the usage object holding that last
+/// `prompt_tokens`, so a stream that reports usage on several chunks never
+/// pairs one chunk's prompt count with another chunk's cache detail.
+fn extract_usage(tail: &str) -> Option<UpstreamUsage> {
     let input = find_int_after(tail, "\"prompt_tokens\"");
     let output = find_int_after(tail, "\"completion_tokens\"");
-    match (input, output) {
-        (Some(i), Some(o)) => Some((i, o)),
+    let (input, output) = match (input, output) {
+        (Some(i), Some(o)) => (i, o),
         // Embeddings and other input-only modalities: count prompt tokens.
-        (Some(i), None) => Some((i, 0)),
-        _ => None,
+        (Some(i), None) => (i, 0),
+        _ => return None,
+    };
+    Some(UpstreamUsage::new(input, output, tail_cached_tokens(tail)))
+}
+
+/// Cached prompt tokens of the JSON object around the tail's last
+/// `prompt_tokens`; 0 when it reports none, is cut off, or does not parse.
+fn tail_cached_tokens(tail: &str) -> u32 {
+    let Some(at) = tail.rfind("\"prompt_tokens\"") else {
+        return 0;
+    };
+    enclosing_json_object(tail, at)
+        .and_then(|object| serde_json::from_str::<serde_json::Value>(object).ok())
+        .map_or(0, |usage| cached_prompt_tokens(&usage) as u32)
+}
+
+/// The JSON object that byte offset `at` sits in: from the nearest `{` before
+/// it that is still open there, through its matching `}`. The backward walk
+/// counts braces only (a usage object's keys hold none); the forward walk
+/// skips string contents. `None` when either end is outside `text`.
+fn enclosing_json_object(text: &str, at: usize) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut start = None;
+    for i in (0..at).rev() {
+        match bytes[i] {
+            b'}' => depth += 1,
+            b'{' if depth == 0 => {
+                start = Some(i);
+                break;
+            }
+            b'{' => depth -= 1,
+            _ => {}
+        }
     }
+    let start = start?;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, &b) in bytes[start..].iter().enumerate() {
+        if in_string {
+            match b {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&text[start..=start + offset]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn find_int_after(haystack: &str, key: &str) -> Option<u32> {
@@ -4809,6 +5289,12 @@ pub(crate) struct RequestMeta {
     pub(crate) request_type: &'static str,
     /// Device id from the bearer token (identity-key requests), else empty.
     pub(crate) device_id: String,
+    /// The end user the caller named, on keys with `end_user_fairshare` on
+    /// (see [`end_user_for`]), else empty.
+    pub(crate) end_user: String,
+    /// The variant name the client called the model by, else empty. The
+    /// ledger's `model` is the parent's either way.
+    pub(crate) model_variant: String,
 }
 
 /// Classify a request by its OpenAI-style path suffix. Matching the suffix (not
@@ -4835,6 +5321,8 @@ fn request_type_for_path(path: &str) -> &'static str {
         "rerank"
     } else if path.ends_with("/moderations") {
         "moderation"
+    } else if crate::search::is_search_path(path) {
+        "search"
     } else {
         "other"
     }
@@ -5102,6 +5590,7 @@ pub(crate) fn finalize(
     est: CostEstimate,
     input_tokens: u32,
     output_tokens: u32,
+    cached_input_tokens: u32,
     queue_wait_ms: u32,
     ttft_ms: u32,
     total_ms: u32,
@@ -5128,6 +5617,7 @@ pub(crate) fn finalize(
         weight: resolved.weight,
         input_tokens,
         output_tokens,
+        cached_input_tokens,
         estimated_tokens: est.total(),
         queue_wait_ms,
         ttft_ms,
@@ -5143,6 +5633,10 @@ pub(crate) fn finalize(
         session_id_source: meta.session_id_source.to_string(),
         request_type: meta.request_type.to_string(),
         device_id: meta.device_id.clone(),
+        end_user: meta.end_user.clone(),
+        // The client request's own row; helper rows carry its id instead.
+        parent_request_id: Uuid::nil(),
+        model_variant: meta.model_variant.clone(),
     });
 }
 
@@ -5232,14 +5726,14 @@ mod tests {
         admit_request_for, anthropic_error, apply_multipart_text_view,
         backfill_max_tokens_for_count_tokens, backoff_for, build_targets, build_upstream_url,
         canonical_post_path, clamp_max_tokens, compute_modality_cost, effective_request_type,
-        forward_headers, has_input_guardrails, has_path_traversal, input_guardrails_unscannable,
-        is_chat_path, is_models_collection, is_models_endpoint, is_multipart_endpoint,
-        is_retryable_status, looks_like_context_length_error, messages_input_estimate,
-        multipart_text_view, output_guardrails_unenforceable, parse_multipart,
-        prepare_upstream_body, redress_error, request_type_for_path, requires_registered_model,
-        resolve_conversation, session_hash_order, should_translate_as_stream, strip_beta_query,
-        surface, tenant_active_now, weighted_order, MultipartField, RequestMeta, TooLong,
-        REGISTERED_MODEL_PATHS,
+        end_user_for, forward_headers, has_input_guardrails, has_path_traversal,
+        input_guardrails_unscannable, is_chat_path, is_models_collection, is_models_endpoint,
+        is_multipart_endpoint, is_retryable_status, looks_like_context_length_error,
+        messages_input_estimate, multipart_text_view, output_guardrails_unenforceable,
+        parse_multipart, prepare_upstream_body, redress_error, request_type_for_path,
+        requires_registered_model, resolve_conversation, session_hash_order,
+        should_translate_as_stream, strip_beta_query, surface, tenant_active_now, weighted_order,
+        MultipartField, RequestMeta, TooLong, END_USER_HEADER, REGISTERED_MODEL_PATHS,
     };
     use crate::router::{BoonGrants, Candidate, Intent, RequestFeatures, RouterWeights};
     use axum::body::{Body, Bytes};
@@ -5301,6 +5795,7 @@ mod tests {
             key_budget_started_at: None,
             key_weight: 100,
             key_max_in_flight: None,
+            end_user_fairshare: false,
             allowed_models: None,
             internal: false,
             tracing_enabled: false,
@@ -5578,6 +6073,13 @@ mod tests {
         // `/v1/verdicts` is served by its own route (see main.rs), but the
         // ledger label still derives from the path like every other class.
         assert_eq!(request_type_for_path("/v1/verdicts"), "verdict");
+        assert_eq!(request_type_for_path("/v1/search"), "search");
+        assert_eq!(request_type_for_path("/v1/search/web"), "search");
+        // Another API's search sub-resource is not ours.
+        assert_eq!(
+            request_type_for_path("/v1/vector_stores/vs_1/search"),
+            "other"
+        );
         // Not confused with the legacy completions suffix match.
         assert_eq!(request_type_for_path("/v1/completions"), "completion");
     }
@@ -5827,6 +6329,26 @@ mod tests {
     }
 
     #[test]
+    fn search_tools_are_not_listed_as_models() {
+        use super::{model_facts_index, registry_models_list};
+        let candidates = vec![
+            candidate("glm-5-3", "glm-5-3", "chat", "none", &[], &[]),
+            candidate("web-search", "searxng", "search", "unknown", &[], &[]),
+        ];
+        let ids: Vec<String> = registry_models_list(&candidates, None)["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, vec!["glm-5-3"]);
+        // Nor found by a detail lookup, under its name or its upstream's.
+        let index = model_facts_index(&candidates);
+        assert!(!index.contains_key("web-search"));
+        assert!(!index.contains_key("searxng"));
+    }
+
+    #[test]
     fn a_listing_entry_and_the_detail_lookup_agree() {
         use super::{model_entry, model_facts_index, registry_models_list};
         let candidates = vec![candidate(
@@ -5916,6 +6438,94 @@ mod tests {
     }
 
     #[test]
+    fn retired_models_leave_the_listing_and_deprecated_ones_are_marked() {
+        use super::{model_entry, model_facts_index, model_info_entry, registry_models_list};
+        let now = chrono::Utc::now();
+        let mut old = candidate("glm-4-5v", "glm-4.5v", "chat", "fp8", &[], &[]);
+        old.model.lifecycle = obleth_config::ModelLifecycle {
+            status: obleth_config::ModelStatus::Deprecated,
+            replacement: "gemma4-31b-it".into(),
+            retire_at: Some(now + chrono::Duration::days(14)),
+            ..Default::default()
+        };
+        let mut gone = candidate("llama2-70b", "llama2", "chat", "fp16", &[], &[]);
+        gone.model.lifecycle.status = obleth_config::ModelStatus::Retired;
+        gone.model.variants = vec![obleth_config::ModelVariant {
+            name: "llama2-70b-spec".into(),
+            ..Default::default()
+        }];
+        let mut overdue = candidate("old-overdue", "x", "chat", "fp8", &[], &[]);
+        overdue.model.lifecycle = obleth_config::ModelLifecycle {
+            status: obleth_config::ModelStatus::Deprecated,
+            retire_at: Some(now - chrono::Duration::hours(1)),
+            ..Default::default()
+        };
+        let active = candidate("gemma4-31b-it", "gemma", "chat", "bf16", &[], &[]);
+        let candidates = vec![old, gone, overdue, active];
+
+        let list = registry_models_list(&candidates, None);
+        let data = list["data"].as_array().unwrap();
+        let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
+        // Retired (by status or by date) is gone, variants included.
+        assert_eq!(ids, vec!["gemma4-31b-it", "glm-4-5v"]);
+        let dep = &data[1];
+        assert_eq!(dep["status"], "deprecated");
+        assert_eq!(dep["replacement"], "gemma4-31b-it");
+        assert!(dep["retire_at"].is_string());
+        // An active model's entry is unchanged.
+        assert!(data[0].get("status").is_none());
+
+        // Asking for a retired model by id still says what became of it.
+        let detail = model_entry(&model_facts_index(&candidates)["llama2-70b"]);
+        assert_eq!(detail["status"], "retired");
+
+        let info = model_info_entry(&candidates[0].model, true);
+        assert_eq!(info["model_info"]["status"], "deprecated");
+        assert_eq!(info["model_info"]["replacement"], "gemma4-31b-it");
+        let info = model_info_entry(&candidates[3].model, true);
+        assert_eq!(info["model_info"]["status"], "active");
+        assert!(info["model_info"].get("replacement").is_none());
+    }
+
+    #[test]
+    fn staged_models_are_served_by_name_but_never_advertised() {
+        use super::{model_facts_index, registry_model_info, registry_models_list};
+        let mut staged = candidate("qwen4-72b", "qwen4", "chat", "fp8", &["qwen4"], &[]);
+        staged.model.lifecycle.status = obleth_config::ModelStatus::Staged;
+        staged.model.variants = vec![obleth_config::ModelVariant {
+            name: "qwen4-72b-spec".into(),
+            ..Default::default()
+        }];
+        let live = candidate("gemma4-31b-it", "gemma", "chat", "bf16", &[], &[]);
+        let candidates = vec![staged, live];
+
+        // Not in the listing, variants included, whatever the allowlist says.
+        for allowed in [None, Some(&["qwen4-72b".to_string()][..])] {
+            let list = registry_models_list(&candidates, allowed);
+            let ids: Vec<&str> = list["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["id"].as_str().unwrap())
+                .collect();
+            assert!(!ids.iter().any(|id| id.starts_with("qwen4")), "{ids:?}");
+        }
+        // Not on /model/info.
+        let info = registry_model_info(&candidates, None);
+        let names: Vec<&str> = info
+            .iter()
+            .map(|m| m["model_name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["gemma4-31b-it"]);
+        // A lookup by any of its names answers like an unknown model.
+        let index = model_facts_index(&candidates);
+        for id in ["qwen4-72b", "qwen4", "qwen4-72b-spec"] {
+            assert!(!index[id].answers_by_id(None), "{id}");
+        }
+        assert!(index["gemma4-31b-it"].answers_by_id(None));
+    }
+
+    #[test]
     fn model_info_entry_uses_obleth_params_and_keeps_the_conventional_keys() {
         use super::model_info_entry;
         let mut model = model_with(Vec::new());
@@ -5979,6 +6589,128 @@ mod tests {
         assert!(!index.contains_key("wildcard-passthrough"));
     }
 
+    fn with_variants(
+        mut c: obleth_config::routing::Candidate,
+    ) -> obleth_config::routing::Candidate {
+        c.model.boons = vec!["vision".into()];
+        c.model.variants = vec![obleth_config::ModelVariant {
+            name: "glm-5-3-spec".into(),
+            description: "Drafted by a small model, verified by this one".into(),
+            boons: vec!["speculation".into()],
+        }];
+        c
+    }
+
+    #[test]
+    fn models_listing_lists_each_variant_as_its_own_entry() {
+        use super::{model_entry, model_facts_index, registry_models_list};
+        let candidates = vec![with_variants(candidate(
+            "glm-5-3",
+            "glm-5-3-mxfp4",
+            "chat",
+            "mxfp4",
+            &["glm-5-3-fp8"],
+            &["coding"],
+        ))];
+        let list = registry_models_list(&candidates, None);
+        let data = list["data"].as_array().unwrap();
+        let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
+        // Aliases stay out of the listing; a variant is listed by its name.
+        assert_eq!(ids, vec!["glm-5-3", "glm-5-3-spec"]);
+        let spec = &data[1];
+        assert_eq!(spec["variant_of"], "glm-5-3");
+        assert_eq!(
+            spec["description"],
+            "Drafted by a small model, verified by this one"
+        );
+        assert_eq!(spec["boons"], serde_json::json!(["vision", "speculation"]));
+        assert_eq!(spec["mode"], "chat");
+        assert_eq!(spec["quantization"], "mxfp4");
+        assert_eq!(spec["aliases"], serde_json::json!([]));
+        // The parent's own entry is unchanged by having variants.
+        assert!(data[0].get("variant_of").is_none());
+        // A detail lookup by the variant's name answers with its entry.
+        let detail = model_entry(&model_facts_index(&candidates)["glm-5-3-spec"]);
+        assert_eq!(&detail, spec);
+    }
+
+    #[test]
+    fn a_variant_is_listed_to_tenants_allowed_its_model_or_its_name() {
+        use super::registry_models_list;
+        let candidates = vec![with_variants(candidate(
+            "glm-5-3",
+            "glm-5-3",
+            "chat",
+            "none",
+            &[],
+            &[],
+        ))];
+        let ids = |allowed: &[&str]| -> Vec<String> {
+            let allowed: Vec<String> = allowed.iter().map(|a| a.to_string()).collect();
+            registry_models_list(&candidates, Some(&allowed))["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(ids(&["glm-5-3"]), vec!["glm-5-3", "glm-5-3-spec"]);
+        assert_eq!(ids(&["glm-5-3-spec"]), vec!["glm-5-3-spec"]);
+        assert!(ids(&["other"]).is_empty());
+    }
+
+    #[test]
+    fn a_variant_is_served_by_its_parent_with_its_boons_added() {
+        use super::{admission_pool, serve_as};
+        let parent = std::sync::Arc::new(
+            with_variants(candidate(
+                "glm-5-3",
+                "glm-5-3-mxfp4",
+                "chat",
+                "mxfp4",
+                &[],
+                &[],
+            ))
+            .model,
+        );
+
+        let (served, variant) = serve_as(parent.clone(), "glm-5-3-spec");
+        assert_eq!(variant.as_deref(), Some("glm-5-3-spec"));
+        assert_eq!(served.boons, vec!["vision", "speculation"]);
+        // One backend, one pool: the variant queues with its parent and keeps
+        // every capacity, pricing and upstream field.
+        assert_eq!(served.model_name, "glm-5-3");
+        assert_eq!(admission_pool(Some(&served)), admission_pool(Some(&parent)));
+        assert_eq!(
+            admission_pool(Some(&served)),
+            obleth_fairshare::PoolKey::Model("glm-5-3".into())
+        );
+        assert_eq!(served.max_in_flight, parent.max_in_flight);
+        assert_eq!(served.capacity_mode, parent.capacity_mode);
+        assert_eq!(served.upstream_model, parent.upstream_model);
+        assert_eq!(served.endpoints, parent.endpoints);
+        assert_eq!(served.input_cost_per_token, parent.input_cost_per_token);
+
+        // The model's own name (and an alias) serve it exactly as it is.
+        for name in ["glm-5-3", "glm-5-3-fp8"] {
+            let (served, variant) = serve_as(parent.clone(), name);
+            assert!(variant.is_none());
+            assert!(std::sync::Arc::ptr_eq(&served, &parent), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_variant_header_is_set_only_for_a_variant() {
+        use super::{error_json, with_variant_header, MODEL_VARIANT_HEADER};
+        let resp = with_variant_header(
+            error_json(StatusCode::SERVICE_UNAVAILABLE, "busy"),
+            Some("glm-5-3-spec"),
+        );
+        assert_eq!(resp.headers()[MODEL_VARIANT_HEADER], "glm-5-3-spec");
+        let resp = with_variant_header(error_json(StatusCode::OK, "ok"), None);
+        assert!(resp.headers().get(MODEL_VARIANT_HEADER).is_none());
+    }
+
     #[test]
     fn model_info_paths_are_recognized_bare_and_under_v1() {
         use super::{is_model_info_endpoint, is_models_endpoint};
@@ -5996,6 +6728,8 @@ mod tests {
         obleth_config::ResolvedModel {
             model_name: "m".into(),
             aliases: Vec::new(),
+            lifecycle: Default::default(),
+            variants: Vec::new(),
             quantization: "unknown".into(),
             upstream_model: "m".into(),
             api_base: "http://primary/v1".into(),
@@ -6047,7 +6781,7 @@ mod tests {
 
     #[test]
     fn append_tail_keeps_last_cap_bytes() {
-        use super::{append_tail, extract_usage, TAIL_CAP};
+        use super::{append_tail, extract_usage, UpstreamUsage, TAIL_CAP};
         let mut tail = Vec::new();
         // Small chunks accumulate verbatim.
         append_tail(&mut tail, b"hello ");
@@ -6065,7 +6799,7 @@ mod tests {
         assert_eq!(tail.len(), TAIL_CAP);
         assert_eq!(
             extract_usage(&String::from_utf8_lossy(&tail)),
-            Some((12, 34))
+            Some(UpstreamUsage::uncached(12, 34))
         );
         // A chunk larger than the cap replaces the buffer with its own tail.
         append_tail(&mut tail, &vec![b'y'; TAIL_CAP * 2]);
@@ -6990,6 +7724,8 @@ mod tests {
             session_id_source: "none",
             request_type: "chat",
             device_id: "dev-1".into(),
+            end_user: String::new(),
+            model_variant: String::new(),
         };
         assert_eq!(meta.device_id, "dev-1");
     }
@@ -6998,6 +7734,8 @@ mod tests {
         ResolvedModel {
             model_name: name.to_string(),
             aliases: Vec::new(),
+            lifecycle: Default::default(),
+            variants: Vec::new(),
             quantization: "unknown".into(),
             upstream_model: name.to_string(),
             api_base: "http://upstream".to_string(),
@@ -7098,7 +7836,7 @@ mod tests {
         resolved.max_in_flight = Some(5);
         let mut route = minimal_model("m");
         route.max_in_flight = Some(9);
-        let req = admit_request_for(&resolved, "m", Some(&route), 77, 123);
+        let req = admit_request_for(&resolved, "m", Some(&route), 77, 123, None);
         assert_eq!(req.tenant, resolved.tenant_id);
         assert_eq!(req.key, resolved.key_id);
         assert_eq!(req.weight, 77);
@@ -7110,14 +7848,97 @@ mod tests {
         assert_eq!(req.tenant_max_in_flight, Some(5));
         assert_eq!(req.key_max_in_flight, Some(2));
         assert_eq!(req.cost, 123);
+        assert_eq!(req.end_user, None);
 
         // Zero and negative caps mean "no cap".
         resolved.max_in_flight = Some(0);
         resolved.key_max_in_flight = Some(-1);
-        let req = admit_request_for(&resolved, "m", None, 1, 1);
+        let req = admit_request_for(&resolved, "m", None, 1, 1, None);
         assert_eq!(req.tenant_max_in_flight, None);
         assert_eq!(req.key_max_in_flight, None);
         assert_eq!(req.model_max_in_flight, None);
+    }
+
+    #[test]
+    fn an_end_user_queues_under_a_key_derived_from_the_real_key() {
+        let mut resolved = key_with_schedule("UTC", None, None, None);
+        resolved.key_id = Uuid::new_v4();
+        resolved.tenant_id = Uuid::new_v4();
+        resolved.end_user_fairshare = true;
+        resolved.key_weight = 40;
+        resolved.key_max_in_flight = Some(3);
+        let alice = admit_request_for(&resolved, "m", None, 100, 10, Some("alice"));
+        let bob = admit_request_for(&resolved, "m", None, 100, 10, Some("bob"));
+
+        assert_eq!(
+            alice.key,
+            obleth_config::end_user_key_id(resolved.key_id, "alice")
+        );
+        assert_ne!(alice.key, bob.key, "each end user gets their own place");
+        assert_ne!(alice.key, resolved.key_id);
+        assert_eq!(alice.tenant, resolved.tenant_id, "still the key's tenant");
+        // The key's weight and cap apply to each end user.
+        assert_eq!(alice.key_weight, 40);
+        assert_eq!(alice.key_max_in_flight, Some(3));
+        assert_eq!(
+            alice.end_user,
+            Some(obleth_fairshare::EndUser {
+                parent_key: resolved.key_id,
+                name: "alice".into()
+            })
+        );
+    }
+
+    #[test]
+    fn end_user_is_read_only_for_keys_that_turned_it_on() {
+        let mut resolved = key_with_schedule("UTC", None, None, None);
+        let mut headers = HeaderMap::new();
+        headers.insert(END_USER_HEADER, "header-user".parse().unwrap());
+        let body = serde_json::json!({ "user": "body-user" });
+
+        // Off (the default): an ordinary caller can't split itself up.
+        assert_eq!(end_user_for(&resolved, &headers, &body), None);
+
+        resolved.end_user_fairshare = true;
+        // The header wins over the body.
+        assert_eq!(
+            end_user_for(&resolved, &headers, &body).as_deref(),
+            Some("header-user")
+        );
+        // Then the body's `user`, then Anthropic's metadata.user_id.
+        let none = HeaderMap::new();
+        assert_eq!(
+            end_user_for(&resolved, &none, &body).as_deref(),
+            Some("body-user")
+        );
+        let anthropic = serde_json::json!({ "metadata": { "user_id": "claude-user" } });
+        assert_eq!(
+            end_user_for(&resolved, &none, &anthropic).as_deref(),
+            Some("claude-user")
+        );
+        // A blank header falls through to the body; nothing named means None.
+        let mut blank = HeaderMap::new();
+        blank.insert(END_USER_HEADER, "   ".parse().unwrap());
+        assert_eq!(
+            end_user_for(&resolved, &blank, &body).as_deref(),
+            Some("body-user")
+        );
+        assert_eq!(end_user_for(&resolved, &none, &serde_json::json!({})), None);
+        // Non-string `user` values are ignored rather than stringified.
+        assert_eq!(
+            end_user_for(&resolved, &none, &serde_json::json!({ "user": 42 })),
+            None
+        );
+    }
+
+    #[test]
+    fn the_end_user_header_is_not_sent_upstream() {
+        let mut headers = HeaderMap::new();
+        headers.insert(END_USER_HEADER, "alice".parse().unwrap());
+        headers.insert("x-request-note", "kept".parse().unwrap());
+        let fwd = forward_headers(&headers);
+        assert!(fwd.get(END_USER_HEADER).is_none());
+        assert_eq!(fwd.get("x-request-note").unwrap(), "kept");
     }
     /// Endpoints whose OpenAI spec sends `multipart/form-data` (they take a
     /// file upload). The video create's upload is its optional
@@ -7270,19 +8091,80 @@ mod lifecycle_tests {
         s.chars().filter(|c| !c.is_whitespace()).collect()
     }
 
-    /// `proxy_handler_inner`'s source, for ordering pins (there is no
+    /// `run_pipeline`'s source, for ordering pins (there is no
     /// AppState harness in this crate: it needs live Redis and ClickHouse).
     fn handler() -> &'static str {
         let src = include_str!("proxy.rs");
         let src = &src[..src.find("\nmod tests {").expect("the test module")];
-        let start = src
-            .find("async fn proxy_handler_inner(")
-            .expect("proxy_handler_inner");
+        let start = src.find("async fn run_pipeline(").expect("run_pipeline");
         let end = start
             + src[start..]
                 .find("\n/// Drops the usage-only SSE event")
                 .expect("end of the handler");
         &src[start..end]
+    }
+
+    #[test]
+    fn a_variant_is_admitted_to_its_parents_pool() {
+        let h = squash(handler());
+        let serve = h.find("serve_as(r,&model)").expect("variant resolution");
+        let adopt = h
+            .find("model=r.model_name.clone();")
+            .expect("parent name adopted");
+        let pool = h
+            .find("letpool=admission_pool(route.as_deref());")
+            .expect("pool keyed by the served route");
+        let admit = h.find(".admit_to(").expect("admission");
+        assert!(serve < adopt && adopt < pool && pool < admit);
+        // The ledger and the allowlist see the parent name; the variant rides
+        // on the request's metadata for its usage row and response header.
+        assert!(h[serve..pool].contains("req_meta.model_variant="));
+        assert!(h[serve..pool].contains("served_variant.clone_from(&variant);"));
+    }
+
+    #[test]
+    fn the_lifecycle_gate_runs_after_resolution_and_before_the_allowlist() {
+        let h = squash(handler());
+        let serve = h.find("serve_as(r,&model)").expect("variant resolution");
+        let gate = h.find("crate::lifecycle::gate(").expect("lifecycle gate");
+        let allow = h.find("modelnotpermittedfortenant").expect("allowlist");
+        let pool = h
+            .find("letpool=admission_pool(route.as_deref());")
+            .expect("admission pool");
+        // Resolved first (aliases and variants answer for their model), then
+        // gated, so a redirect is allowlisted and admitted as the replacement.
+        assert!(serve < gate && gate < allow && allow < pool);
+        // A refusal is recorded before it is returned.
+        let refuse = h.find("Gate::Refuse(resp)").expect("refusal arm");
+        let ret = refuse + h[refuse..].find("returnresp;").expect("refusal returns");
+        assert!(h[refuse..ret].contains("finalize("));
+        assert!(h[refuse..ret].contains("StatusCode::GONE"));
+    }
+
+    #[test]
+    fn every_proxied_response_carries_the_lifecycle_notice() {
+        let src = squash(include_str!("proxy.rs"));
+        let start = src
+            .find("asyncfnproxy_handler_inner(")
+            .expect("inner handler");
+        let body = &src[start..start + 600];
+        assert!(body.contains("crate::lifecycle::apply_headers(&mutresp,notice)"));
+    }
+
+    #[test]
+    fn a_committed_cascade_says_who_drafted_the_answer() {
+        let h = squash(handler());
+        let spec = h.find("speculation::run(").expect("speculation");
+        let dispatch = h.find("letprepared_body").expect("normal dispatch");
+        assert_eq!(
+            h[spec..dispatch]
+                .matches(".header(crate::boons::speculation::DRAFTED_BY_HEADER,drafted_by)")
+                .count(),
+            2,
+            "both the buffered and the streamed commit carry the header"
+        );
+        // Nothing after the cascade abstained claims a drafter.
+        assert!(!h[dispatch..].contains("DRAFTED_BY_HEADER"));
     }
 
     #[test]
@@ -7487,14 +8369,22 @@ mod lifecycle_tests {
         assert_eq!(usage, None);
         let (tokens, billed) = truncated_stream_billing(usage, streamed, est);
         assert!(billed, "delivered text must be billed");
-        assert_eq!(tokens, (30, 5), "prompt estimate + ~4 chars per token");
+        assert_eq!(
+            tokens,
+            UpstreamUsage::uncached(30, 5),
+            "prompt estimate + ~4 chars per token"
+        );
 
         // Reported usage wins; nothing streamed is nothing billed.
+        let reported = UpstreamUsage::new(7, 3, 4);
         assert_eq!(
-            truncated_stream_billing(Some((7, 3)), streamed, est),
-            ((7, 3), true)
+            truncated_stream_billing(Some(reported), streamed, est),
+            (reported, true)
         );
-        assert_eq!(truncated_stream_billing(None, 0, est), ((0, 0), false));
+        assert_eq!(
+            truncated_stream_billing(None, 0, est),
+            (UpstreamUsage::default(), false)
+        );
     }
 
     #[test]
@@ -7562,8 +8452,120 @@ mod lifecycle_tests {
     #[test]
     fn completion_body_usage_reads_openai_usage() {
         let body = serde_json::json!({ "usage": { "prompt_tokens": 4, "completion_tokens": 9 } });
-        assert_eq!(completion_body_usage(&body), Some((4, 9)));
+        assert_eq!(
+            completion_body_usage(&body),
+            Some(UpstreamUsage::uncached(4, 9))
+        );
         assert_eq!(completion_body_usage(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn completion_body_usage_reads_cached_prompt_tokens() {
+        let usage = |details: serde_json::Value| {
+            completion_body_usage(&serde_json::json!({ "usage": {
+                "prompt_tokens": 100, "completion_tokens": 9, "prompt_tokens_details": details,
+            } }))
+        };
+        assert_eq!(
+            usage(serde_json::json!({ "cached_tokens": 64 })),
+            Some(UpstreamUsage::new(100, 9, 64))
+        );
+        // `null` details, details without the count, and a count above the
+        // prompt (clamped) all stay within the prompt.
+        assert_eq!(
+            usage(serde_json::Value::Null),
+            Some(UpstreamUsage::uncached(100, 9))
+        );
+        assert_eq!(
+            usage(serde_json::json!({ "audio_tokens": 0 })),
+            Some(UpstreamUsage::uncached(100, 9))
+        );
+        assert_eq!(
+            usage(serde_json::json!({ "cached_tokens": 500 })).map(|u| u.cached),
+            Some(100)
+        );
+        // An embedding reports prompt tokens only.
+        assert_eq!(
+            completion_body_usage(&serde_json::json!({ "usage": {
+                "prompt_tokens": 12, "total_tokens": 12,
+                "prompt_tokens_details": { "cached_tokens": 8 },
+            } })),
+            Some(UpstreamUsage::new(12, 0, 8))
+        );
+    }
+
+    /// The tail of a streamed chat completion: one content chunk, the final
+    /// usage-only chunk carrying `usage`, then `[DONE]`.
+    fn stream_tail(usage: serde_json::Value) -> String {
+        let content = serde_json::json!({
+            "object": "chat.completion.chunk",
+            "choices": [{ "index": 0, "delta": { "content": "hi" } }],
+        });
+        let last = serde_json::json!({
+            "object": "chat.completion.chunk", "choices": [], "usage": usage,
+        });
+        format!("data: {content}\n\ndata: {last}\n\ndata: [DONE]\n\n")
+    }
+
+    #[test]
+    fn stream_tail_usage_reads_cached_prompt_tokens() {
+        let tail = stream_tail(serde_json::json!({
+            "prompt_tokens": 2048, "total_tokens": 2098, "completion_tokens": 50,
+            "prompt_tokens_details": { "cached_tokens": 1536 },
+        }));
+        assert_eq!(
+            extract_usage(&tail),
+            Some(UpstreamUsage::new(2048, 50, 1536))
+        );
+    }
+
+    #[test]
+    fn stream_tail_usage_without_cache_detail_is_unchanged() {
+        let null = stream_tail(serde_json::json!({
+            "prompt_tokens": 20, "total_tokens": 25, "completion_tokens": 5,
+            "prompt_tokens_details": null,
+        }));
+        assert_eq!(extract_usage(&null), Some(UpstreamUsage::uncached(20, 5)));
+        let absent = stream_tail(serde_json::json!({
+            "prompt_tokens": 20, "total_tokens": 25, "completion_tokens": 5,
+        }));
+        assert_eq!(extract_usage(&absent), Some(UpstreamUsage::uncached(20, 5)));
+        let no_count = stream_tail(serde_json::json!({
+            "prompt_tokens": 20, "completion_tokens": 5,
+            "prompt_tokens_details": { "audio_tokens": 0 },
+        }));
+        assert_eq!(
+            extract_usage(&no_count),
+            Some(UpstreamUsage::uncached(20, 5))
+        );
+    }
+
+    #[test]
+    fn stream_tail_cache_detail_comes_from_the_final_usage_object() {
+        // Usage on every chunk (continuous usage stats): only the last chunk's
+        // cache detail may pair with the last chunk's prompt count, even when
+        // that last chunk reports none and an earlier one did.
+        let early = serde_json::json!({
+            "choices": [{ "index": 0, "delta": { "content": "x" } }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 1,
+                       "prompt_tokens_details": { "cached_tokens": 8 } },
+        });
+        let last = serde_json::json!({
+            "choices": [],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 2, "prompt_tokens_details": null },
+        });
+        let tail = format!("data: {early}\n\ndata: {last}\n\ndata: [DONE]\n\n");
+        assert_eq!(extract_usage(&tail), Some(UpstreamUsage::uncached(10, 2)));
+
+        // Key order does not matter: details before the prompt count still
+        // belong to the same object.
+        let reordered = r#"data: {"choices":[],"usage":{"prompt_tokens_details":{"cached_tokens":3},"completion_tokens":2,"prompt_tokens":10}}"#;
+        assert_eq!(extract_usage(reordered), Some(UpstreamUsage::new(10, 2, 3)));
+
+        // A usage object cut off at the end of the tail reports no cache
+        // detail rather than a guess, and keeps the old prompt reading.
+        let cut = r#"data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"prompt_tokens_details":{"cached_tok"#;
+        assert_eq!(extract_usage(cut), Some(UpstreamUsage::uncached(10, 2)));
     }
 
     #[test]

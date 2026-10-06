@@ -1,7 +1,7 @@
 "use client";
 
 import type { ReactNode } from "react";
-import { Image as ImageIcon, MessageSquare, Route, Scale, Sparkles, type LucideIcon } from "lucide-react";
+import { Image as ImageIcon, MessageSquare, Route, Scale, Search, Sparkles, type LucideIcon } from "lucide-react";
 import type { ModelRoute } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
 import type { PlaygroundSession } from "./playground";
@@ -12,6 +12,7 @@ export const MODES: { mode: PlaygroundSession["mode"]; label: string; icon: Luci
   { mode: "image", label: "Image", icon: ImageIcon },
   { mode: "router", label: "Router", icon: Route },
   { mode: "verdicts", label: "Verdicts", icon: Scale },
+  { mode: "search", label: "Search", icon: Search },
 ];
 
 export const modeInfo = (mode: PlaygroundSession["mode"]) =>

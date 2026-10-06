@@ -134,7 +134,33 @@ export interface DeploymentRow {
 }
 
 export function slurmPlacement(s: Pick<ManagedModelSpec, "partition" | "gres" | "mem" | "cpus_per_task" | "time_limit">): string {
-  return [s.partition, s.gres || null, s.cpus_per_task ? `${s.cpus_per_task} CPU` : null, s.mem || null, s.time_limit ? walltimeLabel(parseTimeLimit(s.time_limit)) : null].filter(Boolean).join(" · ");
+  const mem = s.mem === "0" ? "all memory" : s.mem || null;
+  return [s.partition, s.gres || null, s.cpus_per_task ? `${s.cpus_per_task} CPU` : null, mem, s.time_limit ? walltimeLabel(parseTimeLimit(s.time_limit)) : null].filter(Boolean).join(" · ");
+}
+
+/**
+ * The accounts a partition takes from this Slurm user: their associations for
+ * that partition (or for every partition), less what the partition's
+ * AllowAccounts/DenyAccounts rule out. Null when the cluster doesn't report
+ * enough to tell, so callers fall back to every account.
+ */
+export function accountsFor(resources: ClusterResources, partition: string): string[] | null {
+  const assoc = resources.associations;
+  const p = resources.partitions.find((x) => x.name === partition);
+  if (!assoc?.length && !p?.allowed_accounts?.length && !p?.denied_accounts?.length) return null;
+  const base = assoc?.length ? assoc.filter((a) => !a.partition || a.partition === partition).map((a) => a.account) : resources.accounts;
+  const allowed = p?.allowed_accounts ?? [];
+  const denied = new Set(p?.denied_accounts ?? []);
+  return [...new Set(base)].filter((a) => (!allowed.length || allowed.includes(a)) && !denied.has(a)).sort();
+}
+
+/** Slurm's own words from a slurmrestd error body, e.g. "Invalid account or
+ *  account/partition combination specified", or the text unchanged. */
+export function slurmErrorText(raw: string): string {
+  const errors = [...raw.matchAll(/"error"\s*:\s*"((?:[^"\\]|\\.)*)"/g)].map((m) => m[1]).filter(Boolean);
+  const descs = [...raw.matchAll(/"description"\s*:\s*"((?:[^"\\]|\\.)*)"/g)].map((m) => m[1]).filter((d) => d && !/^Expected OpenAPI/.test(d));
+  const picked = errors.length ? errors : descs;
+  return picked.length ? [...new Set(picked)].join("; ") : raw;
 }
 
 export function buildDeploymentRows(
@@ -250,6 +276,27 @@ export function memToMb(mem: string | null | undefined): number | null {
   const unit = (m[2] ?? "M").toUpperCase();
   const mb = unit === "K" ? n / 1024 : unit === "M" ? n : unit === "G" ? n * 1024 : n * 1024 * 1024;
   return Math.round(mb);
+}
+
+/**
+ * What one replica's job asks Slurm for, as a sentence:
+ * "Each replica asks Slurm for 1 node with 1 GPU, 72 CPUs and 500 GB of memory."
+ * A blank box is said as the default it falls back to.
+ */
+export function replicaAsk({ nodes, gres, cpus, mem }: { nodes: number; gres: string; cpus: string; mem: string }): string {
+  const n = Math.max(1, Math.floor(nodes) || 1);
+  const g = gres.trim();
+  const gpus = gresCount(g);
+  const c = cpus.trim();
+  const m = mem.trim();
+  const mb = memToMb(m);
+  const parts = [
+    !g ? "no GPUs" : gpus ? `${gpus} GPU${gpus === 1 ? "" : "s"}` : g,
+    !c ? "Slurm's default CPUs" : `${c} CPU${c === "1" ? "" : "s"}`,
+    !m ? "the partition's default memory" : mb === 0 ? "all of its memory" : mb ? `${mb >= 1024 ? `${Math.round(mb / 1024)} GB` : `${mb} MB`} of memory` : `${m} of memory`,
+  ];
+  const list = `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}`;
+  return n === 1 ? `Each replica asks Slurm for 1 node with ${list}.` : `Each replica asks Slurm for ${n} nodes, each with ${list}.`;
 }
 
 export function mbLabel(mb: number | null | undefined): string {

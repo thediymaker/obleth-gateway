@@ -1,0 +1,71 @@
+<?xml version="1.0"?>
+<!--
+  Bounds ClickHouse's own logs. The stock image logs at trace and keeps its
+  system log tables (query_log, part_log, metric_log, text_log, ...) forever,
+  which on a busy gateway outgrows the usage ledger many times over. Each
+  table below is partitioned by day and drops days older than 7; text_log
+  keeps warnings and errors. Mounted into the server's config.d so it merges
+  with the shipped config. The Helm chart renders the same settings from
+  clickhouse.systemLogRetentionDays and clickhouse.logLevel.
+-->
+<clickhouse>
+    <logger>
+        <level>information</level>
+    </logger>
+    <query_log>
+        <partition_by>event_date</partition_by>
+        <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
+        <settings>ttl_only_drop_parts = 1</settings>
+    </query_log>
+    <query_thread_log>
+        <partition_by>event_date</partition_by>
+        <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
+        <settings>ttl_only_drop_parts = 1</settings>
+    </query_thread_log>
+    <query_views_log>
+        <partition_by>event_date</partition_by>
+        <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
+        <settings>ttl_only_drop_parts = 1</settings>
+    </query_views_log>
+    <part_log>
+        <partition_by>event_date</partition_by>
+        <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
+        <settings>ttl_only_drop_parts = 1</settings>
+    </part_log>
+    <trace_log>
+        <partition_by>event_date</partition_by>
+        <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
+        <settings>ttl_only_drop_parts = 1</settings>
+    </trace_log>
+    <text_log>
+        <partition_by>event_date</partition_by>
+        <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
+        <settings>ttl_only_drop_parts = 1</settings>
+        <level>warning</level>
+    </text_log>
+    <metric_log>
+        <partition_by>event_date</partition_by>
+        <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
+        <settings>ttl_only_drop_parts = 1</settings>
+    </metric_log>
+    <error_log>
+        <partition_by>event_date</partition_by>
+        <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
+        <settings>ttl_only_drop_parts = 1</settings>
+    </error_log>
+    <asynchronous_metric_log>
+        <partition_by>event_date</partition_by>
+        <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
+        <settings>ttl_only_drop_parts = 1</settings>
+    </asynchronous_metric_log>
+    <processors_profile_log>
+        <partition_by>event_date</partition_by>
+        <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
+        <settings>ttl_only_drop_parts = 1</settings>
+    </processors_profile_log>
+    <backup_log>
+        <partition_by>event_date</partition_by>
+        <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
+        <settings>ttl_only_drop_parts = 1</settings>
+    </backup_log>
+</clickhouse>

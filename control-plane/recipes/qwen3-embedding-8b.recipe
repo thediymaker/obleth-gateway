@@ -1,0 +1,51 @@
+---
+name: Qwen3 Embedding 8B
+description: "Text embeddings for search and retrieval, 4096 dimensions, in over 100 languages. One GPU with 24 GB or more."
+engine: vllm
+kind: model
+model: Qwen/Qwen3-Embedding-8B
+weights_gb: 15
+requires: "vLLM 0.11.0 or later"
+model_type: embedding
+api_model_name: qwen3-embedding-8b
+port: 8000
+health_path: /health
+target_replicas: 1
+max_job_failures: 2
+tested:
+  - hardware: "1× A100 80 GB"
+    engine: "vLLM 0.30.1rc1 (nightly)"
+    date: 2026-10-03
+    result: "Ready in 3 minutes. Returned 4,096-dimension embeddings that ranked related texts above unrelated ones."
+inputs:
+  - name: context
+    label: Longest input
+    type: choice
+    options: [8192, 32768]
+    default: 32768
+    unit: tokens
+  - name: image
+    label: Container image
+    type: path
+    default: "{{cluster.image.vllm}}"
+    required: true
+  - name: cache
+    label: Weight cache
+    type: path
+    default: "{{cluster.cache}}"
+    required: true
+    help: HF_HOME, where the weights are kept between jobs.
+---
+#!/bin/bash -l
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=48G
+set -euo pipefail
+{{cluster.setup}}
+export HF_HOME={{cache}}
+apptainer exec --nv --bind {{cache}} {{image}} \
+  vllm serve Qwen/Qwen3-Embedding-8B \
+    --served-model-name {{api_model_name}} \
+    --host 0.0.0.0 --port "$OBLETH_SERVING_PORT" \
+    --runner pooling \
+    --max-model-len {{context}}

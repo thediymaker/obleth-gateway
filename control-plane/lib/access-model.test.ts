@@ -25,7 +25,7 @@ const key = (over: Partial<ApiKey> = {}): ApiKey => ({
   id: "k1", tenant_id: "t1", name: "alice", description: "", key_prefix: "sk-abc", kind: "secret",
   identity_issuer: null, identity_subject: null, identity_claims: null, weight: 100, max_in_flight: null,
   budget_tokens: null, budget_cost_usd: null, budget_period: null, budget_started_at: null,
-  disabled: false, tracing_enabled: false, created_at: "2026-09-01T00:00:00Z", updated_at: "", ...over,
+  disabled: false, tracing_enabled: false, end_user_fairshare: false, created_at: "2026-09-01T00:00:00Z", updated_at: "", ...over,
 });
 
 describe("time zones", () => {

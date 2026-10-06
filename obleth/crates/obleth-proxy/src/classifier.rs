@@ -37,7 +37,7 @@ use crate::verdicts::{answers, fan_out, QuestionCall, QuestionOutcome};
 #[derive(Clone)]
 pub struct Classifier {
     settings: Arc<ArcSwap<AutoRouterSettings>>,
-    /// hash(prompt + available tags) -> classified intent.
+    /// hash(brain + prompt + available tags) -> classified intent.
     cache: Cache<u64, Intent>,
 }
 
@@ -80,7 +80,7 @@ impl Classifier {
             return Intent::default();
         }
 
-        let key = cache_key(prompt, available_tags);
+        let key = cache_key(&brain.model_name, prompt, available_tags);
         if let Some(hit) = self.cache.get(&key).await {
             return hit;
         }
@@ -109,8 +109,12 @@ impl Classifier {
     }
 }
 
-fn cache_key(prompt: &str, available_tags: &[String]) -> u64 {
+/// The brain is part of the key: after `classifier_model` changes, answers
+/// cached from the previous brain -- including the empty ones cached after a
+/// failure -- must not be served as the new brain's for the rest of the TTL.
+fn cache_key(brain: &str, prompt: &str, available_tags: &[String]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    brain.hash(&mut hasher);
     prompt.hash(&mut hasher);
     for t in available_tags {
         t.hash(&mut hasher);
@@ -256,11 +260,26 @@ fn intent_from_outcomes(outcomes: &[QuestionOutcome]) -> Intent {
         }
     }
     chosen.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    drop_exclusive_losers(&mut chosen);
     chosen.truncate(3);
     Intent {
         tags: chosen.into_iter().map(|(t, _)| t).collect(),
         difficulty,
         source: crate::router::IntentSource::Classifier,
+    }
+}
+
+/// Drop the weaker tag of each [`obleth_config::EXCLUSIVE_TAG_PAIRS`] pair
+/// when both were chosen. `chosen` is sorted strongest first, so the weaker
+/// one is whichever comes later. Runs before the cap, so the slot it frees
+/// goes to the next tag.
+fn drop_exclusive_losers(chosen: &mut Vec<(String, f64)>) {
+    for (a, b) in obleth_config::EXCLUSIVE_TAG_PAIRS {
+        let pa = chosen.iter().position(|(t, _)| t == a);
+        let pb = chosen.iter().position(|(t, _)| t == b);
+        if let (Some(pa), Some(pb)) = (pa, pb) {
+            chosen.remove(pa.max(pb));
+        }
     }
 }
 
@@ -314,17 +333,45 @@ mod tests {
             ok_outcome("tag:math", &[(" no", -0.05), (" yes", -3.0)]),
             ok_outcome("tag:vision", &[(" yes", -0.3), (" no", -1.6)]),
             ok_outcome("tag:tools", &[(" yes", -0.2), (" no", -1.9)]),
-            ok_outcome("tag:writing", &[(" yes", -0.25), (" no", -1.8)]),
+            ok_outcome("tag:creative", &[(" yes", -0.25), (" no", -1.8)]),
         ];
         let intent = intent_from_outcomes(&outcomes);
         // Five tags say yes-ish, but math says no, and only the strongest
         // three survive, ordered by p(yes).
-        assert_eq!(intent.tags, vec!["coding", "tools", "writing"]);
+        assert_eq!(intent.tags, vec!["coding", "tools", "creative"]);
         assert_eq!(intent.difficulty, 2, "argmax level B = difficulty 2");
         assert!(matches!(
             intent.source,
             crate::router::IntentSource::Classifier
         ));
+    }
+
+    #[test]
+    fn coding_and_writing_keep_only_the_stronger() {
+        // "Write a SQL query": the classifier says yes to writing almost as
+        // readily as to coding. Coding is stronger, so writing goes, and the
+        // freed slot goes to the next tag.
+        let code = vec![
+            ok_outcome("tag:coding", &[(" yes", -0.01), (" no", -5.0)]),
+            ok_outcome("tag:writing", &[(" yes", -0.05), (" no", -3.0)]),
+            ok_outcome("tag:general", &[(" yes", -0.07), (" no", -2.7)]),
+            ok_outcome("tag:reasoning", &[(" yes", -0.4), (" no", -1.2)]),
+        ];
+        assert_eq!(
+            intent_from_outcomes(&code).tags,
+            vec!["coding", "general", "reasoning"]
+        );
+
+        // "Write the README intro": prose first, so writing stays.
+        let prose = vec![
+            ok_outcome("tag:coding", &[(" yes", -0.6), (" no", -0.8)]),
+            ok_outcome("tag:writing", &[(" yes", -0.02), (" no", -4.0)]),
+            ok_outcome("tag:general", &[(" yes", -0.1), (" no", -2.4)]),
+        ];
+        assert_eq!(
+            intent_from_outcomes(&prose).tags,
+            vec!["writing", "general"]
+        );
     }
 
     #[test]
@@ -340,6 +387,23 @@ mod tests {
         let intent = intent_from_outcomes(&outcomes);
         assert!(intent.tags.is_empty());
         assert_eq!(intent.difficulty, 1);
+    }
+
+    #[test]
+    fn switching_the_brain_does_not_reuse_the_previous_brains_cached_answers() {
+        // Without the brain in the key, a switch to a new classifier_model
+        // served the old brain's answers (and its cached failures) for the
+        // rest of the TTL.
+        let tags = vec!["coding".to_string(), "math".to_string()];
+        let prompt = "What is the capital of France?";
+        assert_ne!(
+            cache_key("brain-a", prompt, &tags),
+            cache_key("brain-b", prompt, &tags)
+        );
+        assert_eq!(
+            cache_key("brain-b", prompt, &tags),
+            cache_key("brain-b", prompt, &tags)
+        );
     }
 
     #[test]
@@ -404,6 +468,8 @@ mod tests {
         ResolvedModel {
             model_name: "brain-test".to_string(),
             aliases: Vec::new(),
+            lifecycle: Default::default(),
+            variants: Vec::new(),
             quantization: "unknown".into(),
             upstream_model: "brain-upstream".to_string(),
             api_base: api_base.to_string(),

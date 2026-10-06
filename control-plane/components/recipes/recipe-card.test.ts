@@ -15,6 +15,8 @@ const valid: ParsedRecipe = {
     port: 8000,
     target_replicas: 4,
     max_job_failures: 3,
+    inputs: [],
+    kind: "model",
   },
   body: "#!/bin/bash\nllama-server",
   directives: { warnings: [] },

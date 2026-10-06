@@ -300,8 +300,10 @@ impl BoonGrants {
 /// Every hard-filter reason string, in the order the filters are applied. A
 /// candidate is attributed to the *first* filter it fails, so this order is
 /// part of the explanation's contract, not just presentation.
-const REJECTION_REASONS: [&str; 11] = [
+const REJECTION_REASONS: [&str; 13] = [
     "disabled",
+    "staged",
+    "retiring",
     "auto_excluded",
     "unhealthy",
     "model_type",
@@ -487,6 +489,17 @@ fn evaluate<'a>(
     let hard_reject = |c: &Candidate| -> Option<&'static str> {
         if !c.model.enabled {
             return Some("disabled");
+        }
+        // A staged model is served by name for testing, but `auto` must not
+        // send traffic to it before it goes live. A deprecated model is still
+        // served by name, but `auto` must not start sending traffic to
+        // something on its way out; a retired one is not served at all.
+        match c.model.lifecycle.status_at(chrono::Utc::now()) {
+            crate::ModelStatus::Active => {}
+            crate::ModelStatus::Staged => return Some("staged"),
+            crate::ModelStatus::Deprecated | crate::ModelStatus::Retired => {
+                return Some("retiring")
+            }
         }
         // Operator policy, checked ahead of health so the explanation reads as
         // a deliberate exclusion rather than a transient outage. The model stays
@@ -1043,6 +1056,41 @@ pub fn heuristic_intent(json: &serde_json::Value, est_input_tokens: u64) -> Inte
         push("coding");
     }
 
+    // Prose to write or edit. Phrases rather than single words, and never
+    // alongside a code signal: "write" and "email" alone match "write a SQL
+    // query" and "validate an email address" just as well.
+    let writing_signal = !code_signal
+        && [
+            "short story",
+            "poem",
+            "sonnet",
+            "essay",
+            "cover letter",
+            "personal statement",
+            "an email",
+            "email to",
+            "a letter",
+            "blog post",
+            "newsletter",
+            "press release",
+            "linkedin post",
+            "rewrite",
+            "rephrase",
+            "reword",
+            "proofread",
+            "tighten this",
+            "polish this",
+            "edit this",
+            "fix the grammar",
+            "more diplomatic",
+            "more professional",
+        ]
+        .iter()
+        .any(|k| lower.contains(k));
+    if writing_signal {
+        push("writing");
+    }
+
     let math_signal = [
         "solve",
         "equation",
@@ -1123,6 +1171,8 @@ mod tests {
         ResolvedModel {
             model_name: name.to_string(),
             aliases: Vec::new(),
+            lifecycle: Default::default(),
+            variants: Vec::new(),
             upstream_model: name.to_string(),
             api_base: "http://upstream".to_string(),
             api_key: None,
@@ -1203,6 +1253,40 @@ mod tests {
             1,
         );
         assert!(chosen.is_none());
+    }
+
+    #[test]
+    fn variants_are_never_auto_candidates() {
+        let mut m = model("glm-5-3");
+        m.boons = vec!["vision".into()];
+        m.variants = vec![crate::types::ModelVariant {
+            name: "glm-5-3-spec".into(),
+            description: String::new(),
+            boons: vec!["speculation".into()],
+        }];
+        let candidates = vec![healthy(m)];
+        let pick = |allowed: Option<&[String]>| {
+            select_model(
+                &candidates,
+                &RequestFeatures::default(),
+                &HashMap::new(),
+                &HashMap::new(),
+                allowed,
+                &[],
+                BoonGrants::default(),
+                &RouterWeights::default(),
+                0.0,
+                1,
+            )
+        };
+        // `auto` picks the model itself, with only its own boons.
+        let chosen = pick(None).unwrap();
+        assert_eq!(chosen.model_name, "glm-5-3");
+        assert_eq!(chosen.boons, vec!["vision".to_string()]);
+        // A tenant allowed only the variant has nothing for `auto` to pick:
+        // a variant is a name for a model, not a candidate of its own.
+        let only_variant = vec!["glm-5-3-spec".to_string()];
+        assert!(pick(Some(&only_variant)).is_none());
     }
 
     #[test]
@@ -1359,6 +1443,56 @@ mod tests {
             .map(|r| r.reason)
             .expect("alpha must appear in the rejection list");
         assert_eq!(reason, "auto_excluded");
+    }
+
+    #[test]
+    fn auto_never_picks_a_deprecated_or_retired_model() {
+        for status in [crate::ModelStatus::Deprecated, crate::ModelStatus::Retired] {
+            let mut old = model("old");
+            old.lifecycle.status = status;
+            let explain = explain_selection(
+                &[healthy(old), healthy(model("new"))],
+                &RequestFeatures::default(),
+                &HashMap::new(),
+                &HashMap::new(),
+                None,
+                &[],
+                BoonGrants::default(),
+                &RouterWeights::default(),
+                0.0,
+                &Intent::default(),
+            );
+            let reason = explain
+                .rejected
+                .iter()
+                .find(|r| r.models.iter().any(|m| m == "old"))
+                .map(|r| r.reason);
+            assert_eq!(reason, Some("retiring"), "{status:?}");
+        }
+    }
+
+    #[test]
+    fn auto_never_picks_a_staged_model() {
+        let mut new = model("new");
+        new.lifecycle.status = crate::ModelStatus::Staged;
+        let explain = explain_selection(
+            &[healthy(new), healthy(model("live"))],
+            &RequestFeatures::default(),
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            &[],
+            BoonGrants::default(),
+            &RouterWeights::default(),
+            0.0,
+            &Intent::default(),
+        );
+        let reason = explain
+            .rejected
+            .iter()
+            .find(|r| r.models.iter().any(|m| m == "new"))
+            .map(|r| r.reason);
+        assert_eq!(reason, Some("staged"));
     }
 
     #[test]
@@ -1576,6 +1710,36 @@ mod tests {
         let body = serde_json::json!({ "messages": [{"role": "user", "content": "hello"}] });
         let tags = heuristic_intent(&body, 40_000).tags;
         assert!(tags.contains(&"long-context".to_string()));
+    }
+
+    #[test]
+    fn heuristic_intent_tags_prose_to_write_or_edit() {
+        for prompt in [
+            "Draft an email to my thesis committee thanking them.",
+            "Can you proofread my cover letter?",
+            "Rewrite this paragraph so it reads more naturally.",
+            "Make this message more diplomatic: you missed the deadline again.",
+        ] {
+            let body = serde_json::json!({ "messages": [{"role": "user", "content": prompt}] });
+            let tags = heuristic_intent(&body, 10).tags;
+            assert_eq!(tags, vec!["writing".to_string()], "{prompt}");
+        }
+    }
+
+    #[test]
+    fn heuristic_intent_does_not_call_code_writing() {
+        for prompt in [
+            "Write a SQL query that counts orders per customer.",
+            "Rewrite this python function to use a generator.",
+            "Write a regex that validates an email address.",
+        ] {
+            let body = serde_json::json!({ "messages": [{"role": "user", "content": prompt}] });
+            let tags = heuristic_intent(&body, 10).tags;
+            assert!(tags.contains(&"coding".to_string()), "{prompt}");
+            assert!(!tags.contains(&"writing".to_string()), "{prompt}");
+        }
+        let body = serde_json::json!({ "messages": [{"role": "user", "content": "What is the capital of France?"}] });
+        assert!(heuristic_intent(&body, 10).tags.is_empty());
     }
 
     #[test]

@@ -68,6 +68,10 @@ export const managedModelFormSchema = z
     slurm_min_replicas: requiredInt(0, 100_000, "Whole number ≥ 0."),
     slurm_target_replicas: requiredInt(1, 100_000, "Whole number ≥ 1."),
     slurm_max_job_failures: requiredInt(0, 100_000, "Whole number ≥ 0 (0 = no limit)."),
+    // A relative path would be read from the job's working directory, /tmp on the node.
+    slurm_log_output_dir: z.string().optional().refine((v) => v === undefined || isBlank(v) || v.trim().startsWith("/"), {
+      message: "A full path starting with /, like /scratch/you/logs, or blank.",
+    }),
   })
   .passthrough()
   .superRefine((v, ctx) => {

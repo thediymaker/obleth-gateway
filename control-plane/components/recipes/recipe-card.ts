@@ -3,7 +3,8 @@
 // component can build the cards and pass them across the client boundary.
 // `import type` keeps this module free of any runtime dependency on the
 // fs-touching sbatch-recipes loader.
-import type { ParsedRecipe, RecipeVariable } from "@/lib/sbatch-recipes";
+import type { ParsedRecipe, RecipeTest, RecipeVariable } from "@/lib/sbatch-recipes";
+import type { RecipeInput } from "@/lib/recipe-inputs";
 
 export interface RecipeDeployPreview {
   apiModelName: string;
@@ -30,6 +31,17 @@ export interface RecipeDeployPreview {
   rawBody: string;
   warnings: string[];
   variables?: RecipeVariable[];
+  inputs: RecipeInput[];
+  kind: "model" | "engine";
+  model?: string;
+  weightsGb?: number;
+  requires?: string;
+  nodeOptions?: number[];
+  nodeNotes?: Record<string, string>;
+  basedOn?: string;
+  env?: Record<string, string>;
+  description?: string;
+  tested?: RecipeTest[];
 }
 
 export interface RecipeCard {
@@ -47,6 +59,12 @@ export interface RecipeCard {
   source: "file" | "db";
   recipeId?: string; // DB row id, when source === "db"
   body?: string; // raw recipe text, for pre-filling Edit / Clone-to-edit
+}
+
+/** One test of a recipe as a sentence: "Served on 1× GH200 96 GB with vLLM
+ *  0.30.1, 2026-10-03." */
+export function testedSentence(t: RecipeTest): string {
+  return `Served on ${t.hardware}${t.engine ? ` with ${t.engine}` : ""}${t.date ? `, ${t.date}` : ""}.`;
 }
 
 export function toRecipeCards(parsed: ParsedRecipe[]): RecipeCard[] {

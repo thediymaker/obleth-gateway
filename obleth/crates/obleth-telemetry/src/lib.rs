@@ -18,7 +18,10 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 const BATCH_MAX: usize = 500;
-const FLUSH_INTERVAL: Duration = Duration::from_millis(1000);
+/// WAL replay keeps its own one-second cadence, independent of the flush
+/// interval, so a long flush interval doesn't slow recovery after an outage.
+/// Replay batches are already large (up to 1 MiB of rows each).
+const REPLAY_INTERVAL: Duration = Duration::from_secs(1);
 /// Bound on the reachability probe that precedes schema setup: the ClickHouse
 /// client has no connect timeout, and a blackholed host would otherwise hang
 /// boot (or the flusher) for the OS TCP timeout.
@@ -69,6 +72,7 @@ struct UsageRow<'a> {
     weight: i64,
     input_tokens: u32,
     output_tokens: u32,
+    cached_input_tokens: u32,
     estimated_tokens: u32,
     queue_wait_ms: u32,
     ttft_ms: u32,
@@ -84,6 +88,10 @@ struct UsageRow<'a> {
     session_id_source: &'a str,
     request_type: &'a str,
     device_id: &'a str,
+    end_user: &'a str,
+    #[serde(with = "clickhouse::serde::uuid")]
+    parent_request_id: Uuid,
+    model_variant: &'a str,
 }
 
 impl<'a> From<&'a UsageRecord> for UsageRow<'a> {
@@ -97,6 +105,7 @@ impl<'a> From<&'a UsageRecord> for UsageRow<'a> {
             weight: r.weight,
             input_tokens: r.input_tokens,
             output_tokens: r.output_tokens,
+            cached_input_tokens: r.cached_input_tokens,
             estimated_tokens: r.estimated_tokens,
             queue_wait_ms: r.queue_wait_ms,
             ttft_ms: r.ttft_ms,
@@ -112,6 +121,9 @@ impl<'a> From<&'a UsageRecord> for UsageRow<'a> {
             session_id_source: &r.session_id_source,
             request_type: &r.request_type,
             device_id: &r.device_id,
+            end_user: &r.end_user,
+            parent_request_id: r.parent_request_id,
+            model_variant: &r.model_variant,
         }
     }
 }
@@ -215,6 +227,9 @@ impl TelemetrySink {
     /// retries schema setup with backoff before its first insert. Only an
     /// invalid database name is an error.
     ///
+    /// Rows are inserted every `flush_interval`, or sooner once `BATCH_MAX`
+    /// are buffered.
+    ///
     /// `_fail_open` is ignored: telemetry always spills to the WAL on failure.
     /// `OBLETH_FAIL_OPEN` governs budget admission only, and a ledger outage
     /// must never cost accounting data. Kept so callers compile unchanged.
@@ -224,6 +239,7 @@ impl TelemetrySink {
         user: &str,
         password: &str,
         wal_path: &str,
+        flush_interval: Duration,
         _fail_open: bool,
     ) -> Result<Self, TelemetryError> {
         if !is_valid_identifier(database) {
@@ -259,6 +275,7 @@ impl TelemetrySink {
             schema_ready: schema_ready.clone(),
             wal: wal::Wal::new(wal_path),
             wal_path: wal_path.to_string(),
+            flush_interval,
             backoff: Backoff::default(),
             replay_backoff: Backoff::default(),
             stats: stats.clone(),
@@ -268,6 +285,7 @@ impl TelemetrySink {
         let spans_flusher = SpansFlusher {
             client,
             schema_ready: schema_ready.clone(),
+            flush_interval,
             stats: stats.clone(),
         };
         let (drain, drain_rx) = mpsc::channel(4);
@@ -350,6 +368,7 @@ struct Flusher {
     /// Kept alongside `wal` (which doesn't expose its path) so a persistent
     /// schema failure can name where usage is spilling to.
     wal_path: String,
+    flush_interval: Duration,
     backoff: Backoff,
     replay_backoff: Backoff,
     stats: Arc<TelemetryStats>,
@@ -367,8 +386,15 @@ impl Flusher {
         mut drain: mpsc::Receiver<oneshot::Sender<()>>,
     ) {
         let mut buf: Vec<UsageRecord> = Vec::with_capacity(BATCH_MAX);
-        let mut ticker = tokio::time::interval(FLUSH_INTERVAL);
+        // The first flush is one interval after boot; replay starts at once so
+        // spill left by a previous run goes back to ClickHouse right away.
+        let mut ticker = tokio::time::interval_at(
+            tokio::time::Instant::now() + self.flush_interval,
+            self.flush_interval,
+        );
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut replay = tokio::time::interval(REPLAY_INTERVAL);
+        replay.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 Some(ack) = drain.recv() => {
@@ -400,6 +426,8 @@ impl Flusher {
                 }
                 _ = ticker.tick() => {
                     self.flush(&mut buf, true).await;
+                }
+                _ = replay.tick() => {
                     self.replay_wal().await;
                 }
             }
@@ -583,6 +611,7 @@ impl Backoff {
 struct SpansFlusher {
     client: Client,
     schema_ready: Arc<AtomicBool>,
+    flush_interval: Duration,
     #[allow(dead_code)]
     stats: Arc<TelemetryStats>,
 }
@@ -594,7 +623,7 @@ impl SpansFlusher {
         mut drain: mpsc::Receiver<oneshot::Sender<()>>,
     ) {
         let mut buf: Vec<SpanRecord> = Vec::with_capacity(BATCH_MAX);
-        let mut ticker = tokio::time::interval(FLUSH_INTERVAL);
+        let mut ticker = tokio::time::interval(self.flush_interval);
         loop {
             tokio::select! {
                 Some(ack) = drain.recv() => {
@@ -704,6 +733,7 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
             weight Int64,
             input_tokens UInt32,
             output_tokens UInt32,
+            cached_input_tokens UInt32 DEFAULT 0,
             estimated_tokens UInt32,
             queue_wait_ms UInt32,
             ttft_ms UInt32,
@@ -719,6 +749,9 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
             session_id_source LowCardinality(String) DEFAULT '',
             request_type LowCardinality(String) DEFAULT '',
             device_id String DEFAULT '',
+            end_user String DEFAULT '',
+            parent_request_id UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
+            model_variant String DEFAULT '',
             ts DateTime64(3) MATERIALIZED fromUnixTimestamp64Milli(ts_ms),
             INDEX idx_ts_ms ts_ms TYPE minmax GRANULARITY 4
         ) ENGINE = MergeTree()
@@ -789,6 +822,35 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
     client
         .query(&format!(
             "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS device_id String DEFAULT ''"
+        ))
+        .execute()
+        .await?;
+    // Idempotent add for databases created before per-end-user attribution.
+    client
+        .query(&format!(
+            "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS end_user String DEFAULT ''"
+        ))
+        .execute()
+        .await?;
+    // Idempotent add for databases created before upstream prefix-cache hits
+    // were recorded.
+    client
+        .query(&format!(
+            "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS cached_input_tokens UInt32 DEFAULT 0"
+        ))
+        .execute()
+        .await?;
+    // Idempotent adds for databases created before helper-call rows named the
+    // request they served, and before requests recorded the variant they used.
+    client
+        .query(&format!(
+            "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS parent_request_id UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000')"
+        ))
+        .execute()
+        .await?;
+    client
+        .query(&format!(
+            "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS model_variant String DEFAULT ''"
         ))
         .execute()
         .await?;
@@ -1110,6 +1172,7 @@ mod conv_tests {
             weight: 1,
             input_tokens: 1,
             output_tokens: 1,
+            cached_input_tokens: 0,
             estimated_tokens: 2,
             queue_wait_ms: 0,
             ttft_ms: 0,
@@ -1125,6 +1188,9 @@ mod conv_tests {
             session_id_source: String::new(),
             request_type: "chat".into(),
             device_id: String::new(),
+            end_user: String::new(),
+            parent_request_id: Uuid::nil(),
+            model_variant: String::new(),
         }
     }
 
@@ -1141,6 +1207,7 @@ mod conv_tests {
             "default",
             "",
             wal_path.to_str().unwrap(),
+            Duration::from_millis(100),
             true,
         )
         .await
@@ -1168,6 +1235,7 @@ mod conv_tests {
             "default",
             "",
             wal_path.to_str().unwrap(),
+            Duration::from_millis(100),
             true,
         )
         .await
@@ -1185,6 +1253,37 @@ mod conv_tests {
         let _ = tokio::fs::remove_dir_all(&directory).await;
     }
 
+    /// Rows are batched for the flush interval even though WAL replay ticks
+    /// every second; a one-row insert per tick is what floods ClickHouse with
+    /// parts to merge.
+    #[tokio::test]
+    async fn rows_wait_for_the_flush_interval() {
+        let directory =
+            std::env::temp_dir().join(format!("obleth-sink-test-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir(&directory).await.unwrap();
+        let wal_path = directory.join("usage.jsonl");
+        let sink = TelemetrySink::start(
+            "http://127.0.0.1:1",
+            "obleth",
+            "default",
+            "",
+            wal_path.to_str().unwrap(),
+            Duration::from_secs(60),
+            true,
+        )
+        .await
+        .unwrap();
+        for _ in 0..3 {
+            sink.record(record());
+        }
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let stats = sink.stats();
+        assert_eq!(stats.waled.load(Ordering::Relaxed), 0);
+        sink.shutdown().await;
+        assert_eq!(stats.waled.load(Ordering::Relaxed), 3);
+        let _ = tokio::fs::remove_dir_all(&directory).await;
+    }
+
     #[tokio::test]
     async fn spills_even_when_fail_open_is_false() {
         let directory =
@@ -1197,6 +1296,7 @@ mod conv_tests {
             "default",
             "",
             wal_path.to_str().unwrap(),
+            Duration::from_millis(100),
             false,
         )
         .await
@@ -1219,6 +1319,7 @@ mod conv_tests {
             "default",
             "",
             "unused",
+            Duration::from_millis(100),
             true,
         )
         .await;
@@ -1233,6 +1334,7 @@ mod conv_tests {
             "default",
             "",
             "unused",
+            Duration::from_millis(100),
             true,
         )
         .await
@@ -1254,6 +1356,7 @@ mod conv_tests {
             schema_ready: Arc::new(AtomicBool::new(false)),
             wal: wal::Wal::new("unused-test-wal"),
             wal_path: "unused-test-wal".to_string(),
+            flush_interval: Duration::from_millis(100),
             backoff: Backoff::default(),
             replay_backoff: Backoff::default(),
             stats: Arc::default(),
@@ -1291,6 +1394,7 @@ mod conv_tests {
             weight: 1,
             input_tokens: 0,
             output_tokens: 0,
+            cached_input_tokens: 0,
             estimated_tokens: 0,
             queue_wait_ms: 0,
             ttft_ms: 0,
@@ -1306,6 +1410,9 @@ mod conv_tests {
             session_id_source: "derived".into(),
             request_type: "chat".into(),
             device_id: "dev-1".into(),
+            end_user: String::new(),
+            parent_request_id: Uuid::nil(),
+            model_variant: String::new(),
         };
         let row = UsageRow::from(&rec);
         assert_eq!(row.session_id_source, "derived");
@@ -1323,6 +1430,7 @@ mod conv_tests {
             weight: 1,
             input_tokens: 0,
             output_tokens: 0,
+            cached_input_tokens: 0,
             estimated_tokens: 0,
             queue_wait_ms: 0,
             ttft_ms: 0,
@@ -1338,6 +1446,9 @@ mod conv_tests {
             session_id_source: "derived".into(),
             request_type: "chat".into(),
             device_id: "dev-1".into(),
+            end_user: String::new(),
+            parent_request_id: Uuid::nil(),
+            model_variant: String::new(),
         };
         rec.energy_wh = 1.5;
         rec.energy_cost_usd = 0.0002;
@@ -1346,6 +1457,31 @@ mod conv_tests {
         assert_eq!(row.energy_wh, 1.5);
         assert_eq!(row.energy_cost_usd, 0.0002);
         assert_eq!(row.co2_g, 0.6);
+    }
+
+    #[test]
+    fn usage_row_mirrors_cached_input_tokens() {
+        let mut rec = record();
+        rec.input_tokens = 120;
+        rec.cached_input_tokens = 96;
+        let row = UsageRow::from(&rec);
+        assert_eq!(row.input_tokens, 120);
+        assert_eq!(row.cached_input_tokens, 96);
+    }
+
+    #[test]
+    fn usage_row_mirrors_the_parent_request_and_variant() {
+        let mut rec = record();
+        let row = UsageRow::from(&rec);
+        assert!(row.parent_request_id.is_nil());
+        assert_eq!(row.model_variant, "");
+
+        let parent = Uuid::new_v4();
+        rec.parent_request_id = parent;
+        rec.model_variant = "glm-5-3-spec".into();
+        let row = UsageRow::from(&rec);
+        assert_eq!(row.parent_request_id, parent);
+        assert_eq!(row.model_variant, "glm-5-3-spec");
     }
 }
 
@@ -1441,6 +1577,7 @@ mod clickhouse_tests {
             schema_ready: Arc::new(AtomicBool::new(true)),
             wal: wal::Wal::new("unused-test-wal"),
             wal_path: "unused-test-wal".to_string(),
+            flush_interval: Duration::from_millis(100),
             backoff: Backoff::default(),
             replay_backoff: Backoff::default(),
             stats: Arc::default(),
@@ -1550,6 +1687,7 @@ mod clickhouse_tests {
             "default",
             "",
             wal_path.to_str().unwrap(),
+            Duration::from_millis(100),
             true,
         )
         .await

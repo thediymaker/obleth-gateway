@@ -89,6 +89,11 @@ obleth:
   modelHealthTimeoutSecs: 30
   modelHealthRetentionDays: 30
   usageRetentionDays: 180
+  # Milliseconds each gateway pod buffers usage rows and trace spans before it
+  # inserts them into ClickHouse (100-60000). ClickHouse rewrites every insert
+  # in later merges, so fewer, larger inserts cost much less disk I/O; rows
+  # reach the dashboard up to this long after a request finishes.
+  telemetryFlushIntervalMs: 5000
   # On shutdown the gateway stops accepting and waits this long for in-flight
   # requests (including streams). Keep it below the pod's
   # terminationGracePeriodSeconds (345) minus the 5s preStop delay, the 20s
@@ -338,6 +343,14 @@ clickhouse:
   resources:
     requests: { cpu: "500m", memory: "2Gi" }
     limits: { cpu: "1", memory: "4Gi" }
+  # ClickHouse's own logs (query_log, part_log, metric_log, text_log, ...).
+  # The stock image keeps them forever and logs at trace, so on a busy
+  # gateway they outgrow the usage ledger many times over. Each system log
+  # table drops days older than this, and text_log keeps warnings and errors.
+  systemLogRetentionDays: 7
+  # Server log level (none, fatal, critical, error, warning, notice,
+  # information, debug, trace).
+  logLevel: information
   # PVC-backed storage for the usage ledger. Disable for ephemeral test envs
   # (usage history is lost on restart).
   persistence:

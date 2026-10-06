@@ -37,11 +37,11 @@ use utoipa::ToSchema;
 use crate::types::{
     is_valid_capacity_mode, is_valid_endpoint_selection_mode, is_valid_model_type,
     is_valid_quantization, merge_upstream_headers, normalize_aliases, normalize_boons,
-    normalize_tool_servers, parse_tag_level, upstream_header_names, ModelEndpoint, ModelRoute,
-    UpstreamHeaders, UpstreamHeadersWrite, CAPACITY_MODES, DEFAULT_CAPACITY_MODE,
-    DEFAULT_CAPACITY_SOURCE, DEFAULT_ENDPOINT_SELECTION_MODE, DEFAULT_MODEL_TYPE,
-    DEFAULT_QUANTIZATION, DEFAULT_RETRY_BACKOFF_MS, ENDPOINT_SELECTION_MODES, MAX_MODEL_ALIASES,
-    MODEL_TYPES, QUANTIZATIONS,
+    normalize_tool_servers, normalize_variants, parse_tag_level, upstream_header_names,
+    ModelEndpoint, ModelRoute, ModelVariant, UpstreamHeaders, UpstreamHeadersWrite, CAPACITY_MODES,
+    DEFAULT_CAPACITY_MODE, DEFAULT_CAPACITY_SOURCE, DEFAULT_ENDPOINT_SELECTION_MODE,
+    DEFAULT_MODEL_TYPE, DEFAULT_QUANTIZATION, DEFAULT_RETRY_BACKOFF_MS, ENDPOINT_SELECTION_MODES,
+    MAX_MODEL_ALIASES, MAX_MODEL_VARIANTS, MODEL_TYPES, QUANTIZATIONS,
 };
 
 /// File-format discriminator for model manifests.
@@ -121,6 +121,11 @@ pub struct ManifestModel {
     /// Blank and duplicate entries are dropped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aliases: Option<Vec<String>>,
+    /// Opt-in names for this model with extra boons on. Replaced as a whole
+    /// when present, like `aliases`; absent leaves the stored variants alone.
+    /// Blank and duplicate names and unknown boons are dropped with a warning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variants: Option<Vec<ModelVariant>>,
     /// Serving format from the fixed `QUANTIZATIONS` vocabulary. An
     /// unrecognized value is rejected rather than silently defaulted, on the
     /// same reasoning as `model_type`.
@@ -292,6 +297,7 @@ pub const IMPORT_ACTION_UNCHANGED: &str = "unchanged";
 pub struct ModelConfig {
     pub description: String,
     pub aliases: Vec<String>,
+    pub variants: Vec<ModelVariant>,
     pub upstream_model: String,
     pub api_base: String,
     pub api_key: Option<String>,
@@ -344,6 +350,7 @@ impl Default for ModelConfig {
         Self {
             description: String::new(),
             aliases: Vec::new(),
+            variants: Vec::new(),
             upstream_model: String::new(),
             api_base: String::new(),
             api_key: None,
@@ -397,6 +404,7 @@ impl From<&ModelRoute> for ModelConfig {
         Self {
             description: m.description.clone(),
             aliases: m.aliases.clone(),
+            variants: m.variants.clone(),
             upstream_model: m.upstream_model.clone(),
             api_base: m.api_base.clone(),
             api_key: m.api_key.clone(),
@@ -461,6 +469,7 @@ impl ModelConfig {
         };
         note(self.description != other.description, "description");
         note(self.aliases != other.aliases, "aliases");
+        note(self.variants != other.variants, "variants");
         note(
             self.upstream_model != other.upstream_model,
             "upstream_model",
@@ -867,6 +876,30 @@ pub fn resolve_model(
         }
     }
 
+    if let Some(raw) = &entry.variants {
+        next.variants = normalize_variants(raw);
+        // Like aliases, a variant name colliding with another model's names is
+        // the importer's to catch; here only what normalization dropped.
+        let dropped = raw.len() - next.variants.len();
+        if dropped > 0 {
+            warnings.push(format!(
+                "dropped {dropped} blank, duplicate, or over-cap variant(s) (at most {MAX_MODEL_VARIANTS} are kept)"
+            ));
+        }
+        let unknown: Vec<&str> = raw
+            .iter()
+            .flat_map(|v| v.boons.iter())
+            .filter(|b| !crate::types::is_valid_boon(&b.trim().to_ascii_lowercase()))
+            .map(|b| b.as_str())
+            .collect();
+        if !unknown.is_empty() {
+            warnings.push(format!(
+                "dropped unknown variant boon(s): {}",
+                unknown.join(", ")
+            ));
+        }
+    }
+
     if let Some(raw) = &entry.tags {
         // Store the suffixed form so a declared strength level survives, the
         // same shape `serialize_tag_levels` writes on every other path. An
@@ -1091,6 +1124,7 @@ pub fn model_to_manifest_entry(m: &ModelRoute) -> ManifestModel {
         model_name: m.model_name.clone(),
         description: Some(m.description.clone()),
         aliases: Some(m.aliases.clone()),
+        variants: Some(m.variants.clone()),
         upstream_model: Some(m.upstream_model.clone()),
         api_base: Some(m.api_base.clone()),
         api_key: None,
@@ -1150,6 +1184,8 @@ mod tests {
             id: uuid::Uuid::new_v4(),
             model_name: name.to_string(),
             aliases: Vec::new(),
+            lifecycle: Default::default(),
+            variants: Vec::new(),
             description: "original".into(),
             upstream_model: "upstream/original".into(),
             api_base: "http://127.0.0.1:8000/v1".into(),
@@ -1394,6 +1430,62 @@ mod tests {
         assert_eq!(r.config.quantization, "fp8");
         assert!(!r.changed_fields.contains(&"aliases".to_string()));
         assert!(!r.changed_fields.contains(&"quantization".to_string()));
+    }
+
+    #[test]
+    fn variants_replace_the_whole_list_and_report_what_was_dropped() {
+        let mut existing = route("m");
+        existing.variants = vec![ModelVariant {
+            name: "m-old".into(),
+            description: String::new(),
+            boons: vec!["vision".into()],
+        }];
+        let mut e = entry("m");
+        e.variants = Some(vec![
+            ModelVariant {
+                name: " m-spec ".into(),
+                description: "drafted and verified".into(),
+                boons: vec!["speculation".into(), "teleportation".into()],
+            },
+            ModelVariant {
+                name: "m-spec".into(),
+                description: "a duplicate".into(),
+                boons: vec![],
+            },
+        ]);
+
+        let r = resolve_model(&e, Some(&existing), &[]).unwrap();
+
+        assert_eq!(
+            r.config.variants,
+            vec![ModelVariant {
+                name: "m-spec".into(),
+                description: "drafted and verified".into(),
+                boons: vec!["speculation".into()],
+            }]
+        );
+        assert!(r.changed_fields.contains(&"variants".to_string()));
+        assert!(
+            r.warnings.iter().any(|w| w.contains("dropped 1")),
+            "{:?}",
+            r.warnings
+        );
+        assert!(
+            r.warnings.iter().any(|w| w.contains("teleportation")),
+            "{:?}",
+            r.warnings
+        );
+
+        // Absent leaves the stored list alone.
+        let r = resolve_model(&entry("m"), Some(&existing), &[]).unwrap();
+        assert_eq!(r.config.variants, existing.variants);
+        assert!(!r.changed_fields.contains(&"variants".to_string()));
+    }
+
+    #[test]
+    fn manifest_written_before_variants_still_parses() {
+        let m: ManifestModel = serde_json::from_str(r#"{"model_name":"m"}"#).unwrap();
+        assert_eq!(m.variants, None);
     }
 
     #[test]

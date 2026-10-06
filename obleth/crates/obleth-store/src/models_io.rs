@@ -39,7 +39,7 @@ pub struct ModelImportOutcome {
 
 /// Every column of `models` that `model_from_row` reads. Kept as one const so
 /// the insert's RETURNING clause cannot drift from the mapper.
-const MODEL_COLUMNS: &str = "id, model_name, aliases, description, upstream_model, api_base, api_key,
+const MODEL_COLUMNS: &str = "id, model_name, aliases, variants, description, upstream_model, api_base, api_key,
      upstream_headers, model_type, quantization, input_cost_per_token, output_cost_per_token, cost_per_image,
      cost_per_audio_second, cost_per_character, cost_per_video, context_window, admission_weight,
      max_in_flight, capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace,
@@ -81,10 +81,11 @@ impl Store {
                     route_bias, auto_eligible,
                     draft_model, verify_api_base, verify_upstream_model, aliases, quantization,
                     upstream_headers, cost_per_video, capacity_namespace, capacity_service,
-                    per_replica_max_in_flight, capacity_source, capacity_headroom
+                    per_replica_max_in_flight, capacity_source, capacity_headroom, variants
                  ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
                     $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31,
-                    $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47)
+                    $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47,
+                    $48)
                  on conflict (model_name) do update set
                     description = excluded.description,
                     upstream_model = excluded.upstream_model,
@@ -131,6 +132,7 @@ impl Store {
                     per_replica_max_in_flight = excluded.per_replica_max_in_flight,
                     capacity_source = excluded.capacity_source,
                     capacity_headroom = excluded.capacity_headroom,
+                    variants = excluded.variants,
                     updated_at = now()
                  returning {MODEL_COLUMNS}, (xmax = 0) as inserted"
             );
@@ -191,6 +193,9 @@ impl Store {
                 .bind(c.per_replica_max_in_flight.map(|n| n.max(1)))
                 .bind(&c.capacity_source)
                 .bind(c.capacity_headroom)
+                .bind(sqlx::types::Json(obleth_config::normalize_variants(
+                    &c.variants,
+                )))
                 .fetch_one(&mut *tx)
                 .await?;
 

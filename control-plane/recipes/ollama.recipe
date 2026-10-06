@@ -1,0 +1,55 @@
+---
+name: Ollama
+description: "Any model in the Ollama library, pulled when the job starts. Quick to try; the model is served under its Ollama tag."
+engine: ollama
+kind: engine
+model_type: chat
+api_model_name: my-model
+port: 8000
+health_path: /api/tags
+target_replicas: 1
+max_job_failures: 2
+tested:
+  - hardware: "1× A100 80 GB"
+    engine: "Ollama 0.35.1"
+    date: 2026-10-03
+    result: "Served gpt-oss:20b. Ready in 2.5 minutes. The first answer took over a minute while Ollama loaded the model; after that, about 47 tokens a second. Tool calls worked 3 times out of 3."
+inputs:
+  - name: model
+    label: Ollama model
+    type: text
+    required: true
+    help: The tag, e.g. qwen2.5:0.5b. The API model name must match it.
+  - name: image
+    label: Container image
+    type: path
+    default: "{{cluster.image.ollama}}"
+    required: true
+  - name: cache
+    label: Model folder
+    type: path
+    default: "{{cluster.cache}}"
+    required: true
+    help: OLLAMA_MODELS, so pulled models are kept between jobs.
+---
+#!/bin/bash -l
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
+set -euo pipefail
+{{cluster.setup}}
+# The official image sets OLLAMA_HOST itself, and under apptainer an image's
+# variables win over the job's, so each call passes its own with --env.
+ollama_on() { # host:port, then ollama's arguments
+  local host=$1; shift
+  apptainer exec --nv --bind {{cache}} --env "OLLAMA_MODELS={{cache}}/ollama,OLLAMA_HOST=$host" {{image}} ollama "$@"
+}
+# Pull through a server only this node can reach, then serve on the replica's
+# port: the health check passes once the model is there to answer.
+for ((PULL_PORT = 49152 + RANDOM % 10000; ; PULL_PORT++)); do (exec 3<>/dev/tcp/127.0.0.1/$PULL_PORT) 2>/dev/null || break; done
+ollama_on 127.0.0.1:$PULL_PORT serve &
+PULLER=$!
+until ollama_on 127.0.0.1:$PULL_PORT list >/dev/null 2>&1; do kill -0 $PULLER; sleep 2; done
+ollama_on 127.0.0.1:$PULL_PORT pull {{model}}
+pkill -TERM -P $PULLER || true; kill $PULLER 2>/dev/null || true; wait $PULLER || true
+exec apptainer exec --nv --bind {{cache}} --env "OLLAMA_MODELS={{cache}}/ollama,OLLAMA_HOST=0.0.0.0:$OBLETH_SERVING_PORT" {{image}} ollama serve

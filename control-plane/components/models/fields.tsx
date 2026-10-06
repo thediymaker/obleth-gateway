@@ -5,15 +5,15 @@ import { Check, ChevronDown } from "lucide-react";
 import { HelpTip } from "@/components/fairshare/help";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
-import type { BoonBlockers } from "@/lib/boon-availability";
+import { FUNCTION_CALLING_BOONS, type BoonBlockers } from "@/lib/boon-availability";
 import { distinctEmbeddingModelCount } from "@/lib/knowledge-format";
-import { touches, type FormSnapshot } from "@/lib/models-model";
+import { MAX_VARIANTS, touches, variantDrafts, variantNameProblem, variantsValue, type FormSnapshot, type VariantDraft } from "@/lib/models-model";
 import type { KnowledgeCollection, McpServer, ModelKnowledgeCollections, ModelRoute } from "@/lib/obleth";
 import { cn, parseTagLevel, TAG_LEVEL_LABELS } from "@/lib/utils";
 
 // Fixed routing-tag vocabulary; mirrors obleth-config `MODEL_TAGS`. Used by the
 // `auto` router to match requests to models.
-export const MODEL_TAGS = ["coding", "general", "reasoning", "math", "vision", "long-context", "fast", "creative"] as const;
+export const MODEL_TAGS = ["coding", "general", "reasoning", "math", "vision", "long-context", "fast", "creative", "writing"] as const;
 
 // Fixed boon vocabulary; mirrors obleth-config `MODEL_BOONS`. A boon grants a
 // capability the model lacks natively. Each boon is configured globally in
@@ -47,7 +47,13 @@ export const MODEL_BOONS = [
     value: "image_generation",
     label: "Image generation",
     description:
-      "Add a generate_image tool this model can call to produce pictures through the image model configured in Settings → Boons. The gateway runs the generation and attaches the result to the reply; the image is billed per image against the caller's tenant. Requires the Function calling capability — without it no tool is injected and the model will say it cannot draw.",
+      "Add a generate_image tool this model can call to produce pictures through the image model configured in Settings → Boons. The gateway runs the generation and attaches the result to the reply; the image is billed per image against the caller's tenant. Needs Function calling under Native, because the model calls the tool itself; turning Function calling off turns this off.",
+  },
+  {
+    value: "web_search",
+    label: "Web search",
+    description:
+      "Add a web_search tool this model can call to look things up through the search tool configured in Settings → Boons. The gateway runs the search and hands the results back to the model, which answers citing the URLs it used. Each search is logged under the request that made it. Needs Function calling under Native, because the model calls the tool itself; turning Function calling off turns this off. A client that brings its own web_search tool keeps it.",
   },
   {
     value: "speculation",
@@ -66,6 +72,7 @@ export const MODEL_TYPE_OPTIONS = [
   { value: "audio_speech", label: "Text to speech (TTS)" },
   { value: "image", label: "Image generation" },
   { value: "video", label: "Video generation" },
+  { value: "search", label: "Web search (SearXNG)" },
 ] as const;
 
 // Serving-format vocabulary; mirrors obleth-config `QUANTIZATIONS`. A
@@ -96,6 +103,9 @@ export const UPSTREAM_HEADERS_HINT =
 export const ALIASES_HINT =
   "One name per line. Extra names that resolve to this same route — register the old spelling here when you clean up an API model name, and pinned clients keep working. Only the API model name itself is advertised by /v1/models.";
 
+export const VARIANTS_HINT =
+  "A variant is another name for this model with extra boons turned on: `glm-5-3-spec` could be this model with Speculation. It reaches the same deployment and shares its capacity and price. Its boons are added to the model's own and never turn one off, so callers opt in by asking for the variant while the plain name keeps working as before. A boon that is off in Settings → Boons does nothing here either.";
+
 export function modelTypeHint(type: string): string {
   switch (type) {
     case "chat":
@@ -110,6 +120,8 @@ export function modelTypeHint(type: string): string {
       return "Serves /v1/images/generations, /v1/images/edits and /v1/images/variations (multipart image upload). Billed per image.";
     case "video":
       return "Serves the /v1/videos job API: create (JSON or multipart reference image), poll, download, delete, list. Billed a flat price per created job; polls and downloads are free. Health is catalog-only.";
+    case "search":
+      return "A web search tool, not a model: serves POST /v1/search (the Perplexity Search API shape, as LiteLLM does) and is listed on GET /v1/search/tools, not /v1/models. The API base is a SearXNG instance's root, with JSON output enabled in its settings. Searches are free.";
     default:
       return "";
   }
@@ -217,15 +229,18 @@ export function Field({
   );
 }
 
-export function TextArea({ name, label, rows = 3, defaultValue, placeholder, className }: {
+export function TextArea({ name, label, rows = 3, defaultValue, value, onChange, placeholder, className }: {
   name: string; label: string; rows?: number; defaultValue?: string; placeholder?: string; className?: string;
+  /** Controlled when given. */
+  value?: string;
+  onChange?: (value: string) => void;
 }) {
   return (
     <textarea
       name={name}
       aria-label={label}
       rows={rows}
-      defaultValue={defaultValue}
+      {...(value !== undefined ? { value, onChange: (e: ChangeEvent<HTMLTextAreaElement>) => onChange?.(e.target.value) } : { defaultValue })}
       placeholder={placeholder}
       autoCapitalize="none"
       autoCorrect="off"
@@ -309,7 +324,8 @@ export function ChipCheckbox({
   disabled,
   hint,
 }: {
-  name: string;
+  /** Omit for a chip whose value the surrounding form carries some other way. */
+  name?: string;
   label: string;
   defaultChecked?: boolean;
   checked?: boolean;
@@ -384,6 +400,92 @@ export function TagLevelPicker({ tag, level, onChange }: { tag: string; level: n
 }
 
 // ---------------------------------------------------------------------------
+// Variants
+// ---------------------------------------------------------------------------
+
+const BOON_ORDER = MODEL_BOONS.map((b) => b.value);
+
+function listed(words: string[]): string {
+  return words.length < 2 ? words.join("") : `${words.slice(0, -1).join(", ")} and ${words[words.length - 1]}`;
+}
+
+/**
+ * A model's variants: each row a name, what callers get, and the boons it
+ * adds. The rows submit together as one JSON field, `variants`, so the save
+ * bar sees any edit as one change and the save sends the whole list.
+ */
+export function VariantsField({ model, modelNames = [] }: { model: ModelRoute; modelNames?: string[] }) {
+  const [rows, setRows] = useState<VariantDraft[]>(() => variantDrafts(model));
+  const own = { name: model.model_name, aliases: model.aliases ?? [], otherModels: modelNames.filter((n) => n !== model.model_name) };
+  const edit = (i: number, patch: (row: VariantDraft) => Partial<VariantDraft>) =>
+    setRows((prev) => prev.map((r, j) => (j === i ? { ...r, ...patch(r) } : r)));
+  return (
+    <div className="flex flex-col gap-2">
+      <input type="hidden" name="variants" value={variantsValue(rows, BOON_ORDER)} />
+      {rows.map((v, i) => {
+        const name = v.name.trim();
+        const problem = variantNameProblem(rows, i, own);
+        const added = MODEL_BOONS.filter((b) => v.boons.includes(b.value)).map((b) => b.label);
+        return (
+          <div key={i} className="flex flex-col gap-2 rounded-lg border border-border p-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <Input
+                aria-label="Variant name"
+                value={v.name}
+                onChange={(e) => edit(i, () => ({ name: e.target.value }))}
+                ref={(el) => el?.setCustomValidity(problem ?? "")}
+                aria-invalid={problem ? true : undefined}
+                required
+                placeholder={`${model.model_name}-spec`}
+                autoComplete="off"
+                spellCheck={false}
+                className="h-9 w-56 font-mono text-[12.5px]"
+              />
+              <Input
+                aria-label="Variant description"
+                value={v.description}
+                onChange={(e) => edit(i, () => ({ description: e.target.value }))}
+                placeholder="What callers get (optional)"
+                className="h-9 min-w-0 flex-1 text-[13px]"
+              />
+              <button type="button" onClick={() => setRows((prev) => prev.filter((_, j) => j !== i))} aria-label={`Remove ${name || "this variant"}`} className="text-xs text-muted-foreground underline underline-offset-[3px] hover:text-foreground">Remove</button>
+            </div>
+            <div role="group" aria-label={`Boons ${name || "this variant"} adds`} className="flex flex-wrap gap-1.5">
+              {MODEL_BOONS.map((boon) => (
+                <ChipCheckbox
+                  key={boon.value}
+                  label={boon.label}
+                  hint={boon.description}
+                  checked={v.boons.includes(boon.value)}
+                  onChange={(on) => edit(i, (r) => ({ boons: on ? [...r.boons, boon.value] : r.boons.filter((b) => b !== boon.value) }))}
+                />
+              ))}
+            </div>
+            {problem ? (
+              <p className="text-[11.5px] text-foreground">{problem}</p>
+            ) : (
+              <p className="text-[11.5px] text-muted-foreground">
+                {name ? <span className="font-mono">{name}</span> : "This name"} reaches {model.model_name}
+                {added.length ? ` with ${listed(added)} turned on as well.` : " with no extra boons, the same as an alias."}
+              </p>
+            )}
+          </div>
+        );
+      })}
+      <button
+        type="button"
+        disabled={rows.length >= MAX_VARIANTS}
+        onClick={() => setRows((prev) => [...prev, { name: "", description: "", boons: [] }])}
+        className="self-start text-[12.5px] text-secondary-foreground underline underline-offset-[3px] hover:text-foreground disabled:no-underline disabled:opacity-50"
+      >
+        {rows.length ? "Add another variant" : "Add a variant"}
+      </button>
+      {rows.length >= MAX_VARIANTS && <p className="text-[11.5px] text-muted-foreground">A model can have up to {MAX_VARIANTS} variants.</p>}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Routing tags and chat capabilities
 // ---------------------------------------------------------------------------
 
@@ -438,7 +540,8 @@ export function RoutingTagsField({ model }: { model?: ModelRoute }) {
 // depend on native function calling + tool choice: without them the gateway
 // can't run the tool loop and silently drops the tools (the model then claims
 // it can't search). So the tool servers are disabled until both are on, and
-// any grants are cleared the moment either is turned off. Carries
+// any grants are cleared the moment either is turned off. The tool boons
+// (FUNCTION_CALLING_BOONS) follow Function calling the same way. Carries
 // `has_capabilities` so a save with every switch off still applies.
 export function ChatCapabilityFields({
   model,
@@ -463,9 +566,27 @@ export function ChatCapabilityFields({
   // switches are controlled; the others stay uncontrolled.
   const [knowledgeChecked, setKnowledgeChecked] = useState(model?.boons?.includes("knowledge") ?? false);
   const [speculationChecked, setSpeculationChecked] = useState(model?.boons?.includes("speculation") ?? false);
+  // The tool boons are controlled too: turning Function calling off clears them.
+  const [toolBoons, setToolBoons] = useState<Set<string>>(() => new Set((model?.boons ?? []).filter((b) => FUNCTION_CALLING_BOONS.includes(b))));
   const [draftModel, setDraftModel] = useState(model?.draft_model ?? "");
   const [specWiringOpen, setSpecWiringOpen] = useState(false);
   const toolsReady = fnCalling && toolChoice;
+  // Cleared on the switch, not in an effect: a model saved with a tool boon
+  // and Function calling off keeps that grant on load, so an unrelated save
+  // doesn't drop it. It shows as inactive until Function calling is on.
+  const changeFnCalling = (on: boolean) => {
+    setFnCalling(on);
+    if (!on) setToolBoons(new Set());
+  };
+  const setToolBoon = (value: string, on: boolean) =>
+    setToolBoons((prev) => {
+      const next = new Set(prev);
+      if (on) next.add(value);
+      else next.delete(value);
+      return next;
+    });
+  // Tool boons held while Function calling is off: granted, but no tool is added.
+  const waitingBoons = MODEL_BOONS.filter((boon) => !fnCalling && toolBoons.has(boon.value));
   // Boons whose global switch (or helper model) is missing in Settings. The
   // grant alone does nothing in that state, so the form says so rather than
   // letting the misconfiguration surface later as "the model says it can't".
@@ -481,7 +602,7 @@ export function ChatCapabilityFields({
 
   const native = (
     <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
-      <Switch name="supports_function_calling" label="Function calling" checked={fnCalling} onChange={setFnCalling}>Function calling</Switch>
+      <Switch name="supports_function_calling" label="Function calling" checked={fnCalling} onChange={changeFnCalling}>Function calling</Switch>
       <Switch name="supports_tool_choice" label="Tool choice" checked={toolChoice} onChange={setToolChoice}>Tool choice</Switch>
       <Switch name="supports_response_schema" label="Response schema" defaultChecked={model?.supports_response_schema ?? false}>Response schema</Switch>
       <Switch name="supports_system_messages" label="System messages" defaultChecked={model ? model.supports_system_messages : true}>System messages</Switch>
@@ -499,16 +620,23 @@ export function ChatCapabilityFields({
           // a disabled checkbox submits nothing — which would silently revoke
           // the grant on the next unrelated save. Only a NEW grant is refused,
           // since it would be inert the moment it was made.
-          const disabled = Boolean(blocked) && !held;
+          // A tool boon follows Function calling: off, it can't be newly
+          // granted, and one still held from before stays operable to ungrant.
+          const toolBoon = FUNCTION_CALLING_BOONS.includes(boon.value);
+          const on = toolBoon ? toolBoons.has(boon.value) : held;
+          const needsFn = toolBoon && !fnCalling;
+          const disabled = (Boolean(blocked) && !held) || (needsFn && !on);
           const control =
             boon.value === "knowledge" ? { checked: knowledgeChecked, onChange: setKnowledgeChecked }
             : boon.value === "speculation" ? { checked: speculationChecked, onChange: setSpeculationChecked }
+            : toolBoon ? { checked: on, onChange: (c: boolean) => setToolBoon(boon.value, c) }
             : { defaultChecked: held };
+          const why = [blocked && "off in Settings", needsFn && "needs Function calling"].filter(Boolean).join(" · ");
           return (
             <div key={boon.value} className="flex items-center gap-2">
               <Switch name={`boon_${boon.value}`} label={boon.label} disabled={disabled} className="flex-1" {...control}>
                 <span className="block">{boon.label}</span>
-                {blocked && <span className="block text-[11px] text-muted-foreground">{held ? "on here · off in Settings" : "off in Settings"}</span>}
+                {why && <span className="block text-[11px] text-muted-foreground">{on ? `on here · ${why}` : why}</span>}
               </Switch>
               <HelpTip label={`About ${boon.label}`} align="right">{boon.description}</HelpTip>
             </div>
@@ -522,6 +650,15 @@ export function ChatCapabilityFields({
               <span className="font-medium text-foreground">{boon.label}</span>
               {boon.held ? " is granted but inactive — " : " can’t be granted — "}
               {boon.reason}
+            </li>
+          ))}
+        </ul>
+      )}
+      {waitingBoons.length > 0 && (
+        <ul className="max-w-prose space-y-0.5 text-[11.5px] leading-snug text-muted-foreground">
+          {waitingBoons.map((boon) => (
+            <li key={boon.value}>
+              <span className="font-medium text-foreground">{boon.label}</span> is granted but does nothing while Function calling is off. The model calls the tool itself, so turn Function calling on under Native, or turn the boon off.
             </li>
           ))}
         </ul>

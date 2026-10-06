@@ -22,8 +22,9 @@ import { cn, getJson } from "@/lib/utils";
 
 const DAY_MS = 86_400_000;
 
-function keyFieldSection(name: string): "key" | "tracing" | null {
+function keyFieldSection(name: string): "key" | "tracing" | "end_user" | null {
   if (name === "tracing_enabled") return "tracing";
+  if (name === "end_user_fairshare") return "end_user";
   if (["name", "description", "weight", "max_in_flight", "budget_tokens", "budget_cost_usd", "budget_period", "budget_started_at"].includes(name)) return "key";
   return null;
 }
@@ -37,6 +38,7 @@ const KEY_LABELS: Record<string, string> = {
   budget_cost_usd: "Spend cap",
   budget_period: "Budget period",
   tracing_enabled: "Trace requests",
+  end_user_fairshare: "Per-user fairshare",
 };
 
 function Use({ row }: { row: KeyRow }) {
@@ -264,6 +266,15 @@ export function KeyPanel({
           </Setting>
           <Setting label="Trace requests" hint="Keep each step of its requests" fields={["tracing_enabled"]} was={{ field: "tracing_enabled", checkbox: true }} className="px-6">
             <Switch name="tracing_enabled" label="Trace requests" defaultChecked={k.tracing_enabled} />
+          </Setting>
+          <Setting
+            label="Per-user fairshare"
+            hint="For an app that serves many people through this key: each person it names in a request (x-obleth-end-user or user) waits in line on their own. Only for apps you trust."
+            fields={["end_user_fairshare"]}
+            was={{ field: "end_user_fairshare", checkbox: true }}
+            className="px-6"
+          >
+            <Switch name="end_user_fairshare" label="Per-user fairshare" defaultChecked={k.end_user_fairshare} />
           </Setting>
         </SettingsForm>
       </Sheet>

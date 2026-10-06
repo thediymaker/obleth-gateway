@@ -85,6 +85,39 @@ pub fn cache_key(tenant_id: &str, model: &str, body: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Longest end-user id kept, in characters. A longer one is cut, so two ids
+/// that differ only past this point share one place in the queue.
+pub const END_USER_MAX_CHARS: usize = 128;
+
+/// The end-user id a request names, cleaned up: surrounding whitespace
+/// trimmed, cut to [`END_USER_MAX_CHARS`], `None` when nothing is left.
+pub fn normalize_end_user(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.chars().take(END_USER_MAX_CHARS).collect())
+}
+
+/// The scheduler identity of one end user of a key that has
+/// `end_user_fairshare` on. Derived, not stored: the same (key, end user)
+/// always yields the same id, so a user keeps their place across requests
+/// and gateway replicas, and two keys' users never collide. Version-8 UUID
+/// (custom), so it can never equal a real key id, which is version 4.
+pub fn end_user_key_id(key: uuid::Uuid, end_user: &str) -> uuid::Uuid {
+    let mut hasher = Sha256::new();
+    hasher.update(b"obleth-end-user\0");
+    hasher.update(key.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(end_user.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x80; // version 8
+    bytes[8] = (bytes[8] & 0x3f) | 0x80; // RFC 4122 variant
+    uuid::Uuid::from_bytes(bytes)
+}
+
 /// SHA-256 hex digest of an arbitrary content string. Used by the compression
 /// boon as the reversibility store key: identical content hashes to one entry.
 pub fn content_hash(content: &str) -> String {
@@ -110,6 +143,29 @@ mod tests {
     fn hash_is_stable_and_distinct() {
         assert_eq!(hash_api_key("a"), hash_api_key("a"));
         assert_ne!(hash_api_key("a"), hash_api_key("b"));
+    }
+
+    #[test]
+    fn end_user_ids_are_trimmed_and_capped() {
+        assert_eq!(normalize_end_user("  alice \n").as_deref(), Some("alice"));
+        assert_eq!(normalize_end_user("   "), None);
+        assert_eq!(normalize_end_user(""), None);
+        let long = "é".repeat(END_USER_MAX_CHARS + 10);
+        let cut = normalize_end_user(&long).unwrap();
+        assert_eq!(cut.chars().count(), END_USER_MAX_CHARS);
+    }
+
+    #[test]
+    fn end_user_key_id_is_stable_and_scoped_to_the_key() {
+        let key = uuid::Uuid::new_v4();
+        let other = uuid::Uuid::new_v4();
+        let alice = end_user_key_id(key, "alice");
+        assert_eq!(alice, end_user_key_id(key, "alice"));
+        assert_ne!(alice, end_user_key_id(key, "bob"));
+        assert_ne!(alice, end_user_key_id(other, "alice"));
+        // Never mistakable for a real (v4) key id.
+        assert_eq!(alice.get_version_num(), 8);
+        assert_ne!(alice, key);
     }
 
     #[test]

@@ -7,13 +7,17 @@ import type { CharoState } from "./sprite";
 import type { TraceSummary } from "@/lib/charo/trace";
 import type { StepOutcome } from "@/lib/charo/bench/types";
 import { ensureActivitiesRegistered, getActivity } from "@/lib/charo/activities";
-import { stripHiddenReasoning } from "@/lib/charo/visible-text";
+import { splitHiddenReasoning, stripHiddenReasoning } from "@/lib/charo/visible-text";
 import { hasGeneratedImage, stripGeneratedImages } from "@/lib/charo/generated-images";
 
 export interface ChatTurn {
   id: string;
   role: "user" | "assistant";
   content: string;
+  /** The model's thinking, from its reasoning field or inline <think> blocks. Never sent back to a model. */
+  reasoning?: string;
+  /** How long the model thought: first reasoning token to first answer token (or to the end). */
+  reasoningMs?: number;
   promptId?: string;
   requestId?: string;
   metrics?: { inputTokens?: number; outputTokens?: number; ttftMs?: number; totalMs: number };
@@ -52,6 +56,16 @@ interface WireMessage {
   content: WireContent;
 }
 
+/**
+ * The most thinking a turn keeps. Conversations persist in localStorage, and a
+ * long trace on every turn of a long session would fill it.
+ */
+export const MAX_REASONING_CHARS = 60_000;
+
+function capReasoning(text: string): string {
+  return text.length > MAX_REASONING_CHARS ? `${text.slice(0, MAX_REASONING_CHARS)}\n\n[… thinking truncated]` : text;
+}
+
 function uid(): string {
   return Math.random().toString(36).slice(2);
 }
@@ -79,7 +93,8 @@ const TRACE_POLL_TRIES = 12;
 /**
  * Flatten turns into wire messages.
  *
- * `supportsVision` describes the model this history is bound for, and is
+ * `supportsVision` says whether the model this history is bound for takes
+ * images -- natively, or through the gateway's vision boon -- and is
  * `undefined` when that is not known (the brain path picks its own model):
  *
  * - Generated-image payloads are stripped from assistant text in every case —
@@ -326,14 +341,36 @@ export function useCharoStream(options?: { model?: string; supportsVision?: bool
       });
       if (!res.ok || !res.body) throw new Error(`request failed (${res.status})`);
       let sawError = false;
+      // Thinking arrives two ways: the reasoning field (relayed as its own
+      // event) and, from models served without a reasoning parser, <think>
+      // blocks inside the content. Both are kept, apart from the answer.
+      let raw = "";
+      let fieldReasoning = "";
+      let thinkingSince: number | null = null;
+      let thoughtMs: number | undefined;
+      const reasoningOf = (inline: string) => capReasoning([fieldReasoning, inline].filter((s) => s.trim()).join("\n\n"));
       await readSSE(res, signal, (event, parsed) => {
         if (event === "request") {
           patchTurn(assistantId, (m) => ({ ...m, requestId: String(parsed.requestId ?? "") }));
         } else if (event === "metrics") {
           patchTurn(assistantId, (m) => ({ ...m, metrics: parsed as ChatTurn["metrics"] }));
+        } else if (event === "reasoning") {
+          fieldReasoning += String(parsed.text ?? "");
+          thinkingSince ??= performance.now();
+          const inline = splitHiddenReasoning(raw).thinking;
+          patchTurn(assistantId, (m) => ({ ...m, reasoning: reasoningOf(inline) }));
         } else if (event === "token") {
-          const t = String(parsed.text ?? "");
-          patchTurn(assistantId, (m) => ({ ...m, content: stripHiddenReasoning(m.content + t) }));
+          raw += String(parsed.text ?? "");
+          const { visible, thinking } = splitHiddenReasoning(raw);
+          if (thinking) thinkingSince ??= performance.now();
+          if (visible.trim() && thinkingSince !== null && thoughtMs === undefined) thoughtMs = performance.now() - thinkingSince;
+          const reasoning = reasoningOf(thinking);
+          patchTurn(assistantId, (m) => ({
+            ...m,
+            content: visible,
+            ...(reasoning ? { reasoning } : {}),
+            ...(thoughtMs !== undefined ? { reasoningMs: thoughtMs } : {}),
+          }));
         } else if (event === "image") {
           const images = Array.isArray(parsed.images)
             ? (parsed.images as unknown[]).filter((u): u is string => typeof u === "string")
@@ -356,6 +393,11 @@ export function useCharoStream(options?: { model?: string; supportsVision?: bool
           }));
         }
       });
+      // A turn that only thought (cut off by max_tokens, or stopped) thought until the end.
+      if (thinkingSince !== null && thoughtMs === undefined) {
+        const ms = performance.now() - thinkingSince;
+        patchTurn(assistantId, (m) => ({ ...m, reasoningMs: ms }));
+      }
       return sawError;
     },
     [patchTurn, pollTrace, options?.generation],
