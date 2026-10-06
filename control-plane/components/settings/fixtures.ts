@@ -45,7 +45,7 @@ export function settingsData(over: Partial<SettingsData> = {}): SettingsData {
     charo: { enabled: true, brain_model: "north-mini-code", tools_enabled: { run_benchmark: true }, bench_max_concurrency: 40, bench_max_duration_s: 120, bench_max_requests: 500 } as CharoSettingsView,
     retention: { days: 180, configured: false },
     slurm: { enabled: false, provisioner_running: true } as SlurmSettingsView,
-    models: [model("glm-5-3", { boons: ["vision", "image_generation", "speculation"] }), model("north-mini-code"), model("flux-2", { model_type: "image" } as Partial<ModelRoute>)],
+    models: [model("glm-5-3", { boons: ["vision", "image_generation", "speculation"], supports_function_calling: true }), model("north-mini-code"), model("flux-2", { model_type: "image" } as Partial<ModelRoute>)],
     version: { gateway: { version: "0.9.0", git_sha: "abcdef1234", built_at: null }, controlPlane: { version: "0.9.0", sha: null }, latest: null, updateAvailable: false },
     ...over,
   };

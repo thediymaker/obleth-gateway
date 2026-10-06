@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { boonBlockers } from "./boon-availability";
+import { boonBlockers, boonsWaitingOnFunctionCalling } from "./boon-availability";
 import type { BoonSettingsView, KnowledgeSettingsView } from "@/lib/obleth";
 
 const boons = (over: Partial<BoonSettingsView> = {}): BoonSettingsView =>
@@ -54,5 +54,19 @@ describe("boonBlockers", () => {
     // `safe()` hands us null on an admin-API hiccup; a form that refused every
     // grant would be worse than one that lets the operator through.
     expect(boonBlockers(null, null)).toEqual({});
+  });
+});
+
+describe("boonsWaitingOnFunctionCalling", () => {
+  it("names the tool boons a model holds while Function calling is off", () => {
+    expect(boonsWaitingOnFunctionCalling({ boons: ["vision", "image_generation", "web_search"], supports_function_calling: false })).toEqual(["image_generation", "web_search"]);
+  });
+
+  it("is empty once Function calling is on", () => {
+    expect(boonsWaitingOnFunctionCalling({ boons: ["image_generation", "web_search"], supports_function_calling: true })).toEqual([]);
+  });
+
+  it("leaves out boons that don't need it", () => {
+    expect(boonsWaitingOnFunctionCalling({ boons: ["vision", "compression"], supports_function_calling: false })).toEqual([]);
   });
 });

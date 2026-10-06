@@ -9,6 +9,7 @@ import type {
   SlurmSettingsView,
   SpeculationCategoryGate,
 } from "@/lib/obleth";
+import { boonsWaitingOnFunctionCalling } from "@/lib/boon-availability";
 
 /**
  * The Settings page's pure logic: its sections, the presets they offer, and
@@ -238,6 +239,18 @@ export function needsYou(input: {
     if (boons.image_generation_enabled && !boons.image_generation_model) out.push({ key: "image-model", title: "Image generation is on with no image model", detail: "Pick the model that draws.", href: "#boon-image_generation", action: "Pick one" });
     if (boons.web_search_enabled && !boons.web_search_tool) out.push({ key: "search-tool", title: "Web search is on with no search tool", detail: "Pick the search tool the models search with.", href: "#boon-web_search", action: "Pick one" });
     if (boons.speculation_enabled && !boons.speculation_draft_model) out.push({ key: "spec-model", title: "Speculation is on with no drafter", detail: "Pick the fast model that drafts.", href: "#boon-speculation", action: "Pick one" });
+  }
+  const waiting = models.filter((m) => m.model_type === "chat" && boonsWaitingOnFunctionCalling(m).length > 0);
+  if (waiting.length) {
+    const one = waiting.length === 1 ? waiting[0] : null;
+    const labels = one ? boonsWaitingOnFunctionCalling(one).map((b) => BOONS.find((x) => x.modelBoon === b)?.label ?? b) : [];
+    out.push({
+      key: "boons-need-function-calling",
+      title: one ? `${one.model_name} has ${labels.join(" and ")}, but Function calling is off` : `${waiting.length} models have tool boons, but Function calling is off`,
+      detail: `${one ? "" : `${waiting.map((m) => m.model_name).join(", ")}. `}These boons give the model a tool to call, so they do nothing until Function calling is on.`,
+      href: one ? `/models/${encodeURIComponent(one.model_name)}#set-native` : "/models",
+      action: one ? "Open the model" : "Models",
+    });
   }
   if (input.knowledge && !input.knowledge.enabled) {
     const asking = models.filter((m) => (m.boons ?? []).includes("knowledge")).map((m) => m.model_name);

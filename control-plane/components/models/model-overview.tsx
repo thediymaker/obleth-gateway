@@ -13,6 +13,7 @@ import { logsHref } from "@/lib/log-links";
 import { changeLabel, compact, describeAudit, formatMs } from "@/lib/overview-model";
 import { cn, getJson } from "@/lib/utils";
 import { auditHref } from "@/lib/audit-model";
+import { boonsWaitingOnFunctionCalling } from "@/lib/boon-availability";
 
 const DAY_MS = 86_400_000;
 const CURRENT = "hsl(240 5% 90%)";
@@ -236,6 +237,7 @@ export function ModelOverview({
   });
   const failed = hist ? hist.buckets.reduce((t, b) => ({ requests: t.requests + b.requests, errors: t.errors + b.errors }), { requests: 0, errors: 0 }) : null;
   const chat = model.model_type === "chat";
+  const inactiveBoons = boonsWaitingOnFunctionCalling(model);
   const caps = [
     model.supports_function_calling && "Function calling",
     model.supports_tool_choice && "Tool choice",
@@ -286,7 +288,7 @@ export function ModelOverview({
           <SetupRow label="API base" href="#set-api-base"><span className="font-mono text-[12px]">{model.api_base || "set by the provisioner"}</span></SetupRow>
           {chat && <SetupRow label="Router tags" href="#set-tags">{tags.length ? tags.join(" · ") : <span className="text-muted-foreground">none</span>}{!model.auto_eligible && <span className="text-muted-foreground"> · not picked by auto</span>}</SetupRow>}
           {chat && <SetupRow label="Capabilities" href="#set-native">{caps.length ? caps.join(" · ") : <span className="text-muted-foreground">none declared</span>}</SetupRow>}
-          {chat && <SetupRow label="Boons" href="#set-boons">{model.boons?.length ? model.boons.map((b) => b.replace(/_/g, " ")).join(" · ") : <span className="text-muted-foreground">none</span>}</SetupRow>}
+          {chat && <SetupRow label="Boons" href="#set-boons">{model.boons?.length ? model.boons.map((b, i) => <span key={b}>{i > 0 && " · "}{b.replace(/_/g, " ")}{inactiveBoons.includes(b) && <span className="text-muted-foreground"> (off: needs function calling)</span>}</span>) : <span className="text-muted-foreground">none</span>}</SetupRow>}
           <SetupRow label="Price" href="#set-price"><span className="font-mono text-[12px]">{price ? `${price}${chat ? " in · out per 1M" : ""}` : "not set"}</span></SetupRow>
         </section>
         <section id="activity" aria-label="Recent changes" className="scroll-mt-24 rounded-xl border border-border bg-card px-[18px] pb-2 pt-4">

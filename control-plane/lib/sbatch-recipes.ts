@@ -14,7 +14,7 @@ import { z } from "zod";
 import type { RecipeCard, RecipeDeployPreview } from "@/components/recipes/recipe-card";
 import { toRecipeCards } from "@/components/recipes/recipe-card";
 import { parseSbatchDirectives, stripSbatchDirectives, unixLineEndings, type ParsedDirectives } from "./sbatch-directives";
-import { EMPTY_CLUSTER, renderScript, type ClusterValues, type RecipeInput } from "./recipe-inputs";
+import { EMPTY_CLUSTER, inputCapabilities, MODEL_CAPABILITIES, renderScript, type ClusterValues, type ModelCapability, type RecipeInput } from "./recipe-inputs";
 import { splitFrontmatter } from "./recipe-frontmatter";
 import type { PutManagedModel } from "@/lib/obleth";
 import { obleth } from "@/lib/obleth";
@@ -126,8 +126,9 @@ const InputSchema = z.object({
   max: z.coerce.number().optional(),
   unit: z.string().optional(),
   adds: z.string().optional(),
+  capabilities: z.array(z.enum(MODEL_CAPABILITIES)).optional(),
   by_nodes: z.record(z.string(), scalar).optional(),
-});
+}).refine((i) => !i.capabilities?.length || i.type === "flag", { message: "capabilities only go on a flag input" });
 
 function uniqueNames(what: string) {
   return (items: { name: string }[] | undefined, ctx: z.RefinementCtx) => {
@@ -361,7 +362,7 @@ export interface DeployPayload {
     upstream_model: string;
     api_base: string;
     model_type: string;
-  };
+  } & Partial<Record<`supports_${ModelCapability}`, true>>;
   managedBody: PutManagedModel;
 }
 
@@ -466,12 +467,17 @@ export function buildManagedFromRecipe(
     },
   };
 
+  // What the flags that are on tell us the model can do, e.g. a tool parser
+  // means function calling, so its tool boons work without a second step.
+  const capabilities = inputCapabilities(h.inputs, overrides.inputs ?? overrides.variables, cluster, overrides.nodes ?? placement(h.nodes, d.nodes));
+
   return {
     createBody: {
       model_name: modelName,
       upstream_model: modelName,
       api_base: "",
       model_type: h.model_type,
+      ...Object.fromEntries(capabilities.map((c) => [`supports_${c}`, true])),
     },
     managedBody,
   };
