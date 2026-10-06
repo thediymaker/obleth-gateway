@@ -132,7 +132,11 @@ Tables the image already bounds (asynchronous_insert_log, blob_storage_log)
 and opentelemetry_span_log, whose custom engine takes no TTL, are left alone.
 */}}
 {{- define "obleth.clickhouseConfig" -}}
-{{- $days := int .Values.clickhouse.systemLogRetentionDays -}}
+{{- /* An upgrade with --reuse-values from a chart before this setting carries no key: use the default. */ -}}
+{{- $days := 7 -}}
+{{- if hasKey .Values.clickhouse "systemLogRetentionDays" -}}
+{{- $days = int .Values.clickhouse.systemLogRetentionDays -}}
+{{- end -}}
 {{- if lt $days 1 -}}
 {{- fail "clickhouse.systemLogRetentionDays must be at least 1" -}}
 {{- end -}}
