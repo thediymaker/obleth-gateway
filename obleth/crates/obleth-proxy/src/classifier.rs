@@ -37,7 +37,7 @@ use crate::verdicts::{answers, fan_out, QuestionCall, QuestionOutcome};
 #[derive(Clone)]
 pub struct Classifier {
     settings: Arc<ArcSwap<AutoRouterSettings>>,
-    /// hash(prompt + available tags) -> classified intent.
+    /// hash(brain + prompt + available tags) -> classified intent.
     cache: Cache<u64, Intent>,
 }
 
@@ -80,7 +80,7 @@ impl Classifier {
             return Intent::default();
         }
 
-        let key = cache_key(prompt, available_tags);
+        let key = cache_key(&brain.model_name, prompt, available_tags);
         if let Some(hit) = self.cache.get(&key).await {
             return hit;
         }
@@ -109,8 +109,12 @@ impl Classifier {
     }
 }
 
-fn cache_key(prompt: &str, available_tags: &[String]) -> u64 {
+/// The brain is part of the key: after `classifier_model` changes, answers
+/// cached from the previous brain -- including the empty ones cached after a
+/// failure -- must not be served as the new brain's for the rest of the TTL.
+fn cache_key(brain: &str, prompt: &str, available_tags: &[String]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    brain.hash(&mut hasher);
     prompt.hash(&mut hasher);
     for t in available_tags {
         t.hash(&mut hasher);
@@ -383,6 +387,23 @@ mod tests {
         let intent = intent_from_outcomes(&outcomes);
         assert!(intent.tags.is_empty());
         assert_eq!(intent.difficulty, 1);
+    }
+
+    #[test]
+    fn switching_the_brain_does_not_reuse_the_previous_brains_cached_answers() {
+        // Without the brain in the key, a switch to a new classifier_model
+        // served the old brain's answers (and its cached failures) for the
+        // rest of the TTL.
+        let tags = vec!["coding".to_string(), "math".to_string()];
+        let prompt = "What is the capital of France?";
+        assert_ne!(
+            cache_key("brain-a", prompt, &tags),
+            cache_key("brain-b", prompt, &tags)
+        );
+        assert_eq!(
+            cache_key("brain-b", prompt, &tags),
+            cache_key("brain-b", prompt, &tags)
+        );
     }
 
     #[test]
