@@ -4844,7 +4844,19 @@ fn family_entries(
     allowed: Option<&[String]>,
     boons: &obleth_config::BoonSettings,
 ) -> Vec<serde_json::Value> {
-    let now = chrono::Utc::now();
+    listed_families(families, candidates, allowed, chrono::Utc::now())
+        .into_iter()
+        .map(|(family, member)| family_entry(family, Some(member), boons))
+        .collect()
+}
+
+/// The families [`family_entries`] lists, each with its default member.
+fn listed_families<'a>(
+    families: &'a [std::sync::Arc<obleth_config::ModelFamily>],
+    candidates: &'a [obleth_config::routing::Candidate],
+    allowed: Option<&[String]>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<(&'a obleth_config::ModelFamily, &'a ResolvedModel)> {
     families
         .iter()
         .filter(|f| family_visible(f, allowed))
@@ -4855,9 +4867,39 @@ fn family_entries(
                     && c.model.enabled
                     && c.model.lifecycle.status_at(now).listed()
             })?;
-            Some(family_entry(f, Some(&member.model), boons))
+            Some((f.as_ref(), &member.model))
         })
         .collect()
+}
+
+/// Every id `GET /v1/models` lists for `resolved`, sorted, with the model
+/// pool that serves it: a variant's model's, and a family's default
+/// member's. `GET /v1/load` reports these, so it shows exactly the models
+/// the caller is offered.
+pub(crate) fn listed_pools(
+    registry: &crate::router::ModelRegistry,
+    families: &crate::reasoning::FamilyRegistry,
+    resolved: &ResolvedKey,
+) -> Vec<(String, String)> {
+    let candidates = registry.load();
+    let families = families.all();
+    let allowed = allowed_models_for(resolved);
+    let now = chrono::Utc::now();
+    let mut out: Vec<(String, String)> = listed_routes(&candidates, allowed, now)
+        .into_iter()
+        .map(|(model, variant)| {
+            let id = variant.map_or(&model.model_name, |v| &v.name);
+            (id.clone(), model.model_name.clone())
+        })
+        .chain(
+            listed_families(&families, &candidates, allowed, now)
+                .into_iter()
+                .map(|(family, member)| (family.name.clone(), member.model_name.clone())),
+        )
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out.dedup_by(|a, b| a.0 == b.0);
+    out
 }
 
 /// Whether a caller limited to `allowed` may see a family: by its own name,
@@ -4960,25 +5002,42 @@ fn registry_models_list(
     allowed: Option<&[String]>,
     boons: &obleth_config::BoonSettings,
 ) -> serde_json::Value {
-    let mut data: Vec<serde_json::Value> = candidates
-        .iter()
-        // An unlisted model (and its variants) is served by name only.
-        .filter(|c| c.model.enabled && c.model.listed && is_listed_model_type(&c.model.model_type))
-        .flat_map(|c| {
-            std::iter::once(ModelFacts::of(&c.model, boons)).chain(
-                c.model
-                    .variants
-                    .iter()
-                    .map(|v| ModelFacts::of_variant(&c.model, v, boons)),
-            )
+    let mut data: Vec<serde_json::Value> = listed_routes(candidates, allowed, chrono::Utc::now())
+        .into_iter()
+        .map(|(model, variant)| match variant {
+            Some(v) => ModelFacts::of_variant(model, v, boons),
+            None => ModelFacts::of(model, boons),
         })
-        .filter(|f| f.visible(allowed))
-        .filter(|f| f.status.listed())
         .map(|f| model_entry(&f))
         .collect();
     data.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
     data.dedup_by(|a, b| a["id"] == b["id"]);
     serde_json::json!({ "object": "list", "data": data })
+}
+
+/// The routes [`registry_models_list`] lists, each once for itself (`None`)
+/// and once per variant, in registry order: enabled, listed and of a listed
+/// type, active or deprecated at `now`, and visible under `allowed` by the
+/// route's name or, for a variant, its own (as [`ModelFacts::visible`]).
+fn listed_routes<'a>(
+    candidates: &'a [obleth_config::routing::Candidate],
+    allowed: Option<&[String]>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<(&'a ResolvedModel, Option<&'a obleth_config::ModelVariant>)> {
+    candidates
+        .iter()
+        .map(|c| &c.model)
+        // An unlisted model (and its variants) is served by name only.
+        .filter(|m| m.enabled && m.listed && is_listed_model_type(&m.model_type))
+        .filter(|m| m.lifecycle.status_at(now).listed())
+        .flat_map(|m| {
+            std::iter::once((m, None)).chain(m.variants.iter().map(move |v| (m, Some(v))))
+        })
+        .filter(|(m, v)| {
+            model_visible(allowed, &m.model_name)
+                || v.is_some_and(|v| model_visible(allowed, &v.name))
+        })
+        .collect()
 }
 
 /// One discovery entry (`/v1/models` and `/v1/models/{id}`). A variant's
@@ -7539,6 +7598,97 @@ mod tests {
         let info = model_info_entry(&candidates[3].model, true, &Default::default());
         assert_eq!(info["model_info"]["status"], "active");
         assert!(info["model_info"].get("replacement").is_none());
+    }
+
+    #[test]
+    fn the_load_listing_names_what_the_models_listing_lists() {
+        use super::{family_entries, listed_pools, registry_models_list};
+        let mut glm = candidate("glm", "glm-fp8", "chat", "fp8", &["glm-old"], &[]);
+        glm.model.variants = vec![obleth_config::ModelVariant {
+            name: "glm-search".into(),
+            ..Default::default()
+        }];
+        let mut staged = candidate("staged", "staged", "chat", "fp8", &[], &[]);
+        staged.model.lifecycle.status = obleth_config::ModelStatus::Staged;
+        let mut retired = candidate("retired", "retired", "chat", "fp8", &[], &[]);
+        retired.model.lifecycle.status = obleth_config::ModelStatus::Retired;
+        let mut unlisted = candidate("unlisted", "unlisted", "chat", "fp8", &[], &[]);
+        unlisted.model.listed = false;
+        let search = candidate(
+            "web",
+            "searxng",
+            obleth_config::SEARCH_MODEL_TYPE,
+            "none",
+            &[],
+            &[],
+        );
+        let other = candidate("other", "other", "embedding", "none", &[], &[]);
+        let registry = crate::router::ModelRegistry::new();
+        registry.store(vec![glm, staged, retired, unlisted, search, other]);
+        let families = crate::reasoning::FamilyRegistry::new();
+        families.store(vec![obleth_config::ModelFamily {
+            id: uuid::Uuid::nil(),
+            name: "fam".into(),
+            description: String::new(),
+            default_level: obleth_config::ReasoningLevel::None,
+            members: obleth_config::FamilyMembers {
+                none: "unlisted".into(),
+                low: "glm".into(),
+                medium: "glm".into(),
+                high: "glm".into(),
+            },
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }]);
+
+        let allowlists = [
+            None,
+            Some(vec!["glm-search".to_string(), "other".to_string()]),
+            Some(vec!["glm".to_string(), "fam".to_string()]),
+        ];
+        for allowed in allowlists {
+            let mut key = crate::boons::test_support::test_key();
+            key.allowed_models = allowed.clone();
+            let candidates = registry.load();
+            let mut ids: Vec<String> =
+                registry_models_list(&candidates, allowed.as_deref(), &Default::default())["data"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .chain(
+                        family_entries(
+                            &families.all(),
+                            &candidates,
+                            allowed.as_deref(),
+                            &Default::default(),
+                        )
+                        .iter(),
+                    )
+                    .map(|e| e["id"].as_str().unwrap().to_string())
+                    .collect();
+            ids.sort();
+            let pools = listed_pools(&registry, &families, &key);
+            let listed: Vec<String> = pools.iter().map(|(id, _)| id.clone()).collect();
+            assert_eq!(listed, ids, "{allowed:?}");
+        }
+
+        // A variant counts in its model's pool, a family in its default
+        // member's.
+        let pools = listed_pools(
+            &registry,
+            &families,
+            &crate::boons::test_support::test_key(),
+        );
+        assert_eq!(
+            pools,
+            [
+                ("fam", "unlisted"),
+                ("glm", "glm"),
+                ("glm-search", "glm"),
+                ("other", "other"),
+            ]
+            .map(|(id, pool)| (id.to_string(), pool.to_string()))
+        );
     }
 
     #[test]

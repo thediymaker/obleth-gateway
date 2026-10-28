@@ -10,6 +10,7 @@ mod jobs;
 mod jwt_auth;
 mod knowledge;
 mod lifecycle;
+mod load;
 mod mcp;
 mod messages;
 mod metrics;
@@ -424,6 +425,29 @@ async fn main() -> anyhow::Result<()> {
         Some(jwt_auth::JwtAuth::new(verifier, store.clone()))
     };
 
+    // Discovered models: each replica derives their pool sizes from the live
+    // backend and hands them to fairshare as configured values. Started with
+    // the Management API below; `GET /v1/load` reads the sizes it sets.
+    let capacity_discovery =
+        obleth_admin::capacity_discovery::CapacityDiscovery::new(cfg.capacity_discovery.clone());
+    let load = cfg.load_endpoint.then(|| {
+        load::LoadReporter::new(
+            fairshare.clone(),
+            model_registry.clone(),
+            families.clone(),
+            capacity_discovery.clone(),
+            obleth_admin::live_load::LoadSettings {
+                replica_aware: cfg.fairshare_replica_aware,
+                // The replica heartbeat above runs with either one on.
+                replicas_known: cfg.fairshare_shared_slots || cfg.fairshare_replica_aware,
+                default_cap: cfg.default_model_max_in_flight,
+            },
+        )
+    });
+    if load.is_none() {
+        tracing::info!("GET /v1/load is off (OBLETH_LOAD_ENDPOINT)");
+    }
+
     let app_state = AppState {
         redis: redis.clone(),
         fairshare: fairshare.clone(),
@@ -459,6 +483,7 @@ async fn main() -> anyhow::Result<()> {
         jwt,
         knowledge: knowledge.clone(),
         jobs: jobs::JobStore::new(store.clone(), cfg.job_scope),
+        load,
     };
     tracing::info!(
         scope = cfg.job_scope.as_str(),
@@ -580,11 +605,8 @@ async fn main() -> anyhow::Result<()> {
         telemetry: Some(telemetry.clone()),
         catalogs: Default::default(),
     };
-    // Discovered models: each replica derives their pool sizes from the live
-    // backend and hands them to fairshare as configured values. Reads the
-    // registry the refresher above keeps current, never Postgres.
-    let capacity_discovery =
-        obleth_admin::capacity_discovery::CapacityDiscovery::new(cfg.capacity_discovery.clone());
+    // Capacity discovery's loop reads the registry the refresher above keeps
+    // current, never Postgres.
     let _capacity_discovery_task =
         capacity_discovery.spawn(fairshare.clone(), cfg.default_model_max_in_flight, {
             let registry = model_registry.clone();
@@ -636,34 +658,7 @@ async fn main() -> anyhow::Result<()> {
     let admin_app = obleth_admin::router(admin_state);
 
     // ---- routers ----
-    let proxy_app = Router::new()
-        .route("/health", get(|| async { "ok" }))
-        // Native typed-verdict endpoint. Registered explicitly (not via the
-        // fallback) so it is never mistaken for a passthrough path and proxied
-        // verbatim to `{api_base}/verdicts`.
-        .route(
-            verdicts::VERDICTS_PATH,
-            axum::routing::post(verdicts::handler),
-        )
-        // Native web search (Perplexity shape), in both spellings LiteLLM
-        // serves. `GET /v1/search/tools` shares the `:tool` pattern.
-        .route(search::SEARCH_PATH, axum::routing::post(search::search))
-        .route(
-            "/v1/search/:tool",
-            axum::routing::post(search::search_named).get(search::tools),
-        )
-        .route("/search", axum::routing::post(search::search))
-        .route(
-            "/search/:tool",
-            axum::routing::post(search::search_named).get(search::tools),
-        )
-        // The voices a text-to-speech model's server offers (not in OpenAI's
-        // API; vLLM-Omni's shape). Speech itself streams through the fallback.
-        .route(speech::VOICES_PATH, get(speech::voices))
-        .route("/mcp/:server", axum::routing::any(mcp::mcp_handler))
-        .route("/mcp/:server/*rest", axum::routing::any(mcp::mcp_handler))
-        .fallback(proxy::proxy_handler)
-        .with_state(app_state);
+    let proxy_app = proxy_router(app_state);
 
     let metrics_state = MetricsState {
         metrics: metrics.clone(),
@@ -800,6 +795,42 @@ async fn serve_until_shutdown(
         ),
     }
     Ok(())
+}
+
+/// The data-plane router: the gateway's native endpoints, with everything
+/// else through the proxy pipeline.
+fn proxy_router(state: AppState) -> Router {
+    Router::new()
+        .route("/health", get(|| async { "ok" }))
+        // Native typed-verdict endpoint. Registered explicitly (not via the
+        // fallback) so it is never mistaken for a passthrough path and proxied
+        // verbatim to `{api_base}/verdicts`.
+        .route(
+            verdicts::VERDICTS_PATH,
+            axum::routing::post(verdicts::handler),
+        )
+        // Native web search (Perplexity shape), in both spellings LiteLLM
+        // serves. `GET /v1/search/tools` shares the `:tool` pattern.
+        .route(search::SEARCH_PATH, axum::routing::post(search::search))
+        .route(
+            "/v1/search/:tool",
+            axum::routing::post(search::search_named).get(search::tools),
+        )
+        .route("/search", axum::routing::post(search::search))
+        .route(
+            "/search/:tool",
+            axum::routing::post(search::search_named).get(search::tools),
+        )
+        // The voices a text-to-speech model's server offers (not in OpenAI's
+        // API; vLLM-Omni's shape). Speech itself streams through the fallback.
+        .route(speech::VOICES_PATH, get(speech::voices))
+        // Each model's live load, for callers. Registered explicitly so it is
+        // never forwarded upstream; off, it answers 404 itself.
+        .route(load::LOAD_PATH, get(load::load))
+        .route("/mcp/:server", axum::routing::any(mcp::mcp_handler))
+        .route("/mcp/:server/*rest", axum::routing::any(mcp::mcp_handler))
+        .fallback(proxy::proxy_handler)
+        .with_state(state)
 }
 
 #[derive(Clone)]

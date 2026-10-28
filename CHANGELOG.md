@@ -4,6 +4,16 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
+## Unreleased
+
+**Gateway**
+
+- **Live load per model.** `GET /v1/load` on the proxy port tells a client how busy each model it can use is right now, so it can show that a model is busy or full and say why a request is waiting. It takes the caller's key or identity token like `/v1/models`, and lists the same ids. Each entry has the model pool's `slots`, the requests `in_flight` in it and `waiting` for it, and a `state`: `free`, `busy` (at least 80% of the slots in use), `full` (every slot in use, or anyone waiting) or `offline` (no servers). A variant reports its model's pool and a family its default member's. `scope` is `cluster` when the counts cover every gateway replica and `replica` when they are the answering replica's own. When the caller's key or tenant has an in-flight cap, each entry also has `you`: the caller's own requests in flight in that pool, and the tighter of the two caps as `limit`, which holds in each pool separately. `?model=` returns one entry. The numbers are the ones the Fairshare page shows, read at most once a second per replica however many clients poll, and the answer names no other tenant or key.
+
+**Deployment**
+
+- `OBLETH_LOAD_ENDPOINT` (default `true`) turns `/v1/load` off; the path then answers 404. The Helm chart sets it from `obleth.loadEndpoint`, and Docker Compose passes it through from `.env`.
+
 ## v2.4.0
 
 Agent sessions can keep their place on a busy model: with session affinity on, the fairshare scheduler serves a key's warm sessions first and can hold a slot for a session's next step, so its cached prompt is still there when the step arrives. It is off by default and can be turned on for the whole gateway or one model at a time. `auto` can keep a conversation on the model that answered it until an answer goes wrong, and Reports gains a Model speed section.

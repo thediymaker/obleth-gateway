@@ -1199,6 +1199,7 @@ mod pipeline_tests {
             jwt: None,
             knowledge: Arc::new(crate::knowledge::KnowledgeIndex::new()),
             jobs: crate::jobs::JobStore::new(store, Default::default()),
+            load: None,
         };
         Some(Gateway { state, wal_dir })
     }

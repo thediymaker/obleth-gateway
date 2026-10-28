@@ -154,6 +154,12 @@ obleth:
   # share their renders. Another tenant's job is a 404 either way. Any other
   # value falls back to `key` with a warning in the gateway log.
   videoJobScope: key
+  # Serve GET /v1/load on the proxy port: each model's live load (its slots,
+  # and the requests running in it and waiting for it) for the models a
+  # caller can use, so a client can show that a model is busy and why a
+  # request waits. It names no other tenant or key. false makes the path
+  # answer 404.
+  loadEndpoint: true
   resources:
     requests: { cpu: "250m", memory: "256Mi" }
     limits: { cpu: "2", memory: "1Gi" }

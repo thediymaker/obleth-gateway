@@ -13,6 +13,7 @@ pub mod capacity_discovery;
 pub mod energy_probe;
 mod error;
 pub mod knowledge;
+pub mod live_load;
 pub mod model_health;
 mod models_io;
 mod openapi;
@@ -5580,15 +5581,48 @@ pub fn enabled_pool_share_with(
         .iter()
         .filter(|m| m.enabled)
         .map(|m| {
-            let configured = discovered.get(&m.model_name).copied().unwrap_or_else(|| {
-                m.max_in_flight
-                    .and_then(|c| usize::try_from(c).ok())
-                    .filter(|c| *c > 0)
-                    .unwrap_or(default_cap)
-            });
+            let configured = pool_size(
+                &m.model_name,
+                m.max_in_flight.and_then(|c| usize::try_from(c).ok()),
+                default_cap,
+                discovered,
+            );
             replica_share(configured, replicas)
         })
         .sum()
+}
+
+/// A model's pool size as configured, cluster-wide: the size discovery set
+/// for it, else its own `max_in_flight` when positive, else `default_cap`.
+pub fn pool_size(
+    model_name: &str,
+    max_in_flight: Option<usize>,
+    default_cap: usize,
+    discovered: &std::collections::HashMap<String, usize>,
+) -> usize {
+    discovered
+        .get(model_name)
+        .copied()
+        .unwrap_or_else(|| max_in_flight.filter(|c| *c > 0).unwrap_or(default_cap))
+}
+
+/// Whether an enabled model has somewhere to send a request right now: a
+/// fixed `api_base` or an enabled endpoint, and not a backend discovery last
+/// saw with no ready replica (see [`models_with_servers`]).
+pub fn has_servers(api_base: &str, has_enabled_endpoint: bool, none_ready: bool) -> bool {
+    (!api_base.trim().is_empty() || has_enabled_endpoint) && !none_ready
+}
+
+/// Names of the models capacity discovery last saw with no ready replica.
+pub fn models_without_ready_replicas(
+    discovery: &capacity_discovery::CapacityDiscovery,
+) -> std::collections::HashSet<String> {
+    discovery
+        .statuses()
+        .into_iter()
+        .filter(|s| s.ready_replicas == Some(0))
+        .map(|s| s.model_name)
+        .collect()
 }
 
 /// Names of the enabled models that have somewhere to send a request right
@@ -5608,8 +5642,13 @@ pub fn models_with_servers(
     models
         .iter()
         .filter(|m| m.enabled)
-        .filter(|m| !m.api_base.trim().is_empty() || with_endpoint.contains(&m.id))
-        .filter(|m| !none_ready.contains(&m.model_name))
+        .filter(|m| {
+            has_servers(
+                &m.api_base,
+                with_endpoint.contains(&m.id),
+                none_ready.contains(&m.model_name),
+            )
+        })
         .map(|m| m.model_name.clone())
         .collect()
 }
@@ -5625,13 +5664,7 @@ fn served_models(
         .filter(|e| e.enabled)
         .map(|e| e.model_id)
         .collect();
-    let none_ready = state
-        .capacity_discovery
-        .statuses()
-        .into_iter()
-        .filter(|s| s.ready_replicas == Some(0))
-        .map(|s| s.model_name)
-        .collect();
+    let none_ready = models_without_ready_replicas(&state.capacity_discovery);
     let serving = models_with_servers(&models, &with_endpoint, &none_ready);
     let counted = models
         .into_iter()
@@ -5642,16 +5675,16 @@ fn served_models(
 
 /// How the answering replica enforces the limits right now: its mode, the
 /// live replica count, and what configured limits are divided by in that
-/// mode (1 unless the split applies).
-fn enforcement(state: &AdminState) -> (SlotMode, usize, usize) {
+/// mode (1 unless the split applies). `replica_aware` is
+/// `OBLETH_FAIRSHARE_REPLICA_AWARE`.
+pub(crate) fn enforcement(stats: &Stats, replica_aware: bool) -> (SlotMode, usize, usize) {
     use std::sync::atomic::Ordering;
-    let stats = &state.fairshare_stats;
     let replicas = stats.replicas.load(Ordering::Relaxed).max(1);
     let mode = stats.mode();
     let divisor = match mode {
         SlotMode::Shared | SlotMode::Local => 1,
         SlotMode::Split => replicas,
-        SlotMode::Fallback if state.fairshare_replica_aware => replicas,
+        SlotMode::Fallback if replica_aware => replicas,
         SlotMode::Fallback => 1,
     };
     (mode, replicas, divisor)
@@ -5661,8 +5694,9 @@ fn enforcement(state: &AdminState) -> (SlotMode, usize, usize) {
 /// read from the shared slots. In `shared` mode only; when Redis does not
 /// answer, the global count this replica last heard stands in and the
 /// per-pool counts are left out.
-async fn cluster_in_flight(
-    state: &AdminState,
+pub(crate) async fn cluster_in_flight(
+    fairshare: &FairShare,
+    stats: &Stats,
     mode: SlotMode,
     pools: &[PoolKey],
 ) -> Option<(usize, Vec<Option<usize>>)> {
@@ -5670,13 +5704,10 @@ async fn cluster_in_flight(
     if mode != SlotMode::Shared {
         return None;
     }
-    match state.fairshare.cluster_in_flight(pools).await {
+    match fairshare.cluster_in_flight(pools).await {
         Some((global, per)) => Some((global, per.into_iter().map(Some).collect())),
         None => Some((
-            state
-                .fairshare_stats
-                .cluster_in_flight
-                .load(Ordering::Relaxed),
+            stats.cluster_in_flight.load(Ordering::Relaxed),
             vec![None; pools.len()],
         )),
     }
@@ -5857,7 +5888,8 @@ async fn get_stats(State(state): State<AdminState>) -> Json<LiveStats> {
     use std::sync::atomic::Ordering;
     // The live counters are the point of this endpoint; a database hiccup
     // should degrade the capacity number, not fail the poll.
-    let (mode, replicas, divisor) = enforcement(&state);
+    let (mode, replicas, divisor) =
+        enforcement(&state.fairshare_stats, state.fairshare_replica_aware);
     let discovered = state.capacity_discovery.effective_caps();
     let endpoints = state.store.all_model_endpoints().await.unwrap_or_default();
     let capacity = state
@@ -5884,7 +5916,9 @@ async fn get_stats(State(state): State<AdminState>) -> Json<LiveStats> {
         },
         replicas,
         mode: mode.as_str().into(),
-        cluster_in_flight: cluster_in_flight(&state, mode, &[]).await.map(|(g, _)| g),
+        cluster_in_flight: cluster_in_flight(&state.fairshare, &state.fairshare_stats, mode, &[])
+            .await
+            .map(|(g, _)| g),
     })
 }
 
@@ -5937,7 +5971,8 @@ async fn get_capacity_discovery(
     State(state): State<AdminState>,
 ) -> Result<Json<CapacityDiscoveryView>> {
     let settings = state.capacity_discovery.settings().clone();
-    let (mode, replicas, divisor) = enforcement(&state);
+    let (mode, replicas, divisor) =
+        enforcement(&state.fairshare_stats, state.fairshare_replica_aware);
     let local_in_flight = state.fairshare.model_load();
     let statuses: std::collections::HashMap<String, capacity_discovery::ModelCapacityStatus> =
         state
@@ -5957,7 +5992,7 @@ async fn get_capacity_discovery(
         .iter()
         .map(|m| PoolKey::Model(m.model_name.clone()))
         .collect();
-    let cluster = cluster_in_flight(&state, mode, &pool_keys)
+    let cluster = cluster_in_flight(&state.fairshare, &state.fairshare_stats, mode, &pool_keys)
         .await
         .map(|(_, per)| per)
         .unwrap_or_else(|| vec![None; pool_keys.len()]);
@@ -6106,6 +6141,51 @@ pub(crate) struct LiveNames<'a> {
     pub serving: &'a std::collections::HashSet<String>,
 }
 
+/// A pool's request counts as the live view reports them, the health prober
+/// left out (see [`live_pool_view`] for the arguments).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PoolCounts {
+    /// In flight in the view's scope.
+    pub(crate) in_flight: usize,
+    /// Waiting for a slot in the view's scope.
+    pub(crate) queued: usize,
+    /// In flight across every replica, from the shared slots.
+    pub(crate) cluster_in_flight: Option<usize>,
+    /// The answering replica's own counts, whatever the scope.
+    pub(crate) replica_in_flight: usize,
+    pub(crate) replica_queued: usize,
+}
+
+/// One pool's [`PoolCounts`].
+pub(crate) fn pool_counts(
+    p: &ModelPoolFairshare,
+    local: Option<&ModelPoolFairshare>,
+    cluster_in_flight: Option<usize>,
+) -> PoolCounts {
+    let (h_in, h_q) = health_load(p);
+    let (replica_in_flight, replica_queued) = local
+        .map(|l| {
+            let (h_in, h_q) = health_load(l);
+            (
+                l.in_flight.saturating_sub(h_in),
+                l.queued.saturating_sub(h_q),
+            )
+        })
+        .unwrap_or((0, 0));
+    PoolCounts {
+        in_flight: p.in_flight.saturating_sub(h_in),
+        queued: p.queued.saturating_sub(h_q),
+        // Cluster-wide slot counts include every replica's health probes,
+        // which are not told apart from traffic there. Without a fresh read,
+        // the count the replica last heard stands in.
+        cluster_in_flight: cluster_in_flight
+            .or(p.cluster_in_flight)
+            .or(local.and_then(|l| l.cluster_in_flight)),
+        replica_in_flight,
+        replica_queued,
+    }
+}
+
 /// One pool of the live view: `p` is the scheduler's pool in the view's
 /// scope (merged across replicas in `cluster` scope), `local` the answering
 /// replica's own pool when it has one, `cluster_in_flight` the shared slot
@@ -6117,33 +6197,19 @@ pub(crate) fn live_pool_view(
     names: &LiveNames<'_>,
 ) -> ModelPoolView {
     let cap = p.cap;
-    let (h_in, h_q) = health_load(p);
-    let (local_in, local_q) = local
-        .map(|l| {
-            let (h_in, h_q) = health_load(l);
-            (
-                l.in_flight.saturating_sub(h_in),
-                l.queued.saturating_sub(h_q),
-            )
-        })
-        .unwrap_or((0, 0));
+    let counts = pool_counts(p, local, cluster_in_flight);
     let health_tenant = model_health::health_tenant_id();
     ModelPoolView {
         model: p.model.clone(),
         no_servers: names.enabled.contains(p.model.as_str()) && !names.serving.contains(&p.model),
         cap,
         configured_cap: p.configured_cap,
-        in_flight: p.in_flight.saturating_sub(h_in),
-        // Cluster-wide slot counts include every replica's health probes,
-        // which are not told apart from traffic there. Without a fresh read,
-        // the count the replica last heard stands in.
-        cluster_in_flight: cluster_in_flight
-            .or(p.cluster_in_flight)
-            .or(local.and_then(|l| l.cluster_in_flight)),
-        queued: p.queued.saturating_sub(h_q),
+        in_flight: counts.in_flight,
+        cluster_in_flight: counts.cluster_in_flight,
+        queued: counts.queued,
         borrowed: p.borrowed,
-        replica_in_flight: local_in,
-        replica_queued: local_q,
+        replica_in_flight: counts.replica_in_flight,
+        replica_queued: counts.replica_queued,
         groups: p
             .groups
             .iter()
@@ -6216,16 +6282,16 @@ pub(crate) fn live_pool_view(
 }
 
 /// Which replicas the live view covers, and the pools to build it from.
-struct LiveScope {
-    scope: &'static str,
-    reason: Option<String>,
-    cluster: Option<obleth_fairshare::ClusterSnapshot>,
+pub(crate) struct LiveScope {
+    pub(crate) scope: &'static str,
+    pub(crate) reason: Option<String>,
+    pub(crate) cluster: Option<obleth_fairshare::ClusterSnapshot>,
 }
 
 /// In `shared` mode, every live replica's scheduler state merged; when the
 /// shared backend cannot give it, or outside `shared` mode, the answering
 /// replica's own, with why when the cluster view was wanted.
-async fn live_scope(state: &AdminState, mode: SlotMode) -> LiveScope {
+pub(crate) async fn live_scope(fairshare: &FairShare, mode: SlotMode) -> LiveScope {
     if mode != SlotMode::Shared {
         return LiveScope {
             scope: "replica",
@@ -6233,7 +6299,7 @@ async fn live_scope(state: &AdminState, mode: SlotMode) -> LiveScope {
             cluster: None,
         };
     }
-    match state.fairshare.cluster_snapshot().await {
+    match fairshare.cluster_snapshot().await {
         Ok(cluster) => LiveScope {
             scope: "cluster",
             reason: None,
@@ -6269,8 +6335,8 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
         .snapshot()
         .await
         .ok_or(AdminError::Internal("fairshare unavailable".into()))?;
-    let (mode, _, divisor) = enforcement(&state);
-    let scope = live_scope(&state, mode).await;
+    let (mode, _, divisor) = enforcement(&state.fairshare_stats, state.fairshare_replica_aware);
+    let scope = live_scope(&state.fairshare, mode).await;
     let source: &[ModelPoolFairshare] = match &scope.cluster {
         Some(c) => &c.pools,
         None => &snap.pools,
@@ -6322,10 +6388,11 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
             }
         })
         .collect();
-    let (cluster_global, cluster_pools) = match cluster_in_flight(&state, mode, &pool_keys).await {
-        Some((global, per)) => (Some(global), per),
-        None => (None, vec![None; pool_keys.len()]),
-    };
+    let (cluster_global, cluster_pools) =
+        match cluster_in_flight(&state.fairshare, &state.fairshare_stats, mode, &pool_keys).await {
+            Some((global, per)) => (Some(global), per),
+            None => (None, vec![None; pool_keys.len()]),
+        };
 
     // Pools outlive their model: a renamed, deleted or disabled model keeps an
     // empty pool in the scheduler until restart. Every pool with visible
