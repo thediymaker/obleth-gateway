@@ -4,15 +4,16 @@
 //! One entry per id the caller's `GET /v1/models` lists, with the numbers
 //! the dashboard's Fairshare page shows for that model's pool: its slots,
 //! the requests running in it and the requests waiting for it. A variant
-//! reports its model's pool and a family its default member's. `you` is the
-//! caller's own requests in flight and the in-flight cap that applies to
-//! them. Nothing about other tenants or keys is included.
+//! reports its model's pool and a family its default member's. When an
+//! in-flight cap applies to the caller, each entry's `you` has the caller's
+//! own requests in that pool and the cap, which holds in each pool
+//! separately. Nothing about other tenants or keys is included.
 //!
 //! The pool numbers are read at most once a second per gateway replica,
 //! however many clients poll, and shared by every caller; `you` is read from
-//! the same reading. The call takes no fairshare slot, reserves no budget and writes
-//! no ledger row. `OBLETH_LOAD_ENDPOINT=false` turns it off: the path then
-//! answers 404 like an unknown one.
+//! the same reading. The call takes no fairshare slot, reserves no budget
+//! and writes no ledger row. `OBLETH_LOAD_ENDPOINT=false` turns it off: the
+//! path then answers 404 like an unknown one.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -122,12 +123,10 @@ impl LoadReporter {
                 "the fairshare scheduler is not answering",
             );
         };
-        let key = scheduler_key(resolved, headers);
-        let pool = wanted.and(listed.first().map(|(_, pool)| pool.as_str()));
-        let you = You {
-            in_flight: reading.key_in_flight(key, pool),
-            limit: tightest_cap(resolved, reading.divisor),
-        };
+        let you = tightest_cap(resolved, reading.divisor).map(|limit| Caller {
+            key: scheduler_key(resolved, headers),
+            limit,
+        });
         let mut resp = (
             StatusCode::OK,
             axum::Json(load_list(&reading, &listed, you)),
@@ -172,7 +171,6 @@ struct LoadList {
     object: &'static str,
     scope: &'static str,
     data: Vec<ModelLoad>,
-    you: You,
 }
 
 #[derive(Debug, Serialize)]
@@ -182,14 +180,24 @@ struct ModelLoad {
     slots: usize,
     in_flight: usize,
     waiting: usize,
+    /// Present when an in-flight cap applies to the caller.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    you: Option<You>,
 }
 
-/// The caller's own requests and cap.
-#[derive(Debug, Serialize)]
+/// The caller's own requests in one pool, and its cap there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 struct You {
     in_flight: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    limit: Option<usize>,
+    limit: usize,
+}
+
+/// A caller with an in-flight cap: the scheduler key its requests queue
+/// under, and the cap in each pool as the answering replica enforces it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Caller {
+    key: Uuid,
+    limit: usize,
 }
 
 /// `GET /v1/load`.
@@ -225,9 +233,10 @@ async fn handle(state: &AppState, model: Option<&str>, headers: &HeaderMap) -> R
     reporter.answer(&resolved, model, headers).await
 }
 
-/// The response for `listed` (id, pool) pairs. A pool with no reading (a
-/// model registered since it was taken) reports no slots until the next.
-fn load_list(reading: &LiveLoad, listed: &[(String, String)], you: You) -> LoadList {
+/// The response for `listed` (id, pool) pairs, with `caller`'s own requests
+/// in each entry's pool when it has a cap. A pool with no reading (a model
+/// registered since it was taken) reports no slots until the next.
+fn load_list(reading: &LiveLoad, listed: &[(String, String)], caller: Option<Caller>) -> LoadList {
     LoadList {
         object: "list",
         scope: reading.scope,
@@ -241,10 +250,13 @@ fn load_list(reading: &LiveLoad, listed: &[(String, String)], you: You) -> LoadL
                     slots: load.slots,
                     in_flight: load.in_flight,
                     waiting: load.waiting,
+                    you: caller.map(|c| You {
+                        in_flight: reading.key_in_flight(c.key, Some(pool)),
+                        limit: c.limit,
+                    }),
                 }
             })
             .collect(),
-        you,
     }
 }
 
@@ -322,7 +334,10 @@ mod tests {
                 ("small".to_string(), load(8, 8, 2)),
                 ("down".to_string(), load(0, 0, 0)),
             ]),
-            keys: HashMap::new(),
+            keys: HashMap::from([(
+                Uuid::nil(),
+                HashMap::from([("glm-5-3".to_string(), 2), ("small".to_string(), 1)]),
+            )]),
         };
         let listed = vec![
             ("down".to_string(), "down".to_string()),
@@ -331,34 +346,43 @@ mod tests {
             ("new".to_string(), "new".to_string()),
             ("small".to_string(), "small".to_string()),
         ];
-        let you = You {
-            in_flight: 2,
-            limit: Some(4),
+        let caller = Caller {
+            key: Uuid::nil(),
+            limit: 4,
         };
-        let body = serde_json::to_value(load_list(&reading, &listed, you)).unwrap();
+        let body = serde_json::to_value(load_list(&reading, &listed, Some(caller))).unwrap();
         assert_eq!(
             body,
             serde_json::json!({
                 "object": "list",
                 "scope": "cluster",
                 "data": [
-                    {"id": "down", "state": "offline", "slots": 0, "in_flight": 0, "waiting": 0},
-                    {"id": "glm-5-3", "state": "busy", "slots": 40, "in_flight": 34, "waiting": 0},
-                    {"id": "glm-5-3-search", "state": "busy", "slots": 40, "in_flight": 34, "waiting": 0},
-                    {"id": "new", "state": "offline", "slots": 0, "in_flight": 0, "waiting": 0},
-                    {"id": "small", "state": "full", "slots": 8, "in_flight": 8, "waiting": 2},
+                    {"id": "down", "state": "offline", "slots": 0, "in_flight": 0, "waiting": 0,
+                     "you": {"in_flight": 0, "limit": 4}},
+                    {"id": "glm-5-3", "state": "busy", "slots": 40, "in_flight": 34, "waiting": 0,
+                     "you": {"in_flight": 2, "limit": 4}},
+                    {"id": "glm-5-3-search", "state": "busy", "slots": 40, "in_flight": 34, "waiting": 0,
+                     "you": {"in_flight": 2, "limit": 4}},
+                    {"id": "new", "state": "offline", "slots": 0, "in_flight": 0, "waiting": 0,
+                     "you": {"in_flight": 0, "limit": 4}},
+                    {"id": "small", "state": "full", "slots": 8, "in_flight": 8, "waiting": 2,
+                     "you": {"in_flight": 1, "limit": 4}},
                 ],
-                "you": {"in_flight": 2, "limit": 4},
             })
         );
 
-        // No cap: `limit` is left out.
-        let you = You {
-            in_flight: 0,
-            limit: None,
-        };
-        let body = serde_json::to_value(load_list(&reading, &listed[..1], you)).unwrap();
-        assert_eq!(body["you"], serde_json::json!({"in_flight": 0}));
+        // No cap applies: no entry has `you`.
+        let body = serde_json::to_value(load_list(&reading, &listed, None)).unwrap();
+        assert_eq!(body.get("you"), None);
+        assert!(body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e.get("you").is_none()));
+        assert_eq!(
+            body["data"][1],
+            serde_json::json!({"id": "glm-5-3", "state": "busy", "slots": 40, "in_flight": 34, "waiting": 0})
+        );
     }
 
     #[test]
@@ -515,38 +539,77 @@ mod tests {
                 "object": "list",
                 "scope": "cluster",
                 "data": [
-                    {"id": "busy", "state": "busy", "slots": 10, "in_flight": 8, "waiting": 0},
-                    {"id": "busy-search", "state": "busy", "slots": 10, "in_flight": 8, "waiting": 0},
-                    {"id": "fam", "state": "free", "slots": 8, "in_flight": 0, "waiting": 0},
-                    {"id": "quiet", "state": "free", "slots": 8, "in_flight": 0, "waiting": 0},
+                    {"id": "busy", "state": "busy", "slots": 10, "in_flight": 8, "waiting": 0,
+                     "you": {"in_flight": 3, "limit": 4}},
+                    {"id": "busy-search", "state": "busy", "slots": 10, "in_flight": 8, "waiting": 0,
+                     "you": {"in_flight": 3, "limit": 4}},
+                    {"id": "fam", "state": "free", "slots": 8, "in_flight": 0, "waiting": 0,
+                     "you": {"in_flight": 0, "limit": 4}},
+                    {"id": "quiet", "state": "free", "slots": 8, "in_flight": 0, "waiting": 0,
+                     "you": {"in_flight": 0, "limit": 4}},
                 ],
-                "you": {"in_flight": 3, "limit": 4},
             })
         );
 
-        // One model: its entry, and the caller's requests in its pool only.
-        let body = json_of(
-            reporter
-                .answer(&key, Some("quiet"), &HeaderMap::new())
-                .await,
-        )
-        .await;
-        assert_eq!(body["data"].as_array().unwrap().len(), 1);
-        assert_eq!(body["data"][0]["id"], "quiet");
-        assert_eq!(body["you"], serde_json::json!({"in_flight": 0, "limit": 4}));
+        // One model: its entry alone, carrying its own `you`.
         let body = json_of(
             reporter
                 .answer(&key, Some("busy-search"), &HeaderMap::new())
                 .await,
         )
         .await;
-        assert_eq!(body["you"]["in_flight"], 3);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "object": "list",
+                "scope": "cluster",
+                "data": [
+                    {"id": "busy-search", "state": "busy", "slots": 10, "in_flight": 8, "waiting": 0,
+                     "you": {"in_flight": 3, "limit": 4}},
+                ],
+            })
+        );
+
+        // A caller with no cap gets no `you`.
+        let mut uncapped = key.clone();
+        uncapped.key_max_in_flight = None;
+        uncapped.max_in_flight = None;
+        let body = json_of(
+            reporter
+                .answer(&uncapped, Some("busy"), &HeaderMap::new())
+                .await,
+        )
+        .await;
+        assert_eq!(body["data"][0].get("you"), None);
+        assert_eq!(body["data"][0]["in_flight"], 8);
 
         // A model the caller is not offered is not found.
         for name in ["other", "hidden", "nope"] {
             let resp = reporter.answer(&key, Some(name), &HeaderMap::new()).await;
             assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{name}");
         }
+    }
+
+    #[tokio::test]
+    async fn an_end_user_sees_its_own_requests() {
+        let sources = sources();
+        let reporter = reporter(&sources);
+        let mut key = caller();
+        key.end_user_fairshare = true;
+        let alice = obleth_config::end_user_key_id(key.key_id, "alice");
+        let _alice = run(&sources.0, alice, "busy", 2).await;
+        let _shared = run(&sources.0, key.key_id, "busy", 1).await;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(proxy::END_USER_HEADER, HeaderValue::from_static("alice"));
+        let body = json_of(reporter.answer(&key, Some("busy"), &headers).await).await;
+        assert_eq!(
+            body["data"][0]["you"],
+            serde_json::json!({"in_flight": 2, "limit": 4})
+        );
+        let body = json_of(reporter.answer(&key, Some("busy"), &HeaderMap::new()).await).await;
+        assert_eq!(body["data"][0]["you"]["in_flight"], 1);
+        assert_eq!(body["data"][0]["in_flight"], 3);
     }
 
     #[tokio::test]
@@ -564,12 +627,12 @@ mod tests {
             body["data"][0]["in_flight"], 1,
             "served from the last reading"
         );
-        assert_eq!(body["you"]["in_flight"], 1);
+        assert_eq!(body["data"][0]["you"]["in_flight"], 1);
 
         *reporter.last.lock().await = None;
         let body = json_of(reporter.answer(&key, Some("busy"), &HeaderMap::new()).await).await;
         assert_eq!(body["data"][0]["in_flight"], 2);
-        assert_eq!(body["you"]["in_flight"], 2);
+        assert_eq!(body["data"][0]["you"]["in_flight"], 2);
     }
 
     // ---- through the gateway's router (needs Postgres and Redis) ----
@@ -705,15 +768,20 @@ mod tests {
         assert_eq!(ids, ["busy", "busy-search", "fam", "quiet"]);
         assert_eq!(
             body["data"][0],
-            serde_json::json!({"id": "busy", "state": "free", "slots": 10, "in_flight": 2, "waiting": 0})
+            serde_json::json!({"id": "busy", "state": "free", "slots": 10, "in_flight": 2, "waiting": 0,
+                               "you": {"in_flight": 2, "limit": 4}})
         );
-        assert_eq!(body["you"], serde_json::json!({"in_flight": 2, "limit": 4}));
+        assert_eq!(body.get("you"), None);
 
         let resp = gw
             .get(&format!("{LOAD_PATH}?model=quiet"), Some(&secret))
             .await;
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["data"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            body["data"][0]["you"],
+            serde_json::json!({"in_flight": 0, "limit": 4})
+        );
         let resp = gw
             .get(&format!("{LOAD_PATH}?model=other"), Some(&secret))
             .await;
