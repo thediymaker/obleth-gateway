@@ -132,6 +132,10 @@ pub struct Config {
     pub auto_classifier_model: Option<String>,
     pub auto_classifier_timeout_ms: u64,
 
+    /// Serve `GET /v1/load`, each model's live load for callers
+    /// (`OBLETH_LOAD_ENDPOINT`, default on). Off, the path answers 404.
+    pub load_endpoint: bool,
+
     /// Who may poll, download, delete and list a video job
     /// (`OBLETH_VIDEO_JOB_SCOPE`): the key that created it (`key`, the
     /// default) or any key of its tenant (`tenant`).
@@ -499,6 +503,7 @@ impl Config {
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
             auto_classifier_timeout_ms: parse_or("OBLETH_AUTO_CLASSIFIER_TIMEOUT_MS", 250),
+            load_endpoint: bool_or("OBLETH_LOAD_ENDPOINT", true),
             job_scope,
             warnings,
         }

@@ -120,6 +120,8 @@ services:
       # key (default): a video job is private to the key that created it; tenant: shared tenant-wide.
       OBLETH_VIDEO_JOB_SCOPE: ${OBLETH_VIDEO_JOB_SCOPE:-key}
       OBLETH_SESSION_ID_DERIVATION: ${OBLETH_SESSION_ID_DERIVATION:-true}
+      # GET /v1/load: each model's live load for callers. false answers 404.
+      OBLETH_LOAD_ENDPOINT: ${OBLETH_LOAD_ENDPOINT:-true}
       # Boot-time seed only; the dashboard's routing settings win once saved.
       OBLETH_AUTO_CLASSIFIER_ENABLED: ${OBLETH_AUTO_CLASSIFIER_ENABLED:-false}
       OBLETH_AUTO_CLASSIFIER_MODEL: ${OBLETH_AUTO_CLASSIFIER_MODEL:-}

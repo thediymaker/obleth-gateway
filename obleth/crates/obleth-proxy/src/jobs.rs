@@ -1390,6 +1390,7 @@ mod pipeline_tests {
             jwt: None,
             knowledge: Arc::new(crate::knowledge::KnowledgeIndex::new()),
             jobs: JobStore::new(store.clone(), scope),
+            load: None,
         };
         Some(Gateway {
             state,

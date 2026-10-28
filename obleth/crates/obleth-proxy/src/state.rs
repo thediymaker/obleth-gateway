@@ -90,4 +90,7 @@ pub struct AppState {
     /// Read by the knowledge boon (`boons::knowledge::apply`) via
     /// `CollectionSlab::retrieve`.
     pub knowledge: Arc<crate::knowledge::KnowledgeIndex>,
+    /// What `GET /v1/load` reads pool load with. `None` when
+    /// `OBLETH_LOAD_ENDPOINT` is off; the path then answers 404.
+    pub load: Option<crate::load::LoadReporter>,
 }
