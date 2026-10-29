@@ -67,6 +67,7 @@ use obleth_tokenizer::Tokenizer;
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::proxy::UpstreamUsage;
 use crate::state::AppState;
 
 /// Phase A/B1 gating: the model was granted the boon AND it is globally active
@@ -1245,7 +1246,8 @@ fn helper_request_type<'a>(key: &ResolvedKey, label: &'a str) -> &'a str {
 /// synthetic tenant, in which case it is stamped `benchmark` instead (see
 /// [`helper_request_type`]). `parent_request_id` is the client request the
 /// call served; the row records it so the request log can link the two.
-#[allow(clippy::too_many_arguments)]
+/// `usage.cached` is the part of the prompt the helper's upstream served from
+/// its prefix cache.
 pub(crate) fn bill_helper_call(
     state: &AppState,
     helper: &ResolvedModel,
@@ -1253,9 +1255,13 @@ pub(crate) fn bill_helper_call(
     session_id: &str,
     parent_request_id: Uuid,
     request_type: &str,
-    input_tokens: u32,
-    output_tokens: u32,
+    usage: UpstreamUsage,
 ) {
+    let UpstreamUsage {
+        input: input_tokens,
+        output: output_tokens,
+        cached: cached_input_tokens,
+    } = usage;
     let request_type = helper_request_type(key, request_type);
     let total_tokens = input_tokens.saturating_add(output_tokens);
     let cost_usd = (input_tokens as f64) * helper.input_cost_per_token
@@ -1269,7 +1275,7 @@ pub(crate) fn bill_helper_call(
         return;
     }
     commit_helper_term_usage(state, key, total_tokens as i64, cost_usd);
-    state.telemetry.record(helper_usage_record(
+    let mut record = helper_usage_record(
         helper,
         key,
         session_id,
@@ -1278,7 +1284,23 @@ pub(crate) fn bill_helper_call(
         input_tokens,
         output_tokens,
         cost_usd,
-    ));
+    );
+    record.cached_input_tokens = cached_input_tokens;
+    state.telemetry.record(record);
+}
+
+/// Helper-billing usage of a buffered completion: each count independently,
+/// zero when absent, with the cached part of the prompt when it reports one.
+pub(crate) fn reported_usage(completion: &Value) -> UpstreamUsage {
+    let Some(usage) = completion.get("usage") else {
+        return UpstreamUsage::default();
+    };
+    let read = |field: &str| usage.get(field).and_then(Value::as_u64).unwrap_or(0) as u32;
+    UpstreamUsage::new(
+        read("prompt_tokens"),
+        read("completion_tokens"),
+        crate::proxy::cached_prompt_tokens(usage) as u32,
+    )
 }
 
 /// The ledger row for one helper call (see [`bill_helper_call`]). Split out so

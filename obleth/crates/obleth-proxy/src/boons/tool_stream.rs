@@ -36,6 +36,7 @@ use futures_util::{Stream, StreamExt};
 use obleth_config::{ResolvedKey, ResolvedModel, ToolLoopSettings};
 use serde_json::{json, Value};
 
+use crate::proxy::UpstreamUsage;
 use crate::state::AppState;
 use crate::upstream_failure::{payload_failure, stream_cut_error, DEFAULT_FAILURE_STATUS};
 
@@ -50,6 +51,8 @@ pub struct StreamStats {
     pub ttft_ms: u32,
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// The part of `input_tokens` the upstream served from its prefix cache.
+    pub cached_input_tokens: u32,
     pub final_set: bool,
     ttft_set: bool,
     /// The status to record when the client-facing turn failed: the upstream
@@ -191,7 +194,7 @@ pub fn run(
             let mut content_acc = String::new();
             let mut tool_acc: BTreeMap<u64, ToolAccum> = BTreeMap::new();
             let mut buffered_tool_deltas: Vec<Value> = Vec::new();
-            let mut usage: Option<(u32, u32)> = None;
+            let mut usage: Option<UpstreamUsage> = None;
             let mut id = String::from("chatcmpl-toolstream");
             let mut model_name = upstream_model.clone();
             let mut finish_reason: Option<Value> = None;
@@ -249,15 +252,7 @@ pub fn run(
                             yield Ok(Bytes::from(role_chunk(&id, &model_name, created)));
                         }
                         if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
-                            let it = u
-                                .get("prompt_tokens")
-                                .and_then(|x| x.as_u64())
-                                .unwrap_or(0) as u32;
-                            let ot = u
-                                .get("completion_tokens")
-                                .and_then(|x| x.as_u64())
-                                .unwrap_or(0) as u32;
-                            usage = Some((it, ot));
+                            usage = Some(chunk_usage(u));
                         }
                         // Capture the turn's terminal finish reason so the plain
                         // answer can be closed with a proper finish chunk. The
@@ -328,8 +323,8 @@ pub fn run(
                         finish_reason.clone(),
                     )));
                     if client_include_usage {
-                        if let Some((it, ot)) = usage {
-                            yield Ok(Bytes::from(usage_chunk(&id, &model_name, created, it, ot)));
+                        if let Some(u) = usage {
+                            yield Ok(Bytes::from(usage_chunk(&id, &model_name, created, u)));
                         }
                     }
                 }
@@ -360,8 +355,8 @@ pub fn run(
                     finish_reason.clone(),
                 )));
                 if client_include_usage {
-                    if let Some((it, ot)) = usage {
-                        yield Ok(Bytes::from(usage_chunk(&id, &model_name, created, it, ot)));
+                    if let Some(u) = usage {
+                        yield Ok(Bytes::from(usage_chunk(&id, &model_name, created, u)));
                     }
                 }
                 yield Ok(Bytes::from(done()));
@@ -398,8 +393,8 @@ pub fn run(
                 });
                 yield Ok(Bytes::from(format!("data: {fin}\n\n")));
                 if client_include_usage {
-                    if let Some((it, ot)) = usage {
-                        yield Ok(Bytes::from(usage_chunk(&id, &model_name, created, it, ot)));
+                    if let Some(u) = usage {
+                        yield Ok(Bytes::from(usage_chunk(&id, &model_name, created, u)));
                     }
                 }
                 yield Ok(Bytes::from(done()));
@@ -409,10 +404,8 @@ pub fn run(
 
             // Gateway-owned tools: bill this turn, surface a visible marker per
             // call, execute, append results, and loop for the next turn.
-            if let Some((it, ot)) = usage {
-                super::bill_helper_call(
-                    &state, &route, &key, &session_id, request_id, "tool_loop", it, ot,
-                );
+            if let Some(u) = usage {
+                super::bill_helper_call(&state, &route, &key, &session_id, request_id, "tool_loop", u);
             }
             super::tool_loop::push_message(
                 &mut request,
@@ -494,7 +487,7 @@ pub fn run(
 
         let mut bytes = final_resp.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
-        let mut usage: Option<(u32, u32)> = None;
+        let mut usage: Option<UpstreamUsage> = None;
         let mut id = String::from("chatcmpl-toolstream");
         let mut model_name = upstream_model.clone();
         let mut finish_reason: Option<Value> = None;
@@ -547,9 +540,7 @@ pub fn run(
                         yield Ok(Bytes::from(role_chunk(&id, &model_name, created)));
                     }
                     if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
-                        let it = u.get("prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-                        let ot = u.get("completion_tokens").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-                        usage = Some((it, ot));
+                        usage = Some(chunk_usage(u));
                     }
                     if let Some(fr) = v
                         .pointer("/choices/0/finish_reason")
@@ -597,8 +588,8 @@ pub fn run(
             }
             yield Ok(Bytes::from(finish_chunk(&id, &model_name, created, finish_reason)));
             if client_include_usage {
-                if let Some((it, ot)) = usage {
-                    yield Ok(Bytes::from(usage_chunk(&id, &model_name, created, it, ot)));
+                if let Some(u) = usage {
+                    yield Ok(Bytes::from(usage_chunk(&id, &model_name, created, u)));
                 }
             }
         }
@@ -709,11 +700,23 @@ fn set_ttft(stats: &Arc<Mutex<StreamStats>>, ms: u32) {
     }
 }
 
-fn finalize_stats(stats: &Arc<Mutex<StreamStats>>, usage: Option<(u32, u32)>) {
-    if let Some((it, ot)) = usage {
+/// One stream chunk's `usage` object: each count independently, zero when
+/// absent, with the cached part of the prompt when it reports one.
+fn chunk_usage(u: &Value) -> UpstreamUsage {
+    let read = |field: &str| u.get(field).and_then(Value::as_u64).unwrap_or(0) as u32;
+    UpstreamUsage::new(
+        read("prompt_tokens"),
+        read("completion_tokens"),
+        crate::proxy::cached_prompt_tokens(u) as u32,
+    )
+}
+
+fn finalize_stats(stats: &Arc<Mutex<StreamStats>>, usage: Option<UpstreamUsage>) {
+    if let Some(u) = usage {
         if let Ok(mut s) = stats.lock() {
-            s.input_tokens = it;
-            s.output_tokens = ot;
+            s.input_tokens = u.input;
+            s.output_tokens = u.output;
+            s.cached_input_tokens = u.cached;
             s.final_set = true;
         }
     }
@@ -724,7 +727,7 @@ fn finalize_stats(stats: &Arc<Mutex<StreamStats>>, usage: Option<(u32, u32)>) {
 fn fail_stats(
     stats: &Arc<Mutex<StreamStats>>,
     status: u16,
-    usage: Option<(u32, u32)>,
+    usage: Option<UpstreamUsage>,
     delivered_chars: usize,
 ) {
     finalize_stats(stats, usage);
@@ -894,18 +897,22 @@ fn reasoning_chunk(id: &str, model: &str, created: i64, text: &str) -> String {
 }
 
 /// A trailing usage-only chunk (emitted when the client asked for usage).
-pub(crate) fn usage_chunk(id: &str, model: &str, created: i64, input: u32, output: u32) -> String {
+pub(crate) fn usage_chunk(id: &str, model: &str, created: i64, usage: UpstreamUsage) -> String {
+    let mut counts = json!({
+        "prompt_tokens": usage.input,
+        "completion_tokens": usage.output,
+        "total_tokens": usage.input + usage.output,
+    });
+    if usage.cached > 0 {
+        counts["prompt_tokens_details"] = json!({ "cached_tokens": usage.cached });
+    }
     let chunk = json!({
         "id": id,
         "object": "chat.completion.chunk",
         "created": created,
         "model": model,
         "choices": [],
-        "usage": {
-            "prompt_tokens": input,
-            "completion_tokens": output,
-            "total_tokens": input + output,
-        },
+        "usage": counts,
     });
     format!("data: {chunk}\n\n")
 }
@@ -1159,5 +1166,43 @@ mod tests {
     #[test]
     fn image_chunk_is_none_without_images() {
         assert!(image_chunk("id1", "m", 1, &[]).is_none());
+    }
+
+    #[test]
+    fn chunk_usage_keeps_the_cached_prompt_tokens() {
+        let u = json!({
+            "prompt_tokens": 126008, "completion_tokens": 84,
+            "prompt_tokens_details": { "cached_tokens": 125952 },
+        });
+        assert_eq!(chunk_usage(&u), UpstreamUsage::new(126008, 84, 125952));
+        assert_eq!(
+            chunk_usage(&json!({ "completion_tokens": 4, "prompt_tokens_details": null })),
+            UpstreamUsage::uncached(0, 4)
+        );
+    }
+
+    #[test]
+    fn usage_chunk_reports_cached_tokens_only_when_there_are_some() {
+        let parse = |sse: String| -> Value {
+            serde_json::from_str(sse.trim_start_matches("data: ").trim_end()).unwrap()
+        };
+        let v = parse(usage_chunk("id1", "m", 1, UpstreamUsage::new(100, 9, 64)));
+        assert_eq!(v["usage"]["prompt_tokens"], 100);
+        assert_eq!(v["usage"]["total_tokens"], 109);
+        assert_eq!(v["usage"]["prompt_tokens_details"]["cached_tokens"], 64);
+        let v = parse(usage_chunk("id1", "m", 1, UpstreamUsage::uncached(100, 9)));
+        assert!(v["usage"].get("prompt_tokens_details").is_none());
+    }
+
+    #[test]
+    fn finalize_stats_carries_the_cached_prompt_tokens() {
+        let stats = Arc::new(Mutex::new(StreamStats::default()));
+        finalize_stats(&stats, Some(UpstreamUsage::new(500, 20, 448)));
+        let s = stats.lock().unwrap();
+        assert!(s.final_set);
+        assert_eq!(
+            (s.input_tokens, s.output_tokens, s.cached_input_tokens),
+            (500, 20, 448)
+        );
     }
 }

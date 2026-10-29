@@ -689,7 +689,6 @@ pub async fn run(
             Ok(completion) => {
                 let model_ms = (crate::tracer::now_ms() - model_call_start) as u32;
                 let iter_ms = (crate::tracer::now_ms() - iter_start) as u32;
-                let (input_tokens, output_tokens) = reported_tokens(&completion);
                 super::bill_helper_call(
                     state,
                     route,
@@ -697,8 +696,7 @@ pub async fn run(
                     session_id,
                     request_id,
                     "tool_loop",
-                    input_tokens,
-                    output_tokens,
+                    super::reported_usage(&completion),
                 );
                 *body = completion;
                 replaced = true;
@@ -794,7 +792,6 @@ pub async fn run(
     };
     match finalized {
         Ok(completion) => {
-            let (input_tokens, output_tokens) = reported_tokens(&completion);
             super::bill_helper_call(
                 state,
                 route,
@@ -802,8 +799,7 @@ pub async fn run(
                 session_id,
                 request_id,
                 "tool_loop",
-                input_tokens,
-                output_tokens,
+                super::reported_usage(&completion),
             );
             *body = completion;
             replaced = true;
@@ -834,17 +830,6 @@ pub async fn run(
         warning,
         turn0_usage: replaced.then(|| turn0_or_estimate(state, loop_plan, turn0)),
     }
-}
-
-/// Helper-billing token counts: each field independently, zero when absent.
-fn reported_tokens(completion: &Value) -> (u32, u32) {
-    let read = |field: &str| {
-        completion
-            .pointer(&format!("/usage/{field}"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32
-    };
-    (read("prompt_tokens"), read("completion_tokens"))
 }
 
 /// Turn 0's reported usage, or an estimate of it when the upstream reported
@@ -1331,8 +1316,16 @@ mod tests {
             None
         );
         assert_eq!(
-            reported_tokens(&json!({"usage": {"completion_tokens": 4}})),
-            (0, 4)
+            super::super::reported_usage(&json!({"usage": {"completion_tokens": 4}})),
+            UpstreamUsage::uncached(0, 4)
+        );
+        // A helper turn's cached prompt tokens reach its row.
+        assert_eq!(
+            super::super::reported_usage(&json!({"usage": {
+                "prompt_tokens": 126008, "completion_tokens": 84,
+                "prompt_tokens_details": {"cached_tokens": 125952},
+            }})),
+            UpstreamUsage::new(126008, 84, 125952)
         );
     }
 

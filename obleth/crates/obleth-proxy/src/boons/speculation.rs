@@ -985,8 +985,7 @@ fn bill_verify(req: &SpecRequest<'_>, verifier: &Verifier) {
             req.session_id,
             req.request_id,
             "speculation_verify",
-            verifier.billed_input,
-            verifier.scorings,
+            crate::proxy::UpstreamUsage::uncached(verifier.billed_input, verifier.scorings),
         );
     }
 }
@@ -1001,8 +1000,7 @@ fn bill_draft(req: &SpecRequest<'_>, drafter: &ResolvedModel, usage: Option<(u32
             req.session_id,
             req.request_id,
             "speculation_draft",
-            it,
-            ot,
+            crate::proxy::UpstreamUsage::uncached(it, ot),
         );
     }
 }
@@ -1388,7 +1386,7 @@ fn drive_stream(
                             bill_verify(&breq, &verifier);
                             yield Ok(Bytes::from(finish_chunk(&id, &model_name, created, None)));
                             if plan.include_usage {
-                                yield Ok(Bytes::from(usage_chunk(&id, &model_name, created, input, output)));
+                                yield Ok(Bytes::from(usage_chunk(&id, &model_name, created, crate::proxy::UpstreamUsage::uncached(input, output))));
                             }
                             yield Ok(Bytes::from(done()));
                             if let Ok(mut st) = stats.lock() {
@@ -1541,7 +1539,7 @@ fn drive_stream(
         if !error_forwarded {
             yield Ok(Bytes::from(finish_chunk(&id, &model_name, created, finish)));
             if plan.include_usage {
-                yield Ok(Bytes::from(usage_chunk(&id, &model_name, created, input, output)));
+                yield Ok(Bytes::from(usage_chunk(&id, &model_name, created, crate::proxy::UpstreamUsage::uncached(input, output))));
             }
         }
         yield Ok(Bytes::from(done()));

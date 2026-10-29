@@ -573,14 +573,7 @@ pub(crate) async fn scan_harm(
         session_id,
         request_id,
         "guardrails_boon",
-        completion
-            .pointer("/usage/prompt_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32,
-        completion
-            .pointer("/usage/completion_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32,
+        super::reported_usage(&completion),
     );
 
     match harm_probability(&completion) {
