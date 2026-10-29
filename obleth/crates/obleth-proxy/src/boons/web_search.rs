@@ -59,13 +59,20 @@ pub(super) fn max_searches(cfg: &WebSearchBoonSettings) -> u32 {
         .clamp(1, WEB_SEARCH_MAX_PER_REQUEST)
 }
 
-/// The OpenAI function-tool definition for `web_search`.
-pub(super) fn tool_def(cfg: &WebSearchBoonSettings) -> Value {
+/// The OpenAI function-tool definition for `web_search`. The configured
+/// description gets today's date, so queries about anything recent name the
+/// right year instead of the model's training year.
+pub(super) fn tool_def(cfg: &WebSearchBoonSettings, today: chrono::NaiveDate) -> Value {
+    let description = format!(
+        "{} Today's date is {} (UTC): put the year or date in queries about anything recent.",
+        cfg.tool_description.trim_end(),
+        today.format("%Y-%m-%d")
+    );
     json!({
         "type": "function",
         "function": {
             "name": WEB_SEARCH_TOOL,
-            "description": cfg.tool_description,
+            "description": description,
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -132,7 +139,7 @@ pub(super) fn inject(
     supports_system_messages: bool,
     json_body: &mut Value,
 ) {
-    let def = tool_def(cfg);
+    let def = tool_def(cfg, chrono::Utc::now().date_naive());
     if let Some(obj) = json_body.as_object_mut() {
         match obj.get_mut("tools").and_then(|v| v.as_array_mut()) {
             Some(existing) => existing.push(def),
@@ -192,9 +199,16 @@ pub(super) fn domains_arg(args: &Value) -> Vec<String> {
 }
 
 /// The tool result for a search that came back: a numbered list the model can
-/// cite from, or a plain statement that nothing was found.
-pub(super) fn format_results(query: &str, results: &[Value]) -> String {
+/// cite from, or a plain statement that nothing was found. While the request
+/// has searches left, the model is told it may search again with other words.
+pub(super) fn format_results(query: &str, results: &[Value], searches_left: u32) -> String {
     if results.is_empty() {
+        if searches_left > 0 {
+            return format!(
+                "No web results were found for \"{query}\". Search again with different \
+                 keywords, or answer from what you know and say that the search found nothing."
+            );
+        }
         return format!(
             "No web results were found for \"{query}\". Answer from what you know, and say \
              that the search found nothing."
@@ -231,6 +245,12 @@ pub(super) fn format_results(query: &str, results: &[Value]) -> String {
             out.push_str(&snippet);
             out.push('\n');
         }
+    }
+    if searches_left > 0 {
+        out.push_str(
+            "\nIf these results do not answer the question, search again with different \
+             keywords, for example the year or date, or the word news.",
+        );
     }
     out.push_str("\nCite the URLs of the results you rely on.");
     out
@@ -376,7 +396,11 @@ pub(super) async fn execute(
     let (status, result, results) = match outcome {
         Ok(Ok(results)) => {
             let count = results.len() as u32;
-            (200, format_results(&query, &results), count)
+            (
+                200,
+                format_results(&query, &results, limit.saturating_sub(ctx.searches)),
+                count,
+            )
         }
         Ok(Err(reason)) => {
             tracing::warn!(
@@ -427,14 +451,16 @@ mod tests {
 
     #[test]
     fn the_tool_definition_asks_for_a_query_and_optional_domains() {
-        let def = tool_def(&cfg());
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 3, 9).unwrap();
+        let def = tool_def(&cfg(), today);
         assert_eq!(def["function"]["name"], WEB_SEARCH_TOOL);
         assert_eq!(def["function"]["parameters"]["required"], json!(["query"]));
         assert!(def["function"]["parameters"]["properties"]["domains"].is_object());
-        assert_eq!(
-            def["function"]["description"],
-            obleth_config::DEFAULT_WEB_SEARCH_TOOL_DESCRIPTION
-        );
+        let description = def["function"]["description"].as_str().unwrap();
+        assert!(description.starts_with(obleth_config::DEFAULT_WEB_SEARCH_TOOL_DESCRIPTION));
+        assert!(description.ends_with(
+            " Today's date is 2026-03-09 (UTC): put the year or date in queries about anything recent."
+        ));
     }
 
     #[test]
@@ -542,7 +568,7 @@ mod tests {
                 "date": null,
             }),
         ];
-        let text = format_results("gaudi 3 memory", &results);
+        let text = format_results("gaudi 3 memory", &results, 0);
         assert!(text.starts_with("Web results for \"gaudi 3 memory\":"));
         assert!(text.contains(
             "[1] Gaudi 3\nhttps://example.org/gaudi3\nPublished: 2024-04-09\n128 GB of HBM"
@@ -550,11 +576,17 @@ mod tests {
         assert!(text.contains("[2] (untitled)\nhttps://example.org/x\n"));
         assert!(!text.contains(&"s".repeat(SNIPPET_MAX_CHARS + 1)));
         assert!(text.ends_with("Cite the URLs of the results you rely on."));
+        assert!(!text.contains("search again"));
+        let again = format_results("gaudi 3 memory", &results, 2);
+        assert!(again.contains("search again with different keywords"));
+        assert!(again.ends_with("Cite the URLs of the results you rely on."));
     }
 
     #[test]
     fn no_results_and_failures_tell_the_model_to_answer_anyway() {
-        assert!(format_results("q", &[]).contains("No web results were found"));
+        assert!(format_results("q", &[], 0).contains("No web results were found"));
+        assert!(!format_results("q", &[], 0).contains("Search again"));
+        assert!(format_results("q", &[], 1).contains("Search again with different keywords"));
         let failed = failure_result("timed out");
         assert!(failed.contains("(timed out)"));
         assert!(failed.contains("do not retry"));
