@@ -3304,6 +3304,21 @@ async fn run_pipeline(
             }
             _ => None,
         };
+        // The client's usage also carries the energy measured for it; the cached
+        // copy above stays without it, as a cache hit uses none.
+        let final_body = if status_code == 200
+            && is_stream_usage_path(&path)
+            && accounting.state.energy.settings().enabled
+        {
+            let figures = accounting.state.energy.figures(
+                &accounting.energy,
+                total_ms,
+                accounting.queue_wait_ms,
+            );
+            stamp_body(final_body, &final_content_type, figures)
+        } else {
+            final_body
+        };
         let _ = settle_guard
             .complete(accounting.settle(tokens, ttft_ms, total_ms, status_code, cache_put))
             .await;
@@ -3365,6 +3380,18 @@ async fn run_pipeline(
         let mut full: Vec<u8> = Vec::new();
         let mut cacheable = store_in_cache.is_some();
         let mut usage_filter = strip_usage_chunk.then(UsageChunkFilter::default);
+        // The usage a client asked for also carries the energy measured for it.
+        let mut energy_stamp = (expect_end
+            && status_code == 200
+            && accounting.state.energy.settings().enabled)
+            .then(UsageEnergyStamp::default);
+        let energy_now = |a: &StreamAccounting| {
+            a.state.energy.figures(
+                &a.energy,
+                a.request_start.elapsed().as_millis() as u32,
+                a.queue_wait_ms,
+            )
+        };
         let mut broke_off = false;
         // Characters of generated text delivered so far, for billing a stream
         // the upstream breaks off before reporting usage.
@@ -3400,6 +3427,13 @@ async fn run_pipeline(
                             cacheable = false;
                             full = Vec::new();
                         }
+                    }
+                    let chunk = match energy_stamp.as_mut() {
+                        Some(stamp) => stamp.push(chunk, || energy_now(&accounting)),
+                        None => chunk,
+                    };
+                    if chunk.is_empty() {
+                        continue;
                     }
                     crate::upstream_failure::remember_sent(&mut sent_tail, &chunk);
                     yield Ok::<Bytes, std::io::Error>(chunk);
@@ -3439,6 +3473,18 @@ async fn run_pipeline(
                             full = Vec::new();
                         }
                     }
+                    let rest = match energy_stamp.as_mut() {
+                        Some(stamp) => stamp.push(rest, || energy_now(&accounting)),
+                        None => rest,
+                    };
+                    if !rest.is_empty() {
+                        crate::upstream_failure::remember_sent(&mut sent_tail, &rest);
+                        yield Ok::<Bytes, std::io::Error>(rest);
+                    }
+                }
+            }
+            if let Some(rest) = energy_stamp.take().map(UsageEnergyStamp::finish) {
+                if !rest.is_empty() {
                     crate::upstream_failure::remember_sent(&mut sent_tail, &rest);
                     yield Ok::<Bytes, std::io::Error>(rest);
                 }
@@ -3633,6 +3679,128 @@ impl UsageChunkFilter {
     fn finish(self) -> Bytes {
         Bytes::from(self.pending)
     }
+}
+
+/// Adds the request's measured energy and carbon to the usage a client
+/// receives, as `usage.energy_wh` and `usage.co2_g`. Only events that carry
+/// usage are parsed and rewritten; every other byte passes through as is. The
+/// figures are read when the usage event goes by, the end of the answer, so
+/// they match what settlement records to within that moment.
+#[derive(Default)]
+struct UsageEnergyStamp {
+    pending: Vec<u8>,
+}
+
+impl UsageEnergyStamp {
+    fn push(&mut self, chunk: Bytes, figures: impl Fn() -> crate::energy::EnergyFigures) -> Bytes {
+        if self.pending.is_empty()
+            && (chunk.ends_with(b"\n\n") || chunk.ends_with(b"\r\n\r\n"))
+            && find_bytes(&chunk, b"prompt_tokens").is_none()
+        {
+            return chunk;
+        }
+        self.pending.extend_from_slice(&chunk);
+        let mut out = Vec::with_capacity(self.pending.len() + 64);
+        while let Some(end) = sse_event_end(&self.pending) {
+            let event: Vec<u8> = self.pending.drain(..end).collect();
+            match stamp_usage_event(&event, &figures) {
+                Some(stamped) => out.extend_from_slice(&stamped),
+                None => out.extend_from_slice(&event),
+            }
+        }
+        // An event this long without its end is not a usage event: let it go.
+        if self.pending.len() > USAGE_FILTER_MAX_PENDING {
+            out.extend_from_slice(&self.pending);
+            self.pending.clear();
+        }
+        Bytes::from(out)
+    }
+
+    fn finish(self) -> Bytes {
+        Bytes::from(self.pending)
+    }
+}
+
+/// Writes `energy_wh` and `co2_g` into a body's `usage` object (chat and text
+/// completion shape), rounded to a millionth. False when there is no such
+/// object or nothing was measured.
+fn stamp_usage(value: &mut serde_json::Value, figures: crate::energy::EnergyFigures) -> bool {
+    let Some(usage) = value
+        .get_mut("usage")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return false;
+    };
+    if !usage.contains_key("prompt_tokens")
+        || !figures.energy_wh.is_finite()
+        || figures.energy_wh <= 0.0
+    {
+        return false;
+    }
+    let round = |n: f64| (n * 1e6).round() / 1e6;
+    usage.insert(
+        "energy_wh".into(),
+        serde_json::json!(round(figures.energy_wh)),
+    );
+    if figures.co2_g.is_finite() && figures.co2_g > 0.0 {
+        usage.insert("co2_g".into(), serde_json::json!(round(figures.co2_g)));
+    }
+    true
+}
+
+/// [`UsageEnergyStamp`] for a whole buffered body: JSON, or SSE the gateway
+/// assembled for a client that asked to stream.
+fn stamp_body(body: Bytes, content_type: &str, figures: crate::energy::EnergyFigures) -> Bytes {
+    if content_type.starts_with("text/event-stream") {
+        let mut stamp = UsageEnergyStamp::default();
+        let mut out = stamp.push(body, || figures).to_vec();
+        out.extend_from_slice(&stamp.finish());
+        return Bytes::from(out);
+    }
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return body;
+    };
+    if !stamp_usage(&mut value, figures) {
+        return body;
+    }
+    serde_json::to_vec(&value).map(Bytes::from).unwrap_or(body)
+}
+
+/// One SSE event with its usage stamped, or None to send it unchanged.
+fn stamp_usage_event(
+    event: &[u8],
+    figures: &dyn Fn() -> crate::energy::EnergyFigures,
+) -> Option<Vec<u8>> {
+    find_bytes(event, b"prompt_tokens")?;
+    let text = std::str::from_utf8(event).ok()?;
+    let mut data = Vec::new();
+    let mut other = Vec::new();
+    for line in text.lines() {
+        match line.trim_start().strip_prefix("data:") {
+            Some(payload) => data.push(payload.trim()),
+            None if line.trim().is_empty() => {}
+            None => other.push(line),
+        }
+    }
+    let mut value: serde_json::Value = serde_json::from_str(&data.join("\n")).ok()?;
+    if !stamp_usage(&mut value, figures()) {
+        return None;
+    }
+    let end = if event.ends_with(b"\r\n\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let mut out = String::with_capacity(event.len() + 64);
+    for line in other {
+        out.push_str(line);
+        out.push_str(end);
+    }
+    out.push_str("data: ");
+    out.push_str(&serde_json::to_string(&value).ok()?);
+    out.push_str(end);
+    out.push_str(end);
+    Some(out.into_bytes())
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -9967,6 +10135,89 @@ mod lifecycle_tests {
         assert_eq!(
             run_filter(&[crlf.as_bytes()]),
             format!("{a}{done}").replace("\n\n", "\r\n\r\n")
+        );
+    }
+
+    fn run_stamp(chunks: &[&[u8]], figures: crate::energy::EnergyFigures) -> String {
+        let mut stamp = UsageEnergyStamp::default();
+        let mut out = Vec::new();
+        for c in chunks {
+            out.extend_from_slice(&stamp.push(Bytes::copy_from_slice(c), || figures));
+        }
+        out.extend_from_slice(&stamp.finish());
+        String::from_utf8(out).unwrap()
+    }
+
+    fn measured(energy_wh: f64, co2_g: f64) -> crate::energy::EnergyFigures {
+        crate::energy::EnergyFigures {
+            energy_wh,
+            energy_cost_usd: 0.0,
+            co2_g,
+        }
+    }
+
+    #[test]
+    fn the_usage_event_carries_the_measured_energy_and_content_is_untouched() {
+        let a = content_event("Hel");
+        let u = usage_event();
+        let done = "data: [DONE]\n\n";
+        let joined = format!("{a}{u}{done}");
+        let bytes = joined.as_bytes();
+        // Split inside the usage event, as an upstream may.
+        let cut = a.len() + 20;
+        let out = run_stamp(
+            &[&bytes[..cut], &bytes[cut..]],
+            measured(0.0263512345, 8.88),
+        )
+        .replace("\r\n", "\n");
+        assert!(out.starts_with(&a), "{out}");
+        assert!(out.ends_with(done), "{out}");
+        let usage = &out[a.len()..out.len() - done.len()];
+        let value: serde_json::Value =
+            serde_json::from_str(usage.trim().strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(value["usage"]["prompt_tokens"], 7);
+        assert_eq!(value["usage"]["energy_wh"], 0.026351);
+        assert_eq!(value["usage"]["co2_g"], 8.88);
+        assert_eq!(value["choices"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn nothing_measured_leaves_the_stream_byte_for_byte() {
+        let a = content_event("hi");
+        let u = usage_event();
+        let done = "data: [DONE]\n\n";
+        let joined = format!("{a}{u}{done}");
+        assert_eq!(run_stamp(&[joined.as_bytes()], measured(0.0, 0.0)), joined);
+        let crlf = joined.replace("\n\n", "\r\n\r\n");
+        assert_eq!(run_stamp(&[crlf.as_bytes()], measured(0.0, 0.0)), crlf);
+        // Measured energy keeps the stream's own framing.
+        let stamped = run_stamp(&[crlf.as_bytes()], measured(1.5, 0.5));
+        assert!(stamped.contains("\"energy_wh\":1.5"), "{stamped}");
+        assert!(stamped.ends_with("data: [DONE]\r\n\r\n"));
+        assert!(!stamped.replace("\r\n", "").contains('\n'), "{stamped}");
+    }
+
+    #[test]
+    fn a_whole_json_answer_carries_the_measured_energy() {
+        let body = serde_json::json!({
+            "choices": [{ "index": 0, "message": { "role": "assistant", "content": "hi" } }],
+            "usage": { "prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10 },
+        });
+        let bytes = Bytes::from(serde_json::to_vec(&body).unwrap());
+        let out = stamp_body(bytes.clone(), "application/json", measured(2.0, 0.674));
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(value["usage"]["energy_wh"], 2.0);
+        assert_eq!(value["usage"]["co2_g"], 0.674);
+        assert_eq!(value["choices"], body["choices"]);
+        // Nothing measured, or no usage, sends the body unchanged.
+        assert_eq!(
+            stamp_body(bytes.clone(), "application/json", measured(0.0, 0.0)),
+            bytes
+        );
+        let plain = Bytes::from_static(b"{\"data\":[]}");
+        assert_eq!(
+            stamp_body(plain.clone(), "application/json", measured(2.0, 1.0)),
+            plain
         );
     }
 
