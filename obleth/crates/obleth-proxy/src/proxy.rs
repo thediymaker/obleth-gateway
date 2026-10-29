@@ -3384,7 +3384,8 @@ async fn run_pipeline(
         let mut energy_stamp = (expect_end
             && status_code == 200
             && accounting.state.energy.settings().enabled)
-            .then(UsageEnergyStamp::default);
+            .then(|| UsageEnergyStamp::for_content_type(&content_type_str))
+        .flatten();
         let energy_now = |a: &StreamAccounting| {
             a.state.energy.figures(
                 &a.energy,
@@ -3483,7 +3484,9 @@ async fn run_pipeline(
                     }
                 }
             }
-            if let Some(rest) = energy_stamp.take().map(UsageEnergyStamp::finish) {
+            if let Some(rest) = energy_stamp
+                .take()
+                .map(|s| s.finish(|| energy_now(&accounting))) {
                 if !rest.is_empty() {
                     crate::upstream_failure::remember_sent(&mut sent_tail, &rest);
                     yield Ok::<Bytes, std::io::Error>(rest);
@@ -3682,17 +3685,50 @@ impl UsageChunkFilter {
 }
 
 /// Adds the request's measured energy and carbon to the usage a client
-/// receives, as `usage.energy_wh` and `usage.co2_g`. Only events that carry
-/// usage are parsed and rewritten; every other byte passes through as is. The
-/// figures are read when the usage event goes by, the end of the answer, so
-/// they match what settlement records to within that moment.
+/// receives, as `usage.energy_wh` and `usage.co2_g`. In a stream only events
+/// that carry usage are parsed and rewritten, and every other byte passes
+/// through as is; a JSON answer is held until it ends, as a client can read it
+/// only whole. The figures are read as the usage goes by, the end of the
+/// answer, so they match what settlement records to within that moment.
 #[derive(Default)]
 struct UsageEnergyStamp {
     pending: Vec<u8>,
+    /// A whole JSON answer rather than a stream of events.
+    json: bool,
+    /// The JSON answer outgrew [`USAGE_STAMP_MAX_BODY`] and passes unchanged.
+    passing: bool,
 }
 
+/// The largest JSON answer held to add energy to its usage.
+const USAGE_STAMP_MAX_BODY: usize = 1024 * 1024;
+
 impl UsageEnergyStamp {
+    /// A stamp for an answer of this content type; None for one it can't read.
+    fn for_content_type(content_type: &str) -> Option<Self> {
+        if content_type.starts_with("text/event-stream") {
+            Some(Self::default())
+        } else if content_type.contains("json") {
+            Some(Self {
+                json: true,
+                ..Self::default()
+            })
+        } else {
+            None
+        }
+    }
+
     fn push(&mut self, chunk: Bytes, figures: impl Fn() -> crate::energy::EnergyFigures) -> Bytes {
+        if self.json {
+            if self.passing {
+                return chunk;
+            }
+            self.pending.extend_from_slice(&chunk);
+            if self.pending.len() > USAGE_STAMP_MAX_BODY {
+                self.passing = true;
+                return Bytes::from(std::mem::take(&mut self.pending));
+            }
+            return Bytes::new();
+        }
         if self.pending.is_empty()
             && (chunk.ends_with(b"\n\n") || chunk.ends_with(b"\r\n\r\n"))
             && find_bytes(&chunk, b"prompt_tokens").is_none()
@@ -3716,7 +3752,10 @@ impl UsageEnergyStamp {
         Bytes::from(out)
     }
 
-    fn finish(self) -> Bytes {
+    fn finish(self, figures: impl Fn() -> crate::energy::EnergyFigures) -> Bytes {
+        if self.json && !self.passing && !self.pending.is_empty() {
+            return stamp_body(Bytes::from(self.pending), "application/json", figures());
+        }
         Bytes::from(self.pending)
     }
 }
@@ -3754,7 +3793,7 @@ fn stamp_body(body: Bytes, content_type: &str, figures: crate::energy::EnergyFig
     if content_type.starts_with("text/event-stream") {
         let mut stamp = UsageEnergyStamp::default();
         let mut out = stamp.push(body, || figures).to_vec();
-        out.extend_from_slice(&stamp.finish());
+        out.extend_from_slice(&stamp.finish(|| figures));
         return Bytes::from(out);
     }
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&body) else {
@@ -10144,7 +10183,7 @@ mod lifecycle_tests {
         for c in chunks {
             out.extend_from_slice(&stamp.push(Bytes::copy_from_slice(c), || figures));
         }
-        out.extend_from_slice(&stamp.finish());
+        out.extend_from_slice(&stamp.finish(|| figures));
         String::from_utf8(out).unwrap()
     }
 
@@ -10209,6 +10248,16 @@ mod lifecycle_tests {
         assert_eq!(value["usage"]["energy_wh"], 2.0);
         assert_eq!(value["usage"]["co2_g"], 0.674);
         assert_eq!(value["choices"], body["choices"]);
+        // Passed through in pieces, it is held and stamped once it ends.
+        let mut stamp = UsageEnergyStamp::for_content_type("application/json").unwrap();
+        let (a, b) = bytes.split_at(bytes.len() / 2);
+        assert!(stamp
+            .push(Bytes::copy_from_slice(a), || measured(2.0, 0.674))
+            .is_empty());
+        assert!(stamp
+            .push(Bytes::copy_from_slice(b), || measured(2.0, 0.674))
+            .is_empty());
+        assert_eq!(stamp.finish(|| measured(2.0, 0.674)), out);
         // Nothing measured, or no usage, sends the body unchanged.
         assert_eq!(
             stamp_body(bytes.clone(), "application/json", measured(0.0, 0.0)),
