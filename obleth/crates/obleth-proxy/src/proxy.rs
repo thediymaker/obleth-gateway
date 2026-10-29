@@ -2387,6 +2387,9 @@ async fn run_pipeline(
                     drafted_by,
                 } => {
                     drop(permit);
+                    // Zero figures (accounting off, nothing measured) leave it as is.
+                    let mut body = body;
+                    stamp_usage(&mut body, accounting.energy_now());
                     let total_ms = request_start.elapsed().as_millis() as u32;
                     let _ = settle_guard
                         .complete(accounting.settle(
@@ -2424,13 +2427,27 @@ async fn run_pipeline(
                         // item; the client is told once the request has
                         // settled (see the streaming tool loop below).
                         let mut cut = false;
+                        let mut energy_stamp = accounting.energy_stamp("text/event-stream");
                         while let Some(item) = driver.next().await {
                             match item {
-                                Ok(chunk) => yield Ok(chunk),
+                                Ok(chunk) => {
+                                    let chunk = match energy_stamp.as_mut() {
+                                        Some(stamp) => stamp.push(chunk, || accounting.energy_now()),
+                                        None => chunk,
+                                    };
+                                    if !chunk.is_empty() {
+                                        yield Ok(chunk);
+                                    }
+                                }
                                 Err(_) => {
                                     cut = true;
                                     break;
                                 }
+                            }
+                        }
+                        if let Some(rest) = energy_stamp.take().map(|s| s.finish(|| accounting.energy_now())) {
+                            if !rest.is_empty() {
+                                yield Ok(rest);
                             }
                         }
                         drop(permit);
@@ -2995,18 +3012,32 @@ async fn run_pipeline(
                     // would otherwise settle the request as a client
                     // disconnect.
                     let mut cut = false;
+                    // The usage the loop reports carries the energy measured
+                    // for the whole request, every turn included.
+                    let mut energy_stamp = accounting.energy_stamp("text/event-stream");
                     while let Some(item) = driver.next().await {
                         match item {
                             Ok(chunk) => {
                                 if let Some(monitor) = output_monitor.as_mut() {
                                     monitor.push(&chunk);
                                 }
-                                yield Ok(chunk);
+                                let chunk = match energy_stamp.as_mut() {
+                                    Some(stamp) => stamp.push(chunk, || accounting.energy_now()),
+                                    None => chunk,
+                                };
+                                if !chunk.is_empty() {
+                                    yield Ok(chunk);
+                                }
                             }
                             Err(_) => {
                                 cut = true;
                                 break;
                             }
+                        }
+                    }
+                    if let Some(rest) = energy_stamp.take().map(|s| s.finish(|| accounting.energy_now())) {
+                        if !rest.is_empty() {
+                            yield Ok(rest);
                         }
                     }
                     drop(permit);
@@ -3381,18 +3412,9 @@ async fn run_pipeline(
         let mut cacheable = store_in_cache.is_some();
         let mut usage_filter = strip_usage_chunk.then(UsageChunkFilter::default);
         // The usage a client asked for also carries the energy measured for it.
-        let mut energy_stamp = (expect_end
-            && status_code == 200
-            && accounting.state.energy.settings().enabled)
-            .then(|| UsageEnergyStamp::for_content_type(&content_type_str))
-        .flatten();
-        let energy_now = |a: &StreamAccounting| {
-            a.state.energy.figures(
-                &a.energy,
-                a.request_start.elapsed().as_millis() as u32,
-                a.queue_wait_ms,
-            )
-        };
+        let mut energy_stamp = (expect_end && status_code == 200)
+            .then(|| accounting.energy_stamp(&content_type_str))
+            .flatten();
         let mut broke_off = false;
         // Characters of generated text delivered so far, for billing a stream
         // the upstream breaks off before reporting usage.
@@ -3430,7 +3452,7 @@ async fn run_pipeline(
                         }
                     }
                     let chunk = match energy_stamp.as_mut() {
-                        Some(stamp) => stamp.push(chunk, || energy_now(&accounting)),
+                        Some(stamp) => stamp.push(chunk, || accounting.energy_now()),
                         None => chunk,
                     };
                     if chunk.is_empty() {
@@ -3475,7 +3497,7 @@ async fn run_pipeline(
                         }
                     }
                     let rest = match energy_stamp.as_mut() {
-                        Some(stamp) => stamp.push(rest, || energy_now(&accounting)),
+                        Some(stamp) => stamp.push(rest, || accounting.energy_now()),
                         None => rest,
                     };
                     if !rest.is_empty() {
@@ -3486,7 +3508,7 @@ async fn run_pipeline(
             }
             if let Some(rest) = energy_stamp
                 .take()
-                .map(|s| s.finish(|| energy_now(&accounting))) {
+                .map(|s| s.finish(|| accounting.energy_now())) {
                 if !rest.is_empty() {
                     crate::upstream_failure::remember_sent(&mut sent_tail, &rest);
                     yield Ok::<Bytes, std::io::Error>(rest);
@@ -4239,6 +4261,26 @@ pub(crate) struct StreamAccounting {
 }
 
 impl StreamAccounting {
+    /// The energy measured for this request up to now.
+    fn energy_now(&self) -> crate::energy::EnergyFigures {
+        self.state.energy.figures(
+            &self.energy,
+            self.request_start.elapsed().as_millis() as u32,
+            self.queue_wait_ms,
+        )
+    }
+
+    /// A stamp that adds the measured energy to the usage of an answer of
+    /// this content type; None while energy accounting is off.
+    fn energy_stamp(&self, content_type: &str) -> Option<UsageEnergyStamp> {
+        self.state
+            .energy
+            .settings()
+            .enabled
+            .then(|| UsageEnergyStamp::for_content_type(content_type))
+            .flatten()
+    }
+
     fn monitor(
         &self,
         policy: Option<&obleth_config::GuardrailsPolicy>,
@@ -10234,6 +10276,25 @@ mod lifecycle_tests {
         assert!(stamped.contains("\"energy_wh\":1.5"), "{stamped}");
         assert!(stamped.ends_with("data: [DONE]\r\n\r\n"));
         assert!(!stamped.replace("\r\n", "").contains('\n'), "{stamped}");
+    }
+
+    #[test]
+    fn the_tool_loops_own_usage_chunk_carries_the_measured_energy() {
+        let a = crate::boons::tool_stream::content_chunk("c1", "m", 1, "Hi");
+        let u = crate::boons::tool_stream::usage_chunk("c1", "m", 1, 575, 13);
+        let done = crate::boons::tool_stream::done();
+        let out = run_stamp(
+            &[a.as_bytes(), u.as_bytes(), done.as_bytes()],
+            measured(0.47, 0.16),
+        );
+        assert!(out.starts_with(&a), "{out}");
+        assert!(out.ends_with(done), "{out}");
+        let usage = &out[a.len()..out.len() - done.len()];
+        let value: serde_json::Value =
+            serde_json::from_str(usage.trim().strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(value["usage"]["prompt_tokens"], 575);
+        assert_eq!(value["usage"]["energy_wh"], 0.47);
+        assert_eq!(value["usage"]["co2_g"], 0.16);
     }
 
     #[test]
