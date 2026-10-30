@@ -32,13 +32,14 @@ beforeEach(() => {
           tenants: [{ value: "t-cs", label: "cs-teaching", requests: 40, errors: 2 }],
           keys: [{ value: "k-1", label: "canvas-tutor · sk-ct9", requests: 40, errors: 2 }],
           request_types: [{ value: "chat", label: "", requests: 40, errors: 2 }],
+          error_classes: [{ value: "", label: "", requests: 38, errors: 0 }, { value: "upstream_error", label: "", requests: 1, errors: 1 }, { value: "limit", label: "", requests: 1, errors: 1 }],
           failures: [{ status_code: 502, model: "granite41-30b", requests: 2 }],
         }
       : url.includes("/histogram")
-      ? { bucket_ms: 60_000, buckets: [{ bucket_ms: Math.floor((now - 60_000) / 60_000) * 60_000, requests: 40, errors: 2 }] }
+      ? { bucket_ms: 60_000, buckets: [{ bucket_ms: Math.floor((now - 60_000) / 60_000) * 60_000, requests: 40, errors: 2, platform_errors: 1 }] }
       : url.includes("status=error")
         ? [entry({ request_id: "bad00000-0000-0000-0000-000000000000", status_code: 502, cost_usd: 0, output_tokens: 0, ttft_ms: 0 })]
-        : [entry(), entry({ request_id: "abcd0000-0000-0000-0000-000000000000", model: "kimi-k2-7-code", status_code: 429, cost_usd: 0, total_ms: 3 })];
+        : [entry({ error_class: "", error_reason: "" }), entry({ request_id: "abcd0000-0000-0000-0000-000000000000", model: "kimi-k2-7-code", status_code: 429, cost_usd: 0, total_ms: 3, error_class: "limit", error_reason: "Rate limit of 60 requests a minute reached for key canvas-tutor" })];
     return { ok: true, json: async () => body } as Response;
   }));
   host = document.createElement("div");
@@ -80,6 +81,13 @@ describe("the request log", () => {
     const rows = host.querySelectorAll("tbody tr");
     expect(rows).toHaveLength(2);
     expect(rows[1].textContent).toContain("429");
+    // A failed row says why, in plain words, with the reason as recorded.
+    expect(rows[1].textContent).toContain("Over limit or budget");
+    expect(rows[1].textContent).toContain("Rate limit of 60 requests a minute reached");
+    expect(rows[0].textContent).not.toContain("HTTP");
+    // The header and the strip split the failures by side.
+    expect(host.textContent).toContain("5.0% failed, 2.5% on the platform's side");
+    expect(host.querySelector('[aria-label="Requests over time"]')!.textContent).toContain("Failed on the platform");
     expect(calls.some((c) => c.startsWith("/api/live/usage/logs/histogram?"))).toBe(true);
   });
 
@@ -94,6 +102,21 @@ describe("the request log", () => {
     expect(last.some((c) => c.startsWith("/api/live/usage/logs/histogram?"))).toBe(true);
     expect(host.querySelectorAll("tbody tr")).toHaveLength(1);
     expect(box.value).toBe("");
+  });
+
+  it("filters to one side's failures, and one kind, from the search box", async () => {
+    await render();
+    const box = host.querySelector<HTMLInputElement>('input[aria-label="Search requests"]')!;
+    await act(async () => type(box, "fault:platform class:capacity,network"));
+    await act(async () => box.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })));
+    await act(async () => { await new Promise((r) => setTimeout(r, 0)); });
+    const sent = calls.filter((c) => c.includes("fault=platform") && c.includes("error_class=capacity%2Cnetwork"));
+    expect(sent.some((c) => c.startsWith("/api/live/usage/logs?"))).toBe(true);
+    expect(sent.some((c) => c.startsWith("/api/live/usage/logs/histogram?"))).toBe(true);
+    expect(sent.some((c) => c.startsWith("/api/live/usage/logs/facets?"))).toBe(true);
+    expect(host.textContent).toContain("Failed on the platform's side");
+    expect(host.textContent).toContain("Why: No capacity, Couldn't reach the model");
+    expect(host.querySelector('[aria-label="Failures by"]')).not.toBeNull();
   });
 
   it("says when a search token matches nothing", async () => {
@@ -132,6 +155,14 @@ describe("the request log", () => {
     const panel = host.querySelector('[aria-label="What\'s in this window"]')!;
     expect(panel.textContent).toContain("502 Bad gateway");
     expect(panel.textContent).toContain("canvas-tutor · sk-ct9");
+    // Why the failures failed, with each side named and successes left out.
+    expect(panel.textContent).toContain("Why it failed");
+    expect(panel.textContent).toContain("Model server error · Platform");
+    expect(panel.textContent).toContain("Over limit or budget · Caller");
+    const why = [...panel.querySelectorAll("button")].find((b) => b.textContent?.startsWith("Model server error"))!;
+    await act(async () => why.click());
+    await act(async () => { await new Promise((r) => setTimeout(r, 0)); });
+    expect(calls.some((c) => c.startsWith("/api/live/usage/logs?") && c.includes("error_class=upstream_error"))).toBe(true);
     const pair = [...panel.querySelectorAll("button")].find((b) => b.textContent?.includes("granite41-30b"))!;
     await act(async () => pair.click());
     await act(async () => { await new Promise((r) => setTimeout(r, 0)); });

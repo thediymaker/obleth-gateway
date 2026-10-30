@@ -1,3 +1,4 @@
+import { parseClasses, parseFault } from "@/lib/failure-classes";
 import type { SpanEntry, UsageLogEntry } from "@/lib/obleth";
 
 /**
@@ -38,6 +39,10 @@ export interface LogFilters {
   status: "" | "success" | "error";
   /** One exact HTTP status, as text ("" for any). */
   statusCode: string;
+  /** Only the platform's failures, or only the callers' ("" for either, and successes). */
+  fault: "" | "platform" | "client";
+  /** Failure classes (lib/failure-classes.ts), one or several joined by commas. */
+  errorClass: string;
   /** `model`, `tenantId` and `keyId` each hold one value, or several joined by commas (a `*` search). */
   model: string;
   tenantId: string;
@@ -56,6 +61,8 @@ export const DEFAULT_LOG_FILTERS: LogFilters = {
   window: "1h",
   status: "",
   statusCode: "",
+  fault: "",
+  errorClass: "",
   model: "",
   tenantId: "",
   keyId: "",
@@ -92,6 +99,8 @@ export function logParams(f: LogFilters, range: { since: number; until: number }
   if (f.window === "custom") p.set("until_ms", String(Math.floor(range.until)));
   if (f.status) p.set("status", f.status);
   if (f.statusCode) p.set("status_code", f.statusCode);
+  if (f.fault) p.set("fault", f.fault);
+  if (f.errorClass) p.set("error_class", f.errorClass);
   if (f.model) p.set("model", f.model);
   if (f.tenantId) p.set("tenant_id", f.tenantId);
   if (f.keyId) p.set("key_id", f.keyId);
@@ -105,7 +114,7 @@ export function logParams(f: LogFilters, range: { since: number; until: number }
 }
 
 export function filtersActive(f: LogFilters): boolean {
-  return !!(f.status || f.statusCode || f.model || f.tenantId || f.keyId || f.requestType || f.sessionId || f.requestId || f.tracedOnly || f.includeInternal || f.window === "custom");
+  return !!(f.status || f.statusCode || f.fault || f.errorClass || f.model || f.tenantId || f.keyId || f.requestType || f.sessionId || f.requestId || f.tracedOnly || f.includeInternal || f.window === "custom");
 }
 
 // ---------------------------------------------------------------------------
@@ -139,11 +148,18 @@ export interface SearchLookups {
   models: string[];
 }
 
+/** Whether the filters show failures only: failed, a 4xx or 5xx status, a side or a class. */
+export function failuresOnly(f: LogFilters): boolean {
+  return f.status === "error" || Number(f.statusCode) >= 400 || !!f.fault || !!f.errorClass;
+}
+
 /**
  * Turn `status:error model:glm-5-3 team:cs-teaching 7c1e` into filters.
  * Teams and keys resolve by name (or key prefix), case-insensitively. In
  * `model:`, `team:` and `key:` a `*` stands for any run of characters and
- * picks every match (`key:jlee379*`). A bare word with a `*`, or one that
+ * picks every match (`key:jlee379*`). `fault:platform` or `fault:caller`
+ * keeps one side's failures, and `class:capacity,network` those classes
+ * (lib/failure-classes.ts). A bare word with a `*`, or one that
  * cannot be a request id, is looked up as a key, then a team, then a model;
  * one without a `*` matches names that start with it. Hex is a request-id
  * prefix. A token that matches nothing comes back in `unknown`, and one that
@@ -207,6 +223,14 @@ export function parseSearch(text: string, lookups: SearchLookups): { patch: Part
       else if (["error", "failed", "fail"].includes(v)) patch.status = "error";
       else if (["ok", "success", "succeeded"].includes(v)) patch.status = "success";
       else unknown.push(token);
+    } else if (key === "fault" || key === "side") {
+      const side = parseFault(value);
+      if (side) patch.fault = side;
+      else unknown.push(token);
+    } else if (key === "class" || key === "why") {
+      const classes = parseClasses(value);
+      if (classes) patch.errorClass = classes.join(",");
+      else unknown.push(token);
     } else if (key === "model") {
       apply(token, value, findModels(value));
     } else if (key === "team" || key === "tenant") {
@@ -258,7 +282,8 @@ export function listLabel(f: LogFilters, field: MatchField, noun: string): strin
 // The histogram
 // ---------------------------------------------------------------------------
 
-export interface HistogramBucket { bucket_ms: number; requests: number; errors: number }
+/** `platform_errors` is the part of `errors` that were the platform's; absent from older gateways. */
+export interface HistogramBucket { bucket_ms: number; requests: number; errors: number; platform_errors?: number }
 
 /** Every bucket across the window, the missing ones as zero, oldest first. */
 export function fillHistogram(buckets: HistogramBucket[], range: { since: number; until: number }, bucketMs: number): HistogramBucket[] {

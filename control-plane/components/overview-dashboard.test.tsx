@@ -20,8 +20,8 @@ const models = [
 const window: OverviewWindow = {
   range: "24h",
   now: Date.now(),
-  summary: { ...EMPTY_OVERVIEW_SUMMARY, detailed: true, requests: 1200, tokens: 50_000, errors: 6, cost: 3.2, hasPricing: true, activeTenants: 2, p50TtftMs: 380, avgTtftMs: 520 },
-  previous: { requests: 1000, tokens: 40_000, errors: 5, cost: 2 },
+  summary: { ...EMPTY_OVERVIEW_SUMMARY, detailed: true, classified: true, requests: 1200, tokens: 50_000, errors: 6, platformErrors: 2, cost: 3.2, hasPricing: true, activeTenants: 2, p50TtftMs: 380, avgTtftMs: 520 },
+  previous: { requests: 1000, tokens: 40_000, errors: 5, platformErrors: 1, cost: 2 },
   series: [],
   models: [],
   tenants: [{ id: "t1", name: "research", requests: 900, tokens: 40_000, cost: 2.5 }],
@@ -69,11 +69,32 @@ describe("OverviewDashboard", () => {
     expect(text).toContain("nothing queued");
     expect(text).not.toContain("Needs attention");
     expect(text).toContain("▲ 20% vs yesterday");
-    expect(text).toContain("0.50%"); // 6 failed of 1,200
+    expect(text).toContain("0.17%"); // 2 of 1,200 failed on the platform's side
     expect(text).toContain("380 ms");
     expect(text).toContain("$3.20");
     expect(text).toContain("20.0% hits");
     expect(text).toContain("Response cache · 24h");
+  });
+
+  it("heads the failures tile with the platform's failures, callers' underneath, each linked to its requests", () => {
+    render([healthy("a", "alpha"), healthy("b", "beta")]);
+    const tile = [...host.querySelectorAll("a")].find((a) => a.getAttribute("href") === "/failures?range=24h")!.parentElement!.parentElement!;
+    expect(tile.textContent).toContain("Platform failures · 24h");
+    const links = [...tile.querySelectorAll("a")].map((a) => [a.textContent, a.getAttribute("href")]);
+    expect(links).toEqual([
+      ["Platform failures · 24h", "/failures?range=24h"],
+      ["0.17%", "/logs?fault=platform&window=24h"],
+      ["4 more from callers", "/logs?fault=client&window=24h"],
+    ]);
+  });
+
+  it("shows every failure as the error rate on a gateway that does not split them by side", () => {
+    window.summary = { ...window.summary, classified: false };
+    render([healthy("a", "alpha"), healthy("b", "beta")]);
+    expect(host.textContent).toContain("Error rate · 24h");
+    expect(host.textContent).toContain("0.50%"); // 6 failed of 1,200
+    expect([...host.querySelectorAll("a")].some((a) => a.getAttribute("href") === "/logs?status=error&window=24h")).toBe(true);
+    window.summary = { ...window.summary, classified: true };
   });
 
   it("says when the gateway is too old to report errors, rather than showing zero", () => {

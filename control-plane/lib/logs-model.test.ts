@@ -5,6 +5,7 @@ import {
   bucketLabel,
   DEFAULT_LOG_FILTERS,
   describeRequest,
+  failuresOnly,
   fillHistogram,
   globTest,
   helperCallsParams,
@@ -108,6 +109,13 @@ describe("the search box", () => {
     expect(parseSearch("nobody*", many).unknown).toEqual(["nobody*"]);
   });
 
+  it("reads whose failures and which kinds", () => {
+    expect(parseSearch("fault:platform", lookups).patch).toEqual({ fault: "platform" });
+    expect(parseSearch("fault:caller class:client_input,limit", lookups).patch).toEqual({ fault: "client", errorClass: "client_input,limit" });
+    expect(parseSearch("class:upstream-timeout", lookups).patch).toEqual({ errorClass: "upstream_timeout" });
+    expect(parseSearch("fault:everyone class:sunspots", lookups).unknown).toEqual(["fault:everyone", "class:sunspots"]);
+  });
+
   it("takes any type the gateway records", () => {
     expect(parseSearch("type:verdict", lookups).patch).toEqual({ requestType: "verdict" });
     expect(parseSearch("type:Some_New_Thing", lookups).patch).toEqual({ requestType: "some_new_thing" });
@@ -166,6 +174,15 @@ describe("the query both reads share", () => {
     expect(Object.fromEntries(p)).toEqual({ since_ms: "100", status: "error", model: "glm-5-3", limit: "50" });
     const zoomed = logParams({ ...DEFAULT_LOG_FILTERS, window: "custom", sinceMs: 100, untilMs: 200 }, { since: 100, until: 200 });
     expect(zoomed.get("until_ms")).toBe("200");
+  });
+
+  it("sends whose failures and which kinds, and counts either as looking at failures", () => {
+    const f = { ...DEFAULT_LOG_FILTERS, fault: "platform" as const, errorClass: "capacity,network" };
+    expect(Object.fromEntries(logParams(f, { since: 100, until: 200 }))).toEqual({ since_ms: "100", fault: "platform", error_class: "capacity,network" });
+    expect(failuresOnly(f)).toBe(true);
+    expect(failuresOnly({ ...DEFAULT_LOG_FILTERS, errorClass: "limit" })).toBe(true);
+    expect(failuresOnly({ ...DEFAULT_LOG_FILTERS, statusCode: "200" })).toBe(false);
+    expect(failuresOnly(DEFAULT_LOG_FILTERS)).toBe(false);
   });
 
   it("slides a preset window with the clock and keeps a zoomed one where it was", () => {

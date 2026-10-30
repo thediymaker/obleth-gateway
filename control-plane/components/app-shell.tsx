@@ -15,6 +15,7 @@ import {
   KeyRound,
   LayoutDashboard,
   LogOut,
+  OctagonAlert,
   PanelLeftClose,
   PanelLeftOpen,
   Plug,
@@ -49,6 +50,7 @@ const navGroups = [
     { href: "/deployments", label: "Deployments", icon: Rocket },
     { href: "/playground", label: "Playground", icon: FlaskConical },
     { href: "/logs", label: "Request Logs", icon: Radio },
+    { href: "/failures", label: "Failures", icon: OctagonAlert },
     { href: "/reports", label: "Reports", icon: BarChart3 },
   ] },
   { label: "Access", items: [

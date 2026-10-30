@@ -337,6 +337,23 @@ export function LogsSkeleton() {
   );
 }
 
+/** Failures: header, the two sides' tiles, then the grouped table. */
+export function FailuresSkeleton() {
+  return (
+    <Loading label="Loading failures">
+      <Header controls={2} />
+      <Tiles count={2} className="grid gap-3 sm:grid-cols-2" />
+      <SkeletonPanel className="gap-0 p-0">
+        {Array.from({ length: 10 }, (_, i) => (
+          <div key={i} className="flex items-center gap-4 border-t border-border px-4 py-3 first:border-t-0">
+            <Skeleton className="h-4 w-10" /><Skeleton className="h-5 w-16 rounded-full" /><Skeleton className="h-4 w-64" /><Skeleton className="h-4 w-32" /><Skeleton className="ml-auto h-4 w-20" />
+          </div>
+        ))}
+      </SkeletonPanel>
+    </Loading>
+  );
+}
+
 /** Reports: header, five tiles, the chart, the two ranked lists, then the table. */
 export function ReportsSkeleton() {
   return (

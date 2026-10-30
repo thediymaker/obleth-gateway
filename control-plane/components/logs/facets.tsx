@@ -1,7 +1,8 @@
 "use client";
 
 import { useState } from "react";
-import { HTTP_REASONS, listOf, pickOne, type LogFilters, type MatchField } from "@/lib/logs-model";
+import { classLabel, classSide, SIDE_LABEL } from "@/lib/failure-classes";
+import { failuresOnly as onlyFailures, HTTP_REASONS, listOf, pickOne, type LogFilters, type MatchField } from "@/lib/logs-model";
 import type { UsageLogFacet, UsageLogFacets } from "@/lib/obleth";
 import { compact } from "@/lib/overview-model";
 import { cn } from "@/lib/utils";
@@ -16,6 +17,7 @@ function List({
   active,
   mono,
   failuresOnly,
+  dim,
 }: {
   title: string;
   facets: UsageLogFacet[];
@@ -24,6 +26,8 @@ function List({
   active: (f: UsageLogFacet) => boolean;
   mono?: boolean;
   failuresOnly: boolean;
+  /** Lines whose failures show dim: the callers' rather than the platform's. */
+  dim?: (f: UsageLogFacet) => boolean;
 }) {
   const [all, setAll] = useState(false);
   const max = Math.max(1, ...facets.map((f) => f.requests));
@@ -50,7 +54,7 @@ function List({
               {!failuresOnly && f.errors > 0 && <span className="text-muted-foreground"> · {failShare >= 0.1 ? `${Math.round(failShare * 100)}%` : `${(failShare * 100).toFixed(1)}%`} failed</span>}
             </span>
             <span className="col-span-2 mt-0.5 flex h-1 overflow-hidden rounded-full bg-muted/50">
-              <span className="bg-foreground" style={{ width: `${(f.errors / max) * 100}%` }} />
+              <span className={dim?.(f) ? "bg-muted-foreground" : "bg-foreground"} style={{ width: `${(f.errors / max) * 100}%` }} />
               <span className="bg-muted-foreground/50" style={{ width: `${((f.requests - f.errors) / max) * 100}%` }} />
             </span>
           </button>
@@ -67,11 +71,14 @@ function List({
 
 /**
  * What the requests in view are made of: the busiest status codes, models,
- * teams, keys and types, each clickable to narrow the list to it. Looking at
- * failures, it leads with the status code and model pairs that fail most.
+ * teams, keys and types, and why the failures failed, each clickable to
+ * narrow the list to it. Looking at failures, it leads with the status code
+ * and model pairs that fail most.
  */
 export function Facets({ facets, filters, onPatch, loading }: { facets: UsageLogFacets | undefined; filters: LogFilters; onPatch: (p: Partial<LogFilters>) => void; loading: boolean }) {
-  const failuresOnly = filters.status === "error" || Number(filters.statusCode) >= 400;
+  const failuresOnly = onlyFailures(filters);
+  // Successes come back under the empty class; a gateway too old to classify has no list.
+  const classes = facets?.error_classes?.filter((f) => f.value);
   if (!facets) {
     return <div className={cn("rounded-xl border border-border bg-card", loading && "skeleton h-[168px]")} />;
   }
@@ -114,7 +121,18 @@ export function Facets({ facets, filters, onPatch, loading }: { facets: UsageLog
               </div>
             </div>
           )}
-          <div className="grid gap-x-6 gap-y-4 sm:grid-cols-2 lg:grid-cols-5">
+          <div className={cn("grid gap-x-6 gap-y-4 sm:grid-cols-2", classes ? "lg:grid-cols-3 xl:grid-cols-6" : "lg:grid-cols-5")}>
+            {classes && (
+              <List
+                title="Why it failed"
+                facets={classes}
+                label={(f) => { const side = classSide(f.value); return side ? `${classLabel(f.value)} · ${SIDE_LABEL[side]}` : classLabel(f.value); }}
+                active={(f) => listOf(filters.errorClass).includes(f.value)}
+                onPick={(f) => onPatch({ errorClass: filters.errorClass === f.value ? "" : f.value })}
+                dim={(f) => classSide(f.value) !== "platform"}
+                failuresOnly={failuresOnly}
+              />
+            )}
             <List
               title="Status"
               facets={facets.status_codes}

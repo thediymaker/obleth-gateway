@@ -1,4 +1,4 @@
-import type { UsageLogParams, UsageLogStatus } from "@/lib/obleth";
+import type { FaultSide, UsageLogParams, UsageLogStatus } from "@/lib/obleth";
 
 /** The log's filters and cursor from a request's query string. */
 export function logParamsFrom(sp: URLSearchParams): UsageLogParams {
@@ -10,6 +10,8 @@ export function logParamsFrom(sp: URLSearchParams): UsageLogParams {
   const statusRaw = str("status");
   const status: UsageLogStatus | undefined =
     statusRaw === "success" || statusRaw === "error" ? statusRaw : undefined;
+  const faultRaw = str("fault");
+  const fault: FaultSide | undefined = faultRaw === "platform" || faultRaw === "client" ? faultRaw : undefined;
 
   return {
     tenantId: str("tenant_id"),
@@ -19,6 +21,8 @@ export function logParamsFrom(sp: URLSearchParams): UsageLogParams {
     sessionId: str("session_id"),
     status,
     statusCode: num("status_code"),
+    fault,
+    errorClass: str("error_class"),
     requestId: str("request_id"),
     sinceMs: num("since_ms"),
     untilMs: num("until_ms"),

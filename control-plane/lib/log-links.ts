@@ -8,6 +8,10 @@ export interface LogsLink {
   status?: "error" | "success";
   /** One exact HTTP status. */
   code?: number;
+  /** Only the platform's failures, or only the callers'. */
+  fault?: "platform" | "client";
+  /** One failure class (lib/failure-classes.ts), or several joined by commas. */
+  class?: string;
   model?: string;
   team?: string;
   key?: string;

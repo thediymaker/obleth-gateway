@@ -40,6 +40,7 @@ import {
   type Named,
   type SavedView,
 } from "@/lib/logs-model";
+import { classLabel, classSide, failureReason, SIDE_PHRASE } from "@/lib/failure-classes";
 import type { UsageLogEntry, UsageLogFacets, UsageLogHistogram } from "@/lib/obleth";
 import { cn, getJson } from "@/lib/utils";
 
@@ -64,8 +65,12 @@ function Toggle({ on, onClick, children }: { on: boolean; onClick: () => void; c
   );
 }
 
-/** Requests per bucket, failures bright. Drag across it to zoom the window to that stretch. */
-function Strip({ buckets, bucketMs, loading, onZoom }: { buckets: HistogramBucket[]; bucketMs: number; loading: boolean; onZoom: (since: number, until: number) => void }) {
+/**
+ * Requests per bucket: the platform's failures bright, the callers' dim, and
+ * the rest dimmer. A gateway that does not split failures by side has every
+ * failure bright. Drag across it to zoom the window to that stretch.
+ */
+function Strip({ buckets, bucketMs, split, loading, onZoom }: { buckets: HistogramBucket[]; bucketMs: number; split: boolean; loading: boolean; onZoom: (since: number, until: number) => void }) {
   const box = useRef<HTMLDivElement>(null);
   const [drag, setDrag] = useState<{ a: number; b: number } | null>(null);
   const max = Math.max(1, ...buckets.map((b) => b.requests));
@@ -80,7 +85,17 @@ function Strip({ buckets, bucketMs, loading, onZoom }: { buckets: HistogramBucke
   return (
     <section aria-label="Requests over time" className="rounded-xl border border-border bg-card px-[18px] pb-2.5 pt-3">
       <div className="flex items-center justify-between pb-2 text-[12.5px]">
-        <span className="text-secondary-foreground">Requests per {bucketLabel(bucketMs)} · <span className="text-foreground">failed shown bright</span></span>
+        <span className="flex flex-wrap items-center gap-x-3 gap-y-1 text-secondary-foreground">
+          <span>Requests per {bucketLabel(bucketMs)}</span>
+          {split ? (
+            <>
+              <span className="inline-flex items-center gap-1.5 text-foreground"><span className="h-2 w-2 rounded-[2px] bg-foreground" />Failed on the platform</span>
+              <span className="inline-flex items-center gap-1.5"><span className="h-2 w-2 rounded-[2px] bg-muted-foreground" />Failed from callers</span>
+            </>
+          ) : (
+            <span className="text-foreground">failed shown bright</span>
+          )}
+        </span>
         <span className="text-[11.5px] text-muted-foreground">Drag across the chart to zoom into a moment</span>
       </div>
       <div
@@ -96,12 +111,18 @@ function Strip({ buckets, bucketMs, loading, onZoom }: { buckets: HistogramBucke
         }}
       >
         {loading && buckets.length === 0 && <div className="skeleton absolute inset-0 rounded-md" />}
-        {buckets.map((b, i) => (
-          <div key={b.bucket_ms} title={`${new Date(b.bucket_ms).toLocaleString()} · ${b.requests} requests${b.errors ? `, ${b.errors} failed` : ""}`} className={cn("flex h-full flex-1 flex-col justify-end", i >= lo && i <= hi && "bg-muted/60")}>
-            <span className="block rounded-t-[1px] bg-foreground" style={{ height: `${(b.errors / max) * 100}%` }} />
-            <span className="block bg-muted-foreground/60" style={{ height: `${((b.requests - b.errors) / max) * 100}%` }} />
-          </div>
-        ))}
+        {buckets.map((b, i) => {
+          const platform = split ? b.platform_errors ?? 0 : b.errors;
+          const caller = b.errors - platform;
+          const failed = !b.errors ? "" : split ? `, ${b.errors} failed (${platform} on the platform, ${caller} from callers)` : `, ${b.errors} failed`;
+          return (
+            <div key={b.bucket_ms} title={`${new Date(b.bucket_ms).toLocaleString()} · ${b.requests} requests${failed}`} className={cn("flex h-full flex-1 flex-col justify-end", i >= lo && i <= hi && "bg-muted/60")}>
+              <span className="block rounded-t-[1px] bg-foreground" style={{ height: `${(platform / max) * 100}%` }} />
+              <span className="block bg-muted-foreground" style={{ height: `${(caller / max) * 100}%` }} />
+              <span className={cn("block", split ? "bg-muted-foreground/35" : "bg-muted-foreground/60")} style={{ height: `${((b.requests - b.errors) / max) * 100}%` }} />
+            </div>
+          );
+        })}
       </div>
       <div className="flex justify-between pt-1.5 font-mono text-[10.5px] text-muted-foreground">
         {ticks.map((b) => <span key={b.bucket_ms}>{label(b.bucket_ms)}</span>)}
@@ -118,8 +139,12 @@ function Row({ row, selected, onOpen, now }: { row: UsageLogEntry; selected: boo
   return (
     <tr onClick={onOpen} className={cn("cursor-pointer border-t border-border/70 transition-colors hover:bg-muted/30", selected && "bg-secondary")}>
       <td className="whitespace-nowrap py-2 pl-[18px] pr-3 font-mono text-[12px] text-muted-foreground" title={new Date(row.ts_ms).toLocaleString()}>{when(row.ts_ms, now)}</td>
-      <td className="py-2 pr-3">
-        <span className={cn("inline-flex h-5 items-center rounded-full border px-1.5 font-mono text-[11px]", failed ? "border-foreground bg-foreground font-semibold text-background" : "border-border text-secondary-foreground")}>{row.status_code}</span>
+      <td className="max-w-[18rem] py-2 pr-3">
+        <span className="flex min-w-0 items-center gap-2">
+          <span className={cn("inline-flex h-5 shrink-0 items-center rounded-full border px-1.5 font-mono text-[11px]", failed ? "border-foreground bg-foreground font-semibold text-background" : "border-border text-secondary-foreground")}>{row.status_code}</span>
+          {failed && row.error_class && <span className={cn("truncate text-[12.5px]", classSide(row.error_class) === "platform" ? "font-medium text-foreground" : "text-secondary-foreground")}>{classLabel(row.error_class)}</span>}
+        </span>
+        {failed && row.error_class !== undefined && <span className="mt-0.5 block truncate text-[11.5px] text-muted-foreground" title={failureReason(row)}>{failureReason(row)}</span>}
       </td>
       <td className="max-w-[16rem] py-2 pr-3">
         <span className="block truncate font-mono text-[12.5px]">{row.model}</span>
@@ -244,6 +269,9 @@ export function RequestLogs({
   const buckets = fillHistogram(histogram.data?.buckets ?? [], range, histogram.data?.bucket_ms ?? bucketMs);
   const total = buckets.reduce((n, b) => n + b.requests, 0);
   const failedCount = buckets.reduce((n, b) => n + b.errors, 0);
+  // Every bucket from the gateway splits its failures by side, or none does.
+  const split = histogram.data?.buckets.every((b) => b.platform_errors !== undefined) ?? true;
+  const platformCount = split ? buckets.reduce((n, b) => n + (b.platform_errors ?? 0), 0) : 0;
   const lastPage = older.length ? older.length % PAGE !== 0 : (head.data?.length ?? 0) < PAGE;
 
   async function loadOlder() {
@@ -268,7 +296,7 @@ export function RequestLogs({
     const { patch: p, unknown, tooBroad } = parseSearch(draft, { tenants, keys, models });
     if (Object.keys(p).length) patch(withPatterns(filters, p));
     const notes = [
-      ...(unknown.length ? [`Didn't recognise ${unknown.join(", ")}. Try model:, team:, key:, status:, type: or session:, with * for any characters (key:jlee379*).`] : []),
+      ...(unknown.length ? [`Didn't recognise ${unknown.join(", ")}. Try model:, team:, key:, status:, fault: (platform or caller), class: (such as capacity), type: or session:, with * for any characters (key:jlee379*).`] : []),
       ...(tooBroad.length ? [`${tooBroad.join(", ")} matches more than ${MAX_MATCHES}. Narrow it down.`] : []),
     ];
     setSearchNote(notes.length ? notes.join(" ") : null);
@@ -311,7 +339,7 @@ export function RequestLogs({
         <div className="min-w-0">
           <h1 className="text-[26px] font-semibold tracking-tight">Request logs</h1>
           <p className="mt-1 text-[13px] text-muted-foreground">
-            {histogram.isLoading ? "Counting…" : `${total.toLocaleString()} requests ${winLabel}${total ? ` · ${((failedCount / total) * 100).toFixed(1)}% failed` : ""}`}
+            {histogram.isLoading ? "Counting…" : `${total.toLocaleString()} requests ${winLabel}${total ? ` · ${((failedCount / total) * 100).toFixed(1)}% failed` : ""}${total && failedCount && split ? `, ${((platformCount / total) * 100).toFixed(1)}% ${SIDE_PHRASE.platform}` : ""}`}
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -365,7 +393,7 @@ export function RequestLogs({
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
               onKeyDown={(e) => { if (e.key === "Enter") runSearch(); if (e.key === "Escape") setDraft(""); }}
-              placeholder="Request ID, a key or team name, or model:, team:, key:, status:, type:, session: (* for any characters)"
+              placeholder="Request ID, a key or team name, or model:, team:, key:, status:, fault:, class:, type:, session: (* for any characters)"
               aria-label="Search requests"
               className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted-foreground"
             />
@@ -388,6 +416,8 @@ export function RequestLogs({
           <Toggle on={filters.tracedOnly} onClick={() => patch({ tracedOnly: !filters.tracedOnly })}>Traced only</Toggle>
           <Toggle on={filters.includeInternal} onClick={() => patch({ includeInternal: !filters.includeInternal })}>Include health checks</Toggle>
           {filters.statusCode && <Chip active onClear={() => patch({ statusCode: "" })}>HTTP <span className="font-mono">{filters.statusCode}</span></Chip>}
+          {filters.fault && <Chip active onClear={() => patch({ fault: "" })}>Failed {SIDE_PHRASE[filters.fault]}</Chip>}
+          {filters.errorClass && <Chip active onClear={() => patch({ errorClass: "" })}>Why: {filters.errorClass.split(",").map(classLabel).join(", ")}</Chip>}
           {filters.sessionId && <Chip active onClear={() => patch({ sessionId: "" })}>Session <span className="font-mono">{filters.sessionId.slice(0, 12)}{filters.sessionId.length > 12 ? "…" : ""}</span></Chip>}
           {filters.requestId && <Chip active onClear={() => patch({ requestId: "" })}>ID starts <span className="font-mono">{filters.requestId}</span></Chip>}
           {filtersActive(filters) && (
@@ -399,6 +429,7 @@ export function RequestLogs({
       <Strip
         buckets={buckets}
         bucketMs={histogram.data?.bucket_ms ?? bucketMs}
+        split={split}
         loading={histogram.isLoading}
         onZoom={(since, until) => { setLive(false); patch({ window: "custom", sinceMs: since, untilMs: Math.min(until, Date.now()) }); }}
       />

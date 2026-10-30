@@ -14,13 +14,13 @@ const fairshare = (extra: Partial<FairshareLiveView> = {}) =>
 describe("buildSeries", () => {
   it("lays the current window out bucket by bucket, each with the bucket one window earlier", () => {
     const now = 10 * HOUR + 90_000; // 10:01:30
-    const at = (t: number, requests: number, errors = 0) => ({ bucket_ms: t, requests, input_tokens: 0, output_tokens: 0, total_tokens: requests * 10, errors, p50_ttft_ms: 300 });
-    const points = [at(10 * HOUR, 5, 1), at(9 * HOUR, 3), at(10 * HOUR - 60_000, 2)];
+    const at = (t: number, requests: number, errors = 0, platform_errors = 0) => ({ bucket_ms: t, requests, input_tokens: 0, output_tokens: 0, total_tokens: requests * 10, errors, platform_errors, p50_ttft_ms: 300 });
+    const points = [at(10 * HOUR, 5, 2, 1), at(9 * HOUR, 3), at(10 * HOUR - 60_000, 2)];
     const series = buildSeries(points, "1h", now);
     expect(series).toHaveLength(60);
     expect(series.at(-1)).toMatchObject({ t: 10 * HOUR + 60_000, requests: 0, prevRequests: 0 });
     // 10:00 this window lines up with 09:00 the hour before.
-    expect(series.at(-2)).toMatchObject({ t: 10 * HOUR, requests: 5, errors: 1, tokens: 50, ttft: 300, prevRequests: 3 });
+    expect(series.at(-2)).toMatchObject({ t: 10 * HOUR, requests: 5, errors: 2, platformErrors: 1, tokens: 50, ttft: 300, prevRequests: 3 });
     // Missing buckets are zero, never skipped.
     expect(series.filter((p) => p.requests === 0 && p.t < 10 * HOUR - 60_000)).toHaveLength(57);
   });
@@ -33,9 +33,9 @@ describe("buildSeries", () => {
 
 describe("window comparisons", () => {
   it("derives the previous window by subtracting the current one from a two-window read", () => {
-    const current = { ...EMPTY_OVERVIEW_SUMMARY, requests: 120, tokens: 1000, errors: 3, cost: 2 };
-    const both = { ...EMPTY_OVERVIEW_SUMMARY, requests: 220, tokens: 1800, errors: 4, cost: 3.5 };
-    expect(previousTotals(current, both)).toEqual({ requests: 100, tokens: 800, errors: 1, cost: 1.5 });
+    const current = { ...EMPTY_OVERVIEW_SUMMARY, requests: 120, tokens: 1000, errors: 3, platformErrors: 1, cost: 2 };
+    const both = { ...EMPTY_OVERVIEW_SUMMARY, requests: 220, tokens: 1800, errors: 4, platformErrors: 2, cost: 3.5 };
+    expect(previousTotals(current, both)).toEqual({ requests: 100, tokens: 800, errors: 1, platformErrors: 1, cost: 1.5 });
   });
 
   it("says which way things moved, and stays quiet with nothing to compare", () => {
