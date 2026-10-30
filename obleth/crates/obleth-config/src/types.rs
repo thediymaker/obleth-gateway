@@ -1237,6 +1237,15 @@ pub struct UsageRecord {
     /// keeps older WAL records replayable.
     #[serde(default)]
     pub streamed: bool,
+    /// What kind of failure the request met (`ErrorClass::as_str`), or empty
+    /// for a success. `#[serde(default)]` keeps older WAL records replayable.
+    #[serde(default)]
+    pub error_class: String,
+    /// Why it failed, in the words of whoever refused it (the model server's
+    /// error message, or the gateway's own), cut to `ERROR_REASON_MAX_CHARS`.
+    /// Never request or answer text. Empty for a success.
+    #[serde(default)]
+    pub error_reason: String,
 }
 
 /// Runtime-configurable retention for the raw per-request `usage` ledger.

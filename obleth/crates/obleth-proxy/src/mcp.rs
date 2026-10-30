@@ -106,6 +106,10 @@ fn mcp_usage_record(
         key_name: key.key_name.clone(),
         tenant_name: key.tenant_name.clone(),
         streamed: false,
+        error_class: obleth_config::class_for_status(status_code, "direct")
+            .map_or("", obleth_config::ErrorClass::as_str)
+            .to_string(),
+        error_reason: obleth_config::reason_for_status(status_code, "direct").to_string(),
     }
 }
 

@@ -210,6 +210,7 @@ async fn handle(
         reasoning_effort_requested: String::new(),
         model_family: String::new(),
         streamed: false,
+        failure: None,
     };
 
     // ---- tenant input guardrails ----

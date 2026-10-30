@@ -715,6 +715,32 @@ impl TooLong {
     }
 }
 
+/// How far over its context window a prompt's estimate must be before the
+/// gateway refuses it itself. The estimate (~4 characters a token) runs low
+/// on code and non-Latin text but high on long runs of whitespace, so a
+/// prompt only just over by its count may still fit.
+const SURE_OVERFLOW_FACTOR: u64 = 5; // 5/4: a quarter over
+
+/// The model's context window, when the prompt's estimate is far enough over
+/// it that the model is sure to refuse; `None` when it may fit or the window
+/// is unknown.
+fn sure_overflow(context_window: i64, prompt_estimate: u32) -> Option<u64> {
+    let window = u64::try_from(context_window).ok().filter(|&w| w > 0)?;
+    (u64::from(prompt_estimate) * 4 >= window * SURE_OVERFLOW_FACTOR).then_some(window)
+}
+
+/// `400` for a prompt over the model's context window, in the OpenAI error
+/// shape and with OpenAI's code for it, which SDKs and agents key on.
+fn context_overflow_response(message: &str) -> Response<Body> {
+    let body = serde_json::json!({ "error": {
+        "message": message,
+        "type": "invalid_request_error",
+        "param": "messages",
+        "code": "context_length_exceeded",
+    }});
+    (StatusCode::BAD_REQUEST, axum::Json(body)).into_response()
+}
+
 /// Flat input-token estimate for one image part. Images aren't tokenized
 /// here, and their real cost depends on the model and the resolution.
 pub(crate) const IMAGE_PART_TOKEN_ESTIMATE: u64 = 1500;
@@ -1232,6 +1258,8 @@ async fn run_pipeline(
         model_family: String::new(),
         // Set once the upstream answers.
         streamed: false,
+        // Set where a failure's status is chosen.
+        failure: None,
     };
     // Surface the conversation id on the OTLP/Jaeger root span for cross-request
     // grouping (the field is declared Empty on the #[instrument] below).
@@ -1801,6 +1829,51 @@ async fn run_pipeline(
     let response_plan = boon_outcome.response_plan;
     let speculation_plan = boon_outcome.speculation;
 
+    // ---- a prompt the model cannot hold ----
+    // Refused here, after boons have had their chance to shrink it, rather
+    // than queued for a model that will turn it away.
+    if method == Method::POST && is_chat_path(&path) {
+        if let Some(window) = route
+            .as_deref()
+            .and_then(|r| sure_overflow(r.context_window, est.input_tokens))
+        {
+            // vLLM's own opening, which clients that compact a conversation
+            // on a context-length error already look for.
+            let message = format!(
+                "This model's maximum context length is {window} tokens, and the prompt is \
+                 about {} tokens. Shorten the prompt and retry.",
+                est.input_tokens
+            );
+            req_meta.failure = Some(obleth_config::Failure::new(
+                obleth_config::ErrorClass::ClientInput,
+                &message,
+            ));
+            if let Some(t) = tracer.take() {
+                t.finish("error");
+            }
+            finalize(
+                &state,
+                request_id,
+                &resolved,
+                &req_meta,
+                &model,
+                Admission::Rejected,
+                est,
+                0,
+                0,
+                0,
+                0,
+                0,
+                request_start.elapsed().as_millis() as u32,
+                StatusCode::BAD_REQUEST.as_u16(),
+                "off",
+                0.0,
+                crate::energy::EnergyFigures::default(),
+            );
+            return context_overflow_response(&message);
+        }
+    }
+
     // Live streaming tool loop: when the *only* response transform is the
     // gateway tool loop and the client asked to stream, keep the upstream call
     // streaming and drive it through `tool_stream`. Content/reasoning deltas
@@ -2307,7 +2380,7 @@ async fn run_pipeline(
     // headers arrive, which settles as nothing generated (zero tokens, 499).
     // Once an upstream answer starts, `arm_estimate` switches that fallback
     // to the admission estimate.
-    let accounting = StreamAccounting {
+    let mut accounting = StreamAccounting {
         state: state.clone(),
         request_id,
         resolved: resolved.clone(),
@@ -2459,6 +2532,8 @@ async fn run_pipeline(
                             (s.ttft_ms, drained_settlement(200, s.failure, usage, 0, est))
                         };
                         let total_ms = request_start.elapsed().as_millis() as u32;
+                        let mut accounting = accounting;
+                        accounting.fail_stream(settled.status, cut, None);
                         let _ = settle_guard.complete(accounting.settle_with(
                             settled.tokens, ttft_ms, total_ms, settled.status, None, settled.billed,
                         )).await;
@@ -2546,6 +2621,8 @@ async fn run_pipeline(
     let mut upstream_resp: Option<reqwest::Response> = None;
     let mut last_url = String::new();
     let mut last_err: Option<String> = None;
+    // `last_err` in words fit for the ledger: no internal URLs.
+    let mut last_reason: Option<String> = None;
     let mut timed_out = false;
     let total_targets = targets.len();
     // Which target answered: a job lives on the backend that accepted it.
@@ -2602,6 +2679,10 @@ async fn run_pipeline(
                 // panicking should that invariant ever change.
                 let Some(fields) = multipart_fields.take() else {
                     let total_ms = request_start.elapsed().as_millis() as u32;
+                    accounting.fail(
+                        obleth_config::ErrorClass::Gateway,
+                        "multipart request body was already consumed",
+                    );
                     let _ = settle_guard
                         .complete(accounting.settle_unbilled(0, total_ms, 500))
                         .await;
@@ -2627,6 +2708,7 @@ async fn run_pipeline(
                     let status = resp.status().as_u16();
                     if is_retryable_status(status) && (configured_left || more_targets) {
                         last_err = Some(format!("upstream status {status}"));
+                        last_reason = Some(format!("model server answered {status}"));
                         if configured_left {
                             state.metrics.record_upstream_attempt("retry");
                             tokio::time::sleep(backoff_for(backoff, attempt)).await;
@@ -2650,6 +2732,14 @@ async fn run_pipeline(
                     timed_out |= read_timed_out;
                     let connection_error = is_connection_error(&e);
                     last_err = Some(e.to_string());
+                    last_reason = Some(if read_timed_out {
+                        format!(
+                            "no answer from the model server within {}",
+                            secs_label(req_timeout)
+                        )
+                    } else {
+                        format!("could not reach the model server: {}", transport_cause(&e))
+                    });
                     if configured_left {
                         state.metrics.record_upstream_attempt(if read_timed_out {
                             "timeout"
@@ -2673,6 +2763,10 @@ async fn run_pipeline(
                 Err(_) => {
                     timed_out = true;
                     last_err = Some(format!("timed out after {req_timeout:?}"));
+                    last_reason = Some(format!(
+                        "no answer from the model server within {}",
+                        secs_label(req_timeout)
+                    ));
                     if configured_left {
                         state.metrics.record_upstream_attempt("timeout");
                         tokio::time::sleep(backoff_for(backoff, attempt)).await;
@@ -2756,6 +2850,16 @@ async fn run_pipeline(
             } else {
                 (502u16, StatusCode::BAD_GATEWAY)
             };
+            accounting.fail(
+                if timed_out {
+                    obleth_config::ErrorClass::UpstreamTimeout
+                } else {
+                    obleth_config::ErrorClass::Network
+                },
+                last_reason
+                    .as_deref()
+                    .unwrap_or("could not reach the model server"),
+            );
             // Nothing was generated: refund the per-minute reservation and
             // release any term reservation rather than keeping the estimate.
             let total_ms = request_start.elapsed().as_millis() as u32;
@@ -2801,6 +2905,7 @@ async fn run_pipeline(
     if status_code >= 400 {
         let mut buf: Vec<u8> = Vec::new();
         let mut ttft_ms = 0u32;
+        let mut read_error: Option<String> = None;
         let mut byte_stream = upstream.bytes_stream();
         while let Some(item) = byte_stream.next().await {
             match item {
@@ -2816,12 +2921,45 @@ async fn run_pipeline(
                     buf.extend_from_slice(&chunk);
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "upstream read failed reading error body");
+                    tracing::warn!(
+                        error = %e,
+                        %request_id,
+                        model = %model,
+                        status = status_code,
+                        bytes_read = buf.len(),
+                        "upstream read failed reading error body"
+                    );
+                    read_error = Some(transport_cause(&e));
                     break;
                 }
             }
         }
         drop(permit);
+
+        // Why the upstream refused, for the ledger. When its message broke off
+        // before it could be read, the client gets an error saying so in the
+        // shape its SDK reads, rather than the fragment.
+        let mut content_type = content_type;
+        let reason = match (obleth_config::reason_from_body(&buf), &read_error) {
+            (Some(reason), _) => reason,
+            (None, Some(cause)) => {
+                let msg = format!(
+                    "the model server answered {status_code}, but its error message was cut off ({cause})"
+                );
+                buf = serde_json::to_vec(&serde_json::json!({
+                    "error": { "message": msg, "type": GATEWAY_ERROR_TYPE }
+                }))
+                .unwrap_or_default();
+                content_type = header::HeaderValue::from_static("application/json");
+                msg
+            }
+            (None, None) => format!("model server answered {status_code}"),
+        };
+        accounting.fail(
+            obleth_config::class_for_status(status_code, "fast")
+                .unwrap_or(obleth_config::ErrorClass::UpstreamError),
+            &reason,
+        );
 
         if let Some(ref mut t) = tracer {
             let body = String::from_utf8_lossy(&buf);
@@ -3062,6 +3200,7 @@ async fn run_pipeline(
                     {
                         turn.record(&accounting.state, done);
                     }
+                    accounting.fail_stream(settled.status, cut, None);
                     let _ = settle_guard.complete(accounting.settle_with(
                         settled.tokens, ttft_ms, total_ms, settled.status, None, settled.billed,
                     )).await;
@@ -3115,6 +3254,7 @@ async fn run_pipeline(
         let mut ttft_ms = 0u32;
         let mut truncated = false;
         let mut read_error: Option<String> = None;
+        let mut read_cause = String::new();
         let mut byte_stream = upstream.bytes_stream();
         while let Some(item) = byte_stream.next().await {
             match item {
@@ -3132,6 +3272,7 @@ async fn run_pipeline(
                     tracing::warn!(error = %e, "upstream read failed during boon interception");
                     truncated = true;
                     read_error = Some(e.to_string());
+                    read_cause = transport_cause(&e);
                     break;
                 }
             }
@@ -3151,6 +3292,10 @@ async fn run_pipeline(
                 ),
             );
             let total_ms = request_start.elapsed().as_millis() as u32;
+            accounting.fail(
+                obleth_config::ErrorClass::UpstreamError,
+                &format!("the answer broke off before it arrived ({read_cause})"),
+            );
             let _ = settle_guard
                 .complete(accounting.settle_unbilled(ttft_ms, total_ms, 502))
                 .await;
@@ -3202,6 +3347,7 @@ async fn run_pipeline(
                 None => (UpstreamUsage::default(), false),
             };
             let total_ms = request_start.elapsed().as_millis() as u32;
+            accounting.fail(upstream_failure_class(failure.status), &failure.message);
             let _ = settle_guard
                 .complete(accounting.settle_with(
                     tokens,
@@ -3559,6 +3705,18 @@ async fn run_pipeline(
                 .as_ref()
                 .map_or(crate::upstream_failure::DEFAULT_FAILURE_STATUS, |f| f.status);
             let settled = drained_settlement(status_code, Some(status), usage, streamed_chars, est);
+            accounting.fail_stream(
+                settled.status,
+                true,
+                Some(failure.as_ref().map_or(
+                    if ended_early {
+                        "the answer stream ended before its last event"
+                    } else {
+                        "the answer stream broke off"
+                    },
+                    |f| f.message.as_str(),
+                )),
+            );
             let _ = settle_guard.complete(accounting.settle_with(
                 settled.tokens, ttft_ms, total_ms, settled.status, None, settled.billed,
             )).await;
@@ -3613,6 +3771,11 @@ async fn run_pipeline(
                 usage,
                 streamed_chars,
                 est,
+            );
+            accounting.fail_stream(
+                settled.status,
+                false,
+                failure.as_ref().map(|f| f.message.as_str()),
             );
             // store the full response for identical future requests
             let cache_put = if cacheable && settled.cacheable {
@@ -4261,6 +4424,26 @@ pub(crate) struct StreamAccounting {
 }
 
 impl StreamAccounting {
+    /// Record why the request failed, for its ledger row.
+    pub(crate) fn fail(&mut self, class: obleth_config::ErrorClass, reason: &str) {
+        self.meta.failure = Some(obleth_config::Failure::new(class, reason));
+    }
+
+    /// Record why a drained stream failed, when it settles as a failure: the
+    /// upstream's own message when it gave one, else that the stream broke
+    /// off (`cut`) or reported a failure without saying what.
+    fn fail_stream(&mut self, status: u16, cut: bool, message: Option<&str>) {
+        if status < 400 {
+            return;
+        }
+        let reason = message.unwrap_or(if cut {
+            "the answer stream broke off"
+        } else {
+            "the model server reported a failure in its answer"
+        });
+        self.fail(upstream_failure_class(status), reason);
+    }
+
     /// The energy measured for this request up to now.
     fn energy_now(&self) -> crate::energy::EnergyFigures {
         self.state.energy.figures(
@@ -4309,9 +4492,17 @@ impl StreamAccounting {
     /// estimate afterwards. Runtime shutdown remains best-effort, just like
     /// the asynchronous telemetry sink; a partial answer is never cached.
     fn on_cancel(&self, tokens: Option<UpstreamUsage>) -> impl FnOnce() + Send + 'static {
-        let accounting = self.clone();
+        let mut accounting = self.clone();
         move || {
             let elapsed = accounting.request_start.elapsed().as_millis() as u32;
+            accounting.fail(
+                obleth_config::ErrorClass::ClientCancel,
+                if tokens.is_none() {
+                    "client disconnected before the model answered"
+                } else {
+                    "client disconnected while the answer was being sent"
+                },
+            );
             let (tokens, billed) = match tokens {
                 Some(tokens) => (tokens, true),
                 None => (UpstreamUsage::default(), false),
@@ -6311,6 +6502,42 @@ fn is_connection_error(e: &reqwest::Error) -> bool {
     false
 }
 
+/// The innermost cause of a transport error, which names what went wrong
+/// (`Connection refused (os error 111)`) without the request URL that
+/// reqwest's own message carries.
+fn transport_cause(e: &reqwest::Error) -> String {
+    use std::error::Error as _;
+    let mut cause = String::new();
+    let mut source = e.source();
+    while let Some(err) = source {
+        cause = err.to_string();
+        source = err.source();
+    }
+    if cause.is_empty() {
+        let kind = if e.is_connect() {
+            "connect error"
+        } else if e.is_body() || e.is_decode() {
+            "response body error"
+        } else {
+            "request error"
+        };
+        return kind.to_string();
+    }
+    cause
+}
+
+/// The class of a failure status the upstream gave, in its status line or
+/// inside its answer.
+fn upstream_failure_class(status: u16) -> obleth_config::ErrorClass {
+    obleth_config::class_for_status(status, "fast")
+        .unwrap_or(obleth_config::ErrorClass::UpstreamError)
+}
+
+/// A duration in whole seconds, for reasons a person reads.
+fn secs_label(d: Duration) -> String {
+    format!("{} s", d.as_secs())
+}
+
 /// Exponential backoff for retry `attempt` (0-based), capped to avoid overflow.
 fn backoff_for(base: Duration, attempt: u32) -> Duration {
     if base.is_zero() {
@@ -6531,6 +6758,10 @@ pub(crate) struct RequestMeta {
     /// Whether the reply is relayed to the client as an event stream, known
     /// once the upstream answers; see `UsageRecord::streamed`.
     pub(crate) streamed: bool,
+    /// Why the request failed, recorded where its failure status is chosen.
+    /// Left `None` where the status says it all; see
+    /// `obleth_config::ledger_failure`.
+    pub(crate) failure: Option<obleth_config::Failure>,
 }
 
 /// The name a response cache entry is keyed by.
@@ -6916,6 +7147,8 @@ pub(crate) fn finalize(
     if resolved.internal {
         return;
     }
+    let (error_class, error_reason) =
+        obleth_config::ledger_failure(status_code, admission.as_str(), meta.failure.as_ref());
     state.telemetry.record(UsageRecord {
         request_id,
         tenant_id: resolved.tenant_id,
@@ -6951,6 +7184,8 @@ pub(crate) fn finalize(
         key_name: resolved.key_name.clone(),
         tenant_name: resolved.tenant_name.clone(),
         streamed: meta.streamed,
+        error_class: error_class.to_string(),
+        error_reason,
     });
 }
 
@@ -7056,16 +7291,16 @@ mod tests {
     use super::{
         admit_request_for, anthropic_error, apply_multipart_text_view,
         backfill_max_tokens_for_count_tokens, backoff_for, build_targets, build_upstream_url,
-        canonical_post_path, clamp_max_tokens, compute_modality_cost, conversation_seed,
-        effective_request_type, end_user_for, forward_headers, has_input_guardrails,
-        has_path_traversal, input_guardrails_unscannable, is_chat_path, is_models_collection,
-        is_models_endpoint, is_multipart_endpoint, is_retryable_status,
+        canonical_post_path, clamp_max_tokens, compute_modality_cost, context_overflow_response,
+        conversation_seed, effective_request_type, end_user_for, forward_headers,
+        has_input_guardrails, has_path_traversal, input_guardrails_unscannable, is_chat_path,
+        is_models_collection, is_models_endpoint, is_multipart_endpoint, is_retryable_status,
         looks_like_context_length_error, messages_input_estimate, multipart_text_view,
         output_guardrails_unenforceable, parse_multipart, prepare_upstream_body, redress_error,
         request_type_for_path, requires_registered_model, resolve_conversation,
         response_cache_name, route_keeps_sessions, session_hash_order, should_translate_as_stream,
-        strip_beta_query, surface, tenant_active_now, weighted_order, MultipartField, RequestMeta,
-        TooLong, END_USER_HEADER, REGISTERED_MODEL_PATHS, SEED_CAP,
+        strip_beta_query, sure_overflow, surface, tenant_active_now, weighted_order,
+        MultipartField, RequestMeta, TooLong, END_USER_HEADER, REGISTERED_MODEL_PATHS, SEED_CAP,
     };
     use crate::router::{BoonGrants, Candidate, Intent, RequestFeatures, RouterWeights};
     use axum::body::{Body, Bytes};
@@ -9026,6 +9261,21 @@ mod tests {
     }
 
     #[test]
+    fn only_a_prompt_well_over_the_window_is_refused_up_front() {
+        assert_eq!(sure_overflow(262_144, 200_000), None);
+        assert_eq!(sure_overflow(262_144, 262_144), None);
+        assert_eq!(sure_overflow(262_144, 327_679), None);
+        assert_eq!(sure_overflow(262_144, 327_680), Some(262_144));
+        assert_eq!(sure_overflow(0, 10_000_000), None);
+        assert_eq!(sure_overflow(-1, 10_000_000), None);
+        let resp = context_overflow_response("too long");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(looks_like_context_length_error(
+            "This model's maximum context length is 8 tokens, and the prompt is about 9 tokens."
+        ));
+    }
+
+    #[test]
     fn messages_input_estimate_adds_serialized_tools_length_over_three() {
         let chat_body = serde_json::json!({
             "messages": [{"role": "user", "content": "hi"}],
@@ -9541,6 +9791,7 @@ mod tests {
             reasoning_effort_requested: String::new(),
             model_family: String::new(),
             streamed: false,
+            failure: None,
         };
         assert_eq!(meta.device_id, "dev-1");
     }
@@ -9938,6 +10189,7 @@ mod lifecycle_tests {
             reasoning_effort_requested: String::new(),
             model_family: String::new(),
             streamed: false,
+            failure: None,
         };
         super::record_called_name(&mut meta, Some("acme"), Some("acme"));
         assert_eq!(meta.model_family, "acme");
@@ -10103,7 +10355,7 @@ mod lifecycle_tests {
             .find(".reserve_with_term(&resolved.tenant_id,")
             .expect("tenant reserve");
         let proceed = flat
-            .find("letaccounting=StreamAccounting{")
+            .find("letmutaccounting=StreamAccounting{")
             .expect("accounting");
         assert!(key < tenant);
         let releases = flat[tenant..proceed]

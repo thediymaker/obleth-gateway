@@ -221,6 +221,7 @@ pub fn router(state: AdminState) -> Router {
         .route("/api/v1/usage/logs", get(get_usage_logs))
         .route("/api/v1/usage/logs/histogram", get(get_usage_log_histogram))
         .route("/api/v1/usage/logs/facets", get(get_usage_log_facets))
+        .route("/api/v1/usage/failures", get(get_usage_failure_groups))
         .route(
             "/api/v1/usage/logs/:request_id/spans",
             get(get_request_spans),
@@ -5285,6 +5286,48 @@ async fn get_usage_log_facets(
         k.label = key_names.get(&k.value).cloned().unwrap_or_default();
     }
     Ok(Json(facets))
+}
+
+/// The failures among the requests matching the log's filters: how many
+/// were the platform's and how many the callers', and the same failure
+/// repeated (one key, model, status, class and reason) as one group with a
+/// count. Tenant and key names are the live ones where the tenant or key
+/// still exists.
+#[utoipa::path(
+    get, path = "/api/v1/usage/failures", tag = "usage",
+    params(usage::UsageLogQuery),
+    responses((status = 200, body = usage::UsageFailureGroups))
+)]
+async fn get_usage_failure_groups(
+    State(state): State<AdminState>,
+    Query(q): Query<usage::UsageLogQuery>,
+) -> Result<Json<usage::UsageFailureGroups>> {
+    let mut failures = usage::query_usage_failure_groups(&state.clickhouse, q).await?;
+    let tenant_names: std::collections::HashMap<Uuid, String> = state
+        .store
+        .list_tenants()
+        .await?
+        .into_iter()
+        .map(|t| (t.id, t.name))
+        .collect();
+    let key_ids: Vec<Uuid> = failures.groups.iter().map(|g| g.key_id).collect();
+    let key_names: std::collections::HashMap<Uuid, String> = state
+        .store
+        .keys_by_ids(&key_ids)
+        .await?
+        .into_iter()
+        .filter(|k| !k.name.is_empty())
+        .map(|k| (k.id, k.name))
+        .collect();
+    for g in &mut failures.groups {
+        if let Some(name) = tenant_names.get(&g.tenant_id) {
+            g.tenant_name = name.clone();
+        }
+        if let Some(name) = key_names.get(&g.key_id) {
+            g.key_name = name.clone();
+        }
+    }
+    Ok(Json(failures))
 }
 
 /// Requests and failures over time for the request log's window, counted with

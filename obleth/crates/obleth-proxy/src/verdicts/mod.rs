@@ -697,6 +697,7 @@ async fn handler_inner(
         reasoning_effort_requested: String::new(),
         model_family: String::new(),
         streamed: false,
+        failure: None,
     };
     if let Some(t) = tracer.as_mut() {
         t.set_conversation(&req_meta.session_id, req_meta.session_id_source);

@@ -30,6 +30,11 @@ const SCHEMA_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKFILL_MARKER: &str = "backfilled_v1";
 /// `usage_meta` key under which booting replicas elect one backfiller.
 const BACKFILL_CLAIM: &str = "backfill_claim_v1";
+/// `usage_meta` key recording that `usage_daily` rows written before it
+/// counted platform failures have been given their count.
+const PLATFORM_ERRORS_MARKER: &str = "platform_errors_v1";
+/// `usage_meta` key under which booting replicas elect who adds that count.
+const PLATFORM_ERRORS_CLAIM: &str = "platform_errors_claim_v1";
 /// How long a claimant waits for concurrent claims to become visible.
 const BACKFILL_CLAIM_SETTLE: Duration = Duration::from_secs(2);
 /// Upper bound on `TelemetrySink::shutdown` draining both flushers.
@@ -98,6 +103,8 @@ struct UsageRow<'a> {
     key_name: &'a str,
     tenant_name: &'a str,
     streamed: bool,
+    error_class: &'a str,
+    error_reason: &'a str,
 }
 
 impl<'a> From<&'a UsageRecord> for UsageRow<'a> {
@@ -136,6 +143,8 @@ impl<'a> From<&'a UsageRecord> for UsageRow<'a> {
             key_name: &r.key_name,
             tenant_name: &r.tenant_name,
             streamed: r.streamed,
+            error_class: &r.error_class,
+            error_reason: &r.error_reason,
         }
     }
 }
@@ -770,6 +779,8 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
             key_name String DEFAULT '',
             tenant_name String DEFAULT '',
             streamed Bool DEFAULT false,
+            error_class LowCardinality(String) DEFAULT '',
+            error_reason String DEFAULT '',
             ts DateTime64(3) MATERIALIZED fromUnixTimestamp64Milli(ts_ms),
             INDEX idx_ts_ms ts_ms TYPE minmax GRANULARITY 4
         ) ENGINE = MergeTree()
@@ -900,6 +911,19 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
         ))
         .execute()
         .await?;
+    // Why a request failed (see `obleth_config::failure`); empty on older rows,
+    // which readers file by status code instead.
+    for column in [
+        "error_class LowCardinality(String) DEFAULT ''",
+        "error_reason String DEFAULT ''",
+    ] {
+        client
+            .query(&format!(
+                "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS {column}"
+            ))
+            .execute()
+            .await?;
+    }
     // Required for `insert_deduplication_token` on a non-replicated table: an
     // insert that timed out after committing is replayed from the WAL with the
     // same token, and ClickHouse discards the duplicate.
@@ -985,7 +1009,8 @@ async fn ensure_daily_rollup(client: &Client, database: &str) -> Result<(), Tele
             cost_usd_sum Float64,
             energy_wh_sum Float64,
             energy_cost_usd_sum Float64,
-            co2_g_sum Float64
+            co2_g_sum Float64,
+            platform_error_requests UInt64
         ) ENGINE = SummingMergeTree()
         PARTITION BY toYYYYMM(day)
         ORDER BY (day, tenant_id, key_id, model)"
@@ -1003,6 +1028,9 @@ async fn ensure_daily_rollup(client: &Client, database: &str) -> Result<(), Tele
         "energy_wh_sum Float64 DEFAULT 0",
         "energy_cost_usd_sum Float64 DEFAULT 0",
         "co2_g_sum Float64 DEFAULT 0",
+        // Added after the others, so it stays last, in step with the
+        // positional backfill below.
+        "platform_error_requests UInt64 DEFAULT 0",
     ] {
         client
             .query(&format!(
@@ -1026,8 +1054,11 @@ async fn ensure_daily_rollup(client: &Client, database: &str) -> Result<(), Tele
     // Latency sums (`ttft_ms_sum`/`total_ms_sum`) are accumulated over
     // successful (2xx/3xx) requests only, so timeouts and upstream errors don't
     // distort the average TTFT / total-time reported per day. The read side
-    // divides these by `success_requests` to match.
-    let rollup_select = "
+    // divides these by `success_requests` to match. `platform_error_requests`
+    // counts the failures that were the platform's, not the caller's (see
+    // `obleth_config::failure`).
+    let rollup_select = format!(
+        "
         toDate(ts) AS day,
         tenant_id,
         key_id,
@@ -1045,7 +1076,11 @@ async fn ensure_daily_rollup(client: &Client, database: &str) -> Result<(), Tele
         sum(cost_usd) AS cost_usd_sum,
         sum(energy_wh) AS energy_wh_sum,
         sum(energy_cost_usd) AS energy_cost_usd_sum,
-        sum(co2_g) AS co2_g_sum";
+        sum(co2_g) AS co2_g_sum,
+        countIf({class} IN {platform}) AS platform_error_requests",
+        class = obleth_config::EFFECTIVE_CLASS_SQL,
+        platform = obleth_config::PLATFORM_CLASSES_SQL,
+    );
 
     // Benchmark traffic (synthetic tenants) never enters the permanent rollup:
     // usage_daily has no request_type dimension and an immutable sort key, so
@@ -1087,7 +1122,11 @@ async fn ensure_daily_rollup(client: &Client, database: &str) -> Result<(), Tele
                 .execute()
                 .await
             {
-                Ok(()) => meta_put(client, database, BACKFILL_MARKER, "1").await?,
+                Ok(()) => {
+                    meta_put(client, database, BACKFILL_MARKER, "1").await?;
+                    // The backfill already counted them.
+                    meta_put(client, database, PLATFORM_ERRORS_MARKER, "1").await?;
+                }
                 Err(e) => tracing::warn!(
                     error = %e,
                     "usage_daily backfill failed; rollup will fill going forward"
@@ -1124,6 +1163,61 @@ async fn ensure_daily_rollup(client: &Client, database: &str) -> Result<(), Tele
             ))
             .execute()
             .await?;
+    }
+    count_earlier_platform_errors(client, database).await?;
+    Ok(())
+}
+
+/// Give rollup rows written before `platform_error_requests` existed their
+/// count, once per deployment.
+///
+/// The view counts every row inserted since it was created with the column,
+/// so the history is the raw ledger before that moment. `SummingMergeTree`
+/// adds rows that share a key, so the count goes in as rows of its own with
+/// every other column 0. Rows already pruned from the raw ledger stay at 0.
+/// A request finished just before the view was created but flushed just
+/// after is counted twice; a flush lasts seconds, and that is accepted.
+async fn count_earlier_platform_errors(
+    client: &Client,
+    database: &str,
+) -> Result<(), TelemetryError> {
+    if meta_count(client, database, PLATFORM_ERRORS_MARKER).await? > 0 {
+        return Ok(());
+    }
+    if !won_claim(client, database, PLATFORM_ERRORS_CLAIM).await? {
+        return Ok(());
+    }
+    let view_created_ms = client
+        .query(
+            "SELECT toUnixTimestamp(metadata_modification_time) * 1000 FROM system.tables
+             WHERE database = ? AND name = 'usage_daily_mv'",
+        )
+        .bind(database)
+        .fetch_one::<i64>()
+        .await?;
+    let insert = format!(
+        "INSERT INTO {database}.usage_daily (day, tenant_id, key_id, model, platform_error_requests)
+         SELECT toDate(ts) AS day, tenant_id, key_id, model,
+                countIf({class} IN {platform}) AS platform_error_requests
+         FROM {database}.usage
+         WHERE request_type != '{bench}' AND ts_ms < {view_created_ms}
+         GROUP BY day, tenant_id, key_id, model
+         HAVING platform_error_requests > 0",
+        class = obleth_config::EFFECTIVE_CLASS_SQL,
+        platform = obleth_config::PLATFORM_CLASSES_SQL,
+        bench = obleth_config::BENCHMARK_REQUEST_TYPE,
+    );
+    match client
+        .query(&insert)
+        .with_option("insert_deduplicate", "0")
+        .execute()
+        .await
+    {
+        Ok(()) => meta_put(client, database, PLATFORM_ERRORS_MARKER, "1").await?,
+        Err(e) => tracing::warn!(
+            error = %e,
+            "usage_daily platform failure count for earlier days failed; it counts going forward"
+        ),
     }
     Ok(())
 }
@@ -1190,15 +1284,20 @@ async fn meta_put(
 ///   backfill and history is counted twice. The window makes this unlikely,
 ///   not impossible.
 async fn won_backfill_claim(client: &Client, database: &str) -> Result<bool, TelemetryError> {
+    won_claim(client, database, BACKFILL_CLAIM).await
+}
+
+/// The election [`won_backfill_claim`] describes, under any claim key.
+async fn won_claim(client: &Client, database: &str, key: &str) -> Result<bool, TelemetryError> {
     let claim = Uuid::new_v4().to_string();
-    meta_put(client, database, BACKFILL_CLAIM, &claim).await?;
+    meta_put(client, database, key, &claim).await?;
     tokio::time::sleep(BACKFILL_CLAIM_SETTLE).await;
     let winner = client
         .query(&format!(
             "SELECT min(value) FROM {database}.usage_meta
              WHERE key = ? AND updated_at > now64(3) - INTERVAL 5 MINUTE"
         ))
-        .bind(BACKFILL_CLAIM)
+        .bind(key)
         .fetch_one::<String>()
         .await?;
     Ok(winner == claim)
@@ -1243,6 +1342,8 @@ mod conv_tests {
             key_name: String::new(),
             tenant_name: String::new(),
             streamed: false,
+            error_class: String::new(),
+            error_reason: String::new(),
         }
     }
 
@@ -1471,6 +1572,8 @@ mod conv_tests {
             key_name: String::new(),
             tenant_name: String::new(),
             streamed: false,
+            error_class: String::new(),
+            error_reason: String::new(),
         };
         let row = UsageRow::from(&rec);
         assert_eq!(row.session_id_source, "derived");
@@ -1513,6 +1616,8 @@ mod conv_tests {
             key_name: String::new(),
             tenant_name: String::new(),
             streamed: false,
+            error_class: String::new(),
+            error_reason: String::new(),
         };
         rec.energy_wh = 1.5;
         rec.energy_cost_usd = 0.0002;
