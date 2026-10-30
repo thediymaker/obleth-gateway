@@ -778,6 +778,9 @@ pub struct OverviewSummaryView {
     pub output_tokens: u64,
     /// Requests in the window that ended with an HTTP status of 400 or above.
     pub errors: u64,
+    /// The part of `errors` that were the platform's failures, not the
+    /// callers' (see `obleth_config::ErrorClass::is_platform`).
+    pub platform_errors: u64,
     /// Median time to first token over the window; 0 when no request produced one.
     pub p50_ttft_ms: f64,
     pub avg_ttft_ms: f64,
@@ -5591,6 +5594,7 @@ async fn get_overview_summary(
         input_tokens: totals.input_tokens,
         output_tokens: totals.output_tokens,
         errors: totals.errors,
+        platform_errors: totals.platform_errors,
         p50_ttft_ms: totals.p50_ttft_ms,
         avg_ttft_ms: totals.avg_ttft_ms,
         energy_wh: totals.energy_wh,
