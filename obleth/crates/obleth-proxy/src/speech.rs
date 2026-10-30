@@ -92,7 +92,7 @@ async fn handle(state: &AppState, model: Option<&str>, headers: &HeaderMap) -> R
     let route = match crate::lifecycle::gate(state, &route, chrono::Utc::now()).await {
         crate::lifecycle::Gate::Serve(_) => route,
         crate::lifecycle::Gate::Redirect(next, _) => next,
-        crate::lifecycle::Gate::Refuse(resp) => return resp,
+        crate::lifecycle::Gate::Refuse(resp, _) => return resp,
     };
     if !permitted(&resolved, &route, name) {
         return error_json(StatusCode::FORBIDDEN, "model not permitted for tenant");

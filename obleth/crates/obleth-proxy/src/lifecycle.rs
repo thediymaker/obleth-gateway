@@ -54,8 +54,8 @@ pub(crate) enum Gate {
     Serve(Option<Notice>),
     /// Serve it with this route instead (a retired model with `redirect` on).
     Redirect(Arc<ResolvedModel>, Notice),
-    /// Refuse it with this response.
-    Refuse(Response<Body>),
+    /// Refuse it with this response, which says this.
+    Refuse(Response<Body>, String),
 }
 
 /// Decide how to serve a request that resolved to `route` at `now`.
@@ -84,7 +84,10 @@ pub(crate) async fn gate(state: &AppState, route: &ResolvedModel, now: DateTime<
                     ),
                 }
             }
-            Gate::Refuse(refusal(&notice(false)))
+            {
+                let notice = notice(false);
+                Gate::Refuse(refusal(&notice), retired_message(&notice))
+            }
         }
     }
 }

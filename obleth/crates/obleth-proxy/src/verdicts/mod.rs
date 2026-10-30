@@ -886,7 +886,7 @@ async fn handler_inner(
             model = next.model_name.clone();
             next
         }
-        crate::lifecycle::Gate::Refuse(resp) => return resp,
+        crate::lifecycle::Gate::Refuse(resp, _) => return resp,
     };
     // verdicts reads chat-completions logprobs; only chat routes can serve it.
     if route.model_type != "chat" {

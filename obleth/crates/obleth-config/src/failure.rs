@@ -194,11 +194,22 @@ pub fn reason_from_body(body: &[u8]) -> Option<String> {
     if text.is_empty() {
         return None;
     }
-    let message = match serde_json::from_str::<serde_json::Value>(text) {
+    let mut message = match serde_json::from_str::<serde_json::Value>(text) {
         Ok(v) => json_message(&v)?,
         Err(_) if text.starts_with('<') => return None,
         Err(_) => text.lines().next().unwrap_or_default().to_string(),
     };
+    // A router in front of the model server can wrap the server's whole
+    // error body, as a string, in its own error's message.
+    for _ in 0..2 {
+        match serde_json::from_str::<serde_json::Value>(message.trim()) {
+            Ok(inner) => match json_message(&inner) {
+                Some(inner) => message = inner,
+                None => break,
+            },
+            Err(_) => break,
+        }
+    }
     let reason = clean_reason(&message);
     (!reason.is_empty()).then_some(reason)
 }
@@ -347,6 +358,11 @@ mod tests {
             reason_from_body(b"upstream connect error or disconnect/reset before headers\nmore")
                 .as_deref(),
             Some("upstream connect error or disconnect/reset before headers")
+        );
+        let wrapped = br#"{"error":{"code":null,"param":null,"message":"{\"error\":{\"message\":\"deepseek-v4-1-flash is not a multimodal model\",\"type\":\"BadRequestError\",\"code\":400}}","type":"invalid_request_error"}}"#;
+        assert_eq!(
+            reason_from_body(wrapped).as_deref(),
+            Some("deepseek-v4-1-flash is not a multimodal model")
         );
         assert_eq!(reason_from_body(b"<html><body>502</body></html>"), None);
         assert_eq!(reason_from_body(b"  "), None);

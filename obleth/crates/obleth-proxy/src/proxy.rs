@@ -717,16 +717,17 @@ impl TooLong {
 
 /// How far over its context window a prompt's estimate must be before the
 /// gateway refuses it itself. The estimate (~4 characters a token) runs low
-/// on code and non-Latin text but high on long runs of whitespace, so a
-/// prompt only just over by its count may still fit.
-const SURE_OVERFLOW_FACTOR: u64 = 5; // 5/4: a quarter over
+/// on code and non-Latin text but high on long words and runs of
+/// whitespace (a list of common words came out at 6.6 characters a token),
+/// so only a prompt it puts at twice the window is sure not to fit.
+const SURE_OVERFLOW_FACTOR: u64 = 2;
 
 /// The model's context window, when the prompt's estimate is far enough over
 /// it that the model is sure to refuse; `None` when it may fit or the window
 /// is unknown.
 fn sure_overflow(context_window: i64, prompt_estimate: u32) -> Option<u64> {
     let window = u64::try_from(context_window).ok().filter(|&w| w > 0)?;
-    (u64::from(prompt_estimate) * 4 >= window * SURE_OVERFLOW_FACTOR).then_some(window)
+    (u64::from(prompt_estimate) >= window * SURE_OVERFLOW_FACTOR).then_some(window)
 }
 
 /// `400` for a prompt over the model's context window, in the OpenAI error
@@ -1560,10 +1561,14 @@ async fn run_pipeline(
                 variant = None;
                 *lifecycle_notice = Some(notice);
             }
-            crate::lifecycle::Gate::Refuse(resp) => {
+            crate::lifecycle::Gate::Refuse(resp, reason) => {
                 // Recorded, so the operator can see who still calls the model
                 // and tell them before the 410s do.
                 record_called_name(&mut req_meta, variant.as_deref(), family_name.as_deref());
+                req_meta.failure = Some(obleth_config::Failure::new(
+                    obleth_config::ErrorClass::Retired,
+                    &reason,
+                ));
                 let elapsed = request_start.elapsed().as_millis() as u32;
                 finalize(
                     &state,
@@ -9264,8 +9269,8 @@ mod tests {
     fn only_a_prompt_well_over_the_window_is_refused_up_front() {
         assert_eq!(sure_overflow(262_144, 200_000), None);
         assert_eq!(sure_overflow(262_144, 262_144), None);
-        assert_eq!(sure_overflow(262_144, 327_679), None);
-        assert_eq!(sure_overflow(262_144, 327_680), Some(262_144));
+        assert_eq!(sure_overflow(262_144, 524_287), None);
+        assert_eq!(sure_overflow(262_144, 524_288), Some(262_144));
         assert_eq!(sure_overflow(0, 10_000_000), None);
         assert_eq!(sure_overflow(-1, 10_000_000), None);
         let resp = context_overflow_response("too long");
@@ -10229,7 +10234,7 @@ mod lifecycle_tests {
         // gated, so a redirect is allowlisted and admitted as the replacement.
         assert!(serve < gate && gate < allow && allow < pool);
         // A refusal is recorded before it is returned.
-        let refuse = h.find("Gate::Refuse(resp)").expect("refusal arm");
+        let refuse = h.find("Gate::Refuse(resp,reason)").expect("refusal arm");
         let ret = refuse + h[refuse..].find("returnresp;").expect("refusal returns");
         assert!(h[refuse..ret].contains("finalize("));
         assert!(h[refuse..ret].contains("StatusCode::GONE"));
