@@ -7,6 +7,8 @@ describe("links to the request log", () => {
     expect(logsHref({ status: "error", model: "glm-5-3", team: "", window: "24h" })).toBe("/logs?status=error&model=glm-5-3&window=24h");
     expect(logsHref({ code: 502, since: 100, until: 200 })).toBe("/logs?code=502&since=100&until=200");
     expect(logsHref({ requestId: "7c1e40a2" })).toBe("/logs?requestId=7c1e40a2");
+    expect(logsHref({ fault: "platform", window: "1h" })).toBe("/logs?fault=platform&window=1h");
+    expect(logsHref({ key: "k-1", code: 400, class: "client_input" })).toBe("/logs?key=k-1&code=400&class=client_input");
   });
 
   it("reads a day as its local midnight, and a day's end as the moment before the next", () => {

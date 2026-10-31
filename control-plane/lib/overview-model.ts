@@ -30,6 +30,8 @@ export interface SeriesPoint {
   requests: number;
   tokens: number;
   errors: number;
+  /** The part of `errors` that were the platform's failures. */
+  platformErrors: number;
   cost: number;
   /** Median time to first token in the bucket, or null when nothing produced a first token. */
   ttft: number | null;
@@ -59,6 +61,7 @@ export function buildSeries(points: UsageTimePoint[], range: OverviewRange, now:
       requests: Number(cur?.requests ?? 0),
       tokens: Number(cur?.total_tokens ?? 0),
       errors: Number(cur?.errors ?? 0),
+      platformErrors: Number(cur?.platform_errors ?? 0),
       cost: Number(cur?.cost_usd ?? 0),
       ttft: cur?.p50_ttft_ms ? Number(cur.p50_ttft_ms) : null,
       prevRequests: Number(prev?.requests ?? 0),
@@ -77,6 +80,7 @@ export function previousTotals(current: OverviewSummary, both: OverviewSummary) 
     requests: minus(both.requests, current.requests),
     tokens: minus(both.tokens, current.tokens),
     errors: minus(both.errors, current.errors),
+    platformErrors: minus(both.platformErrors, current.platformErrors),
     cost: minus(both.cost, current.cost),
   };
 }

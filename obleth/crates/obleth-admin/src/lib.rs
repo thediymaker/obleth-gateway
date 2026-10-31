@@ -221,6 +221,7 @@ pub fn router(state: AdminState) -> Router {
         .route("/api/v1/usage/logs", get(get_usage_logs))
         .route("/api/v1/usage/logs/histogram", get(get_usage_log_histogram))
         .route("/api/v1/usage/logs/facets", get(get_usage_log_facets))
+        .route("/api/v1/usage/failures", get(get_usage_failure_groups))
         .route(
             "/api/v1/usage/logs/:request_id/spans",
             get(get_request_spans),
@@ -777,6 +778,9 @@ pub struct OverviewSummaryView {
     pub output_tokens: u64,
     /// Requests in the window that ended with an HTTP status of 400 or above.
     pub errors: u64,
+    /// The part of `errors` that were the platform's failures, not the
+    /// callers' (see `obleth_config::ErrorClass::is_platform`).
+    pub platform_errors: u64,
     /// Median time to first token over the window; 0 when no request produced one.
     pub p50_ttft_ms: f64,
     pub avg_ttft_ms: f64,
@@ -5287,6 +5291,48 @@ async fn get_usage_log_facets(
     Ok(Json(facets))
 }
 
+/// The failures among the requests matching the log's filters: how many
+/// were the platform's and how many the callers', and the same failure
+/// repeated (one key, model, status, class and reason) as one group with a
+/// count. Tenant and key names are the live ones where the tenant or key
+/// still exists.
+#[utoipa::path(
+    get, path = "/api/v1/usage/failures", tag = "usage",
+    params(usage::UsageLogQuery),
+    responses((status = 200, body = usage::UsageFailureGroups))
+)]
+async fn get_usage_failure_groups(
+    State(state): State<AdminState>,
+    Query(q): Query<usage::UsageLogQuery>,
+) -> Result<Json<usage::UsageFailureGroups>> {
+    let mut failures = usage::query_usage_failure_groups(&state.clickhouse, q).await?;
+    let tenant_names: std::collections::HashMap<Uuid, String> = state
+        .store
+        .list_tenants()
+        .await?
+        .into_iter()
+        .map(|t| (t.id, t.name))
+        .collect();
+    let key_ids: Vec<Uuid> = failures.groups.iter().map(|g| g.key_id).collect();
+    let key_names: std::collections::HashMap<Uuid, String> = state
+        .store
+        .keys_by_ids(&key_ids)
+        .await?
+        .into_iter()
+        .filter(|k| !k.name.is_empty())
+        .map(|k| (k.id, k.name))
+        .collect();
+    for g in &mut failures.groups {
+        if let Some(name) = tenant_names.get(&g.tenant_id) {
+            g.tenant_name = name.clone();
+        }
+        if let Some(name) = key_names.get(&g.key_id) {
+            g.key_name = name.clone();
+        }
+    }
+    Ok(Json(failures))
+}
+
 /// Requests and failures over time for the request log's window, counted with
 /// the log's own filters so the chart and the list always agree. Only
 /// non-empty buckets come back.
@@ -5548,6 +5594,7 @@ async fn get_overview_summary(
         input_tokens: totals.input_tokens,
         output_tokens: totals.output_tokens,
         errors: totals.errors,
+        platform_errors: totals.platform_errors,
         p50_ttft_ms: totals.p50_ttft_ms,
         avg_ttft_ms: totals.avg_ttft_ms,
         energy_wh: totals.energy_wh,

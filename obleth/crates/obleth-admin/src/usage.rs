@@ -220,6 +220,16 @@ pub struct UsageLogQuery {
     pub status: Option<String>,
     /// One exact HTTP status, e.g. `502`. Combines with `status`.
     pub status_code: Option<u16>,
+    /// Whose failures: `platform` (the gateway or a model server could not
+    /// serve the request) or `client` (the request could not be served as
+    /// sent). Implies failures only.
+    pub fault: Option<String>,
+    /// One failure class, or several joined by commas (`capacity,network`);
+    /// see `obleth_config::ErrorClass`.
+    #[serde(default, deserialize_with = "comma_list")]
+    #[schema(value_type = Option<String>)]
+    #[param(value_type = Option<String>)]
+    pub error_class: Vec<String>,
     /// Case-insensitive prefix match on the request id, for the search box.
     pub request_id: Option<String>,
     /// Only the helper calls a boon made for this client request (a
@@ -316,6 +326,12 @@ pub struct UsageLogRow {
     /// (rows written before this column existed read false here and may
     /// still carry a first-token time equal to the whole reply).
     pub streamed: bool,
+    /// Why it failed, as recorded; empty on a success and on older rows.
+    pub error_reason: String,
+    /// What kind of failure the request met (`obleth_config::ErrorClass`), or
+    /// empty for a success. Rows written before failures were classified are
+    /// filed by their status code.
+    pub error_class: String,
 }
 
 /// A bind value for the request-log filters, in placeholder order.
@@ -362,6 +378,16 @@ fn log_filter_sql(q: &UsageLogQuery, since: i64) -> (String, Vec<LogBind>) {
         // A u16 prints as digits only, so it is safe to inline.
         sql.push_str(&format!(" and status_code = {code}"));
     }
+    let class = obleth_config::EFFECTIVE_CLASS_SQL;
+    let platform = obleth_config::PLATFORM_CLASSES_SQL;
+    match q.fault.as_deref() {
+        Some("platform") => sql.push_str(&format!(" and {class} in {platform}")),
+        Some("client") => sql.push_str(&format!(
+            " and status_code >= 400 and {class} not in {platform}"
+        )),
+        _ => {}
+    }
+    any_of(&mut sql, &mut binds, class, "?", &q.error_class);
     if let Some(rid) = &q.request_id {
         sql.push_str(" and startsWith(lower(toString(request_id)), lower(?))");
         binds.push(LogBind::Text(rid.clone()));
@@ -413,16 +439,23 @@ fn bind_log_filters(
 }
 
 /// The request log's columns, in [`UsageLogRow`] field order: rows are read
-/// by position, so the two must move together.
-const USAGE_LOG_SELECT: &str =
-    "select request_id, ts_ms, tenant_id, key_id, model, request_type, session_id, session_id_source, device_id, \
-     admission, status_code, input_tokens, output_tokens, \
-     toUInt64(input_tokens) + toUInt64(output_tokens) as total_tokens, \
-     cached_input_tokens, queue_wait_ms, ttft_ms, total_ms, cache_status, cost_usd, \
-     energy_wh, energy_cost_usd, co2_g, parent_request_id, model_variant, \
-     reasoning_effort, reasoning_effort_requested, model_family, \
-     key_name as recorded_key_name, tenant_name as recorded_tenant_name, streamed \
-     from usage";
+/// by position, so the two must move together. The class is read through
+/// [`obleth_config::EFFECTIVE_CLASS_SQL`] under another name: an alias
+/// `error_class` would shadow the column the expression reads.
+fn usage_log_select() -> String {
+    format!(
+        "select request_id, ts_ms, tenant_id, key_id, model, request_type, session_id, session_id_source, device_id, \
+         admission, status_code, input_tokens, output_tokens, \
+         toUInt64(input_tokens) + toUInt64(output_tokens) as total_tokens, \
+         cached_input_tokens, queue_wait_ms, ttft_ms, total_ms, cache_status, cost_usd, \
+         energy_wh, energy_cost_usd, co2_g, parent_request_id, model_variant, \
+         reasoning_effort, reasoning_effort_requested, model_family, \
+         key_name as recorded_key_name, tenant_name as recorded_tenant_name, streamed, \
+         error_reason, {} as filed_class \
+         from usage",
+        obleth_config::EFFECTIVE_CLASS_SQL
+    )
+}
 
 /// Read individual `usage` rows newest-first, honoring the supplied filters and
 /// keyset cursor.
@@ -434,7 +467,7 @@ pub async fn query_usage_logs(
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
     let (filter, binds) = log_filter_sql(&q, since);
 
-    let mut sql = String::from(USAGE_LOG_SELECT);
+    let mut sql = usage_log_select();
     sql.push_str(&filter);
     // Keyset cursor: (ts_ms, request_id) tuple strictly less than the cursor.
     // Tuple comparison matches the `order by` below for stable paging.
@@ -475,6 +508,9 @@ pub struct UsageLogBucket {
     pub requests: u64,
     /// Requests in the bucket that ended with an HTTP status of 400 or above.
     pub errors: u64,
+    /// The part of `errors` that were the platform's failures, not the
+    /// caller's (see `obleth_config::ErrorClass::is_platform`).
+    pub platform_errors: u64,
 }
 
 /// Most buckets a histogram returns: a strip a few hundred pixels wide needs
@@ -494,8 +530,11 @@ fn usage_log_histogram_sql(bucket: i64, filter: &str) -> String {
     format!(
         "select intDiv(ts_ms, {bucket}) * {bucket} as bucket_ms, \
          count() as requests, \
-         countIf(status_code >= 400) as errors \
-         from usage{filter} group by bucket_ms order by bucket_ms"
+         countIf(status_code >= 400) as errors, \
+         countIf({class} in {platform}) as platform_errors \
+         from usage{filter} group by bucket_ms order by bucket_ms",
+        class = obleth_config::EFFECTIVE_CLASS_SQL,
+        platform = obleth_config::PLATFORM_CLASSES_SQL,
     )
 }
 
@@ -556,6 +595,9 @@ pub struct UsageLogFacets {
     pub tenants: Vec<UsageLogFacet>,
     pub keys: Vec<UsageLogFacet>,
     pub request_types: Vec<UsageLogFacet>,
+    /// Failure classes (`obleth_config::ErrorClass`); successes come back
+    /// under the empty value.
+    pub error_classes: Vec<UsageLogFacet>,
     pub failures: Vec<UsageLogFailure>,
 }
 
@@ -566,6 +608,7 @@ pub const LOG_FACET_DIMENSIONS: &[(&str, &str)] = &[
     ("tenants", "toString(tenant_id)"),
     ("keys", "toString(key_id)"),
     ("request_types", "request_type"),
+    ("error_classes", obleth_config::EFFECTIVE_CLASS_SQL),
 ];
 
 fn usage_log_facet_sql(expr: &str, filter: &str) -> String {
@@ -614,12 +657,13 @@ pub async fn query_usage_log_facets(
     let failures =
         bind_log_filters(client.query(&failures_sql), binds.clone()).fetch_all::<UsageLogFailure>();
     let dims = LOG_FACET_DIMENSIONS;
-    let (status_codes, models, tenants, keys, request_types, failures) = tokio::try_join!(
+    let (status_codes, models, tenants, keys, request_types, error_classes, failures) = tokio::try_join!(
         facet(dims[0].1),
         facet(dims[1].1),
         facet(dims[2].1),
         facet(dims[3].1),
         facet(dims[4].1),
+        facet(dims[5].1),
         failures,
     )?;
     Ok(UsageLogFacets {
@@ -628,7 +672,108 @@ pub async fn query_usage_log_facets(
         tenants,
         keys,
         request_types,
+        error_classes,
         failures,
+    })
+}
+
+/// Most groups [`query_usage_failure_groups`] returns.
+const FAILURE_GROUP_LIMIT: u64 = 50;
+
+/// Failures that are the same failure over and over: one caller, one model,
+/// one status, one class, and one reason once its numbers are set aside (so
+/// "prompt contains at least 196609 input tokens" and "... 204864 ..." group
+/// together).
+#[derive(Debug, Clone, Row, Serialize, Deserialize, ToSchema)]
+pub struct UsageFailureGroup {
+    pub error_class: String,
+    /// Whether the class is the platform's failure rather than the caller's.
+    pub platform: bool,
+    #[serde(with = "clickhouse::serde::uuid")]
+    #[schema(value_type = String)]
+    pub tenant_id: Uuid,
+    pub tenant_name: String,
+    #[serde(with = "clickhouse::serde::uuid")]
+    #[schema(value_type = String)]
+    pub key_id: Uuid,
+    pub key_name: String,
+    pub model: String,
+    pub status_code: u16,
+    /// One of the group's recorded reasons, numbers and all; empty for rows
+    /// written before reasons were recorded.
+    pub reason: String,
+    pub requests: u64,
+    /// The group's first and last failure, unix epoch millis.
+    pub first_ms: i64,
+    pub last_ms: i64,
+}
+
+/// `GET /usage/failures`: the failures among the requests matching the
+/// log's filters, split by whose they were, and grouped into repeats.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UsageFailureGroups {
+    /// Every request matching the filters, failed or not.
+    pub requests: u64,
+    pub failures: u64,
+    /// The part of `failures` that were the platform's.
+    pub platform_failures: u64,
+    /// The largest groups first, at most 50.
+    pub groups: Vec<UsageFailureGroup>,
+}
+
+#[derive(Debug, Clone, Row, Deserialize)]
+struct FailureCounts {
+    requests: u64,
+    failures: u64,
+    platform_failures: u64,
+}
+
+fn failure_counts_sql(filter: &str) -> String {
+    format!(
+        "select count() as requests, \
+         countIf(status_code >= 400) as failures, \
+         countIf({class} in {platform}) as platform_failures \
+         from usage{filter}",
+        class = obleth_config::EFFECTIVE_CLASS_SQL,
+        platform = obleth_config::PLATFORM_CLASSES_SQL,
+    )
+}
+
+/// Aliases stay clear of the columns the query reads; see [`usage_totals_sql`].
+fn failure_groups_sql(filter: &str) -> String {
+    format!(
+        "select {class} as filed_class, filed_class in {platform} as is_platform, \
+         tenant_id, any(tenant_name) as recorded_tenant, key_id, any(key_name) as recorded_key, \
+         model, status_code, any(error_reason) as sample_reason, \
+         count() as failed, min(ts_ms) as first_at, max(ts_ms) as last_at \
+         from usage{filter} and status_code >= 400 \
+         group by filed_class, tenant_id, key_id, model, status_code, \
+         replaceRegexpAll(error_reason, '[0-9]+', 'N') \
+         order by failed desc, last_at desc limit {FAILURE_GROUP_LIMIT}",
+        class = obleth_config::EFFECTIVE_CLASS_SQL,
+        platform = obleth_config::PLATFORM_CLASSES_SQL,
+    )
+}
+
+/// The failures among the requests matching the log's filters: how many
+/// there were, how many were the platform's, and the largest repeats.
+pub async fn query_usage_failure_groups(
+    client: &clickhouse::Client,
+    q: UsageLogQuery,
+) -> Result<UsageFailureGroups, clickhouse::error::Error> {
+    let since = q.since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
+    let (filter, binds) = log_filter_sql(&q, since);
+    let counts_sql = failure_counts_sql(&filter);
+    let groups_sql = failure_groups_sql(&filter);
+    let (counts, groups) = tokio::try_join!(
+        bind_log_filters(client.query(&counts_sql), binds.clone()).fetch_one::<FailureCounts>(),
+        bind_log_filters(client.query(&groups_sql), binds).fetch_all::<UsageFailureGroup>(),
+    )?;
+    Ok(UsageFailureGroups {
+        requests: counts.requests,
+        failures: counts.failures,
+        platform_failures: counts.platform_failures,
+        groups,
     })
 }
 
@@ -683,6 +828,9 @@ pub struct UsageDailyRow {
     pub energy_cost_usd: f64,
     /// Total CO₂ equivalent in grams for the grouped rows.
     pub co2_g: f64,
+    /// The part of `error_requests` that were the platform's failures, not
+    /// the caller's.
+    pub platform_error_requests: u64,
 }
 
 /// Whole-gateway usage totals for the overview strip: one aggregate row over
@@ -706,6 +854,9 @@ pub struct UsageTotals {
     pub energy_wh: f64,
     pub energy_cost_usd: f64,
     pub co2_g: f64,
+    /// The part of `errors` that were the platform's failures, not the
+    /// caller's (see `obleth_config::ErrorClass::is_platform`).
+    pub platform_errors: u64,
 }
 
 /// Columns are read positionally into [`UsageTotals`], so aliases need not
@@ -723,8 +874,11 @@ fn usage_totals_sql(filter: &str) -> String {
          countIf(status_code >= 400) as errors, \
          round(if(countIf(ttft_ms > 0) > 0, quantileIf(0.5)(ttft_ms, ttft_ms > 0), 0), 1) as p50_ttft_ms, \
          round(if(countIf(ttft_ms > 0) > 0, avgIf(ttft_ms, ttft_ms > 0), 0), 1) as avg_ttft_ms, \
-         sum(energy_wh) as energy_wh, sum(energy_cost_usd) as energy_cost_usd, sum(co2_g) as co2_g \
-         from usage where ts_ms >= ?{filter}"
+         sum(energy_wh) as energy_wh, sum(energy_cost_usd) as energy_cost_usd, sum(co2_g) as co2_g, \
+         countIf({class} in {platform}) as platform_errors \
+         from usage where ts_ms >= ?{filter}",
+        class = obleth_config::EFFECTIVE_CLASS_SQL,
+        platform = obleth_config::PLATFORM_CLASSES_SQL,
     )
 }
 
@@ -828,6 +982,9 @@ pub struct UsageTimePoint {
     /// Median time to first token in the bucket; 0 when no request produced one.
     pub p50_ttft_ms: f64,
     pub avg_ttft_ms: f64,
+    /// The part of `errors` that were the platform's failures, not the
+    /// caller's.
+    pub platform_errors: u64,
 }
 
 #[derive(Debug, Clone, Row, Serialize, Deserialize, ToSchema)]
@@ -1197,8 +1354,11 @@ fn usage_series_sql(bucket: i64) -> String {
          countIf(status_code >= 400) as errors, \
          sum(cost_usd) as cost_usd, \
          round(if(countIf(ttft_ms > 0) > 0, quantileIf(0.5)(ttft_ms, ttft_ms > 0), 0), 1) as p50_ttft_ms, \
-         round(if(countIf(ttft_ms > 0) > 0, avgIf(ttft_ms, ttft_ms > 0), 0), 1) as avg_ttft_ms \
-         from usage where ts_ms >= ?"
+         round(if(countIf(ttft_ms > 0) > 0, avgIf(ttft_ms, ttft_ms > 0), 0), 1) as avg_ttft_ms, \
+         countIf({class} in {platform}) as platform_errors \
+         from usage where ts_ms >= ?",
+        class = obleth_config::EFFECTIVE_CLASS_SQL,
+        platform = obleth_config::PLATFORM_CLASSES_SQL,
     )
 }
 
@@ -1610,7 +1770,8 @@ pub async fn query_usage_daily(
          round(sum(cost_usd_sum), 6) as cost_usd, \
          round(sum(energy_wh_sum), 6) as energy_wh, \
          round(sum(energy_cost_usd_sum), 6) as energy_cost_usd, \
-         round(sum(co2_g_sum), 6) as co2_g \
+         round(sum(co2_g_sum), 6) as co2_g, \
+         sum(platform_error_requests) \
          from (select * from usage_daily {inner_where}) "
     );
     sql.push_str(group_clause);
@@ -1961,13 +2122,13 @@ mod alias_tests {
     #[test]
     fn totals_aliases_do_not_shadow_columns() {
         assert_no_shadowing(&usage_totals_sql(""));
-        assert_eq!(select_items(&usage_totals_sql("")).len(), 12);
+        assert_eq!(select_items(&usage_totals_sql("")).len(), 13);
     }
 
     #[test]
     fn series_aliases_do_not_shadow_columns() {
         assert_no_shadowing(&usage_series_sql(60_000));
-        assert_eq!(select_items(&usage_series_sql(60_000)).len(), 10);
+        assert_eq!(select_items(&usage_series_sql(60_000)).len(), 11);
     }
 
     fn speed_query(filters: bool) -> UsageSpeedQuery {
@@ -2019,7 +2180,7 @@ mod alias_tests {
     fn log_histogram_aliases_do_not_shadow_columns() {
         let sql = usage_log_histogram_sql(60_000, " where ts_ms >= ?");
         assert_no_shadowing(&sql);
-        assert_eq!(select_items(&sql).len(), 3);
+        assert_eq!(select_items(&sql).len(), 4);
     }
 
     fn log_query() -> UsageLogQuery {
@@ -2032,6 +2193,8 @@ mod alias_tests {
             device_id: None,
             status: None,
             status_code: None,
+            fault: None,
+            error_class: Vec::new(),
             request_id: None,
             parent_request_id: None,
             since_ms: None,
@@ -2113,7 +2276,8 @@ mod alias_tests {
     fn log_columns_follow_the_row_field_order() {
         // `UsageLogRow` is read by position: a column out of place would land
         // in the wrong field (or fail the read) without any name check.
-        let select = USAGE_LOG_SELECT
+        let select = usage_log_select().replace(obleth_config::EFFECTIVE_CLASS_SQL, "class_expr");
+        let select = select
             .trim_start_matches("select ")
             .split(" from ")
             .next()
@@ -2156,8 +2320,41 @@ mod alias_tests {
                 "recorded_key_name",
                 "recorded_tenant_name",
                 "streamed",
+                "error_reason",
+                "filed_class",
             ]
         );
+    }
+
+    #[test]
+    fn failure_reads_file_old_rows_by_status_and_split_by_side() {
+        let counts = failure_counts_sql(" where ts_ms >= ?");
+        assert_no_shadowing(&counts);
+        assert_eq!(select_items(&counts).len(), 3);
+        let groups = failure_groups_sql(" where ts_ms >= ?");
+        assert!(groups.contains(" and status_code >= 400 group by"));
+        assert!(groups.contains(obleth_config::EFFECTIVE_CLASS_SQL));
+        assert!(!groups.contains(" as error_class"));
+        assert_eq!(groups.matches('?').count(), 1);
+
+        let q = |fault: Option<&str>, classes: &[&str]| UsageLogQuery {
+            fault: fault.map(str::to_string),
+            error_class: classes.iter().map(|c| c.to_string()).collect(),
+            ..log_query()
+        };
+        let (sql, binds) = log_filter_sql(&q(Some("platform"), &[]), 0);
+        assert!(sql.ends_with(&format!(
+            " and {} in {}",
+            obleth_config::EFFECTIVE_CLASS_SQL,
+            obleth_config::PLATFORM_CLASSES_SQL
+        )));
+        assert_eq!(sql.matches('?').count(), binds.len());
+        let (sql, _) = log_filter_sql(&q(Some("client"), &[]), 0);
+        assert!(sql.contains(" and status_code >= 400 and multiIf("));
+        assert!(sql.contains(" not in ('capacity'"));
+        let (sql, binds) = log_filter_sql(&q(None, &["capacity", "network"]), 0);
+        assert!(sql.ends_with(" in (?, ?)"));
+        assert_eq!(sql.matches('?').count(), binds.len());
     }
 
     #[test]

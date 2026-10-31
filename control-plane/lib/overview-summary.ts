@@ -13,6 +13,8 @@ export interface OverviewSummary {
   inputTokens: number;
   outputTokens: number;
   errors: number;
+  /** The part of `errors` that were the platform's failures, not the callers'. */
+  platformErrors: number;
   p50TtftMs: number;
   avgTtftMs: number;
   energyWh: number;
@@ -20,6 +22,8 @@ export interface OverviewSummary {
   co2G: number;
   /** Whether the gateway reported the window detail (errors, latency, energy). Older gateways do not. */
   detailed: boolean;
+  /** Whether the gateway splits failures into the platform's and the callers'. Older gateways do not. */
+  classified: boolean;
 }
 
 export const EMPTY_OVERVIEW_SUMMARY: OverviewSummary = {
@@ -35,12 +39,14 @@ export const EMPTY_OVERVIEW_SUMMARY: OverviewSummary = {
   inputTokens: 0,
   outputTokens: 0,
   errors: 0,
+  platformErrors: 0,
   p50TtftMs: 0,
   avgTtftMs: 0,
   energyWh: 0,
   energyCostUsd: 0,
   co2G: 0,
   detailed: false,
+  classified: false,
 };
 
 export function toOverviewSummary(view: OverviewSummaryView): OverviewSummary {
@@ -58,12 +64,14 @@ export function toOverviewSummary(view: OverviewSummaryView): OverviewSummary {
     inputTokens: Number(view.input_tokens ?? 0),
     outputTokens: Number(view.output_tokens ?? 0),
     errors: Number(view.errors ?? 0),
+    platformErrors: Number(view.platform_errors ?? 0),
     p50TtftMs: Number(view.p50_ttft_ms ?? 0),
     avgTtftMs: Number(view.avg_ttft_ms ?? 0),
     energyWh: Number(view.energy_wh ?? 0),
     energyCostUsd: Number(view.energy_cost_usd ?? 0),
     co2G: Number(view.co2_g ?? 0),
     detailed: view.errors !== undefined,
+    classified: view.platform_errors !== undefined,
   };
 }
 

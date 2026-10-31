@@ -210,6 +210,7 @@ async fn handle(
         reasoning_effort_requested: String::new(),
         model_family: String::new(),
         streamed: false,
+        failure: None,
     };
 
     // ---- tenant input guardrails ----
@@ -417,7 +418,7 @@ async fn pick_tool(
     let route = match crate::lifecycle::gate(state, &route, chrono::Utc::now()).await {
         crate::lifecycle::Gate::Serve(_) => route,
         crate::lifecycle::Gate::Redirect(next, _) => next,
-        crate::lifecycle::Gate::Refuse(resp) => return Err(resp),
+        crate::lifecycle::Gate::Refuse(resp, _) => return Err(resp),
     };
     if let Some(allowed) = allowed_for(resolved) {
         if !allowed.iter().any(|m| m == &route.model_name) {

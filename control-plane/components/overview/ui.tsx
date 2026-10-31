@@ -119,17 +119,40 @@ export function Sparkline({ values, className, label }: { values: number[]; clas
   );
 }
 
-export function Kpi({ label, value, detail, trend, href, emphasis }: {
+/**
+ * A headline number with its trend. The whole tile opens `href`; with
+ * `valueHref` or `detailHref` the number and the line under it open their
+ * own pages instead, over a tile that still opens `href` everywhere else.
+ */
+export function Kpi({ label, value, detail, trend, href, emphasis, valueHref, valueTitle, detailHref }: {
   label: string; value: string; detail?: string | null; trend: number[]; href?: string; emphasis?: boolean;
+  valueHref?: string; valueTitle?: string; detailHref?: string;
 }) {
+  const nested = !!(valueHref || detailHref);
+  const valueCls = "text-[26px] font-semibold leading-tight tracking-tight tabular-nums";
+  const detailCls = cn("min-h-4 truncate text-xs", emphasis ? "text-foreground" : "text-muted-foreground");
+  const cls = cn("flex min-w-0 flex-col gap-1.5 rounded-xl border bg-card px-4 pb-3 pt-3.5 transition-colors", emphasis ? "border-muted-foreground" : "border-border", href && "hover:border-muted-foreground/60");
+  if (nested) {
+    // The label's link stretches over the tile; the inner links sit above it.
+    const inner = "relative z-10 w-fit max-w-full underline-offset-[3px] hover:underline";
+    return (
+      <div className={cn(cls, "relative")}>
+        <SectionLabel className={cn(emphasis && "text-secondary-foreground")}>
+          {href ? <Link href={href} className="after:absolute after:inset-0 after:rounded-xl">{label}</Link> : label}
+        </SectionLabel>
+        {valueHref ? <Link href={valueHref} title={valueTitle} className={cn(valueCls, inner)}>{value}</Link> : <span title={valueTitle} className={valueCls}>{value}</span>}
+        {detailHref && detail ? <Link href={detailHref} className={cn(detailCls, inner)}>{detail}</Link> : <span className={detailCls}>{detail ?? " "}</span>}
+        <Sparkline values={trend} label={`${label} trend`} />
+      </div>
+    );
+  }
   const body = (
     <>
       <SectionLabel className={cn(emphasis && "text-secondary-foreground")}>{label}</SectionLabel>
-      <span className="text-[26px] font-semibold leading-tight tracking-tight tabular-nums">{value}</span>
-      <span className={cn("min-h-4 truncate text-xs", emphasis ? "text-foreground" : "text-muted-foreground")}>{detail ?? " "}</span>
+      <span title={valueTitle} className={valueCls}>{value}</span>
+      <span className={detailCls}>{detail ?? " "}</span>
       <Sparkline values={trend} label={`${label} trend`} />
     </>
   );
-  const cls = cn("flex min-w-0 flex-col gap-1.5 rounded-xl border bg-card px-4 pb-3 pt-3.5 transition-colors", emphasis ? "border-muted-foreground" : "border-border", href && "hover:border-muted-foreground/60");
   return href ? <Link href={href} className={cls}>{body}</Link> : <div className={cls}>{body}</div>;
 }

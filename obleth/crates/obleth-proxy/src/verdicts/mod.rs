@@ -697,6 +697,7 @@ async fn handler_inner(
         reasoning_effort_requested: String::new(),
         model_family: String::new(),
         streamed: false,
+        failure: None,
     };
     if let Some(t) = tracer.as_mut() {
         t.set_conversation(&req_meta.session_id, req_meta.session_id_source);
@@ -885,7 +886,7 @@ async fn handler_inner(
             model = next.model_name.clone();
             next
         }
-        crate::lifecycle::Gate::Refuse(resp) => return resp,
+        crate::lifecycle::Gate::Refuse(resp, _) => return resp,
     };
     // verdicts reads chat-completions logprobs; only chat routes can serve it.
     if route.model_type != "chat" {

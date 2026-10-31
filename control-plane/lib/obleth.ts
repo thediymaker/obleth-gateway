@@ -815,6 +815,8 @@ export interface UsageTimePoint {
   /** Median time to first token in the bucket; 0 when no request produced one. */
   p50_ttft_ms?: number;
   avg_ttft_ms?: number;
+  /** The part of `errors` that were the platform's failures, not the caller's. Absent from older gateways. */
+  platform_errors?: number;
 }
 
 /// One row of the permanent daily rollup (`usage_daily`).
@@ -839,7 +841,28 @@ export interface UsageDailyRow {
   energy_wh: number;
   energy_cost_usd: number;
   co2_g: number;
+  /** The part of `error_requests` that were the platform's failures, not the caller's. Absent from older gateways. */
+  platform_error_requests?: number;
 }
+
+/**
+ * What kind of failure a request met. The first four are the caller's side
+ * (the request could not be served as sent), the rest the platform's (it
+ * could not serve a valid request). See lib/failure-classes.ts for labels.
+ */
+export type ErrorClass =
+  | "client_input"
+  | "client_cancel"
+  | "retired"
+  | "limit"
+  | "capacity"
+  | "upstream_timeout"
+  | "upstream_error"
+  | "network"
+  | "gateway";
+
+/** Whose failures: the platform's, or the callers'. */
+export type FaultSide = "platform" | "client";
 
 /// One row of the live request log (`usage/logs`), enriched with tenant/key names.
 export interface UsageLogEntry {
@@ -888,6 +911,14 @@ export interface UsageLogEntry {
   reasoning_effort?: string;
   /** The reasoning effort the caller asked for, or empty. Absent from older gateways. */
   reasoning_effort_requested?: string;
+  /**
+   * What kind of failure the request met (an `ErrorClass`), or empty for a
+   * success. Rows written before failures were classified are filed by their
+   * status code. Absent from older gateways.
+   */
+  error_class?: string;
+  /** Why it failed, as recorded; empty on a success and on rows written before reasons were. Absent from older gateways. */
+  error_reason?: string;
 }
 
 /// One recorded span from the flight-recorder tracer for a single request.
@@ -926,6 +957,10 @@ export interface UsageLogParams {
   includeInternal?: boolean;
   /** Only the helper calls made while serving this client request. */
   parentRequestId?: string;
+  /** Only the platform's failures, or only the callers'. Either means failures only. */
+  fault?: FaultSide;
+  /** One failure class, or several joined by commas (`capacity,network`). */
+  errorClass?: string;
 }
 
 /** One value of a log facet; `label` is a tenant's or key's name. */
@@ -943,6 +978,8 @@ export interface UsageLogFacets {
   tenants: UsageLogFacet[];
   keys: UsageLogFacet[];
   request_types: UsageLogFacet[];
+  /** Failure classes; successes come back under the empty value. Absent from older gateways. */
+  error_classes?: UsageLogFacet[];
   /** Status code and model pairs among the failures, most common first. */
   failures: { status_code: number; model: string; requests: number }[];
 }
@@ -950,7 +987,42 @@ export interface UsageLogFacets {
 /** `GET /usage/logs/histogram`: the width used, and each non-empty bucket. */
 export interface UsageLogHistogram {
   bucket_ms: number;
-  buckets: { bucket_ms: number; requests: number; errors: number }[];
+  /** `platform_errors` is the part of `errors` that were the platform's; absent from older gateways. */
+  buckets: { bucket_ms: number; requests: number; errors: number; platform_errors?: number }[];
+}
+
+/**
+ * The same failure over and over: one key, model, status, class and reason
+ * (numbers in the reason set aside, so two prompt lengths over one limit
+ * group together).
+ */
+export interface UsageFailureGroup {
+  error_class: string;
+  /** Whether the class is the platform's failure rather than the caller's. */
+  platform: boolean;
+  tenant_id: string;
+  tenant_name: string;
+  key_id: string;
+  key_name: string;
+  model: string;
+  status_code: number;
+  /** One of the group's recorded reasons; empty for rows written before reasons were. */
+  reason: string;
+  requests: number;
+  /** The group's first and last failure, epoch millis. */
+  first_ms: number;
+  last_ms: number;
+}
+
+/** `GET /usage/failures`: the failures among the requests matching the log's filters, split by side and grouped into repeats. */
+export interface UsageFailureGroups {
+  /** Every request matching the filters, failed or not. */
+  requests: number;
+  failures: number;
+  /** The part of `failures` that were the platform's. */
+  platform_failures: number;
+  /** The largest groups first, at most 50. */
+  groups: UsageFailureGroup[];
 }
 
 export interface UsageRetentionView {
@@ -1066,6 +1138,8 @@ export interface OverviewSummaryView {
   output_tokens?: number;
   /** Requests that ended with an HTTP status of 400 or above. */
   errors?: number;
+  /** The part of `errors` that were the platform's failures, not the caller's. */
+  platform_errors?: number;
   /** Median time to first token; 0 when no request produced one. */
   p50_ttft_ms?: number;
   avg_ttft_ms?: number;
@@ -2036,6 +2110,27 @@ function qs(params: Record<string, string | number | undefined>) {
   return s ? `?${s}` : "";
 }
 
+/** The request log's filters as query parameters, shared by the log, its histogram, facets and failure groups. */
+function logFilterQuery(params: UsageLogParams) {
+  return {
+    tenant_id: params.tenantId,
+    key_id: params.keyId,
+    model: params.model,
+    request_type: params.requestType,
+    session_id: params.sessionId,
+    device_id: params.deviceId,
+    status: params.status,
+    status_code: params.statusCode,
+    fault: params.fault,
+    error_class: params.errorClass,
+    request_id: params.requestId,
+    since_ms: params.sinceMs,
+    until_ms: params.untilMs,
+    traced_only: params.tracedOnly ? "true" : undefined,
+    include_internal: params.includeInternal ? "true" : undefined,
+  };
+}
+
 /** Build/version identity reported by the gateway's public /version endpoint. */
 export interface VersionInfo {
   version: string;
@@ -2722,64 +2817,24 @@ export const obleth = {
   usageLogs: (params: UsageLogParams = {}) =>
     api<UsageLogEntry[]>(
       `/usage/logs${qs({
-        tenant_id: params.tenantId,
-        key_id: params.keyId,
-        model: params.model,
-        request_type: params.requestType,
-        session_id: params.sessionId,
-        device_id: params.deviceId,
-        status: params.status,
-        status_code: params.statusCode,
-        request_id: params.requestId,
-        since_ms: params.sinceMs,
-        until_ms: params.untilMs,
+        ...logFilterQuery(params),
         before_ms: params.beforeMs,
         before_request_id: params.beforeRequestId,
         limit: params.limit,
-        traced_only: params.tracedOnly ? "true" : undefined,
-        include_internal: params.includeInternal ? "true" : undefined,
         parent_request_id: params.parentRequestId,
       })}`,
     ),
   /** Requests and failures per bucket, counted with the log's own filters. */
   usageLogHistogram: (params: UsageLogParams & { bucketMs?: number } = {}) =>
     api<UsageLogHistogram>(
-      `/usage/logs/histogram${qs({
-        tenant_id: params.tenantId,
-        key_id: params.keyId,
-        model: params.model,
-        request_type: params.requestType,
-        session_id: params.sessionId,
-        device_id: params.deviceId,
-        status: params.status,
-        status_code: params.statusCode,
-        request_id: params.requestId,
-        since_ms: params.sinceMs,
-        until_ms: params.untilMs,
-        traced_only: params.tracedOnly ? "true" : undefined,
-        include_internal: params.includeInternal ? "true" : undefined,
-        bucket_ms: params.bucketMs,
-      })}`,
+      `/usage/logs/histogram${qs({ ...logFilterQuery(params), bucket_ms: params.bucketMs })}`,
     ),
   /** What the requests matching the log's filters are made of, busiest first. */
   usageLogFacets: (params: UsageLogParams = {}) =>
-    api<UsageLogFacets>(
-      `/usage/logs/facets${qs({
-        tenant_id: params.tenantId,
-        key_id: params.keyId,
-        model: params.model,
-        request_type: params.requestType,
-        session_id: params.sessionId,
-        device_id: params.deviceId,
-        status: params.status,
-        status_code: params.statusCode,
-        request_id: params.requestId,
-        since_ms: params.sinceMs,
-        until_ms: params.untilMs,
-        traced_only: params.tracedOnly ? "true" : undefined,
-        include_internal: params.includeInternal ? "true" : undefined,
-      })}`,
-    ),
+    api<UsageLogFacets>(`/usage/logs/facets${qs(logFilterQuery(params))}`),
+  /** The failures among the requests matching the log's filters, grouped into repeats; the last 24 hours by default. */
+  usageFailures: (params: UsageLogParams = {}) =>
+    api<UsageFailureGroups>(`/usage/failures${qs(logFilterQuery(params))}`),
   getRequestSpans: (requestId: string) =>
     api<SpanEntry[]>(`/usage/logs/${requestId}/spans`).catch(() => [] as SpanEntry[]),
   // Server-only: hand the control-plane (Charo's model-test console) the reserved

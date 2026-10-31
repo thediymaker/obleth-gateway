@@ -6,6 +6,7 @@ import { useQuery } from "@tanstack/react-query";
 import { ChevronDown, ChevronUp, Copy, X } from "lucide-react";
 import { RouteExplainPanel } from "@/components/playground/route-explain";
 import { Button } from "@/components/ui/button";
+import { classLabel, ERROR_CLASSES, failureReason, isErrorClass } from "@/lib/failure-classes";
 import { logsHref } from "@/lib/log-links";
 import { modelHref } from "@/lib/model-links";
 import { cost, describeRequest, duration, effortText, helperCallsParams, helperPurpose, HTTP_REASONS, isFailure, servedRequest, timeSplit, type LogFilters } from "@/lib/logs-model";
@@ -19,7 +20,7 @@ function stamp(ms: number) {
 }
 
 function title(row: UsageLogEntry): string {
-  if (isFailure(row)) return HTTP_REASONS[row.status_code] ?? `Failed with HTTP ${row.status_code}`;
+  if (isFailure(row)) return classLabel(row.error_class) || HTTP_REASONS[row.status_code] || `Failed with HTTP ${row.status_code}`;
   if (row.cache_status === "hit") return "Answered from the cache";
   return `Answered in ${duration(row.total_ms)}`;
 }
@@ -152,6 +153,8 @@ export function RequestPanel({
   }, [onClose, onStep]);
 
   const failed = isFailure(row);
+  // A failure's kind, in plain words; unknown to a gateway that predates classes.
+  const kind = row.error_class && isErrorClass(row.error_class) ? ERROR_CLASSES[row.error_class] : null;
   const traced = row.has_trace && (spans?.length ?? 0) > 0;
   const tl = traced ? timeline(spans!) : null;
   const split = timeSplit(row);
@@ -187,6 +190,9 @@ export function RequestPanel({
           </Button>
           {row.session_id && <Button type="button" variant="outline" size="sm" onClick={() => onFilter({ sessionId: row.session_id })}>This session</Button>}
           {row.key_id && <Button type="button" variant="outline" size="sm" onClick={() => onFilter({ keyId: row.key_id, tenantId: row.tenant_id })}>More from this key</Button>}
+          {failed && row.error_class && (
+            <Button type="button" variant="outline" size="sm" onClick={() => onFilter({ errorClass: row.error_class, statusCode: String(row.status_code), model: row.model, keyId: row.key_id, tenantId: row.tenant_id, status: "" })}>Failures like this</Button>
+          )}
           <Button asChild variant="outline" size="sm"><Link href={modelHref(row.model)}>Open {row.model}</Link></Button>
         </div>
       </div>
@@ -200,6 +206,18 @@ export function RequestPanel({
             <p className="text-[13px] leading-relaxed text-secondary-foreground">{describeRequest(row, spans ?? [])}</p>
           )}
         </section>
+
+        {failed && row.error_class !== undefined && (
+          <section aria-label="Why it failed" className="space-y-1.5">
+            <p className="text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">Why it failed</p>
+            <p className="text-[13px]">
+              <span className="font-semibold">{classLabel(row.error_class) || `HTTP ${row.status_code}`}</span>
+              {kind && <span className="text-secondary-foreground">, on the {kind.side === "platform" ? "platform's" : "caller's"} side. </span>}
+              {kind && <span className="text-muted-foreground">{kind.hint}</span>}
+            </p>
+            <p className="whitespace-pre-wrap break-words rounded-lg border border-border bg-background/40 px-3 py-2 font-mono text-[12.5px] text-secondary-foreground">{failureReason(row)}</p>
+          </section>
+        )}
 
         <section aria-label="Timeline" className="space-y-2">
           <div className="flex items-baseline justify-between">

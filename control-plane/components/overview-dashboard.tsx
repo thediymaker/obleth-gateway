@@ -16,6 +16,7 @@ import {
   type OverviewRange,
 } from "@/lib/overview-model";
 import { countsScope, tenantsBelowShare } from "@/lib/fairshare";
+import { logsHref } from "@/lib/log-links";
 import { cn, getJson } from "@/lib/utils";
 import { Fleet, RightNow, type LiveCapacity } from "@/components/overview/fleet";
 import { FooterTiles, NeedsAttention, RecentChanges, TopTenants } from "@/components/overview/panels";
@@ -107,9 +108,20 @@ export function OverviewDashboard({
   const prev = win.previous;
   const against = PREVIOUS_LABEL[win.range];
   const hasErrors = s.detailed;
-  const errorRate = s.requests ? (s.errors / s.requests) * 100 : 0;
-  const prevErrorRate = prev?.requests ? (prev.errors / prev.requests) * 100 : 0;
-  const errorDetail = !hasErrors ? "Needs a newer gateway" : `${s.errors.toLocaleString()} failed${prev && prevErrorRate ? ` · was ${prevErrorRate.toFixed(prevErrorRate < 1 ? 2 : 1)}%` : ""}`;
+  // The headline is the platform's own failures; callers' failures (bad
+  // requests, hang-ups, limits) are the line under it. A gateway that does
+  // not split them shows every failure, as before.
+  const split = hasErrors && s.classified;
+  const failed = split ? s.platformErrors : s.errors;
+  const callerErrors = Math.max(0, s.errors - s.platformErrors);
+  const errorRate = s.requests ? (failed / s.requests) * 100 : 0;
+  const prevFailed = split ? prev?.platformErrors ?? 0 : prev?.errors ?? 0;
+  const prevErrorRate = prev?.requests ? (prevFailed / prev.requests) * 100 : 0;
+  const errorDetail = !hasErrors
+    ? "Needs a newer gateway"
+    : split
+      ? `${s.platformErrors.toLocaleString()} of ${s.requests.toLocaleString()} requests · ${callerErrors ? `${callerErrors.toLocaleString()} caller failure${callerErrors === 1 ? "" : "s"}` : "no caller failures"}`
+      : `${s.errors.toLocaleString()} failed${prev && prevErrorRate ? ` · was ${prevErrorRate.toFixed(prevErrorRate < 1 ? 2 : 1)}%` : ""}`;
   const serving = fleet.filter((t) => t.health === "healthy" || t.health === "unknown").length;
   const pct = (v: number) => `${v.toFixed(v < 1 ? 2 : 1)}%`;
   const updatedAt = Math.max(windowQuery.dataUpdatedAt, fairshareQuery.dataUpdatedAt);
@@ -151,13 +163,26 @@ export function OverviewDashboard({
       <div className={cn("grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-5", windowQuery.isPlaceholderData && "opacity-60")}>
         <Kpi label={`Requests · ${win.range}`} value={compact(s.requests)} detail={prev ? changeLabel(s.requests, prev.requests, against) : null} trend={series.map((p) => p.requests)} href="/reports" />
         <Kpi label={`Tokens · ${win.range}`} value={compact(s.tokens)} detail={s.inputTokens || s.outputTokens ? `${compact(s.inputTokens)} in · ${compact(s.outputTokens)} out` : prev ? changeLabel(s.tokens, prev.tokens, against) : null} trend={series.map((p) => p.tokens)} href="/reports" />
-        <Kpi label={`Error rate · ${win.range}`} value={hasErrors ? pct(errorRate) : "—"} detail={errorDetail} trend={series.map((p) => p.errors)} href={`/logs?status=error&window=${win.range}`} emphasis={hasErrors && errorRate >= 2 && errorRate > prevErrorRate * 2} />
+        {split ? (
+          <Kpi
+            label={`Platform failures · ${win.range}`}
+            value={pct(errorRate)}
+            valueTitle={`${s.platformErrors.toLocaleString()} of ${s.requests.toLocaleString()} requests failed on the platform's side`}
+            valueHref={logsHref({ fault: "platform", window: win.range })}
+            detail={errorDetail}
+            trend={series.map((p) => p.platformErrors)}
+            href={`/failures?range=${win.range}`}
+            emphasis={errorRate >= 2 && errorRate > prevErrorRate * 2}
+          />
+        ) : (
+          <Kpi label={`Error rate · ${win.range}`} value={hasErrors ? pct(errorRate) : "—"} detail={errorDetail} trend={series.map((p) => p.errors)} href={logsHref({ status: "error", window: win.range })} emphasis={hasErrors && errorRate >= 2 && errorRate > prevErrorRate * 2} />
+        )}
         <Kpi label="First token · p50" value={formatMs(s.p50TtftMs)} detail={s.avgTtftMs ? `avg ${formatMs(s.avgTtftMs)}` : null} trend={series.map((p) => p.ttft ?? 0)} href="/reports" />
         <Kpi label={`Spend · ${win.range}`} value={s.hasPricing ? money(s.cost) : "—"} detail={s.hasPricing ? `at list price · ${s.activeTenants} tenant${s.activeTenants === 1 ? "" : "s"}` : "No prices set on models"} trend={series.map((p) => p.cost)} href="/reports" />
       </div>
 
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_400px]">
-        <TrafficPanel series={series} range={win.range} hasErrors={hasErrors} />
+        <TrafficPanel series={series} range={win.range} hasErrors={hasErrors} split={split} />
         <RightNow capacity={capacity} fleet={fleet} onOpen={setPeek} />
       </div>
 

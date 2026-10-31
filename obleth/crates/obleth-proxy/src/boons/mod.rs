@@ -1334,6 +1334,8 @@ fn helper_usage_record(
         key_name: key.key_name.clone(),
         tenant_name: key.tenant_name.clone(),
         streamed: false,
+        error_class: String::new(),
+        error_reason: String::new(),
     }
 }
 

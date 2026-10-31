@@ -3,7 +3,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { RequestPanel, StepDetail } from "./request-panel";
-import { NIL_REQUEST_ID } from "@/lib/logs-model";
+import { NIL_REQUEST_ID, type LogFilters } from "@/lib/logs-model";
 import type { SpanNode } from "@/lib/trace-model";
 import type { SpanEntry, UsageLogEntry } from "@/lib/obleth";
 
@@ -191,12 +191,12 @@ describe("the request panel", () => {
   });
   afterEach(() => vi.unstubAllGlobals());
 
-  async function show(row: UsageLogEntry) {
+  async function show(row: UsageLogEntry, onFilter: (patch: Partial<LogFilters>) => void = () => {}) {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     await act(async () => {
       root.render(
         <QueryClientProvider client={client}>
-          <RequestPanel row={row} onClose={() => {}} onStep={() => {}} canStep={{ newer: false, older: false }} onFilter={() => {}} />
+          <RequestPanel row={row} onClose={() => {}} onStep={() => {}} canStep={{ newer: false, older: false }} onFilter={onFilter} />
         </QueryClientProvider>,
       );
     });
@@ -205,6 +205,29 @@ describe("the request panel", () => {
 
   const fact = (label: string) => [...host.querySelectorAll("dt")].find((d) => d.textContent === label)?.nextElementSibling ?? null;
   const helperSection = () => host.querySelector('[aria-label="Helper calls"]');
+
+  it("says why a request failed, whose side it was on, and the reason as recorded", async () => {
+    const picked: Partial<LogFilters>[] = [];
+    await show(entry({ status_code: 503, output_tokens: 0, cost_usd: 0, error_class: "capacity", error_reason: "No slot came free in 30 s on glm-5-3" }), (p) => picked.push(p));
+    expect(host.querySelector("h2")!.textContent).toBe("No capacity");
+    const why = host.querySelector('[aria-label="Why it failed"]')!;
+    expect(why.textContent).toContain("No capacity, on the platform's side.");
+    expect(why.textContent).toContain("No slot came free in 30 s on glm-5-3");
+    const like = [...host.querySelectorAll("button")].find((b) => b.textContent === "Failures like this")!;
+    await act(async () => like.click());
+    expect(picked).toEqual([{ errorClass: "capacity", statusCode: "503", model: "glm-5-3", keyId: "k-1", tenantId: "t-cs", status: "" }]);
+  });
+
+  it("gives an older failure's status in place of a reason it never recorded", async () => {
+    await show(entry({ status_code: 400, output_tokens: 0, cost_usd: 0, error_class: "client_input", error_reason: "" }));
+    const why = host.querySelector('[aria-label="Why it failed"]')!;
+    expect(why.textContent).toContain("Request refused, on the caller's side.");
+    expect(why.textContent).toContain("HTTP 400");
+    // A gateway that does not classify failures leaves the section out.
+    await show(entry({ request_id: "b0000000-0000-0000-0000-000000000000", status_code: 502 }));
+    expect(host.querySelector('[aria-label="Why it failed"]')).toBeNull();
+    expect(host.querySelector("h2")!.textContent).toBe("Bad gateway");
+  });
 
   it("names the variant a client asked for", async () => {
     await show(entry({ model_variant: "glm-5-3-spec" }));

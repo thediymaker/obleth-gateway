@@ -1,7 +1,7 @@
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { describe, expect, it } from "vitest";
-import { AuditSkeleton, CollectionSkeleton, DashboardSkeleton, KnowledgeSkeleton, McpSkeleton, DeploymentSkeleton, DeploymentsSkeleton, FairshareSkeleton, GroupsSkeleton, KeysSkeleton, LogsSkeleton, ModelSkeleton, ModelsSkeleton, OverviewSkeleton, PlaygroundSkeleton, ReportsSkeleton, SettingsSkeleton, TenantSkeleton, TenantsSkeleton, UsersSkeleton } from "./page-skeletons";
+import { AuditSkeleton, CollectionSkeleton, DashboardSkeleton, KnowledgeSkeleton, McpSkeleton, DeploymentSkeleton, DeploymentsSkeleton, FailuresSkeleton, FairshareSkeleton, GroupsSkeleton, KeysSkeleton, LogsSkeleton, ModelSkeleton, ModelsSkeleton, OverviewSkeleton, PlaygroundSkeleton, ReportsSkeleton, SettingsSkeleton, TenantSkeleton, TenantsSkeleton, UsersSkeleton } from "./page-skeletons";
 
 describe("page skeletons", () => {
   it.each([
@@ -13,6 +13,7 @@ describe("page skeletons", () => {
     ["Loading models", ModelsSkeleton],
     ["Loading the model", ModelSkeleton],
     ["Loading request logs", LogsSkeleton],
+    ["Loading failures", FailuresSkeleton],
     ["Loading reports", ReportsSkeleton],
     ["Loading tenants", TenantsSkeleton],
     ["Loading the tenant", TenantSkeleton],

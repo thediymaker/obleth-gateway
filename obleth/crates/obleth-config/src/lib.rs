@@ -6,6 +6,7 @@
 pub mod budget;
 pub mod capacity;
 pub mod config;
+pub mod failure;
 pub mod jwt;
 pub mod keys;
 pub mod manifest;
@@ -14,6 +15,10 @@ pub mod routing;
 pub mod types;
 
 pub use config::{CapacityDiscoveryConfig, Config, SessionAffinityConfig, SlackAlertConfig};
+pub use failure::{
+    class_for_status, clean_reason, ledger_failure, reason_for_status, reason_from_body,
+    ErrorClass, Failure, EFFECTIVE_CLASS_SQL, ERROR_REASON_MAX_CHARS, PLATFORM_CLASSES_SQL,
+};
 pub use jwt::{
     identity_key_hash, jwt_issuers_from_env, parse_jwt_issuers, sanitize_device_id, JwtConfigError,
     JwtIssuerConfig, ALLOWED_JWT_ALGORITHMS, DEVICE_ID_MAX_LEN,

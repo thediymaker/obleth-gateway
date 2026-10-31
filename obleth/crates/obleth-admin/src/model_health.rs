@@ -1463,6 +1463,10 @@ fn build_probe_usage(
         key_name: String::new(),
         tenant_name: String::new(),
         streamed: false,
+        error_class: obleth_config::class_for_status(http_status.unwrap_or(0), "")
+            .map_or("", obleth_config::ErrorClass::as_str)
+            .to_string(),
+        error_reason: obleth_config::reason_for_status(http_status.unwrap_or(0), "").to_string(),
     }
 }
 
