@@ -73,3 +73,21 @@ export function groupLogsHref(g: UsageFailureGroup, range: FailureRange): string
 export function groupsFor(groups: UsageFailureGroup[], side: FailureSide): UsageFailureGroup[] {
   return side === "all" ? groups : groups.filter((g) => g.platform === (side === "platform"));
 }
+
+/** How many points a tile's trend line has over the page's range. */
+export const TREND_POINTS = 48;
+
+/**
+ * One value per bucket from `sinceMs` on, zero where the histogram left a
+ * bucket out (it returns only non-empty ones).
+ */
+export function trendOf<B extends { bucket_ms: number }>(buckets: B[], sinceMs: number, bucketMs: number, pick: (b: B) => number): number[] {
+  if (bucketMs <= 0) return [];
+  const start = Math.floor(sinceMs / bucketMs) * bucketMs;
+  const out = new Array<number>(TREND_POINTS + 1).fill(0);
+  for (const b of buckets) {
+    const i = Math.round((b.bucket_ms - start) / bucketMs);
+    if (i >= 0 && i < out.length) out[i] += pick(b);
+  }
+  return out;
+}

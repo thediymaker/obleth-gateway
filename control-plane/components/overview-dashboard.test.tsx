@@ -76,7 +76,7 @@ describe("OverviewDashboard", () => {
     expect(text).toContain("Response cache · 24h");
   });
 
-  it("heads the failures tile with the platform's failures, callers' underneath, each linked to its requests", () => {
+  it("heads the failures tile with the platform's failures, linked to their requests, and counts callers' underneath", () => {
     render([healthy("a", "alpha"), healthy("b", "beta")]);
     const tile = [...host.querySelectorAll("a")].find((a) => a.getAttribute("href") === "/failures?range=24h")!.parentElement!.parentElement!;
     expect(tile.textContent).toContain("Platform failures · 24h");
@@ -84,8 +84,8 @@ describe("OverviewDashboard", () => {
     expect(links).toEqual([
       ["Platform failures · 24h", "/failures?range=24h"],
       ["0.17%", "/logs?fault=platform&window=24h"],
-      ["4 more from callers", "/logs?fault=client&window=24h"],
     ]);
+    expect(tile.textContent).toContain("2 of 1,200 requests · 4 caller failures");
   });
 
   it("shows every failure as the error rate on a gateway that does not split them by side", () => {

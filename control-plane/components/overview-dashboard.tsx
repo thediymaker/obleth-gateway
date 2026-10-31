@@ -120,7 +120,7 @@ export function OverviewDashboard({
   const errorDetail = !hasErrors
     ? "Needs a newer gateway"
     : split
-      ? callerErrors ? `${callerErrors.toLocaleString()} more from callers` : "None from callers"
+      ? `${s.platformErrors.toLocaleString()} of ${s.requests.toLocaleString()} requests · ${callerErrors ? `${callerErrors.toLocaleString()} caller failure${callerErrors === 1 ? "" : "s"}` : "no caller failures"}`
       : `${s.errors.toLocaleString()} failed${prev && prevErrorRate ? ` · was ${prevErrorRate.toFixed(prevErrorRate < 1 ? 2 : 1)}%` : ""}`;
   const serving = fleet.filter((t) => t.health === "healthy" || t.health === "unknown").length;
   const pct = (v: number) => `${v.toFixed(v < 1 ? 2 : 1)}%`;
@@ -170,7 +170,6 @@ export function OverviewDashboard({
             valueTitle={`${s.platformErrors.toLocaleString()} of ${s.requests.toLocaleString()} requests failed on the platform's side`}
             valueHref={logsHref({ fault: "platform", window: win.range })}
             detail={errorDetail}
-            detailHref={callerErrors ? logsHref({ fault: "client", window: win.range }) : undefined}
             trend={series.map((p) => p.platformErrors)}
             href={`/failures?range=${win.range}`}
             emphasis={errorRate >= 2 && errorRate > prevErrorRate * 2}
