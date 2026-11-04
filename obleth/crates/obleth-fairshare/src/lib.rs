@@ -772,6 +772,31 @@ impl FairShare {
         self.ctl.send(Ctl::Sample { respond }).ok()?;
         rx.await.ok()
     }
+
+    /// Shared mode: a history sample counted across every live replica,
+    /// from this replica's view and the views its peers last published (the
+    /// same state [`FairShare::cluster_snapshot`] reads). `None` outside
+    /// shared mode or when the backend does not answer within a second; the
+    /// sampler then records [`FairShare::sample`], this replica's own.
+    pub async fn cluster_sample(&self) -> Option<FairshareSample> {
+        if self.stats.mode() != SlotMode::Shared {
+            return None;
+        }
+        let backend = self.shared.get().cloned()?;
+        let (respond, rx) = oneshot::channel();
+        self.ctl.send(Ctl::View { respond }).ok()?;
+        let local = rx.await.ok()?;
+        let peers = bounded(Duration::from_secs(1), backend.peer_views())
+            .await
+            .ok()?;
+        let mut views: Vec<&ReplicaView> = vec![&local.view];
+        views.extend(peers.views.iter().map(|p| &p.view));
+        let ts_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        Some(FairshareSample::from_views(ts_ms, &views))
+    }
 }
 
 struct Waiter {
@@ -3544,6 +3569,7 @@ impl Scheduler {
             global_in_flight: self.in_flight,
             global_queued: self.queued_total,
             pools,
+            cluster: false,
         }
     }
 

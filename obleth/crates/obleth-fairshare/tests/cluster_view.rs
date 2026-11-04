@@ -245,6 +245,54 @@ async fn a_gateway_without_a_view_is_live_but_not_reporting() {
     assert_eq!((snap.replicas_live, snap.replicas_reporting), (2, 1));
 }
 
+/// The history sampler's cluster sample: any gateway records the whole
+/// pool, where its own sample holds only its part.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_gateway_samples_the_whole_pool_for_history() {
+    let cluster = InMemoryCluster::new();
+    let gws = gateways(&cluster, 3, config());
+    shared(&gws).await;
+    let tenant = Uuid::new_v4();
+    let req = || AdmitRequest::new(tenant, MODEL, 1).model_cap(6);
+    let mut permits = Vec::new();
+    for fs in &gws {
+        for _ in 0..2 {
+            permits.push(admit_now(fs, req()).await);
+        }
+    }
+    let mut waiters = Vec::new();
+    for (i, fs) in gws.iter().enumerate() {
+        for _ in 0..=i {
+            waiters.push(waiter(fs, req()));
+        }
+    }
+
+    for fs in &gws {
+        let s = wait_until("every gateway's view", async || {
+            let s = fs.cluster_sample().await?;
+            (s.global_queued == 6).then_some(s)
+        })
+        .await;
+        assert!(s.cluster);
+        assert_eq!((s.global_in_flight, s.global_queued), (6, 6));
+        let p = &s.pools[0];
+        assert_eq!(
+            (p.model.as_str(), p.cap, p.in_flight, p.queued),
+            (MODEL, 6, 6, 6)
+        );
+    }
+    let own = gws[0].sample().await.expect("scheduler alive");
+    assert!(!own.cluster);
+    assert_eq!(own.global_in_flight, 2);
+
+    cluster.set_failing(true);
+    assert!(gws[0].cluster_sample().await.is_none());
+    drop(permits);
+    for w in waiters {
+        w.abort();
+    }
+}
+
 /// With the backend down there is no cluster view: the caller falls back to
 /// the gateway's own snapshot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -8,7 +8,7 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-use crate::FairshareSnapshot;
+use crate::{FairshareSnapshot, PoolKey, ReplicaView};
 
 /// How often the gateway samples the scheduler. The dashboard polls at the
 /// same rate, so replayed and live points line up.
@@ -39,6 +39,10 @@ pub struct FairshareSample {
     pub global_in_flight: usize,
     pub global_queued: usize,
     pub pools: Vec<PoolSample>,
+    /// Counted across every live replica (shared mode) rather than the
+    /// sampling replica alone.
+    #[serde(default)]
+    pub cluster: bool,
 }
 
 impl FairshareSample {
@@ -66,6 +70,59 @@ impl FairshareSample {
                         .collect(),
                 })
                 .collect(),
+            cluster: false,
+        }
+    }
+
+    /// A sample summed over replica views: this replica's own plus the ones
+    /// its peers last published, as [`crate::FairShare::cluster_snapshot`]
+    /// gathers them. Group totals are never trimmed from a view, so the
+    /// sums are exact.
+    pub fn from_views(ts_ms: i64, views: &[&ReplicaView]) -> Self {
+        let mut pools: BTreeMap<String, PoolSample> = BTreeMap::new();
+        for view in views {
+            for p in &view.pools {
+                let model = match PoolKey::from_slot_id(&p.pool) {
+                    Some(key) => key.display_name().to_string(),
+                    None => p.pool.clone(),
+                };
+                let acc = pools.entry(model.clone()).or_insert_with(|| PoolSample {
+                    model,
+                    cap: p.configured_cap,
+                    in_flight: 0,
+                    queued: 0,
+                    groups: Vec::new(),
+                });
+                acc.in_flight += p.in_flight;
+                acc.queued += p.queued;
+                for g in &p.groups {
+                    match acc.groups.iter_mut().find(|a| a.name == g.name) {
+                        Some(a) => {
+                            a.in_flight += g.in_flight;
+                            a.queued += g.queued;
+                        }
+                        None => acc.groups.push(GroupSample {
+                            name: g.name.clone(),
+                            in_flight: g.in_flight,
+                            queued: g.queued,
+                        }),
+                    }
+                }
+            }
+        }
+        let pools: Vec<PoolSample> = pools
+            .into_values()
+            .map(|mut p| {
+                p.groups.sort_by(|a, b| a.name.cmp(&b.name));
+                p
+            })
+            .collect();
+        FairshareSample {
+            ts_ms,
+            global_in_flight: pools.iter().map(|p| p.in_flight).sum(),
+            global_queued: pools.iter().map(|p| p.queued).sum(),
+            pools,
+            cluster: true,
         }
     }
 }
@@ -78,6 +135,8 @@ pub struct HistoryPoint {
     pub in_flight: usize,
     pub queued: usize,
     pub groups: BTreeMap<String, usize>,
+    /// See [`FairshareSample::cluster`].
+    pub cluster: bool,
 }
 
 /// Bounded, time-ordered ring of samples. `max_len == 0` records nothing.
@@ -174,6 +233,7 @@ fn project(
                     in_flight,
                     queued,
                     groups,
+                    cluster: sample.cluster,
                 }
             }
             None => HistoryPoint {
@@ -181,6 +241,7 @@ fn project(
                 in_flight: 0,
                 queued: 0,
                 groups: BTreeMap::new(),
+                cluster: sample.cluster,
             },
         },
         None => {
@@ -204,6 +265,7 @@ fn project(
                 in_flight: sample.global_in_flight.saturating_sub(excluded_in_flight),
                 queued: sample.global_queued.saturating_sub(excluded_queued),
                 groups,
+                cluster: sample.cluster,
             }
         }
     }
@@ -283,6 +345,84 @@ mod tests {
                 pool("n", 8, 5, 4, vec![group("research", 5, 4)]),
             ]),
         )
+    }
+
+    /// (pool id, in flight, queued, [(group, in flight, queued)]).
+    type PoolSpec<'a> = (&'a str, usize, usize, Vec<(&'a str, usize, usize)>);
+
+    fn replica(pools: Vec<PoolSpec>) -> ReplicaView {
+        ReplicaView {
+            version: crate::view::VIEW_VERSION,
+            pools: pools
+                .into_iter()
+                .map(|(pool, in_flight, queued, groups)| crate::ReplicaPoolView {
+                    pool: pool.into(),
+                    configured_cap: 64,
+                    in_flight,
+                    queued,
+                    groups: groups
+                        .into_iter()
+                        .map(|(name, in_flight, queued)| crate::ReplicaGroupView {
+                            name: name.into(),
+                            weight: 100,
+                            in_flight,
+                            queued,
+                            served: 0.0,
+                        })
+                        .collect(),
+                    tenants: Vec::new(),
+                    keys: Vec::new(),
+                    omitted_tenants: 0,
+                    omitted_keys: 0,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn from_views_sums_pools_and_groups_across_replicas() {
+        let a = replica(vec![(
+            "m:flash",
+            20,
+            5,
+            vec![("default", 18, 5), ("teaching", 2, 0)],
+        )]);
+        let b = replica(vec![
+            ("m:flash", 22, 8, vec![("default", 22, 8)]),
+            ("u", 1, 0, vec![("default", 1, 0)]),
+        ]);
+        let c = replica(vec![("m:flash", 22, 4, vec![("default", 22, 4)])]);
+        let s = FairshareSample::from_views(5_000, &[&a, &b, &c]);
+        assert!(s.cluster);
+        assert_eq!((s.global_in_flight, s.global_queued), (65, 17));
+        let flash = s.pools.iter().find(|p| p.model == "flash").expect("flash");
+        assert_eq!((flash.cap, flash.in_flight, flash.queued), (64, 64, 17));
+        assert_eq!(
+            flash.groups,
+            vec![
+                GroupSample {
+                    name: "default".into(),
+                    in_flight: 62,
+                    queued: 17
+                },
+                GroupSample {
+                    name: "teaching".into(),
+                    in_flight: 2,
+                    queued: 0
+                },
+            ]
+        );
+        assert!(s.pools.iter().any(|p| p.model == crate::UNROUTED_POOL));
+
+        let h = FairshareHistory::new(4);
+        h.push(sample(1_000));
+        h.push(s);
+        let points = h.points(0, Some("flash"), None);
+        assert_eq!(
+            points.iter().map(|p| p.cluster).collect::<Vec<_>>(),
+            vec![false, true]
+        );
+        assert_eq!((points[1].in_flight, points[1].queued), (64, 17));
     }
 
     #[test]
