@@ -754,4 +754,28 @@ mod pipeline {
             .get("reasoning_effort")
             .is_none());
     }
+
+    // Lives here for the gateway harness; the strip itself is in proxy.rs.
+    #[tokio::test]
+    async fn the_upstream_never_sees_a_tool_strict_flag() {
+        let Some(gw) = gateway().await else { return };
+        let (seen, base) = spawn_upstream().await;
+        gw.register(route("plain", &base, ModelReasoning::default()))
+            .await;
+        let secret = gw.key().await;
+
+        let mut body = chat("plain");
+        body["tools"] = json!([{"type": "function", "function": {
+            "name": "edit",
+            "strict": true,
+            "parameters": {"type": "object", "properties": {"old_str": {"type": "string"}}}
+        }}]);
+        let resp = gw.post("/v1/chat/completions", &secret, body).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let sent = seen.lock().unwrap().pop().unwrap();
+        let function = &sent["tools"][0]["function"];
+        assert_eq!(function["name"], "edit");
+        assert!(function.get("strict").is_none());
+        assert!(function["parameters"]["properties"]["old_str"].is_object());
+    }
 }

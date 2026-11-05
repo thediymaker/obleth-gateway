@@ -974,14 +974,21 @@ fn spawn_model_registry_refresh(
 }
 
 /// Sample the scheduler every `FAIRSHARE_HISTORY_INTERVAL_MS` into the
-/// in-memory history ring. A failed sample (scheduler gone) skips the tick.
+/// in-memory history ring. With shared slots each sample counts every live
+/// replica, so whichever replica answers `/fairshare/history` returns the
+/// same series; when the shared backend cannot be read the tick records this
+/// replica's own state. A failed sample (scheduler gone) skips the tick.
 fn spawn_fairshare_history_sampler(fairshare: FairShare, history: Arc<FairshareHistory>) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_millis(FAIRSHARE_HISTORY_INTERVAL_MS));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
-            if let Some(sample) = fairshare.sample().await {
+            let sample = match fairshare.cluster_sample().await {
+                Some(sample) => Some(sample),
+                None => fairshare.sample().await,
+            };
+            if let Some(sample) = sample {
                 history.push(sample);
             }
         }

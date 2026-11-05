@@ -108,6 +108,8 @@ export interface GroupHistoryPoint {
   time: string;
   ts: number;
   queued: number;
+  /** 1 when the point counts only the gateway that sampled it. */
+  alone: number;
   [key: string]: number | string;
 }
 
@@ -197,7 +199,7 @@ export function buildHistoryChart(points: FairshareHistoryPoint[]): {
   for (const p of points) for (const g of Object.keys(p.groups)) names.add(g);
   const groupKeys: GroupKey[] = [...names].sort((a, b) => a.localeCompare(b)).map((name) => ({ name, key: groupDataKey(name) }));
   const history = points.map((p) => {
-    const row: GroupHistoryPoint = { time: formatPointTime(p.ts_ms), ts: p.ts_ms, queued: p.queued };
+    const row: GroupHistoryPoint = { time: formatPointTime(p.ts_ms), ts: p.ts_ms, queued: p.queued, alone: p.cluster ? 0 : 1 };
     for (const g of groupKeys) row[g.key] = p.groups[g.name] ?? 0;
     return row;
   });

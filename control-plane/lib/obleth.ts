@@ -1299,6 +1299,9 @@ export interface FairshareHistoryPoint {
   queued: number;
   /** Group name to in-flight slots. */
   groups: Record<string, number>;
+  /** Counted across every live gateway (shared slots); false when the
+   *  answering gateway sampled itself alone. Absent from older gateways. */
+  cluster?: boolean;
 }
 export interface FairshareHistoryView {
   interval_ms: number;

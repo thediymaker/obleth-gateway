@@ -165,7 +165,7 @@ export function FairshareDashboard({ tenantNames, initialPool = "all" }: { tenan
       )}
 
       {/* History is sampled per gateway process, so with several it is the answering one's. */}
-      {raw && <RunningHistory history={history} groups={groupKeys} oldestTs={oldestTs} retentionMs={retentionMs} scopeLabel={`${scoped ? scope : "all pools"}${(raw.replicas ?? 1) > 1 ? " · this gateway" : ""}`} />}
+      {raw && <RunningHistory history={history} groups={groupKeys} oldestTs={oldestTs} retentionMs={retentionMs} scopeLabel={scoped ? scope : "all pools"} replicas={raw.replicas ?? 1} />}
 
       <TenantPanel tenant={selectedTenant} view={raw} keys={view?.keys} series={series.data} onClose={() => setSelected(null)} />
     </div>

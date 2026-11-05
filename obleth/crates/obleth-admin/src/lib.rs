@@ -6574,6 +6574,10 @@ pub struct FairshareHistoryPointView {
     pub queued: usize,
     /// Group name to in-flight slots.
     pub groups: std::collections::BTreeMap<String, usize>,
+    /// Counted across every live gateway replica (shared slots). False for a
+    /// point the answering replica sampled alone: shared slots off, or the
+    /// shared backend unreadable at sample time.
+    pub cluster: bool,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -6612,6 +6616,7 @@ async fn get_fairshare_history(
             in_flight: p.in_flight,
             queued: p.queued,
             groups: p.groups,
+            cluster: p.cluster,
         })
         .collect();
     Json(FairshareHistoryView {
@@ -11798,12 +11803,14 @@ mod tests {
             global_in_flight: 4,
             global_queued: 2,
             pools: vec![pool("m", 3, 1, 3), pool("n", 1, 1, 1)],
+            cluster: false,
         });
         t.fairshare_history.push(FairshareSample {
             ts_ms: 3_000,
             global_in_flight: 6,
             global_queued: 0,
             pools: vec![pool("m", 6, 0, 6)],
+            cluster: true,
         });
 
         let get = |path: &str| {
@@ -11822,6 +11829,8 @@ mod tests {
         assert_eq!(points.len(), 2);
         assert_eq!(points[0]["in_flight"], 2, "global 4 minus 2 prober: {body}");
         assert_eq!(points[0]["groups"]["research"], 4);
+        assert_eq!(points[0]["cluster"], false);
+        assert_eq!(points[1]["cluster"], true);
         assert!(
             points[0]["groups"]
                 .get(model_health::HEALTH_GROUP)

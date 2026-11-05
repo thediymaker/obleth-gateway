@@ -351,6 +351,23 @@ describe("history", () => {
     expect(host.textContent).not.toContain("No samples yet");
   });
 
+  it("says the history counts every gateway when each point was sampled cluster-wide", async () => {
+    mocks.view = { ...mocks.view!, replicas: 3, mode: "shared", shared_slots: true, scope: "cluster", replicas_reporting: 3 };
+    const point = (ts_ms: number, cluster: boolean) => ({ ts_ms, in_flight: 3, queued: 1, groups: { research: 3 }, cluster });
+    mocks.history = { interval_ms: 2000, retention_ms: 3_600_000, oldest_ts_ms: 1_700_000_000_000, points: [point(1_700_000_000_000, true), point(1_700_000_002_000, true)] };
+    await render();
+    expect(host.textContent).toContain("all pools · all 3 gateways · History since");
+    expect(host.textContent).not.toContain("this gateway only");
+  });
+
+  it("flags history points a gateway sampled alone", async () => {
+    mocks.view = { ...mocks.view!, replicas: 3, mode: "shared", shared_slots: true, scope: "cluster", replicas_reporting: 3 };
+    const point = (ts_ms: number, cluster: boolean) => ({ ts_ms, in_flight: 3, queued: 1, groups: { research: 3 }, cluster });
+    mocks.history = { interval_ms: 2000, retention_ms: 3_600_000, oldest_ts_ms: 1_700_000_000_000, points: [point(1_700_000_000_000, false), point(1_700_000_002_000, true)] };
+    await render();
+    expect(host.textContent).toContain("all 3 gateways, some points this gateway only");
+  });
+
   it("shows history is disabled instead of waiting forever", async () => {
     mocks.history = { interval_ms: 2000, retention_ms: 0, oldest_ts_ms: null, points: [] };
     await render();

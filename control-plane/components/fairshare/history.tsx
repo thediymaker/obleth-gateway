@@ -32,15 +32,17 @@ function HistoryTooltip({ active, payload, series }: { active?: boolean; payload
  * own chart underneath: two measures, two axes' worth of meaning, so two
  * charts sharing time and hover rather than one chart with a second axis.
  */
-export const RunningHistory = memo(function RunningHistory({ history, groups, oldestTs, retentionMs, scopeLabel }: {
+export const RunningHistory = memo(function RunningHistory({ history, groups, oldestTs, retentionMs, scopeLabel, replicas }: {
   history: GroupHistoryPoint[];
   groups: GroupKey[];
   oldestTs: number | null;
   retentionMs: number | null;
   scopeLabel: string;
+  /** Live gateway replicas; with more than one, the subtitle says which ones the points count. */
+  replicas: number;
 }) {
   const [window, setWindow] = useState<Window>("1h");
-  const { rows, series, peak } = useMemo(() => {
+  const { rows, series, peak, alone } = useMemo(() => {
     const newest = history.at(-1)?.ts ?? 0;
     const inWindow = history.filter((r) => r.ts >= newest - WINDOW_MS[window]);
     // The heaviest groups keep their own tone; the rest fold into "Other".
@@ -55,15 +57,19 @@ export const RunningHistory = memo(function RunningHistory({ history, groups, ol
       rows = inWindow.map((r) => ({ ...r, "group:__other": folded.reduce((n, g) => n + Number(r[g.key] ?? 0), 0) }));
     }
     const peak = rows.reduce<GroupHistoryPoint | null>((best, r) => (r.queued > 0 && (!best || r.queued > best.queued) ? r : best), null);
-    return { rows: thinHistory(rows, MAX_CHART_ROWS), series, peak };
+    const alone = inWindow.filter((r) => r.alone).length;
+    return { rows: thinHistory(rows, MAX_CHART_ROWS), series, peak, alone: alone === 0 ? "none" : alone === inWindow.length ? "all" : "some" };
   }, [history, groups, window]);
 
   const disabled = retentionMs === 0;
+  // With shared slots every gateway samples the whole fleet; otherwise, or
+  // while the shared backend is unreadable, a point is one gateway's own.
+  const gateways = replicas <= 1 || rows.length === 0 ? "" : alone === "none" ? ` · all ${replicas} gateways` : alone === "all" ? " · this gateway only" : ` · all ${replicas} gateways, some points this gateway only`;
   const subtitle = disabled
     ? "History disabled (OBLETH_FAIRSHARE_HISTORY_SECS=0)"
     : oldestTs
-      ? `Requests holding a slot, stacked by group · ${scopeLabel} · History since ${new Date(oldestTs).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
-      : `Requests holding a slot, stacked by group · ${scopeLabel}`;
+      ? `Requests holding a slot, stacked by group · ${scopeLabel}${gateways} · History since ${new Date(oldestTs).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
+      : `Requests holding a slot, stacked by group · ${scopeLabel}${gateways}`;
 
   return (
     <Panel
