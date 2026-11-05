@@ -1160,6 +1160,12 @@ async fn run_pipeline(
     if let Some(fields) = &multipart_fields {
         json = multipart_text_view(fields);
     }
+    // Re-serialize so paths that forward the raw bytes match the parsed body.
+    if is_chat_path(&path) && strip_tool_strict(&mut json) {
+        if let Ok(bytes) = serde_json::to_vec(&json) {
+            body_bytes = Bytes::from(bytes);
+        }
+    }
 
     let mut model = if let Some(fields) = &multipart_fields {
         fields
@@ -6892,6 +6898,29 @@ fn is_chat_path(path: &str) -> bool {
     request_type_for_path(path) == "chat"
 }
 
+/// Remove the per-tool `strict` flag from a chat request's function tools.
+/// Returns whether anything was removed.
+///
+/// vLLM does not enforce `strict` as a schema guarantee, and with some tool
+/// parsers it changes decoding so that string arguments (code, file contents)
+/// are dropped from the call. Agent frameworks send `strict: true` by default,
+/// so the flag is removed before any boon or upstream sees the request. Only
+/// `function.strict` is touched: the schema itself, including properties that
+/// happen to be named `strict`, and `response_format` are left as sent. The
+/// `/v1/responses` and `/v1/messages` translations already omit the flag.
+fn strip_tool_strict(json: &mut serde_json::Value) -> bool {
+    let Some(tools) = json.get_mut("tools").and_then(|t| t.as_array_mut()) else {
+        return false;
+    };
+    let mut removed = false;
+    for tool in tools {
+        if let Some(function) = tool.get_mut("function").and_then(|f| f.as_object_mut()) {
+            removed |= function.remove("strict").is_some();
+        }
+    }
+    removed
+}
+
 /// A block/redact output policy scans chat-completion message content only
 /// (which `/v1/responses` and `/v1/messages` are translated into). Other
 /// endpoints that return model-generated text (legacy completions,
@@ -7304,8 +7333,9 @@ mod tests {
         output_guardrails_unenforceable, parse_multipart, prepare_upstream_body, redress_error,
         request_type_for_path, requires_registered_model, resolve_conversation,
         response_cache_name, route_keeps_sessions, session_hash_order, should_translate_as_stream,
-        strip_beta_query, sure_overflow, surface, tenant_active_now, weighted_order,
-        MultipartField, RequestMeta, TooLong, END_USER_HEADER, REGISTERED_MODEL_PATHS, SEED_CAP,
+        strip_beta_query, strip_tool_strict, sure_overflow, surface, tenant_active_now,
+        weighted_order, MultipartField, RequestMeta, TooLong, END_USER_HEADER,
+        REGISTERED_MODEL_PATHS, SEED_CAP,
     };
     use crate::router::{BoonGrants, Candidate, Intent, RequestFeatures, RouterWeights};
     use axum::body::{Body, Bytes};
@@ -8857,6 +8887,46 @@ mod tests {
         assert_eq!(fwd["x-team"], "ops");
         assert_eq!(fwd.get_all("x-team").iter().count(), 1);
         assert_eq!(fwd["x-trace"], "t1");
+    }
+
+    #[test]
+    fn strip_tool_strict_removes_only_the_tool_flag() {
+        let mut json = serde_json::json!({
+            "model": "m",
+            "tools": [
+                {"type": "function", "function": {
+                    "name": "edit",
+                    "strict": true,
+                    "parameters": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {"strict": {"type": "boolean"}}
+                    }
+                }},
+                {"type": "function", "function": {"name": "plain", "parameters": {}}}
+            ],
+            "response_format": {"type": "json_schema", "json_schema": {"name": "x", "strict": true}}
+        });
+        assert!(strip_tool_strict(&mut json));
+        let edit = &json["tools"][0]["function"];
+        assert!(edit.get("strict").is_none());
+        // The schema is untouched, including a property named `strict`.
+        assert_eq!(edit["parameters"]["additionalProperties"], false);
+        assert!(edit["parameters"]["properties"]["strict"].is_object());
+        assert_eq!(json["tools"][1]["function"]["name"], "plain");
+        assert_eq!(json["response_format"]["json_schema"]["strict"], true);
+    }
+
+    #[test]
+    fn strip_tool_strict_reports_no_change() {
+        let mut no_tools = serde_json::json!({"model": "m", "messages": []});
+        assert!(!strip_tool_strict(&mut no_tools));
+        let mut without_flag = serde_json::json!({
+            "tools": [{"type": "function", "function": {"name": "f"}}]
+        });
+        assert!(!strip_tool_strict(&mut without_flag));
+        let mut odd = serde_json::json!({"tools": "not-a-list"});
+        assert!(!strip_tool_strict(&mut odd));
     }
 
     #[test]
