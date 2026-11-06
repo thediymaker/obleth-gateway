@@ -652,7 +652,30 @@ async fn main() -> anyhow::Result<()> {
             }
         })),
         capacity_discovery: capacity_discovery.clone(),
+        // Advice findings are judged through the real /v1/verdicts pipeline
+        // (auth, fairshare, ledger) as the reserved control-plane key, so the
+        // judging shows up in usage like any other caller.
+        judge: Some(std::sync::Arc::new({
+            let st = app_state.clone();
+            let store = store.clone();
+            move |body: serde_json::Value| {
+                let st = st.clone();
+                let store = store.clone();
+                Box::pin(async move { judge_with_verdicts(st, store, body).await })
+                    as std::pin::Pin<
+                        Box<
+                            dyn std::future::Future<
+                                    Output = std::result::Result<serde_json::Value, String>,
+                                > + Send,
+                        >,
+                    >
+            }
+        })),
     };
+    obleth_admin::advice::spawn_output_stats_refresher(
+        admin_state.clickhouse.clone(),
+        output_stats.clone(),
+    );
     obleth_admin::model_health::spawn_worker(admin_state.clone());
     obleth_admin::usage_retention::spawn_worker(admin_state.clone());
     let admin_app = obleth_admin::router(admin_state);
@@ -750,6 +773,45 @@ async fn wait_for_signal() {
 }
 
 /// First SIGTERM/ctrl-c starts the drain; a second one exits immediately.
+/// One `/v1/verdicts` call made in-process as the control-plane key: the
+/// same handler a client reaches, without a network hop.
+async fn judge_with_verdicts(
+    state: AppState,
+    store: Store,
+    body: serde_json::Value,
+) -> std::result::Result<serde_json::Value, String> {
+    let secret = store
+        .control_plane_key_secret()
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "the control-plane key does not exist yet".to_string())?;
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(verdicts::VERDICTS_PATH)
+        .header(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {secret}"),
+        )
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(body.to_string()))
+        .map_err(|e| e.to_string())?;
+    let resp = verdicts::handler(AxumState(state), req).await;
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!(
+            "verdicts answered {status}: {}",
+            String::from_utf8_lossy(&bytes)
+                .chars()
+                .take(300)
+                .collect::<String>()
+        ));
+    }
+    serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+}
+
 fn spawn_signal_listener(tx: tokio::sync::watch::Sender<bool>) {
     tokio::spawn(async move {
         wait_for_signal().await;
