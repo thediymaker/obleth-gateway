@@ -513,6 +513,7 @@ mod pipeline {
             knowledge: Arc::new(crate::knowledge::KnowledgeIndex::new()),
             jobs: crate::jobs::JobStore::new(store, Default::default()),
             load: None,
+            crash_guard: crate::crash_guard::CrashGuard::disabled(),
         };
         Some(Gateway { state, wal_dir })
     }

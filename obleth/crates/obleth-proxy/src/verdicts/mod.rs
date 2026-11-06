@@ -698,6 +698,7 @@ async fn handler_inner(
         model_family: String::new(),
         streamed: false,
         failure: None,
+        crash_fp: String::new(),
     };
     if let Some(t) = tracer.as_mut() {
         t.set_conversation(&req_meta.session_id, req_meta.session_id_source);
@@ -2330,6 +2331,7 @@ mod model_choice_tests {
             knowledge: Arc::new(crate::knowledge::KnowledgeIndex::new()),
             jobs: crate::jobs::JobStore::new(store, Default::default()),
             load: None,
+            crash_guard: crate::crash_guard::CrashGuard::disabled(),
         };
         Some(Gateway { state, wal_dir })
     }

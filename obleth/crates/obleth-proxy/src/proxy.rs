@@ -1267,6 +1267,7 @@ async fn run_pipeline(
         streamed: false,
         // Set where a failure's status is chosen.
         failure: None,
+        crash_fp: String::new(),
     };
     // Surface the conversation id on the OTLP/Jaeger root span for cross-request
     // grouping (the field is declared Empty on the #[instrument] below).
@@ -1712,6 +1713,63 @@ async fn run_pipeline(
             crate::energy::EnergyFigures::default(),
         );
         return rejected_field_response(&model, field);
+    }
+
+    // ---- crash guard ----
+    // A request that was in flight when one of this model's engines died is
+    // held back while the model is down to its last server, and refused after
+    // a second death; see `crate::crash_guard`. Fingerprinted on the caller's
+    // body, before the gateway adds fields of its own.
+    if route.is_some() && state.crash_guard.enabled() {
+        req_meta.crash_fp = crate::crash_guard::fingerprint(&model, &json);
+        let verdict = state
+            .crash_guard
+            .check(&state.redis, &model, &req_meta.crash_fp)
+            .await;
+        if verdict != crate::crash_guard::Verdict::Pass {
+            let (status, class, msg) = match verdict {
+                crate::crash_guard::Verdict::Hold { ready, usual } => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    obleth_config::ErrorClass::Capacity,
+                    crate::crash_guard::hold_message(&model, ready, usual),
+                ),
+                crate::crash_guard::Verdict::Refuse { strikes } => (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    obleth_config::ErrorClass::ClientInput,
+                    crate::crash_guard::refuse_message(&model, strikes),
+                ),
+                crate::crash_guard::Verdict::Pass => unreachable!(),
+            };
+            tracing::warn!(%request_id, model = %model, fingerprint = %req_meta.crash_fp, status = status.as_u16(), "crash guard: request not sent");
+            req_meta.failure = Some(obleth_config::Failure::new(class, &msg));
+            if let Some(t) = tracer.take() {
+                t.finish("error");
+            }
+            let elapsed = request_start.elapsed().as_millis() as u32;
+            finalize(
+                &state,
+                request_id,
+                &resolved,
+                &req_meta,
+                &model,
+                Admission::Rejected,
+                CostEstimate {
+                    input_tokens: 0,
+                    estimated_output_tokens: 0,
+                },
+                0,
+                0,
+                0,
+                0,
+                0,
+                elapsed,
+                status.as_u16(),
+                "off",
+                0.0,
+                crate::energy::EnergyFigures::default(),
+            );
+            return crate::crash_guard::guard_response(status, &msg);
+        }
     }
 
     // ---- reasoning effort ----
@@ -4661,6 +4719,19 @@ async fn settle_inner(
         output: output_tokens,
         cached: cached_input_tokens,
     } = tokens;
+    // The crash guard counts a strike against every request that was in
+    // flight when the model server's engine died.
+    if !meta.crash_fp.is_empty()
+        && meta
+            .failure
+            .as_ref()
+            .is_some_and(|f| crate::crash_guard::is_engine_death(&f.reason))
+    {
+        state
+            .crash_guard
+            .record_death(&state.redis, model, &meta.crash_fp)
+            .await;
+    }
     // Feed the router's per-request cost estimate: one EWMA sample of how
     // long this model's answers actually run. Successful requests only — an
     // error body's usage says nothing about the model's answering behavior.
@@ -6791,6 +6862,9 @@ pub(crate) struct RequestMeta {
     /// Left `None` where the status says it all; see
     /// `obleth_config::ledger_failure`.
     pub(crate) failure: Option<obleth_config::Failure>,
+    /// The crash guard's fingerprint of the request body, or empty when the
+    /// guard does not watch it; see [`crate::crash_guard`].
+    pub(crate) crash_fp: String,
 }
 
 /// The name a response cache entry is keyed by.
@@ -9885,6 +9959,7 @@ mod tests {
             model_family: String::new(),
             streamed: false,
             failure: None,
+            crash_fp: String::new(),
         };
         assert_eq!(meta.device_id, "dev-1");
     }
@@ -10283,6 +10358,7 @@ mod lifecycle_tests {
             model_family: String::new(),
             streamed: false,
             failure: None,
+            crash_fp: String::new(),
         };
         super::record_called_name(&mut meta, Some("acme"), Some("acme"));
         assert_eq!(meta.model_family, "acme");

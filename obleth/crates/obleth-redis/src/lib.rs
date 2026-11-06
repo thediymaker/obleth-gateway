@@ -66,6 +66,9 @@ const COMPRESS_PREFIX: &str = "obleth:compress:";
 const KNOWLEDGE_QUERY_PREFIX: &str = "obleth:knowledge:q:";
 /// `auto` conversation records and answered-request markers, per tenant.
 const AUTO_TURN_PREFIX: &str = "obleth:auto:";
+/// Crash-guard strikes: how many model-server engine deaths one request (by
+/// fingerprint) was being answered at, per model.
+const CRASH_PREFIX: &str = "obleth:crash:";
 const INVALIDATE_CHANNEL: &str = "obleth:invalidate";
 /// Single shared key holding the provisioner's last-seen epoch seconds. Shared
 /// via Redis (not per-pod memory) so the dashboard reads a consistent value no
@@ -450,6 +453,32 @@ impl RedisStore {
             .set_ex(Self::auto_turn_key(tenant, hash), value, ttl_secs)
             .await?;
         Ok(())
+    }
+
+    fn crash_key(model: &str, fingerprint: &str) -> String {
+        format!("{CRASH_PREFIX}{model}:{fingerprint}")
+    }
+
+    /// The crash-guard strikes recorded against a request fingerprint for
+    /// `model` (0 when none, or expired).
+    pub async fn crash_strikes(&self, model: &str, fingerprint: &str) -> Result<u32> {
+        let mut conn = self.conn.clone();
+        let v: Option<u32> = conn.get(Self::crash_key(model, fingerprint)).await?;
+        Ok(v.unwrap_or(0))
+    }
+
+    /// Add one crash-guard strike to a request fingerprint for `model` and
+    /// (re)start its expiry; returns the new count.
+    pub async fn crash_strike(&self, model: &str, fingerprint: &str, ttl_secs: u64) -> Result<u32> {
+        let key = Self::crash_key(model, fingerprint);
+        let mut conn = self.conn.clone();
+        let (n, _): (u32, bool) = redis::pipe()
+            .atomic()
+            .incr(&key, 1u32)
+            .expire(&key, ttl_secs as i64)
+            .query_async(&mut conn)
+            .await?;
+        Ok(n)
     }
 
     fn query_vector_key(hash: &str) -> String {

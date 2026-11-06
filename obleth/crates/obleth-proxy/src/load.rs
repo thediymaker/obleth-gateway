@@ -726,6 +726,7 @@ mod tests {
             knowledge: Arc::new(crate::knowledge::KnowledgeIndex::new()),
             jobs: crate::jobs::JobStore::new(store, Default::default()),
             load: on.then(|| reporter(&sources)),
+            crash_guard: crate::crash_guard::CrashGuard::disabled(),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());

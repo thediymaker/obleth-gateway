@@ -5,6 +5,7 @@
 //! + budgets), ClickHouse (usage ledger) and the fairshare scheduler together.
 
 mod completion;
+mod crash_guard;
 mod energy;
 mod jobs;
 mod jwt_auth;
@@ -484,6 +485,7 @@ async fn main() -> anyhow::Result<()> {
         knowledge: knowledge.clone(),
         jobs: jobs::JobStore::new(store.clone(), cfg.job_scope),
         load,
+        crash_guard: crate::crash_guard::CrashGuard::new(Some(capacity_discovery.clone())),
     };
     tracing::info!(
         scope = cfg.job_scope.as_str(),
