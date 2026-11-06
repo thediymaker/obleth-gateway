@@ -2139,6 +2139,141 @@ pub fn upstream_header_map(headers: &obleth_config::UpstreamHeaders) -> reqwest:
     out
 }
 
+/// One resolved upstream target: a base URL plus an optional bearer key, and
+/// the model's operator-configured upstream headers.
+pub struct UpstreamTarget {
+    pub base: String,
+    pub api_key: Option<String>,
+    pub headers: reqwest::header::HeaderMap,
+}
+
+/// Build the ordered list of upstream targets for a request.
+///
+/// When the model defines explicit endpoints we route across the ones that are
+/// both `enabled` and `healthy`. `failover` orders them by ascending priority
+/// (lowest first); `load_balance` orders them by a weighted random shuffle so
+/// traffic spreads across clusters in proportion to their weights; `session_hash`
+/// pins a session to one endpoint via rendezvous hashing of the session key,
+/// with the rest following for failover. When no usable endpoints exist we fall
+/// back to the model's own `api_base`/`api_key` (or the global default base),
+/// preserving the legacy single-upstream path.
+pub fn build_targets(
+    route: Option<&ResolvedModel>,
+    default_base: &str,
+    selection_mode: &str,
+    session_key: &str,
+) -> Vec<UpstreamTarget> {
+    let mut targets: Vec<UpstreamTarget> = Vec::new();
+    let headers = route
+        .map(|r| upstream_header_map(&r.upstream_headers))
+        .unwrap_or_default();
+    if let Some(r) = route {
+        let mut eligible: Vec<&obleth_config::ResolvedEndpoint> = r
+            .endpoints
+            .iter()
+            .filter(|e| e.enabled && e.healthy)
+            .collect();
+        if !eligible.is_empty() {
+            match selection_mode {
+                "load_balance" => eligible = weighted_order(eligible),
+                "session_hash" => eligible = session_hash_order(eligible, session_key),
+                _ => eligible.sort_by_key(|e| e.priority), // failover (default)
+            }
+            for e in eligible {
+                targets.push(UpstreamTarget {
+                    base: e.api_base.clone(),
+                    api_key: e.api_key.clone().or_else(|| r.api_key.clone()),
+                    headers: headers.clone(),
+                });
+            }
+            return targets;
+        }
+    }
+    targets.push(UpstreamTarget {
+        base: route
+            .map(|r| r.api_base.clone())
+            .unwrap_or_else(|| default_base.to_string()),
+        api_key: route.and_then(|r| r.api_key.clone()),
+        headers,
+    });
+    targets
+}
+
+/// Order endpoints by weighted random sampling (A-Res): each endpoint gets a
+/// key `u^(1/weight)` for a uniform random `u`, and we sort by descending key.
+/// Higher-weight endpoints land earlier more often, so the first eligible
+/// target is chosen in proportion to weight while the rest stay available for
+/// failover.
+pub fn weighted_order(
+    items: Vec<&obleth_config::ResolvedEndpoint>,
+) -> Vec<&obleth_config::ResolvedEndpoint> {
+    let mut seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9e37_79b9_7f4a_7c15);
+    let mut next = move || {
+        seed = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = seed;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    };
+    let mut keyed: Vec<(f64, &obleth_config::ResolvedEndpoint)> = items
+        .into_iter()
+        .map(|e| {
+            let w = e.weight.max(1) as f64;
+            let u = (next() as f64 / u64::MAX as f64).max(1e-12);
+            (u.powf(1.0 / w), e)
+        })
+        .collect();
+    keyed.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    keyed.into_iter().map(|(_, e)| e).collect()
+}
+
+/// FNV-1a over `session_key\0endpoint_id` — a small, dependency-free, stable
+/// hash. Stability matters: the same key must score an endpoint identically on
+/// every request so a session keeps landing on the same replica.
+fn rendezvous_score(session_key: &str, endpoint_id: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in session_key
+        .bytes()
+        .chain(std::iter::once(0u8))
+        .chain(endpoint_id.bytes())
+    {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Order endpoints so a session sticks to one replica: rendezvous (highest-
+/// random-weight) hashing scores each endpoint by `hash(session_key, id)`; the
+/// highest score is the session's home and goes first, the rest follow for
+/// failover. Deterministic for a given key; adding/removing an endpoint
+/// reshuffles only minimally. With no session key, falls back to weighted order.
+pub fn session_hash_order<'a>(
+    items: Vec<&'a obleth_config::ResolvedEndpoint>,
+    session_key: &str,
+) -> Vec<&'a obleth_config::ResolvedEndpoint> {
+    if session_key.is_empty() {
+        // No session key on the request, so stickiness is impossible: this falls
+        // back to weighted_order, i.e. session_hash behaves like load_balance.
+        // Logged (debug, not warn — keyless requests are common and expected) so
+        // operators can see why a session_hash model isn't actually sticking.
+        tracing::debug!(
+            "session_hash selected but request has no session key; falling back to weighted order"
+        );
+        return weighted_order(items);
+    }
+    let mut scored: Vec<(u64, &obleth_config::ResolvedEndpoint)> = items
+        .into_iter()
+        .map(|e| (rendezvous_score(session_key, &e.id), e))
+        .collect();
+    // Highest score first; tie-break on id for a fully deterministic order.
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.id.cmp(&b.1.id)));
+    scored.into_iter().map(|(_, e)| e).collect()
+}
+
 fn secret_set(s: &Option<String>) -> bool {
     s.as_ref().is_some_and(|v| !v.is_empty())
 }
@@ -9729,6 +9864,212 @@ mod tests {
             .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
             .body(axum::body::Body::from(body.to_string()))
             .expect("build request")
+    }
+
+    /// A Slurm-managed embedder has a blank `api_base` and lives only in its
+    /// endpoints. Indexing and the search preview must reach the healthy one
+    /// with its key, like the data plane does, not fail on the blank base.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn indexing_and_search_reach_an_embedder_through_its_healthy_endpoint() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let auth = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = auth.clone();
+        let upstream = axum::Router::new().route(
+            "/v1/embeddings",
+            axum::routing::post(
+                move |headers: HeaderMap, Json(body): Json<serde_json::Value>| {
+                    let seen = seen.clone();
+                    async move {
+                        seen.lock()
+                            .unwrap()
+                            .push(headers["authorization"].to_str().unwrap().to_string());
+                        let data: Vec<_> = (0..body["input"].as_array().unwrap().len())
+                            .map(|index| {
+                                serde_json::json!({"index": index, "embedding": [1.0, 0.0]})
+                            })
+                            .collect();
+                        Json(serde_json::json!({"data": data}))
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+        let name = format!("slurm-embedder-{}", Uuid::new_v4());
+        let (status, created) = send(
+            &t.app,
+            json_request(
+                "POST",
+                "/api/v1/models",
+                serde_json::json!({
+                    "model_name": name,
+                    "upstream_model": "bge-m3",
+                    "api_base": "",
+                    "model_type": "embedding",
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let model_id: Uuid = created["id"].as_str().unwrap().parse().unwrap();
+        // Lower priority wins, so only the health check keeps this one out.
+        let down = t
+            .store
+            .create_model_endpoint(
+                model_id,
+                "down",
+                "http://upstream.invalid/v1",
+                Some("sk-down"),
+                0,
+                100,
+                true,
+                None,
+            )
+            .await
+            .expect("endpoint");
+        t.store
+            .record_endpoint_health(down.id, "unhealthy", None, None, None)
+            .await
+            .expect("health");
+        t.store
+            .create_model_endpoint(
+                model_id,
+                "up",
+                &format!("http://{addr}/v1"),
+                Some("sk-up"),
+                1,
+                100,
+                true,
+                None,
+            )
+            .await
+            .expect("endpoint");
+
+        let collection = t
+            .store
+            .create_collection(&format!("slurm-{}", Uuid::new_v4()), "", &name)
+            .await
+            .expect("collection");
+        let doc = t
+            .store
+            .upsert_document(collection.id, "t", "t.txt", "text/plain", "hello world")
+            .await
+            .expect("document");
+        // Claimed by hand: `claim_pending_document` could pick up a sibling
+        // test's leftover document, and only a claimed one can turn `ready`.
+        sqlx::query("update knowledge_documents set status = 'indexing' where id = $1")
+            .bind(doc.id)
+            .execute(t.store.pool())
+            .await
+            .expect("claim");
+
+        knowledge::indexer::index_document(
+            &t.store,
+            &reqwest::Client::new(),
+            &doc,
+            &obleth_config::BoonSettings::default().knowledge,
+        )
+        .await
+        .expect("index through the endpoint");
+        let docs = t.store.list_documents(collection.id).await.expect("list");
+        assert_eq!(docs[0].status, "ready");
+
+        let (status, hits) = send(
+            &t.app,
+            json_request(
+                "POST",
+                &format!("/api/v1/knowledge/collections/{}/search", collection.id),
+                serde_json::json!({"query": "hello"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{hits}");
+        assert_eq!(hits.as_array().unwrap().len(), 1, "{hits}");
+
+        // One call each from indexing and search, with the endpoint's key.
+        assert_eq!(*auth.lock().unwrap(), vec!["Bearer sk-up", "Bearer sk-up"]);
+
+        t.store.delete_collection(collection.id).await.ok();
+        t.store.delete_model(model_id).await.ok();
+    }
+
+    /// Attaching collections grants the boon `eligible()` also requires, in the
+    /// row and in what the data plane reads; without it requests silently go
+    /// without context. Detaching leaves the boon alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn attaching_collections_grants_the_knowledge_boon() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let redis = RedisStore::connect(&std::env::var("OBLETH_TEST_REDIS_URL").unwrap())
+            .await
+            .expect("connect redis");
+        let name = format!("kb-boon-{}", Uuid::new_v4());
+        let model = fixture_model(&t.store, &name, 0.0).await;
+        assert!(model.boons.is_empty());
+        let collection = t
+            .store
+            .create_collection(&format!("kb-boon-{}", Uuid::new_v4()), "", "embed-a")
+            .await
+            .expect("collection");
+        let path = format!("/api/v1/models/{}/knowledge", model.id);
+        let knowledge = vec!["knowledge".to_string()];
+
+        // An empty list on a model without the boon grants nothing.
+        let (status, body) = send(
+            &t.app,
+            json_request("PUT", &path, serde_json::json!({"collection_ids": []})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(t.store.get_model(model.id).await.unwrap().boons.is_empty());
+
+        // Attaching twice grants once.
+        for _ in 0..2 {
+            let (status, body) = send(
+                &t.app,
+                json_request(
+                    "PUT",
+                    &path,
+                    serde_json::json!({"collection_ids": [collection.id]}),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(t.store.get_model(model.id).await.unwrap().boons, knowledge);
+        }
+        let published = redis
+            .get_resolved_model(&name)
+            .await
+            .expect("read redis")
+            .expect("published");
+        assert_eq!(published.boons, knowledge);
+        assert_eq!(published.knowledge_collections, vec![collection.id]);
+
+        // Detaching keeps the boon, and the model has no collections to use it on.
+        let (status, body) = send(
+            &t.app,
+            json_request("PUT", &path, serde_json::json!({"collection_ids": []})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(t.store.get_model(model.id).await.unwrap().boons, knowledge);
+        let published = redis
+            .get_resolved_model(&name)
+            .await
+            .expect("read redis")
+            .expect("published");
+        assert_eq!(published.boons, knowledge);
+        assert!(published.knowledge_collections.is_empty());
+
+        t.store.delete_collection(collection.id).await.ok();
+        t.store.delete_model(model.id).await.ok();
     }
 
     /// Rejected request fields go through create, update, their own endpoint

@@ -15,13 +15,14 @@ use axum::extract::State;
 use axum::http::{header, HeaderMap, Method, Request, Response, StatusCode};
 use axum::response::IntoResponse;
 use futures_util::StreamExt;
-use obleth_config::{Admission, ResolvedEndpoint, ResolvedKey, ResolvedModel, UsageRecord};
+use obleth_config::{Admission, ResolvedKey, ResolvedModel, UsageRecord};
 use obleth_tokenizer::{CostEstimate, Tokenizer};
 use tokio::time::timeout;
 use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::state::AppState;
+pub(crate) use obleth_admin::{build_targets, UpstreamTarget as Target};
 
 pub(crate) const BODY_LIMIT: usize = 64 * 1024 * 1024;
 const TAIL_CAP: usize = 16 * 1024;
@@ -5829,139 +5830,6 @@ fn prepare_upstream_body(
     serde_json::to_vec(&*json).map(Bytes::from).unwrap_or(body)
 }
 
-/// One resolved upstream target: a base URL plus an optional bearer key, and
-/// the model's operator-configured upstream headers.
-pub(crate) struct Target {
-    pub(crate) base: String,
-    pub(crate) api_key: Option<String>,
-    pub(crate) headers: HeaderMap,
-}
-
-/// Build the ordered list of upstream targets for a request.
-///
-/// When the model defines explicit endpoints we route across the ones that are
-/// both `enabled` and `healthy`. `failover` orders them by ascending priority
-/// (lowest first); `load_balance` orders them by a weighted random shuffle so
-/// traffic spreads across clusters in proportion to their weights; `session_hash`
-/// pins a session to one endpoint via rendezvous hashing of the session key,
-/// with the rest following for failover. When no usable endpoints exist we fall
-/// back to the model's own `api_base`/`api_key` (or the global default base),
-/// preserving the legacy single-upstream path.
-pub(crate) fn build_targets(
-    route: Option<&ResolvedModel>,
-    default_base: &str,
-    selection_mode: &str,
-    session_key: &str,
-) -> Vec<Target> {
-    let mut targets: Vec<Target> = Vec::new();
-    let headers = route
-        .map(|r| obleth_admin::upstream_header_map(&r.upstream_headers))
-        .unwrap_or_default();
-    if let Some(r) = route {
-        let mut eligible: Vec<&ResolvedEndpoint> = r
-            .endpoints
-            .iter()
-            .filter(|e| e.enabled && e.healthy)
-            .collect();
-        if !eligible.is_empty() {
-            match selection_mode {
-                "load_balance" => eligible = weighted_order(eligible),
-                "session_hash" => eligible = session_hash_order(eligible, session_key),
-                _ => eligible.sort_by_key(|e| e.priority), // failover (default)
-            }
-            for e in eligible {
-                targets.push(Target {
-                    base: e.api_base.clone(),
-                    api_key: e.api_key.clone().or_else(|| r.api_key.clone()),
-                    headers: headers.clone(),
-                });
-            }
-            return targets;
-        }
-    }
-    targets.push(Target {
-        base: route
-            .map(|r| r.api_base.clone())
-            .unwrap_or_else(|| default_base.to_string()),
-        api_key: route.and_then(|r| r.api_key.clone()),
-        headers,
-    });
-    targets
-}
-
-/// Order endpoints by weighted random sampling (A-Res): each endpoint gets a
-/// key `u^(1/weight)` for a uniform random `u`, and we sort by descending key.
-/// Higher-weight endpoints land earlier more often, so the first eligible
-/// target is chosen in proportion to weight while the rest stay available for
-/// failover.
-fn weighted_order(items: Vec<&ResolvedEndpoint>) -> Vec<&ResolvedEndpoint> {
-    let mut seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x9e37_79b9_7f4a_7c15);
-    let mut next = move || {
-        seed = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = seed;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    };
-    let mut keyed: Vec<(f64, &ResolvedEndpoint)> = items
-        .into_iter()
-        .map(|e| {
-            let w = e.weight.max(1) as f64;
-            let u = (next() as f64 / u64::MAX as f64).max(1e-12);
-            (u.powf(1.0 / w), e)
-        })
-        .collect();
-    keyed.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    keyed.into_iter().map(|(_, e)| e).collect()
-}
-
-/// FNV-1a over `session_key\0endpoint_id` — a small, dependency-free, stable
-/// hash. Stability matters: the same key must score an endpoint identically on
-/// every request so a session keeps landing on the same replica.
-fn rendezvous_score(session_key: &str, endpoint_id: &str) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in session_key
-        .bytes()
-        .chain(std::iter::once(0u8))
-        .chain(endpoint_id.bytes())
-    {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
-}
-
-/// Order endpoints so a session sticks to one replica: rendezvous (highest-
-/// random-weight) hashing scores each endpoint by `hash(session_key, id)`; the
-/// highest score is the session's home and goes first, the rest follow for
-/// failover. Deterministic for a given key; adding/removing an endpoint
-/// reshuffles only minimally. With no session key, falls back to weighted order.
-fn session_hash_order<'a>(
-    items: Vec<&'a ResolvedEndpoint>,
-    session_key: &str,
-) -> Vec<&'a ResolvedEndpoint> {
-    if session_key.is_empty() {
-        // No session key on the request, so stickiness is impossible: this falls
-        // back to weighted_order, i.e. session_hash behaves like load_balance.
-        // Logged (debug, not warn — keyless requests are common and expected) so
-        // operators can see why a session_hash model isn't actually sticking.
-        tracing::debug!(
-            "session_hash selected but request has no session key; falling back to weighted order"
-        );
-        return weighted_order(items);
-    }
-    let mut scored: Vec<(u64, &ResolvedEndpoint)> = items
-        .into_iter()
-        .map(|e| (rendezvous_score(session_key, &e.id), e))
-        .collect();
-    // Highest score first; tie-break on id for a fully deterministic order.
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.id.cmp(&b.1.id)));
-    scored.into_iter().map(|(_, e)| e).collect()
-}
-
 /// Whether an upstream HTTP status is worth retrying or failing over for.
 /// Transient transport/overload conditions only — never 4xx client errors
 /// (except 408 request-timeout and 429 too-many-requests).
@@ -6755,14 +6623,15 @@ mod tests {
         looks_like_context_length_error, messages_input_estimate, multipart_text_view,
         output_guardrails_unenforceable, parse_multipart, prepare_upstream_body, redress_error,
         request_type_for_path, requires_registered_model, resolve_conversation,
-        response_cache_name, route_keeps_sessions, session_hash_order, should_translate_as_stream,
-        strip_beta_query, surface, tenant_active_now, weighted_order, MultipartField, RequestMeta,
-        TooLong, END_USER_HEADER, REGISTERED_MODEL_PATHS, SEED_CAP,
+        response_cache_name, route_keeps_sessions, should_translate_as_stream, strip_beta_query,
+        surface, tenant_active_now, MultipartField, RequestMeta, TooLong, END_USER_HEADER,
+        REGISTERED_MODEL_PATHS, SEED_CAP,
     };
     use crate::router::{BoonGrants, Candidate, Intent, RequestFeatures, RouterWeights};
     use axum::body::{Body, Bytes};
     use axum::http::{header, HeaderMap, Response, StatusCode};
     use chrono::{DateTime, TimeZone, Utc};
+    use obleth_admin::{session_hash_order, weighted_order};
     use obleth_config::{ResolvedEndpoint, ResolvedKey, ResolvedModel, WeeklyWindow};
     use std::collections::HashMap;
     use std::time::Duration;

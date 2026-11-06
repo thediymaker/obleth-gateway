@@ -866,7 +866,12 @@ impl Store {
         Ok(rows.iter().map(|r| r.get("id")).collect())
     }
 
-    /// Replace a model's full set of knowledge-collection attachments.
+    /// Replace a model's full set of knowledge-collection attachments. A
+    /// non-empty set also grants the `knowledge` boon in the same transaction,
+    /// since retrieval needs both and a model with only the attachment silently
+    /// answers without context. An empty set leaves `boons` as it is: the boon
+    /// is also the operator's own switch, and with no collections it does
+    /// nothing anyway.
     pub async fn set_model_collections(&self, model_id: Uuid, ids: &[Uuid]) -> Result<()> {
         let mut tx = self.pool().begin().await?;
         sqlx::query("delete from model_knowledge_collections where model_id = $1")
@@ -880,6 +885,15 @@ impl Store {
             )
             .bind(model_id)
             .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        if !ids.is_empty() {
+            sqlx::query(
+                "update models set boons = boons || '[\"knowledge\"]'::jsonb, updated_at = now()
+                  where id = $1 and not boons @> '[\"knowledge\"]'::jsonb",
+            )
+            .bind(model_id)
             .execute(&mut *tx)
             .await?;
         }

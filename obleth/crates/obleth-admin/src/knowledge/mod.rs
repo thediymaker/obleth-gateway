@@ -600,12 +600,7 @@ pub async fn search_collection(
         .store
         .get_model_by_name(&collection.indexed_embedding_model)
         .await?;
-    let target = embed::EmbedTarget {
-        api_base: model.api_base.clone(),
-        api_key: model.api_key.clone(),
-        headers: crate::upstream_header_map(&model.upstream_headers),
-        upstream_model: model.upstream_model.clone(),
-    };
+    let target = embed::resolve_target(&state.store, &model).await?;
     // `embed_timeout_ms` -- the hard bound documented for request-path query
     // embedding -- not `index_timeout_ms`, which is the (looser) background
     // indexing timeout. This preview issues the same kind of call the
@@ -700,6 +695,9 @@ pub async fn get_model_collections(
     Ok(Json(ModelCollectionsView { collection_ids }))
 }
 
+/// Replace the collections a model retrieves from. A non-empty list also grants
+/// the `knowledge` boon, without which the attachment does nothing; an empty
+/// list leaves `boons` alone.
 #[utoipa::path(
     put, path = "/api/v1/models/{id}/knowledge", tag = "models",
     params(("id" = Uuid, Path, description = "Model id")),
@@ -737,9 +735,12 @@ pub async fn set_model_collections(
         .store
         .set_model_collections(id, &body.collection_ids)
         .await?;
+    // Reread: the write above may have granted the boon, and publishing the row
+    // from before it would leave the data plane without it.
+    let updated = state.store.get_model(id).await?;
     // Refresh Redis immediately so the data plane reflects the new attachment
     // set on the model's next request, instead of waiting on the 15s refresh.
-    sync_model(&state, &model).await?;
+    sync_model(&state, &updated).await?;
     state
         .store
         .record_audit(
@@ -747,7 +748,10 @@ pub async fn set_model_collections(
             "set_model_knowledge_collections",
             "model",
             &id.to_string(),
-            serde_json::json!({ "collection_ids": body.collection_ids }),
+            serde_json::json!({
+                "collection_ids": body.collection_ids,
+                "knowledge_boon_granted": updated.boons != model.boons,
+            }),
         )
         .await?;
     Ok(Json(ModelCollectionsView {
