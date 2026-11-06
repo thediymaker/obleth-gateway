@@ -2,7 +2,8 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { saveSettingsAction } from "@/app/actions";
+import { applyAdviceFixAction, saveSettingsAction } from "@/app/actions";
+import type { AdviceReportView } from "@/lib/obleth";
 import { settingsData } from "./fixtures";
 import { SettingsPage } from "./settings-page";
 
@@ -13,6 +14,9 @@ vi.mock("@/app/actions", () => ({
   resyncCacheAction: vi.fn(async () => ({ ok: true })),
   testEnergyQueryAction: vi.fn(async () => ({ ok: true })),
   restoreBackupAction: vi.fn(async () => ({ ok: true })),
+  applyAdviceFixAction: vi.fn(async () => ({ ok: true })),
+  snoozeAdviceAction: vi.fn(async () => ({ ok: true })),
+  restoreAdviceAction: vi.fn(async () => ({ ok: true })),
 }));
 vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh: vi.fn(), push: vi.fn(), replace: vi.fn() }), usePathname: () => "/settings" }));
 
@@ -55,6 +59,40 @@ describe("the Settings page", () => {
     expect(needs.textContent).toContain("glm-5-3 asks for Vision, which is off");
     expect(host.querySelector("#boon-vision")!.textContent).toContain("1 asks, off");
     expect(host.querySelector('nav[aria-label="Settings sections"]')!.textContent).toContain("2 of 7 on");
+  });
+
+  it("puts measured findings first, with evidence, the judge's view and a one-step fix", async () => {
+    const advice: AdviceReportView = {
+      generated_at_ms: Date.now(),
+      window_hours: 24,
+      judge: { model: "jeffan-31b-1710" },
+      snoozed: [{ key: "repeating:x", title: "lab-key keeps sending requests m refuses", until_ms: Date.now() + 86_400_000, by: "a@b", at_ms: Date.now() }],
+      findings: [
+        {
+          key: "images_refused", check: "images_refused", severity: "act", weight: 52_000,
+          title: "3 text-only models refused 52,000 requests with images in the last day",
+          detail: "These models can read only text.",
+          evidence: [{ label: "qwen3-coder-30b-a3b-instruct", value: "19,314 refused" }, { label: "Sent by", value: "aewaisha-AI_Key (rcusers), 52,000" }],
+          models: ["qwen3-coder-30b-a3b-instruct", "qwen3-235b", "qwen35-397b"],
+          fix: { kind: "grant_boon", boon: "vision", models: ["qwen3-coder-30b-a3b-instruct", "qwen3-235b", "qwen35-397b"] },
+          logs: { status_code: 400, error_class: "client_input" },
+          judgment: { model: "jeffan-31b-1710", hurting_users: 0.93, worth_acting: 0.88, fix_is_safe: 0.95 },
+        },
+        { key: "long_answers:glm-5-2", check: "long_answers", severity: "note", weight: 5_000, title: "glm-5-2 writes long answers: 5,000 tokens on average", detail: "Auto can send requests here.", evidence: [], models: ["glm-5-2"] },
+      ],
+    };
+    await render(<SettingsPage data={settingsData({ advice })} />);
+    const needs = host.querySelector("#needs")!;
+    // The finding to act on, then the two settings findings; the note is folded away.
+    expect(needs.querySelector("h2")!.textContent).toBe("Needs you · 3");
+    expect(needs.textContent).toContain("19,314 refused");
+    expect(needs.textContent).toContain("jeffan-31b-1710 rates it: users affected 93%, worth acting on today 88%, the fix is safe 95%.");
+    expect(needs.textContent).toContain("Also noticed · 1");
+    expect(needs.textContent).toContain("Set aside · 1");
+    expect(needs.querySelector<HTMLAnchorElement>('a[href^="/logs"]')!.getAttribute("href")).toBe("/logs?code=400&class=client_input&window=24h");
+    await act(async () => button("Turn on the vision boon for 3 models").click());
+    await act(async () => button("Turn on").click());
+    expect(vi.mocked(applyAdviceFixAction)).toHaveBeenCalledWith("images_refused");
   });
 
   it("saves only the section that changed", async () => {

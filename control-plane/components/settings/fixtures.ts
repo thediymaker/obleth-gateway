@@ -35,6 +35,7 @@ export const readiness = (over: Partial<RouterReadinessView> = {}): RouterReadin
 
 export function settingsData(over: Partial<SettingsData> = {}): SettingsData {
   return {
+    advice: null,
     alerts: alerts(),
     router: router(),
     readiness: readiness(),
