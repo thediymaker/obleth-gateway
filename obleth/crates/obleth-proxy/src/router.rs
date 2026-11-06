@@ -50,7 +50,7 @@ impl ModelRegistry {
 }
 
 /// One uniform draw in `[0,1)`. Dependency-free splitmix64 seeded from the
-/// clock, matching `weighted_order` in proxy.rs — obleth-proxy deliberately
+/// clock, matching `obleth_admin::weighted_order` — obleth-proxy deliberately
 /// carries no `rand` dependency.
 pub fn splitmix_uniform() -> f64 {
     let mut z = std::time::SystemTime::now()
