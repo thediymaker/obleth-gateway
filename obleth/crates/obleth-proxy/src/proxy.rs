@@ -1720,8 +1720,9 @@ async fn run_pipeline(
     // held back while the model is down to its last server, and refused after
     // a second death; see `crate::crash_guard`. Fingerprinted on the caller's
     // body, before the gateway adds fields of its own.
-    if route.is_some() && state.crash_guard.enabled() {
-        req_meta.crash_fp = crate::crash_guard::fingerprint(&model, &json);
+    // Synthetic tenants (benchmarks, probes) are left out; see the module.
+    if route.is_some() && state.crash_guard.enabled() && !resolved.synthetic {
+        req_meta.crash_fp = crate::crash_guard::fingerprint(&resolved.key_id, &model, &json);
         let verdict = state
             .crash_guard
             .check(&state.redis, &model, &req_meta.crash_fp)

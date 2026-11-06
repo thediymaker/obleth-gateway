@@ -1403,8 +1403,14 @@ mod pipeline {
     }
 
     /// Wait (briefly) for the strikes a settled request records.
-    async fn strikes_reach(gw: &Gateway, model: &str, body: &Value, want: u32) -> u32 {
-        let fp = crate::crash_guard::fingerprint(model, body);
+    async fn strikes_reach(
+        gw: &Gateway,
+        key: &ResolvedKey,
+        model: &str,
+        body: &Value,
+        want: u32,
+    ) -> u32 {
+        let fp = crate::crash_guard::fingerprint(&key.key_id, model, body);
         let mut n = 0;
         for _ in 0..50 {
             n = gw
@@ -1429,7 +1435,7 @@ mod pipeline {
         gw.state.crash_guard = crate::crash_guard::CrashGuard::new(None);
         let (up, base) = spawn_upstream().await;
         gw.register(route("engine-dies", &base)).await;
-        let (secret, _) = gw.tenant().await;
+        let (secret, key) = gw.tenant().await;
         let body = json!({"model": "engine-dies", "max_tokens": 8,
                           "messages": [{"role": "user", "content": format!("crash {}", Uuid::new_v4())}]});
 
@@ -1437,12 +1443,12 @@ mod pipeline {
         // still goes through, and its second death is the second strike.
         let (status, _, _) = gw.chat(&secret, &body).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(strikes_reach(&gw, "engine-dies", &body, 1).await, 1);
+        assert_eq!(strikes_reach(&gw, &key, "engine-dies", &body, 1).await, 1);
         let mut retry = body.clone();
         retry["stream"] = json!(false); // a volatile field: still the same request
         let (status, _, _) = gw.chat(&secret, &retry).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(strikes_reach(&gw, "engine-dies", &body, 2).await, 2);
+        assert_eq!(strikes_reach(&gw, &key, "engine-dies", &body, 2).await, 2);
         assert_eq!(up.hits("engine-dies"), 2);
 
         // Third try: refused before it is sent.
@@ -1457,6 +1463,81 @@ mod pipeline {
         let (status, _, _) = gw.chat(&secret, &changed).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(up.hits("engine-dies"), 3);
+
+        // Another caller sending the refused body is not held to its strikes.
+        let (other, _) = gw.tenant().await;
+        let (status, _, _) = gw.chat(&other, &body).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(up.hits("engine-dies"), 4);
+    }
+
+    #[tokio::test]
+    async fn strikes_far_apart_do_not_add_up() {
+        let Some(gw) = gateway().await else {
+            return;
+        };
+        let (model, fp) = ("engine-dies", format!("window-{}", Uuid::new_v4()));
+        let redis = &gw.state.redis;
+        let ms = Duration::from_millis;
+        assert_eq!(
+            redis
+                .crash_strike(model, &fp, ms(200), Duration::from_secs(60))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            redis
+                .crash_strike(model, &fp, ms(200), Duration::from_secs(60))
+                .await
+                .unwrap(),
+            2
+        );
+        tokio::time::sleep(ms(300)).await;
+        // Past the window: the count starts again.
+        assert_eq!(
+            redis
+                .crash_strike(model, &fp, ms(200), Duration::from_secs(60))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(redis.crash_strikes(model, &fp).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn synthetic_tenants_collect_no_strikes() {
+        let Some(mut gw) = gateway().await else {
+            return;
+        };
+        gw.state.crash_guard = crate::crash_guard::CrashGuard::new(None);
+        let (_up, base) = spawn_upstream().await;
+        gw.register(route("engine-dies", &base)).await;
+        let mut key = crate::boons::test_support::test_key();
+        key.key_id = Uuid::new_v4();
+        key.tenant_id = Uuid::new_v4();
+        key.synthetic = true;
+        let secret = format!("sk-synthetic-{}", Uuid::new_v4());
+        gw.state
+            .key_cache
+            .insert(obleth_config::hash_api_key(&secret), Arc::new(key.clone()))
+            .await;
+        let body = json!({"model": "engine-dies", "max_tokens": 8,
+                          "messages": [{"role": "user", "content": format!("probe {}", Uuid::new_v4())}]});
+        for _ in 0..3 {
+            let (status, _, _) = gw.chat(&secret, &body).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let fp = crate::crash_guard::fingerprint(&key.key_id, "engine-dies", &body);
+        assert_eq!(
+            gw.state
+                .redis
+                .crash_strikes("engine-dies", &fp)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]

@@ -340,7 +340,10 @@ fn endpoints_are_deduplicated_and_judged_by_their_conditions() {
             {"addresses": ["10.0.0.1"], "conditions": {"ready": false},
              "targetRef": {"uid": "a"}},
             // The address-keyed endpoint again.
-            {"addresses": ["10.0.0.5"], "conditions": {"ready": true, "terminating": false}}
+            {"addresses": ["10.0.0.5"], "conditions": {"ready": true, "terminating": false}},
+            // A pod being shut down: counted, not ready, terminating.
+            {"addresses": ["10.0.0.6"], "conditions": {"ready": false, "serving": true, "terminating": true},
+             "targetRef": {"uid": "e"}}
         ]},
         // A slice of a Service with no endpoints.
         {"endpoints": null},
@@ -349,7 +352,11 @@ fn endpoints_are_deduplicated_and_judged_by_their_conditions() {
     .expect("slices");
     assert_eq!(
         count_endpoints(&slices),
-        EndpointCount { total: 5, ready: 4 }
+        EndpointCount {
+            total: 6,
+            ready: 4,
+            terminating: 1
+        }
     );
     assert_eq!(count_endpoints(&[]), EndpointCount::default());
 }
