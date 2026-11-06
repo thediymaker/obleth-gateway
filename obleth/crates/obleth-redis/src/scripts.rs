@@ -784,3 +784,20 @@ for _, pool in ipairs(lowered) do wake(totals, pool, ARGV[2], now) end
 return 1
 "#
 );
+
+/// Add one crash-guard strike to the hash at `KEYS[1]` (`n` strikes, `last`
+/// strike time). A strike more than `ARGV[2]` ms after the previous one starts
+/// the count again: only engine deaths close together add up. The hash
+/// expires `ARGV[3]` seconds after its last strike.
+///
+/// ARGV: now ms, window ms, ttl secs. Returns the strike count.
+pub const CRASH_STRIKE: &str = r#"
+local last = redis.call('HGET', KEYS[1], 'last')
+if last and (tonumber(ARGV[1]) - tonumber(last)) > tonumber(ARGV[2]) then
+  redis.call('DEL', KEYS[1])
+end
+local n = redis.call('HINCRBY', KEYS[1], 'n', 1)
+redis.call('HSET', KEYS[1], 'last', ARGV[1])
+redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
+return n
+"#;

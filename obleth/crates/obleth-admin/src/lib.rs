@@ -6075,6 +6075,7 @@ async fn get_capacity_discovery(
                     namespace: m.capacity_namespace.clone(),
                     service: m.capacity_service.clone(),
                     ready_replicas: None,
+                    terminating_replicas: None,
                     per_replica_max_in_flight: None,
                     per_replica_source: None,
                     replica_capacity: None,

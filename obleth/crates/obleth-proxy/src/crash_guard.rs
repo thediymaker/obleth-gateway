@@ -10,9 +10,22 @@
 //!
 //! The gateway cannot tell which of the requests in flight killed the engine,
 //! so it counts strikes. Every request that was being answered when an engine
-//! died gets one strike against its fingerprint (the model plus its body,
-//! less fields that do not change the answer), kept in Redis for
-//! [`STRIKE_TTL`] so every gateway replica sees it.
+//! died gets one strike against its fingerprint (the API key, the model and
+//! the body less fields that do not change the answer), kept in Redis so
+//! every gateway replica sees it. The key is part of it because a retry comes
+//! from the caller that sent the request: another caller sending the same
+//! prompt is not held back for it. Strikes count only while they come close
+//! together: one more than [`STRIKE_WINDOW`] after the last starts the count
+//! again, so a request that happens to be in flight at two unrelated deaths
+//! (a large fleet loses a server now and then) is not refused for it. A
+//! record is forgotten [`STRIKE_TTL`] after its last strike.
+//!
+//! Synthetic tenants (benchmarks, probes) collect no strikes: they repeat the
+//! same bodies on a schedule, and a refused probe would read as an outage.
+//! Neither does an engine-dead answer while one of the model's servers is
+//! being shut down (capacity discovery sees it `terminating`): vLLM answers
+//! requests still running when a planned drain runs out of time with the
+//! same error.
 //!
 //! - No strike: the request goes through.
 //! - One strike (a suspect): it goes through while the model has at least
@@ -21,9 +34,10 @@
 //!   until a second server is back. A model that usually runs one server
 //!   lets it through once that server is back: there is nothing else to
 //!   protect, and a second crash settles it.
-//! - Two strikes: the request has been in flight at two engine deaths, which
-//!   chance does not explain; it is refused with `422` until its strikes
-//!   expire. A changed request has a new fingerprint and goes through.
+//! - Two strikes: the request has been in flight at two engine deaths within
+//!   [`STRIKE_WINDOW`], which chance does not explain; it is refused with
+//!   `422` until its record expires. A changed request has a new
+//!   fingerprint and goes through.
 //!
 //! A big fleet that loses one server still has others, so its suspects go
 //! through: at worst a request that does kill engines takes a second server
@@ -42,8 +56,10 @@ use obleth_redis::RedisStore;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-/// How long a strike is remembered.
+/// How long a strike record is kept after its last strike.
 pub(crate) const STRIKE_TTL: Duration = Duration::from_secs(6 * 3600);
+/// How close together strikes must come to add up.
+pub(crate) const STRIKE_WINDOW: Duration = Duration::from_secs(3600);
 /// How long the most ready servers seen for a model counts as its strength.
 pub(crate) const PEAK_WINDOW: Duration = Duration::from_secs(3 * 3600);
 /// What a held suspect is told to wait before sending again.
@@ -74,10 +90,11 @@ pub(crate) fn is_engine_death(reason: &str) -> bool {
     reason.contains("EngineCore encountered an issue") || reason.contains("EngineDeadError")
 }
 
-/// The fingerprint of a request to `model`: a hash of the model name and the
-/// body without [`VOLATILE_FIELDS`].
-pub(crate) fn fingerprint(model: &str, body: &Value) -> String {
+/// The fingerprint of a request from API key `key` to `model`: a hash of
+/// the key, the model name and the body without [`VOLATILE_FIELDS`].
+pub(crate) fn fingerprint(key: &uuid::Uuid, model: &str, body: &Value) -> String {
     let mut h = Sha256::new();
+    h.update(key.as_bytes());
     h.update(model.as_bytes());
     h.update([0u8]);
     match body {
@@ -199,13 +216,38 @@ impl CrashGuard {
         decide(strikes, ready, usual)
     }
 
+    /// Whether capacity discovery saw one of `model`'s servers being shut
+    /// down (a rollout or scale-down) on its last pass.
+    fn shutting_down(&self, model: &str) -> bool {
+        self.discovery.as_ref().is_some_and(|d| {
+            d.statuses()
+                .into_iter()
+                .find(|s| s.model_name == model)
+                .and_then(|s| s.terminating_replicas)
+                .is_some_and(|n| n > 0)
+        })
+    }
+
     /// Record that a request with fingerprint `fp` was in flight when one of
-    /// `model`'s engines died.
+    /// `model`'s engines died. Not while one of the model's servers is being
+    /// shut down: vLLM ends a drain that runs out of time with the same
+    /// engine-dead error, for requests still running then.
     pub(crate) async fn record_death(&self, redis: &RedisStore, model: &str, fp: &str) {
         if !self.enabled || fp.is_empty() {
             return;
         }
-        match redis.crash_strike(model, fp, STRIKE_TTL.as_secs()).await {
+        if self.shutting_down(model) {
+            tracing::info!(
+                model,
+                fingerprint = fp,
+                "crash guard: engine-dead answer while a server is shutting down; not a strike"
+            );
+            return;
+        }
+        match redis
+            .crash_strike(model, fp, STRIKE_WINDOW, STRIKE_TTL)
+            .await
+        {
             Ok(n) => tracing::warn!(
                 model,
                 fingerprint = fp,
@@ -284,11 +326,17 @@ mod tests {
         let a = json!({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 5, "stream": true});
         let b = json!({"stream": false, "max_tokens": 5, "user": "x",
                        "messages": [{"role": "user", "content": "hi"}]});
-        assert_eq!(fingerprint("m", &a), fingerprint("m", &b));
+        let k = uuid::Uuid::new_v4();
+        assert_eq!(fingerprint(&k, "m", &a), fingerprint(&k, "m", &b));
         let c = json!({"messages": [{"role": "user", "content": "hi!"}], "max_tokens": 5});
-        assert_ne!(fingerprint("m", &a), fingerprint("m", &c));
-        assert_ne!(fingerprint("m", &a), fingerprint("n", &a));
-        assert_eq!(fingerprint("m", &a).len(), 32);
+        assert_ne!(fingerprint(&k, "m", &a), fingerprint(&k, "m", &c));
+        assert_ne!(fingerprint(&k, "m", &a), fingerprint(&k, "n", &a));
+        assert_eq!(fingerprint(&k, "m", &a).len(), 32);
+        // Another caller sending the same body is another request.
+        assert_ne!(
+            fingerprint(&k, "m", &a),
+            fingerprint(&uuid::Uuid::new_v4(), "m", &a)
+        );
     }
 
     #[test]

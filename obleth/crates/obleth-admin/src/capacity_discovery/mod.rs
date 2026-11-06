@@ -154,6 +154,10 @@ pub struct ModelCapacityStatus {
     pub service: Option<String>,
     /// Serving replicas the source reported on its last answer.
     pub ready_replicas: Option<usize>,
+    /// `kubernetes`: replicas being shut down (a rollout or scale-down), on
+    /// the last answer. The crash guard does not count an engine death on a
+    /// model with one as a crash.
+    pub terminating_replicas: Option<usize>,
     /// Requests one replica takes, as used in the last derivation. `None`
     /// when the ready replicas' values differ (endpoints with their own
     /// `max_in_flight`); `replica_capacity` then has their sum.
@@ -558,10 +562,17 @@ impl Discoverer {
                 "kubernetes" => match plans.remove(&t.model_name) {
                     Some(Ok(plan)) => {
                         let (outcome, found) = kubernetes_outcome(t, &plan, &lookups);
+                        let terminating = found.as_ref().and_then(|ns| {
+                            match lookups.get(&(ns.clone(), plan.service.clone())) {
+                                Some(Ok(slices)) => Some(kube::count_endpoints(slices).terminating),
+                                _ => None,
+                            }
+                        });
                         seen = Seen {
                             namespaces: plan.namespaces,
                             namespace: found,
                             service: Some(plan.service),
+                            terminating,
                         };
                         outcome
                     }
@@ -663,6 +674,7 @@ impl Discoverer {
             namespace: seen.namespace,
             service: seen.service,
             ready_replicas: None,
+            terminating_replicas: seen.terminating,
             per_replica_max_in_flight: None,
             per_replica_source: None,
             replica_capacity: None,
@@ -760,6 +772,7 @@ struct Seen {
     namespaces: Vec<String>,
     namespace: Option<String>,
     service: Option<String>,
+    terminating: Option<usize>,
 }
 
 /// EndpointSlice lists by `(namespace, service)`.

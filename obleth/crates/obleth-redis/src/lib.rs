@@ -46,6 +46,7 @@ cached_script!(slot_acquire_script, scripts::SLOT_ACQUIRE);
 cached_script!(slot_release_script, scripts::SLOT_RELEASE);
 cached_script!(slot_hold_script, scripts::SLOT_HOLD);
 cached_script!(slot_reconcile_script, scripts::SLOT_RECONCILE);
+cached_script!(crash_strike_script, scripts::CRASH_STRIKE);
 
 const KEY_PREFIX: &str = "obleth:key:";
 const MODEL_PREFIX: &str = "obleth:model:";
@@ -67,8 +68,8 @@ const KNOWLEDGE_QUERY_PREFIX: &str = "obleth:knowledge:q:";
 /// `auto` conversation records and answered-request markers, per tenant.
 const AUTO_TURN_PREFIX: &str = "obleth:auto:";
 /// Crash-guard strikes: how many model-server engine deaths one request (by
-/// fingerprint) was being answered at, per model.
-const CRASH_PREFIX: &str = "obleth:crash:";
+/// fingerprint) was being answered at, per model. A hash (`n`, `last`).
+const CRASH_PREFIX: &str = "obleth:crashguard:";
 const INVALIDATE_CHANNEL: &str = "obleth:invalidate";
 /// Single shared key holding the provisioner's last-seen epoch seconds. Shared
 /// via Redis (not per-pod memory) so the dashboard reads a consistent value no
@@ -463,20 +464,28 @@ impl RedisStore {
     /// `model` (0 when none, or expired).
     pub async fn crash_strikes(&self, model: &str, fingerprint: &str) -> Result<u32> {
         let mut conn = self.conn.clone();
-        let v: Option<u32> = conn.get(Self::crash_key(model, fingerprint)).await?;
+        let v: Option<u32> = conn.hget(Self::crash_key(model, fingerprint), "n").await?;
         Ok(v.unwrap_or(0))
     }
 
-    /// Add one crash-guard strike to a request fingerprint for `model` and
-    /// (re)start its expiry; returns the new count.
-    pub async fn crash_strike(&self, model: &str, fingerprint: &str, ttl_secs: u64) -> Result<u32> {
-        let key = Self::crash_key(model, fingerprint);
+    /// Add one crash-guard strike to a request fingerprint for `model`; a
+    /// strike more than `window` after the previous one starts the count
+    /// again. The record expires `ttl` after its last strike. Returns the
+    /// count.
+    pub async fn crash_strike(
+        &self,
+        model: &str,
+        fingerprint: &str,
+        window: std::time::Duration,
+        ttl: std::time::Duration,
+    ) -> Result<u32> {
         let mut conn = self.conn.clone();
-        let (n, _): (u32, bool) = redis::pipe()
-            .atomic()
-            .incr(&key, 1u32)
-            .expire(&key, ttl_secs as i64)
-            .query_async(&mut conn)
+        let n: u32 = crash_strike_script()
+            .key(Self::crash_key(model, fingerprint))
+            .arg(now_ms())
+            .arg(window.as_millis() as i64)
+            .arg(ttl.as_secs() as i64)
+            .invoke_async(&mut conn)
             .await?;
         Ok(n)
     }

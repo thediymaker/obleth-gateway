@@ -366,6 +366,8 @@ impl Endpoint {
 pub struct EndpointCount {
     pub total: usize,
     pub ready: usize,
+    /// Endpoints of pods being shut down (`terminating`), ready or not.
+    pub terminating: usize,
 }
 
 /// Count the distinct endpoints across a Service's slices. The same backend
@@ -376,16 +378,21 @@ pub struct EndpointCount {
 pub fn count_endpoints(slices: &[EndpointSlice]) -> EndpointCount {
     let mut all: HashSet<String> = HashSet::new();
     let mut ready: HashSet<String> = HashSet::new();
+    let mut terminating: HashSet<String> = HashSet::new();
     for e in slices.iter().flat_map(|s| s.endpoints.iter()) {
         let Some(key) = e.key() else { continue };
         if e.is_serving() {
             ready.insert(key.clone());
+        }
+        if e.conditions.terminating == Some(true) {
+            terminating.insert(key.clone());
         }
         all.insert(key);
     }
     EndpointCount {
         total: all.len(),
         ready: ready.len(),
+        terminating: terminating.len(),
     }
 }
 
