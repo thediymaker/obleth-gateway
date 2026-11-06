@@ -1324,7 +1324,12 @@ async fn run_pipeline(
         // With stickiness on, find the model that answered this conversation's
         // last turn before deciding anything.
         let conversation = if router_settings.sticky_enabled {
-            Some(crate::sticky::lookup(&state, &resolved.tenant_id, &json).await)
+            // Only a client's own conversation id names one conversation; a
+            // derived id is shared by every chat that opens the same way.
+            let session_id = (req_meta.session_id_source == SessionSource::Client.as_str())
+                .then_some(req_meta.session_id.as_str())
+                .filter(|s| !s.is_empty());
+            Some(crate::sticky::lookup(&state, &resolved.tenant_id, &json, session_id).await)
         } else {
             None
         };
@@ -1383,21 +1388,34 @@ async fn run_pipeline(
         let choice = conversation.as_ref().map(|c| {
             let mut observed = c.observed.clone();
             observed.complaint = complaint;
-            crate::sticky::choose(&candidates, c.record.as_ref(), &intent, &observed, |pool| {
-                crate::router::select_model(
-                    pool,
-                    &features,
-                    &busyness,
-                    &expected_output,
-                    allowed,
-                    &intent.tags,
-                    grants,
-                    &weights,
-                    uniform,
-                    intent.difficulty,
-                )
-                .is_some()
-            })
+            crate::sticky::client_signal(
+                &mut observed,
+                headers
+                    .get(crate::sticky::AUTO_ESCALATE_HEADER)
+                    .and_then(|v| v.to_str().ok()),
+            );
+            crate::sticky::choose(
+                &candidates,
+                c.record.as_ref(),
+                c.session.as_ref(),
+                &intent,
+                &observed,
+                |pool| {
+                    crate::router::select_model(
+                        pool,
+                        &features,
+                        &busyness,
+                        &expected_output,
+                        allowed,
+                        &intent.tags,
+                        grants,
+                        &weights,
+                        uniform,
+                        intent.difficulty,
+                    )
+                    .is_some()
+                },
+            )
         });
         let pool: &[crate::router::Candidate] = choice
             .as_ref()
