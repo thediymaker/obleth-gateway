@@ -90,12 +90,12 @@ const MAX_TOPICS: usize = 16;
 
 impl SessionRecord {
     /// The model this conversation used last for one of `domains`, when it has
-    /// been there before. The general domain is not a topic to return to.
+    /// been there before. General chat (the `general` tag, or an untagged turn)
+    /// is not a topic to return to: nearly every turn carries it.
     pub fn standing(&self, domains: &[String]) -> Option<&Standing> {
-        self.topics
-            .iter()
-            .rev()
-            .find(|s| s.domain != GENERAL_DOMAIN && domains.contains(&s.domain))
+        self.topics.iter().rev().find(|s| {
+            s.domain != GENERAL_DOMAIN && s.domain != GENERAL_TAG && domains.contains(&s.domain)
+        })
     }
 
     /// Take `record` as the conversation's last turn, and its model as the one
@@ -599,8 +599,19 @@ mod tests {
         assert_eq!(session.last.as_ref().unwrap().model, "hemmingway");
         let coding = session.standing(&["coding".into()]).unwrap();
         assert_eq!((coding.model.as_str(), coding.rung), ("glm", 3));
-        // Chit-chat is not a topic to return to.
+        // Chit-chat is not a topic to return to, tagged or not.
         assert!(session.standing(&[GENERAL_DOMAIN.into()]).is_none());
+        session.remember(&turn("north-mini", &[GENERAL_TAG], 1));
+        assert!(session
+            .standing(&[GENERAL_TAG.into(), "creative".into()])
+            .is_none());
+        assert_eq!(
+            session
+                .standing(&["coding".into(), GENERAL_TAG.into()])
+                .unwrap()
+                .model,
+            "glm"
+        );
         // A later coding turn replaces the coding model, not the others.
         session.remember(&turn("kimi", &["coding"], 4));
         assert_eq!(session.standing(&["coding".into()]).unwrap().model, "kimi");
@@ -608,7 +619,7 @@ mod tests {
             session.standing(&["writing".into()]).unwrap().model,
             "hemmingway"
         );
-        assert_eq!(session.topics.len(), 3);
+        assert_eq!(session.topics.len(), 4);
     }
 
     #[test]

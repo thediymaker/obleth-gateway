@@ -53,8 +53,13 @@ pub(crate) async fn lookup(
     json: &serde_json::Value,
     session_id: Option<&str>,
 ) -> Conversation {
-    let retry_key = sticky::retry_key(json);
     let session_key = session_id.map(sticky::session_key);
+    // Within a named conversation, "the same request again" means in this
+    // conversation: two chats that open the same way are not a regenerate.
+    let retry_key = sticky::retry_key(json).map(|k| match &session_key {
+        Some(s) => format!("{s}:{k}"),
+        None => k,
+    });
     let get = |key: Option<String>| async move {
         match key {
             Some(k) => state
@@ -181,6 +186,8 @@ pub(crate) fn choose(
                     .find(|c| c.model.model_name == s.model)
                     .map(|c| (c, s.rung))
             });
+        // It must still be strong enough for this turn; a harder one routes on.
+        let returning = returning.filter(|(c, _)| c.strength(&plan.domains) >= intent.difficulty);
         if let Some((c, rung)) = returning {
             let only = std::slice::from_ref(c);
             if serves(only) {
@@ -667,6 +674,48 @@ mod tests {
         assert_eq!(code.reason, Reason::Returned);
         assert_eq!(names(&code), ["glm"]);
         assert_eq!(code.floor, 3);
+    }
+
+    #[test]
+    fn hello_tagged_general_does_not_hold_a_coding_turn() {
+        // The classifier tags "Hello" general and a build request
+        // coding + creative + general (11-06, obleth-dev).
+        let all = fleet();
+        let mut session = SessionRecord::default();
+        session.remember(&turn_record("north-mini", "general", 1));
+        let build = Intent {
+            tags: vec!["coding".into(), "creative".into(), "general".into()],
+            difficulty: 2,
+            source: IntentSource::Classifier,
+        };
+        let choice = choose(
+            &all,
+            session.last.as_ref(),
+            Some(&session),
+            &build,
+            &Observed::default(),
+            |_| true,
+        );
+        assert_eq!(choice.reason, Reason::Topic);
+        assert_eq!(names(&choice), ["glm"]);
+    }
+
+    #[test]
+    fn a_returning_model_too_weak_for_a_harder_turn_is_passed_over() {
+        let all = fleet();
+        let mut session = SessionRecord::default();
+        session.remember(&turn_record("north-mini", "coding", 2));
+        session.remember(&turn_record("hemmingway", "writing", 3));
+        let choice = choose(
+            &all,
+            session.last.as_ref(),
+            Some(&session),
+            &tagged("coding", 3),
+            &Observed::default(),
+            |_| true,
+        );
+        assert_eq!(choice.reason, Reason::Topic);
+        assert_eq!(names(&choice), ["glm"]);
     }
 
     #[test]
