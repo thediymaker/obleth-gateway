@@ -3705,6 +3705,34 @@ impl Store {
         Ok(())
     }
 
+    /// Load the advice state (snoozed findings), or `None` if never saved.
+    /// Stored as plain JSON: the admin crate owns its shape.
+    pub async fn get_advice_state(&self) -> Result<Option<serde_json::Value>> {
+        let row = sqlx::query("select value from app_settings where key = 'advice'")
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            Some(row) => {
+                let value: sqlx::types::Json<serde_json::Value> = row.try_get("value")?;
+                Ok(Some(value.0))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Persist the advice state (upsert on the single `advice` key).
+    pub async fn put_advice_state(&self, state: &serde_json::Value) -> Result<()> {
+        sqlx::query(
+            "insert into app_settings (key, value, updated_at)
+             values ('advice', $1, now())
+             on conflict (key) do update set value = excluded.value, updated_at = now()",
+        )
+        .bind(sqlx::types::Json(state))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Load the persisted `auto` router settings, or `None` if unset.
     pub async fn get_auto_router_settings(
         &self,

@@ -1578,6 +1578,62 @@ export interface RouterReadinessView {
   difficulty_enabled: boolean;
 }
 
+/// Advice: what an operator should change, found from the last day of
+/// requests. Every number on a finding is measured; a judge model may order
+/// the list but never adds findings.
+export interface AdviceEvidenceView {
+  label: string;
+  value: string;
+}
+
+export type AdviceFixView = { kind: "grant_boon"; boon: string; models: string[] };
+
+export interface AdviceLogsView {
+  model?: string;
+  key_id?: string;
+  status_code?: number;
+  error_class?: string;
+}
+
+export interface AdviceJudgmentView {
+  model: string;
+  hurting_users: number;
+  worth_acting: number;
+  fix_is_safe?: number;
+}
+
+export interface AdviceFindingView {
+  key: string;
+  check: string;
+  severity: "act" | "watch" | "note";
+  title: string;
+  detail: string;
+  evidence: AdviceEvidenceView[];
+  models: string[];
+  fix?: AdviceFixView;
+  logs?: AdviceLogsView;
+  judgment?: AdviceJudgmentView;
+  weight: number;
+}
+
+export interface SnoozedAdviceView {
+  key: string;
+  title: string;
+  /// Absent: dismissed for good.
+  until_ms?: number;
+  by: string;
+  at_ms: number;
+}
+
+export interface AdviceReportView {
+  generated_at_ms: number;
+  window_hours: number;
+  findings: AdviceFindingView[];
+  snoozed: SnoozedAdviceView[];
+  /// `pending`: some findings are still being judged; a later read has them.
+  judge: { model?: string; error?: string; pending?: boolean };
+}
+
 export interface RejectionView {
   reason: string;
   models: string[];
@@ -2928,6 +2984,19 @@ export const obleth = {
   getRouterReadiness: reactCache(() =>
     api<RouterReadinessView>("/router/readiness"),
   ),
+  /// Advice from the last day of requests (cached about a minute by the gateway).
+  getAdvice: reactCache(() => api<AdviceReportView>("/advice")),
+  snoozeAdvice: (key: string, body: { title: string; until_ms?: number }, options?: AuditOptions) =>
+    api<SnoozedAdviceView[]>(`/advice/snoozed/${encodeURIComponent(key)}`, {
+      method: "PUT",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify(body),
+    }),
+  restoreAdvice: (key: string, options?: AuditOptions) =>
+    api<SnoozedAdviceView[]>(`/advice/snoozed/${encodeURIComponent(key)}`, {
+      method: "DELETE",
+      headers: auditActorHeaders(options),
+    }),
   getBoonSettings: reactCache(() => api<BoonSettingsView>("/settings/boons")),
   setBoonSettings: (body: UpdateBoonSettings, options?: AuditOptions) =>
     api<BoonSettingsView>("/settings/boons", {

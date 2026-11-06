@@ -10,9 +10,11 @@ import { SettingsCard } from "@/components/access/ui";
 import { AlertsSection } from "@/components/settings/alerts-section";
 import { BoonsSection } from "@/components/settings/boons-section";
 import { AboutSection, AssistantSection, DataSection, EnergySection, type VersionInfo } from "@/components/settings/other-sections";
+import { NeedsYouSection, needsYouCount } from "@/components/settings/needs-you";
 import { RoutingSection } from "@/components/settings/routing-section";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import type {
+  AdviceReportView,
   AlertSettingsView,
   AutoRouterSettingsView,
   BoonSettingsView,
@@ -29,6 +31,8 @@ import { BOONS, needsYou, sectionOfField } from "@/lib/settings-model";
 import { cn } from "@/lib/utils";
 
 export interface SettingsData {
+  /** What the last day of requests says to change; null when it could not be read. */
+  advice: AdviceReportView | null;
   alerts: AlertSettingsView | null;
   router: AutoRouterSettingsView | null;
   readiness: RouterReadinessView | null;
@@ -146,6 +150,7 @@ export function SettingsPage({ data, anchor }: { data: SettingsData; anchor?: st
   const [active, setActive] = useState("needs");
   const [dirty, setDirty] = useState<string[]>([]);
   const findings = needsYou({ alerts: data.alerts, boons: data.boons, knowledge: data.knowledge, models: data.models, readiness: data.readiness, slurm: data.slurm, compressor: data.compressor, router: data.router });
+  const needsCount = needsYouCount(findings, data.advice);
   const boonsOn = data.boons ? BOONS.filter((b) => data.boons![b.enabled]).length : null;
 
   useEffect(() => {
@@ -179,7 +184,7 @@ export function SettingsPage({ data, anchor }: { data: SettingsData; anchor?: st
   }, [confirm, data.alerts, data.retention]);
 
   const nav: { id: string; label: string; count?: string | number; href?: string }[] = [
-    { id: "needs", label: "Needs you", count: findings.length || undefined },
+    { id: "needs", label: "Needs you", count: needsCount || undefined },
     { id: "alerts", label: "Alerts", count: data.alerts ? (data.alerts.slack_webhook_set || data.alerts.email ? "on" : "none") : undefined },
     { id: "routing", label: "Routing", count: data.router ? (data.router.classifier_enabled ? "auto on" : "heuristics") : undefined },
     { id: "boons", label: "Boons", count: boonsOn !== null ? `${boonsOn} of ${BOONS.length} on` : undefined },
@@ -201,7 +206,7 @@ export function SettingsPage({ data, anchor }: { data: SettingsData; anchor?: st
       {confirmElement}
       <div className="flex flex-col gap-1.5">
         <h1 className="text-[26px] font-semibold tracking-tight">Settings</h1>
-        <p className="text-[13px] text-secondary-foreground">How the whole gateway behaves. Changes apply at once, no restart.{findings.length ? ` ${findings.length} thing${findings.length === 1 ? " needs" : "s need"} you.` : ""}</p>
+        <p className="text-[13px] text-secondary-foreground">How the whole gateway behaves. Changes apply at once, no restart.{needsCount ? ` ${needsCount} thing${needsCount === 1 ? " needs" : "s need"} you.` : ""}</p>
       </div>
 
       <div className="grid items-start gap-6 lg:grid-cols-[200px_minmax(0,1fr)]">
@@ -219,20 +224,7 @@ export function SettingsPage({ data, anchor }: { data: SettingsData; anchor?: st
         </nav>
 
         <div className="flex min-w-0 flex-col gap-4">
-          <section id="needs" aria-label="Needs you" className={cn("scroll-mt-24 rounded-xl bg-card", findings.length ? "border-[1.5px] border-foreground" : "border border-border")}>
-            <h2 className="px-[18px] pb-2 pt-3.5 text-sm font-semibold">{findings.length ? `Needs you · ${findings.length}` : "Nothing needs you"}</h2>
-            {findings.length === 0 && <p className="px-[18px] pb-3.5 text-[12.5px] text-muted-foreground">Alerts reach someone, every boon a model asks for is on, and routing has nothing to fix.</p>}
-            {findings.map((f) => (
-              <div key={f.key} className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-4 border-t border-border px-[18px] py-3">
-                <div className="min-w-0"><p className="text-[13.5px] font-medium">{f.title}</p><p className="mt-0.5 text-[12.5px] text-secondary-foreground">{f.detail}</p></div>
-                {f.href.startsWith("#") ? (
-                  <a href={f.href} onClick={(e) => { e.preventDefault(); jump(f.href.slice(1)); }} className="inline-flex h-8 items-center rounded-lg border border-border px-3 text-[12.5px] hover:border-muted-foreground/60">{f.action}</a>
-                ) : (
-                  <Link href={f.href} className="inline-flex h-8 items-center rounded-lg border border-border px-3 text-[12.5px] hover:border-muted-foreground/60">{f.action}</Link>
-                )}
-              </div>
-            ))}
-          </section>
+          <NeedsYouSection findings={findings} advice={data.advice} jump={jump} />
 
           <SettingsForm id="settings" sectionOf={sectionOf} labelOf={labelOf} save={saveSettingsAction} confirmSave={confirmSave} onSaved={() => router.refresh()} onDirtyChange={onDirty} className="flex flex-col gap-4" ariaLabel="Gateway settings">
             {data.alerts ? <AlertsSection settings={data.alerts} /> : <Unreadable id="alerts" title="Alerts" />}

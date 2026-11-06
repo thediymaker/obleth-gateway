@@ -211,6 +211,7 @@ async fn handle(
         model_family: String::new(),
         streamed: false,
         failure: None,
+        crash_fp: String::new(),
     };
 
     // ---- tenant input guardrails ----
@@ -1201,6 +1202,7 @@ mod pipeline_tests {
             knowledge: Arc::new(crate::knowledge::KnowledgeIndex::new()),
             jobs: crate::jobs::JobStore::new(store, Default::default()),
             load: None,
+            crash_guard: crate::crash_guard::CrashGuard::disabled(),
         };
         Some(Gateway { state, wal_dir })
     }

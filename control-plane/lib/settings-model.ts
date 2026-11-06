@@ -257,8 +257,9 @@ export function needsYou(input: {
     const asking = models.filter((m) => (m.boons ?? []).includes("knowledge")).map((m) => m.model_name);
     if (asking.length) out.push({ key: "knowledge", title: `${asking.length === 1 ? `${asking[0]} asks` : `${asking.length} models ask`} for Knowledge, but retrieval is off`, detail: "Their collections aren't searched.", href: "/knowledge?tab=retrieval", action: "Retrieval settings" });
   }
+  // Long answers come from the request ledger in Advice, with their evidence.
   for (const f of input.readiness?.findings ?? []) {
-    if (f.severity === "warn") out.push({ key: `router-${f.code}`, title: f.title, detail: f.detail, href: "#routing", action: "Routing" });
+    if (f.severity === "warn" && f.code !== "long_output_model") out.push({ key: `router-${f.code}`, title: f.title, detail: f.detail, href: "#routing", action: "Routing" });
   }
   if (input.slurm?.enabled && !input.slurm.provisioner_running) {
     out.push({ key: "provisioner", title: "Slurm is on, but the provisioner isn't running", detail: "Nothing is launched or replaced until it checks in.", href: "/deployments?slurm=1", action: "Slurm connection" });

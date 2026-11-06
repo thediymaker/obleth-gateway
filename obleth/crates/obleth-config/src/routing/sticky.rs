@@ -13,6 +13,13 @@
 //! fingerprint of the answer it produced ([`turn_key`]). The next request
 //! fingerprints its last assistant message the same way to find it.
 //!
+//! A client that names its conversations (a session id, see
+//! `resolve_conversation`) gets a [`SessionRecord`] instead, found by that id.
+//! It survives clients that rewrite earlier turns before sending them back
+//! (Chat flattens tool turns to text, which no fingerprint matches), and it
+//! remembers which model served each topic, so a conversation that moves from
+//! code to docs and back to code returns to its coding model.
+//!
 //! Everything here is pure; the proxy owns the store and the classifier call.
 
 use serde::{Deserialize, Serialize};
@@ -22,6 +29,10 @@ use super::{Candidate, Intent, GENERAL_DOMAIN, GENERAL_TAG};
 
 /// How long a conversation's record outlives its last turn.
 pub const STICKY_TTL_SECS: u64 = 2 * 60 * 60;
+
+/// How long a named conversation's [`SessionRecord`] outlives its last turn:
+/// people come back to a chat after lunch, or the next morning.
+pub const SESSION_TTL_SECS: u64 = 24 * 60 * 60;
 
 /// Consecutive tool turns with errors before the incumbent is replaced. One
 /// failing command is ordinary agent work; a run of them is not.
@@ -55,6 +66,61 @@ pub struct TurnRecord {
     /// whose arguments are not JSON.
     #[serde(default)]
     pub bad_output: bool,
+}
+
+/// The model that last served one topic of a conversation, and its level there.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Standing {
+    pub domain: String,
+    pub model: String,
+    pub rung: u8,
+}
+
+/// What the gateway remembers about a conversation the client names: its last
+/// turn, and the model that served each topic it has been through.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionRecord {
+    pub last: Option<TurnRecord>,
+    #[serde(default)]
+    pub topics: Vec<Standing>,
+}
+
+/// Topics a conversation remembers at most; the oldest is forgotten first.
+const MAX_TOPICS: usize = 16;
+
+impl SessionRecord {
+    /// The model this conversation used last for one of `domains`, when it has
+    /// been there before. General chat (the `general` tag, or an untagged turn)
+    /// is not a topic to return to: nearly every turn carries it.
+    pub fn standing(&self, domains: &[String]) -> Option<&Standing> {
+        self.topics.iter().rev().find(|s| {
+            s.domain != GENERAL_DOMAIN && s.domain != GENERAL_TAG && domains.contains(&s.domain)
+        })
+    }
+
+    /// Take `record` as the conversation's last turn, and its model as the one
+    /// for each of its topics.
+    pub fn remember(&mut self, record: &TurnRecord) {
+        for domain in &record.domains {
+            self.topics.retain(|s| s.domain != *domain);
+            self.topics.push(Standing {
+                domain: domain.clone(),
+                model: record.model.clone(),
+                rung: record.rung,
+            });
+        }
+        let extra = self.topics.len().saturating_sub(MAX_TOPICS);
+        self.topics.drain(..extra);
+        self.last = Some(record.clone());
+    }
+}
+
+/// The store key of a named conversation's [`SessionRecord`]. The id is hashed
+/// so a client's own naming never shapes the key.
+pub fn session_key(session_id: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(session_id.as_bytes());
+    format!("s:{}", hex(&h.finalize()))
 }
 
 /// Evidence that the incumbent is not doing a good job.
@@ -129,6 +195,9 @@ pub enum Reason {
     Escalated(Signal),
     Harder,
     Topic,
+    /// The turn went back to a topic the conversation had before, and to the
+    /// model that served it then.
+    Returned,
     /// The incumbent could not take the request (down, too small a context,
     /// a missing capability, or no longer allowed).
     Forced,
@@ -146,6 +215,7 @@ impl Reason {
             Reason::Escalated(Signal::ToolErrors) => "escalated:tool_errors",
             Reason::Harder => "harder",
             Reason::Topic => "topic",
+            Reason::Returned => "returned",
             Reason::Forced => "forced",
         }
     }
@@ -164,7 +234,10 @@ pub fn domains_of(tags: &[String]) -> Vec<String> {
 pub fn decide(record: &TurnRecord, intent: &Intent, observed: &Observed) -> Plan {
     let max = crate::MAX_TIER_LEVEL;
     let specific: Vec<&String> = intent.tags.iter().filter(|t| *t != GENERAL_TAG).collect();
-    let topic_changed = !specific.is_empty()
+    // A round that carries tool results continues the same piece of work,
+    // however the classifier reads it: only a new user turn changes topic.
+    let topic_changed = !observed.tool_turn
+        && !specific.is_empty()
         && !specific
             .iter()
             .any(|t| record.domains.iter().any(|d| d == *t));
@@ -505,6 +578,84 @@ mod tests {
             difficulty,
             source: IntentSource::Classifier,
         }
+    }
+
+    fn turn(model: &str, domains: &[&str], rung: u8) -> TurnRecord {
+        TurnRecord {
+            model: model.into(),
+            domains: domains.iter().map(|d| d.to_string()).collect(),
+            rung,
+            strikes: 0,
+            bad_output: false,
+        }
+    }
+
+    #[test]
+    fn a_session_remembers_the_model_for_each_topic() {
+        let mut session = SessionRecord::default();
+        session.remember(&turn("north-mini", &[GENERAL_DOMAIN], 1));
+        session.remember(&turn("glm", &["coding"], 3));
+        session.remember(&turn("hemmingway", &["writing"], 3));
+        assert_eq!(session.last.as_ref().unwrap().model, "hemmingway");
+        let coding = session.standing(&["coding".into()]).unwrap();
+        assert_eq!((coding.model.as_str(), coding.rung), ("glm", 3));
+        // Chit-chat is not a topic to return to, tagged or not.
+        assert!(session.standing(&[GENERAL_DOMAIN.into()]).is_none());
+        session.remember(&turn("north-mini", &[GENERAL_TAG], 1));
+        assert!(session
+            .standing(&[GENERAL_TAG.into(), "creative".into()])
+            .is_none());
+        assert_eq!(
+            session
+                .standing(&["coding".into(), GENERAL_TAG.into()])
+                .unwrap()
+                .model,
+            "glm"
+        );
+        // A later coding turn replaces the coding model, not the others.
+        session.remember(&turn("kimi", &["coding"], 4));
+        assert_eq!(session.standing(&["coding".into()]).unwrap().model, "kimi");
+        assert_eq!(
+            session.standing(&["writing".into()]).unwrap().model,
+            "hemmingway"
+        );
+        assert_eq!(session.topics.len(), 4);
+    }
+
+    #[test]
+    fn a_session_forgets_its_oldest_topics_first() {
+        let mut session = SessionRecord::default();
+        for i in 0..MAX_TOPICS + 2 {
+            session.remember(&turn("m", &[&format!("t{i}")], 1));
+        }
+        assert_eq!(session.topics.len(), MAX_TOPICS);
+        assert!(session.standing(&["t0".into()]).is_none());
+        assert!(session
+            .standing(&[format!("t{}", MAX_TOPICS + 1)])
+            .is_some());
+    }
+
+    #[test]
+    fn session_keys_hash_the_id() {
+        let key = session_key("20e5a101-f62b-4c98-8f2e-d6c3aa1137c2");
+        assert!(key.starts_with("s:"));
+        assert_eq!(key.len(), 2 + 64);
+        assert_ne!(key, session_key("another chat"));
+        assert_eq!(key, session_key("20e5a101-f62b-4c98-8f2e-d6c3aa1137c2"));
+    }
+
+    #[test]
+    fn a_tool_round_never_changes_topic() {
+        let tool_round = Observed {
+            tool_turn: true,
+            ..Default::default()
+        };
+        let plan = decide(&record(2), &intent(&["writing"], 1), &tool_round);
+        assert_eq!(plan.decision, Decision::Keep);
+        assert_eq!(plan.domains, vec!["coding".to_string()]);
+        // A new user turn can.
+        let plan = decide(&record(2), &intent(&["writing"], 1), &Observed::default());
+        assert_eq!(plan.decision, Decision::Topic);
     }
 
     #[test]

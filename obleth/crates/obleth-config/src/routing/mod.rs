@@ -323,24 +323,43 @@ const REJECTION_REASONS: [&str; 13] = [
 /// the old unit-price comparison instead of inventing a difference.
 pub const DEFAULT_EXPECTED_OUTPUT_TOKENS: f64 = 500.0;
 
-/// Rolling per-model average of observed completion lengths, shared between
-/// the data plane (which records every settled request) and anything that
-/// scores candidates (the router, and the admin simulate endpoint — same
-/// process, same numbers, so the playground cannot drift from serving).
+/// Fewest answers in the window before a model's windowed mean is trusted
+/// over the live average. Below it, a handful of long agent replies would
+/// decide the figure.
+pub const WINDOWED_OUTPUT_MIN_ANSWERS: u64 = 200;
+
+/// Per-model expected completion length, shared between the data plane (which
+/// records every settled request) and anything that scores candidates (the
+/// router, the admin simulate endpoint, routing readiness): same process, same
+/// numbers, so the playground cannot drift from serving.
 ///
-/// An EWMA rather than a windowed mean: no history to store, and a model
-/// whose behavior changes (a template fix, a thinking knob) converges within
-/// a few dozen requests. In-memory only — a restart forgets and re-learns,
-/// which costs at most a brief return to unit-price ranking.
+/// Two sources, the first that has an answer wins:
+/// - **windowed**: the mean over a recent window of the shared request ledger,
+///   refreshed periodically and identical on every gateway replica. Only set
+///   for models with at least [`WINDOWED_OUTPUT_MIN_ANSWERS`] answers.
+/// - **live**: an in-memory EWMA of this process's own requests, for models
+///   the ledger has too little on (new models, a cold ledger). With alpha 0.2
+///   it mostly reflects the last few answers, which is why it is only the
+///   fallback.
 #[derive(Clone, Default)]
-pub struct OutputStats(std::sync::Arc<std::sync::RwLock<HashMap<String, f64>>>);
+pub struct OutputStats {
+    live: std::sync::Arc<std::sync::RwLock<HashMap<String, f64>>>,
+    windowed: std::sync::Arc<std::sync::RwLock<HashMap<String, WindowedOutput>>>,
+}
+
+/// One model's completion lengths over the ledger window.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WindowedOutput {
+    pub mean: f64,
+    pub answers: u64,
+}
 
 impl OutputStats {
     const ALPHA: f64 = 0.2;
 
     /// Record one settled request's completion length for `model`.
     pub fn observe(&self, model: &str, output_tokens: u64) {
-        let mut map = match self.0.write() {
+        let mut map = match self.live.write() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
@@ -353,13 +372,40 @@ impl OutputStats {
         }
     }
 
-    /// Snapshot for one scoring pass. Auto requests only, so the clone is off
-    /// the hot path for every request that names its model.
-    pub fn snapshot(&self) -> HashMap<String, f64> {
-        match self.0.read() {
+    /// Replace the windowed figures with a fresh read of the ledger. Models
+    /// under [`WINDOWED_OUTPUT_MIN_ANSWERS`] are dropped here, so they fall
+    /// back to the live average.
+    pub fn set_windowed(&self, figures: HashMap<String, WindowedOutput>) {
+        let kept = figures
+            .into_iter()
+            .filter(|(_, w)| w.answers >= WINDOWED_OUTPUT_MIN_ANSWERS && w.mean.is_finite())
+            .collect();
+        match self.windowed.write() {
+            Ok(mut g) => *g = kept,
+            Err(poisoned) => *poisoned.into_inner() = kept,
+        }
+    }
+
+    /// The windowed figures alone: models the ledger has enough answers on.
+    pub fn windowed(&self) -> HashMap<String, WindowedOutput> {
+        match self.windowed.read() {
             Ok(g) => g.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         }
+    }
+
+    /// Snapshot for one scoring pass: the windowed mean where there is one,
+    /// else the live average. Auto requests only, so the clone is off the hot
+    /// path for every request that names its model.
+    pub fn snapshot(&self) -> HashMap<String, f64> {
+        let mut out = match self.live.read() {
+            Ok(g) => g.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        for (model, w) in self.windowed() {
+            out.insert(model, w.mean);
+        }
+        out
     }
 }
 

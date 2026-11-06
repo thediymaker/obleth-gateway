@@ -1087,6 +1087,15 @@ mod pipeline {
                 json!({"id": "c1", "object": "chat.completion.chunk", "choices": [],
                        "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}}),
             ]),
+            "engine-dies" => Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"error": {"message": "EngineCore encountered an issue. See stack trace (above) for the root cause.",
+                                     "type": "InternalServerError", "code": 500}})
+                    .to_string(),
+                ))
+                .unwrap(),
             "errors-in-json" => Response::builder()
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -1336,6 +1345,7 @@ mod pipeline {
             knowledge: Arc::new(crate::knowledge::KnowledgeIndex::new()),
             jobs: crate::jobs::JobStore::new(store, Default::default()),
             load: None,
+            crash_guard: crate::crash_guard::CrashGuard::disabled(),
         };
         Some(Gateway { state, wal_dir })
     }
@@ -1390,6 +1400,63 @@ mod pipeline {
         let (_, cache_hit, _) = gw.chat(&secret, &body).await;
         assert!(!cache_hit);
         assert_eq!(upstream.hits("fails-mid-stream"), 2);
+    }
+
+    /// Wait (briefly) for the strikes a settled request records.
+    async fn strikes_reach(gw: &Gateway, model: &str, body: &Value, want: u32) -> u32 {
+        let fp = crate::crash_guard::fingerprint(model, body);
+        let mut n = 0;
+        for _ in 0..50 {
+            n = gw
+                .state
+                .redis
+                .crash_strikes(model, &fp)
+                .await
+                .expect("strikes");
+            if n >= want {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        n
+    }
+
+    #[tokio::test]
+    async fn a_request_in_flight_at_two_engine_deaths_is_refused_and_a_changed_one_is_not() {
+        let Some(mut gw) = gateway().await else {
+            return;
+        };
+        gw.state.crash_guard = crate::crash_guard::CrashGuard::new(None);
+        let (up, base) = spawn_upstream().await;
+        gw.register(route("engine-dies", &base)).await;
+        let (secret, _) = gw.tenant().await;
+        let body = json!({"model": "engine-dies", "max_tokens": 8,
+                          "messages": [{"role": "user", "content": format!("crash {}", Uuid::new_v4())}]});
+
+        // First death: one strike. With no ready count known the suspect
+        // still goes through, and its second death is the second strike.
+        let (status, _, _) = gw.chat(&secret, &body).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(strikes_reach(&gw, "engine-dies", &body, 1).await, 1);
+        let mut retry = body.clone();
+        retry["stream"] = json!(false); // a volatile field: still the same request
+        let (status, _, _) = gw.chat(&secret, &retry).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(strikes_reach(&gw, "engine-dies", &body, 2).await, 2);
+        assert_eq!(up.hits("engine-dies"), 2);
+
+        // Third try: refused before it is sent.
+        let (status, _, text) = gw.chat(&secret, &body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{text}");
+        assert!(text.contains("crash_guard"), "{text}");
+        assert_eq!(up.hits("engine-dies"), 2);
+
+        // A changed request is a different request.
+        let mut changed = body.clone();
+        changed["messages"][0]["content"] = json!(format!("other {}", Uuid::new_v4()));
+        let (status, _, _) = gw.chat(&secret, &changed).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(up.hits("engine-dies"), 3);
     }
 
     #[tokio::test]

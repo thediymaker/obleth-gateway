@@ -1391,6 +1391,7 @@ mod pipeline_tests {
             knowledge: Arc::new(crate::knowledge::KnowledgeIndex::new()),
             jobs: JobStore::new(store.clone(), scope),
             load: None,
+            crash_guard: crate::crash_guard::CrashGuard::disabled(),
         };
         Some(Gateway {
             state,

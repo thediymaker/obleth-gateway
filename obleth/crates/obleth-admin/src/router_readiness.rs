@@ -67,7 +67,14 @@ pub(crate) async fn get_router_readiness(
         .unwrap_or_default();
     let mut candidates = state.store.build_candidates(settings.tier_source).await?;
     derive_levels(&mut candidates, settings.tier_source);
-    let stats = state.output_stats.snapshot();
+    // Ledger-window means only: the live per-process average is a handful of
+    // recent answers and is not evidence enough to warn on.
+    let stats: std::collections::HashMap<String, f64> = state
+        .output_stats
+        .windowed()
+        .into_iter()
+        .map(|(model, w)| (model, w.mean))
+        .collect();
     Ok(Json(build_readiness(&settings, &candidates, &stats)))
 }
 
@@ -172,15 +179,14 @@ pub fn build_readiness(
                     severity: "warn",
                     code: "long_output_model",
                     title: format!(
-                        "`{}` averages {:.0} output tokens per answer",
+                        "{} writes long answers: {:.0} tokens on average over the last day",
                         c.model.model_name, avg
                     ),
-                    detail: "Its per-token price makes it look cheap while per request \
-                             it is among the slowest and most expensive choices. The \
-                             router's request-cost estimate accounts for this once it \
-                             has observations, but consider whether an unbounded \
-                             thinker belongs in the auto pool at all (auto-exclude \
-                             keeps it callable by name)."
+                    detail: "Auto weighs each model's cost per request, so it already \
+                             expects these answers to be long. If they are long because \
+                             the model thinks at length, requests Auto sends it will be \
+                             slow; take it out of Auto and it still answers when called \
+                             by name."
                         .to_string(),
                     models: vec![c.model.model_name.clone()],
                 });

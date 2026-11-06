@@ -6,6 +6,7 @@
 //! ClickHouse. The Next.js dashboard and any CLI/Terraform consume these exact
 //! endpoints.
 
+pub mod advice;
 pub mod alerts;
 pub mod autotune;
 mod backup;
@@ -137,6 +138,10 @@ pub struct AdminState {
     /// The gateway's capacity discovery: its settings, which model writes are
     /// checked against.
     pub capacity_discovery: capacity_discovery::CapacityDiscovery,
+    /// Bridge to the data plane's `/v1/verdicts`, used to judge advice
+    /// findings. Injected by the binary that owns the data plane; `None`
+    /// (a standalone admin process) leaves findings unjudged.
+    pub judge: Option<advice::JudgeFn>,
 }
 
 /// A boxed call into the data plane's classifier: `(prompt, available_tags)`
@@ -414,6 +419,11 @@ pub fn router(state: AdminState) -> Router {
             get(get_auto_router_settings).put(put_auto_router_settings),
         )
         .route("/api/v1/router/simulate", post(simulate_route))
+        .route("/api/v1/advice", get(advice::get_advice))
+        .route(
+            "/api/v1/advice/snoozed/:key",
+            put(advice::put_snoozed).delete(advice::delete_snoozed),
+        )
         .route(
             "/api/v1/router/readiness",
             get(router_readiness::get_router_readiness),
@@ -7543,6 +7553,7 @@ async fn update_model(
         state.store.reset_model_health(id).await?;
     }
     sync_model_from(&state, &model, Some(&existing)).await?;
+    advice::invalidate();
     state
         .store
         .record_audit(
@@ -9780,6 +9791,7 @@ mod tests {
                 output_stats: Default::default(),
                 classify: None,
                 capacity_discovery,
+                judge: None,
                 health: ModelHealthRuntime {
                     scheduled_enabled: false,
                     default_interval_secs: 60,
