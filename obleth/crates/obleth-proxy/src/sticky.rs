@@ -233,23 +233,15 @@ pub(crate) fn choose(
         Decision::Harder => Reason::Harder,
         Decision::Topic => Reason::Topic,
     };
-    let exclude = matches!(plan.decision, Decision::Escalate(_)).then_some(record.model.as_str());
-    // A new topic the incumbent gave up to a stronger model goes to one at
-    // least that strong, not back to the incumbent's own level.
-    let top = match (plan.decision, incumbent) {
-        (Decision::Topic, Some(c)) => plan
-            .floor
-            .max(c.strength(&plan.domains).saturating_add(1))
-            .min(obleth_config::MAX_TIER_LEVEL),
-        _ => plan.floor,
-    };
-    for floor in (0..=top).rev() {
+    // An escalation moves away from the incumbent, and so does a new topic it
+    // gave up to a stronger model: the router picks within the topic, by its
+    // tags, from the others.
+    let exclude = matches!(plan.decision, Decision::Escalate(_) | Decision::Topic)
+        .then_some(record.model.as_str());
+    for floor in (0..=plan.floor).rev() {
         let pool = sticky::floor_pool(candidates, &plan.domains, floor, exclude);
         if !pool.is_empty() && serves(&pool) {
-            return Choice {
-                floor: top.min(floor.max(plan.floor)),
-                ..choice(Some(pool), reason)
-            };
+            return choice(Some(pool), reason);
         }
     }
     // Nothing else can take it: route as usual, which may keep the incumbent.
@@ -698,6 +690,33 @@ mod tests {
         );
         assert_eq!(choice.reason, Reason::Topic);
         assert_eq!(names(&choice), ["glm"]);
+    }
+
+    #[test]
+    fn a_coding_turn_tagged_creative_does_not_drop_the_floor_to_a_writer() {
+        // The pool is everyone at the floor in any of the turn's topics, and
+        // the router then scores them on the tags; the floor itself stays the
+        // conversation's, not one above the incumbent.
+        let mut all = fleet();
+        all.push(leveled("writer", &[("creative", 3), ("writing", 3)]));
+        let hello = turn_record("north-mini", "general", 1);
+        let build = Intent {
+            tags: vec!["coding".into(), "creative".into(), "general".into()],
+            difficulty: 2,
+            source: IntentSource::Classifier,
+        };
+        let choice = choose(
+            &all,
+            Some(&hello),
+            None,
+            &build,
+            &Observed::default(),
+            |_| true,
+        );
+        assert_eq!(choice.reason, Reason::Topic);
+        assert_eq!(choice.floor, 2);
+        assert!(names(&choice).contains(&"glm"));
+        assert!(!names(&choice).contains(&"north-mini"));
     }
 
     #[test]
