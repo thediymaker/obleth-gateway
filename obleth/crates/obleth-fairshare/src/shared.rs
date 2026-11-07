@@ -642,6 +642,12 @@ impl SharedSlots for InMemorySlots {
             freed.extend(s.free_pool_holds(&claim.pool, claim.hold.as_deref()));
         }
         let held = claim.hold.as_ref().filter(|id| s.holds.contains_key(*id));
+        // Background work steps aside while an interactive request waits on
+        // its model or on the ceiling anywhere, as the Redis backend does.
+        let now = Instant::now();
+        let marked = |s: &MemState, mark: &str| s.waiting.get(mark).is_some_and(|t| *t > now);
+        let yield_to_interactive = claim.background
+            && (claim.sibling.as_deref().is_some_and(|sib| marked(&s, sib)) || marked(&s, ""));
         let outcome = if !live {
             AcquireOutcome::NotRegistered
         } else if let Some(id) = held {
@@ -650,12 +656,13 @@ impl SharedSlots for InMemorySlots {
             AcquireOutcome::Redeemed
         } else if claim.redeem_only {
             AcquireOutcome::NotHeld
-        } else if s.count(&pf)
-            + claim
-                .sibling
-                .as_deref()
-                .map_or(0, |sib| s.count(&pool_field(sib)))
-            >= claim.pool_cap
+        } else if yield_to_interactive
+            || s.count(&pf)
+                + claim
+                    .sibling
+                    .as_deref()
+                    .map_or(0, |sib| s.count(&pool_field(sib)))
+                >= claim.pool_cap
         {
             AcquireOutcome::Denied(SlotDenial::Pool)
         } else if s.count(GLOBAL_FIELD) >= claim.global_cap {

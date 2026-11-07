@@ -540,6 +540,10 @@ return out
 /// counters are taken together, in the totals and in the holdings; if any is
 /// at its cap nothing is taken and the pool (or, for the global ceiling, the
 /// ceiling) is marked as waited on, so the next release there publishes.
+/// A background claim (ARGV[16]) is refused as pool full while its model's
+/// interactive pool (ARGV[15]) or the global ceiling is marked as waited on
+/// on any replica: a slot freed while an interactive request waits anywhere
+/// goes to that request, never to background work that reached it first.
 ///
 /// Returns `{code, pool count, global count}`, counts after the call. Codes:
 /// 1 granted, 2 took over a held slot, 3 no slot held (claim for a held
@@ -597,7 +601,12 @@ if ARGV[15] ~= '' then
   sib = tonumber(redis.call('HGET', totals, 'p|' .. ARGV[15])) or 0
 end
 local code = 1
-if p + sib >= tonumber(ARGV[5]) then code = 0
+local yield = false
+if ARGV[16] == '1' then
+  local w = redis.call('HMGET', totals, 'w|' .. ARGV[15], 'w')
+  yield = (tonumber(w[1]) or 0) > now or (tonumber(w[2]) or 0) > now
+end
+if yield or p + sib >= tonumber(ARGV[5]) then code = 0
 elseif g >= tonumber(ARGV[6]) then code = -1
 elseif tcap > 0 and tn >= tcap then code = -2
 elseif kcap > 0 and kn >= kcap then code = -3

@@ -2845,7 +2845,57 @@ mod tests {
         }
         woken.sort();
         assert_eq!(woken, vec!["b:s".to_string(), "m:s".to_string()]);
-        let (outcome, _) = store.slot_acquire(&keys, "b", &fg()).await.unwrap();
+        let last = fg();
+        let (outcome, _) = store.slot_acquire(&keys, "b", &last).await.unwrap();
+        assert_eq!(outcome, AcquireOutcome::Granted);
+
+        // Slots free while the interactive pool is still marked as waited on
+        // (by gw-b's refusal above): background on gw-a is refused although
+        // there is room under its share, since an interactive request may be
+        // waiting for that slot.
+        let (freed, _) = store
+            .slot_release(
+                &keys,
+                "b",
+                &SlotRelease {
+                    pool: last.pool.clone(),
+                    tenant: last.tenant,
+                    key: last.key,
+                    sibling: Some("b:s".into()),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(freed);
+        // And a background slot: the pool is at 2 of 4, under background's
+        // share of 3, so only the mark stands in the way.
+        let c = bg_slots.pop().unwrap();
+        let (freed, _) = store
+            .slot_release(
+                &keys,
+                "a",
+                &SlotRelease {
+                    pool: c.pool.clone(),
+                    tenant: c.tenant,
+                    key: c.key,
+                    sibling: Some("m:s".into()),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(freed);
+        assert!(
+            totals_field(&store, &keys, "w|m:s").await > 0,
+            "still marked"
+        );
+        let (outcome, _) = store.slot_acquire(&keys, "a", &bg(3)).await.unwrap();
+        assert_eq!(outcome, AcquireOutcome::Denied(SlotDenial::Pool));
+        // Once nobody has waited for a while, background may take it.
+        tokio::time::sleep(std::time::Duration::from_millis(
+            crate::slots::WAIT_MARK_MS + 100,
+        ))
+        .await;
+        let (outcome, _) = store.slot_acquire(&keys, "a", &bg(3)).await.unwrap();
         assert_eq!(outcome, AcquireOutcome::Granted);
         listener.abort();
         drop_test_keys(&store, &keys, &["a", "b"]).await;

@@ -51,7 +51,7 @@ pub const SLOT_CHAIN_KEY: &str = "obleth:fairshare:chain";
 /// How long a refused claim marks its pool as waited on. Every refusal
 /// renews it, and a waiter retries well inside it, so releases keep
 /// publishing for as long as anyone is still waiting.
-const WAIT_MARK_MS: u64 = 1_000;
+pub(crate) const WAIT_MARK_MS: u64 = 1_000;
 
 /// Where replica and slot state lives. [`Default`] is the gateway's layout;
 /// tests use their own so they cannot disturb, or be disturbed by, anything

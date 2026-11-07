@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use obleth_config::FairshareAlgorithm;
 use obleth_fairshare::{
-    AdmitRequest, Admitted, FairShare, InMemoryCluster, PoolKey, SharedSlotsConfig, SlotMode,
-    StaticCapacity,
+    AcquireOutcome, AdmitRequest, Admitted, FairShare, InMemoryCluster, PoolKey, SharedSlots,
+    SharedSlotsConfig, SlotClaim, SlotDenial, SlotMode, StaticCapacity,
 };
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -248,4 +248,102 @@ async fn the_background_share_holds_across_gateways() {
     drop((p1, p2, p3));
     batch.clear();
     admitted(more).await;
+}
+
+/// A slot freed while an interactive request waits on another gateway goes
+/// to that request, even when background work waits on the gateway nearer
+/// the release: background never takes a slot an interactive request anywhere
+/// is waiting for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn background_yields_to_interactive_waiters_on_other_gateways() {
+    let cluster = InMemoryCluster::new();
+    let gws = gateways(&cluster, 3, 4096);
+    for fs in &gws {
+        wait_for_shared(fs).await;
+    }
+    // gw-1 fills the pool with interactive work and has two more waiting.
+    let mut running = Vec::new();
+    for _ in 0..4 {
+        running.push(admit_now(&gws[1], interactive(), req(Uuid::new_v4(), 4)).await);
+    }
+    let w1 = waiter(&gws[1], interactive(), req(Uuid::new_v4(), 4));
+    let w2 = waiter(&gws[1], interactive(), req(Uuid::new_v4(), 4));
+    still_waiting(&w1).await;
+    // Background waits on the other two gateways.
+    let t = Uuid::new_v4();
+    let b0 = waiter(&gws[0], background(), bg_req(t, 4, 0.75));
+    let b2 = waiter(&gws[2], background(), bg_req(t, 4, 0.75));
+    still_waiting(&b0).await;
+    still_waiting(&b2).await;
+
+    // Each release while gw-1 still has a waiter goes to one of its waiters
+    // (whichever fairshare picks), never to background.
+    let fg_now = || cluster.pool_in_flight(&interactive().slot_id());
+    running.pop();
+    let one = tokio::time::timeout(Duration::from_secs(2), async {
+        while !(w1.is_finished() || w2.is_finished()) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(one.is_ok(), "an interactive waiter got the slot");
+    assert_eq!(fg_now(), 4);
+    still_waiting(&b0).await;
+    still_waiting(&b2).await;
+    running.pop();
+    let (a, b) = (admitted(w1).await, admitted(w2).await);
+    running.extend([a, b]);
+    assert_eq!(fg_now(), 4);
+    still_waiting(&b0).await;
+    still_waiting(&b2).await;
+    assert_eq!(cluster.pool_in_flight(&background().slot_id()), 0);
+
+    // Nobody waits now: freed slots go to background, up to its share.
+    running.clear();
+    admitted(b0).await;
+    admitted(b2).await;
+}
+
+/// The backend rule under the scheduler: while an interactive claim on the
+/// model was refused within the wait-mark window, a background claim is
+/// refused although the pool has room under background's share.
+#[tokio::test]
+async fn a_waited_on_interactive_pool_refuses_background_claims() {
+    let cluster = InMemoryCluster::new();
+    let a = cluster.gateway("gw-a");
+    let b = cluster.gateway("gw-b");
+    let fg = |cap| SlotClaim {
+        pool: interactive().slot_id(),
+        tenant: Uuid::new_v4(),
+        key: Uuid::new_v4(),
+        pool_cap: cap,
+        global_cap: 100,
+        sibling: Some(background().slot_id()),
+        background: false,
+        tenant_cap: None,
+        key_cap: None,
+        hold: None,
+        redeem_only: false,
+        starving: false,
+    };
+    let bg = SlotClaim {
+        pool: background().slot_id(),
+        sibling: Some(interactive().slot_id()),
+        background: true,
+        ..fg(3)
+    };
+    // No one waits: background may claim.
+    let (outcome, _) = a.acquire(bg.clone()).await.unwrap();
+    assert_eq!(outcome, AcquireOutcome::Granted);
+    // An interactive claim on gw-b is refused (a cap of 1 stands for a full
+    // pool), which marks the interactive pool as waited on.
+    let (outcome, _) = b.acquire(fg(1)).await.unwrap();
+    assert_eq!(outcome, AcquireOutcome::Denied(SlotDenial::Pool));
+    // Room for background (1 of its 3), but an interactive request waits.
+    let (outcome, _) = a.acquire(bg.clone()).await.unwrap();
+    assert_eq!(outcome, AcquireOutcome::Denied(SlotDenial::Pool));
+    // The mark lapses once nobody has been refused for a while.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let (outcome, _) = a.acquire(bg).await.unwrap();
+    assert_eq!(outcome, AcquireOutcome::Granted);
 }
