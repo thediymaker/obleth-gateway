@@ -1322,6 +1322,11 @@ async fn run_pipeline(
         // neutral default.
         let available_tags = union_candidate_tags(&candidates, allowed);
         let effort_header = headers.get("x-obleth-effort").and_then(|v| v.to_str().ok());
+        let classify_system = crate::router::classify_system_from_header(
+            headers
+                .get(crate::router::CLASSIFY_SYSTEM_HEADER)
+                .and_then(|v| v.to_str().ok()),
+        );
         // With stickiness on, find the model that answered this conversation's
         // last turn before deciding anything.
         let conversation = if router_settings.sticky_enabled {
@@ -1347,6 +1352,7 @@ async fn run_pipeline(
                 &available_tags,
                 &router_settings,
                 effort_header,
+                classify_system,
                 skip_classifier,
             ),
             crate::sticky::complaint(
@@ -4965,6 +4971,7 @@ pub(crate) async fn derive_intent(
     available_tags: &[String],
     settings: &obleth_config::AutoRouterSettings,
     effort_header: Option<&str>,
+    classify_system: Option<usize>,
     skip_classifier: bool,
 ) -> crate::router::Intent {
     let forced = crate::router::difficulty_from_header(effort_header);
@@ -4974,7 +4981,7 @@ pub(crate) async fn derive_intent(
             if name != crate::router::AUTO_MODEL_NAME {
                 if let Some(brain) = resolve_model(state, name).await {
                     let brain = &brain;
-                    let prompts = crate::router::classifier_prompts(json);
+                    let prompts = crate::router::classifier_prompts(json, classify_system);
                     let classified = crate::router::classify_turns(prompts, |prompt| async move {
                         state
                             .classifier

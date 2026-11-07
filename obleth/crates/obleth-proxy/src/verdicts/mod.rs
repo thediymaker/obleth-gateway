@@ -806,6 +806,8 @@ async fn handler_inner(
             &available_tags,
             &router_settings,
             effort_header,
+            // Verdicts writes its own prompt; there is no client system text.
+            None,
             // Input guardrails already ran on this state and these questions.
             false,
         )

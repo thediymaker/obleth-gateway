@@ -1210,6 +1210,16 @@ pub fn heuristic_intent(json: &serde_json::Value, est_input_tokens: u64) -> Inte
     }
 }
 
+/// Request header naming how many bytes at the end of the system text the
+/// classifier may read. See [`classifier_prompts`].
+pub const CLASSIFY_SYSTEM_HEADER: &str = "x-obleth-classify-system";
+
+/// Parse [`CLASSIFY_SYSTEM_HEADER`]: a byte count. Anything else is ignored,
+/// so the whole system text is read as before.
+pub fn classify_system_from_header(raw: Option<&str>) -> Option<usize> {
+    raw?.trim().parse().ok()
+}
+
 /// Most bytes of request text one classifier call reads.
 pub const CLASSIFIER_PROMPT_MAX_BYTES: usize = 2_000;
 
@@ -1235,7 +1245,12 @@ const GENERAL_TAG: &str = "general";
 /// The user message has first claim on [`CLASSIFIER_PROMPT_MAX_BYTES`] and the
 /// system text gets what is left, so a long system prompt cannot push the
 /// request itself out of view.
-pub fn classifier_prompts(json: &serde_json::Value) -> Vec<String> {
+///
+/// `system_tail` is the client's [`CLASSIFY_SYSTEM_HEADER`]: only that many
+/// bytes at the end of the system text are read. A client whose system text is
+/// mostly its own instructions (tools, display formats) sends it, so those
+/// instructions do not decide the topic; `Some(0)` reads no system text.
+pub fn classifier_prompts(json: &serde_json::Value, system_tail: Option<usize>) -> Vec<String> {
     let Some(messages) = json.get("messages").and_then(|m| m.as_array()) else {
         return Vec::new();
     };
@@ -1258,6 +1273,10 @@ pub fn classifier_prompts(json: &serde_json::Value) -> Vec<String> {
     }
     let system = system.join("\n");
     let system = system.trim();
+    let system = match system_tail {
+        Some(n) => tail_bytes(system, n).trim(),
+        None => system,
+    };
 
     messages
         .iter()
@@ -1326,6 +1345,18 @@ fn classifier_message_text(content: Option<&serde_json::Value>) -> String {
 }
 
 /// At most `max` bytes from the start of `s`, cut on a char boundary.
+/// The last `max` bytes of `s`, cut forward to a character boundary.
+fn tail_bytes(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut start = s.len() - max;
+    while !s.is_char_boundary(start) {
+        start += 1;
+    }
+    &s[start..]
+}
+
 fn head_bytes(s: &str, max: usize) -> &str {
     if s.len() <= max {
         return s;
@@ -3329,9 +3360,44 @@ mod tests {
             ]
         });
         assert_eq!(
-            classifier_prompts(&body),
+            classifier_prompts(&body, None),
             vec!["Be brief.\nWrite a Rust function", "Be brief.\nhello"]
         );
+    }
+
+    #[test]
+    fn classifier_prompts_read_only_the_system_tail_the_client_names() {
+        let body = serde_json::json!({"messages": [
+            {"role": "system", "content": "Use the run_command tool to build code.\n\nYou help with poems."},
+            {"role": "user", "content": "brainstorm names for a bakery"}
+        ]});
+        assert_eq!(
+            classifier_prompts(&body, Some("You help with poems.".len())),
+            vec!["You help with poems.\nbrainstorm names for a bakery"]
+        );
+        assert_eq!(
+            classifier_prompts(&body, Some(0)),
+            vec!["brainstorm names for a bakery"]
+        );
+        // A tail longer than the system text reads all of it.
+        assert_eq!(
+            classifier_prompts(&body, Some(10_000)),
+            classifier_prompts(&body, None)
+        );
+        // A cut inside a multi-byte character moves forward to its end.
+        let body = serde_json::json!({"messages": [
+            {"role": "system", "content": "tools ééé"},
+            {"role": "user", "content": "hi"}
+        ]});
+        assert_eq!(classifier_prompts(&body, Some(5)), vec!["éé\nhi"]);
+    }
+
+    #[test]
+    fn classify_system_header_is_a_byte_count() {
+        assert_eq!(classify_system_from_header(Some(" 42 ")), Some(42));
+        assert_eq!(classify_system_from_header(Some("0")), Some(0));
+        assert_eq!(classify_system_from_header(Some("all")), None);
+        assert_eq!(classify_system_from_header(None), None);
     }
 
     #[test]
@@ -3348,7 +3414,10 @@ mod tests {
                 ]}
             ]
         });
-        assert_eq!(classifier_prompts(&body), vec!["fix the failing build"]);
+        assert_eq!(
+            classifier_prompts(&body, None),
+            vec!["fix the failing build"]
+        );
     }
 
     #[test]
@@ -3356,7 +3425,7 @@ mod tests {
         let messages: Vec<serde_json::Value> = (0..CLASSIFIER_LOOKBACK_TURNS + 2)
             .map(|i| serde_json::json!({"role": "user", "content": format!("turn {i}")}))
             .collect();
-        let prompts = classifier_prompts(&serde_json::json!({ "messages": messages }));
+        let prompts = classifier_prompts(&serde_json::json!({ "messages": messages }), None);
         assert_eq!(prompts.len(), CLASSIFIER_LOOKBACK_TURNS);
         assert_eq!(
             prompts[0],
@@ -3372,7 +3441,7 @@ mod tests {
                 {"role": "user", "content": "Write a Rust function that parses JSON"}
             ]
         });
-        let prompts = classifier_prompts(&body);
+        let prompts = classifier_prompts(&body, None);
         assert_eq!(prompts.len(), 1);
         assert!(prompts[0].starts_with("You are a course assistant."));
         assert!(prompts[0].ends_with("\nWrite a Rust function that parses JSON"));
@@ -3387,7 +3456,7 @@ mod tests {
                 {"role": "user", "content": "é".repeat(CLASSIFIER_PROMPT_MAX_BYTES)}
             ]
         });
-        let prompts = classifier_prompts(&body);
+        let prompts = classifier_prompts(&body, None);
         assert!(prompts[0].len() <= CLASSIFIER_PROMPT_MAX_BYTES);
         assert!(
             prompts[0].starts_with('é'),

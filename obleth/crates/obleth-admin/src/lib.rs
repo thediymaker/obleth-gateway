@@ -2843,6 +2843,11 @@ pub struct SimulateRouteRequest {
     pub needs_tool_choice: bool,
     #[serde(default)]
     pub needs_response_schema: bool,
+    /// Bytes at the end of the system text the classifier may read, as the
+    /// `x-obleth-classify-system` header sets on the data plane. Absent reads
+    /// all of it.
+    #[serde(default)]
+    pub classify_system: Option<usize>,
     /// Weight overrides. Unset fields fall back to the saved settings.
     #[serde(default)]
     pub capacity_weight: Option<f64>,
@@ -3019,10 +3024,11 @@ async fn simulate_route(
                 if !menu.is_empty() {
                     // `None` is the classifier's failure shape; heuristics take
                     // over below, exactly as on the data plane.
-                    intent = classify_turns(classifier_prompts(&json), |prompt| {
-                        classify(prompt, menu.clone())
-                    })
-                    .await;
+                    intent =
+                        classify_turns(classifier_prompts(&json, body.classify_system), |prompt| {
+                            classify(prompt, menu.clone())
+                        })
+                        .await;
                 }
             }
         }
