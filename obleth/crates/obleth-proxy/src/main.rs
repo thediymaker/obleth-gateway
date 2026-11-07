@@ -835,7 +835,11 @@ async fn serve_until_shutdown(
     let running = futures::future::try_join_all(servers.into_iter().map(|(listener, app)| {
         let stop = shutdown_requested(shutdown.clone());
         async move {
+            // TCP_NODELAY: a response goes out as headers then body; with
+            // Nagle on, the body waits for the client's delayed ACK of the
+            // headers (40 ms on Linux) on every reused keep-alive connection.
             axum::serve(listener, app)
+                .tcp_nodelay(true)
                 .with_graceful_shutdown(stop)
                 .await
         }
