@@ -49,9 +49,117 @@ pub struct NewBatchFile<'a> {
     pub purpose: &'a str,
     pub filename: &'a str,
     pub bytes: i64,
-    /// Input files only.
-    pub content: Option<&'a [u8]>,
     pub batch_id: Option<&'a str>,
+}
+
+/// Bytes per stored chunk of an uploaded file.
+pub const FILE_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+
+/// An upload being written: the file row and its chunks go in one
+/// transaction, so a file is visible only once complete. Dropping the
+/// writer without [`BatchFileWriter::finish`] discards it.
+pub struct BatchFileWriter {
+    tx: sqlx::Transaction<'static, sqlx::Postgres>,
+    id: String,
+    seq: i32,
+    buf: Vec<u8>,
+    bytes: i64,
+}
+
+impl BatchFileWriter {
+    /// Append bytes, storing a chunk whenever [`FILE_CHUNK_BYTES`] are
+    /// buffered.
+    pub async fn write(&mut self, mut data: &[u8]) -> Result<()> {
+        while !data.is_empty() {
+            let room = FILE_CHUNK_BYTES - self.buf.len();
+            let take = room.min(data.len());
+            self.buf.extend_from_slice(&data[..take]);
+            data = &data[take..];
+            self.bytes += take as i64;
+            if self.buf.len() >= FILE_CHUNK_BYTES {
+                self.flush().await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn flush(&mut self) -> Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        sqlx::query("insert into batch_file_chunks (file_id, seq, data) values ($1, $2, $3)")
+            .bind(&self.id)
+            .bind(self.seq)
+            .bind(&self.buf)
+            .execute(&mut *self.tx)
+            .await?;
+        self.seq += 1;
+        self.buf.clear();
+        Ok(())
+    }
+
+    /// Bytes written so far.
+    pub fn bytes(&self) -> i64 {
+        self.bytes
+    }
+
+    /// Store what is left and commit the file.
+    pub async fn finish(mut self) -> Result<BatchFile> {
+        self.flush().await?;
+        let row = sqlx::query(&format!(
+            "update batch_files set bytes = $2 where id = $1 returning {FILE_COLUMNS}"
+        ))
+        .bind(&self.id)
+        .bind(self.bytes)
+        .fetch_one(&mut *self.tx)
+        .await?;
+        self.tx.commit().await?;
+        row_to_file(&row)
+    }
+}
+
+/// A batch being created: the batch row and its items go in one
+/// transaction, so a batch is visible only once every item is stored.
+pub struct BatchWriter {
+    tx: sqlx::Transaction<'static, sqlx::Postgres>,
+    id: String,
+    total: i32,
+}
+
+impl BatchWriter {
+    /// Store a run of items.
+    pub async fn add_items(&mut self, items: &[NewBatchItem]) -> Result<()> {
+        for chunk in items.chunks(ITEM_CHUNK) {
+            let lines: Vec<i32> = chunk.iter().map(|i| i.line).collect();
+            let ids: Vec<&str> = chunk.iter().map(|i| i.custom_id.as_str()).collect();
+            let bodies: Vec<&str> = chunk.iter().map(|i| i.body.as_str()).collect();
+            sqlx::query(
+                "insert into batch_items (batch_id, line, custom_id, body)
+                 select $1, * from unnest($2::int[], $3::text[], $4::text[])",
+            )
+            .bind(&self.id)
+            .bind(&lines)
+            .bind(&ids)
+            .bind(&bodies)
+            .execute(&mut *self.tx)
+            .await?;
+            self.total += chunk.len() as i32;
+        }
+        Ok(())
+    }
+
+    /// Commit the batch, `in_progress`, with its item count.
+    pub async fn finish(mut self) -> Result<BatchRecord> {
+        let row = sqlx::query(&format!(
+            "update batches set total = $2 where id = $1 returning {BATCH_COLUMNS}"
+        ))
+        .bind(&self.id)
+        .bind(self.total)
+        .fetch_one(&mut *self.tx)
+        .await?;
+        self.tx.commit().await?;
+        row_to_batch(&row)
+    }
 }
 
 /// One batch.
@@ -224,23 +332,39 @@ const ITEM_CHUNK: usize = 1000;
 impl Store {
     // ---- files ------------------------------------------------------------
 
-    pub async fn insert_batch_file(&self, file: &NewBatchFile<'_>) -> Result<BatchFile> {
-        let row = sqlx::query(&format!(
-            "insert into batch_files (id, tenant_id, key_id, purpose, filename, bytes, content, batch_id)
-             values ($1, $2, $3, $4, $5, $6, $7, $8)
-             returning {FILE_COLUMNS}"
-        ))
+    /// Start an upload (see [`BatchFileWriter`]); `file.bytes` is ignored.
+    pub async fn begin_batch_file(&self, file: &NewBatchFile<'_>) -> Result<BatchFileWriter> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "insert into batch_files (id, tenant_id, key_id, purpose, filename, bytes, batch_id)
+             values ($1, $2, $3, $4, $5, 0, $6)",
+        )
         .bind(file.id)
         .bind(file.tenant_id)
         .bind(file.key_id)
         .bind(file.purpose)
         .bind(file.filename)
-        .bind(file.bytes)
-        .bind(file.content)
         .bind(file.batch_id)
-        .fetch_one(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        row_to_file(&row)
+        Ok(BatchFileWriter {
+            tx,
+            id: file.id.to_string(),
+            seq: 0,
+            buf: Vec::with_capacity(FILE_CHUNK_BYTES.min(1 << 20)),
+            bytes: 0,
+        })
+    }
+
+    /// Record a whole file at once (small files and tests).
+    pub async fn insert_batch_file(
+        &self,
+        file: &NewBatchFile<'_>,
+        content: &[u8],
+    ) -> Result<BatchFile> {
+        let mut w = self.begin_batch_file(file).await?;
+        w.write(content).await?;
+        w.finish().await
     }
 
     pub async fn get_batch_file(&self, id: &str, owner: JobOwner) -> Result<Option<BatchFile>> {
@@ -254,18 +378,17 @@ impl Store {
         row.as_ref().map(row_to_file).transpose()
     }
 
-    /// The stored content of an uploaded file; `None` for a missing file or
-    /// one with no content of its own (an output or error file).
-    pub async fn batch_file_content(&self, id: &str, owner: JobOwner) -> Result<Option<Vec<u8>>> {
-        let sql = format!(
-            "select content from batch_files where id = $1 and content is not null{}",
-            owner_clause(owner, 2)
-        );
-        let row = bind_owner(sqlx::query(&sql).bind(id), owner)
+    /// Chunk `seq` of an uploaded file, or `None` past its end. The caller
+    /// has already checked that the file is the caller's (see
+    /// [`Store::get_batch_file`]).
+    pub async fn batch_file_chunk(&self, id: &str, seq: i32) -> Result<Option<Vec<u8>>> {
+        let row = sqlx::query("select data from batch_file_chunks where file_id = $1 and seq = $2")
+            .bind(id)
+            .bind(seq)
             .fetch_optional(&self.pool)
             .await?;
         Ok(match row {
-            Some(r) => r.try_get("content")?,
+            Some(r) => Some(r.try_get("data")?),
             None => None,
         })
     }
@@ -320,21 +443,16 @@ impl Store {
 
     // ---- batches ----------------------------------------------------------
 
-    /// Record a batch that passed validation, with every line as a pending
-    /// item, in one transaction. It starts `in_progress`.
-    pub async fn create_batch(
-        &self,
-        batch: &NewBatch<'_>,
-        items: &[NewBatchItem],
-    ) -> Result<BatchRecord> {
+    /// Start a batch that passed validation (see [`BatchWriter`]). It
+    /// starts `in_progress` once committed.
+    pub async fn begin_batch(&self, batch: &NewBatch<'_>) -> Result<BatchWriter> {
         let mut tx = self.pool.begin().await?;
-        let row = sqlx::query(&format!(
+        sqlx::query(
             "insert into batches (id, tenant_id, key_id, model, endpoint, input_file_id,
                                   completion_window, deadline_at, status, total, metadata,
                                   in_progress_at)
-             values ($1, $2, $3, $4, $5, $6, $7, $8, 'in_progress', $9, $10::jsonb, now())
-             returning {BATCH_COLUMNS}"
-        ))
+             values ($1, $2, $3, $4, $5, $6, $7, $8, 'in_progress', 0, $9::jsonb, now())",
+        )
         .bind(batch.id)
         .bind(batch.tenant_id)
         .bind(batch.key_id)
@@ -343,27 +461,25 @@ impl Store {
         .bind(batch.input_file_id)
         .bind(batch.completion_window)
         .bind(batch.deadline_at)
-        .bind(items.len() as i32)
         .bind(batch.metadata)
-        .fetch_one(&mut *tx)
+        .execute(&mut *tx)
         .await?;
-        for chunk in items.chunks(ITEM_CHUNK) {
-            let lines: Vec<i32> = chunk.iter().map(|i| i.line).collect();
-            let ids: Vec<&str> = chunk.iter().map(|i| i.custom_id.as_str()).collect();
-            let bodies: Vec<&str> = chunk.iter().map(|i| i.body.as_str()).collect();
-            sqlx::query(
-                "insert into batch_items (batch_id, line, custom_id, body)
-                 select $1, * from unnest($2::int[], $3::text[], $4::text[])",
-            )
-            .bind(batch.id)
-            .bind(&lines)
-            .bind(&ids)
-            .bind(&bodies)
-            .execute(&mut *tx)
-            .await?;
-        }
-        tx.commit().await?;
-        row_to_batch(&row)
+        Ok(BatchWriter {
+            tx,
+            id: batch.id.to_string(),
+            total: 0,
+        })
+    }
+
+    /// Record a batch that passed validation with all of its items at once.
+    pub async fn create_batch(
+        &self,
+        batch: &NewBatch<'_>,
+        items: &[NewBatchItem],
+    ) -> Result<BatchRecord> {
+        let mut w = self.begin_batch(batch).await?;
+        w.add_items(items).await?;
+        w.finish().await
     }
 
     /// Record a batch whose input failed validation: status `failed`, with
@@ -549,6 +665,10 @@ impl Store {
     /// Finish an item `instance` holds with the upstream's successful answer.
     /// Returns false when the item is no longer this runner's (its lease
     /// lapsed and another took it, or the batch was cancelled).
+    ///
+    /// Only the item's own row is written. The batch's counts are recomputed
+    /// from its items by [`Store::advance_batches`]; updating them here would
+    /// make every finishing request wait on the batch row's lock.
     pub async fn complete_batch_item(
         &self,
         batch_id: &str,
@@ -558,7 +678,6 @@ impl Store {
         response: &[u8],
         request_id: Uuid,
     ) -> Result<bool> {
-        let mut tx = self.pool.begin().await?;
         let done = sqlx::query(
             "update batch_items
              set status = 'succeeded', response_status = $4, response = $5, request_id = $6,
@@ -571,17 +690,9 @@ impl Store {
         .bind(status_code)
         .bind(response)
         .bind(request_id)
-        .execute(&mut *tx)
+        .execute(&self.pool)
         .await?;
-        let mine = done.rows_affected() > 0;
-        if mine {
-            sqlx::query("update batches set completed = completed + 1 where id = $1")
-                .bind(batch_id)
-                .execute(&mut *tx)
-                .await?;
-        }
-        tx.commit().await?;
-        Ok(mine)
+        Ok(done.rows_affected() > 0)
     }
 
     /// Finish an item `instance` holds as failed, with `error` (JSON text)
@@ -597,7 +708,6 @@ impl Store {
         error: &str,
         request_id: Option<Uuid>,
     ) -> Result<bool> {
-        let mut tx = self.pool.begin().await?;
         let done = sqlx::query(
             "update batch_items
              set status = 'failed', response_status = $4, response = $5, error = $6::jsonb,
@@ -611,17 +721,9 @@ impl Store {
         .bind(response)
         .bind(error)
         .bind(request_id)
-        .execute(&mut *tx)
+        .execute(&self.pool)
         .await?;
-        let mine = done.rows_affected() > 0;
-        if mine {
-            sqlx::query("update batches set failed = failed + 1 where id = $1")
-                .bind(batch_id)
-                .execute(&mut *tx)
-                .await?;
-        }
-        tx.commit().await?;
-        Ok(mine)
+        Ok(done.rows_affected() > 0)
     }
 
     /// Put an item `instance` holds back in the queue, to be tried again
@@ -655,23 +757,33 @@ impl Store {
         Ok(done.rows_affected() > 0)
     }
 
+    /// Hand back every item `instance` holds, at once and without counting the
+    /// attempt: the runner is shutting down. Returns how many.
+    pub async fn release_batch_leases(&self, instance: &str) -> Result<u64> {
+        let done = sqlx::query(
+            "update batch_items
+             set status = 'pending', lease_owner = null, lease_until = null,
+                 attempts = greatest(attempts - 1, 0), next_attempt_at = now()
+             where lease_owner = $1 and status = 'running'",
+        )
+        .bind(instance)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected())
+    }
+
     /// Return items whose lease lapsed (their runner died or stalled) to the
     /// queue, or fail them once they have had `max_attempts`. Returns how many
     /// were swept.
     pub async fn sweep_batch_leases(&self, max_attempts: i32) -> Result<u64> {
         let mut tx = self.pool.begin().await?;
         let failed = sqlx::query(
-            "with lapsed as (
-                 update batch_items
-                 set status = 'failed', lease_owner = null, lease_until = null,
-                     finished_at = now(),
-                     error = jsonb_build_object('code', 'lease_lapsed',
-                         'message', 'the request was retried the most times allowed')
-                 where status = 'running' and lease_until < now() and attempts >= $1
-                 returning batch_id)
-             update batches b set failed = b.failed + c.n
-             from (select batch_id, count(*)::int as n from lapsed group by batch_id) c
-             where b.id = c.batch_id",
+            "update batch_items
+             set status = 'failed', lease_owner = null, lease_until = null,
+                 finished_at = now(),
+                 error = jsonb_build_object('code', 'lease_lapsed',
+                     'message', 'the request was retried the most times allowed')
+             where status = 'running' and lease_until < now() and attempts >= $1",
         )
         .bind(max_attempts)
         .execute(&mut *tx)
@@ -688,31 +800,47 @@ impl Store {
         Ok(failed.rows_affected() + requeued.rows_affected())
     }
 
+    /// Recompute the counts of every active batch from its items:
+    /// `completed` is succeeded items, `failed` is failed and expired ones.
+    pub async fn refresh_batch_counts(&self) -> Result<u64> {
+        let done = sqlx::query(
+            "update batches b set completed = c.ok, failed = c.bad
+             from (select i.batch_id,
+                          count(*) filter (where i.status = 'succeeded')::int as ok,
+                          count(*) filter (where i.status in ('failed', 'expired'))::int as bad
+                   from batch_items i
+                   join batches a on a.id = i.batch_id
+                   where a.status in ('in_progress', 'cancelling')
+                   group by i.batch_id) c
+             where b.id = c.batch_id and (b.completed, b.failed) is distinct from (c.ok, c.bad)",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected())
+    }
+
     /// Move batches on: expire pending items of batches past their deadline,
-    /// and give every active batch with nothing pending or running its final
-    /// status, with its output and error files. `new_file_id` mints file ids.
-    /// Returns the batches that reached a final status.
+    /// refresh the counts of active batches, and give every active batch with
+    /// nothing pending or running its final status, with its output and
+    /// error files. `new_file_id` mints file ids. Returns the batches that
+    /// reached a final status.
     pub async fn advance_batches(
         &self,
         new_file_id: &(dyn Fn() -> String + Send + Sync),
     ) -> Result<Vec<FinishedBatch>> {
         // Expire the queue of every batch past its deadline.
         sqlx::query(
-            "with expired as (
-                 update batch_items i
-                 set status = 'expired', finished_at = now(),
-                     error = jsonb_build_object('code', 'batch_expired',
-                         'message', 'the batch reached its completion window before this request ran')
-                 from batches b
-                 where b.id = i.batch_id and b.status = 'in_progress' and b.deadline_at <= now()
-                   and i.status = 'pending'
-                 returning i.batch_id)
-             update batches b set failed = b.failed + c.n
-             from (select batch_id, count(*)::int as n from expired group by batch_id) c
-             where b.id = c.batch_id",
+            "update batch_items i
+             set status = 'expired', finished_at = now(),
+                 error = jsonb_build_object('code', 'batch_expired',
+                     'message', 'the batch reached its completion window before this request ran')
+             from batches b
+             where b.id = i.batch_id and b.status = 'in_progress' and b.deadline_at <= now()
+               and i.status = 'pending'",
         )
         .execute(&self.pool)
         .await?;
+        self.refresh_batch_counts().await?;
 
         let candidates = sqlx::query(
             "select b.id from batches b
@@ -769,6 +897,7 @@ impl Store {
             "select
                  count(*) filter (where status = 'succeeded') as ok,
                  count(*) filter (where status <> 'succeeded') as bad,
+                 count(*) filter (where status in ('failed', 'expired'))::int as failed,
                  coalesce(sum(octet_length(response)) filter (where status = 'succeeded'), 0)::bigint as ok_bytes,
                  coalesce(sum(octet_length(coalesce(response, convert_to(error::text, 'UTF8'))))
                      filter (where status <> 'succeeded'), 0)::bigint as bad_bytes
@@ -820,15 +949,18 @@ impl Store {
             "expired" => "expired_at",
             _ => "completed_at",
         };
+        let failed: i32 = sizes.try_get("failed")?;
         sqlx::query(&format!(
             "update batches set status = $2, output_file_id = $3, error_file_id = $4,
-                 finalizing_at = now(), {stamp} = now()
+                 completed = $5, failed = $6, finalizing_at = now(), {stamp} = now()
              where id = $1"
         ))
         .bind(id)
         .bind(final_status)
         .bind(&output)
         .bind(&errors)
+        .bind(ok as i32)
+        .bind(failed)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -968,16 +1100,18 @@ mod tests {
         let id = uid("file");
         let content = b"{\"custom_id\":\"a\"}\n";
         store
-            .insert_batch_file(&NewBatchFile {
-                id: &id,
-                tenant_id: owner.tenant_id,
-                key_id: owner.key_id.unwrap(),
-                purpose: PURPOSE_BATCH,
-                filename: "in.jsonl",
-                bytes: content.len() as i64,
-                content: Some(content),
-                batch_id: None,
-            })
+            .insert_batch_file(
+                &NewBatchFile {
+                    id: &id,
+                    tenant_id: owner.tenant_id,
+                    key_id: owner.key_id.unwrap(),
+                    purpose: PURPOSE_BATCH,
+                    filename: "in.jsonl",
+                    bytes: 0,
+                    batch_id: None,
+                },
+                content,
+            )
             .await
             .expect("insert");
         assert!(store.get_batch_file(&id, owner).await.unwrap().is_some());
@@ -988,19 +1122,64 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+        let file = store.get_batch_file(&id, owner).await.unwrap().unwrap();
+        assert_eq!(file.bytes, content.len() as i64);
         assert_eq!(
-            store
-                .batch_file_content(&id, owner)
-                .await
-                .unwrap()
-                .as_deref(),
+            store.batch_file_chunk(&id, 0).await.unwrap().as_deref(),
             Some(&content[..])
         );
+        assert!(store.batch_file_chunk(&id, 1).await.unwrap().is_none());
+        // A big file is stored in chunks and reads back whole.
+        let big: Vec<u8> = (0..(FILE_CHUNK_BYTES * 2 + 123))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let big_id = uid("file");
+        let mut w = store
+            .begin_batch_file(&NewBatchFile {
+                id: &big_id,
+                tenant_id: owner.tenant_id,
+                key_id: owner.key_id.unwrap(),
+                purpose: PURPOSE_BATCH,
+                filename: "big.jsonl",
+                bytes: 0,
+                batch_id: None,
+            })
+            .await
+            .unwrap();
+        for part in big.chunks(1_000_003) {
+            w.write(part).await.unwrap();
+        }
+        assert_eq!(w.finish().await.unwrap().bytes, big.len() as i64);
+        let mut back = Vec::new();
+        let mut seq = 0;
+        while let Some(c) = store.batch_file_chunk(&big_id, seq).await.unwrap() {
+            back.extend_from_slice(&c);
+            seq += 1;
+        }
+        assert_eq!((seq, back == big), (3, true));
+        // An upload dropped before finishing leaves nothing.
+        let gone = uid("file");
+        let mut w = store
+            .begin_batch_file(&NewBatchFile {
+                id: &gone,
+                tenant_id: owner.tenant_id,
+                key_id: owner.key_id.unwrap(),
+                purpose: PURPOSE_BATCH,
+                filename: "x.jsonl",
+                bytes: 0,
+                batch_id: None,
+            })
+            .await
+            .unwrap();
+        w.write(b"partial").await.unwrap();
+        drop(w);
+        assert!(store.get_batch_file(&gone, owner).await.unwrap().is_none());
         let listed = store
             .list_batch_files(owner, Some(PURPOSE_BATCH), None, 10)
             .await
             .unwrap();
-        assert_eq!(listed.len(), 1);
+        // The small file and the big one; not the dropped upload.
+        assert_eq!(listed.len(), 2);
         assert!(!store.delete_batch_file(&id, other).await.unwrap());
         assert!(store.delete_batch_file(&id, owner).await.unwrap());
     }
@@ -1153,6 +1332,7 @@ mod tests {
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         store.sweep_batch_leases(2).await.unwrap();
+        store.refresh_batch_counts().await.unwrap();
         let again = store
             .claim_batch_items(&batch.id, "alive", 5, 60)
             .await

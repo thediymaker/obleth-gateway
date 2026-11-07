@@ -165,7 +165,7 @@ obleth:
   # model has no interactive request waiting, and in at most `maxShare` of
   # its slots, so interactive callers always find the rest free.
   batches:
-    enabled: false
+    enabled: true
     maxShare: "0.75"
     maxLines: 50000
     maxFileBytes: 209715200

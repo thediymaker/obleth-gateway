@@ -525,6 +525,8 @@ return out
 /// yielding to held slots
 /// ARGV[15] = the same model's other pool ('' for none): its count is added
 /// to this pool's when checking the pool cap
+/// ARGV[16] = '1' for a background claim: any refusal marks only its own
+/// pool as waited on, never the global ceiling
 ///
 /// A replica whose heartbeat has expired may not take slots: its holdings
 /// are about to be (or have been) reclaimed. Held slots that ran out are
@@ -602,10 +604,8 @@ elseif kcap > 0 and kn >= kcap then code = -3
 end
 if code ~= 1 then
   local mark = 'w|' .. pool
-  if code == -1 then mark = 'w' end
-  if tonumber(ARGV[9]) > 0 then
-    redis.call('HSET', totals, mark, now + tonumber(ARGV[9]))
-  end
+  if code == -1 and ARGV[16] ~= '1' then mark = 'w' end
+  redis.call('HSET', totals, mark, now + tonumber(ARGV[9]))
   return { code, p, g }
 end
 

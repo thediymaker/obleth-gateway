@@ -1,7 +1,8 @@
 -- Idempotent: safe to re-run.
 -- Batches: the OpenAI Files and Batches APIs.
 --
--- A caller uploads a JSONL file of requests (`batch_files`, purpose `batch`),
+-- A caller uploads a JSONL file of requests (`batch_files`, purpose `batch`;
+-- its bytes in `batch_file_chunks`, written as the upload streams in),
 -- then creates a batch from it (`batches`). Each line becomes a row in
 -- `batch_items`, which the gateway's batch runner claims with a lease, sends
 -- through the normal pipeline at background priority, and finishes with the
@@ -20,7 +21,6 @@ create table if not exists batch_files (
     purpose     text not null,
     filename    text not null,
     bytes       bigint not null default 0,
-    content     bytea,
     batch_id    text,
     created_at  timestamptz not null default now()
 );
@@ -28,6 +28,15 @@ create table if not exists batch_files (
 create index if not exists batch_files_owner_idx
     on batch_files (tenant_id, key_id, created_at desc);
 create index if not exists batch_files_created_idx on batch_files (created_at);
+
+-- An uploaded file's bytes, in order, a few MB per row, so neither an upload
+-- nor a read ever holds the whole file in memory.
+create table if not exists batch_file_chunks (
+    file_id  text not null references batch_files (id) on delete cascade,
+    seq      integer not null,
+    data     bytea not null,
+    primary key (file_id, seq)
+);
 
 create table if not exists batches (
     id                text primary key,

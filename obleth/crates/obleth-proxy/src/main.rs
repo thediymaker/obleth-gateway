@@ -496,14 +496,20 @@ async fn main() -> anyhow::Result<()> {
         cfg.job_scope.as_str()
     );
     jobs::spawn_job_pruner(app_state.jobs.clone());
-    if let Some(b) = app_state.batches.clone() {
-        tracing::info!(
-            max_lines = b.config().max_lines,
-            share = b.config().share,
-            "batches on: /v1/files and /v1/batches are served"
-        );
-        batches::spawn_runner(app_state.clone(), b);
-    }
+    // Created here so the batch runner can watch it; the signal listener that
+    // sends on it starts once the listeners are bound.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let batch_runner = match app_state.batches.clone() {
+        Some(b) => {
+            tracing::info!(
+                max_lines = b.config().max_lines,
+                share = b.config().share,
+                "batches on: /v1/files and /v1/batches are served"
+            );
+            batches::spawn_runner(app_state.clone(), b, shutdown_rx.clone())
+        }
+        None => None,
+    };
 
     match store.all_resolved_models().await {
         Ok(models) => {
@@ -717,7 +723,6 @@ async fn main() -> anyhow::Result<()> {
         cfg.metrics_listen
     );
 
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     spawn_signal_listener(shutdown_tx);
     serve_until_shutdown(
         vec![
@@ -730,6 +735,10 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
+    // Before the heartbeat stops: the runner's last requests still hold slots.
+    if let Some(runner) = batch_runner {
+        runner.finish().await;
+    }
     // Only once drained: a draining replica still holds its in-flight slots.
     if let Some(heartbeat) = replica_heartbeat {
         heartbeat.stop().await;

@@ -2795,11 +2795,28 @@ mod tests {
         }
         let (outcome, _) = store.slot_acquire(&keys, "a", &bg(3)).await.unwrap();
         assert_eq!(outcome, AcquireOutcome::Denied(SlotDenial::Pool));
-        assert_eq!(
-            totals_field(&store, &keys, "w|b:s").await,
-            0,
-            "no wait mark"
+        // Marked on its own pool only: interactive holds read `w|m:s`.
+        assert!(
+            totals_field(&store, &keys, "w|b:s").await > 0,
+            "own pool marked"
         );
+        assert_eq!(totals_field(&store, &keys, "w|m:s").await, 0);
+        assert_eq!(totals_field(&store, &keys, "w").await, 0);
+        // A background refusal at its share of the ceiling marks its pool,
+        // not the ceiling.
+        let (outcome, _) = store
+            .slot_acquire(
+                &keys,
+                "a",
+                &SlotClaim {
+                    global_cap: 1,
+                    ..bg(9)
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, AcquireOutcome::Denied(SlotDenial::Global));
+        assert_eq!(totals_field(&store, &keys, "w").await, 0);
 
         // Interactive takes the last slot, then counts background's three.
         let (outcome, _) = store.slot_acquire(&keys, "b", &fg()).await.unwrap();
@@ -2807,7 +2824,7 @@ mod tests {
         let (outcome, _) = store.slot_acquire(&keys, "b", &fg()).await.unwrap();
         assert_eq!(outcome, AcquireOutcome::Denied(SlotDenial::Pool));
 
-        // Freeing a background slot wakes the interactive pool.
+        // Freeing a background slot wakes both pools: each was waited on.
         let c = bg_slots.pop().unwrap();
         let slot = SlotRelease {
             pool: c.pool.clone(),
@@ -2817,11 +2834,17 @@ mod tests {
         };
         let (freed, _) = store.slot_release(&keys, "a", &slot).await.unwrap();
         assert!(freed);
-        let woken = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-            .await
-            .expect("published")
-            .unwrap();
-        assert_eq!(woken, "m:s");
+        let mut woken = Vec::new();
+        for _ in 0..2 {
+            woken.push(
+                tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("published")
+                    .unwrap(),
+            );
+        }
+        woken.sort();
+        assert_eq!(woken, vec!["b:s".to_string(), "m:s".to_string()]);
         let (outcome, _) = store.slot_acquire(&keys, "b", &fg()).await.unwrap();
         assert_eq!(outcome, AcquireOutcome::Granted);
         listener.abort();

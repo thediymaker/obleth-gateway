@@ -79,9 +79,10 @@ pub struct SlotClaim {
     /// count is added to this pool's when checking `pool_cap`, since both
     /// draw on the same upstream capacity.
     pub sibling: Option<String>,
-    /// A background claim: a refusal does not mark the pool or the ceiling
-    /// as waited on, so it changes nothing for interactive callers; the
-    /// pool retries on its own timer.
+    /// A background claim: a refusal marks only its own pool as waited on,
+    /// never the global ceiling, so a freed slot wakes background waiters
+    /// without changing anything for interactive callers (their pool's
+    /// session-affinity holds look at their own pool's mark).
     pub background: bool,
     pub tenant_cap: Option<usize>,
     pub key_cap: Option<usize>,
@@ -669,9 +670,9 @@ impl SharedSlots for InMemorySlots {
             }
             AcquireOutcome::Granted
         };
-        if let (AcquireOutcome::Denied(denial), false) = (outcome, claim.background) {
+        if let AcquireOutcome::Denied(denial) = outcome {
             let mark = match denial {
-                SlotDenial::Global => String::new(),
+                SlotDenial::Global if !claim.background => String::new(),
                 _ => claim.pool.clone(),
             };
             s.waiting.insert(mark, Instant::now() + WAIT_MARK);
