@@ -93,6 +93,8 @@ pub struct AppState {
     /// What `GET /v1/load` reads pool load with. `None` when
     /// `OBLETH_LOAD_ENDPOINT` is off; the path then answers 404.
     pub load: Option<crate::load::LoadReporter>,
+    /// Files and batches; `None` unless `OBLETH_BATCHES` is on.
+    pub batches: Option<crate::batches::Batches>,
     /// Keeps one request from taking down every server of a model; see
     /// [`crate::crash_guard`].
     pub crash_guard: crate::crash_guard::CrashGuard,

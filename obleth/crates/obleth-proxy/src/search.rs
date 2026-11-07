@@ -1203,6 +1203,7 @@ mod pipeline_tests {
             jobs: crate::jobs::JobStore::new(store, Default::default()),
             load: None,
             crash_guard: crate::crash_guard::CrashGuard::disabled(),
+            batches: None,
         };
         Some(Gateway { state, wal_dir })
     }

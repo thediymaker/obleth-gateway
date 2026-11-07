@@ -18,6 +18,7 @@ use std::sync::OnceLock;
 use uuid::Uuid;
 
 mod backup;
+pub mod batches;
 mod crypto;
 mod jobs;
 pub mod knowledge;
@@ -109,6 +110,7 @@ const SCHEMA_V36: &str =
 const SCHEMA_V37: &str = include_str!("../../../../schema/postgres/0037_job_kind.sql");
 const SCHEMA_V38: &str =
     include_str!("../../../../schema/postgres/0038_model_session_affinity.sql");
+const SCHEMA_V39: &str = include_str!("../../../../schema/postgres/0039_batches.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -263,6 +265,7 @@ impl Store {
             sqlx::raw_sql(SCHEMA_V36).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V37).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V38).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V39).execute(&mut *conn).await?;
             Ok(())
         }
         .await;
@@ -1291,6 +1294,37 @@ impl Store {
              where k.key_hash = $1",
         )
         .bind(hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(resolved_from_row).transpose()
+    }
+
+    /// The resolved key with this id, for callers that act for a key later
+    /// without its secret (the batch runner).
+    pub async fn resolved_key_by_id(&self, id: Uuid) -> Result<Option<ResolvedKey>> {
+        let row = sqlx::query(
+            "select k.id as key_id, k.tenant_id, k.disabled,
+                    k.name as key_name, t.name as tenant_name, t.fairshare_group, g.weight as group_weight,
+                    t.weight, t.tokens_per_minute, t.max_in_flight, t.status,
+                    t.timezone, t.active_from, t.active_until, t.weekly_windows,
+                    t.budget_tokens, t.budget_cost_usd, t.budget_period, t.budget_started_at,
+                    k.budget_tokens as key_budget_tokens,
+                    k.budget_cost_usd as key_budget_cost_usd,
+                    k.budget_period as key_budget_period,
+                    k.budget_started_at as key_budget_started_at,
+                    k.weight as key_weight, k.max_in_flight as key_max_in_flight,
+                    k.end_user_fairshare,
+                    t.allowed_models,
+                    (k.tracing_enabled OR t.tracing_enabled) AS tracing_enabled,
+                    t.guardrails_policy,
+                    t.compression_policy,
+                    t.synthetic
+             from api_keys k
+             join tenants t on t.id = k.tenant_id
+             join fairshare_groups g on g.name = t.fairshare_group
+             where k.id = $1",
+        )
+        .bind(id)
         .fetch_optional(&self.pool)
         .await?;
         row.as_ref().map(resolved_from_row).transpose()

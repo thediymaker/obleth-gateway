@@ -153,6 +153,8 @@ pub struct Tenant {
 /// (benchmark/test traffic). Mirrors the `health_probe` convention: default
 /// usage reads exclude it; `include_internal=true` opts back in.
 pub const BENCHMARK_REQUEST_TYPE: &str = "benchmark";
+/// `request_type` of a request the batch runner sent for a batch item.
+pub const BATCH_REQUEST_TYPE: &str = "batch";
 
 pub fn default_tenant_status() -> String {
     "active".to_string()

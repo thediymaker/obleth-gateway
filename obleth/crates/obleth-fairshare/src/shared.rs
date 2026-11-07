@@ -75,6 +75,14 @@ pub struct SlotClaim {
     pub key: Uuid,
     pub pool_cap: usize,
     pub global_cap: usize,
+    /// The same model's other pool (see [`crate::PoolKey::sibling`]): its
+    /// count is added to this pool's when checking `pool_cap`, since both
+    /// draw on the same upstream capacity.
+    pub sibling: Option<String>,
+    /// A background claim: a refusal does not mark the pool or the ceiling
+    /// as waited on, so it changes nothing for interactive callers; the
+    /// pool retries on its own timer.
+    pub background: bool,
     pub tenant_cap: Option<usize>,
     pub key_cap: Option<usize>,
     /// The id of a slot held for this request's session ([`SlotHold::id`]):
@@ -117,6 +125,9 @@ pub struct SlotRelease {
     pub pool: String,
     pub tenant: Uuid,
     pub key: Uuid,
+    /// The same model's other pool: a freed slot is room for its waiters
+    /// too, so they are woken as well.
+    pub sibling: Option<String>,
 }
 
 /// Which cluster-wide limit refused a claim.
@@ -638,7 +649,13 @@ impl SharedSlots for InMemorySlots {
             AcquireOutcome::Redeemed
         } else if claim.redeem_only {
             AcquireOutcome::NotHeld
-        } else if s.count(&pf) >= claim.pool_cap {
+        } else if s.count(&pf)
+            + claim
+                .sibling
+                .as_deref()
+                .map_or(0, |sib| s.count(&pool_field(sib)))
+            >= claim.pool_cap
+        {
             AcquireOutcome::Denied(SlotDenial::Pool)
         } else if s.count(GLOBAL_FIELD) >= claim.global_cap {
             AcquireOutcome::Denied(SlotDenial::Global)
@@ -652,7 +669,7 @@ impl SharedSlots for InMemorySlots {
             }
             AcquireOutcome::Granted
         };
-        if let AcquireOutcome::Denied(denial) = outcome {
+        if let (AcquireOutcome::Denied(denial), false) = (outcome, claim.background) {
             let mark = match denial {
                 SlotDenial::Global => String::new(),
                 _ => claim.pool.clone(),
@@ -770,6 +787,9 @@ impl SharedSlots for InMemorySlots {
         };
         for fs in subs {
             fs.wake(&slot.pool);
+            if let Some(sibling) = &slot.sibling {
+                fs.wake(sibling);
+            }
         }
         Box::pin(async move { Ok(counts) })
     }

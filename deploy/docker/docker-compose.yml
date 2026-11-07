@@ -122,6 +122,9 @@ services:
       OBLETH_SESSION_ID_DERIVATION: ${OBLETH_SESSION_ID_DERIVATION:-true}
       # GET /v1/load: each model's live load for callers. false answers 404.
       OBLETH_LOAD_ENDPOINT: ${OBLETH_LOAD_ENDPOINT:-true}
+      # The OpenAI Files and Batches APIs, run at background priority.
+      OBLETH_BATCHES: ${OBLETH_BATCHES:-false}
+      OBLETH_BATCH_MAX_SHARE: ${OBLETH_BATCH_MAX_SHARE:-0.75}
       # Boot-time seed only; the dashboard's routing settings win once saved.
       OBLETH_AUTO_CLASSIFIER_ENABLED: ${OBLETH_AUTO_CLASSIFIER_ENABLED:-false}
       OBLETH_AUTO_CLASSIFIER_MODEL: ${OBLETH_AUTO_CLASSIFIER_MODEL:-}

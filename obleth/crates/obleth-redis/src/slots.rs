@@ -208,12 +208,13 @@ impl RedisStore {
             .arg(claim.global_cap.max(1) as u64)
             .arg(claim.tenant_cap.unwrap_or(0) as u64)
             .arg(claim.key_cap.unwrap_or(0) as u64)
-            .arg(WAIT_MARK_MS)
+            .arg(if claim.background { 0 } else { WAIT_MARK_MS })
             .arg(&keys.hold_prefix)
             .arg(&keys.channel)
             .arg(claim.hold.as_deref().unwrap_or(""))
             .arg(if claim.redeem_only { "1" } else { "0" })
             .arg(if claim.starving { "1" } else { "0" })
+            .arg(claim.sibling.as_deref().unwrap_or(""))
             .invoke_async(&mut conn)
             .await?;
         let outcome = match code {
@@ -251,6 +252,7 @@ impl RedisStore {
             .arg(slot.tenant.to_string())
             .arg(slot.key.to_string())
             .arg(&keys.channel)
+            .arg(slot.sibling.as_deref().unwrap_or(""))
             .invoke_async(&mut conn)
             .await?;
         Ok((

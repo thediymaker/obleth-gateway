@@ -1392,6 +1392,7 @@ mod pipeline_tests {
             jobs: JobStore::new(store.clone(), scope),
             load: None,
             crash_guard: crate::crash_guard::CrashGuard::disabled(),
+            batches: None,
         };
         Some(Gateway {
             state,

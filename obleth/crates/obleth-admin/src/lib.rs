@@ -11612,6 +11612,8 @@ mod tests {
                 hold: None,
                 redeem_only: false,
                 starving: false,
+                sibling: None,
+                background: false,
             };
             use obleth_fairshare::SharedSlots;
             other.acquire(claim).await.expect("claimed");

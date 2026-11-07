@@ -4,6 +4,7 @@
 //! a Prometheus metrics endpoint. Wires Postgres (config SoT), Redis (hot cache
 //! + budgets), ClickHouse (usage ledger) and the fairshare scheduler together.
 
+mod batches;
 mod completion;
 mod crash_guard;
 mod energy;
@@ -486,6 +487,8 @@ async fn main() -> anyhow::Result<()> {
         jobs: jobs::JobStore::new(store.clone(), cfg.job_scope),
         load,
         crash_guard: crate::crash_guard::CrashGuard::new(Some(capacity_discovery.clone())),
+        batches: batches::BatchConfig::from_env()
+            .map(|cfg| batches::Batches::new(store.clone(), cfg)),
     };
     tracing::info!(
         scope = cfg.job_scope.as_str(),
@@ -493,6 +496,14 @@ async fn main() -> anyhow::Result<()> {
         cfg.job_scope.as_str()
     );
     jobs::spawn_job_pruner(app_state.jobs.clone());
+    if let Some(b) = app_state.batches.clone() {
+        tracing::info!(
+            max_lines = b.config().max_lines,
+            share = b.config().share,
+            "batches on: /v1/files and /v1/batches are served"
+        );
+        batches::spawn_runner(app_state.clone(), b);
+    }
 
     match store.all_resolved_models().await {
         Ok(models) => {
