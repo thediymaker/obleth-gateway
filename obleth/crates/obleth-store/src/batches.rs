@@ -179,6 +179,8 @@ pub struct BatchRecord {
     pub total: i32,
     pub completed: i32,
     pub failed: i32,
+    /// When a request of the batch last finished.
+    pub last_progress_at: Option<DateTime<Utc>>,
     /// JSON text.
     pub metadata: Option<String>,
     /// JSON text: the OpenAI `errors` object's `data` list.
@@ -191,6 +193,33 @@ pub struct BatchRecord {
     pub expired_at: Option<DateTime<Utc>>,
     pub cancelling_at: Option<DateTime<Utc>>,
     pub cancelled_at: Option<DateTime<Utc>>,
+}
+
+/// How long a batch with requests left goes without one finishing before it
+/// reads as waiting for capacity.
+pub const BATCH_WAITING_AFTER_SECS: i64 = 120;
+
+impl BatchRecord {
+    /// Whether the batch is in progress with requests left and has gone
+    /// [`BATCH_WAITING_AFTER_SECS`] without one finishing: usually its model is
+    /// busy with interactive work, which batches yield to.
+    pub fn waiting_for_capacity(&self, now: DateTime<Utc>) -> bool {
+        if self.status != "in_progress" || self.completed + self.failed >= self.total {
+            return false;
+        }
+        match self.last_progress_at.or(self.in_progress_at) {
+            Some(since) => (now - since).num_seconds() >= BATCH_WAITING_AFTER_SECS,
+            None => false,
+        }
+    }
+
+    /// When the batch reached its final status, if it has.
+    pub fn finished_at(&self) -> Option<DateTime<Utc>> {
+        self.completed_at
+            .or(self.failed_at)
+            .or(self.expired_at)
+            .or(self.cancelled_at)
+    }
 }
 
 /// A batch to record.
@@ -250,6 +279,23 @@ pub enum BatchOutput {
     Error,
 }
 
+/// Filters for [`Store::list_all_batches`].
+#[derive(Debug, Clone, Default)]
+pub struct AdminBatchFilter<'a> {
+    /// One status, or `active` for every unfinished status.
+    pub status: Option<&'a str>,
+    pub tenant_id: Option<Uuid>,
+    pub model: Option<&'a str>,
+}
+
+/// A batch with the names of its tenant and key.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdminBatchRow {
+    pub batch: BatchRecord,
+    pub tenant_name: Option<String>,
+    pub key_name: Option<String>,
+}
+
 /// A batch that moved to a final status.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FinishedBatch {
@@ -261,7 +307,7 @@ const FILE_COLUMNS: &str = "id, tenant_id, key_id, purpose, filename, bytes, bat
 
 const BATCH_COLUMNS: &str = "id, tenant_id, key_id, model, endpoint, input_file_id,
     output_file_id, error_file_id, completion_window, deadline_at, status, total, completed,
-    failed, metadata::text as metadata, errors::text as errors, created_at, in_progress_at,
+    failed, last_progress_at, metadata::text as metadata, errors::text as errors, created_at, in_progress_at,
     finalizing_at, completed_at, failed_at, expired_at, cancelling_at, cancelled_at";
 
 fn row_to_file(row: &sqlx::postgres::PgRow) -> Result<BatchFile> {
@@ -293,6 +339,7 @@ fn row_to_batch(row: &sqlx::postgres::PgRow) -> Result<BatchRecord> {
         total: row.try_get("total")?,
         completed: row.try_get("completed")?,
         failed: row.try_get("failed")?,
+        last_progress_at: row.try_get("last_progress_at")?,
         metadata: row.try_get("metadata")?,
         errors: row.try_get("errors")?,
         created_at: row.try_get("created_at")?,
@@ -565,6 +612,107 @@ impl Store {
     /// and its pending items to `cancelled`; requests already running finish
     /// and the runner then moves the batch to `cancelled`. A batch in a final
     /// status is returned unchanged. `None` when there is no such batch.
+    /// A batch by id, whoever owns it (the admin API).
+    pub async fn get_batch_any(&self, id: &str) -> Result<Option<BatchRecord>> {
+        let row = sqlx::query(&format!(
+            "select {BATCH_COLUMNS} from batches where id = $1"
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(row_to_batch).transpose()
+    }
+
+    /// Batches across every tenant, newest first, with their tenant and key
+    /// names (the admin API). `status` filters to one status, or to the
+    /// unfinished ones with `active`.
+    pub async fn list_all_batches(
+        &self,
+        filter: &AdminBatchFilter<'_>,
+        after: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<AdminBatchRow>> {
+        let cols = BATCH_COLUMNS
+            .split(',')
+            .map(|c| {
+                let c = c.trim();
+                match c.split_once(" as ") {
+                    Some((expr, alias)) => format!("b.{expr} as {alias}"),
+                    None => format!("b.{c}"),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut sql = format!(
+            "select {cols}, t.name as tenant_name, k.name as key_name
+             from batches b
+             left join tenants t on t.id = b.tenant_id
+             left join api_keys k on k.id = b.key_id
+             where true"
+        );
+        let mut n = 1;
+        match filter.status {
+            Some("active") => sql.push_str(
+                " and b.status in ('validating', 'in_progress', 'finalizing', 'cancelling')",
+            ),
+            Some(_) => {
+                sql.push_str(&format!(" and b.status = ${n}"));
+                n += 1;
+            }
+            None => {}
+        }
+        if filter.tenant_id.is_some() {
+            sql.push_str(&format!(" and b.tenant_id = ${n}"));
+            n += 1;
+        }
+        if filter.model.is_some() {
+            sql.push_str(&format!(" and b.model = ${n}"));
+            n += 1;
+        }
+        if after.is_some() {
+            sql.push_str(&format!(
+                " and (b.created_at, b.id) < (select created_at, id from batches where id = ${n})"
+            ));
+            n += 1;
+        }
+        sql.push_str(&format!(
+            " order by b.created_at desc, b.id desc limit ${n}"
+        ));
+        let mut q = sqlx::query(&sql);
+        if let Some(s) = filter.status.filter(|s| *s != "active") {
+            q = q.bind(s);
+        }
+        if let Some(t) = filter.tenant_id {
+            q = q.bind(t);
+        }
+        if let Some(m) = filter.model {
+            q = q.bind(m);
+        }
+        if let Some(a) = after {
+            q = q.bind(a);
+        }
+        let rows = q.bind(limit.clamp(1, 200)).fetch_all(&self.pool).await?;
+        rows.iter()
+            .map(|r| {
+                Ok(AdminBatchRow {
+                    batch: row_to_batch(r)?,
+                    tenant_name: r.try_get("tenant_name")?,
+                    key_name: r.try_get("key_name")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Batch counts by status across every tenant (the admin API).
+    pub async fn batch_status_counts(&self) -> Result<Vec<(String, i64)>> {
+        let rows = sqlx::query("select status, count(*) as n from batches group by status")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter()
+            .map(|r| Ok((r.try_get("status")?, r.try_get("n")?)))
+            .collect()
+    }
+
     pub async fn cancel_batch(&self, id: &str, owner: JobOwner) -> Result<Option<BatchRecord>> {
         let mut tx = self.pool.begin().await?;
         let sql = format!(
@@ -804,15 +952,19 @@ impl Store {
     /// `completed` is succeeded items, `failed` is failed and expired ones.
     pub async fn refresh_batch_counts(&self) -> Result<u64> {
         let done = sqlx::query(
-            "update batches b set completed = c.ok, failed = c.bad
+            "update batches b set completed = c.ok, failed = c.bad, last_progress_at = c.last
              from (select i.batch_id,
                           count(*) filter (where i.status = 'succeeded')::int as ok,
-                          count(*) filter (where i.status in ('failed', 'expired'))::int as bad
+                          count(*) filter (where i.status in ('failed', 'expired'))::int as bad,
+                          max(i.finished_at) filter (where i.status in ('succeeded', 'failed'))
+                              as last
                    from batch_items i
                    join batches a on a.id = i.batch_id
                    where a.status in ('in_progress', 'cancelling')
                    group by i.batch_id) c
-             where b.id = c.batch_id and (b.completed, b.failed) is distinct from (c.ok, c.bad)",
+             where b.id = c.batch_id
+               and (b.completed, b.failed, b.last_progress_at)
+                   is distinct from (c.ok, c.bad, c.last)",
         )
         .execute(&self.pool)
         .await?;
@@ -1249,11 +1401,14 @@ mod tests {
             .unwrap();
         assert_eq!(again.len(), 1);
         assert_eq!((again[0].line, again[0].attempts), (4, 2));
-        assert!(store
+        // Not finished while a request is still running (other tests' batches
+        // may finish in the same pass).
+        assert!(!store
             .advance_batches(&|| uid("file"))
             .await
             .unwrap()
-            .is_empty());
+            .iter()
+            .any(|d| d.id == batch.id));
         store
             .complete_batch_item(&batch.id, 4, "gw-a", 200, b"{}", rid)
             .await
@@ -1307,6 +1462,84 @@ mod tests {
             .unwrap()
             .iter()
             .any(|d| d.id == batch.id));
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn progress_and_the_admin_list() {
+        let Some(store) = store().await else {
+            return;
+        };
+        let _g = serial().lock().await;
+        let owner = JobOwner::key(Uuid::new_v4(), Uuid::new_v4());
+        let batch = make_batch(&store, owner, 3, Utc::now() + chrono::Duration::hours(1)).await;
+        let now = Utc::now();
+        assert!(batch.last_progress_at.is_none());
+        assert!(!batch.waiting_for_capacity(now));
+        // Nothing finished for longer than the waiting threshold.
+        let later = now + chrono::Duration::seconds(BATCH_WAITING_AFTER_SECS + 5);
+        assert!(batch.waiting_for_capacity(later));
+
+        let got = store.get_batch_any(&batch.id).await.unwrap().unwrap();
+        assert_eq!(got.id, batch.id);
+        assert!(store.get_batch_any("batch_none").await.unwrap().is_none());
+
+        let active = AdminBatchFilter {
+            status: Some("active"),
+            tenant_id: Some(owner.tenant_id),
+            model: None,
+        };
+        let rows = store.list_all_batches(&active, None, 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].batch.id, batch.id);
+        // No tenant or key rows behind these ids.
+        assert_eq!(
+            (rows[0].tenant_name.clone(), rows[0].key_name.clone()),
+            (None, None)
+        );
+        let done = AdminBatchFilter {
+            status: Some("completed"),
+            ..active.clone()
+        };
+        assert!(store
+            .list_all_batches(&done, None, 10)
+            .await
+            .unwrap()
+            .is_empty());
+        let other_model = AdminBatchFilter {
+            model: Some("other"),
+            ..active.clone()
+        };
+        assert!(store
+            .list_all_batches(&other_model, None, 10)
+            .await
+            .unwrap()
+            .is_empty());
+
+        let items = store
+            .claim_batch_items(&batch.id, "gw-a", 1, 60)
+            .await
+            .unwrap();
+        store
+            .complete_batch_item(&batch.id, items[0].line, "gw-a", 200, b"{}", Uuid::new_v4())
+            .await
+            .unwrap();
+        store.refresh_batch_counts().await.unwrap();
+        let b = store.get_batch(&batch.id, owner).await.unwrap().unwrap();
+        assert_eq!(b.completed, 1);
+        let progress = b.last_progress_at.expect("progress recorded");
+        assert!(!b.waiting_for_capacity(progress + chrono::Duration::seconds(10)));
+        assert!(
+            b.waiting_for_capacity(progress + chrono::Duration::seconds(BATCH_WAITING_AFTER_SECS))
+        );
+        let counts = store.batch_status_counts().await.unwrap();
+        assert!(counts.iter().any(|(s, n)| s == "in_progress" && *n >= 1));
+
+        store.cancel_batch(&batch.id, owner).await.unwrap();
+        let b = store.get_batch_any(&batch.id).await.unwrap().unwrap();
+        assert!(!b.waiting_for_capacity(later));
+        // Nothing of it runs: finish it, so no other test's pass picks it up.
+        store.advance_batches(&|| uid("file")).await.unwrap();
     }
 
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.

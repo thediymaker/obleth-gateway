@@ -10,6 +10,7 @@ pub mod advice;
 pub mod alerts;
 pub mod autotune;
 mod backup;
+mod batches;
 pub mod capacity_discovery;
 pub mod energy_probe;
 mod error;
@@ -407,6 +408,9 @@ pub fn router(state: AdminState) -> Router {
                 .delete(delete_mcp_server),
         )
         .route("/api/v1/audit", get(get_audit))
+        .route("/api/v1/batches", get(batches::list_batches))
+        .route("/api/v1/batches/:id", get(batches::get_batch))
+        .route("/api/v1/batches/:id/cancel", post(batches::cancel_batch))
         .route("/api/v1/stats/daily", get(get_daily_stats))
         .route("/api/v1/capacity", get(get_capacity).put(set_capacity))
         .route(

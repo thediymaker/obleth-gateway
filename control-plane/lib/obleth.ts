@@ -2190,6 +2190,60 @@ function logFilterQuery(params: UsageLogParams) {
   };
 }
 
+/** A batch as the admin API lists it (`GET /api/v1/batches`). */
+export interface AdminBatch {
+  id: string;
+  tenant_id: string;
+  tenant_name: string | null;
+  key_id: string;
+  key_name: string | null;
+  model: string;
+  endpoint: string;
+  status: BatchStatus;
+  /** Requests in the batch. */
+  total: number;
+  /** Requests that succeeded. */
+  completed: number;
+  /** Requests that failed or expired. */
+  failed: number;
+  completion_window: string;
+  created_at: string;
+  in_progress_at: string | null;
+  deadline_at: string;
+  last_progress_at: string | null;
+  finished_at: string | null;
+  /** In progress with requests left and none finished for two minutes. */
+  waiting: boolean;
+  metadata: Record<string, string> | null;
+  errors: { data?: { line?: number; message?: string; code?: string }[] } | { line?: number; message?: string; code?: string }[] | null;
+}
+
+export type BatchStatus =
+  | "validating"
+  | "failed"
+  | "in_progress"
+  | "finalizing"
+  | "completed"
+  | "expired"
+  | "cancelling"
+  | "cancelled";
+
+export interface AdminBatchList {
+  data: AdminBatch[];
+  has_more: boolean;
+  /** Batches by status across every tenant. */
+  counts: Partial<Record<BatchStatus, number>>;
+}
+
+export interface BatchListParams {
+  /** One status, or `active` for every unfinished one. */
+  status?: string;
+  tenantId?: string;
+  model?: string;
+  after?: string;
+  limit?: number;
+}
+
 /** Build/version identity reported by the gateway's public /version endpoint. */
 export interface VersionInfo {
   version: string;
@@ -2925,6 +2979,18 @@ export const obleth = {
     api<FairshareHistoryView>(
       `/fairshare/history${qs({ since_ms: params.since_ms, model: params.model })}`,
     ),
+  /** Batches across every tenant, newest first, with their progress. */
+  listBatches: (params: BatchListParams = {}) =>
+    api<AdminBatchList>(
+      `/batches${qs({ status: params.status, tenant_id: params.tenantId, model: params.model, after: params.after, limit: params.limit })}`,
+    ),
+  getBatch: (id: string) => api<AdminBatch>(`/batches/${encodeURIComponent(id)}`),
+  /** Stops a batch's queued requests; running ones finish. */
+  cancelBatch: (id: string, options?: AuditOptions) =>
+    api<AdminBatch>(`/batches/${encodeURIComponent(id)}/cancel`, {
+      method: "POST",
+      headers: auditActorHeaders(options),
+    }),
   audit: (limit = 100) => api<AuditEntry[]>(`/audit?limit=${limit}`),
   /** The audit log narrowed by who, what and when; page back with `before_id`. */
   auditQuery: (params: AuditParams = {}) =>

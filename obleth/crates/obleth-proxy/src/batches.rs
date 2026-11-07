@@ -245,6 +245,8 @@ pub(crate) enum Route<'a> {
     BatchList,
     BatchGet(&'a str),
     BatchCancel(&'a str),
+    /// obleth extension: the results so far of a batch, finished or not.
+    BatchResults(&'a str),
 }
 
 fn valid_id(id: &str) -> bool {
@@ -276,6 +278,7 @@ pub(crate) fn route<'a>(method: &Method, path: &'a str) -> Option<Route<'a>> {
             ("GET", []) => Some(Route::BatchList),
             ("GET", [id]) if valid_id(id) => Some(Route::BatchGet(id)),
             ("POST", [id, "cancel"]) if valid_id(id) => Some(Route::BatchCancel(id)),
+            ("GET", [id, "results"]) if valid_id(id) => Some(Route::BatchResults(id)),
             _ => None,
         };
     }
@@ -304,6 +307,7 @@ pub(crate) async fn handle(
         Route::BatchList => list_batches(batches, owner, &q).await,
         Route::BatchGet(id) => get_batch(batches, owner, id).await,
         Route::BatchCancel(id) => cancel(batches, owner, id).await,
+        Route::BatchResults(id) => results(batches, owner, id, &q).await,
     };
     result.unwrap_or_else(|e| e)
 }
@@ -618,6 +622,15 @@ async fn file_content(batches: &Batches, owner: JobOwner, id: &str) -> Handled {
     let Some(batch_id) = file.batch_id.clone() else {
         return Err(not_found("file", id));
     };
+    Ok(jsonl_response(
+        output_body(batches, batch_id, which),
+        &file.filename,
+    ))
+}
+
+/// The lines of a batch's output or error file, read from its requests in
+/// pages as the client reads them.
+fn output_body(batches: &Batches, batch_id: String, which: BatchOutput) -> Body {
     let store = batches.store.clone();
     // Pages of lines, read as the client reads them.
     let stream = futures_util::stream::unfold(Some(-1i32), move |after| {
@@ -650,7 +663,35 @@ async fn file_content(batches: &Batches, owner: JobOwner, id: &str) -> Handled {
             }
         }
     });
-    Ok(jsonl_response(Body::from_stream(stream), &file.filename))
+    Body::from_stream(stream)
+}
+
+/// obleth extension: `GET /v1/batches/{id}/results` streams the lines of the
+/// output file so far (`?errors=true`: of the error file), while the batch is
+/// still running as well as after, in the same format.
+async fn results(
+    batches: &Batches,
+    owner: JobOwner,
+    id: &str,
+    q: &HashMap<String, String>,
+) -> Handled {
+    let Some(b) = batches
+        .store
+        .get_batch(id, owner)
+        .await
+        .map_err(store_error)?
+    else {
+        return Err(not_found("batch", id));
+    };
+    let errors = q
+        .get("errors")
+        .is_some_and(|v| matches!(v.as_str(), "true" | "1"));
+    let (which, name) = if errors {
+        (BatchOutput::Error, format!("{}_errors.jsonl", b.id))
+    } else {
+        (BatchOutput::Output, format!("{}_output.jsonl", b.id))
+    };
+    Ok(jsonl_response(output_body(batches, b.id, which), &name))
 }
 
 fn jsonl_response(body: Body, filename: &str) -> Response<Body> {
@@ -724,6 +765,7 @@ pub(crate) fn batch_object(b: &BatchRecord) -> serde_json::Value {
         .as_deref()
         .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok());
     let expires = (b.status == "in_progress").then(|| b.deadline_at.timestamp());
+    let waiting = b.waiting_for_capacity(Utc::now());
     serde_json::json!({
         "id": b.id,
         "object": "batch",
@@ -752,6 +794,8 @@ pub(crate) fn batch_object(b: &BatchRecord) -> serde_json::Value {
         "obleth": {
             "model": b.model,
             "deadline_at": b.deadline_at.timestamp(),
+            "last_progress_at": ts(b.last_progress_at),
+            "waiting": waiting.then_some("capacity"),
         },
     })
 }
@@ -1667,6 +1711,11 @@ mod tests {
             route(&post, "/v1/batches/batch_1/cancel"),
             Some(Route::BatchCancel("batch_1"))
         );
+        assert_eq!(
+            route(&get, "/v1/batches/batch_1/results"),
+            Some(Route::BatchResults("batch_1"))
+        );
+        assert_eq!(route(&post, "/v1/batches/batch_1/results"), None);
         assert_eq!(route(&get, "/v1/files/a.b"), None);
         assert_eq!(route(&post, "/v1/chat/completions"), None);
         assert_eq!(route(&delete, "/v1/batches/batch_1"), None);

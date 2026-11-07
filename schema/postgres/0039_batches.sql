@@ -55,6 +55,9 @@ create table if not exists batches (
     total             integer not null default 0,
     completed         integer not null default 0,
     failed            integer not null default 0,
+    -- When a request of the batch last finished: a batch in progress with
+    -- requests left and no progress for a while is waiting for capacity.
+    last_progress_at  timestamptz,
     metadata          jsonb,
     errors            jsonb,
     created_at        timestamptz not null default now(),
@@ -71,6 +74,8 @@ create index if not exists batches_owner_idx on batches (tenant_id, key_id, crea
 create index if not exists batches_active_idx on batches (status)
     where status in ('in_progress', 'cancelling');
 create index if not exists batches_created_idx on batches (created_at);
+-- The admin list, newest first, across every tenant.
+create index if not exists batches_recent_idx on batches (created_at desc, id desc);
 
 create table if not exists batch_items (
     batch_id         text not null references batches (id) on delete cascade,
