@@ -51,7 +51,7 @@ pub const SLOT_CHAIN_KEY: &str = "obleth:fairshare:chain";
 /// How long a refused claim marks its pool as waited on. Every refusal
 /// renews it, and a waiter retries well inside it, so releases keep
 /// publishing for as long as anyone is still waiting.
-const WAIT_MARK_MS: u64 = 1_000;
+pub(crate) const WAIT_MARK_MS: u64 = 1_000;
 
 /// Where replica and slot state lives. [`Default`] is the gateway's layout;
 /// tests use their own so they cannot disturb, or be disturbed by, anything
@@ -214,6 +214,8 @@ impl RedisStore {
             .arg(claim.hold.as_deref().unwrap_or(""))
             .arg(if claim.redeem_only { "1" } else { "0" })
             .arg(if claim.starving { "1" } else { "0" })
+            .arg(claim.sibling.as_deref().unwrap_or(""))
+            .arg(if claim.background { "1" } else { "0" })
             .invoke_async(&mut conn)
             .await?;
         let outcome = match code {
@@ -251,6 +253,7 @@ impl RedisStore {
             .arg(slot.tenant.to_string())
             .arg(slot.key.to_string())
             .arg(&keys.channel)
+            .arg(slot.sibling.as_deref().unwrap_or(""))
             .invoke_async(&mut conn)
             .await?;
         Ok((

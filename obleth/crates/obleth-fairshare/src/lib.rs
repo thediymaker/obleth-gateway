@@ -119,35 +119,77 @@ fn housekeeping_interval(idle_pool_ttl: Duration) -> Duration {
 pub enum PoolKey {
     /// The pool of a resolved model route.
     Model(String),
+    /// Background work (batches) for a model. It has its own queues and
+    /// fairness, and shares the model's slots with [`PoolKey::Model`]: it is
+    /// served only while the model has no interactive request waiting, and
+    /// only up to a share of the model's pool (see
+    /// [`AdmitRequest::background_share`]).
+    Background(String),
     /// One pool shared by every request that did not resolve to a route, so
     /// arbitrary model strings cannot each mint a pool of their own.
     Unrouted,
 }
 
 impl PoolKey {
-    fn display_name(&self) -> &str {
+    fn display_name(&self) -> String {
         match self {
-            PoolKey::Model(name) => name,
-            PoolKey::Unrouted => UNROUTED_POOL,
+            PoolKey::Model(name) => name.clone(),
+            PoolKey::Background(name) => format!("{name} (batch)"),
+            PoolKey::Unrouted => UNROUTED_POOL.to_string(),
         }
     }
 
     /// The pool's id in the shared slot backend, the same on every replica:
-    /// `m:` and the model name, or `u` for the unrouted pool.
+    /// `m:` and the model name, `b:` and the model name for its background
+    /// pool, or `u` for the unrouted pool.
     pub fn slot_id(&self) -> String {
         match self {
             PoolKey::Model(name) => format!("m:{name}"),
+            PoolKey::Background(name) => format!("b:{name}"),
             PoolKey::Unrouted => "u".into(),
         }
     }
 
     /// The inverse of [`PoolKey::slot_id`].
     pub fn from_slot_id(id: &str) -> Option<Self> {
-        match id {
-            "u" => Some(PoolKey::Unrouted),
-            _ => id.strip_prefix("m:").map(|m| PoolKey::Model(m.to_string())),
+        if id == "u" {
+            return Some(PoolKey::Unrouted);
+        }
+        if let Some(m) = id.strip_prefix("m:") {
+            return Some(PoolKey::Model(m.to_string()));
+        }
+        id.strip_prefix("b:")
+            .map(|m| PoolKey::Background(m.to_string()))
+    }
+
+    /// Whether this is a model's background pool.
+    pub fn is_background(&self) -> bool {
+        matches!(self, PoolKey::Background(_))
+    }
+
+    /// The model's other pool: background for interactive and the reverse.
+    /// Both draw on the same upstream capacity.
+    pub fn sibling(&self) -> Option<PoolKey> {
+        match self {
+            PoolKey::Model(name) => Some(PoolKey::Background(name.clone())),
+            PoolKey::Background(name) => Some(PoolKey::Model(name.clone())),
+            PoolKey::Unrouted => None,
         }
     }
+}
+
+/// The share of a model's pool, and of the global ceiling, that background
+/// work may fill when the request does not say.
+pub const DEFAULT_BACKGROUND_SHARE: f64 = 0.75;
+
+/// `share` of `cap`, rounded down, for a background limit.
+pub fn background_cap(cap: usize, share: f64) -> usize {
+    let share = if share.is_finite() {
+        share.clamp(0.0, 1.0)
+    } else {
+        DEFAULT_BACKGROUND_SHARE
+    };
+    (cap as f64 * share).floor() as usize
 }
 
 /// Live counters for metrics/dashboards.
@@ -347,6 +389,10 @@ pub struct AdmitRequest {
     /// Session affinity for the request's pool: the scheduler's setting, or
     /// the model's own.
     pub affinity: PoolAffinity,
+    /// For a background pool: the share of the model's pool and of the
+    /// global ceiling its work may fill. `None` is
+    /// [`DEFAULT_BACKGROUND_SHARE`]. Ignored for other pools.
+    pub background_share: Option<f64>,
 }
 
 /// Where a pool's session affinity setting comes from.
@@ -384,7 +430,14 @@ impl AdmitRequest {
             end_user: None,
             session: None,
             affinity: PoolAffinity::Scheduler,
+            background_share: None,
         }
+    }
+
+    /// The share of the model's pool a background request may fill.
+    pub fn background_share(mut self, share: f64) -> Self {
+        self.background_share = Some(share);
+        self
     }
 
     pub fn weighted(tenant: Uuid, weight: i64, cost: u32) -> Self {
@@ -478,7 +531,7 @@ pub struct Admitted {
 enum Ctl {
     Admit {
         pool: PoolKey,
-        req: AdmitRequest,
+        req: Box<AdmitRequest>,
         respond: oneshot::Sender<Admitted>,
         enqueued: Instant,
     },
@@ -755,7 +808,7 @@ impl FairShare {
         self.ctl
             .send(Ctl::Admit {
                 pool,
-                req,
+                req: Box::new(req),
                 respond,
                 enqueued: Instant::now(),
             })
@@ -984,6 +1037,9 @@ struct Pool {
     /// Where `affinity`'s setting comes from: the scheduler's, which
     /// [`FairShare::set_session_affinity`] changes, or the model's own.
     affinity_source: PoolAffinity,
+    /// Background pools: the share of the model's pool and of the global
+    /// ceiling this pool may fill (see [`background_cap`]).
+    share: f64,
     ctl_tx: mpsc::UnboundedSender<Ctl>,
 }
 
@@ -1027,6 +1083,7 @@ impl Pool {
             cluster_in_flight: None,
             affinity: affinity::Affinity::default(),
             affinity_source: PoolAffinity::Scheduler,
+            share: DEFAULT_BACKGROUND_SHARE,
             ctl_tx,
         }
     }
@@ -1232,6 +1289,38 @@ impl Pool {
     /// has to yield a freed slot to a smaller group.
     fn effective_cap(&self, headroom: usize) -> usize {
         self.cap.min(self.in_flight.saturating_add(headroom)).max(1)
+    }
+
+    /// The slots this pool may fill now, given what the same model's other
+    /// pool holds (`sibling_in_flight`) and has waiting (`sibling_queued`),
+    /// and the replica's in-flight total against its ceiling.
+    ///
+    /// An interactive pool gives up the slots background work holds. A
+    /// background pool takes nothing new while an interactive request waits,
+    /// and fills at most its share of the pool and of the ceiling, both
+    /// counting every request in flight; the rest stays free for
+    /// interactive arrivals.
+    fn effective_with(
+        &self,
+        headroom: usize,
+        sibling_in_flight: usize,
+        sibling_queued: usize,
+        replica_in_flight: usize,
+        ceiling: usize,
+    ) -> usize {
+        if !self.key.is_background() {
+            return self
+                .cap
+                .saturating_sub(sibling_in_flight)
+                .min(self.in_flight.saturating_add(headroom))
+                .max(1);
+        }
+        if sibling_queued > 0 {
+            return self.in_flight;
+        }
+        let pool_room = background_cap(self.cap, self.share).saturating_sub(sibling_in_flight);
+        let global_room = background_cap(ceiling, self.share).saturating_sub(replica_in_flight);
+        pool_room.min(self.in_flight.saturating_add(global_room))
     }
 
     fn compute_group_caps(&self, effective: usize) -> HashMap<String, usize> {
@@ -1465,12 +1554,23 @@ impl Pool {
         holds: bool,
         redeem_only: bool,
     ) -> SlotClaim {
+        let background = self.key.is_background();
+        let (pool_cap, global_cap) = if background {
+            (
+                background_cap(self.configured_cap, self.share),
+                background_cap(global_cap, self.share),
+            )
+        } else {
+            (self.configured_cap, global_cap)
+        };
         SlotClaim {
             pool: self.key.slot_id(),
             tenant,
             key,
-            pool_cap: self.configured_cap,
+            pool_cap,
             global_cap,
+            sibling: self.key.sibling().map(|k| k.slot_id()),
+            background,
             tenant_cap: self.tenant_cap.get(&tenant).copied(),
             key_cap: self.key_cap.get(&key).copied(),
             hold: waiter
@@ -2421,6 +2521,27 @@ impl Scheduler {
         replica_share(self.capacity.max_in_flight(), self.divisor)
     }
 
+    /// What the same model's other pool holds and has waiting here.
+    fn sibling_load(&self, key: &PoolKey) -> (usize, usize) {
+        key.sibling()
+            .and_then(|s| self.pools.get(&s))
+            .map(|p| (p.in_flight, p.queued_total))
+            .unwrap_or((0, 0))
+    }
+
+    /// The slots `key`'s pool may fill now (see [`Pool::effective_with`]).
+    fn effective_of(&self, key: &PoolKey, headroom: usize, ceiling: usize) -> Option<usize> {
+        let pool = self.pools.get(key)?;
+        let (sibling_in_flight, sibling_queued) = self.sibling_load(key);
+        Some(pool.effective_with(
+            headroom,
+            sibling_in_flight,
+            sibling_queued,
+            self.in_flight,
+            ceiling,
+        ))
+    }
+
     /// The mode the current state calls for (see [`SlotMode`]).
     fn wanted_mode(&self) -> SlotMode {
         match &self.shared {
@@ -2487,10 +2608,11 @@ impl Scheduler {
         match msg {
             Ctl::Admit {
                 pool: key,
-                mut req,
+                req,
                 respond,
                 enqueued,
             } => {
+                let mut req = *req;
                 let affinity = match req.affinity {
                     PoolAffinity::Scheduler => self.session_affinity,
                     PoolAffinity::Model(config) => config,
@@ -2504,20 +2626,29 @@ impl Scheduler {
                 let headroom = ceiling.saturating_sub(self.in_flight);
                 let default_cap = self.default_model_cap;
                 let override_cap = match &key {
-                    PoolKey::Model(name) => self.model_caps.get(name).copied(),
+                    PoolKey::Model(name) | PoolKey::Background(name) => {
+                        self.model_caps.get(name).copied()
+                    }
                     PoolKey::Unrouted => None,
                 };
+                let (sibling_in_flight, sibling_queued) = self.sibling_load(&key);
+                let replica_in_flight = self.in_flight;
                 let shared_mode = self.mode == SlotMode::Shared;
                 let quiescing = self.quiescing();
                 let pool = self.pool_mut(&key);
+                if key.is_background() {
+                    pool.share = req.background_share.unwrap_or(DEFAULT_BACKGROUND_SHARE);
+                }
                 pool.set_configured_cap(match key {
                     // No route means no configured cap to honour.
                     PoolKey::Unrouted => default_cap,
-                    PoolKey::Model(_) => override_cap.unwrap_or_else(|| {
-                        req.model_max_in_flight
-                            .filter(|c| *c > 0)
-                            .unwrap_or(default_cap)
-                    }),
+                    PoolKey::Model(_) | PoolKey::Background(_) => {
+                        override_cap.unwrap_or_else(|| {
+                            req.model_max_in_flight
+                                .filter(|c| *c > 0)
+                                .unwrap_or(default_cap)
+                        })
+                    }
                 });
                 pool.idle_since = None;
                 pool.track_meta(&req);
@@ -2531,7 +2662,13 @@ impl Scheduler {
                     self.publish_stats();
                     return;
                 }
-                let effective = pool.effective_cap(headroom);
+                let effective = pool.effective_with(
+                    headroom,
+                    sibling_in_flight,
+                    sibling_queued,
+                    replica_in_flight,
+                    ceiling,
+                );
                 let fast = headroom > 0 && pool.can_grant_immediately(&req, effective);
                 if shared_mode {
                     // Every admission takes a cluster-wide slot first.
@@ -2743,6 +2880,7 @@ impl Scheduler {
                 pool: pool_key.slot_id(),
                 tenant,
                 key,
+                sibling: pool_key.sibling().map(|k| k.slot_id()),
             });
         } else {
             self.note_unrecorded();
@@ -2791,6 +2929,7 @@ impl Scheduler {
             pool: pool_key.slot_id(),
             tenant,
             key,
+            sibling: pool_key.sibling().map(|k| k.slot_id()),
         };
         let fut = s.backend.hold(slot, hold);
         let timeout = s.config.op_timeout;
@@ -3024,6 +3163,9 @@ impl Scheduler {
                 let idx = (self.cursor + i) % n;
                 let headroom = ceiling.saturating_sub(self.in_flight);
                 let key = self.pool_order[idx].clone();
+                let Some(effective) = self.effective_of(&key, headroom, ceiling) else {
+                    continue;
+                };
                 let Some(pool) = self.pools.get_mut(&key) else {
                     continue;
                 };
@@ -3031,7 +3173,6 @@ impl Scheduler {
                 if pool.queued_total == 0 || pool.blocked || pool.pending.len() >= limit {
                     continue;
                 }
-                let effective = pool.effective_cap(headroom);
                 let (next, dropped) = pool.take_next(effective);
                 if dropped > 0 {
                     pool.settle_idle();
@@ -3184,8 +3325,12 @@ impl Scheduler {
                 pool.requeue(claim);
                 pool.probing = true;
                 pool.cluster_in_flight = Some(counts.pool);
+                // A background claim's ceiling is its own share of the global
+                // one, so reaching it blocks only its pool, never the others.
+                let background = key.is_background();
                 match denial {
                     SlotDenial::Pool => pool.blocked = true,
+                    SlotDenial::Global if background => pool.blocked = true,
                     SlotDenial::Tenant => {
                         pool.blocked_tenants.insert(tenant);
                     }
@@ -3198,7 +3343,7 @@ impl Scheduler {
                 self.queued_total += 1;
                 if let Some(s) = self.shared.as_mut() {
                     s.cluster_in_flight = Some(counts.global);
-                    if denial == SlotDenial::Global {
+                    if denial == SlotDenial::Global && !background {
                         s.global_blocked = true;
                     }
                 }
@@ -3478,17 +3623,18 @@ impl Scheduler {
                 }
                 let idx = (self.cursor + i) % n;
                 let headroom = ceiling.saturating_sub(self.in_flight);
-                let (granted, dropped) = match self.pools.get_mut(&self.pool_order[idx]) {
-                    Some(pool) if pool.queued_total > 0 => {
-                        let effective = pool.effective_cap(headroom);
-                        let outcome = pool.dispatch_one(effective);
-                        if outcome.1 > 0 {
-                            pool.settle_idle();
+                let effective = self.effective_of(&self.pool_order[idx], headroom, ceiling);
+                let (granted, dropped) =
+                    match (self.pools.get_mut(&self.pool_order[idx]), effective) {
+                        (Some(pool), Some(effective)) if pool.queued_total > 0 => {
+                            let outcome = pool.dispatch_one(effective);
+                            if outcome.1 > 0 {
+                                pool.settle_idle();
+                            }
+                            outcome
                         }
-                        outcome
-                    }
-                    _ => (false, 0),
-                };
+                        _ => (false, 0),
+                    };
                 self.queued_total = self.queued_total.saturating_sub(dropped);
                 if granted {
                     self.in_flight += 1;
@@ -3504,12 +3650,20 @@ impl Scheduler {
     }
 
     fn publish_model_load(&self, key: &PoolKey) {
-        // The unrouted pool is not a model the router could pick.
-        let PoolKey::Model(model) = key else {
+        // The unrouted pool is not a model the router could pick. Background
+        // work runs on the same upstreams, so it counts toward the model.
+        let (PoolKey::Model(model) | PoolKey::Background(model)) = key else {
             return;
         };
+        let in_flight = [
+            PoolKey::Model(model.clone()),
+            PoolKey::Background(model.clone()),
+        ]
+        .iter()
+        .filter_map(|k| self.pools.get(k).map(|p| p.in_flight))
+        .reduce(|a, b| a + b);
         if let Ok(mut shared) = self.model_load.write() {
-            match self.pools.get(key).map(|p| p.in_flight) {
+            match in_flight {
                 Some(n) if n > 0 => {
                     shared.insert(model.clone(), n);
                 }

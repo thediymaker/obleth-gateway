@@ -806,6 +806,8 @@ async fn handler_inner(
             &available_tags,
             &router_settings,
             effort_header,
+            // Verdicts writes its own prompt; there is no client system text.
+            None,
             // Input guardrails already ran on this state and these questions.
             false,
         )
@@ -2332,6 +2334,7 @@ mod model_choice_tests {
             jobs: crate::jobs::JobStore::new(store, Default::default()),
             load: None,
             crash_guard: crate::crash_guard::CrashGuard::disabled(),
+            batches: None,
         };
         Some(Gateway { state, wal_dir })
     }

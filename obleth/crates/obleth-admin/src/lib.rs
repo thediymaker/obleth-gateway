@@ -10,6 +10,7 @@ pub mod advice;
 pub mod alerts;
 pub mod autotune;
 mod backup;
+mod batches;
 pub mod capacity_discovery;
 pub mod energy_probe;
 mod error;
@@ -407,6 +408,9 @@ pub fn router(state: AdminState) -> Router {
                 .delete(delete_mcp_server),
         )
         .route("/api/v1/audit", get(get_audit))
+        .route("/api/v1/batches", get(batches::list_batches))
+        .route("/api/v1/batches/:id", get(batches::get_batch))
+        .route("/api/v1/batches/:id/cancel", post(batches::cancel_batch))
         .route("/api/v1/stats/daily", get(get_daily_stats))
         .route("/api/v1/capacity", get(get_capacity).put(set_capacity))
         .route(
@@ -2843,6 +2847,11 @@ pub struct SimulateRouteRequest {
     pub needs_tool_choice: bool,
     #[serde(default)]
     pub needs_response_schema: bool,
+    /// Bytes at the end of the system text the classifier may read, as the
+    /// `x-obleth-classify-system` header sets on the data plane. Absent reads
+    /// all of it.
+    #[serde(default)]
+    pub classify_system: Option<usize>,
     /// Weight overrides. Unset fields fall back to the saved settings.
     #[serde(default)]
     pub capacity_weight: Option<f64>,
@@ -3019,10 +3028,11 @@ async fn simulate_route(
                 if !menu.is_empty() {
                     // `None` is the classifier's failure shape; heuristics take
                     // over below, exactly as on the data plane.
-                    intent = classify_turns(classifier_prompts(&json), |prompt| {
-                        classify(prompt, menu.clone())
-                    })
-                    .await;
+                    intent =
+                        classify_turns(classifier_prompts(&json, body.classify_system), |prompt| {
+                            classify(prompt, menu.clone())
+                        })
+                        .await;
                 }
             }
         }
@@ -11606,6 +11616,8 @@ mod tests {
                 hold: None,
                 redeem_only: false,
                 starving: false,
+                sibling: None,
+                background: false,
             };
             use obleth_fairshare::SharedSlots;
             other.acquire(claim).await.expect("claimed");

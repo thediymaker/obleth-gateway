@@ -160,6 +160,26 @@ obleth:
   # request waits. It names no other tenant or key. false makes the path
   # answer 404.
   loadEndpoint: true
+  # The OpenAI Files and Batches APIs (/v1/files, /v1/batches). Batch
+  # requests run through the gateway at background priority: only while a
+  # model has no interactive request waiting, and in at most `maxShare` of
+  # its slots, so interactive callers always find the rest free.
+  batches:
+    enabled: true
+    maxShare: "0.75"
+    maxLines: 50000
+    maxFileBytes: 209715200
+    maxActivePerKey: 10
+    # completion_window bounds, as <n>h or <n>d.
+    windowMin: 1h
+    windowMax: 7d
+    # Batch requests each replica keeps in flight (running or waiting for a
+    # slot).
+    runnerConcurrency: 64
+    retentionDays: 30
+    # `key`: files and batches are private to the key that created them;
+    # `tenant`: shared by every key of the tenant.
+    scope: key
   resources:
     requests: { cpu: "250m", memory: "256Mi" }
     limits: { cpu: "2", memory: "1Gi" }

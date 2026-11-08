@@ -432,3 +432,19 @@ export function SettingsSkeleton() {
     </Loading>
   );
 }
+
+export function BatchesSkeleton() {
+  return (
+    <Loading label="Loading batches">
+      <Header controls={1} />
+      <Tiles count={4} className="grid grid-cols-2 gap-3 xl:grid-cols-4" />
+      <SkeletonPanel className="gap-0 p-0">
+        {Array.from({ length: 8 }, (_, i) => (
+          <div key={i} className="flex items-center gap-4 border-t border-border px-4 py-3.5 first:border-t-0">
+            <Skeleton className="h-4 w-40" /><Skeleton className="h-4 w-28" /><Skeleton className="h-2 w-64 rounded-full" /><Skeleton className="h-4 w-24" /><Skeleton className="ml-auto h-7 w-16" />
+          </div>
+        ))}
+      </SkeletonPanel>
+    </Loading>
+  );
+}

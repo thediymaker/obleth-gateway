@@ -999,6 +999,16 @@ async fn proxy_handler_inner(
     resp
 }
 
+/// Run a request the gateway makes for itself (a batch item) through the
+/// pipeline, as [`proxy_handler`] does for one from a client.
+pub(crate) async fn run_internal(
+    state: AppState,
+    req: Request<Body>,
+    request_id: Uuid,
+) -> Response<Body> {
+    proxy_handler_inner(State(state), req, request_id).await
+}
+
 /// `resp` with [`MODEL_VARIANT_HEADER`] set when the request named a variant.
 fn with_variant_header(mut resp: Response<Body>, variant: Option<&str>) -> Response<Body> {
     if let Some(value) = variant.and_then(|v| header::HeaderValue::from_str(v).ok()) {
@@ -1058,6 +1068,13 @@ async fn run_pipeline(
         .map(|q| format!("?{q}"))
         .unwrap_or_default();
     let headers = parts.headers;
+    // A batch item the runner sends in process: the caller is the batch's
+    // owner, already resolved, and the request is background work. Only the
+    // runner sets this; it never arrives over HTTP.
+    let batch = parts
+        .extensions
+        .get::<crate::batches::BatchCaller>()
+        .cloned();
 
     // ---- reject path traversal before any upstream work ----
     if has_path_traversal(&path) {
@@ -1065,18 +1082,23 @@ async fn run_pipeline(
     }
 
     // ---- auth ----
-    let Some(secret) = bearer(&headers) else {
-        return error_json(StatusCode::UNAUTHORIZED, "missing bearer token");
-    };
     let auth_start = crate::tracer::now_ms();
-    // Shared with the MCP handler (`crate::mcp::mcp_handler`) so both surfaces
-    // authenticate identically: JWT path when the feature is on and the
-    // credential looks like a JWT, else the existing secret-key path.
-    let (resolved, device_id, auth_kind) =
-        match crate::jwt_auth::authenticate_credential(&state, &secret).await {
-            Ok(cred) => (cred.resolved, cred.device_id, cred.auth_kind),
-            Err(resp) => return resp,
-        };
+    let (resolved, device_id, auth_kind) = match &batch {
+        Some(b) => (b.resolved.clone(), String::new(), "batch"),
+        None => {
+            let Some(secret) = bearer(&headers) else {
+                return error_json(StatusCode::UNAUTHORIZED, "missing bearer token");
+            };
+            // Shared with the MCP handler (`crate::mcp::mcp_handler`) so both
+            // surfaces authenticate identically: JWT path when the feature is
+            // on and the credential looks like a JWT, else the existing
+            // secret-key path.
+            match crate::jwt_auth::authenticate_credential(&state, &secret).await {
+                Ok(cred) => (cred.resolved, cred.device_id, cred.auth_kind),
+                Err(resp) => return resp,
+            }
+        }
+    };
     let auth_duration = (crate::tracer::now_ms() - auth_start) as u32;
     if let Err(resp) = gate_resolved_key(&state, &resolved) {
         return resp;
@@ -1099,6 +1121,16 @@ async fn run_pipeline(
             .await;
     }
     let job_create = crate::jobs::is_create(&method, &path);
+
+    // ---- files and batches (when batches are on) ----
+    if let (Some(batches), None) = (state.batches.as_ref(), batch.as_ref()) {
+        if let Some(route) = crate::batches::route(&method, &path) {
+            return crate::batches::handle(
+                &state, batches, &resolved, route, &query, &headers, body,
+            )
+            .await;
+        }
+    }
 
     // ---- request flight-recorder tracer ----
     let mut tracer: Option<crate::tracer::SpanRecorder> = if resolved.tracing_enabled {
@@ -1255,7 +1287,11 @@ async fn run_pipeline(
     let mut req_meta = RequestMeta {
         session_id: conversation.value,
         session_id_source: conversation.source.as_str(),
-        request_type: surfaced_request_type(&resolved, &path, &headers),
+        request_type: if batch.is_some() {
+            obleth_config::BATCH_REQUEST_TYPE
+        } else {
+            surfaced_request_type(&resolved, &path, &headers)
+        },
         device_id,
         end_user: end_user.clone().unwrap_or_default(),
         // Set below once the model name resolves.
@@ -1322,6 +1358,11 @@ async fn run_pipeline(
         // neutral default.
         let available_tags = union_candidate_tags(&candidates, allowed);
         let effort_header = headers.get("x-obleth-effort").and_then(|v| v.to_str().ok());
+        let classify_system = crate::router::classify_system_from_header(
+            headers
+                .get(crate::router::CLASSIFY_SYSTEM_HEADER)
+                .and_then(|v| v.to_str().ok()),
+        );
         // With stickiness on, find the model that answered this conversation's
         // last turn before deciding anything.
         let conversation = if router_settings.sticky_enabled {
@@ -1347,6 +1388,7 @@ async fn run_pipeline(
                 &available_tags,
                 &router_settings,
                 effort_header,
+                classify_system,
                 skip_classifier,
             ),
             crate::sticky::complaint(
@@ -2117,7 +2159,16 @@ async fn run_pipeline(
     // strings cannot each mint scheduler state.
     let admission_start = crate::tracer::now_ms();
     let pool = admission_pool(route.as_deref());
-    let admit_wait = admission_timeout();
+    // A batch item waits in the model's background pool, without the
+    // interactive admission timeout.
+    let pool = match (pool, &batch) {
+        (obleth_fairshare::PoolKey::Model(m), Some(_)) => obleth_fairshare::PoolKey::Background(m),
+        (pool, _) => pool,
+    };
+    let admit_wait = batch
+        .as_ref()
+        .map(|b| b.admission_wait)
+        .unwrap_or_else(admission_timeout);
     // Session affinity can only keep a conversation warm on an upstream it
     // keeps going back to.
     let mut admit_req = admit_request_for(
@@ -2128,7 +2179,9 @@ async fn run_pipeline(
         est.total(),
         end_user.as_deref(),
     );
-    if route_keeps_sessions(route.as_deref()) {
+    if let Some(b) = &batch {
+        admit_req = admit_req.background_share(b.share);
+    } else if route_keeps_sessions(route.as_deref()) {
         admit_req = admit_req.session(req_meta.session_id.as_str());
     }
     if let Some(r) = route
@@ -4965,6 +5018,7 @@ pub(crate) async fn derive_intent(
     available_tags: &[String],
     settings: &obleth_config::AutoRouterSettings,
     effort_header: Option<&str>,
+    classify_system: Option<usize>,
     skip_classifier: bool,
 ) -> crate::router::Intent {
     let forced = crate::router::difficulty_from_header(effort_header);
@@ -4974,7 +5028,7 @@ pub(crate) async fn derive_intent(
             if name != crate::router::AUTO_MODEL_NAME {
                 if let Some(brain) = resolve_model(state, name).await {
                     let brain = &brain;
-                    let prompts = crate::router::classifier_prompts(json);
+                    let prompts = crate::router::classifier_prompts(json, classify_system);
                     let classified = crate::router::classify_turns(prompts, |prompt| async move {
                         state
                             .classifier
@@ -5134,6 +5188,7 @@ pub(crate) fn admit_request_for(
         end_user,
         session: None,
         affinity: Default::default(),
+        background_share: None,
     }
 }
 
@@ -5511,7 +5566,7 @@ fn reasoning_fields(reasoning: &obleth_config::ModelReasoning) -> Option<serde_j
 /// may see everything (internal callers, and tenants without an allowlist).
 /// Entries are canonical `model_name`s, which is also what the discovery
 /// endpoints advertise.
-fn allowed_models_for(resolved: &ResolvedKey) -> Option<&[String]> {
+pub(crate) fn allowed_models_for(resolved: &ResolvedKey) -> Option<&[String]> {
     if resolved.internal {
         None
     } else {
@@ -5520,7 +5575,7 @@ fn allowed_models_for(resolved: &ResolvedKey) -> Option<&[String]> {
 }
 
 /// True when `model_name` is visible under `allowed` (see [`allowed_models_for`]).
-fn model_visible(allowed: Option<&[String]>, model_name: &str) -> bool {
+pub(crate) fn model_visible(allowed: Option<&[String]>, model_name: &str) -> bool {
     allowed.is_none_or(|list| list.iter().any(|m| m == model_name))
 }
 

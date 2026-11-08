@@ -2151,6 +2151,8 @@ mod tests {
             hold: None,
             redeem_only: false,
             starving: false,
+            sibling: None,
+            background: false,
         }
     }
 
@@ -2339,6 +2341,7 @@ mod tests {
             pool: c.pool.clone(),
             tenant: c.tenant,
             key: c.key,
+            sibling: None,
         };
         // b holds nothing, so its release frees nothing.
         let (freed, counts) = store.slot_release(&keys, "b", &slot).await.unwrap();
@@ -2370,6 +2373,7 @@ mod tests {
             pool: c.pool.clone(),
             tenant: c.tenant,
             key: c.key,
+            sibling: None,
         }
     }
 
@@ -2605,6 +2609,7 @@ mod tests {
             pool: starving.pool.clone(),
             tenant: starving.tenant,
             key: starving.key,
+            sibling: None,
         };
         let (held, counts) = store.slot_hold(&keys, "b", &next, &hold).await.unwrap();
         assert!(!held);
@@ -2656,6 +2661,7 @@ mod tests {
             pool: held[0].pool.clone(),
             tenant: held[0].tenant,
             key: held[0].key,
+            sibling: None,
         };
         let (freed, _) = store.slot_release(&keys, "b", &slot).await.unwrap();
         assert!(!freed);
@@ -2740,6 +2746,162 @@ mod tests {
     }
 
     /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    /// A model's interactive and background pools share its cap: each claim
+    /// counts the other pool's slots, a background refusal marks nothing as
+    /// waited on, and freeing a background slot wakes interactive waiters.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sibling_pools_share_the_model_cap() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let keys = replica_test_key();
+        live(&store, &keys, &["a", "b"]).await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (subscribed_tx, mut subscribed) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let listener = {
+            let (store, keys) = (store.clone(), keys.clone());
+            tokio::spawn(async move {
+                store
+                    .run_slot_release_listener(
+                        &keys,
+                        move |pool| {
+                            let _ = tx.send(pool);
+                        },
+                        move |_| {
+                            let _ = subscribed_tx.send(());
+                        },
+                    )
+                    .await
+            })
+        };
+        subscribed.recv().await.expect("subscribed");
+
+        let bg = |cap| SlotClaim {
+            sibling: Some("m:s".into()),
+            background: true,
+            ..claim("b:s", cap, 100)
+        };
+        let fg = || SlotClaim {
+            sibling: Some("b:s".into()),
+            ..claim("m:s", 4, 100)
+        };
+        // Background may fill 3 of 4.
+        let mut bg_slots = Vec::new();
+        for _ in 0..3 {
+            let c = bg(3);
+            let (outcome, _) = store.slot_acquire(&keys, "a", &c).await.unwrap();
+            assert_eq!(outcome, AcquireOutcome::Granted);
+            bg_slots.push(c);
+        }
+        let (outcome, _) = store.slot_acquire(&keys, "a", &bg(3)).await.unwrap();
+        assert_eq!(outcome, AcquireOutcome::Denied(SlotDenial::Pool));
+        // Marked on its own pool only: interactive holds read `w|m:s`.
+        assert!(
+            totals_field(&store, &keys, "w|b:s").await > 0,
+            "own pool marked"
+        );
+        assert_eq!(totals_field(&store, &keys, "w|m:s").await, 0);
+        assert_eq!(totals_field(&store, &keys, "w").await, 0);
+        // A background refusal at its share of the ceiling marks its pool,
+        // not the ceiling.
+        let (outcome, _) = store
+            .slot_acquire(
+                &keys,
+                "a",
+                &SlotClaim {
+                    global_cap: 1,
+                    ..bg(9)
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, AcquireOutcome::Denied(SlotDenial::Global));
+        assert_eq!(totals_field(&store, &keys, "w").await, 0);
+
+        // Interactive takes the last slot, then counts background's three.
+        let (outcome, _) = store.slot_acquire(&keys, "b", &fg()).await.unwrap();
+        assert_eq!(outcome, AcquireOutcome::Granted);
+        let (outcome, _) = store.slot_acquire(&keys, "b", &fg()).await.unwrap();
+        assert_eq!(outcome, AcquireOutcome::Denied(SlotDenial::Pool));
+
+        // Freeing a background slot wakes both pools: each was waited on.
+        let c = bg_slots.pop().unwrap();
+        let slot = SlotRelease {
+            pool: c.pool.clone(),
+            tenant: c.tenant,
+            key: c.key,
+            sibling: Some("m:s".into()),
+        };
+        let (freed, _) = store.slot_release(&keys, "a", &slot).await.unwrap();
+        assert!(freed);
+        let mut woken = Vec::new();
+        for _ in 0..2 {
+            woken.push(
+                tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("published")
+                    .unwrap(),
+            );
+        }
+        woken.sort();
+        assert_eq!(woken, vec!["b:s".to_string(), "m:s".to_string()]);
+        let last = fg();
+        let (outcome, _) = store.slot_acquire(&keys, "b", &last).await.unwrap();
+        assert_eq!(outcome, AcquireOutcome::Granted);
+
+        // Slots free while the interactive pool is still marked as waited on
+        // (by gw-b's refusal above): background on gw-a is refused although
+        // there is room under its share, since an interactive request may be
+        // waiting for that slot.
+        let (freed, _) = store
+            .slot_release(
+                &keys,
+                "b",
+                &SlotRelease {
+                    pool: last.pool.clone(),
+                    tenant: last.tenant,
+                    key: last.key,
+                    sibling: Some("b:s".into()),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(freed);
+        // And a background slot: the pool is at 2 of 4, under background's
+        // share of 3, so only the mark stands in the way.
+        let c = bg_slots.pop().unwrap();
+        let (freed, _) = store
+            .slot_release(
+                &keys,
+                "a",
+                &SlotRelease {
+                    pool: c.pool.clone(),
+                    tenant: c.tenant,
+                    key: c.key,
+                    sibling: Some("m:s".into()),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(freed);
+        assert!(
+            totals_field(&store, &keys, "w|m:s").await > 0,
+            "still marked"
+        );
+        let (outcome, _) = store.slot_acquire(&keys, "a", &bg(3)).await.unwrap();
+        assert_eq!(outcome, AcquireOutcome::Denied(SlotDenial::Pool));
+        // Once nobody has waited for a while, background may take it.
+        tokio::time::sleep(std::time::Duration::from_millis(
+            crate::slots::WAIT_MARK_MS + 100,
+        ))
+        .await;
+        let (outcome, _) = store.slot_acquire(&keys, "a", &bg(3)).await.unwrap();
+        assert_eq!(outcome, AcquireOutcome::Granted);
+        listener.abort();
+        drop_test_keys(&store, &keys, &["a", "b"]).await;
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
     /// A release publishes the pool only while someone waits for it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn slot_releases_publish_only_while_someone_waits() {
@@ -2774,6 +2936,7 @@ mod tests {
             pool: c.pool.clone(),
             tenant: c.tenant,
             key: c.key,
+            sibling: None,
         };
         store.slot_release(&keys, "a", &slot).await.unwrap();
         let quiet = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;

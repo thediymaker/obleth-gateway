@@ -75,6 +75,15 @@ pub struct SlotClaim {
     pub key: Uuid,
     pub pool_cap: usize,
     pub global_cap: usize,
+    /// The same model's other pool (see [`crate::PoolKey::sibling`]): its
+    /// count is added to this pool's when checking `pool_cap`, since both
+    /// draw on the same upstream capacity.
+    pub sibling: Option<String>,
+    /// A background claim: a refusal marks only its own pool as waited on,
+    /// never the global ceiling, so a freed slot wakes background waiters
+    /// without changing anything for interactive callers (their pool's
+    /// session-affinity holds look at their own pool's mark).
+    pub background: bool,
     pub tenant_cap: Option<usize>,
     pub key_cap: Option<usize>,
     /// The id of a slot held for this request's session ([`SlotHold::id`]):
@@ -117,6 +126,9 @@ pub struct SlotRelease {
     pub pool: String,
     pub tenant: Uuid,
     pub key: Uuid,
+    /// The same model's other pool: a freed slot is room for its waiters
+    /// too, so they are woken as well.
+    pub sibling: Option<String>,
 }
 
 /// Which cluster-wide limit refused a claim.
@@ -630,6 +642,12 @@ impl SharedSlots for InMemorySlots {
             freed.extend(s.free_pool_holds(&claim.pool, claim.hold.as_deref()));
         }
         let held = claim.hold.as_ref().filter(|id| s.holds.contains_key(*id));
+        // Background work steps aside while an interactive request waits on
+        // its model or on the ceiling anywhere, as the Redis backend does.
+        let now = Instant::now();
+        let marked = |s: &MemState, mark: &str| s.waiting.get(mark).is_some_and(|t| *t > now);
+        let yield_to_interactive = claim.background
+            && (claim.sibling.as_deref().is_some_and(|sib| marked(&s, sib)) || marked(&s, ""));
         let outcome = if !live {
             AcquireOutcome::NotRegistered
         } else if let Some(id) = held {
@@ -638,7 +656,14 @@ impl SharedSlots for InMemorySlots {
             AcquireOutcome::Redeemed
         } else if claim.redeem_only {
             AcquireOutcome::NotHeld
-        } else if s.count(&pf) >= claim.pool_cap {
+        } else if yield_to_interactive
+            || s.count(&pf)
+                + claim
+                    .sibling
+                    .as_deref()
+                    .map_or(0, |sib| s.count(&pool_field(sib)))
+                >= claim.pool_cap
+        {
             AcquireOutcome::Denied(SlotDenial::Pool)
         } else if s.count(GLOBAL_FIELD) >= claim.global_cap {
             AcquireOutcome::Denied(SlotDenial::Global)
@@ -654,7 +679,7 @@ impl SharedSlots for InMemorySlots {
         };
         if let AcquireOutcome::Denied(denial) = outcome {
             let mark = match denial {
-                SlotDenial::Global => String::new(),
+                SlotDenial::Global if !claim.background => String::new(),
                 _ => claim.pool.clone(),
             };
             s.waiting.insert(mark, Instant::now() + WAIT_MARK);
@@ -770,6 +795,9 @@ impl SharedSlots for InMemorySlots {
         };
         for fs in subs {
             fs.wake(&slot.pool);
+            if let Some(sibling) = &slot.sibling {
+                fs.wake(sibling);
+            }
         }
         Box::pin(async move { Ok(counts) })
     }

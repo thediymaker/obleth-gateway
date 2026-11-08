@@ -523,6 +523,10 @@ return out
 /// ARGV[13] = '1' to take only that held slot,
 /// ARGV[14] = '1' when a request for the pool has waited too long to keep
 /// yielding to held slots
+/// ARGV[15] = the same model's other pool ('' for none): its count is added
+/// to this pool's when checking the pool cap
+/// ARGV[16] = '1' for a background claim: any refusal marks only its own
+/// pool as waited on, never the global ceiling
 ///
 /// A replica whose heartbeat has expired may not take slots: its holdings
 /// are about to be (or have been) reclaimed. Held slots that ran out are
@@ -536,6 +540,10 @@ return out
 /// counters are taken together, in the totals and in the holdings; if any is
 /// at its cap nothing is taken and the pool (or, for the global ceiling, the
 /// ceiling) is marked as waited on, so the next release there publishes.
+/// A background claim (ARGV[16]) is refused as pool full while its model's
+/// interactive pool (ARGV[15]) or the global ceiling is marked as waited on
+/// on any replica: a slot freed while an interactive request waits anywhere
+/// goes to that request, never to background work that reached it first.
 ///
 /// Returns `{code, pool count, global count}`, counts after the call. Codes:
 /// 1 granted, 2 took over a held slot, 3 no slot held (claim for a held
@@ -588,15 +596,24 @@ if ARGV[12] ~= '' then
 end
 
 local tcap, kcap = tonumber(ARGV[7]), tonumber(ARGV[8])
+local sib = 0
+if ARGV[15] ~= '' then
+  sib = tonumber(redis.call('HGET', totals, 'p|' .. ARGV[15])) or 0
+end
 local code = 1
-if p >= tonumber(ARGV[5]) then code = 0
+local yield = false
+if ARGV[16] == '1' then
+  local w = redis.call('HMGET', totals, 'w|' .. ARGV[15], 'w')
+  yield = (tonumber(w[1]) or 0) > now or (tonumber(w[2]) or 0) > now
+end
+if yield or p + sib >= tonumber(ARGV[5]) then code = 0
 elseif g >= tonumber(ARGV[6]) then code = -1
 elseif tcap > 0 and tn >= tcap then code = -2
 elseif kcap > 0 and kn >= kcap then code = -3
 end
 if code ~= 1 then
   local mark = 'w|' .. pool
-  if code == -1 then mark = 'w' end
+  if code == -1 and ARGV[16] ~= '1' then mark = 'w' end
   redis.call('HSET', totals, mark, now + tonumber(ARGV[9]))
   return { code, p, g }
 end
@@ -613,12 +630,13 @@ return { 1, p + 1, g + 1 }
 ///
 /// KEYS[1] = slot totals hash, KEYS[2] = this replica's holdings
 /// ARGV[1] = pool id, ARGV[2] = tenant, ARGV[3] = key, ARGV[4] = release
-/// channel
+/// channel, ARGV[5] = the same model's other pool ('' for none)
 ///
 /// Each counter is decremented only where this replica's holdings still
 /// record it, so a release after a reclaim or a reconcile that already
 /// dropped the slot frees nothing twice. Publishes the pool id when a slot
-/// was freed and someone is waiting on the pool or the ceiling.
+/// was freed and someone is waiting on the pool or the ceiling, and the
+/// other pool's id when someone is waiting there.
 ///
 /// Returns `{freed (0|1), pool count, global count}`.
 pub const SLOT_RELEASE: &str = concat!(
@@ -635,7 +653,10 @@ for _, f in ipairs({ 'g', pf, 't|' .. pool .. '|' .. ARGV[2], 'k|' .. pool .. '|
     if f == pf then freed = 1 end
   end
 end
-if freed == 1 then wake(totals, pool, ARGV[4], now_ms()) end
+if freed == 1 then
+  wake(totals, pool, ARGV[4], now_ms())
+  if ARGV[5] ~= nil and ARGV[5] ~= '' then wake(totals, ARGV[5], ARGV[4], now_ms()) end
+end
 local c = redis.call('HMGET', totals, pf, 'g')
 return { freed, tonumber(c[1]) or 0, tonumber(c[2]) or 0 }
 "#
