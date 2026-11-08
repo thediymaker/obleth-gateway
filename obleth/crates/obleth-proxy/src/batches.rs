@@ -11,6 +11,8 @@
 //! GET    /v1/batches                list batches
 //! GET    /v1/batches/{id}           batch object
 //! POST   /v1/batches/{id}/cancel    cancel a batch
+//! GET    /v1/batches/{id}/results   results so far (obleth extension)
+//! DELETE /v1/batches/{id}           delete a stopped batch (obleth extension)
 //! ```
 //!
 //! A batch is checked line by line when it is created; each line becomes an
@@ -39,8 +41,8 @@ use axum::response::IntoResponse;
 use chrono::{DateTime, Utc};
 use obleth_config::{JobScope, ResolvedKey};
 use obleth_store::batches::{
-    BatchFile, BatchOutput, BatchRecord, ClaimedItem, NewBatch, NewBatchFile, NewBatchItem,
-    OutputRow, PURPOSE_BATCH, PURPOSE_BATCH_ERROR, PURPOSE_BATCH_OUTPUT,
+    BatchDeletion, BatchFile, BatchOutput, BatchRecord, ClaimedItem, NewBatch, NewBatchFile,
+    NewBatchItem, OutputRow, PURPOSE_BATCH, PURPOSE_BATCH_ERROR, PURPOSE_BATCH_OUTPUT,
 };
 use obleth_store::JobOwner;
 use uuid::Uuid;
@@ -247,6 +249,8 @@ pub(crate) enum Route<'a> {
     BatchCancel(&'a str),
     /// obleth extension: the results so far of a batch, finished or not.
     BatchResults(&'a str),
+    /// obleth extension: delete a stopped batch with its answers and files.
+    BatchDelete(&'a str),
 }
 
 fn valid_id(id: &str) -> bool {
@@ -279,6 +283,7 @@ pub(crate) fn route<'a>(method: &Method, path: &'a str) -> Option<Route<'a>> {
             ("GET", [id]) if valid_id(id) => Some(Route::BatchGet(id)),
             ("POST", [id, "cancel"]) if valid_id(id) => Some(Route::BatchCancel(id)),
             ("GET", [id, "results"]) if valid_id(id) => Some(Route::BatchResults(id)),
+            ("DELETE", [id]) if valid_id(id) => Some(Route::BatchDelete(id)),
             _ => None,
         };
     }
@@ -308,6 +313,7 @@ pub(crate) async fn handle(
         Route::BatchGet(id) => get_batch(batches, owner, id).await,
         Route::BatchCancel(id) => cancel(batches, owner, id).await,
         Route::BatchResults(id) => results(batches, owner, id, &q).await,
+        Route::BatchDelete(id) => delete_batch(batches, owner, id).await,
     };
     result.unwrap_or_else(|e| e)
 }
@@ -1229,6 +1235,27 @@ async fn cancel(batches: &Batches, owner: JobOwner, id: &str) -> Handled {
     }
 }
 
+async fn delete_batch(batches: &Batches, owner: JobOwner, id: &str) -> Handled {
+    match batches
+        .store
+        .delete_batch(id, owner)
+        .await
+        .map_err(store_error)?
+    {
+        BatchDeletion::Deleted => Ok(json(
+            serde_json::json!({ "id": id, "object": "batch", "deleted": true }),
+        )),
+        BatchDeletion::Running => {
+            let body = serde_json::json!({ "error": {
+                "message": format!("Batch '{id}' is still running. Cancel it, then delete it once it has stopped."),
+                "type": "invalid_request_error", "param": "id", "code": "batch_running"
+            }});
+            Err((StatusCode::CONFLICT, axum::Json(body)).into_response())
+        }
+        BatchDeletion::NotFound => Err(not_found("batch", id)),
+    }
+}
+
 // ---- runner ---------------------------------------------------------------
 
 /// What one replica's runner has in flight, per batch.
@@ -1718,7 +1745,11 @@ mod tests {
         assert_eq!(route(&post, "/v1/batches/batch_1/results"), None);
         assert_eq!(route(&get, "/v1/files/a.b"), None);
         assert_eq!(route(&post, "/v1/chat/completions"), None);
-        assert_eq!(route(&delete, "/v1/batches/batch_1"), None);
+        assert_eq!(
+            route(&delete, "/v1/batches/batch_1"),
+            Some(Route::BatchDelete("batch_1"))
+        );
+        assert_eq!(route(&delete, "/v1/batches/batch_1/cancel"), None);
     }
 
     #[test]

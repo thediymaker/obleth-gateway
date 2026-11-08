@@ -303,6 +303,15 @@ pub struct FinishedBatch {
     pub status: String,
 }
 
+/// What [`Store::delete_batch`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchDeletion {
+    Deleted,
+    /// The batch hasn't stopped yet: cancel it first.
+    Running,
+    NotFound,
+}
+
 const FILE_COLUMNS: &str = "id, tenant_id, key_id, purpose, filename, bytes, batch_id, created_at";
 
 const BATCH_COLUMNS: &str = "id, tenant_id, key_id, model, endpoint, input_file_id,
@@ -735,6 +744,47 @@ impl Store {
         }
         tx.commit().await?;
         self.get_batch(id, owner).await
+    }
+
+    /// Delete a batch that has stopped, with its requests and answers, its
+    /// output and error files, and its input file unless another batch read
+    /// the same file. A batch still running is left alone.
+    pub async fn delete_batch(&self, id: &str, owner: JobOwner) -> Result<BatchDeletion> {
+        let mut tx = self.pool.begin().await?;
+        let sql = format!(
+            "select status, input_file_id from batches where id = $1{} for update",
+            owner_clause(owner, 2)
+        );
+        let Some(row) = bind_owner(sqlx::query(&sql).bind(id), owner)
+            .fetch_optional(&mut *tx)
+            .await?
+        else {
+            return Ok(BatchDeletion::NotFound);
+        };
+        let status: String = row.try_get("status")?;
+        if !matches!(
+            status.as_str(),
+            "completed" | "failed" | "expired" | "cancelled"
+        ) {
+            return Ok(BatchDeletion::Running);
+        }
+        let input: String = row.try_get("input_file_id")?;
+        sqlx::query("delete from batches where id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        let sql = format!(
+            "delete from batch_files f
+             where (f.batch_id = $1
+                    or (f.id = $2 and not exists (select 1 from batches b
+                                                  where b.input_file_id = f.id))){}",
+            owner_clause(owner, 3)
+        );
+        bind_owner(sqlx::query(&sql).bind(id).bind(&input), owner)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(BatchDeletion::Deleted)
     }
 
     // ---- runner -----------------------------------------------------------
@@ -1540,6 +1590,74 @@ mod tests {
         assert!(!b.waiting_for_capacity(later));
         // Nothing of it runs: finish it, so no other test's pass picks it up.
         store.advance_batches(&|| uid("file")).await.unwrap();
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_stopped_batch_is_deleted_with_its_files() {
+        let Some(store) = store().await else {
+            return;
+        };
+        let _g = serial().lock().await;
+        let owner = JobOwner::key(Uuid::new_v4(), Uuid::new_v4());
+        let other = JobOwner::key(owner.tenant_id, Uuid::new_v4());
+        let batch = make_batch(&store, owner, 2, Utc::now() + chrono::Duration::hours(1)).await;
+        store
+            .insert_batch_file(
+                &NewBatchFile {
+                    id: &batch.input_file_id,
+                    tenant_id: owner.tenant_id,
+                    key_id: owner.key_id.unwrap(),
+                    purpose: PURPOSE_BATCH,
+                    filename: "in.jsonl",
+                    bytes: 0,
+                    batch_id: None,
+                },
+                b"{}\n{}\n",
+            )
+            .await
+            .unwrap();
+
+        // Running: kept, and nobody else can see it to delete it.
+        assert_eq!(
+            store.delete_batch(&batch.id, owner).await.unwrap(),
+            BatchDeletion::Running
+        );
+        store.cancel_batch(&batch.id, owner).await.unwrap();
+        store.advance_batches(&|| uid("file")).await.unwrap();
+        let stopped = store.get_batch(&batch.id, owner).await.unwrap().unwrap();
+        assert_eq!(stopped.status, "cancelled");
+        assert_eq!(
+            store.delete_batch(&batch.id, other).await.unwrap(),
+            BatchDeletion::NotFound
+        );
+
+        assert_eq!(
+            store.delete_batch(&batch.id, owner).await.unwrap(),
+            BatchDeletion::Deleted
+        );
+        assert!(store.get_batch_any(&batch.id).await.unwrap().is_none());
+        assert!(store
+            .get_batch_file(&batch.input_file_id, owner)
+            .await
+            .unwrap()
+            .is_none());
+        for made in [stopped.output_file_id, stopped.error_file_id]
+            .into_iter()
+            .flatten()
+        {
+            assert!(store.get_batch_file(&made, owner).await.unwrap().is_none());
+        }
+        let items: i64 = sqlx::query_scalar("select count(*) from batch_items where batch_id = $1")
+            .bind(&batch.id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(items, 0);
+        assert_eq!(
+            store.delete_batch(&batch.id, owner).await.unwrap(),
+            BatchDeletion::NotFound
+        );
     }
 
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
