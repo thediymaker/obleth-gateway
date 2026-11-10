@@ -24,6 +24,29 @@ use crate::state::AppState;
 
 const MCP_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
+/// Request headers that stay at the gateway.
+const CLIENT_ONLY_HEADERS: &[&str] = &[
+    "cookie",
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-forwarded-port",
+    "x-real-ip",
+];
+
+/// Response headers an MCP server's answer keeps on its way to the caller.
+const RESPONSE_HEADERS: &[&str] = &[
+    "content-type",
+    "cache-control",
+    "mcp-session-id",
+    "mcp-protocol-version",
+    "www-authenticate",
+    "retry-after",
+    "allow",
+    "x-accel-buffering",
+];
+
 /// Count one call to an MCP server in its daily stats: `tool` for a model's
 /// tool call in the gateway's tool loop, otherwise a client's direct request
 /// through `/mcp/<name>`. Fire and forget: stats never slow or fail a request.
@@ -225,6 +248,12 @@ async fn handle(
         parts.uri.query(),
     );
     let mut fwd_headers = forward_headers(&headers);
+    // The server is the operator's, reached with the operator's credential. A
+    // caller's cookies and the addresses a proxy recorded for them are no part
+    // of an MCP call.
+    for name in CLIENT_ONLY_HEADERS {
+        fwd_headers.remove(*name);
+    }
     if let Some(auth) = &server.auth_header {
         if let Ok(v) = header::HeaderValue::from_str(auth) {
             fwd_headers.insert(header::AUTHORIZATION, v);
@@ -285,20 +314,14 @@ async fn handle(
     );
     ledger(&server.name, status);
 
-    // Forward the upstream response headers, dropping only what the re-stream
-    // invalidates. MCP streamable-HTTP servers carry protocol state in
-    // headers — notably `mcp-session-id` on the initialize response — so
-    // stripping them breaks every follow-up request in the session.
+    // Pass on the response headers MCP uses and no others. Streamable-HTTP
+    // servers carry protocol state in headers, notably `mcp-session-id` on the
+    // initialize response, so those must survive. Anything else an upstream
+    // sends (cookies, CORS grants, redirects) would be said by the gateway's
+    // own origin to every caller, so it stops here.
     let mut builder = Response::builder().status(status);
     if let Some(headers_out) = builder.headers_mut() {
-        for (name, value) in upstream.headers() {
-            match name.as_str() {
-                "transfer-encoding" | "content-length" | "connection" => continue,
-                _ => {
-                    headers_out.insert(name.clone(), value.clone());
-                }
-            }
-        }
+        *headers_out = passed_on(upstream.headers());
         if !headers_out.contains_key(header::CONTENT_TYPE) {
             headers_out.insert(
                 header::CONTENT_TYPE,
@@ -316,6 +339,17 @@ async fn handle(
         .body(Body::from_stream(stream))
         .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"));
     (resp, true)
+}
+
+/// The headers of an MCP server's answer that go on to the caller.
+fn passed_on(upstream: &header::HeaderMap) -> header::HeaderMap {
+    let mut out = header::HeaderMap::new();
+    for (name, value) in upstream {
+        if RESPONSE_HEADERS.contains(&name.as_str()) {
+            out.append(name.clone(), value.clone());
+        }
+    }
+    out
 }
 
 #[derive(serde::Deserialize)]
@@ -370,6 +404,55 @@ fn build_mcp_url(base: &str, rest: Option<&str>, query: Option<&str>) -> String 
 mod tests {
     use super::{build_mcp_url, mcp_usage_record, MCP_REQUEST_TYPE};
     use uuid::Uuid;
+
+    #[test]
+    fn an_mcp_answer_keeps_only_the_headers_mcp_uses() {
+        use axum::http::header::{HeaderMap, HeaderValue};
+        let mut upstream = HeaderMap::new();
+        for (name, value) in [
+            ("content-type", "text/event-stream"),
+            ("mcp-session-id", "s-1"),
+            ("mcp-protocol-version", "2025-06-18"),
+            ("www-authenticate", "Bearer"),
+            ("set-cookie", "sid=1; Domain=gateway.example"),
+            ("access-control-allow-origin", "*"),
+            ("access-control-allow-credentials", "true"),
+            ("location", "https://elsewhere.example/"),
+            ("content-length", "12"),
+            ("transfer-encoding", "chunked"),
+            ("x-powered-by", "something"),
+        ] {
+            upstream.insert(name, HeaderValue::from_static(value));
+        }
+        let mut kept: Vec<&str> = super::passed_on(&upstream)
+            .keys()
+            .map(|name| name.as_str())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|name| match name {
+                "content-type" => "content-type",
+                "mcp-session-id" => "mcp-session-id",
+                "mcp-protocol-version" => "mcp-protocol-version",
+                "www-authenticate" => "www-authenticate",
+                _ => "unexpected",
+            })
+            .collect();
+        kept.sort_unstable();
+        assert_eq!(
+            kept,
+            [
+                "content-type",
+                "mcp-protocol-version",
+                "mcp-session-id",
+                "www-authenticate"
+            ]
+        );
+        // A caller's cookies and recorded addresses stay at the gateway.
+        let src = include_str!("mcp.rs");
+        let handler = &src[..src.find("\nmod tests {").expect("the test module")];
+        assert!(handler.contains("for name in CLIENT_ONLY_HEADERS"));
+        assert!(super::CLIENT_ONLY_HEADERS.contains(&"cookie"));
+    }
 
     #[test]
     fn an_mcp_call_is_a_request_log_row() {
