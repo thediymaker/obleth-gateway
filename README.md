@@ -142,6 +142,10 @@ The dashboard login comes from `DASHBOARD_ADMIN_EMAIL` and `DASHBOARD_PASSWORD` 
 
 Log in to register models, create tenants and API keys, configure fairshare weights, and monitor usage. The benchmark fixture backend is pre-registered as the default upstream, so the UI is explorable immediately without a GPU endpoint. Models can also be imported in bulk from any OpenAI-compatible provider's catalog.
 
+## Chat
+
+[obleth-chat](https://github.com/thediymaker/obleth-chat) is the web app for the people who use your models. Each person signs in with their own account and every request reaches the gateway as that person, so fair share, budgets and usage apply per person. It adds document search with citations, workspaces that build apps with a live preview, projects, apps with their own API and chat page, and your Slurm and Kubernetes clusters as tools.
+
 ## Deployment
 
 obleth ships as Docker Compose (above), a Helm chart for Kubernetes, and pre-built binaries. Versions are released in lockstep across the gateway, dashboard, provisioner, and chart. See **[obleth.com](https://obleth.com)** for deployment guides, the configuration reference, and production setup.
