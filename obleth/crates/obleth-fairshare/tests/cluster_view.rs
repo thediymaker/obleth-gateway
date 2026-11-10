@@ -185,12 +185,23 @@ async fn shares_are_recomputed_over_every_gateways_tenants() {
     }
     let waiting = waiter(&gws[1], AdmitRequest::new(starved, MODEL, 1).model_cap(4));
 
+    // Each gateway publishes its view on a timer, so a snapshot can hold one
+    // taken between two of the busy tenant's admits. Wait for the counts the
+    // assertions read, not only for both tenants to appear.
     let snap = wait_until("both gateways' tenants", async || {
         let s = gws[1].cluster_snapshot().await.ok()?;
-        let ready = s
-            .pools
-            .iter()
-            .any(|p| p.model == MODEL && p.tenants.len() == 2);
+        let ready = s.pools.iter().any(|p| {
+            let counts = |id: Uuid| {
+                p.tenants
+                    .iter()
+                    .find(|t| t.tenant_id == id)
+                    .map(|t| (t.in_flight, t.queued))
+            };
+            p.model == MODEL
+                && p.tenants.len() == 2
+                && counts(busy) == Some((4, 0))
+                && counts(starved) == Some((0, 1))
+        });
         (s.replicas_reporting == 2 && ready).then_some(s)
     })
     .await;
