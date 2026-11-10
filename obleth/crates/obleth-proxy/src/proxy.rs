@@ -3683,6 +3683,33 @@ async fn run_pipeline(
                     )
                 }
             }
+            // An answer too large to hold, or not a completion, cannot be given
+            // to the scanners. Under a policy that blocks or redacts it is not
+            // passed on unread; with no such policy it goes through as it came.
+            None if plan.guardrails.is_some() => {
+                drop(permit);
+                let block = crate::boons::guardrails::GuardrailsBlock::unchecked();
+                tracing::warn!(
+                    bytes = buf.len(),
+                    truncated,
+                    "a response under an output content policy could not be read; not passed on"
+                );
+                let tokens = UpstreamUsage::uncached(est.input_tokens, est.estimated_output_tokens);
+                let total_ms = request_start.elapsed().as_millis() as u32;
+                let _ = settle_guard
+                    .complete(accounting.settle(
+                        tokens,
+                        ttft_ms,
+                        total_ms,
+                        block.status.as_u16(),
+                        None,
+                    ))
+                    .await;
+                if let Some(t) = tracer.take() {
+                    t.finish("error");
+                }
+                return error_json(block.status, block.reason);
+            }
             None => (
                 Bytes::from(std::mem::take(&mut buf)),
                 content_type_str.clone(),
