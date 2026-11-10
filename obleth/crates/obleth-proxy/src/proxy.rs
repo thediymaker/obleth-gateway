@@ -2615,10 +2615,11 @@ async fn run_pipeline(
 
     // From here on every exit settles through `settle_guard`, so the
     // per-minute bucket and any term reservation are reconciled exactly once
-    // on every path — including a client that disconnects before upstream
-    // headers arrive, which settles as nothing generated (zero tokens, 499).
-    // Once an upstream answer starts, `arm_estimate` switches that fallback
-    // to the admission estimate.
+    // on every path — including a client that disconnects before the request
+    // is sent upstream, which settles as nothing run (zero tokens, 499).
+    // `arm_dispatched` switches that fallback to the prompt once the request
+    // goes to a model server, and `arm_estimate` to the admission estimate
+    // once an answer starts.
     let mut accounting = StreamAccounting {
         state: state.clone(),
         request_id,
@@ -2867,6 +2868,7 @@ async fn run_pipeline(
     // Which target answered: a job lives on the backend that accepted it.
     let mut served_target = 0usize;
 
+    accounting.arm_dispatched(&mut settle_guard);
     'targets: for (ti, target) in targets.iter().enumerate() {
         let url = build_upstream_url(&target.base, &path, &query);
         last_url = url.clone();
@@ -4754,19 +4756,24 @@ impl StreamAccounting {
     }
 
     /// Cancellation fallback settling as status 499. `tokens` is `None` before
-    /// the upstream has answered (nothing generated, billed nothing) and the
-    /// estimate afterwards. Runtime shutdown remains best-effort, just like
-    /// the asynchronous telemetry sink; a partial answer is never cached.
+    /// the request has gone to a model server (nothing run, billed nothing),
+    /// the prompt alone once it has (the server read it, and with a
+    /// non-streaming request may have written the whole answer before its
+    /// first byte comes back), and the estimate once the answer has started.
+    /// Runtime shutdown remains best-effort, just like the asynchronous
+    /// telemetry sink; a partial answer is never cached.
     fn on_cancel(&self, tokens: Option<UpstreamUsage>) -> impl FnOnce() + Send + 'static {
         let mut accounting = self.clone();
         move || {
             let elapsed = accounting.request_start.elapsed().as_millis() as u32;
             accounting.fail(
                 obleth_config::ErrorClass::ClientCancel,
-                if tokens.is_none() {
-                    "client disconnected before the model answered"
-                } else {
-                    "client disconnected while the answer was being sent"
+                match &tokens {
+                    None => "client disconnected before the request reached the model",
+                    Some(tokens) if tokens.output == 0 => {
+                        "client disconnected before the model answered"
+                    }
+                    Some(_) => "client disconnected while the answer was being sent",
                 },
             );
             let (tokens, billed) = match tokens {
@@ -4779,6 +4786,14 @@ impl StreamAccounting {
 
     pub(crate) fn unbilled_guard(&self) -> crate::completion::CompletionGuard {
         crate::completion::CompletionGuard::new(self.on_cancel(None))
+    }
+
+    /// From the moment a request goes to a model server, a client that
+    /// disconnects is billed its prompt: the server has read it, and closing
+    /// the connection just before the answer would otherwise make the work
+    /// free. A request the gateway itself fails or times out is still unbilled.
+    pub(crate) fn arm_dispatched(&self, guard: &mut crate::completion::CompletionGuard) {
+        guard.rearm(self.on_cancel(Some(UpstreamUsage::uncached(self.est.input_tokens, 0))));
     }
 
     fn arm_estimate(&self, guard: &mut crate::completion::CompletionGuard) {

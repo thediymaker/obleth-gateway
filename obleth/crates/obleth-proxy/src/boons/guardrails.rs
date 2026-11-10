@@ -68,20 +68,18 @@ const MIN_LABEL_MASS: f64 = 0.05;
 // ---------------------------------------------------------------------------
 
 /// Extract plain text from a message `content` value, handling both the string
-/// form and the multimodal array-of-parts form (text parts only).
+/// form and the multimodal array-of-parts form. A part's `text` is read
+/// whatever the part calls itself (`text`, `input_text`, no type at all): the
+/// name is the caller's to choose, and a model server that reads the part
+/// reads its text.
 fn content_to_text(content: &Value) -> String {
     match content {
         Value::String(s) => s.clone(),
         Value::Array(parts) => parts
             .iter()
-            .filter_map(|p| {
-                if p.get("type").and_then(|t| t.as_str()) == Some("text") {
-                    p.get("text")
-                        .and_then(|t| t.as_str())
-                        .map(|s| s.to_string())
-                } else {
-                    None
-                }
+            .filter_map(|p| match p {
+                Value::String(s) => Some(s.clone()),
+                _ => p.get("text").and_then(|t| t.as_str()).map(str::to_string),
             })
             .collect::<Vec<_>>()
             .join("\n"),
@@ -545,10 +543,15 @@ fn redact_content_in_place(
         Value::Array(parts) => {
             let mut changed = false;
             for part in parts.iter_mut() {
-                if part.get("type").and_then(|t| t.as_str()) != Some("text") {
-                    continue;
-                }
-                if let Some(Value::String(s)) = part.get_mut("text") {
+                // Bare strings and any part with text, as `content_to_text` reads.
+                let text = match part {
+                    Value::String(s) => Some(s),
+                    _ => match part.get_mut("text") {
+                        Some(Value::String(s)) => Some(s),
+                        _ => None,
+                    },
+                };
+                if let Some(s) = text {
                     let redacted = redact_text(s, scanners, ban_keywords);
                     if redacted != *s {
                         *s = redacted;
@@ -1495,6 +1498,29 @@ mod tests {
             "reasoning channels must be redacted: {serialized}"
         );
         assert!(serialized.matches("[REDACTED]").count() >= 3);
+    }
+
+    /// A part's text is scanned and redacted whatever the part calls itself.
+    #[test]
+    fn text_in_a_part_of_any_type_is_read() {
+        let content = serde_json::json!([
+            {"type": "text", "text": "tacos one"},
+            {"type": "input_text", "text": "tacos two"},
+            {"text": "tacos three"},
+            "tacos four",
+            {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}
+        ]);
+        assert_eq!(content_to_text(&content).matches("tacos").count(), 4);
+        let mut redacted = content.clone();
+        assert!(redact_content_in_place(
+            &mut redacted,
+            &["ban_keywords".to_string()],
+            &["tacos".to_string()]
+        ));
+        let text = redacted.to_string();
+        assert!(!text.contains("tacos"), "{text}");
+        assert_eq!(text.matches("[REDACTED]").count(), 4);
+        assert!(text.contains("https://example.com/a.png"));
     }
 
     /// The model's words reach the client in more places than the first choice's

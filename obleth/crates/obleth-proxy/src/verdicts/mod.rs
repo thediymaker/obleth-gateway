@@ -1209,7 +1209,7 @@ async fn handler_inner(
             est_cost,
         },
     };
-    let settle_guard = accounting.unbilled_guard();
+    let mut settle_guard = accounting.unbilled_guard();
 
     // ---- fan out against ONE pinned target (prefix-cache locality) ----
     let target = build_targets(
@@ -1235,6 +1235,9 @@ async fn handler_inner(
         );
     };
     let url = format!("{}/chat/completions", target.base.trim_end_matches('/'));
+    // The questions go to the model from here: a caller that hangs up before
+    // the verdicts come back is billed the prompt it had the model read.
+    accounting.arm_dispatched(&mut settle_guard);
     let req_timeout = route
         .request_timeout_secs
         .filter(|s| *s >= 1)
@@ -2114,9 +2117,11 @@ mod settlement_tests {
             .find(".reserve_with_term(&resolved.tenant_id,")
             .expect("tenant reserve");
         let guard = h
-            .find("letsettle_guard=accounting.unbilled_guard();")
+            .find("letmutsettle_guard=accounting.unbilled_guard();")
             .expect("guard");
         assert!(tenant < guard);
+        // Once the questions go to the model, a caller that hangs up pays for the prompt.
+        assert!(h[guard..].contains("accounting.arm_dispatched(&mutsettle_guard);"));
         // Rate limited, term exhausted, and fail-closed error release the key hold.
         assert_eq!(h[tenant..guard].matches("hold.release().await").count(), 3);
         assert!(h[tenant..guard].contains("hold.hand_off()"));
