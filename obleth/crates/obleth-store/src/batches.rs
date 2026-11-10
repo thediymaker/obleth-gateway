@@ -1246,6 +1246,8 @@ mod tests {
         format!("{prefix}_{}", Uuid::new_v4().simple())
     }
 
+    /// Connects and migrates. Call it with `serial()` held: `migrate()` re-runs
+    /// the schema's DDL, which deadlocks with another test's writes.
     async fn store() -> Option<Store> {
         let Some(url) = test_db_url() else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
@@ -1293,10 +1295,10 @@ mod tests {
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn files_are_scoped_to_their_owner() {
+        let _g = serial().lock().await;
         let Some(store) = store().await else {
             return;
         };
-        let _g = serial().lock().await;
         let owner = JobOwner::key(Uuid::new_v4(), Uuid::new_v4());
         let other = JobOwner::key(owner.tenant_id, Uuid::new_v4());
         let id = uid("file");
@@ -1389,10 +1391,10 @@ mod tests {
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn items_are_claimed_once_finished_and_the_batch_completes() {
+        let _g = serial().lock().await;
         let Some(store) = store().await else {
             return;
         };
-        let _g = serial().lock().await;
         let owner = JobOwner::key(Uuid::new_v4(), Uuid::new_v4());
         let batch = make_batch(&store, owner, 5, Utc::now() + chrono::Duration::hours(1)).await;
         assert_eq!((batch.status.as_str(), batch.total), ("in_progress", 5));
@@ -1517,10 +1519,10 @@ mod tests {
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn progress_and_the_admin_list() {
+        let _g = serial().lock().await;
         let Some(store) = store().await else {
             return;
         };
-        let _g = serial().lock().await;
         let owner = JobOwner::key(Uuid::new_v4(), Uuid::new_v4());
         let batch = make_batch(&store, owner, 3, Utc::now() + chrono::Duration::hours(1)).await;
         let now = Utc::now();
@@ -1595,10 +1597,10 @@ mod tests {
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn a_stopped_batch_is_deleted_with_its_files() {
+        let _g = serial().lock().await;
         let Some(store) = store().await else {
             return;
         };
-        let _g = serial().lock().await;
         let owner = JobOwner::key(Uuid::new_v4(), Uuid::new_v4());
         let other = JobOwner::key(owner.tenant_id, Uuid::new_v4());
         let batch = make_batch(&store, owner, 2, Utc::now() + chrono::Duration::hours(1)).await;
@@ -1663,10 +1665,10 @@ mod tests {
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn lapsed_leases_return_to_the_queue_or_fail() {
+        let _g = serial().lock().await;
         let Some(store) = store().await else {
             return;
         };
-        let _g = serial().lock().await;
         let owner = JobOwner::key(Uuid::new_v4(), Uuid::new_v4());
         let batch = make_batch(&store, owner, 2, Utc::now() + chrono::Duration::hours(1)).await;
         // Leased for no time at all: lapsed at once.
@@ -1696,10 +1698,10 @@ mod tests {
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn cancel_and_expiry_end_batches() {
+        let _g = serial().lock().await;
         let Some(store) = store().await else {
             return;
         };
-        let _g = serial().lock().await;
         let owner = JobOwner::key(Uuid::new_v4(), Uuid::new_v4());
 
         // Cancel: pending items are cancelled, the running one finishes.
