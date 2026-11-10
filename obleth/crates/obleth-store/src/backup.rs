@@ -175,7 +175,7 @@ impl Store {
         .collect::<Result<Vec<_>>>()?;
 
         let mcp_servers = sqlx::query(
-            "select id, name, upstream_url, auth_header, enabled, created_at
+            "select id, name, upstream_url, auth_header, enabled, allowed_tenants, created_at
              from mcp_servers order by created_at",
         )
         .fetch_all(&self.pool)
@@ -188,6 +188,7 @@ impl Store {
                 upstream_url: row.try_get("upstream_url")?,
                 auth_header: row.try_get("auth_header")?,
                 enabled: row.try_get("enabled")?,
+                allowed_tenants: row.try_get("allowed_tenants")?,
                 created_at: row.try_get("created_at")?,
             })
         })
@@ -611,13 +612,14 @@ impl Store {
         for s in &data.mcp_servers {
             let row = sqlx::query(
                 "insert into mcp_servers (id, name, upstream_url, auth_header, enabled,
-                        created_at)
-                 values ($1, $2, $3, $4, $5, $6)
+                        created_at, allowed_tenants)
+                 values ($1, $2, $3, $4, $5, $6, $7)
                  on conflict (id) do update set
                         name = excluded.name,
                         upstream_url = excluded.upstream_url,
                         auth_header = excluded.auth_header,
                         enabled = excluded.enabled,
+                        allowed_tenants = excluded.allowed_tenants,
                         updated_at = now()
                  returning (xmax = 0) as inserted",
             )
@@ -627,6 +629,7 @@ impl Store {
             .bind(normalize_secret(s.auth_header.as_deref()))
             .bind(s.enabled)
             .bind(s.created_at)
+            .bind(&s.allowed_tenants)
             .fetch_one(&mut *tx)
             .await
             .map_err(restore_db_error)?;

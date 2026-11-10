@@ -1507,6 +1507,10 @@ pub struct CreateMcpServer {
     pub name: String,
     pub upstream_url: String,
     pub auth_header: Option<String>,
+    /// The tenants whose keys may call the server through `/mcp/{name}`.
+    /// Left out, no tenant may: the server serves only models granted its tools.
+    #[serde(default)]
+    pub allowed_tenants: Vec<Uuid>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1518,6 +1522,9 @@ pub struct UpdateMcpServer {
     #[serde(default)]
     pub clear_auth: bool,
     pub enabled: Option<bool>,
+    /// The tenants whose keys may call the server through `/mcp/{name}`; omit
+    /// to keep the stored list, send `[]` to close the server to direct calls.
+    pub allowed_tenants: Option<Vec<Uuid>>,
     /// A new name; the server's `/mcp/<name>` path and every model grant follow it.
     pub name: Option<String>,
 }
@@ -2373,6 +2380,8 @@ pub struct McpServerView {
     /// write-only.
     pub auth_header_set: bool,
     pub enabled: bool,
+    /// The tenants whose keys may call the server through `/mcp/{name}`.
+    pub allowed_tenants: Vec<Uuid>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -2385,6 +2394,7 @@ impl From<McpServer> for McpServerView {
             upstream_url,
             auth_header,
             enabled,
+            allowed_tenants,
             created_at,
             updated_at,
         } = s;
@@ -2394,6 +2404,7 @@ impl From<McpServer> for McpServerView {
             upstream_url,
             auth_header_set: secret_set(&auth_header),
             enabled,
+            allowed_tenants,
             created_at,
             updated_at,
         }
@@ -8951,9 +8962,15 @@ async fn create_mcp_server(
 ) -> Result<Json<McpServerView>> {
     validate_mcp_server_name(&body.name)?;
     state.ssrf.validate(&body.upstream_url).await?;
+    let allowed = mcp_tenants(&state, body.allowed_tenants).await?;
     let server = state
         .store
-        .create_mcp_server(&body.name, &body.upstream_url, body.auth_header.as_deref())
+        .create_mcp_server(
+            &body.name,
+            &body.upstream_url,
+            body.auth_header.as_deref(),
+            &allowed,
+        )
         .await?;
     sync_mcp_server(&state, &server).await?;
     state
@@ -8963,10 +8980,35 @@ async fn create_mcp_server(
             "create_mcp_server",
             "mcp_server",
             &server.id.to_string(),
-            serde_json::json!({ "name": server.name, "upstream_url": server.upstream_url }),
+            serde_json::json!({
+                "name": server.name,
+                "upstream_url": server.upstream_url,
+                "allowed_tenants": server.allowed_tenants,
+            }),
         )
         .await?;
     Ok(Json(server.into()))
+}
+
+/// The tenants an MCP server is opened to, each one checked to exist and
+/// listed once. A stale id would be a grant waiting for whoever is given it.
+async fn mcp_tenants(state: &AdminState, tenants: Vec<Uuid>) -> Result<Vec<Uuid>> {
+    let mut allowed: Vec<Uuid> = Vec::new();
+    for id in tenants {
+        if allowed.contains(&id) {
+            continue;
+        }
+        match state.store.get_tenant(id).await {
+            Ok(_) => allowed.push(id),
+            Err(obleth_store::StoreError::NotFound) => {
+                return Err(AdminError::BadRequest(format!(
+                    "allowed_tenants names a tenant that does not exist: {id}"
+                )))
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(allowed)
 }
 
 #[utoipa::path(
@@ -9022,6 +9064,10 @@ async fn update_mcp_server(
         None if body.clear_auth => None,
         None => existing.auth_header.as_deref(),
     };
+    let allowed = match body.allowed_tenants.clone() {
+        Some(tenants) => mcp_tenants(&state, tenants).await?,
+        None => existing.allowed_tenants.clone(),
+    };
     let mut server = state
         .store
         .update_mcp_server(
@@ -9029,6 +9075,7 @@ async fn update_mcp_server(
             &body.upstream_url,
             auth,
             body.enabled.unwrap_or(existing.enabled),
+            &allowed,
         )
         .await?;
     let mut regranted: Vec<String> = Vec::new();
@@ -9064,6 +9111,7 @@ async fn update_mcp_server(
                 "renamed_from": rename.as_ref().map(|_| existing.name.clone()),
                 "upstream_url": server.upstream_url,
                 "enabled": server.enabled,
+                "allowed_tenants": server.allowed_tenants,
                 "auth_header_set": server.auth_header.is_some(),
                 "auth_changed": body.auth_header.as_deref().is_some_and(|a| !a.trim().is_empty()) || (body.clear_auth && existing.auth_header.is_some()),
                 "models_regranted": regranted,
@@ -9532,6 +9580,7 @@ async fn sync_mcp_server(state: &AdminState, server: &McpServer) -> Result<()> {
         upstream_url: server.upstream_url.clone(),
         auth_header: server.auth_header.clone(),
         enabled: server.enabled,
+        allowed_tenants: server.allowed_tenants.clone(),
     };
     if server.enabled {
         state
@@ -13068,6 +13117,7 @@ mod tests {
             upstream_url: "http://mcp.invalid/mcp".into(),
             auth_header: Some("Bearer mcp-secret".into()),
             enabled: true,
+            allowed_tenants: vec![],
             created_at: now,
             updated_at: now,
         };

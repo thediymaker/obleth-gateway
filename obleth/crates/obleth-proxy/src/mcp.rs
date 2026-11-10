@@ -232,6 +232,21 @@ async fn handle(
             true,
         );
     }
+    // The server is reached with the operator's credential for it, so a key
+    // reaches it only when the operator opened it to the key's tenant. A server
+    // opened to no one serves only the models granted its tools. The dashboard's
+    // own key is the operator's: it checks every server it lists.
+    let operator = resolved.tenant_id == obleth_store::Store::CONTROL_PLANE_TENANT_ID;
+    if !operator && !server.allowed_tenants.contains(&resolved.tenant_id) {
+        ledger(&server.name, StatusCode::FORBIDDEN);
+        return (
+            error_json(
+                StatusCode::FORBIDDEN,
+                "this key's tenant may not use this mcp server",
+            ),
+            true,
+        );
+    }
 
     // ---- forward upstream ----
     let body_bytes = match axum::body::to_bytes(body, MCP_BODY_LIMIT).await {
@@ -454,6 +469,27 @@ mod tests {
         assert!(super::CLIENT_ONLY_HEADERS.contains(&"cookie"));
     }
 
+    /// A key reaches a server only when the operator opened it to the key's
+    /// tenant, and the check comes before anything is sent upstream.
+    #[test]
+    fn a_server_is_reached_only_by_the_tenants_it_is_opened_to() {
+        let src = include_str!("mcp.rs");
+        let handler = &src[..src.find("\nmod tests {").expect("the test module")];
+        let gate = handler
+            .find("!operator && !server.allowed_tenants.contains(&resolved.tenant_id)")
+            .expect("the tenant gate");
+        let send = handler
+            .find("// ---- forward upstream ----")
+            .expect("the forward");
+        assert!(gate < send);
+        // An entry cached before the list existed admits no one.
+        let old: obleth_config::ResolvedMcpServer = serde_json::from_str(
+            r#"{"name":"files","upstream_url":"http://mcp.invalid/mcp","auth_header":null,"enabled":true}"#,
+        )
+        .unwrap();
+        assert!(old.allowed_tenants.is_empty());
+    }
+
     #[test]
     fn an_mcp_call_is_a_request_log_row() {
         let mut key = crate::boons::test_support::test_key();
@@ -499,8 +535,8 @@ mod tests {
         let logged = &handler[handler
             .find("From here every answer is a row in the ledger")
             .expect("the marker")..];
-        assert_eq!(logged.matches("return (").count(), 4);
-        assert_eq!(logged.matches("ledger(&").count(), 5);
+        assert_eq!(logged.matches("return (").count(), 5);
+        assert_eq!(logged.matches("ledger(&").count(), 6);
         assert!(!logged.contains(", false)"));
     }
 
