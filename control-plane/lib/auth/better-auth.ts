@@ -151,6 +151,12 @@ export function createAuth(
     // Accounts come from OIDC or the seeded break-glass admin; an open
     // email sign-up endpoint would let anyone mint a (pending) account.
     emailAndPassword: { enabled: true, disableSignUp: true },
+    // A sign-in through an identity provider is its own account, found again by
+    // the provider and its subject, never joined to an existing account because
+    // the provider reports the same email address. With linking on, a provider
+    // that vouches for an address its user chose signs that user in as whoever
+    // holds the address here, including the break-glass admin.
+    account: { accountLinking: { enabled: false } },
     hooks: { before: adminApiBeforeHook },
     user: {
       additionalFields: {

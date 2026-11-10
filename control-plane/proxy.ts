@@ -1,9 +1,21 @@
 import { getSessionCookie } from "better-auth/cookies";
 import { NextResponse, type NextRequest } from "next/server";
 import { contentSecurityPolicy, generateNonce } from "@/lib/csp";
+import { sentByAnotherSite } from "@/lib/auth/origin";
 
 export async function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl;
+
+  // The dashboard's own API routes change gateway configuration with the
+  // admin's session, so a change must come from the dashboard's own pages.
+  // `/api/auth` is better-auth's, which checks the origin itself.
+  if (
+    pathname.startsWith("/api/") &&
+    !pathname.startsWith("/api/auth") &&
+    sentByAnotherSite(request.method, request.headers)
+  ) {
+    return NextResponse.json({ error: "This request came from another site." }, { status: 403 });
+  }
 
   // A fresh nonce per document. Forwarding the policy on the *request* is what
   // lets Next.js stamp the nonce on the script tags it renders; the same value
