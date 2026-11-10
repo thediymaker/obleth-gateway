@@ -95,8 +95,10 @@ pub(super) async fn apply(
                     session_id,
                     request_id,
                     "vision_boon",
-                    result.input_tokens,
-                    result.output_tokens,
+                    crate::proxy::UpstreamUsage::uncached(
+                        result.input_tokens,
+                        result.output_tokens,
+                    ),
                 );
                 swaps.push(((*mi, *pi), Swap::Described(result.text)));
             }

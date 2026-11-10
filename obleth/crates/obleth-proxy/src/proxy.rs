@@ -3325,9 +3325,9 @@ async fn run_pipeline(
                     // estimate when the upstream reported none.
                     let (ttft_ms, settled) = {
                         let s = stats.lock().unwrap_or_else(|e| e.into_inner());
-                        let usage = s
-                            .final_set
-                            .then(|| UpstreamUsage::uncached(s.input_tokens, s.output_tokens));
+                        let usage = s.final_set.then(|| {
+                            UpstreamUsage::new(s.input_tokens, s.output_tokens, s.cached_input_tokens)
+                        });
                         (
                             s.ttft_ms,
                             drained_settlement(status_code, s.failure, usage, s.failed_turn_chars, est),
@@ -10758,7 +10758,8 @@ mod lifecycle_tests {
     #[test]
     fn the_tool_loops_own_usage_chunk_carries_the_measured_energy() {
         let a = crate::boons::tool_stream::content_chunk("c1", "m", 1, "Hi");
-        let u = crate::boons::tool_stream::usage_chunk("c1", "m", 1, 575, 13);
+        let u =
+            crate::boons::tool_stream::usage_chunk("c1", "m", 1, UpstreamUsage::uncached(575, 13));
         let done = crate::boons::tool_stream::done();
         let out = run_stamp(
             &[a.as_bytes(), u.as_bytes(), done.as_bytes()],
