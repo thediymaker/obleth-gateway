@@ -725,6 +725,8 @@ export interface McpServer {
   /** Whether an upstream Authorization header is stored. The value itself is write-only and never returned. */
   auth_header_set: boolean;
   enabled: boolean;
+  /** Ids of the tenants whose keys may call the server at `/mcp/<name>`. Empty: no direct calls. */
+  allowed_tenants: string[];
   created_at: string;
   updated_at: string;
 }
@@ -2837,7 +2839,7 @@ export const obleth = {
     }),
   updateMcpServer: (
     id: string,
-    body: { upstream_url: string; auth_header?: string; clear_auth?: boolean; enabled?: boolean; name?: string },
+    body: { upstream_url: string; auth_header?: string; clear_auth?: boolean; enabled?: boolean; name?: string; allowed_tenants?: string[] },
     options?: AuditOptions,
   ) =>
     api<McpServer>(`/mcp-servers/${seg(id)}`, {

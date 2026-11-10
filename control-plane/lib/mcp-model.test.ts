@@ -3,7 +3,7 @@ import { buildMcpRows, mcpLine, mcpState, toolCapable, usageOf } from "./mcp-mod
 import type { McpServerTestRow } from "./charo/mcp/types";
 import type { DailyStatsView, McpServer, ModelRoute } from "./obleth";
 
-const server = (name: string, enabled = true): McpServer => ({ id: name, name, upstream_url: `https://${name}.example/mcp`, auth_header_set: false, enabled, created_at: "", updated_at: "" });
+const server = (name: string, enabled = true): McpServer => ({ id: name, name, upstream_url: `https://${name}.example/mcp`, auth_header_set: false, enabled, allowed_tenants: [], created_at: "", updated_at: "" });
 const probe = (name: string, status: McpServerTestRow["status"], tools = 3): McpServerTestRow => ({ server: name, status, message: status === "fail" ? "connection refused" : "ok", serverInfo: null, protocolVersion: null, tools: status === "fail" ? null : Array.from({ length: tools }, (_, i) => ({ name: `t${i}`, description: null })), latencyMs: { initialize: 100, toolsList: 12 } });
 
 describe("MCP servers", () => {

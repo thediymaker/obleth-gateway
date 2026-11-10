@@ -42,6 +42,12 @@ export function useProbes(servers: McpServer[]) {
   return { probes, check, checkAll: () => { for (const n of names.split("|").filter(Boolean)) void check(n); } };
 }
 
+/** "open to 2 tenants" or "no direct calls", for a server's line in the list. */
+function directCalls(server: McpServer): string {
+  const n = server.allowed_tenants?.length ?? 0;
+  return n ? `open to ${n} tenant${n === 1 ? "" : "s"}` : "no direct calls";
+}
+
 function AddSheet({ open, onClose, onAdded }: { open: boolean; onClose: () => void; onAdded: (name: string) => void }) {
   const [pending, start] = useTransition();
   const [error, setError] = useState<string | null>(null);
@@ -84,7 +90,7 @@ function AddSheet({ open, onClose, onAdded }: { open: boolean; onClose: () => vo
   );
 }
 
-export function McpList({ servers, models, initialStats }: { servers: McpServer[]; models: ModelRoute[]; initialStats: DailyStatsView | null }) {
+export function McpList({ servers, models, tenants = [], initialStats }: { servers: McpServer[]; models: ModelRoute[]; tenants?: { id: string; name: string }[]; initialStats: DailyStatsView | null }) {
   const router = useRouter();
   const { probes, check, checkAll } = useProbes(servers);
   const stats = useQuery({ queryKey: ["daily-stats", "mcp"], queryFn: () => getJson<DailyStatsView>("/api/live/stats/daily?kind=mcp&days=7"), initialData: initialStats ?? undefined, refetchInterval: 60_000 });
@@ -109,7 +115,7 @@ export function McpList({ servers, models, initialStats }: { servers: McpServer[
         <Button type="button" size="sm" className="h-9" onClick={() => setAdding(true)}><Plus className="h-4 w-4" />Add server</Button>
       </div>
       <p className="max-w-[900px] text-[13px] leading-relaxed text-secondary-foreground">
-        Tool servers your models can call. A model you grant a server gets its tools; obleth runs the calls in the gateway and hands the results back to the model. Clients with a key can also reach a server directly at <span className="font-mono text-[12px]">/mcp/&lt;name&gt;</span>.
+        Tool servers your models can call. A model you grant a server gets its tools; obleth runs the calls in the gateway and hands the results back to the model. A tenant you open a server to can also reach it directly, with its own keys, at <span className="font-mono text-[12px]">/mcp/&lt;name&gt;</span>; a server is closed to direct calls until you name a tenant.
       </p>
       {notice && <Notice onDismiss={() => setNotice(null)}>{notice}</Notice>}
 
@@ -152,7 +158,7 @@ export function McpList({ servers, models, initialStats }: { servers: McpServer[
                     >
                       <span className="flex min-w-0 flex-col">
                         <span className="truncate font-mono text-[12.5px] font-medium text-foreground">{r.server.name}</span>
-                        <span className="truncate text-[11.5px] text-muted-foreground">{[r.probe?.serverInfo ? `${r.probe.serverInfo.name} ${r.probe.serverInfo.version}` : null, r.server.auth_header_set ? "key set" : "no key"].filter(Boolean).join(" · ")}</span>
+                        <span className="truncate text-[11.5px] text-muted-foreground">{[r.probe?.serverInfo ? `${r.probe.serverInfo.name} ${r.probe.serverInfo.version}` : null, r.server.auth_header_set ? "key set" : "no key", directCalls(r.server)].filter(Boolean).join(" · ")}</span>
                       </span>
                       <span className="flex min-w-0 flex-col items-start gap-0.5">
                         <McpStateMark state={r.state} />
@@ -180,13 +186,14 @@ export function McpList({ servers, models, initialStats }: { servers: McpServer[
         key={adding ? "open" : "closed"}
         open={adding}
         onClose={() => setAdding(false)}
-        onAdded={(name) => { setAdding(false); setNotice(`Added ${name}. Grant it to models from its panel.`); router.refresh(); }}
+        onAdded={(name) => { setAdding(false); setNotice(`Added ${name}. Grant it to models, and open it to tenants, from its panel.`); router.refresh(); }}
       />
       {openRow && (
         <ServerSheet
           key={openRow.server.id}
           row={openRow}
           models={toolCapable(models)}
+          tenants={tenants}
           onClose={() => setOpen(null)}
           onCheck={() => void check(openRow.server.name)}
           onChanged={(text) => { if (text) setNotice(text); router.refresh(); }}

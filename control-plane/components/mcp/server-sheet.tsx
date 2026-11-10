@@ -2,7 +2,7 @@
 
 import { useCallback, useState, useTransition } from "react";
 import { AlertCircle } from "lucide-react";
-import { deleteMcpServerAction, saveMcpServerAction, setMcpServerEnabledAction, setModelToolServerAction } from "@/app/actions";
+import { deleteMcpServerAction, saveMcpServerAction, setMcpServerEnabledAction, setMcpServerTenantAction, setModelToolServerAction } from "@/app/actions";
 import { SettingsForm, type SaveResult } from "@/components/access/settings-form";
 import { Glyph } from "@/components/deployments/ui";
 import { Setting, Switch, TextField } from "@/components/models/fields";
@@ -26,14 +26,18 @@ export function McpStateMark({ state }: { state: McpState }) {
 
 const SHOWN = 6;
 
-export function ServerSheet({ row, models, onClose, onCheck, onChanged }: { row: McpRow; models: ModelRoute[]; onClose: () => void; onCheck: () => void; onChanged: (text?: string) => void }) {
+export function ServerSheet({ row, models, tenants = [], onClose, onCheck, onChanged }: { row: McpRow; models: ModelRoute[]; tenants?: { id: string; name: string }[]; onClose: () => void; onCheck: () => void; onChanged: (text?: string) => void }) {
   const { confirm, confirmElement } = useConfirm();
   const [pending, start] = useTransition();
   const [error, setError] = useState<string | null>(null);
   const [allModels, setAllModels] = useState(false);
   const [allTools, setAllTools] = useState(false);
   const [granted, setGranted] = useState<Set<string>>(new Set(row.usedBy));
+  const [allTenants, setAllTenants] = useState(false);
+  const [opened, setOpened] = useState<Set<string>>(new Set(row.server.allowed_tenants ?? []));
   const s = row.server;
+  const orderedTenants = [...tenants].sort((a, b) => Number(opened.has(b.id)) - Number(opened.has(a.id)) || a.name.localeCompare(b.name));
+  const shownTenants = allTenants ? orderedTenants : orderedTenants.slice(0, Math.max(SHOWN, opened.size));
   const ms = probeLatency(row.probe);
   const ordered = [...models].sort((a, b) => Number(granted.has(b.model_name)) - Number(granted.has(a.model_name)) || a.model_name.localeCompare(b.model_name));
   const shownModels = allModels ? ordered : ordered.slice(0, Math.max(SHOWN, granted.size));
@@ -47,6 +51,17 @@ export function ServerSheet({ row, models, onClose, onCheck, onChanged }: { row:
       if (!res.ok) {
         setError(res.error);
         setGranted((g) => { const n = new Set(g); if (on) n.delete(model.model_name); else n.add(model.model_name); return n; });
+      } else onChanged();
+    });
+  }
+
+  function open(tenant: { id: string; name: string }, on: boolean) {
+    setOpened((o) => { const n = new Set(o); if (on) n.add(tenant.id); else n.delete(tenant.id); return n; });
+    start(async () => {
+      const res = await setMcpServerTenantAction(s.id, tenant.id, on);
+      if (!res.ok) {
+        setError(res.error);
+        setOpened((o) => { const n = new Set(o); if (on) n.delete(tenant.id); else n.add(tenant.id); return n; });
       } else onChanged();
     });
   }
@@ -145,6 +160,22 @@ export function ServerSheet({ row, models, onClose, onCheck, onChanged }: { row:
               </div>
             ))}
             {ordered.length > shownModels.length && <button type="button" onClick={() => setAllModels(true)} className="pt-1.5 text-xs text-secondary-foreground underline underline-offset-[3px] hover:text-foreground">{ordered.length - shownModels.length} more models could use it</button>}
+          </section>
+
+          <section aria-label="Tenants that can call it directly">
+            <div className="flex flex-wrap items-baseline justify-between gap-2 pb-1">
+              <span className="text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">Tenants that can call it directly · {opened.size}</span>
+              <span className="text-xs text-muted-foreground">With their own keys, at <span className="font-mono">/mcp/{s.name}</span></span>
+            </div>
+            <p className="pb-1 text-[12.5px] text-muted-foreground">{opened.size ? "A direct call uses the key you saved for this server, so open it only to tenants you would give that key." : "No tenant can call this server directly. Models granted its tools still can."}</p>
+            {tenants.length === 0 && <p className="py-2 text-[12.5px] text-muted-foreground">There are no tenants yet.</p>}
+            {shownTenants.map((t) => (
+              <div key={t.id} className="flex items-center justify-between gap-3 border-t border-border py-2 text-[13px] first:border-t-0">
+                <span className="truncate">{t.name}</span>
+                <Switch label={`${t.name} can call ${s.name} directly`} checked={opened.has(t.id)} disabled={pending} onChange={(on) => open(t, on)} />
+              </div>
+            ))}
+            {orderedTenants.length > shownTenants.length && <button type="button" onClick={() => setAllTenants(true)} className="pt-1.5 text-xs text-secondary-foreground underline underline-offset-[3px] hover:text-foreground">{orderedTenants.length - shownTenants.length} more tenants</button>}
           </section>
 
           <section aria-label="Its tools">

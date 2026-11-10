@@ -1924,6 +1924,22 @@ export async function setMcpServerEnabledAction(id: string, enabled: boolean): P
   return { ok: true };
 }
 
+/** Let a tenant's keys call an MCP server directly at `/mcp/<name>`, or stop them. A server no tenant is named for takes no direct calls. */
+export async function setMcpServerTenantAction(id: string, tenantId: string, on: boolean): Promise<ActionResult> {
+  const session = await requireAdmin();
+  try {
+    const server = (await obleth.listMcpServers()).find((m) => m.id === id);
+    if (!server) return { ok: false, error: "That server no longer exists." };
+    const current = server.allowed_tenants ?? [];
+    const next = on ? [...new Set([...current, tenantId])] : current.filter((t) => t !== tenantId);
+    await obleth.updateMcpServer(id, { upstream_url: server.upstream_url, allowed_tenants: next }, { auditActor: session.email });
+  } catch (e) {
+    return actionError(e);
+  }
+  revalidatePath("/mcp");
+  return { ok: true };
+}
+
 /**
  * Save an MCP server's name, URL and key. A blank key keeps the stored one;
  * `clearAuth` removes it. Renaming carries the new name into every model grant.

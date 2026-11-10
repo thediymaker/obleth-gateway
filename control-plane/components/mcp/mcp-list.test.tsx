@@ -3,7 +3,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { setModelToolServerAction } from "@/app/actions";
+import { setMcpServerTenantAction, setModelToolServerAction } from "@/app/actions";
 import { McpList } from "./mcp-list";
 import type { McpServer, ModelRoute } from "@/lib/obleth";
 
@@ -12,13 +12,14 @@ vi.mock("@/app/actions", () => ({
   deleteMcpServerAction: vi.fn(async () => ({ ok: true })),
   saveMcpServerAction: vi.fn(async () => ({ ok: true })),
   setMcpServerEnabledAction: vi.fn(async () => ({ ok: true })),
+  setMcpServerTenantAction: vi.fn(async () => ({ ok: true })),
   setModelToolServerAction: vi.fn(async () => ({ ok: true })),
 }));
 vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh: vi.fn(), push: vi.fn() }) }));
 
 const servers: McpServer[] = [
-  { id: "s1", name: "github", upstream_url: "https://gh.example/mcp", auth_header_set: true, enabled: true, created_at: "", updated_at: "" },
-  { id: "s2", name: "jira", upstream_url: "https://jira.example/mcp", auth_header_set: false, enabled: true, created_at: "", updated_at: "" },
+  { id: "s1", name: "github", upstream_url: "https://gh.example/mcp", auth_header_set: true, enabled: true, allowed_tenants: ["t1"], created_at: "", updated_at: "" },
+  { id: "s2", name: "jira", upstream_url: "https://jira.example/mcp", auth_header_set: false, enabled: true, allowed_tenants: [], created_at: "", updated_at: "" },
 ];
 const models = [
   { id: "m1", model_name: "kimi", model_type: "chat", supports_function_calling: true, tool_servers: ["github"] },
@@ -45,7 +46,7 @@ afterEach(async () => {
 describe("MCP servers", () => {
   it("checks each server, flags the one that doesn't answer, and grants a model its tools", async () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false, enabled: false } } });
-    await act(async () => root.render(<QueryClientProvider client={client}><McpList servers={servers} models={models} initialStats={null} /></QueryClientProvider>));
+    await act(async () => root.render(<QueryClientProvider client={client}><McpList servers={servers} models={models} tenants={[{ id: "t1", name: "research" }, { id: "t2", name: "teaching" }]} initialStats={null} /></QueryClientProvider>));
     await act(async () => { await new Promise((r) => setTimeout(r, 0)); });
     const table = host.querySelector('[aria-label="Servers"]')!;
     expect(table.textContent).toContain("github-mcp 1.4.0");
@@ -57,5 +58,13 @@ describe("MCP servers", () => {
     const glm = document.querySelector<HTMLInputElement>('input[aria-label="glm can use github"]')!;
     await act(async () => glm.click());
     expect(setModelToolServerAction).toHaveBeenCalledWith("m2", "github", true);
+    // A server is closed to direct calls until a tenant is named for it.
+    expect(table.textContent).toContain("open to 1 tenant");
+    expect(table.textContent).toContain("no direct calls");
+    expect(document.querySelector<HTMLInputElement>('input[aria-label="research can call github directly"]')!.checked).toBe(true);
+    const teaching = document.querySelector<HTMLInputElement>('input[aria-label="teaching can call github directly"]')!;
+    expect(teaching.checked).toBe(false);
+    await act(async () => teaching.click());
+    expect(setMcpServerTenantAction).toHaveBeenCalledWith("s1", "t2", true);
   });
 });
