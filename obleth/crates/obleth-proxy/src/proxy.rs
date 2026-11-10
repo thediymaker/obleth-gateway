@@ -1251,6 +1251,16 @@ async fn run_pipeline(
     };
     let mut json: serde_json::Value =
         serde_json::from_slice(&body_bytes).unwrap_or(serde_json::Value::Null);
+    // `stream` decides how the answer is read and what it is billed from. A
+    // value that is neither true nor false (`1`, `"true"`) reads as "not a
+    // stream" here while a model server may still stream for it, and that
+    // answer would be billed from the estimate instead of its usage.
+    if json
+        .get("stream")
+        .is_some_and(|v| !v.is_boolean() && !v.is_null())
+    {
+        return error_json(StatusCode::BAD_REQUEST, "stream must be true or false");
+    }
     // File-upload endpoints (audio transcription/translation, image edits and
     // variations) send the model as a `multipart/form-data` field alongside
     // the uploaded file, not as JSON. Parse the fields once so we can resolve

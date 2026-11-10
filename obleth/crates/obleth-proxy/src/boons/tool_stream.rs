@@ -819,10 +819,12 @@ fn marker_text(name: &str, arguments: &str) -> String {
             } else {
                 let mut s = trimmed.replace('\n', " ");
                 if s.len() > 120 {
-                    while !s.is_char_boundary(120) {
-                        s.truncate(s.len() - 1);
+                    // The cut falls on a character's edge at or before 120 bytes.
+                    let mut end = 120;
+                    while !s.is_char_boundary(end) {
+                        end -= 1;
                     }
-                    s.truncate(120);
+                    s.truncate(end);
                     s.push('…');
                 }
                 s
