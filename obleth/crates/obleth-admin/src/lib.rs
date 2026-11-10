@@ -8590,10 +8590,27 @@ async fn put_managed_model(
             "put_managed_model",
             "managed_model",
             &id.to_string(),
-            serde_json::to_value(&spec).unwrap_or_default(),
+            managed_model_audit(&spec),
         )
         .await?;
     Ok(Json(spec))
+}
+
+/// What the audit log keeps of a managed model's spec: everything but the
+/// shell it runs. The preamble, launch command and script body are free-form
+/// and may carry credentials, and the audit log is searchable and never
+/// pruned, so each is recorded as a line count (as the Slurm settings' setup is).
+fn managed_model_audit(spec: &impl serde::Serialize) -> serde_json::Value {
+    let mut detail = serde_json::to_value(spec).unwrap_or_default();
+    if let Some(fields) = detail.as_object_mut() {
+        for name in ["preamble", "launch_command", "script_body"] {
+            if let Some(text) = fields.remove(name) {
+                let lines = text.as_str().map_or(0, |t| t.lines().count());
+                fields.insert(format!("{name}_lines"), lines.into());
+            }
+        }
+    }
+    detail
 }
 
 #[utoipa::path(delete, path = "/api/v1/models/{id}/managed",
