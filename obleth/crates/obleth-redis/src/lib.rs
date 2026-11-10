@@ -742,6 +742,23 @@ impl RedisStore {
         format!("obleth:daily:{kind}:{id}:{day}")
     }
 
+    /// Count one call by `who` against `what` in the current minute, and say
+    /// whether it is within `limit`: `(allowed, seconds until the minute ends)`.
+    /// A fixed window: for calls that carry no tokens to meter, such as a call
+    /// to an MCP server, this is what keeps one caller from flooding it.
+    pub async fn count_call(&self, what: &str, who: &Uuid, limit: u32) -> Result<(bool, u64)> {
+        let now = now_ms().max(0) as u64;
+        let minute = now / 60_000;
+        let key = format!("obleth:calls:{what}:{who}:{minute}");
+        let mut pipe = redis::pipe();
+        pipe.cmd("INCR").arg(&key);
+        pipe.cmd("EXPIRE").arg(&key).arg(120).ignore();
+        let mut conn = self.conn.clone();
+        let (count,): (u64,) = pipe.query_async(&mut conn).await?;
+        let left = 60 - (now / 1000) % 60;
+        Ok((count <= u64::from(limit), left))
+    }
+
     /// Add to one thing's counters for `day` (`YYYY-MM-DD`, UTC), e.g. an MCP
     /// server's calls, failures and milliseconds. Counters expire after about
     /// 40 days. Best-effort: callers on the request path fire and forget.

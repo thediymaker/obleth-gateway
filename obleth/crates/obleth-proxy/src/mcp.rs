@@ -24,6 +24,13 @@ use crate::state::AppState;
 
 const MCP_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
+/// Calls one key may make to one MCP server in a minute. An MCP call carries no
+/// tokens, so the budgets that meter model traffic do not see it; this keeps a
+/// key from flooding a server, or spending the operator's allowance with the
+/// service behind it. Ten a second sustained is far above what an agent's tool
+/// use needs.
+const CALLS_PER_MINUTE: u32 = 600;
+
 /// Request headers that stay at the gateway.
 const CLIENT_ONLY_HEADERS: &[&str] = &[
     "cookie",
@@ -246,6 +253,33 @@ async fn handle(
             ),
             true,
         );
+    }
+
+    // ---- rate limit: per key and server, before the body is read ----
+    match state
+        .redis
+        .count_call(
+            &format!("mcp:{}", server.name),
+            &resolved.key_id,
+            CALLS_PER_MINUTE,
+        )
+        .await
+    {
+        Ok((true, _)) => {}
+        Ok((false, wait)) => {
+            ledger(&server.name, StatusCode::TOO_MANY_REQUESTS);
+            let mut resp = error_json(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many calls to this mcp server; try again shortly",
+            );
+            if let Ok(value) = header::HeaderValue::from_str(&wait.to_string()) {
+                resp.headers_mut().insert(header::RETRY_AFTER, value);
+            }
+            return (resp, true);
+        }
+        // The count is a safeguard, not a gate on identity: when it cannot be
+        // kept, the call goes through and the failure is logged.
+        Err(e) => tracing::warn!(error = %e, "mcp call count not recorded"),
     }
 
     // ---- forward upstream ----
@@ -482,6 +516,10 @@ mod tests {
             .find("// ---- forward upstream ----")
             .expect("the forward");
         assert!(gate < send);
+        // A key's calls to a server are counted, after the gate and before the
+        // body is read or anything is sent.
+        let count = handler.find(".count_call(").expect("the call count");
+        assert!(gate < count && count < send);
         // An entry cached before the list existed admits no one.
         let old: obleth_config::ResolvedMcpServer = serde_json::from_str(
             r#"{"name":"files","upstream_url":"http://mcp.invalid/mcp","auth_header":null,"enabled":true}"#,
@@ -535,8 +573,8 @@ mod tests {
         let logged = &handler[handler
             .find("From here every answer is a row in the ledger")
             .expect("the marker")..];
-        assert_eq!(logged.matches("return (").count(), 5);
-        assert_eq!(logged.matches("ledger(&").count(), 6);
+        assert_eq!(logged.matches("return (").count(), 6);
+        assert_eq!(logged.matches("ledger(&").count(), 7);
         assert!(!logged.contains(", false)"));
     }
 

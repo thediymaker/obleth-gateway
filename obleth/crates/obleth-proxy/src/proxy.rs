@@ -119,66 +119,6 @@ fn canonical_path(method: &Method, path: &str) -> Option<String> {
     (!mapped.is_empty() && mapped != path).then(|| mapped.to_string())
 }
 
-/// One path the operator lets through to a model's upstream beyond the
-/// endpoints the gateway knows: an entry of `OBLETH_PASSTHROUGH_PATHS`.
-#[derive(Debug, PartialEq)]
-struct Passthrough {
-    method: Method,
-    path: String,
-    /// The entry ended in `*`: any path under `path` matches.
-    prefix: bool,
-}
-
-impl Passthrough {
-    fn matches(&self, method: &Method, path: &str) -> bool {
-        self.method == *method
-            && if self.prefix {
-                path.starts_with(&self.path)
-            } else {
-                path == self.path
-            }
-    }
-}
-
-/// Parse `OBLETH_PASSTHROUGH_PATHS`: comma-separated `METHOD /path` entries, the
-/// method optional (POST), a trailing `*` matching everything under the path.
-/// An entry that is not a method and an absolute path is skipped.
-fn parse_passthrough(raw: Option<&str>) -> Vec<Passthrough> {
-    raw.unwrap_or("")
-        .split(',')
-        .filter_map(|entry| {
-            let entry = entry.trim();
-            let (method, path) = match entry.split_once(char::is_whitespace) {
-                Some((m, p)) => (m.to_ascii_uppercase().parse::<Method>().ok()?, p.trim()),
-                None => (Method::POST, entry),
-            };
-            let (path, prefix) = match path.strip_suffix('*') {
-                Some(p) => (p, true),
-                None => (path, false),
-            };
-            (path.starts_with('/') && !path.contains(char::is_whitespace)).then(|| Passthrough {
-                method,
-                path: path.to_string(),
-                prefix,
-            })
-        })
-        .collect()
-}
-
-fn passthrough() -> &'static [Passthrough] {
-    static RULES: std::sync::OnceLock<Vec<Passthrough>> = std::sync::OnceLock::new();
-    RULES.get_or_init(|| {
-        let rules = parse_passthrough(std::env::var("OBLETH_PASSTHROUGH_PATHS").ok().as_deref());
-        if !rules.is_empty() {
-            tracing::warn!(
-                paths = rules.len(),
-                "OBLETH_PASSTHROUGH_PATHS is set: these paths are forwarded to a model's upstream with its key"
-            );
-        }
-        rules
-    })
-}
-
 pub async fn proxy_handler(state: State<AppState>, mut req: Request<Body>) -> Response<Body> {
     let request_id = Uuid::new_v4();
     // The surface marker is the gateway's own annotation (see
@@ -1211,8 +1151,9 @@ async fn run_pipeline(
     // method or path used to be forwarded as it came whenever the body named
     // an allowed model, which reached whatever else that upstream serves
     // (stored completions, files, fine-tunes, a model server's management
-    // routes). An operator who needs such a route names it in
-    // `OBLETH_PASSTHROUGH_PATHS`.
+    // routes). There is no setting that opens other routes: an endpoint worth
+    // serving is added to `REGISTERED_MODEL_PATHS`, where it is admitted and
+    // metered like the rest.
     if batch.is_none() && !is_forwarded(&method, &path) {
         return error_json(StatusCode::NOT_FOUND, "unknown endpoint");
     }
@@ -1800,8 +1741,8 @@ async fn run_pipeline(
     // serves, so they stay allowed. A request that DID name a registered model on
     // an unusual path (`route` is Some) is still forwarded untouched.
     // The endpoints the gateway knows have answered above when the model is not
-    // registered; this is what is left of them: a path from
-    // `OBLETH_PASSTHROUGH_PATHS` whose body names no registered model.
+    // registered, so nothing should reach this; it stays as the last line
+    // before a request could go to the default upstream.
     if route.is_none() && !is_models_endpoint(&path) {
         return error_json(StatusCode::NOT_FOUND, "unknown endpoint");
     }
@@ -6424,11 +6365,10 @@ fn requires_registered_model(path: &str) -> bool {
 }
 
 /// Whether the pipeline may send this request on to an upstream: an inference
-/// endpoint, model discovery, or a path the operator opted in.
+/// endpoint or model discovery, and nothing else.
 fn is_forwarded(method: &Method, path: &str) -> bool {
     (method == Method::POST && requires_registered_model(path))
         || (method == Method::GET && is_models_endpoint(path))
-        || passthrough().iter().any(|rule| rule.matches(method, path))
 }
 
 /// True when the endpoint takes a file upload, so the OpenAI spec sends it as
@@ -7660,12 +7600,12 @@ mod tests {
         has_input_guardrails, has_path_traversal, input_guardrails_unscannable, is_chat_path,
         is_forwarded, is_models_collection, is_models_endpoint, is_multipart_endpoint,
         is_retryable_status, looks_like_context_length_error, messages_input_estimate,
-        multipart_text_view, output_guardrails_unenforceable, parse_multipart, parse_passthrough,
+        multipart_text_view, output_guardrails_unenforceable, parse_multipart,
         prepare_upstream_body, redress_error, request_type_for_path, requires_registered_model,
         resolve_conversation, response_cache_name, route_keeps_sessions, session_hash_order,
         should_translate_as_stream, strip_beta_query, strip_tool_strict, sure_overflow, surface,
-        tenant_active_now, weighted_order, MultipartField, Passthrough, RequestMeta, TooLong,
-        END_USER_HEADER, REGISTERED_MODEL_PATHS, SEED_CAP,
+        tenant_active_now, weighted_order, MultipartField, RequestMeta, TooLong, END_USER_HEADER,
+        REGISTERED_MODEL_PATHS, SEED_CAP,
     };
     use crate::router::{BoonGrants, Candidate, Intent, RequestFeatures, RouterWeights};
     use axum::body::{Body, Bytes};
@@ -7892,40 +7832,6 @@ mod tests {
         ] {
             assert!(!is_forwarded(&method, path), "{method} {path}");
         }
-    }
-
-    #[test]
-    fn passthrough_paths_are_read_from_the_setting() {
-        assert!(parse_passthrough(None).is_empty());
-        assert!(parse_passthrough(Some(" , ")).is_empty());
-        let rules = parse_passthrough(Some(
-            "GET /stats, /v1/custom , delete /v1/things/* ,nonsense,GET relative,",
-        ));
-        assert_eq!(
-            rules,
-            vec![
-                Passthrough {
-                    method: Method::GET,
-                    path: "/stats".into(),
-                    prefix: false
-                },
-                Passthrough {
-                    method: Method::POST,
-                    path: "/v1/custom".into(),
-                    prefix: false
-                },
-                Passthrough {
-                    method: Method::DELETE,
-                    path: "/v1/things/".into(),
-                    prefix: true
-                },
-            ]
-        );
-        assert!(rules[0].matches(&Method::GET, "/stats"));
-        assert!(!rules[0].matches(&Method::POST, "/stats"));
-        assert!(!rules[0].matches(&Method::GET, "/stats/more"));
-        assert!(rules[2].matches(&Method::DELETE, "/v1/things/t_1"));
-        assert!(!rules[2].matches(&Method::DELETE, "/v1/thing"));
     }
 
     #[test]

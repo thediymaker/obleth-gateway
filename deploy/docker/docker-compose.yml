@@ -117,7 +117,6 @@ services:
       OBLETH_UPSTREAM_TIMEOUT_SECS: ${OBLETH_UPSTREAM_TIMEOUT_SECS:-300}
       OBLETH_ADMISSION_TIMEOUT_SECS: ${OBLETH_ADMISSION_TIMEOUT_SECS:-60}
       # Extra `METHOD /path` routes forwarded to a model's upstream (empty: only the inference endpoints).
-      OBLETH_PASSTHROUGH_PATHS: ${OBLETH_PASSTHROUGH_PATHS:-}
       OBLETH_VIDEO_JOB_RETENTION_HOURS: ${OBLETH_VIDEO_JOB_RETENTION_HOURS:-24}
       # key (default): a video job is private to the key that created it; tenant: shared tenant-wide.
       OBLETH_VIDEO_JOB_SCOPE: ${OBLETH_VIDEO_JOB_SCOPE:-key}

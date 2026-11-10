@@ -146,11 +146,6 @@ obleth:
   # Longest a request waits in the fairshare queue before a 503 with
   # Retry-After: 5. 0 or invalid falls back to this default.
   admissionTimeoutSecs: 60
-  # Extra routes forwarded to a model's upstream with that model's key, beyond
-  # the inference endpoints the proxy knows: comma-separated `METHOD /path`
-  # entries (POST when the method is left out; a trailing * matches everything
-  # under the path). Empty: any other path or method answers 404.
-  passthroughPaths: ""
   # How long a video job's record (which tenant owns it, which endpoint holds
   # it) is kept, in hours. Follow-ups for an older job answer 404. The backend
   # usually forgets finished jobs within an hour or two, so the default leaves
