@@ -92,11 +92,15 @@ obleth:
   # redis://:<password>@<release>-redis:6379), and OBLETH_CLICKHOUSE_PASSWORD
   # (clickhouse.enabled). See examples/values-production.yaml.
   existingSecret: ""
+  # Strict SSRF mode (OBLETH_BLOCK_PRIVATE_NETWORKS=1): admin-registered
+  # upstream URLs may not point at private, loopback or carrier-grade NAT
+  # addresses, except the ranges in allowedPrivateCidrs. Off by default so
+  # in-cluster api_base values work.
+  blockPrivateNetworks: false
   # SSRF allowlist for admin-registered upstream URLs (comma-separated CIDRs).
   # Default SSRF policy permits private/LAN targets (RFC1918, loopback, etc.) so
   # in-cluster api_base values work without this field. Only required when
-  # OBLETH_BLOCK_PRIVATE_NETWORKS=1 (strict mode) — then list trusted ranges,
-  # e.g. "10.0.0.0/8".
+  # blockPrivateNetworks is true — then list trusted ranges, e.g. "10.0.0.0/8".
   allowedPrivateCidrs: ""
   upstreamBaseUrl: ""   # empty -> defaults to the in-chart benchmark fixture backend
   # OTLP/HTTP trace export endpoint (e.g. http://my-collector:4318). Empty disables.
@@ -142,6 +146,11 @@ obleth:
   # Longest a request waits in the fairshare queue before a 503 with
   # Retry-After: 5. 0 or invalid falls back to this default.
   admissionTimeoutSecs: 60
+  # Extra routes forwarded to a model's upstream with that model's key, beyond
+  # the inference endpoints the proxy knows: comma-separated `METHOD /path`
+  # entries (POST when the method is left out; a trailing * matches everything
+  # under the path). Empty: any other path or method answers 404.
+  passthroughPaths: ""
   # How long a video job's record (which tenant owns it, which endpoint holds
   # it) is kept, in hours. Follow-ups for an older job answer 404. The backend
   # usually forgets finished jobs within an hour or two, so the default leaves

@@ -80,6 +80,9 @@ spec:
             - { name: OBLETH_CAPACITY_DISCOVERY_NAMESPACES, value: {{ join "," (uniq .Values.obleth.capacityDiscovery.namespaces) | quote }} }
             - { name: OBLETH_CAPACITY_DEFAULT_SERVICE, value: {{ .Values.obleth.capacityDiscovery.defaultService | quote }} }
             - { name: OBLETH_FAIL_OPEN, value: {{ .Values.obleth.failOpen | quote }} }
+            {{- if .Values.obleth.blockPrivateNetworks }}
+            - { name: OBLETH_BLOCK_PRIVATE_NETWORKS, value: "1" }
+            {{- end }}
             - { name: OBLETH_ALLOWED_PRIVATE_CIDRS, value: {{ .Values.obleth.allowedPrivateCidrs | quote }} }
             - { name: OBLETH_MODEL_HEALTH_ENABLED, value: {{ .Values.obleth.modelHealthEnabled | quote }} }
             - { name: OBLETH_MODEL_HEALTH_INTERVAL_SECS, value: {{ .Values.obleth.modelHealthIntervalSecs | quote }} }
@@ -96,6 +99,7 @@ spec:
             - { name: OBLETH_REDIS_RESPONSE_TIMEOUT_MS, value: {{ .Values.obleth.redisResponseTimeoutMs | quote }} }
             - { name: OBLETH_REDIS_CONNECT_TIMEOUT_MS, value: {{ .Values.obleth.redisConnectTimeoutMs | quote }} }
             - { name: OBLETH_ADMISSION_TIMEOUT_SECS, value: {{ .Values.obleth.admissionTimeoutSecs | quote }} }
+            - { name: OBLETH_PASSTHROUGH_PATHS, value: {{ .Values.obleth.passthroughPaths | default "" | quote }} }
             - { name: OBLETH_VIDEO_JOB_RETENTION_HOURS, value: {{ .Values.obleth.videoJobRetentionHours | quote }} }
             - { name: OBLETH_VIDEO_JOB_SCOPE, value: {{ .Values.obleth.videoJobScope | default "key" | quote }} }
             - { name: OBLETH_LOAD_ENDPOINT, value: {{ .Values.obleth.loadEndpoint | quote }} }
