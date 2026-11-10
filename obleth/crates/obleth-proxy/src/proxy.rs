@@ -77,32 +77,106 @@ pub(crate) fn admission_timeout() -> Duration {
     })
 }
 
-/// The canonical spelling of a POST path, when it differs from the request's.
+/// The canonical spelling of a request path, when it differs from the request's.
 ///
-/// Repeated and trailing slashes are removed, and the bare `/responses`, `/messages`,
-/// `/messages/count_tokens`, and `/verdicts` spellings map to their `/v1` forms. Without this,
-/// `/v1/responses/` or `/responses` skipped the translation shims and was
-/// forwarded to the upstream's own endpoint, so a tenant's guardrails never saw
-/// it, and `/v1/chat/completions/` lost its chat classification (and with it
-/// output guardrails and every chat-only boon).
-fn canonical_post_path(path: &str) -> Option<String> {
-    // Runs of `/` collapse to one, so `//v1/responses` cannot skip the shim
-    // (the upstream URL builder strips leading slashes and would forward it).
+/// Repeated and trailing slashes are removed and a repeated version prefix
+/// (`/v1/v1/…`, what a client sends when its base URL already ends in `/v1`) is
+/// read as one. For POST, the bare `/responses`, `/messages`,
+/// `/messages/count_tokens`, and `/verdicts` spellings map to their `/v1` forms.
+///
+/// Every method is canonicalized, once, before anything looks at the path: the
+/// shims, the job, file and batch routes, the request type, and the upstream
+/// URL all read the same spelling. When only POST was, `GET //v1/videos` or
+/// `/v1/v1/videos/{id}` matched no job route, skipped its ownership check, and
+/// was forwarded to the backend, whose URL builder dropped the extra slash or
+/// prefix; `/v1/responses/` or `/responses` skipped the translation shims, so
+/// a tenant's guardrails never saw it, and `/v1/chat/completions/` lost its
+/// chat classification (and with it output guardrails and every chat-only boon).
+fn canonical_path(method: &Method, path: &str) -> Option<String> {
+    // Runs of `/` collapse to one, so `//v1/responses` cannot skip the shim.
     let mut collapsed = String::with_capacity(path.len());
     for c in path.chars() {
         if !(c == '/' && collapsed.ends_with('/')) {
             collapsed.push(c);
         }
     }
-    let trimmed = collapsed.trim_end_matches('/');
+    let mut trimmed = collapsed.trim_end_matches('/');
+    while let Some(rest) = trimmed.strip_prefix("/v1/v1") {
+        if !(rest.is_empty() || rest.starts_with('/')) {
+            break;
+        }
+        // Drops the first `/v1`; what is left still starts with one.
+        trimmed = &trimmed["/v1".len()..];
+    }
+    let post = method == Method::POST;
     let mapped = match trimmed {
-        "/responses" => crate::responses::RESPONSES_PATH,
-        "/messages" => crate::messages::MESSAGES_PATH,
-        "/messages/count_tokens" => crate::messages::COUNT_TOKENS_PATH,
-        "/verdicts" => crate::verdicts::VERDICTS_PATH,
+        "/responses" if post => crate::responses::RESPONSES_PATH,
+        "/messages" if post => crate::messages::MESSAGES_PATH,
+        "/messages/count_tokens" if post => crate::messages::COUNT_TOKENS_PATH,
+        "/verdicts" if post => crate::verdicts::VERDICTS_PATH,
         other => other,
     };
     (!mapped.is_empty() && mapped != path).then(|| mapped.to_string())
+}
+
+/// One path the operator lets through to a model's upstream beyond the
+/// endpoints the gateway knows: an entry of `OBLETH_PASSTHROUGH_PATHS`.
+#[derive(Debug, PartialEq)]
+struct Passthrough {
+    method: Method,
+    path: String,
+    /// The entry ended in `*`: any path under `path` matches.
+    prefix: bool,
+}
+
+impl Passthrough {
+    fn matches(&self, method: &Method, path: &str) -> bool {
+        self.method == *method
+            && if self.prefix {
+                path.starts_with(&self.path)
+            } else {
+                path == self.path
+            }
+    }
+}
+
+/// Parse `OBLETH_PASSTHROUGH_PATHS`: comma-separated `METHOD /path` entries, the
+/// method optional (POST), a trailing `*` matching everything under the path.
+/// An entry that is not a method and an absolute path is skipped.
+fn parse_passthrough(raw: Option<&str>) -> Vec<Passthrough> {
+    raw.unwrap_or("")
+        .split(',')
+        .filter_map(|entry| {
+            let entry = entry.trim();
+            let (method, path) = match entry.split_once(char::is_whitespace) {
+                Some((m, p)) => (m.to_ascii_uppercase().parse::<Method>().ok()?, p.trim()),
+                None => (Method::POST, entry),
+            };
+            let (path, prefix) = match path.strip_suffix('*') {
+                Some(p) => (p, true),
+                None => (path, false),
+            };
+            (path.starts_with('/') && !path.contains(char::is_whitespace)).then(|| Passthrough {
+                method,
+                path: path.to_string(),
+                prefix,
+            })
+        })
+        .collect()
+}
+
+fn passthrough() -> &'static [Passthrough] {
+    static RULES: std::sync::OnceLock<Vec<Passthrough>> = std::sync::OnceLock::new();
+    RULES.get_or_init(|| {
+        let rules = parse_passthrough(std::env::var("OBLETH_PASSTHROUGH_PATHS").ok().as_deref());
+        if !rules.is_empty() {
+            tracing::warn!(
+                paths = rules.len(),
+                "OBLETH_PASSTHROUGH_PATHS is set: these paths are forwarded to a model's upstream with its key"
+            );
+        }
+        rules
+    })
 }
 
 pub async fn proxy_handler(state: State<AppState>, mut req: Request<Body>) -> Response<Body> {
@@ -115,15 +189,13 @@ pub async fn proxy_handler(state: State<AppState>, mut req: Request<Body>) -> Re
     // Likewise the effort the Responses and Messages shims carry over: a
     // caller sets effort in the body, never with the gateway's own header.
     req.headers_mut().remove(crate::reasoning::EFFORT_HEADER);
-    if req.method() == Method::POST {
-        if let Some(canonical) = canonical_post_path(req.uri().path()) {
-            let pq = match req.uri().query() {
-                Some(q) => format!("{canonical}?{q}"),
-                None => canonical,
-            };
-            if let Ok(uri) = pq.parse() {
-                *req.uri_mut() = uri;
-            }
+    if let Some(canonical) = canonical_path(req.method(), req.uri().path()) {
+        let pq = match req.uri().query() {
+            Some(q) => format!("{canonical}?{q}"),
+            None => canonical,
+        };
+        if let Ok(uri) = pq.parse() {
+            *req.uri_mut() = uri;
         }
     }
     // The router serves the exact `/v1/verdicts` path; its other spellings
@@ -1132,6 +1204,19 @@ async fn run_pipeline(
         }
     }
 
+    // ---- only known endpoints go on to an upstream ----
+    // What is left is forwarded to a model's upstream with the operator's key
+    // for it, so it must be a call the gateway knows how to admit, guard, and
+    // meter: an inference endpoint (POST) or model discovery (GET). Any other
+    // method or path used to be forwarded as it came whenever the body named
+    // an allowed model, which reached whatever else that upstream serves
+    // (stored completions, files, fine-tunes, a model server's management
+    // routes). An operator who needs such a route names it in
+    // `OBLETH_PASSTHROUGH_PATHS`.
+    if batch.is_none() && !is_forwarded(&method, &path) {
+        return error_json(StatusCode::NOT_FOUND, "unknown endpoint");
+    }
+
     // ---- request flight-recorder tracer ----
     let mut tracer: Option<crate::tracer::SpanRecorder> = if resolved.tracing_enabled {
         tracing::debug!(request_id = %request_id, "tracing enabled — recording spans");
@@ -1704,7 +1789,10 @@ async fn run_pipeline(
     // discovery endpoints are the only model-less passthroughs the gateway
     // serves, so they stay allowed. A request that DID name a registered model on
     // an unusual path (`route` is Some) is still forwarded untouched.
-    if route.is_none() && request_type_for_path(&path) == "other" && !is_models_endpoint(&path) {
+    // The endpoints the gateway knows have answered above when the model is not
+    // registered; this is what is left of them: a path from
+    // `OBLETH_PASSTHROUGH_PATHS` whose body names no registered model.
+    if route.is_none() && !is_models_endpoint(&path) {
         return error_json(StatusCode::NOT_FOUND, "unknown endpoint");
     }
     // ---- per-tenant model allowlist (Phase 4) ----
@@ -6244,7 +6332,11 @@ fn is_model_info_endpoint(path: &str) -> bool {
     path == "/model/info" || path == "/v1/model/info"
 }
 
-/// OpenAI endpoints that must name a registered model.
+/// The inference endpoints the gateway forwards to a model's upstream, in their
+/// canonical spelling. Each is a POST that must name a registered model. The
+/// request type, and so the guardrails and metering a call gets, is read from
+/// the path's ending (`request_type_for_path`), which is safe only because no
+/// other path with that ending is forwarded.
 const REGISTERED_MODEL_PATHS: &[&str] = &[
     "/v1/chat/completions",
     "/v1/completions",
@@ -6258,10 +6350,33 @@ const REGISTERED_MODEL_PATHS: &[&str] = &[
     "/v1/images/variations",
     crate::jobs::VIDEOS_PATH,
     crate::jobs::MESHES_PATH,
+    "/v1/rerank",
+    "/v1/reranking",
+    "/rerank",
+    "/reranking",
+    "/v1/moderations",
+    "/v1/score",
+    "/score",
+    "/v1/tokenize",
+    "/v1/detokenize",
+    "/tokenize",
+    "/detokenize",
+    "/v1/pooling",
+    "/pooling",
+    "/v1/classify",
+    "/classify",
 ];
 
 fn requires_registered_model(path: &str) -> bool {
     REGISTERED_MODEL_PATHS.contains(&path)
+}
+
+/// Whether the pipeline may send this request on to an upstream: an inference
+/// endpoint, model discovery, or a path the operator opted in.
+fn is_forwarded(method: &Method, path: &str) -> bool {
+    (method == Method::POST && requires_registered_model(path))
+        || (method == Method::GET && is_models_endpoint(path))
+        || passthrough().iter().any(|rule| rule.matches(method, path))
 }
 
 /// True when the endpoint takes a file upload, so the OpenAI spec sends it as
@@ -6711,13 +6826,28 @@ fn backoff_for(base: Duration, attempt: u32) -> Duration {
 /// outright. Legitimate OpenAI-compatible paths never contain `..`, encoded
 /// dots, or encoded separators.
 pub(crate) fn has_path_traversal(path: &str) -> bool {
-    let lowered = path.to_ascii_lowercase();
-    // Encoded dot (`%2e`) or separators (`%2f` `/`, `%5c` `\`) can reconstruct a
-    // traversal after the upstream decodes them; none are valid here.
-    if lowered.contains("%2e") || lowered.contains("%2f") || lowered.contains("%5c") {
-        return true;
+    // A percent-escape of a letter, digit, `-._~`, or a separator spells a
+    // path the routes here would not recognize but an upstream that decodes
+    // before routing would (`/v1/%76ideos/{id}` is its `/v1/videos/{id}`), and
+    // `%2e`, `%2f`, `%5c` can rebuild a traversal. No client needs to escape
+    // those, so any such escape, and a `%` that starts none, is refused.
+    let bytes = path.as_bytes();
+    let mut i = 0;
+    while let Some(at) = bytes[i..].iter().position(|b| *b == b'%') {
+        let at = i + at;
+        let hex = |b: Option<&u8>| b.and_then(|b| (*b as char).to_digit(16));
+        let (Some(hi), Some(lo)) = (hex(bytes.get(at + 1)), hex(bytes.get(at + 2))) else {
+            return true;
+        };
+        let decoded = (hi * 16 + lo) as u8;
+        if decoded.is_ascii_alphanumeric() || b"-._~/\\".contains(&decoded) {
+            return true;
+        }
+        i = at + 3;
     }
-    path.split(['/', '\\']).any(|seg| seg == "..")
+    // `.` is refused with `..`: the upstream's URL parser drops it, so
+    // `/v1/./videos` would be forwarded as `/v1/videos` without matching it here.
+    path.split(['/', '\\']).any(|seg| seg == ".." || seg == ".")
 }
 
 pub(crate) fn build_upstream_url(base: &str, path: &str, query: &str) -> String {
@@ -7473,21 +7603,21 @@ mod tests {
     use super::{
         admit_request_for, anthropic_error, apply_multipart_text_view,
         backfill_max_tokens_for_count_tokens, backoff_for, build_targets, build_upstream_url,
-        canonical_post_path, clamp_max_tokens, compute_modality_cost, context_overflow_response,
+        canonical_path, clamp_max_tokens, compute_modality_cost, context_overflow_response,
         conversation_seed, effective_request_type, end_user_for, forward_headers,
         has_input_guardrails, has_path_traversal, input_guardrails_unscannable, is_chat_path,
-        is_models_collection, is_models_endpoint, is_multipart_endpoint, is_retryable_status,
-        looks_like_context_length_error, messages_input_estimate, multipart_text_view,
-        output_guardrails_unenforceable, parse_multipart, prepare_upstream_body, redress_error,
-        request_type_for_path, requires_registered_model, resolve_conversation,
-        response_cache_name, route_keeps_sessions, session_hash_order, should_translate_as_stream,
-        strip_beta_query, strip_tool_strict, sure_overflow, surface, tenant_active_now,
-        weighted_order, MultipartField, RequestMeta, TooLong, END_USER_HEADER,
-        REGISTERED_MODEL_PATHS, SEED_CAP,
+        is_forwarded, is_models_collection, is_models_endpoint, is_multipart_endpoint,
+        is_retryable_status, looks_like_context_length_error, messages_input_estimate,
+        multipart_text_view, output_guardrails_unenforceable, parse_multipart, parse_passthrough,
+        prepare_upstream_body, redress_error, request_type_for_path, requires_registered_model,
+        resolve_conversation, response_cache_name, route_keeps_sessions, session_hash_order,
+        should_translate_as_stream, strip_beta_query, strip_tool_strict, sure_overflow, surface,
+        tenant_active_now, weighted_order, MultipartField, Passthrough, RequestMeta, TooLong,
+        END_USER_HEADER, REGISTERED_MODEL_PATHS, SEED_CAP,
     };
     use crate::router::{BoonGrants, Candidate, Intent, RequestFeatures, RouterWeights};
     use axum::body::{Body, Bytes};
-    use axum::http::{header, HeaderMap, Response, StatusCode};
+    use axum::http::{header, HeaderMap, Method, Response, StatusCode};
     use chrono::{DateTime, TimeZone, Utc};
     use obleth_config::{ResolvedEndpoint, ResolvedKey, ResolvedModel, WeeklyWindow};
     use std::collections::HashMap;
@@ -7623,43 +7753,167 @@ mod tests {
     }
 
     #[test]
+    fn every_method_reads_one_spelling_of_a_path() {
+        for method in [Method::GET, Method::DELETE, Method::POST] {
+            for (sent, read) in [
+                ("//v1/videos", "/v1/videos"),
+                ("/v1//videos/vid_1/content", "/v1/videos/vid_1/content"),
+                ("/v1/videos/", "/v1/videos"),
+                ("/v1/v1/videos/vid_1", "/v1/videos/vid_1"),
+                ("/v1/v1/v1/responses", "/v1/responses"),
+                ("//v1//v1/batches/b_1", "/v1/batches/b_1"),
+                ("/v1/v1", "/v1"),
+            ] {
+                assert_eq!(
+                    canonical_path(&method, sent).as_deref(),
+                    Some(read),
+                    "{method} {sent}"
+                );
+            }
+            assert_eq!(canonical_path(&method, "/v1/videos"), None);
+            assert_eq!(canonical_path(&method, "/v1/v1beta/x"), None);
+        }
+        // The bare spellings are POST endpoints.
+        assert_eq!(canonical_path(&Method::GET, "/responses"), None);
+        // What skipped the job routes now reaches them.
+        for sent in ["//v1/videos", "/v1/v1/videos"] {
+            let read = canonical_path(&Method::GET, sent).unwrap();
+            assert!(
+                crate::jobs::follow_up(&Method::GET, &read).is_some(),
+                "{sent}"
+            );
+        }
+        let read = canonical_path(&Method::DELETE, "/v1/v1/videos/vid_1").unwrap();
+        assert!(crate::jobs::follow_up(&Method::DELETE, &read).is_some());
+    }
+
+    #[test]
+    fn odd_spellings_of_a_path_are_refused() {
+        for path in [
+            "/v1/./videos",
+            "/./v1/responses",
+            "/v1/videos/.",
+            "/v1/%76ideos/vid_1",
+            "/v1/%56IDEOS",
+            "/v1/chat%2Dcompletions",
+            "/v1/x%7e",
+            "/v1/x%",
+            "/v1/x%2",
+            "/v1/x%zz",
+        ] {
+            assert!(has_path_traversal(path), "{path}");
+        }
+        for path in [
+            "/v1/models/my%20model",
+            "/v1/models/org%3Amodel",
+            "/v1/models/gpt.4",
+            "/v1/files/file-abc.jsonl",
+        ] {
+            assert!(!has_path_traversal(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn only_known_endpoints_are_forwarded() {
+        for path in REGISTERED_MODEL_PATHS {
+            assert!(is_forwarded(&Method::POST, path), "{path}");
+            for method in [Method::GET, Method::DELETE, Method::PUT, Method::PATCH] {
+                assert!(!is_forwarded(&method, path), "{method} {path}");
+            }
+        }
+        for path in ["/v1/models", "/v1/models/gpt-4o", "/model/info"] {
+            assert!(is_forwarded(&Method::GET, path), "{path}");
+            assert!(!is_forwarded(&Method::POST, path), "{path}");
+            assert!(!is_forwarded(&Method::DELETE, path), "{path}");
+        }
+        // Whatever else an upstream serves, and endpoints under another prefix.
+        for (method, path) in [
+            (Method::GET, "/stats"),
+            (Method::GET, "/v1/files"),
+            (Method::GET, "/v1/chat/completions"),
+            (Method::POST, "/v1/fine_tuning/jobs"),
+            (Method::POST, "/v1/files"),
+            (Method::POST, "/internal/chat/completions"),
+            (Method::POST, "/v1/audio/anything"),
+            (Method::POST, "/v1/videos/vid_1/remix"),
+            (Method::POST, "/"),
+        ] {
+            assert!(!is_forwarded(&method, path), "{method} {path}");
+        }
+    }
+
+    #[test]
+    fn passthrough_paths_are_read_from_the_setting() {
+        assert!(parse_passthrough(None).is_empty());
+        assert!(parse_passthrough(Some(" , ")).is_empty());
+        let rules = parse_passthrough(Some(
+            "GET /stats, /v1/custom , delete /v1/things/* ,nonsense,GET relative,",
+        ));
+        assert_eq!(
+            rules,
+            vec![
+                Passthrough {
+                    method: Method::GET,
+                    path: "/stats".into(),
+                    prefix: false
+                },
+                Passthrough {
+                    method: Method::POST,
+                    path: "/v1/custom".into(),
+                    prefix: false
+                },
+                Passthrough {
+                    method: Method::DELETE,
+                    path: "/v1/things/".into(),
+                    prefix: true
+                },
+            ]
+        );
+        assert!(rules[0].matches(&Method::GET, "/stats"));
+        assert!(!rules[0].matches(&Method::POST, "/stats"));
+        assert!(!rules[0].matches(&Method::GET, "/stats/more"));
+        assert!(rules[2].matches(&Method::DELETE, "/v1/things/t_1"));
+        assert!(!rules[2].matches(&Method::DELETE, "/v1/thing"));
+    }
+
+    #[test]
     fn post_paths_are_canonicalized_before_surface_dispatch() {
         assert_eq!(
-            canonical_post_path("/responses").as_deref(),
+            canonical_path(&Method::POST, "/responses").as_deref(),
             Some("/v1/responses")
         );
         assert_eq!(
-            canonical_post_path("/v1/responses/").as_deref(),
+            canonical_path(&Method::POST, "/v1/responses/").as_deref(),
             Some("/v1/responses")
         );
         assert_eq!(
-            canonical_post_path("/messages").as_deref(),
+            canonical_path(&Method::POST, "/messages").as_deref(),
             Some("/v1/messages")
         );
         assert_eq!(
-            canonical_post_path("/messages/count_tokens/").as_deref(),
+            canonical_path(&Method::POST, "/messages/count_tokens/").as_deref(),
             Some("/v1/messages/count_tokens")
         );
         assert_eq!(
-            canonical_post_path("/verdicts").as_deref(),
+            canonical_path(&Method::POST, "/verdicts").as_deref(),
             Some("/v1/verdicts")
         );
         assert_eq!(
-            canonical_post_path("/v1/chat/completions//").as_deref(),
+            canonical_path(&Method::POST, "/v1/chat/completions//").as_deref(),
             Some("/v1/chat/completions")
         );
         // Repeated slashes collapse, so a doubled prefix cannot skip a shim.
         assert_eq!(
-            canonical_post_path("//v1/responses").as_deref(),
+            canonical_path(&Method::POST, "//v1/responses").as_deref(),
             Some("/v1/responses")
         );
         assert_eq!(
-            canonical_post_path("/v1//messages").as_deref(),
+            canonical_path(&Method::POST, "/v1//messages").as_deref(),
             Some("/v1/messages")
         );
         // Already canonical, or nothing to trim: untouched.
-        assert_eq!(canonical_post_path("/v1/chat/completions"), None);
-        assert_eq!(canonical_post_path("/"), None);
+        assert_eq!(canonical_path(&Method::POST, "/v1/chat/completions"), None);
+        assert_eq!(canonical_path(&Method::POST, "/"), None);
         // Normalization runs before the shim dispatch in `proxy_handler`.
         let src = include_str!("proxy.rs");
         let handler = src
@@ -7667,7 +7921,7 @@ mod tests {
             .expect("proxy_handler");
         let canon = handler
             + src[handler..]
-                .find("canonical_post_path(req.uri().path())")
+                .find("canonical_path(req.method(), req.uri().path())")
                 .expect("normalization");
         let shim = handler
             + src[handler..]
