@@ -371,6 +371,15 @@ pub fn router(state: AdminState) -> Router {
             "/api/v1/models/:id/managed/provision-error",
             patch(set_provision_error),
         )
+        .route(
+            "/api/v1/models/:id/managed/retry",
+            post(retry_managed_model),
+        )
+        .route("/api/v1/models/:id/managed/roll", post(roll_managed_model))
+        .route(
+            "/api/v1/models/:id/managed/backoff",
+            put(set_managed_backoff),
+        )
         .route("/api/v1/replicas", get(list_all_replicas))
         .route(
             "/api/v1/replicas/:id",
@@ -1346,6 +1355,8 @@ fn default_true() -> bool {
 pub(crate) struct PutManagedModel {
     #[serde(default = "default_true")]
     enabled: bool,
+    /// Empty uses the cluster's default partition.
+    #[serde(default)]
     partition: String,
     #[serde(default)]
     gres: String,
@@ -1381,7 +1392,179 @@ pub(crate) struct PutManagedModel {
     max_job_failures: i64,
     #[serde(default)]
     launcher_spec: Option<serde_json::Value>,
+    /// Minutes a running job's server may take to become healthy before the
+    /// job is cancelled and counted as a failed launch. 0 never gives up.
+    #[serde(default = "default_startup_timeout_mins")]
+    startup_timeout_mins: i64,
+    /// Minutes before a healthy replica's time limit at which a replacement
+    /// is submitted. 0 turns the handoff off.
+    #[serde(default = "default_handoff_mins")]
+    handoff_mins: i64,
 }
+fn default_startup_timeout_mins() -> i64 {
+    obleth_config::DEFAULT_STARTUP_TIMEOUT_MINS
+}
+fn default_handoff_mins() -> i64 {
+    obleth_config::DEFAULT_HANDOFF_MINS
+}
+
+/// Ports the provisioner gives each replica by default (its window).
+const DEFAULT_PORT_SPAN: i64 = 8;
+
+/// Every problem with a managed spec, one plain sentence each. Empty when
+/// the spec can be stored.
+fn managed_spec_problems(b: &PutManagedModel) -> Vec<String> {
+    use obleth_config::slurm as sv;
+    let mut out = Vec::new();
+    if !(1..=65535).contains(&b.serving_port) {
+        out.push("The serving port must be between 1 and 65535.".to_string());
+    } else {
+        let last = b.serving_port + b.target_replicas.max(1) * DEFAULT_PORT_SPAN - 1;
+        if last > 65535 {
+            out.push(format!(
+                "The serving port is too high: {} replicas need ports up to {last}, past \
+                 65535. Use a lower port.",
+                b.target_replicas.max(1)
+            ));
+        }
+    }
+    let health = b.health_path.trim();
+    if !health.is_empty() && !health.starts_with('/') {
+        out.push("The health path must start with /, for example /health.".to_string());
+    }
+    if b.target_replicas < 0 {
+        out.push("The replica count cannot be negative. Use 0 to keep none running.".to_string());
+    } else if b.min_replicas < 0 || b.min_replicas > b.target_replicas {
+        out.push(format!(
+            "The healthy-replica floor must be between 0 and the replica count ({}).",
+            b.target_replicas
+        ));
+    }
+    if b.max_job_failures < 0 {
+        out.push("The failure limit cannot be negative. Use 0 for no limit.".to_string());
+    }
+    if b.startup_timeout_mins < 0 {
+        out.push("The startup timeout cannot be negative. Use 0 to wait forever.".to_string());
+    }
+    if b.handoff_mins < 0 {
+        out.push("The handoff time cannot be negative. Use 0 to turn it off.".to_string());
+    }
+    if b.nodes < 1 {
+        out.push("A job needs at least one node.".to_string());
+    }
+    if b.cpus_per_task.is_some_and(|c| c < 0) {
+        out.push(
+            "CPUs per task cannot be negative. Leave it empty for the cluster default.".to_string(),
+        );
+    }
+    if let Some(t) = b.time_limit.as_deref() {
+        if let Err(e) = sv::parse_time_limit(t) {
+            out.push(e);
+        }
+    }
+    if let Some(m) = b.mem.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+        if sv::parse_mem_mb(m).is_none() {
+            out.push(format!(
+                "The memory request \"{m}\" is not a Slurm size. Use a number with a unit, for \
+                 example 64G or 512000M."
+            ));
+        }
+    }
+    if let Err(e) = sv::validate_gres(&b.gres) {
+        out.push(e);
+    }
+    if b.script_body.trim().is_empty() && b.launch_command.trim().is_empty() {
+        out.push("Give the job a script or a launch command.".to_string());
+    }
+    out
+}
+
+#[cfg(test)]
+mod managed_spec_tests {
+    use super::*;
+
+    fn spec(extra: serde_json::Value) -> PutManagedModel {
+        let mut v = serde_json::json!({ "serving_port": 8000, "launch_command": "serve" });
+        for (k, x) in extra.as_object().unwrap() {
+            v[k] = x.clone();
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn a_minimal_spec_is_valid_and_takes_the_defaults() {
+        let b = spec(serde_json::json!({}));
+        assert!(
+            managed_spec_problems(&b).is_empty(),
+            "{:?}",
+            managed_spec_problems(&b)
+        );
+        assert_eq!(b.partition, "", "empty partition uses the cluster default");
+        assert_eq!(b.startup_timeout_mins, 60);
+        assert_eq!(b.handoff_mins, 15);
+        let zero = spec(serde_json::json!({ "target_replicas": 0, "min_replicas": 0 }));
+        assert!(
+            managed_spec_problems(&zero).is_empty(),
+            "0 replicas is allowed"
+        );
+    }
+
+    #[test]
+    fn every_problem_is_named_in_a_plain_sentence() {
+        let b = spec(serde_json::json!({
+            "serving_port": 65530,
+            "health_path": "health",
+            "target_replicas": 2,
+            "min_replicas": 3,
+            "max_job_failures": -1,
+            "time_limit": "2d",
+            "mem": "lots",
+            "gres": "gpu a100",
+            "nodes": 0,
+            "cpus_per_task": -2,
+            "startup_timeout_mins": -1,
+            "launch_command": "",
+        }));
+        let p = managed_spec_problems(&b);
+        let all = p.join(" ");
+        for needle in [
+            "too high",
+            "must start with /",
+            "between 0 and the replica count (2)",
+            "failure limit",
+            "\"2d\" is not a Slurm walltime",
+            "\"lots\" is not a Slurm size",
+            "not a Slurm GRES",
+            "at least one node",
+            "CPUs per task",
+            "startup timeout",
+            "script or a launch command",
+        ] {
+            assert!(all.contains(needle), "missing {needle:?} in {all}");
+        }
+        assert!(p.iter().all(|m| m.ends_with('.')), "{p:?}");
+        let neg = spec(serde_json::json!({ "target_replicas": -1 }));
+        assert!(managed_spec_problems(&neg)[0].contains("cannot be negative"));
+        for ok in ["UNLIMITED", "1-00:00:00", "90", ""] {
+            let b = spec(serde_json::json!({ "time_limit": ok }));
+            assert!(managed_spec_problems(&b).is_empty(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn audit_hides_launch_environment_values_and_runtime_state() {
+        let spec = obleth_config::ManagedModelSpec {
+            launcher_spec: Some(serde_json::json!({ "env": { "HF_TOKEN": "s3cret" } })),
+            paused_reason: Some("Paused.".into()),
+            ..Default::default()
+        };
+        let a = managed_model_audit(&spec);
+        assert_eq!(a["launcher_spec"]["env"]["HF_TOKEN"], "(hidden)");
+        assert!(a.get("paused_reason").is_none());
+        assert!(!a.to_string().contains("s3cret"));
+    }
+}
+
 fn one() -> i64 {
     1
 }
@@ -1397,6 +1580,9 @@ pub(crate) struct CreateReplica {
     slurm_job_id: String,
     #[serde(default)]
     port_base: Option<i64>,
+    /// Where the job's output goes.
+    #[serde(default)]
+    log_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1406,6 +1592,53 @@ pub(crate) struct PatchReplica {
     nodes: Option<String>,
     #[schema(value_type = Option<String>)]
     endpoint_id: Option<Uuid>,
+    /// When Slurm started the job the replica is promoted under.
+    #[serde(default)]
+    job_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the running job reaches its time limit.
+    #[serde(default)]
+    job_ends_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Plain sentence for the dashboard; an empty string clears it.
+    #[serde(default)]
+    state_detail: Option<String>,
+    /// Where the job's output goes; an empty string clears it.
+    #[serde(default)]
+    log_path: Option<String>,
+    /// The port the server was found on.
+    #[serde(default)]
+    port: Option<i64>,
+    /// Set or clear the surge-first replacement flag.
+    #[serde(default)]
+    replace_requested: Option<bool>,
+}
+
+impl PatchReplica {
+    fn details(&self) -> Option<obleth_store::ReplicaDetailsUpdate> {
+        let d = obleth_store::ReplicaDetailsUpdate {
+            job_started_at: self.job_started_at,
+            job_ends_at: self.job_ends_at,
+            state_detail: self.state_detail.clone(),
+            log_path: self.log_path.clone(),
+            port: self.port.filter(|p| (1..=65535).contains(p)),
+            replace_requested: self.replace_requested,
+        };
+        (d.job_started_at.is_some()
+            || d.job_ends_at.is_some()
+            || d.state_detail.is_some()
+            || d.log_path.is_some()
+            || d.port.is_some()
+            || d.replace_requested.is_some())
+        .then_some(d)
+    }
+}
+
+/// `DELETE /api/v1/replicas/{id}` options.
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
+pub(crate) struct DeleteReplicaQuery {
+    /// Drop the row whatever its state (the provisioner's clean-up of a
+    /// finished job). Without it a live replica is cancelled instead.
+    #[serde(default)]
+    force: bool,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -8560,37 +8793,33 @@ async fn put_managed_model(
     headers: HeaderMap,
     Json(body): Json<PutManagedModel>,
 ) -> Result<Json<ManagedModelSpec>> {
-    if body.serving_port < 1 || body.serving_port > 65535 {
-        return Err(AdminError::BadRequest(
-            "serving_port must be 1..=65535".into(),
-        ));
+    // image is optional: an empty image means bare-metal (no apptainer
+    // wrap), and an empty partition uses the cluster's default.
+    let problems = managed_spec_problems(&body);
+    if !problems.is_empty() {
+        return Err(AdminError::BadRequest(problems.join(" ")));
     }
-    if body.partition.trim().is_empty() {
-        return Err(AdminError::BadRequest("partition must not be empty".into()));
-    }
-    // image is optional: an empty image means bare-metal (no apptainer wrap).
-    // A model is launchable if it has either a rendered script_body or a launch_command.
-    if body.script_body.trim().is_empty() && body.launch_command.trim().is_empty() {
-        return Err(AdminError::BadRequest(
-            "launch_command or script_body must not be empty".into(),
-        ));
-    }
+    let health_path = match body.health_path.trim() {
+        "" => "/health".to_string(),
+        p => p.to_string(),
+    };
+    let opt = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let spec = state
         .store
         .upsert_managed_model(obleth_store::UpsertManagedModel {
             model_id: id,
             enabled: body.enabled,
-            partition: body.partition,
-            gres: body.gres,
+            partition: body.partition.trim().to_string(),
+            gres: body.gres.trim().to_string(),
             nodes: body.nodes,
-            constraints: body.constraints,
-            exclude: body.exclude,
-            account: body.account,
-            qos: body.qos,
-            time_limit: body.time_limit,
-            cpus_per_task: body.cpus_per_task,
-            mem: body.mem,
-            image: body.image,
+            constraints: opt(body.constraints),
+            exclude: opt(body.exclude),
+            account: opt(body.account),
+            qos: opt(body.qos),
+            time_limit: opt(body.time_limit),
+            cpus_per_task: body.cpus_per_task.filter(|c| *c > 0),
+            mem: opt(body.mem),
+            image: body.image.trim().to_string(),
             // Stored with Unix line endings: bash reads a `\r` as part of
             // the line, and a browser textarea sends CRLF.
             preamble: body.preamble.replace("\r\n", "\n"),
@@ -8598,11 +8827,13 @@ async fn put_managed_model(
             launch_command: body.launch_command.replace("\r\n", "\n"),
             script_body: body.script_body.replace("\r\n", "\n"),
             serving_port: body.serving_port,
-            health_path: body.health_path,
+            health_path,
             target_replicas: body.target_replicas,
             min_replicas: body.min_replicas,
             max_job_failures: body.max_job_failures,
             launcher_spec: body.launcher_spec,
+            startup_timeout_mins: body.startup_timeout_mins,
+            handoff_mins: body.handoff_mins,
         })
         .await?;
     state
@@ -8631,6 +8862,22 @@ fn managed_model_audit(spec: &impl serde::Serialize) -> serde_json::Value {
                 fields.insert(format!("{name}_lines"), lines.into());
             }
         }
+        // The launcher panel state carries environment values and recipe
+        // inputs typed at launch; keep names, hide values that may be secret.
+        if let Some(ls) = fields.get_mut("launcher_spec") {
+            *ls = obleth_config::slurm::redact_launcher_spec(ls);
+        }
+        // Runtime state, not something the operator set.
+        for name in [
+            "last_provision_error",
+            "last_provision_error_at",
+            "paused_reason",
+            "paused_until",
+            "failed_launches",
+            "backoff_step",
+        ] {
+            fields.remove(name);
+        }
     }
     detail
 }
@@ -8642,6 +8889,7 @@ async fn delete_managed_model(
     Path(id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>> {
+    let previous = state.store.get_managed_model(id).await?;
     state.store.delete_managed_model(id).await?;
     state
         .store
@@ -8650,7 +8898,10 @@ async fn delete_managed_model(
             "delete_managed_model",
             "managed_model",
             &id.to_string(),
-            serde_json::json!({}),
+            previous
+                .as_ref()
+                .map(managed_model_audit)
+                .unwrap_or_else(|| serde_json::json!({})),
         )
         .await?;
     Ok(Json(serde_json::json!({"deleted": true})))
@@ -8702,6 +8953,129 @@ async fn set_provision_error(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
+/// What `retry` and `roll` answer.
+#[derive(Debug, serde::Serialize, ToSchema)]
+pub(crate) struct ManagedActionResult {
+    pub ok: bool,
+    /// Replicas flagged for replacement (roll only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replicas: Option<u64>,
+    /// What happens next, as a plain sentence.
+    pub message: String,
+}
+
+/// "Try again": lift a pause set by the failure limit or a Slurm rejection,
+/// and reset the backoff, so the provisioner's next pass submits.
+#[utoipa::path(post, path = "/api/v1/models/{id}/managed/retry", tag = "slurm",
+    params(("id" = String, Path, description = "Model id")),
+    responses((status = 200, body = ManagedActionResult), (status = 404)))]
+async fn retry_managed_model(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<ManagedActionResult>> {
+    let Some(before) = state.store.get_managed_model(id).await? else {
+        return Err(AdminError::NotFound);
+    };
+    state.store.clear_managed_backoff(id).await?;
+    state
+        .store
+        .record_audit(
+            &audit_actor(&headers),
+            "retry_managed_model",
+            "managed_model",
+            &id.to_string(),
+            serde_json::json!({
+                "paused_reason": before.paused_reason,
+                "failed_launches": before.failed_launches,
+            }),
+        )
+        .await?;
+    Ok(Json(ManagedActionResult {
+        ok: true,
+        replicas: None,
+        message: "Submits are no longer paused. The provisioner starts jobs on its next pass."
+            .into(),
+    }))
+}
+
+/// Replace every live replica one at a time, each replacement started before
+/// the old one is drained, so spec edits apply without an outage.
+#[utoipa::path(post, path = "/api/v1/models/{id}/managed/roll", tag = "slurm",
+    params(("id" = String, Path, description = "Model id")),
+    responses((status = 200, body = ManagedActionResult), (status = 404)))]
+async fn roll_managed_model(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<ManagedActionResult>> {
+    if state.store.get_managed_model(id).await?.is_none() {
+        return Err(AdminError::NotFound);
+    }
+    let n = state.store.request_model_roll(id).await?;
+    state
+        .store
+        .record_audit(
+            &audit_actor(&headers),
+            "roll_managed_model",
+            "managed_model",
+            &id.to_string(),
+            serde_json::json!({ "replicas": n }),
+        )
+        .await?;
+    let message = if n == 0 {
+        "No running replicas to replace. New jobs use the current settings.".to_string()
+    } else {
+        format!(
+            "{n} replica{} will be replaced one at a time. Each keeps serving until its \
+             replacement is healthy.",
+            if n == 1 { "" } else { "s" }
+        )
+    };
+    Ok(Json(ManagedActionResult {
+        ok: true,
+        replicas: Some(n),
+        message,
+    }))
+}
+
+/// The provisioner records a managed model's failure count and pause state.
+#[utoipa::path(put, path = "/api/v1/models/{id}/managed/backoff", tag = "slurm",
+    params(("id" = String, Path, description = "Model id")),
+    request_body = obleth_config::ManagedBackoff,
+    responses((status = 200)))]
+async fn set_managed_backoff(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<obleth_config::ManagedBackoff>,
+) -> Result<Json<serde_json::Value>> {
+    let before = state.store.get_managed_model(id).await?;
+    state.store.set_managed_backoff(id, &body).await?;
+    // Only a new pause is worth an audit row; the counters move every launch.
+    let newly_paused = body.paused_reason.is_some()
+        && before
+            .as_ref()
+            .is_some_and(|m| m.paused_reason != body.paused_reason);
+    if newly_paused {
+        state
+            .store
+            .record_audit(
+                &audit_actor(&headers),
+                "pause_managed_model",
+                "managed_model",
+                &id.to_string(),
+                serde_json::json!({
+                    "paused_reason": body.paused_reason,
+                    "paused_until": body.paused_until,
+                    "failed_launches": body.failed_launches,
+                }),
+            )
+            .await?;
+    }
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
 // ---- replica registry ----------------------------------------------------
 
 #[utoipa::path(get, path = "/api/v1/models/{id}/replicas",
@@ -8730,7 +9104,12 @@ async fn create_replica(
 ) -> Result<Json<ModelReplica>> {
     let r = state
         .store
-        .create_replica(id, &body.slurm_job_id, body.port_base)
+        .create_replica_with_log(
+            id,
+            &body.slurm_job_id,
+            body.port_base,
+            body.log_path.as_deref(),
+        )
         .await?;
     state
         .store
@@ -8770,6 +9149,9 @@ async fn patch_replica(
             .set_replica_runtime(id, body.nodes.as_deref(), body.endpoint_id)
             .await?;
     }
+    if let Some(d) = body.details() {
+        state.store.set_replica_details(id, &d).await?;
+    }
     if let Some(state_val) = body.state.as_deref() {
         state
             .store
@@ -8803,9 +9185,21 @@ async fn restart_replica(
     Path(id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>> {
-    if !state.store.request_replica_cancel(id).await? {
-        return Err(AdminError::NotFound);
+    let replica = state
+        .store
+        .get_replica(id)
+        .await?
+        .ok_or(AdminError::NotFound)?;
+    if matches!(replica.state.as_str(), "lost" | "draining") || replica.cancel_requested {
+        return Err(AdminError::Conflict(
+            "This replica is already stopping or has ended, so there is nothing to restart. \
+             The replica count brings in a new one."
+                .into(),
+        ));
     }
+    // Surge-first: the provisioner starts a successor and drains this one
+    // only once the successor serves (or after the startup timeout).
+    state.store.request_replica_replace(id).await?;
     state
         .store
         .record_audit(
@@ -8813,19 +9207,59 @@ async fn restart_replica(
             "restart_replica",
             "model_replica",
             &id.to_string(),
-            serde_json::json!({}),
+            serde_json::json!({ "replace": true }),
         )
         .await?;
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "message": "A replacement job starts now. This replica keeps serving until the \
+                    replacement is healthy, then it is drained and cancelled.",
+    })))
 }
 
 #[utoipa::path(delete, path = "/api/v1/replicas/{id}",
-    responses((status = 200)))]
+    params(DeleteReplicaQuery),
+    responses(
+        (status = 200, description = "The row was deleted (a lost replica, or `force`)"),
+        (status = 202, description = "The replica's job is being cancelled; the row goes once it has ended"),
+        (status = 404)))]
 async fn delete_replica(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
+    Query(q): Query<DeleteReplicaQuery>,
     headers: HeaderMap,
-) -> Result<Json<serde_json::Value>> {
+) -> Result<(StatusCode, Json<serde_json::Value>)> {
+    if !q.force {
+        let replica = state
+            .store
+            .get_replica(id)
+            .await?
+            .ok_or(AdminError::NotFound)?;
+        if replica.state != "lost" {
+            // A live replica: cancel its job (the provisioner removes the
+            // endpoint first) and let the clean-up drop the row once it ends.
+            state.store.request_replica_cancel(id).await?;
+            state
+                .store
+                .record_audit(
+                    &audit_actor(&headers),
+                    "cancel_replica",
+                    "model_replica",
+                    &id.to_string(),
+                    serde_json::json!({ "state": replica.state }),
+                )
+                .await?;
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "deleted": false,
+                    "cancelling": true,
+                    "message": "The replica's job is being cancelled. It is removed once the \
+                                job has ended.",
+                })),
+            ));
+        }
+    }
     state.store.delete_replica(id).await?;
     state
         .store
@@ -8834,10 +9268,10 @@ async fn delete_replica(
             "delete_replica",
             "model_replica",
             &id.to_string(),
-            serde_json::json!({}),
+            serde_json::json!({ "force": q.force }),
         )
         .await?;
-    Ok(Json(serde_json::json!({"deleted": true})))
+    Ok((StatusCode::OK, Json(serde_json::json!({"deleted": true}))))
 }
 
 #[utoipa::path(post, path = "/api/v1/models/{id}/replicas/clear-lost",
@@ -9948,6 +10382,142 @@ mod tests {
             .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
             .body(axum::body::Body::from(body.to_string()))
             .expect("build request")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn replica_restart_is_surge_first_and_delete_cancels_live_rows() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let name = format!("slurm-{}", Uuid::new_v4());
+        let model = fixture_model(&t.store, &name, 0.0).await;
+        let put = |body: serde_json::Value| {
+            json_request("PUT", &format!("/api/v1/models/{}/managed", model.id), body)
+        };
+        let (status, body) = send(
+            &t.app,
+            put(serde_json::json!({
+                "serving_port": 8000, "launch_command": "serve", "health_path": "health",
+                "time_limit": "4h",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let msg = body["error"].as_str().unwrap();
+        assert!(
+            msg.contains("health path") && msg.contains("\"4h\""),
+            "{msg}"
+        );
+        let (status, body) = send(
+            &t.app,
+            put(serde_json::json!({
+                "serving_port": 8000, "launch_command": "serve", "target_replicas": 0,
+                "min_replicas": 0, "time_limit": "UNLIMITED",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["target_replicas"], 0);
+        assert_eq!(body["startup_timeout_mins"], 60);
+
+        let live = t
+            .store
+            .create_replica(model.id, "71", Some(8000))
+            .await
+            .unwrap();
+        let (status, _) = send(
+            &t.app,
+            json_request(
+                "POST",
+                &format!("/api/v1/replicas/{}/restart", live.id),
+                serde_json::json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let row = t.store.get_replica(live.id).await.unwrap().unwrap();
+        assert!(row.replace_requested && !row.cancel_requested);
+
+        let (status, _) = send(
+            &t.app,
+            json_request(
+                "DELETE",
+                &format!("/api/v1/replicas/{}", live.id),
+                serde_json::json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let row = t
+            .store
+            .get_replica(live.id)
+            .await
+            .unwrap()
+            .expect("row kept");
+        assert!(row.cancel_requested);
+        let (status, _) = send(
+            &t.app,
+            json_request(
+                "POST",
+                &format!("/api/v1/replicas/{}/restart", live.id),
+                serde_json::json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a cancelling replica is not restarted"
+        );
+        let (status, _) = send(
+            &t.app,
+            json_request(
+                "DELETE",
+                &format!("/api/v1/replicas/{}?force=true", live.id),
+                serde_json::json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(t.store.get_replica(live.id).await.unwrap().is_none());
+
+        t.store
+            .set_managed_backoff(
+                model.id,
+                &obleth_config::ManagedBackoff {
+                    failed_launches: 3,
+                    backoff_step: 1,
+                    paused_reason: Some("Paused.".into()),
+                    paused_until: Some(chrono::Utc::now() + chrono::Duration::minutes(5)),
+                },
+            )
+            .await
+            .unwrap();
+        let (status, _) = send(
+            &t.app,
+            json_request(
+                "POST",
+                &format!("/api/v1/models/{}/managed/retry", model.id),
+                serde_json::json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let m = t.store.get_managed_model(model.id).await.unwrap().unwrap();
+        assert!(m.paused_reason.is_none() && m.failed_launches == 0);
+        let (status, body) = send(
+            &t.app,
+            json_request(
+                "POST",
+                &format!("/api/v1/models/{}/managed/roll", model.id),
+                serde_json::json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["replicas"], 0);
+        t.store.delete_model(model.id).await.ok();
     }
 
     /// Rejected request fields go through create, update, their own endpoint

@@ -42,10 +42,21 @@ pub(crate) async fn export_models(
     // Stable order so two exports of the same registry diff cleanly in git.
     models.sort_by(|a, b| a.model_name.cmp(&b.model_name));
 
+    // Endpoints the Slurm provisioner registered for a running job point at
+    // a node and port that will not survive; the managed spec recreates them.
+    let job_endpoints: std::collections::HashSet<uuid::Uuid> = state
+        .store
+        .all_replicas()
+        .await?
+        .iter()
+        .filter_map(|r| r.endpoint_id)
+        .collect();
+
     let mut entries = Vec::with_capacity(models.len());
     for model in &models {
         let mut entry = model_to_manifest_entry(model);
         let mut endpoints = state.store.list_model_endpoints(model.id).await?;
+        endpoints.retain(|e| !job_endpoints.contains(&e.id));
         endpoints.sort_by(|a, b| a.name.cmp(&b.name));
         // Omit the key entirely for models with no endpoints, so re-importing
         // reads as "leave endpoints alone" rather than "set them to empty".
