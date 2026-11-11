@@ -2009,7 +2009,7 @@ const BOON_BOOLS = [
   "compression_enabled", "compression_code_compaction", "compression_dedup", "compression_compact_logs", "compression_allow_lossy",
 ] as const;
 const BOON_NUMBERS = [
-  "vision_max_images", "vision_timeout_ms", "structured_output_max_repair_attempts", "structured_output_timeout_ms",
+  "vision_max_images", "vision_timeout_ms", "vision_cache_ttl_secs", "structured_output_max_repair_attempts", "structured_output_timeout_ms",
   "tool_loop_max_turns", "tool_loop_tool_timeout_ms", "tool_loop_deadline_secs",
   "image_generation_max_images_per_request", "image_generation_timeout_ms",
   "web_search_max_results", "web_search_max_searches_per_request", "web_search_timeout_ms",

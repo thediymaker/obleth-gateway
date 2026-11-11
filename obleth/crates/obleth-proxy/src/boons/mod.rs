@@ -546,6 +546,7 @@ impl BoonEngine {
                     serde_json::json!({
                         "images": images.described,
                         "noted": images.noted,
+                        "reused": images.reused,
                         "describer": settings.vision.fallback_model.as_deref().unwrap_or(""),
                     }),
                 );

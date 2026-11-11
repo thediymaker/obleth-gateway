@@ -142,6 +142,9 @@ export function BoonsSection({ settings: b, models, knowledge, compressor }: { s
         <Setting label="Limits" hint="Images described per request, and how long each may take." fields={["boons.vision_max_images", "boons.vision_timeout_ms"]}>
           <div className="flex flex-wrap gap-3"><NumberField name="vision_max_images" label="Images per request" value={b.vision_max_images} unit="images" className="w-20" /><NumberField name="vision_timeout_ms" label="Describe timeout" value={b.vision_timeout_ms} unit="ms" /></div>
         </Setting>
+        <Setting label="Reuse" hint="A conversation sends its images again each turn. A description is kept this long and used again instead of asking twice; 0 turns this off." fields={["boons.vision_cache_ttl_secs"]}>
+          <NumberField name="vision_cache_ttl_secs" label="Keep descriptions" value={b.vision_cache_ttl_secs} unit="s" />
+        </Setting>
         <Setting label="Prompt" hint="What the describer is asked." fields={["boons.vision_describe_prompt"]}>
           <TextArea name="boons.vision_describe_prompt" label="Describe prompt" rows={3} defaultValue={b.vision_describe_prompt} className="font-sans text-[12.5px]" />
         </Setting>
