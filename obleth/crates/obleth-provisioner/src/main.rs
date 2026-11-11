@@ -216,8 +216,8 @@ async fn tick(
 ) -> anyhow::Result<()> {
     let specs = obleth.list_managed_models().await?; // obleth down -> bail (held). enabled only.
     let all_replicas = obleth.list_all_replicas().await?; // obleth down -> bail (held)
-    // Every model's name in one read; a model missing from it is looked up
-    // on its own below.
+                                                          // Every model's name in one read; a model missing from it is looked up
+                                                          // on its own below.
     let names = obleth.model_names().await.unwrap_or_else(|e| {
         tracing::warn!(error = %e, "model list read failed; looking names up one by one");
         HashMap::new()
@@ -237,7 +237,13 @@ async fn tick(
     // a transport/HTTP error bails the whole tick so an unreachable Slurm is
     // never mistaken for a fleet of dead jobs (no destructive action while held).
     let mut jobs: HashMap<String, domain::JobInfo> = HashMap::new();
-    for id in all_replicas.iter().map(|r| &r.slurm_job_id) {
+    // Lost rows only age out, so their jobs are not looked up: a lookup
+    // error on a long-gone job must not hold every model's tick.
+    for id in all_replicas
+        .iter()
+        .filter(|r| r.state != "lost")
+        .map(|r| &r.slurm_job_id)
+    {
         if id.is_empty() || jobs.contains_key(id) {
             continue;
         }
