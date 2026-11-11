@@ -35,7 +35,13 @@ pub async fn apply(
             })?;
             let job = job_submit_from_spec(spec, model_name, job_prefix, port_base, port_span);
             let job_id = match slurm.submit(&job).await {
-                Ok(id) => id,
+                Ok(submitted) => {
+                    for note in &submitted.notes {
+                        tracing::info!(job_id = %submitted.job_id, model = model_name, %note,
+                            "slurm accepted the job with a note");
+                    }
+                    submitted.job_id
+                }
                 Err(e) => {
                     // Slurm rejected the submit (e.g. bad account/partition/qos).
                     // Surface it in the dashboard, best-effort, then propagate.
@@ -48,7 +54,11 @@ pub async fn apply(
             // Record the replica that tracks this job. If recording fails, the job
             // is already running with nothing pointing at it — and we no longer
             // scan the cluster for orphans — so cancel it (compensating action).
-            if let Err(e) = obleth.create_replica(model_id, &job_id, port_base).await {
+            let log_path = crate::slurm::job_log_path(&job, &job_id);
+            if let Err(e) = obleth
+                .create_replica_with_log(model_id, &job_id, port_base, Some(&log_path))
+                .await
+            {
                 match slurm.cancel(&job_id).await {
                     Ok(()) => tracing::warn!(%job_id, model = model_name,
                         "cancelled just-submitted job after replica record failed"),
@@ -185,7 +195,7 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl SlurmClient for MockSlurm {
-        async fn submit(&self, job: &JobSubmit) -> anyhow::Result<String> {
+        async fn submit(&self, job: &JobSubmit) -> anyhow::Result<crate::slurm::SubmittedJob> {
             if self.fail_submit.load(std::sync::atomic::Ordering::SeqCst) {
                 anyhow::bail!("simulated submit rejection (error 2045)");
             }
@@ -200,8 +210,12 @@ mod tests {
                 nodes: vec![],
                 raw_state: "PENDING".into(),
                 reason: None,
+                ..Default::default()
             });
-            Ok(job_id)
+            Ok(crate::slurm::SubmittedJob {
+                job_id,
+                notes: vec![],
+            })
         }
         async fn cancel(&self, job_id: &str) -> anyhow::Result<()> {
             self.cancelled.lock().unwrap().push(job_id.to_string());
@@ -248,8 +262,7 @@ mod tests {
             launcher_spec: None,
             last_provision_error: None,
             last_provision_error_at: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            ..Default::default()
         }
     }
 

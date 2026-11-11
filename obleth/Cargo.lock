@@ -1695,6 +1695,7 @@ dependencies = [
 name = "obleth-config"
 version = "2.5.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "chrono-tz",
  "hex",
@@ -1726,6 +1727,7 @@ version = "2.5.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "obleth-config",
  "reqwest 0.12.28",

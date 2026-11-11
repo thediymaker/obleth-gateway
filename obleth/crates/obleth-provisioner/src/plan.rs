@@ -106,6 +106,11 @@ pub fn plan(
                 });
                 // not alive
             }
+            Some(JobState::Unknown) => {
+                // A state this build does not know: count it as alive and
+                // leave it alone rather than tear it down on a guess.
+                alive += 1;
+            }
             Some(JobState::Pending) => {
                 alive += 1;
                 cancellable.push((r.id, r.slurm_job_id.clone(), r.endpoint_id, 0, r.age_secs));
@@ -129,7 +134,7 @@ pub fn plan(
                     if let Some(&port) = health.get(&r.id) {
                         let node = jobs
                             .get(&r.slurm_job_id)
-                            .and_then(|j| j.nodes.first().cloned())
+                            .and_then(|j| j.probe_host().map(String::from))
                             .unwrap_or_default();
                         actions.push(Action::Promote {
                             replica_id: r.id,
@@ -357,6 +362,7 @@ mod tests {
                 nodes: nodes.iter().map(|s| s.to_string()).collect(),
                 raw_state: String::new(),
                 reason: None,
+                ..Default::default()
             },
         )
     }

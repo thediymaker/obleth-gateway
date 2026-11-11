@@ -12,6 +12,7 @@ pub mod keys;
 pub mod manifest;
 pub mod reasoning;
 pub mod routing;
+pub mod slurm;
 pub mod types;
 
 pub use config::{CapacityDiscoveryConfig, Config, SessionAffinityConfig, SlackAlertConfig};

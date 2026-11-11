@@ -1,29 +1,76 @@
 use uuid::Uuid;
 
 /// Coarse, version-agnostic view of a Slurm job's state. The slurm adapter maps
-/// Slurm's many job_state strings onto these three.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Slurm's many job_state strings onto these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum JobState {
-    /// Queued/configuring; not yet serving.
+    /// Queued/configuring, or put back in the queue (requeued, held); not
+    /// serving.
+    #[default]
     Pending,
     /// Allocated and running (vLLM may still be booting — health gates that).
     Running,
     /// Terminal/absent: completed, failed, cancelled, preempted, timed out, or
     /// not found in slurmrestd at all.
     Gone,
+    /// A state this build does not recognise. Nothing should be torn down on
+    /// it: the replica is left as it is until the state is one of the above.
+    Unknown,
 }
 
 /// What slurmrestd tells us about one job we own.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct JobInfo {
     pub job_id: String,
     pub state: JobState,
-    /// Allocated node hostnames (first is used for the endpoint URL in v1).
+    /// Allocated node hostnames, with the hostlist expanded
+    /// (`gpu[01-02]` is `gpu01`, `gpu02`).
     pub nodes: Vec<String>,
-    /// Raw slurmrestd job_state string (e.g. "RUNNING", "PENDING", "FAILED").
+    /// The job's base Slurm state (e.g. "RUNNING", "PENDING", "FAILED").
     pub raw_state: String,
     /// slurmrestd state_reason (e.g. "Resources", "Priority"); `None`/"None" omitted.
     pub reason: Option<String>,
+    /// Every state flag Slurm reported, e.g. `["PENDING", "REQUEUED"]`.
+    pub state_flags: Vec<String>,
+    /// The node running the batch script, where the server listens.
+    pub batch_host: Option<String>,
+    /// Job name and owner, when reported.
+    pub name: Option<String>,
+    pub user: Option<String>,
+    /// The port the job wrote into its comment (`obleth-port=N`).
+    pub reported_port: Option<i64>,
+    /// How many times Slurm has requeued the job.
+    pub restart_count: i64,
+    /// When the job started running (its latest start after a requeue).
+    pub start_time: Option<chrono::DateTime<chrono::Utc>>,
+    /// While running: when it will reach its time limit.
+    pub end_time: Option<chrono::DateTime<chrono::Utc>>,
+    /// Time limit in minutes; `None` when unlimited or not reported.
+    pub time_limit_mins: Option<i64>,
+    /// True when the job has no time limit.
+    pub time_limit_unlimited: bool,
+}
+
+impl JobInfo {
+    /// The host to probe and register: the batch host (where the batch
+    /// script, and so the server, runs), else the first allocated node.
+    pub fn probe_host(&self) -> Option<&str> {
+        self.batch_host
+            .as_deref()
+            .or_else(|| self.nodes.first().map(String::as_str))
+            .filter(|h| !h.is_empty())
+    }
+
+    /// True when Slurm put the job back in the queue (requeue or hold flag,
+    /// or a restart count above zero while pending).
+    pub fn is_requeued(&self) -> bool {
+        self.state == JobState::Pending
+            && (self.restart_count > 0
+                || self
+                    .state_flags
+                    .iter()
+                    .any(|f| f.starts_with("REQUEUE") || f == "SPECIAL_EXIT"))
+    }
 }
 
 /// A version-agnostic job request, built from a ManagedModelSpec. The slurm
@@ -110,6 +157,16 @@ pub struct ClusterResources {
     /// partition takes before Slurm refuses the job.
     #[serde(default)]
     pub associations: Vec<AssociationInfo>,
+    /// Why some or all of the above could not be read, as plain sentences;
+    /// `None` when every read worked.
+    #[serde(default)]
+    pub error: Option<String>,
+    /// True when some reads worked and others failed.
+    #[serde(default)]
+    pub partial: bool,
+    /// The Slurm release, when an answer carried it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slurm_release: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
@@ -152,6 +209,9 @@ pub struct NodeInfo {
     /// CPUs and memory already allocated to running jobs, when reported.
     pub alloc_cpus: Option<i64>,
     pub alloc_memory_mb: Option<i64>,
+    /// Slurm's NodeAddr when it differs from the node name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
 }
 
 /// Actions the executor applies. The planner emits these; it performs no I/O.

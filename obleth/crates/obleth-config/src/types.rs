@@ -984,27 +984,128 @@ pub struct ManagedModelSpec {
     pub script_body: String,
     pub serving_port: i64,
     pub health_path: String,
+    /// How many replicas the provisioner keeps running. 0 keeps none running
+    /// (the spec stays, so raising it later starts them again).
     pub target_replicas: i64,
+    /// Health floor: the model counts as healthy (rather than degraded) once
+    /// this many replicas are healthy. It does not hold traffic back: each
+    /// replica takes requests as soon as it is healthy. 0..=target_replicas.
     #[serde(default = "default_min_replicas")]
     pub min_replicas: i64,
-    /// Stop resubmitting when this many lost replicas are visible (0 = no limit).
+    /// Failed launches in a row after which submits pause (0 = no limit). A
+    /// failed launch is a job that ended without ever serving, or that hit
+    /// `startup_timeout_mins`. A job that served and then hit its time limit,
+    /// was preempted or lost its node is not a failure.
     pub max_job_failures: i64,
+    /// Minutes a running job's server may take to become healthy before the
+    /// job is cancelled and counted as a failed launch. 0 never gives up.
+    #[serde(default = "default_startup_timeout_mins")]
+    pub startup_timeout_mins: i64,
+    /// When a healthy replica's job is within this many minutes of its time
+    /// limit, a replacement is submitted, and the old one is drained once the
+    /// replacement serves. 0 turns the handoff off.
+    #[serde(default = "default_handoff_mins")]
+    pub handoff_mins: i64,
     /// Serialized launcher panel state (backend id + knob values + envelope) used to
     /// repopulate the dashboard edit view. Metadata only; does not affect provisioning.
     #[serde(default)]
     #[schema(value_type = Object)]
     pub launcher_spec: Option<serde_json::Value>,
-    /// Last provisioner submit failure (e.g. a Slurm account/partition rejection).
-    /// `None` once a submit succeeds. Drives the dashboard's provisioning banner.
+    /// Last provisioner submit failure, as a plain sentence (e.g. "Slurm
+    /// rejected the job: Invalid account or account/partition combination
+    /// specified."). `None` once a submit succeeds.
     #[serde(default)]
     pub last_provision_error: Option<String>,
     #[serde(default)]
     pub last_provision_error_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Why submits are paused, as a plain sentence; `None` when they are not.
+    /// Set by the provisioner when `max_job_failures` is reached or Slurm
+    /// rejects the job; cleared by `POST .../managed/retry`.
+    #[serde(default)]
+    pub paused_reason: Option<String>,
+    /// No submits before this time. `None` when not paused.
+    #[serde(default)]
+    pub paused_until: Option<chrono::DateTime<chrono::Utc>>,
+    /// Failed launches in a row since a launch last served.
+    #[serde(default)]
+    pub failed_launches: i64,
+    /// Steps taken on the backoff ladder (5, 15, 30, 60 minutes, then hourly);
+    /// 0 when not backing off.
+    #[serde(default)]
+    pub backoff_step: i64,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 fn default_min_replicas() -> i64 {
     1
+}
+/// Default for [`ManagedModelSpec::startup_timeout_mins`].
+pub const DEFAULT_STARTUP_TIMEOUT_MINS: i64 = 60;
+/// Default for [`ManagedModelSpec::handoff_mins`].
+pub const DEFAULT_HANDOFF_MINS: i64 = 15;
+fn default_startup_timeout_mins() -> i64 {
+    DEFAULT_STARTUP_TIMEOUT_MINS
+}
+fn default_handoff_mins() -> i64 {
+    DEFAULT_HANDOFF_MINS
+}
+
+impl Default for ManagedModelSpec {
+    fn default() -> Self {
+        Self {
+            model_id: Uuid::nil(),
+            enabled: true,
+            partition: String::new(),
+            gres: String::new(),
+            nodes: 1,
+            constraints: None,
+            exclude: None,
+            account: None,
+            qos: None,
+            time_limit: None,
+            cpus_per_task: None,
+            mem: None,
+            image: String::new(),
+            preamble: String::new(),
+            log_output_dir: String::new(),
+            launch_command: String::new(),
+            script_body: String::new(),
+            serving_port: 8000,
+            health_path: "/health".into(),
+            target_replicas: 1,
+            min_replicas: 1,
+            max_job_failures: 0,
+            startup_timeout_mins: DEFAULT_STARTUP_TIMEOUT_MINS,
+            handoff_mins: DEFAULT_HANDOFF_MINS,
+            launcher_spec: None,
+            last_provision_error: None,
+            last_provision_error_at: None,
+            paused_reason: None,
+            paused_until: None,
+            failed_launches: 0,
+            backoff_step: 0,
+            created_at: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+            updated_at: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+        }
+    }
+}
+
+/// A managed model's failure and pause state, as the provisioner sets it
+/// (`PUT /api/v1/models/{id}/managed/backoff`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct ManagedBackoff {
+    /// Failed launches in a row.
+    #[serde(default)]
+    pub failed_launches: i64,
+    /// Steps taken on the backoff ladder; 0 when not backing off.
+    #[serde(default)]
+    pub backoff_step: i64,
+    /// Why submits are paused, as a plain sentence; `None` lifts a pause.
+    #[serde(default)]
+    pub paused_reason: Option<String>,
+    /// No submits before this time.
+    #[serde(default)]
+    pub paused_until: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// One known Slurm-backed replica of a managed model. Stored in `model_replicas`.
@@ -1023,10 +1124,31 @@ pub struct ModelReplica {
     pub last_message: Option<String>,
     #[serde(default)]
     pub port_base: Option<i64>,
-    /// Operator requested this replica be restarted: the provisioner cancels its
-    /// Slurm job and the resubmit-to-target then launches a fresh one.
+    /// Cancel this replica's job now; the target count then brings in a new
+    /// one. Set by `DELETE /api/v1/replicas/{id}` on a live replica.
     #[serde(default)]
     pub cancel_requested: bool,
+    /// Replace this replica without an outage: the provisioner submits a
+    /// successor and drains this one once the successor is healthy (or after
+    /// the startup timeout). Set by restart and roll.
+    #[serde(default)]
+    pub replace_requested: bool,
+    /// When Slurm started the job the replica was promoted under.
+    #[serde(default)]
+    pub job_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the running job will reach its time limit, from Slurm.
+    #[serde(default)]
+    pub job_ends_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// What is happening with the replica, as a plain sentence for the
+    /// dashboard (e.g. "Slurm put the job back in the queue ...").
+    #[serde(default)]
+    pub state_detail: Option<String>,
+    /// Where this job's output goes, or `None` when unknown.
+    #[serde(default)]
+    pub log_path: Option<String>,
+    /// The port the server was found on.
+    #[serde(default)]
+    pub port: Option<i64>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -1328,7 +1450,9 @@ pub struct SlurmSettings {
     /// Base URL of `slurmrestd` (e.g. `http://slurm:6820`).
     #[serde(default)]
     pub slurmrestd_url: String,
-    /// `slurmrestd` OpenAPI plugin version path segment.
+    /// `slurmrestd` data-parser version path segment (e.g. `v0.0.43`), or
+    /// `auto` (the default; an empty string means the same) to use the newest
+    /// version the server offers that obleth supports.
     #[serde(default = "default_slurm_api_version")]
     pub slurmrestd_api_version: String,
     /// Slurm user name sent in `X-SLURM-USER-NAME`.
@@ -1406,7 +1530,7 @@ impl SlurmSettings {
 }
 
 fn default_slurm_api_version() -> String {
-    "v0.0.40".to_string()
+    crate::slurm::SLURM_API_VERSION_AUTO.to_string()
 }
 
 fn default_energy_poll_interval_secs() -> u64 {
@@ -3633,6 +3757,98 @@ pub struct BackupData {
     /// Absent in backups taken before families existed.
     #[serde(default)]
     pub model_families: Vec<crate::reasoning::ModelFamily>,
+    /// Slurm deployment specs (what to run and where). Absent in older backups.
+    #[serde(default)]
+    pub managed_models: Vec<ManagedModelBackup>,
+    /// Recipes stored in the database. Absent in older backups.
+    #[serde(default)]
+    pub recipes: Vec<RecipeBackup>,
+}
+
+/// A Slurm deployment spec in a backup: what the operator set, without the
+/// provisioner's runtime state (errors, pauses, backoff).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ManagedModelBackup {
+    #[schema(value_type = String)]
+    pub model_id: Uuid,
+    pub enabled: bool,
+    pub partition: String,
+    pub gres: String,
+    pub nodes: i64,
+    pub constraints: Option<String>,
+    pub exclude: Option<String>,
+    pub account: Option<String>,
+    pub qos: Option<String>,
+    pub time_limit: Option<String>,
+    #[serde(default)]
+    pub cpus_per_task: Option<i64>,
+    #[serde(default)]
+    pub mem: Option<String>,
+    pub image: String,
+    pub preamble: String,
+    pub log_output_dir: String,
+    pub launch_command: String,
+    #[serde(default)]
+    pub script_body: String,
+    pub serving_port: i64,
+    pub health_path: String,
+    pub target_replicas: i64,
+    #[serde(default = "default_min_replicas")]
+    pub min_replicas: i64,
+    pub max_job_failures: i64,
+    #[serde(default = "default_startup_timeout_mins")]
+    pub startup_timeout_mins: i64,
+    #[serde(default = "default_handoff_mins")]
+    pub handoff_mins: i64,
+    #[serde(default)]
+    #[schema(value_type = Option<Object>)]
+    pub launcher_spec: Option<serde_json::Value>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<&ManagedModelSpec> for ManagedModelBackup {
+    fn from(m: &ManagedModelSpec) -> Self {
+        Self {
+            model_id: m.model_id,
+            enabled: m.enabled,
+            partition: m.partition.clone(),
+            gres: m.gres.clone(),
+            nodes: m.nodes,
+            constraints: m.constraints.clone(),
+            exclude: m.exclude.clone(),
+            account: m.account.clone(),
+            qos: m.qos.clone(),
+            time_limit: m.time_limit.clone(),
+            cpus_per_task: m.cpus_per_task,
+            mem: m.mem.clone(),
+            image: m.image.clone(),
+            preamble: m.preamble.clone(),
+            log_output_dir: m.log_output_dir.clone(),
+            launch_command: m.launch_command.clone(),
+            script_body: m.script_body.clone(),
+            serving_port: m.serving_port,
+            health_path: m.health_path.clone(),
+            target_replicas: m.target_replicas,
+            min_replicas: m.min_replicas,
+            max_job_failures: m.max_job_failures,
+            startup_timeout_mins: m.startup_timeout_mins,
+            handoff_mins: m.handoff_mins,
+            launcher_spec: m.launcher_spec.clone(),
+            created_at: m.created_at,
+        }
+    }
+}
+
+/// A database-stored recipe in a backup.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RecipeBackup {
+    #[schema(value_type = String)]
+    pub id: Uuid,
+    pub name: String,
+    pub body: String,
+    #[serde(default)]
+    pub author: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -3940,6 +4156,10 @@ pub struct RestoreReport {
     pub app_settings: RestoreCounts,
     #[serde(default)]
     pub model_families: RestoreCounts,
+    #[serde(default)]
+    pub managed_models: RestoreCounts,
+    #[serde(default)]
+    pub recipes: RestoreCounts,
     #[serde(default)]
     pub warnings: Vec<String>,
 }
