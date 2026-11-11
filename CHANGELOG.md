@@ -4,7 +4,7 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
-## Unreleased
+## v2.5.0
 
 **Security**
 
