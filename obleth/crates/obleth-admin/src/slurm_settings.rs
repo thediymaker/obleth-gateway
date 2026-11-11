@@ -12,9 +12,10 @@ use std::time::{Duration, Instant};
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::Json;
-use base64::Engine;
 use chrono::{DateTime, Utc};
+use obleth_config::slurm as slurm_values;
 use obleth_config::{ClusterDefaults, NodeAlias, SlurmSettings};
+use obleth_provisioner::slurm::{self as slurm_client, SlurmErrorKind, Slurmrestd};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -68,6 +69,26 @@ pub struct SlurmSettingsView {
     /// Seconds the current non-`ok` streak has lasted, or null when the last
     /// tick was `ok` / nothing has been reported.
     pub provisioner_held_secs: Option<i64>,
+    /// When the saved token expires, read from its `exp` claim.
+    pub jwt_expires_at: Option<DateTime<Utc>>,
+    /// Seconds until the token expires (negative once expired).
+    pub jwt_expires_in_secs: Option<i64>,
+    /// The Slurm user the token was minted for (its `sun` claim).
+    pub jwt_user: Option<String>,
+    /// The API version in use: the configured one, or what `auto` resolved
+    /// to when last checked. Null when not known yet.
+    pub resolved_api_version: Option<String>,
+    /// API versions the server offered when last checked.
+    pub available_api_versions: Vec<String>,
+    /// The Slurm release, when last checked.
+    pub slurm_release: Option<String>,
+    /// False when `OBLETH_ENCRYPTION_KEY` is unset and tokens are stored in
+    /// plaintext.
+    pub stored_encrypted: bool,
+    /// Warnings from the provisioner's last tick, as plain sentences.
+    pub provisioner_warnings: Vec<String>,
+    /// Problems with the saved settings, as plain sentences with what to do.
+    pub warnings: Vec<String>,
 }
 
 /// Build identity the provisioner reports via request headers, stored as JSON in
@@ -105,8 +126,139 @@ impl SlurmSettingsView {
             provisioner_tick_detail: None,
             provisioner_last_ok_secs: None,
             provisioner_held_secs: None,
+            jwt_expires_at: None,
+            jwt_expires_in_secs: None,
+            jwt_user: None,
+            resolved_api_version: None,
+            available_api_versions: Vec::new(),
+            slurm_release: None,
+            stored_encrypted: true,
+            provisioner_warnings: Vec::new(),
+            warnings: Vec::new(),
+        }
+        .with_token_and_discovery(s)
+    }
+
+    /// Fill the token claims and the last discovery for these settings.
+    fn with_token_and_discovery(mut self, s: &SlurmSettings) -> Self {
+        let jwt = jwt_health(&s.slurm_jwt);
+        self.jwt_expires_at = jwt.expires_at;
+        self.jwt_expires_in_secs = jwt.expires_in_secs;
+        self.jwt_user = slurm_values::slurm_jwt_claims(&s.slurm_jwt).and_then(|c| c.sun);
+        let found = recall_discovery(&s.slurmrestd_url, &s.slurm_user);
+        self.resolved_api_version = if slurm_values::is_auto_api_version(&s.slurmrestd_api_version)
+        {
+            found.as_ref().and_then(|d| d.resolved.clone())
+        } else {
+            Some(s.slurmrestd_api_version.trim().to_string())
+        };
+        if let Some(d) = found {
+            self.available_api_versions = d.available;
+            self.slurm_release = d.release;
+        }
+        self
+    }
+}
+
+/// What the last connection test (or resource read) learned about a server.
+#[derive(Debug, Clone, Default)]
+struct Discovery {
+    url: String,
+    user: String,
+    available: Vec<String>,
+    resolved: Option<String>,
+    release: Option<String>,
+}
+
+static DISCOVERY: std::sync::Mutex<Option<Discovery>> = std::sync::Mutex::new(None);
+
+fn remember_discovery(d: Discovery) {
+    if let Ok(mut slot) = DISCOVERY.lock() {
+        *slot = Some(d);
+    }
+}
+
+/// Merge what a resource read learned (version in use, release) into the
+/// stored discovery for the same server.
+pub(crate) fn remember_resolved(url: &str, user: &str, version: &str, release: Option<String>) {
+    if let Ok(mut slot) = DISCOVERY.lock() {
+        let mut d = slot
+            .take()
+            .filter(|d| d.url == url.trim() && d.user == user.trim())
+            .unwrap_or_else(|| Discovery {
+                url: url.trim().to_string(),
+                user: user.trim().to_string(),
+                ..Default::default()
+            });
+        d.resolved = Some(version.to_string());
+        if release.is_some() {
+            d.release = release;
+        }
+        *slot = Some(d);
+    }
+}
+
+fn recall_discovery(url: &str, user: &str) -> Option<Discovery> {
+    DISCOVERY
+        .lock()
+        .ok()?
+        .clone()
+        .filter(|d| d.url == url.trim() && d.user == user.trim())
+}
+
+/// How long a token may have left before saving it warns.
+const SHORT_TOKEN_SECS: i64 = 7 * 86_400;
+
+/// The command that mints a 30-day token, for messages.
+const MINT_TOKEN: &str = "`scontrol token lifespan=2592000`";
+
+/// Problems with the saved settings, as plain sentences with what to do.
+/// Pure: the clock and the encryption state are passed in.
+fn settings_warnings(s: &SlurmSettings, now: i64, stored_encrypted: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    let jwt = s.slurm_jwt.trim();
+    if jwt.is_empty() {
+        if s.enabled {
+            out.push(
+                "Slurm is on but no token is saved, so slurmrestd will refuse requests unless it \
+                 trusts this host. Paste the output of `scontrol token`."
+                    .to_string(),
+            );
+        }
+        return out;
+    }
+    let claims = slurm_values::slurm_jwt_claims(jwt);
+    if let Some(exp) = claims.as_ref().and_then(|c| c.exp) {
+        let left = exp - now;
+        if left <= 0 {
+            let at = DateTime::from_timestamp(exp, 0)
+                .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+                .unwrap_or_default();
+            out.push(format!(
+                "This token expired at {at}. Mint a new one with {MINT_TOKEN} for 30 days."
+            ));
+        } else if left < SHORT_TOKEN_SECS {
+            out.push(format!(
+                "This token expires in {}. Mint one with {MINT_TOKEN} for 30 days.",
+                slurm_client::plain_duration(left)
+            ));
         }
     }
+    if let Some(sun) = claims.as_ref().and_then(|c| c.sun.as_deref()) {
+        let user = s.slurm_user.trim();
+        if !user.is_empty() && sun != user {
+            out.push(format!(
+                "The token's user ({sun}) is not the Slurm user you entered ({user})."
+            ));
+        }
+    }
+    if !stored_encrypted {
+        out.push(
+            "OBLETH_ENCRYPTION_KEY is not set, so the Slurm token is stored without encryption."
+                .to_string(),
+        );
+    }
+    out
 }
 
 /// Last four characters of a secret, or `None` when it is shorter than that.
@@ -139,6 +291,9 @@ pub struct ProvisionerTick {
     /// Epoch seconds when the current non-`ok` streak started; 0 when `ok`.
     #[serde(default)]
     pub since: i64,
+    /// Warnings the provisioner reported with the tick.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// What the tick-status merge decided about alerting.
@@ -178,6 +333,7 @@ fn merge_tick(
             at: now,
             last_ok_at: Some(now),
             since: 0,
+            warnings: Vec::new(),
         };
         let transition = if was_held {
             TickTransition::Recovered
@@ -197,6 +353,7 @@ fn merge_tick(
         at: now,
         last_ok_at: prev.and_then(|p| p.last_ok_at),
         since,
+        warnings: Vec::new(),
     };
     let transition = if now - since >= HELD_ALERT_SECS {
         TickTransition::Held
@@ -227,28 +384,33 @@ fn provisioner_status(last_seen: i64, now: i64, fresh_secs: i64) -> (Option<i64>
     (Some(secs), secs <= fresh_secs)
 }
 
-/// Update payload. `slurm_jwt` is write-only: omit/empty to keep the stored JWT,
-/// or send a new value to replace it. `hf_token` is write-only too, but can be
-/// cleared: omit/null keeps it, `""` clears it, any other value replaces it.
-/// `cluster_defaults` replaces the stored block wholesale when present and
-/// keeps it when omitted.
-#[derive(Debug, Deserialize, ToSchema)]
+/// Update payload. Every field is optional: an omitted field keeps its stored
+/// value, and an explicit empty string clears a text field. `slurm_jwt` is
+/// write-only: omit it or send an empty string to keep the stored token, or
+/// send a new one (as `scontrol token` prints it, with or without
+/// `SLURM_JWT=` / `export`) to replace it. `hf_token` is write-only too, but
+/// can be cleared: omit/null keeps it, `""` clears it, any other value
+/// replaces it. `node_aliases` and `cluster_defaults` replace the stored
+/// values when present.
+#[derive(Debug, Default, Deserialize, ToSchema)]
 pub struct UpdateSlurmSettings {
     #[serde(default)]
-    pub enabled: bool,
+    pub enabled: Option<bool>,
     #[serde(default)]
-    pub slurmrestd_url: String,
+    pub slurmrestd_url: Option<String>,
+    /// `auto` (or empty) uses the newest version the server offers; or a
+    /// version such as `v0.0.43`.
     #[serde(default)]
     pub slurmrestd_api_version: Option<String>,
     #[serde(default)]
-    pub slurm_user: String,
+    pub slurm_user: Option<String>,
     /// New JWT. Empty/omitted keeps the existing stored value.
     #[serde(default)]
     pub slurm_jwt: Option<String>,
     /// Full replacement set of node hostname → IP overrides. Blank rows are
     /// dropped; a non-blank host with a non-IP address is rejected.
     #[serde(default)]
-    pub node_aliases: Vec<NodeAlias>,
+    pub node_aliases: Option<Vec<NodeAlias>>,
     /// Full replacement of the cluster defaults. Omitted/null keeps the stored
     /// block.
     #[serde(default)]
@@ -288,11 +450,41 @@ fn normalize_cluster_defaults(d: &ClusterDefaults) -> ClusterDefaults {
     }
 }
 
-/// Result of the "test connection" probe: JWT expiry + a slurmrestd ping.
+/// Result of the "test connection" probe.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SlurmHealthView {
     pub jwt: SlurmJwtHealth,
     pub ping: SlurmPingHealth,
+    pub api: SlurmApiHealth,
+    pub auth: SlurmAuthHealth,
+    /// `UP` or `DOWN` from the ping; null when the ping did not say.
+    pub slurmctld: Option<String>,
+    pub slurm_release: Option<String>,
+    /// The Slurm user the token was minted for (its `sun` claim).
+    pub jwt_user: Option<String>,
+    /// Every problem found, as a plain sentence with what to do. Empty when
+    /// the connection works.
+    pub problems: Vec<String>,
+}
+
+/// Which API version is in use and whether the server serves it.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SlurmApiHealth {
+    /// The saved setting (`auto` or a version).
+    pub configured: String,
+    /// The version used for the checks below.
+    pub resolved: Option<String>,
+    /// Every version the server offers, oldest first.
+    pub available: Vec<String>,
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+/// Whether an authenticated read (the partition list) worked.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SlurmAuthHealth {
+    pub ok: bool,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -309,7 +501,8 @@ pub struct SlurmJwtHealth {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SlurmPingHealth {
-    /// True when slurmrestd answered with a 2xx.
+    /// True when slurmrestd answered, the token was accepted and the
+    /// controller is up.
     pub ok: bool,
     /// HTTP status code, when a response was received.
     pub status_code: Option<u16>,
@@ -319,16 +512,10 @@ pub struct SlurmPingHealth {
     pub error: Option<String>,
 }
 
-/// Decode a JWS-compact JWT's `exp` claim without verifying the signature (we
-/// only have the cluster's token, not its signing secret — this is for an expiry
-/// display, not authentication). Tolerates padded or unpadded base64url.
+/// A JWT's `exp` claim, read without verifying the signature (for display
+/// and warnings, not authentication).
 fn jwt_exp(token: &str) -> Option<i64> {
-    let payload = token.trim().split('.').nth(1)?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload.trim_end_matches('='))
-        .ok()?;
-    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    claims.get("exp").and_then(|e| e.as_i64())
+    slurm_values::slurm_jwt_claims(token)?.exp
 }
 
 fn jwt_health(jwt: &str) -> SlurmJwtHealth {
@@ -360,55 +547,53 @@ fn jwt_health(jwt: &str) -> SlurmJwtHealth {
     }
 }
 
-/// Restrict the slurmrestd API version to a single URL path segment of
-/// letters/digits/dots (e.g. `v0.0.40`) — it's interpolated unescaped into
-/// the ping/job URLs, so this rules out `/`, `..`, and other path-altering
-/// characters reaching slurmrestd requests.
+/// `auto` (or empty) or a version such as `v0.0.43`. The version is
+/// interpolated into request paths, so nothing else is accepted.
 fn is_valid_api_version(v: &str) -> bool {
-    !v.is_empty() && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '.')
+    slurm_values::is_valid_api_version_setting(v)
 }
 
-async fn ping_slurm(s: &SlurmSettings) -> SlurmPingHealth {
-    let url = format!(
-        "{}/slurm/{}/ping",
-        s.slurmrestd_url.trim_end_matches('/'),
-        s.slurmrestd_api_version
-    );
-    let client = match crate::ssrf::upstream_client_builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return SlurmPingHealth {
-                ok: false,
-                status_code: None,
-                latency_ms: None,
-                error: Some(e.to_string()),
-            }
-        }
+/// The test's verdict on the API version, from what the server offers.
+fn api_health(
+    configured: &str,
+    discovered: &std::result::Result<Vec<String>, String>,
+) -> SlurmApiHealth {
+    let auto = slurm_values::is_auto_api_version(configured);
+    let available = discovered.as_ref().cloned().unwrap_or_default();
+    let configured = if auto {
+        slurm_values::SLURM_API_VERSION_AUTO.to_string()
+    } else {
+        configured.trim().to_string()
     };
-    let started = Instant::now();
-    let res = client
-        .get(&url)
-        .header("X-SLURM-USER-NAME", &s.slurm_user)
-        .header("X-SLURM-USER-TOKEN", &s.slurm_jwt)
-        .send()
-        .await;
-    let latency_ms = started.elapsed().as_millis() as u64;
-    match res {
-        Ok(r) => SlurmPingHealth {
-            ok: r.status().is_success(),
-            status_code: Some(r.status().as_u16()),
-            latency_ms: Some(latency_ms),
-            error: None,
-        },
-        Err(e) => SlurmPingHealth {
-            ok: false,
-            status_code: None,
-            latency_ms: Some(latency_ms),
-            error: Some(e.to_string()),
-        },
+    let (resolved, error) = if auto {
+        match discovered {
+            Err(e) => (None, Some(e.clone())),
+            Ok(av) => match slurm_values::pick_api_version(av) {
+                Some(v) => (Some(v), None),
+                None => (None, Some(slurm_client::no_supported_version_message(av))),
+            },
+        }
+    } else if !available.is_empty() && !available.contains(&configured) {
+        let suggestion = slurm_values::pick_api_version(&available)
+            .map(|v| format!(" or to {v}"))
+            .unwrap_or_default();
+        (
+            Some(configured.clone()),
+            Some(format!(
+                "This slurmrestd does not serve API version {configured}; it serves {}. Set \
+                 the API version to auto{suggestion}.",
+                available.join(", ")
+            )),
+        )
+    } else {
+        (Some(configured.clone()), None)
+    };
+    SlurmApiHealth {
+        ok: resolved.is_some() && error.is_none(),
+        configured,
+        resolved,
+        available,
+        error,
     }
 }
 
@@ -460,7 +645,10 @@ pub async fn get_slurm_settings(
             (tick.status != "ok" && tick.since > 0).then(|| (now - tick.since).max(0));
         view.provisioner_tick_detail = tick.detail;
         view.provisioner_tick_status = Some(tick.status);
+        view.provisioner_warnings = tick.warnings;
     }
+    view.stored_encrypted = state.store.cipher_enabled();
+    view.warnings = settings_warnings(&settings, Utc::now().timestamp(), view.stored_encrypted);
     Ok(Json(view))
 }
 
@@ -476,17 +664,25 @@ pub async fn put_slurm_settings(
 ) -> Result<Json<SlurmSettingsView>> {
     let existing = state.store.get_slurm_settings().await?.unwrap_or_default();
 
-    let slurmrestd_url = body.slurmrestd_url.trim().to_string();
-    let slurm_user = body.slurm_user.trim().to_string();
-    if body.enabled {
+    // Partial update: an omitted field keeps its stored value.
+    let enabled = body.enabled.unwrap_or(existing.enabled);
+    let slurmrestd_url = body
+        .slurmrestd_url
+        .as_deref()
+        .map_or_else(|| existing.slurmrestd_url.clone(), |u| u.trim().to_string());
+    let slurm_user = body
+        .slurm_user
+        .as_deref()
+        .map_or_else(|| existing.slurm_user.clone(), |u| u.trim().to_string());
+    if enabled {
         if slurmrestd_url.is_empty() {
             return Err(AdminError::BadRequest(
-                "slurmrestd_url is required when Slurm is enabled".into(),
+                "Enter the slurmrestd URL before turning Slurm on.".into(),
             ));
         }
         if slurm_user.is_empty() {
             return Err(AdminError::BadRequest(
-                "slurm_user is required when Slurm is enabled".into(),
+                "Enter the Slurm user before turning Slurm on.".into(),
             ));
         }
         // The provisioner and status probes send the JWT to this URL; hold it
@@ -496,56 +692,62 @@ pub async fn put_slurm_settings(
     }
 
     // JWT: replace when a non-empty value is supplied, otherwise keep existing.
-    let slurm_jwt = match body.slurm_jwt.as_deref().map(str::trim) {
-        Some(j) if !j.is_empty() => j.to_string(),
+    // A token pasted as `scontrol token` prints it loses the `SLURM_JWT=`.
+    let slurm_jwt = match body
+        .slurm_jwt
+        .as_deref()
+        .map(slurm_values::clean_pasted_jwt)
+    {
+        Some(j) if !j.is_empty() => j,
         _ => existing.slurm_jwt.clone(),
     };
 
-    let api_version = body
-        .slurmrestd_api_version
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| {
-            if existing.slurmrestd_api_version.is_empty() {
-                "v0.0.40".to_string()
-            } else {
-                existing.slurmrestd_api_version.clone()
-            }
-        });
+    let api_version = match body.slurmrestd_api_version.as_deref().map(str::trim) {
+        Some(v) if !v.is_empty() => v.to_string(),
+        Some(_) => slurm_values::SLURM_API_VERSION_AUTO.to_string(),
+        None if existing.slurmrestd_api_version.trim().is_empty() => {
+            slurm_values::SLURM_API_VERSION_AUTO.to_string()
+        }
+        None => existing.slurmrestd_api_version.clone(),
+    };
     if !is_valid_api_version(&api_version) {
         return Err(AdminError::BadRequest(
-            "slurmrestd_api_version must look like 'v0.0.40' (letters, digits, dots only)".into(),
+            "The API version must be auto or look like v0.0.43.".into(),
         ));
     }
 
     // Node aliases: drop fully-blank rows the UI may submit; a host with no IP
     // (or vice versa) is a mistake worth surfacing, and the address must be a
-    // real IP literal — a hostname here would just push the flaky DNS lookup
-    // back onto the proxy, defeating the point of the override.
-    let mut node_aliases = Vec::with_capacity(body.node_aliases.len());
-    for a in &body.node_aliases {
-        let host = a.host.trim();
-        let ip = a.ip.trim();
-        if host.is_empty() && ip.is_empty() {
-            continue;
+    // real IP literal: a hostname here would push the flaky DNS lookup back
+    // onto the proxy, defeating the point of the override.
+    let node_aliases = match &body.node_aliases {
+        None => existing.node_aliases.clone(),
+        Some(list) => {
+            let mut out = Vec::with_capacity(list.len());
+            for a in list {
+                let host = a.host.trim();
+                let ip = a.ip.trim();
+                if host.is_empty() && ip.is_empty() {
+                    continue;
+                }
+                if host.is_empty() {
+                    return Err(AdminError::BadRequest(
+                        "A node alias has an address but no node name.".into(),
+                    ));
+                }
+                if ip.parse::<std::net::IpAddr>().is_err() {
+                    return Err(AdminError::BadRequest(format!(
+                        "The address for node {host} must be an IP address, not \"{ip}\"."
+                    )));
+                }
+                out.push(NodeAlias {
+                    host: host.to_string(),
+                    ip: ip.to_string(),
+                });
+            }
+            out
         }
-        if host.is_empty() {
-            return Err(AdminError::BadRequest(
-                "a node alias has an address but no hostname".into(),
-            ));
-        }
-        if ip.parse::<std::net::IpAddr>().is_err() {
-            return Err(AdminError::BadRequest(format!(
-                "node alias for '{host}' must be an IP address, got '{ip}'"
-            )));
-        }
-        node_aliases.push(NodeAlias {
-            host: host.to_string(),
-            ip: ip.to_string(),
-        });
-    }
+    };
 
     let cluster_defaults = match &body.cluster_defaults {
         Some(d) => normalize_cluster_defaults(d),
@@ -554,7 +756,7 @@ pub async fn put_slurm_settings(
     let hf_token = resolve_hf_token(body.hf_token.as_deref(), &existing.hf_token);
 
     let settings = SlurmSettings {
-        enabled: body.enabled,
+        enabled,
         slurmrestd_url,
         slurmrestd_api_version: api_version,
         slurm_user,
@@ -563,6 +765,13 @@ pub async fn put_slurm_settings(
         cluster_defaults,
         hf_token,
     };
+    if settings.slurmrestd_url != existing.slurmrestd_url
+        || settings.slurm_user != existing.slurm_user
+        || settings.slurm_jwt != existing.slurm_jwt
+        || settings.slurmrestd_api_version != existing.slurmrestd_api_version
+    {
+        slurm_client::forget_resolved_api_versions();
+    }
 
     state.store.put_slurm_settings(&settings).await?;
     state
@@ -592,7 +801,33 @@ pub async fn put_slurm_settings(
             }),
         )
         .await?;
-    Ok(Json(SlurmSettingsView::from_settings(&settings)))
+    // Turning Slurm off stops the provisioner from managing jobs that are
+    // still running; say who did it.
+    if existing.enabled && !settings.enabled {
+        let live = state
+            .store
+            .all_replicas()
+            .await
+            .map(|rs| rs.iter().filter(|r| r.state != "lost").count())
+            .unwrap_or(0);
+        if live > 0 {
+            state.alerts.issue(
+                "slurm_turned_off",
+                "Slurm was turned off with replicas running",
+                format!(
+                    "{} turned Slurm off while {live} replica{} were running. The provisioner \
+                     stops managing them: their jobs keep running until they end or are \
+                     cancelled on the cluster. Turn Slurm back on to manage them again.",
+                    audit_actor(&headers),
+                    if live == 1 { "" } else { "s" }
+                ),
+            );
+        }
+    }
+    let mut view = SlurmSettingsView::from_settings(&settings);
+    view.stored_encrypted = state.store.cipher_enabled();
+    view.warnings = settings_warnings(&settings, Utc::now().timestamp(), view.stored_encrypted);
+    Ok(Json(view))
 }
 
 #[utoipa::path(
@@ -601,17 +836,125 @@ pub async fn put_slurm_settings(
 )]
 pub async fn test_slurm_settings(State(state): State<AdminState>) -> Result<Json<SlurmHealthView>> {
     let settings = state.store.get_slurm_settings().await?.unwrap_or_default();
-    if settings.slurmrestd_url.trim().is_empty() {
+    let url = settings.slurmrestd_url.trim().to_string();
+    if url.is_empty() {
         return Err(AdminError::BadRequest(
-            "slurmrestd_url is not configured".into(),
+            "Enter the slurmrestd URL first.".into(),
         ));
     }
     // Re-checked here: a URL stored before the policy applied, or restored from
     // a backup, must not receive the JWT.
-    state.ssrf.validate(settings.slurmrestd_url.trim()).await?;
+    state.ssrf.validate(&url).await?;
     let jwt = jwt_health(&settings.slurm_jwt);
-    let ping = ping_slurm(&settings).await;
-    Ok(Json(SlurmHealthView { jwt, ping }))
+    let jwt_user = slurm_values::slurm_jwt_claims(&settings.slurm_jwt).and_then(|c| c.sun);
+    let http = crate::ssrf::upstream_client_builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| AdminError::Internal(e.to_string()))?;
+    let user = settings.slurm_user.trim();
+    let token = settings.slurm_jwt.trim();
+
+    let mut problems: Vec<String> = Vec::new();
+    if !jwt.set {
+        problems.push(
+            "No Slurm token is saved. Paste the output of `scontrol token` into the token field."
+                .to_string(),
+        );
+    } else if jwt.expired {
+        problems.push(format!(
+            "The token has expired. Mint a new one with {MINT_TOKEN} for 30 days."
+        ));
+    }
+    if let (Some(sun), false) = (jwt_user.as_deref(), user.is_empty()) {
+        if sun != user {
+            problems.push(format!(
+                "The token's user ({sun}) is not the Slurm user you entered ({user})."
+            ));
+        }
+    }
+
+    let discovered = slurm_client::discover_api_versions(&http, &url, user, token).await;
+    let mut auth_error: Option<String> = None;
+    let discovered = discovered.map(|d| d.available).map_err(|e| {
+        if e.kind == SlurmErrorKind::TokenRejected {
+            auth_error = Some(e.message.clone());
+        }
+        e.message
+    });
+    let api = api_health(&settings.slurmrestd_api_version, &discovered);
+    if let Some(e) = api.error.as_ref().filter(|_| auth_error.is_none()) {
+        problems.push(e.clone());
+    }
+
+    let mut ping = SlurmPingHealth {
+        ok: false,
+        status_code: None,
+        latency_ms: None,
+        error: None,
+    };
+    let mut slurmctld = None;
+    let mut slurm_release = None;
+    if let Some(version) = api.resolved.as_deref() {
+        let client = Slurmrestd::new(http.clone(), &url, version, user, token);
+        let started = Instant::now();
+        match client.ping().await {
+            Ok(p) => {
+                ping.status_code = Some(200);
+                slurmctld = p.slurmctld;
+                slurm_release = p.slurm_release;
+            }
+            Err(e) => {
+                ping.status_code = e.status;
+                ping.error = Some(e.message);
+            }
+        }
+        ping.latency_ms = Some(started.elapsed().as_millis() as u64);
+        if auth_error.is_none() {
+            if let Err(e) = client.check_token().await {
+                auth_error = Some(e.message);
+            }
+        }
+    }
+    if let Some(e) = &ping.error {
+        if !problems.contains(e) && auth_error.as_deref() != Some(e) {
+            problems.push(e.clone());
+        }
+    }
+    if let Some(e) = &auth_error {
+        problems.push(e.clone());
+    }
+    if slurmctld.as_deref() == Some("DOWN") {
+        problems.push(
+            "slurmrestd answered, but the Slurm controller (slurmctld) is not responding, so \
+             jobs cannot be submitted. Check slurmctld on the cluster."
+                .to_string(),
+        );
+    }
+    let auth = SlurmAuthHealth {
+        ok: api.resolved.is_some() && auth_error.is_none(),
+        error: auth_error,
+    };
+    ping.ok = ping.status_code.is_some_and(|c| (200..300).contains(&c))
+        && auth.ok
+        && slurmctld.as_deref() != Some("DOWN");
+
+    remember_discovery(Discovery {
+        url: url.clone(),
+        user: user.to_string(),
+        available: api.available.clone(),
+        resolved: api.resolved.clone(),
+        release: slurm_release.clone(),
+    });
+    Ok(Json(SlurmHealthView {
+        jwt,
+        ping,
+        api,
+        auth,
+        slurmctld,
+        slurm_release,
+        jwt_user,
+        problems,
+    }))
 }
 
 #[utoipa::path(
@@ -679,7 +1022,11 @@ pub async fn get_slurm_settings_resolved(
             .ok()
             .flatten()
             .and_then(|json| serde_json::from_str::<ProvisionerTick>(&json).ok());
-        let (tick, transition) = merge_tick(prev.as_ref(), &status, detail, Utc::now().timestamp());
+        let (mut tick, transition) =
+            merge_tick(prev.as_ref(), &status, detail, Utc::now().timestamp());
+        tick.warnings = header_str("x-obleth-provisioner-tick-warnings")
+            .and_then(|w| serde_json::from_str::<Vec<String>>(&w).ok())
+            .unwrap_or_default();
         if settings.enabled {
             match transition {
                 TickTransition::Held => state.alerts.issue(
@@ -821,9 +1168,10 @@ mod tests {
     #[test]
     fn api_version_rejects_path_traversal_and_separators() {
         assert!(is_valid_api_version("v0.0.40"));
+        assert!(is_valid_api_version("auto"));
+        assert!(is_valid_api_version(""));
         assert!(!is_valid_api_version("../admin"));
         assert!(!is_valid_api_version("v0.0.40/jobs"));
-        assert!(!is_valid_api_version(""));
         assert!(!is_valid_api_version("v0 0.40"));
     }
 
@@ -944,5 +1292,91 @@ mod tests {
             1_000 + HELD_ALERT_SECS,
         );
         assert_eq!(tr, TickTransition::Held);
+    }
+
+    #[test]
+    fn settings_warn_about_short_or_expired_tokens_user_mismatch_and_plaintext() {
+        let now = 1_700_000_000;
+        let tok = |exp: i64, sun: &str| {
+            let enc = |b: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+            format!(
+                "{}.{}.s",
+                enc("{}"),
+                enc(&format!(r#"{{"exp":{exp},"sun":"{sun}"}}"#))
+            )
+        };
+        let s = |jwt: String, user: &str| SlurmSettings {
+            enabled: true,
+            slurm_user: user.into(),
+            slurm_jwt: jwt,
+            ..Default::default()
+        };
+        assert!(settings_warnings(&s(tok(now + 30 * 86_400, "svc"), "svc"), now, true).is_empty());
+        let w = settings_warnings(&s(tok(now + 1800, "alice"), "bob"), now, false);
+        assert_eq!(w.len(), 3, "{w:?}");
+        assert!(
+            w[0].starts_with("This token expires in 30 minutes."),
+            "{}",
+            w[0]
+        );
+        assert!(w[0].contains("scontrol token lifespan=2592000"));
+        assert_eq!(
+            w[1],
+            "The token's user (alice) is not the Slurm user you entered (bob)."
+        );
+        assert!(w[2].contains("OBLETH_ENCRYPTION_KEY"));
+        let w = settings_warnings(&s(tok(now - 60, "svc"), "svc"), now, true);
+        assert!(
+            w[0].starts_with("This token expired at 2023-11-14 22:12 UTC."),
+            "{w:?}"
+        );
+        let w = settings_warnings(&s(String::new(), "svc"), now, true);
+        assert!(w[0].contains("no token is saved"));
+    }
+
+    #[test]
+    fn api_health_explains_versions_the_server_does_not_serve() {
+        let served = Ok(vec![
+            "v0.0.42".to_string(),
+            "v0.0.43".into(),
+            "v0.0.44".into(),
+            "v0.0.45".into(),
+        ]);
+        let a = api_health("auto", &served);
+        assert!(a.ok);
+        assert_eq!(a.resolved.as_deref(), Some("v0.0.45"));
+        let a = api_health("", &served);
+        assert_eq!(a.configured, "auto");
+        let a = api_health("v0.0.40", &served);
+        assert!(!a.ok);
+        let e = a.error.unwrap();
+        assert!(e.contains("does not serve API version v0.0.40"), "{e}");
+        assert!(e.contains("v0.0.42, v0.0.43, v0.0.44, v0.0.45"), "{e}");
+        assert!(e.contains("auto or to v0.0.45"), "{e}");
+        let a = api_health("auto", &Ok(vec!["v0.0.39".into()]));
+        assert!(
+            !a.ok
+                && a.error
+                    .unwrap()
+                    .contains("obleth supports v0.0.40 to v0.0.45")
+        );
+        let a = api_health("auto", &Err("Could not reach slurmrestd.".into()));
+        assert_eq!(a.error.as_deref(), Some("Could not reach slurmrestd."));
+        // An explicit version is used as is when discovery could not list any.
+        let a = api_health("v0.0.43", &Err("no openapi".into()));
+        assert!(a.ok);
+        assert_eq!(a.resolved.as_deref(), Some("v0.0.43"));
+    }
+
+    #[test]
+    fn partial_update_payload_keeps_omitted_fields() {
+        let u: UpdateSlurmSettings =
+            serde_json::from_str(r#"{"slurm_jwt":"SLURM_JWT=abc"}"#).unwrap();
+        assert!(u.enabled.is_none() && u.slurmrestd_url.is_none() && u.slurm_user.is_none());
+        assert!(u.node_aliases.is_none());
+        assert_eq!(
+            obleth_config::slurm::clean_pasted_jwt(u.slurm_jwt.as_deref().unwrap()),
+            "abc"
+        );
     }
 }
