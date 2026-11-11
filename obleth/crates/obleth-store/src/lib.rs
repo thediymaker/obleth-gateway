@@ -111,6 +111,7 @@ const SCHEMA_V37: &str = include_str!("../../../../schema/postgres/0037_job_kind
 const SCHEMA_V38: &str =
     include_str!("../../../../schema/postgres/0038_model_session_affinity.sql");
 const SCHEMA_V39: &str = include_str!("../../../../schema/postgres/0039_batches.sql");
+const SCHEMA_V40: &str = include_str!("../../../../schema/postgres/0040_mcp_server_tenants.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -266,6 +267,7 @@ impl Store {
             sqlx::raw_sql(SCHEMA_V37).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V38).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V39).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V40).execute(&mut *conn).await?;
             Ok(())
         }
         .await;
@@ -3538,17 +3540,19 @@ impl Store {
         name: &str,
         upstream_url: &str,
         auth_header: Option<&str>,
+        allowed_tenants: &[Uuid],
     ) -> Result<McpServer> {
         let auth_header = cipher().encrypt_opt(auth_header);
         let row = sqlx::query(
-            "insert into mcp_servers (id, name, upstream_url, auth_header)
-             values ($1, $2, $3, $4)
-             returning id, name, upstream_url, auth_header, enabled, created_at, updated_at",
+            "insert into mcp_servers (id, name, upstream_url, auth_header, allowed_tenants)
+             values ($1, $2, $3, $4, $5)
+             returning id, name, upstream_url, auth_header, enabled, allowed_tenants, created_at, updated_at",
         )
         .bind(Uuid::new_v4())
         .bind(name)
         .bind(upstream_url)
         .bind(auth_header)
+        .bind(allowed_tenants)
         .fetch_one(&self.pool)
         .await?;
         mcp_server_from_row(&row)
@@ -3556,7 +3560,7 @@ impl Store {
 
     pub async fn list_mcp_servers(&self) -> Result<Vec<McpServer>> {
         let rows = sqlx::query(
-            "select id, name, upstream_url, auth_header, enabled, created_at, updated_at
+            "select id, name, upstream_url, auth_header, enabled, allowed_tenants, created_at, updated_at
              from mcp_servers order by name",
         )
         .fetch_all(&self.pool)
@@ -3566,7 +3570,7 @@ impl Store {
 
     pub async fn get_mcp_server(&self, id: Uuid) -> Result<McpServer> {
         let row = sqlx::query(
-            "select id, name, upstream_url, auth_header, enabled, created_at, updated_at
+            "select id, name, upstream_url, auth_header, enabled, allowed_tenants, created_at, updated_at
              from mcp_servers where id = $1",
         )
         .bind(id)
@@ -3582,17 +3586,19 @@ impl Store {
         upstream_url: &str,
         auth_header: Option<&str>,
         enabled: bool,
+        allowed_tenants: &[Uuid],
     ) -> Result<McpServer> {
         let auth_header = cipher().encrypt_opt(auth_header);
         let row = sqlx::query(
-            "update mcp_servers set upstream_url = $2, auth_header = $3, enabled = $4, updated_at = now()
+            "update mcp_servers set upstream_url = $2, auth_header = $3, enabled = $4, allowed_tenants = $5, updated_at = now()
              where id = $1
-             returning id, name, upstream_url, auth_header, enabled, created_at, updated_at",
+             returning id, name, upstream_url, auth_header, enabled, allowed_tenants, created_at, updated_at",
         )
         .bind(id)
         .bind(upstream_url)
         .bind(auth_header)
         .bind(enabled)
+        .bind(allowed_tenants)
         .fetch_optional(&self.pool)
         .await?
         .ok_or(StoreError::NotFound)?;
@@ -3616,7 +3622,7 @@ impl Store {
             .try_get("name")?;
         let row = sqlx::query(
             "update mcp_servers set name = $2, updated_at = now() where id = $1
-             returning id, name, upstream_url, auth_header, enabled, created_at, updated_at",
+             returning id, name, upstream_url, auth_header, enabled, allowed_tenants, created_at, updated_at",
         )
         .bind(id)
         .bind(new_name)
@@ -3690,7 +3696,7 @@ impl Store {
     /// All enabled MCP servers as (name, resolved), for warming the cache.
     pub async fn all_resolved_mcp_servers(&self) -> Result<Vec<(String, ResolvedMcpServer)>> {
         let rows = sqlx::query(
-            "select name, upstream_url, auth_header, enabled
+            "select name, upstream_url, auth_header, enabled, allowed_tenants
              from mcp_servers where enabled = true",
         )
         .fetch_all(&self.pool)
@@ -3705,6 +3711,7 @@ impl Store {
                         upstream_url: row.try_get("upstream_url")?,
                         auth_header: cipher().decrypt_opt(row.try_get("auth_header")?)?,
                         enabled: row.try_get("enabled")?,
+                        allowed_tenants: row.try_get("allowed_tenants")?,
                     },
                 ))
             })
@@ -4235,6 +4242,7 @@ fn mcp_server_from_row(row: &PgRow) -> Result<McpServer> {
         upstream_url: row.try_get("upstream_url")?,
         auth_header: cipher().decrypt_opt(row.try_get("auth_header")?)?,
         enabled: row.try_get("enabled")?,
+        allowed_tenants: row.try_get("allowed_tenants")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -7648,7 +7656,7 @@ mod tests {
         let new = format!("mcp-{}", Uuid::new_v4());
         let other = format!("mcp-{}", Uuid::new_v4());
         let server = store
-            .create_mcp_server(&old, "http://127.0.0.1:1/mcp", None)
+            .create_mcp_server(&old, "http://127.0.0.1:1/mcp", None, &[])
             .await
             .expect("create mcp server");
         fixtures.track_mcp_server(server.id);
@@ -7728,7 +7736,7 @@ mod tests {
         let doomed = format!("mcp-{}", Uuid::new_v4());
         let kept = format!("mcp-{}", Uuid::new_v4());
         let server = store
-            .create_mcp_server(&doomed, "http://127.0.0.1:1/mcp", None)
+            .create_mcp_server(&doomed, "http://127.0.0.1:1/mcp", None, &[])
             .await
             .expect("create mcp server");
         fixtures.track_mcp_server(server.id);

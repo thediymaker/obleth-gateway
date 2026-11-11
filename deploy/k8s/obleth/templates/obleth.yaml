@@ -80,6 +80,9 @@ spec:
             - { name: OBLETH_CAPACITY_DISCOVERY_NAMESPACES, value: {{ join "," (uniq .Values.obleth.capacityDiscovery.namespaces) | quote }} }
             - { name: OBLETH_CAPACITY_DEFAULT_SERVICE, value: {{ .Values.obleth.capacityDiscovery.defaultService | quote }} }
             - { name: OBLETH_FAIL_OPEN, value: {{ .Values.obleth.failOpen | quote }} }
+            {{- if .Values.obleth.blockPrivateNetworks }}
+            - { name: OBLETH_BLOCK_PRIVATE_NETWORKS, value: "1" }
+            {{- end }}
             - { name: OBLETH_ALLOWED_PRIVATE_CIDRS, value: {{ .Values.obleth.allowedPrivateCidrs | quote }} }
             - { name: OBLETH_MODEL_HEALTH_ENABLED, value: {{ .Values.obleth.modelHealthEnabled | quote }} }
             - { name: OBLETH_MODEL_HEALTH_INTERVAL_SECS, value: {{ .Values.obleth.modelHealthIntervalSecs | quote }} }

@@ -725,6 +725,8 @@ export interface McpServer {
   /** Whether an upstream Authorization header is stored. The value itself is write-only and never returned. */
   auth_header_set: boolean;
   enabled: boolean;
+  /** Ids of the tenants whose keys may call the server at `/mcp/<name>`. Empty: no direct calls. */
+  allowed_tenants: string[];
   created_at: string;
   updated_at: string;
 }
@@ -2160,6 +2162,21 @@ async function api<T>(path: string, init?: ApiInit): Promise<T> {
   return (await res.json()) as T;
 }
 
+/**
+ * One segment of a Management API path, from an id or a name the dashboard was
+ * given (a route parameter, a form field, a tool argument). The value is
+ * percent-encoded, so a `/`, `?` or `#` in it stays inside the segment, and the
+ * dot segments a URL parser would resolve are refused. Without this a crafted
+ * id reached a different admin endpoint than the one the caller was checked for.
+ */
+export function seg(value: string | number): string {
+  const text = String(value);
+  if (text === "" || text === "." || text === "..") {
+    throw new Error("That is not a valid id.");
+  }
+  return encodeURIComponent(text);
+}
+
 function qs(params: Record<string, string | number | undefined>) {
   const q = new URLSearchParams();
   for (const [k, v] of Object.entries(params)) {
@@ -2289,7 +2306,7 @@ export const obleth = {
       body: JSON.stringify(body),
     }),
   setWeight: (id: string, weight: number, options?: AuditOptions) =>
-    api<Tenant>(`/tenants/${id}/weight`, {
+    api<Tenant>(`/tenants/${seg(id)}/weight`, {
       method: "PATCH",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ weight }),
@@ -2302,7 +2319,7 @@ export const obleth = {
       body: JSON.stringify({ name, weight }),
     }),
   setFairshareGroupWeight: (name: string, weight: number, options?: AuditOptions) =>
-    api<FairshareGroup>(`/fairshare/groups/${encodeURIComponent(name)}/weight`, {
+    api<FairshareGroup>(`/fairshare/groups/${seg(name)}/weight`, {
       method: "PATCH",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ weight }),
@@ -2313,7 +2330,7 @@ export const obleth = {
     max_in_flight: number | null,
     options?: AuditOptions,
   ) =>
-    api<Tenant>(`/tenants/${id}/quota`, {
+    api<Tenant>(`/tenants/${seg(id)}/quota`, {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ tokens_per_minute, max_in_flight }),
@@ -2328,13 +2345,13 @@ export const obleth = {
     },
     options?: AuditOptions,
   ) =>
-    api<Tenant>(`/tenants/${id}`, {
+    api<Tenant>(`/tenants/${seg(id)}`, {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
   setTenantStatus: (id: string, status: string, options?: AuditOptions) =>
-    api<Tenant>(`/tenants/${id}/status`, {
+    api<Tenant>(`/tenants/${seg(id)}/status`, {
       method: "PATCH",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ status }),
@@ -2349,7 +2366,7 @@ export const obleth = {
     },
     options?: AuditOptions,
   ) =>
-    api<Tenant>(`/tenants/${id}/schedule`, {
+    api<Tenant>(`/tenants/${seg(id)}/schedule`, {
       method: "PATCH",
       headers: auditActorHeaders(options),
       body: JSON.stringify(body),
@@ -2364,7 +2381,7 @@ export const obleth = {
     },
     options?: AuditOptions,
   ) =>
-    api<Tenant>(`/tenants/${id}/budget`, {
+    api<Tenant>(`/tenants/${seg(id)}/budget`, {
       method: "PATCH",
       headers: auditActorHeaders(options),
       body: JSON.stringify(body),
@@ -2374,7 +2391,7 @@ export const obleth = {
     allowed_models: string[],
     options?: AuditOptions,
   ) =>
-    api<Tenant>(`/tenants/${id}/allowlist`, {
+    api<Tenant>(`/tenants/${seg(id)}/allowlist`, {
       method: "PATCH",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ allowed_models }),
@@ -2384,7 +2401,7 @@ export const obleth = {
     policy: GuardrailsPolicy | null,
     options?: AuditOptions,
   ) =>
-    api<Tenant>(`/tenants/${id}/guardrails`, {
+    api<Tenant>(`/tenants/${seg(id)}/guardrails`, {
       method: "PATCH",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ policy }),
@@ -2394,25 +2411,25 @@ export const obleth = {
     policy: CompressionPolicy | null,
     options?: AuditOptions,
   ) =>
-    api<Tenant>(`/tenants/${id}/compression`, {
+    api<Tenant>(`/tenants/${seg(id)}/compression`, {
       method: "PATCH",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ policy }),
     }),
   /** Move a tenant into another fairshare group (one with no weight shares at the default). */
   setTenantGroup: (id: string, fairshare_group: string, options?: AuditOptions) =>
-    api<Tenant>(`/tenants/${id}/group`, {
+    api<Tenant>(`/tenants/${seg(id)}/group`, {
       method: "PATCH",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ fairshare_group }),
     }),
   deleteTenant: (id: string, options?: AuditOptions) =>
-    api<void>(`/tenants/${id}`, {
+    api<void>(`/tenants/${seg(id)}`, {
       method: "DELETE",
       headers: auditActorHeaders(options),
     }),
   listKeys: (tenantId?: string) =>
-    api<ApiKey[]>(`/keys${tenantId ? `?tenant_id=${tenantId}` : ""}`, {
+    api<ApiKey[]>(`/keys${qs({ tenant_id: tenantId })}`, {
       next: { revalidate: LIST_REVALIDATE_SECS, tags: [CACHE_TAGS.keys] },
     }),
   createKey: (
@@ -2429,7 +2446,7 @@ export const obleth = {
     },
     options?: AuditOptions,
   ) =>
-    api<CreatedKey>(`/tenants/${tenantId}/keys`, {
+    api<CreatedKey>(`/tenants/${seg(tenantId)}/keys`, {
       method: "POST",
       headers: auditActorHeaders(options),
       body: JSON.stringify(body),
@@ -2448,14 +2465,14 @@ export const obleth = {
     },
     options?: AuditOptions,
   ) =>
-    api<ApiKey>(`/keys/${id}`, {
+    api<ApiKey>(`/keys/${seg(id)}`, {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
   /** Move a key to another tenant, keeping its secret and settings. */
   moveKey: (id: string, tenant_id: string, options?: AuditOptions) =>
-    api<ApiKey>(`/keys/${id}/tenant`, {
+    api<ApiKey>(`/keys/${seg(id)}/tenant`, {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ tenant_id }),
@@ -2463,19 +2480,19 @@ export const obleth = {
   /** Every capped tenant and key budget, with its current period's use from the enforcement counters. */
   budgetUsage: () => api<BudgetUsage[]>("/budgets/usage"),
   setKeyDisabled: (id: string, disabled: boolean, options?: AuditOptions) =>
-    api<void>(`/keys/${id}/disabled`, {
+    api<void>(`/keys/${seg(id)}/disabled`, {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ disabled }),
     }),
   setKeyTracing: (id: string, tracing_enabled: boolean, options?: AuditOptions) =>
-    api<void>(`/keys/${id}/tracing`, {
+    api<void>(`/keys/${seg(id)}/tracing`, {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ tracing_enabled }),
     }),
   setKeyEndUserFairshare: (id: string, end_user_fairshare: boolean, options?: AuditOptions) =>
-    api<void>(`/keys/${id}/end-user-fairshare`, {
+    api<void>(`/keys/${seg(id)}/end-user-fairshare`, {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ end_user_fairshare }),
@@ -2485,7 +2502,7 @@ export const obleth = {
     tracing_enabled: boolean,
     options?: AuditOptions,
   ) =>
-    api<void>(`/tenants/${id}/tracing`, {
+    api<void>(`/tenants/${seg(id)}/tracing`, {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ tracing_enabled }),
@@ -2495,13 +2512,13 @@ export const obleth = {
     synthetic: boolean,
     options?: AuditOptions,
   ) =>
-    api<void>(`/tenants/${id}/synthetic`, {
+    api<void>(`/tenants/${seg(id)}/synthetic`, {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ synthetic }),
     }),
   deleteKey: (id: string, options?: AuditOptions) =>
-    api<void>(`/keys/${id}`, {
+    api<void>(`/keys/${seg(id)}`, {
       method: "DELETE",
       headers: auditActorHeaders(options),
     }),
@@ -2533,13 +2550,13 @@ export const obleth = {
     body: ModelWriteFields & { upstream_model: string; api_base: string },
     options?: AuditOptions,
   ) =>
-    api<ModelRoute>(`/models/${id}`, {
+    api<ModelRoute>(`/models/${seg(id)}`, {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
   deleteModel: (id: string, options?: AuditOptions) =>
-    api<void>(`/models/${id}`, {
+    api<void>(`/models/${seg(id)}`, {
       method: "DELETE",
       headers: auditActorHeaders(options),
     }),
@@ -2550,12 +2567,12 @@ export const obleth = {
     }),
   modelHealth: () => api<ModelHealthSummary[]>("/models/health"),
   modelHealthDetail: (id: string) =>
-    api<ModelHealthDetail>(`/models/${id}/health`),
+    api<ModelHealthDetail>(`/models/${seg(id)}/health`),
   checkModelHealth: (id: string) =>
-    api<ModelHealthDetail>(`/models/${id}/health/check`, { method: "POST" }),
+    api<ModelHealthDetail>(`/models/${seg(id)}/health/check`, { method: "POST" }),
   /** Probe a switched-off model and turn it on if the probe comes back healthy. */
   activateModel: (id: string, options?: AuditOptions) =>
-    api<ModelActivation>(`/models/${id}/health/activate`, {
+    api<ModelActivation>(`/models/${seg(id)}/health/activate`, {
       method: "POST",
       headers: auditActorHeaders(options),
     }),
@@ -2566,7 +2583,7 @@ export const obleth = {
     body: ModelHealthConfigBody,
     options?: AuditOptions,
   ) =>
-    api<ModelHealthSummary>(`/models/${id}/health/config`, {
+    api<ModelHealthSummary>(`/models/${seg(id)}/health/config`, {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify(body),
@@ -2576,26 +2593,26 @@ export const obleth = {
     admission_weight: number,
     options?: AuditOptions,
   ) =>
-    api<ModelRoute>(`/models/${id}/weight`, {
+    api<ModelRoute>(`/models/${seg(id)}/weight`, {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ admission_weight }),
     }),
   setModelStatus: (id: string, body: SetModelStatus, options?: AuditOptions) =>
-    api<ModelRoute>(`/models/${id}/status`, {
+    api<ModelRoute>(`/models/${seg(id)}/status`, {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
   /** Replace a model's reasoning-effort map whole. */
   setModelReasoning: (id: string, body: ModelReasoning, options?: AuditOptions) =>
-    api<ModelRoute>(`/models/${id}/reasoning`, {
+    api<ModelRoute>(`/models/${seg(id)}/reasoning`, {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
   setModelListing: (id: string, listed: boolean, options?: AuditOptions) =>
-    api<ModelRoute>(`/models/${id}/listing`, {
+    api<ModelRoute>(`/models/${seg(id)}/listing`, {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ listed }),
@@ -2608,13 +2625,13 @@ export const obleth = {
       body: JSON.stringify(body),
     }),
   updateModelFamily: (id: string, body: ModelFamilyWrite, options?: AuditOptions) =>
-    api<ModelFamily>(`/model-families/${id}`, {
+    api<ModelFamily>(`/model-families/${seg(id)}`, {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
   deleteModelFamily: (id: string, options?: AuditOptions) =>
-    api<void>(`/model-families/${id}`, {
+    api<void>(`/model-families/${seg(id)}`, {
       method: "DELETE",
       headers: auditActorHeaders(options),
     }),
@@ -2623,7 +2640,7 @@ export const obleth = {
     max_in_flight: number | null,
     options?: AuditOptions,
   ) =>
-    api<ModelRoute>(`/models/${id}/capacity`, {
+    api<ModelRoute>(`/models/${seg(id)}/capacity`, {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ max_in_flight }),
@@ -2634,7 +2651,7 @@ export const obleth = {
     fields?: CapacityDiscoveryFields,
     options?: AuditOptions,
   ) =>
-    api<ModelRoute>(`/models/${id}/capacity-mode`, {
+    api<ModelRoute>(`/models/${seg(id)}/capacity-mode`, {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ capacity_mode, ...(fields ?? {}) }),
@@ -2651,7 +2668,7 @@ export const obleth = {
     },
     options?: AuditOptions,
   ) =>
-    api<AutotuneReport>(`/models/${id}/autotune`, {
+    api<AutotuneReport>(`/models/${seg(id)}/autotune`, {
       method: "POST",
       headers: auditActorHeaders(options),
       body: JSON.stringify(opts ?? {}),
@@ -2661,7 +2678,7 @@ export const obleth = {
     max_in_flight: number,
     options?: AuditOptions,
   ) =>
-    api<ModelRoute>(`/models/${id}/autotune/apply`, {
+    api<ModelRoute>(`/models/${seg(id)}/autotune/apply`, {
       method: "POST",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ max_in_flight }),
@@ -2672,7 +2689,7 @@ export const obleth = {
     cache_ttl_secs?: number,
     options?: AuditOptions,
   ) =>
-    api<ModelRoute>(`/models/${id}/cache`, {
+    api<ModelRoute>(`/models/${seg(id)}/cache`, {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ cache_enabled, cache_ttl_secs }),
@@ -2688,33 +2705,33 @@ export const obleth = {
     },
     options?: AuditOptions,
   ) =>
-    api<ModelRoute>(`/models/${id}/reliability`, {
+    api<ModelRoute>(`/models/${seg(id)}/reliability`, {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
   listModelEndpoints: (id: string) =>
-    api<ModelEndpoint[]>(`/models/${id}/endpoints`),
+    api<ModelEndpoint[]>(`/models/${seg(id)}/endpoints`),
   getManagedModel: (id: string) =>
-    api<ManagedModelSpec | null>(`/models/${id}/managed`),
+    api<ManagedModelSpec | null>(`/models/${seg(id)}/managed`),
   listManagedModels: () => api<ManagedModelSpec[]>("/managed"),
   putManagedModel: (
     id: string,
     body: PutManagedModel,
     options?: AuditOptions,
   ) =>
-    api<ManagedModelSpec>(`/models/${id}/managed`, {
+    api<ManagedModelSpec>(`/models/${seg(id)}/managed`, {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
   deleteManagedModel: (id: string, options?: AuditOptions) =>
-    api<void>(`/models/${id}/managed`, {
+    api<void>(`/models/${seg(id)}/managed`, {
       method: "DELETE",
       headers: auditActorHeaders(options),
     }),
   clearProvisionError: (id: string, options?: AuditOptions) =>
-    api<{ ok: boolean }>(`/models/${id}/managed/provision-error`, {
+    api<{ ok: boolean }>(`/models/${seg(id)}/managed/provision-error`, {
       method: "PATCH",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ error: null }),
@@ -2735,22 +2752,22 @@ export const obleth = {
     body: { name: string; body: string; author?: string },
     options?: AuditOptions,
   ) =>
-    api<Recipe>(`/recipes/${id}`, {
+    api<Recipe>(`/recipes/${seg(id)}`, {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
   deleteRecipe: (id: string, options?: AuditOptions) =>
-    api<void>(`/recipes/${id}`, {
+    api<void>(`/recipes/${seg(id)}`, {
       method: "DELETE",
       headers: auditActorHeaders(options),
     }),
   /** Every replica of every managed model. */
   listAllReplicas: () => api<ModelReplica[]>("/replicas"),
   listReplicas: (id: string) =>
-    api<ModelReplica[]>(`/models/${id}/replicas`),
+    api<ModelReplica[]>(`/models/${seg(id)}/replicas`),
   clearLostReplicas: (id: string, options?: AuditOptions) =>
-    api<{ deleted: number }>(`/models/${id}/replicas/clear-lost`, {
+    api<{ deleted: number }>(`/models/${seg(id)}/replicas/clear-lost`, {
       method: "POST",
       headers: auditActorHeaders(options),
     }),
@@ -2758,7 +2775,7 @@ export const obleth = {
   listDeploymentLaunches: (params: DeploymentLaunchesParams = {}) =>
     api<DeploymentLaunch[]>(`/deployments/launches${qs({ ...params })}`),
   restartReplica: (replicaId: string, options?: AuditOptions) =>
-    api<{ ok: boolean }>(`/replicas/${replicaId}/restart`, {
+    api<{ ok: boolean }>(`/replicas/${seg(replicaId)}/restart`, {
       method: "POST",
       headers: auditActorHeaders(options),
     }),
@@ -2775,7 +2792,7 @@ export const obleth = {
     },
     options?: AuditOptions,
   ) =>
-    api<ModelEndpoint>(`/models/${id}/endpoints`, {
+    api<ModelEndpoint>(`/models/${seg(id)}/endpoints`, {
       method: "POST",
       headers: auditActorHeaders(options),
       body: JSON.stringify(body),
@@ -2794,13 +2811,13 @@ export const obleth = {
     },
     options?: AuditOptions,
   ) =>
-    api<ModelEndpoint>(`/models/${id}/endpoints/${endpointId}`, {
+    api<ModelEndpoint>(`/models/${seg(id)}/endpoints/${seg(endpointId)}`, {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
   deleteModelEndpoint: (id: string, endpointId: string, options?: AuditOptions) =>
-    api<void>(`/models/${id}/endpoints/${endpointId}`, {
+    api<void>(`/models/${seg(id)}/endpoints/${seg(endpointId)}`, {
       method: "DELETE",
       headers: auditActorHeaders(options),
     }),
@@ -2822,16 +2839,16 @@ export const obleth = {
     }),
   updateMcpServer: (
     id: string,
-    body: { upstream_url: string; auth_header?: string; clear_auth?: boolean; enabled?: boolean; name?: string },
+    body: { upstream_url: string; auth_header?: string; clear_auth?: boolean; enabled?: boolean; name?: string; allowed_tenants?: string[] },
     options?: AuditOptions,
   ) =>
-    api<McpServer>(`/mcp-servers/${id}`, {
+    api<McpServer>(`/mcp-servers/${seg(id)}`, {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
   deleteMcpServer: (id: string, options?: AuditOptions) =>
-    api<void>(`/mcp-servers/${id}`, {
+    api<void>(`/mcp-servers/${seg(id)}`, {
       method: "DELETE",
       headers: auditActorHeaders(options),
     }),
@@ -2840,7 +2857,7 @@ export const obleth = {
   usageByKey: (sinceMs?: number, limit?: number) =>
     api<UsageKeyAgg[]>(`/usage/keys${qs({ since_ms: sinceMs, limit })}`),
   keyUsage: (id: string, sinceMs?: number) =>
-    api<KeyUsageSummary>(`/keys/${id}/usage${qs({ since_ms: sinceMs })}`),
+    api<KeyUsageSummary>(`/keys/${seg(id)}/usage${qs({ since_ms: sinceMs })}`),
   usageKeysSummary: (
     params: { tenantId?: string; sinceMs?: number; limit?: number } = {},
   ) =>
@@ -2949,7 +2966,7 @@ export const obleth = {
   usageFailures: (params: UsageLogParams = {}) =>
     api<UsageFailureGroups>(`/usage/failures${qs(logFilterQuery(params))}`),
   getRequestSpans: (requestId: string) =>
-    api<SpanEntry[]>(`/usage/logs/${requestId}/spans`).catch(() => [] as SpanEntry[]),
+    api<SpanEntry[]>(`/usage/logs/${seg(requestId)}/spans`).catch(() => [] as SpanEntry[]),
   // Server-only: hand the control-plane (Charo's model-test console) the reserved
   // system key secret so it can call the data plane as the protected internal tenant.
   controlPlaneKey: () =>
@@ -2984,10 +3001,10 @@ export const obleth = {
     api<AdminBatchList>(
       `/batches${qs({ status: params.status, tenant_id: params.tenantId, model: params.model, after: params.after, limit: params.limit })}`,
     ),
-  getBatch: (id: string) => api<AdminBatch>(`/batches/${encodeURIComponent(id)}`),
+  getBatch: (id: string) => api<AdminBatch>(`/batches/${seg(id)}`),
   /** Stops a batch's queued requests; running ones finish. */
   cancelBatch: (id: string, options?: AuditOptions) =>
-    api<AdminBatch>(`/batches/${encodeURIComponent(id)}/cancel`, {
+    api<AdminBatch>(`/batches/${seg(id)}/cancel`, {
       method: "POST",
       headers: auditActorHeaders(options),
     }),
@@ -3053,13 +3070,13 @@ export const obleth = {
   /// Advice from the last day of requests (cached about a minute by the gateway).
   getAdvice: reactCache(() => api<AdviceReportView>("/advice")),
   snoozeAdvice: (key: string, body: { title: string; until_ms?: number }, options?: AuditOptions) =>
-    api<SnoozedAdviceView[]>(`/advice/snoozed/${encodeURIComponent(key)}`, {
+    api<SnoozedAdviceView[]>(`/advice/snoozed/${seg(key)}`, {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
   restoreAdvice: (key: string, options?: AuditOptions) =>
-    api<SnoozedAdviceView[]>(`/advice/snoozed/${encodeURIComponent(key)}`, {
+    api<SnoozedAdviceView[]>(`/advice/snoozed/${seg(key)}`, {
       method: "DELETE",
       headers: auditActorHeaders(options),
     }),
@@ -3142,7 +3159,7 @@ export const obleth = {
       body: JSON.stringify(body),
     }),
   getCollection: (id: string) =>
-    api<KnowledgeCollection>(`/knowledge/collections/${id}`),
+    api<KnowledgeCollection>(`/knowledge/collections/${seg(id)}`),
   updateCollection: (
     id: string,
     body: {
@@ -3154,19 +3171,19 @@ export const obleth = {
     },
     options?: AuditOptions,
   ) =>
-    api<KnowledgeCollection>(`/knowledge/collections/${id}`, {
+    api<KnowledgeCollection>(`/knowledge/collections/${seg(id)}`, {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
   deleteCollection: (id: string, options?: AuditOptions) =>
-    api<void>(`/knowledge/collections/${id}`, {
+    api<void>(`/knowledge/collections/${seg(id)}`, {
       method: "DELETE",
       headers: auditActorHeaders(options),
     }),
   listDocuments: (collectionId: string) =>
     api<KnowledgeDocument[]>(
-      `/knowledge/collections/${collectionId}/documents`,
+      `/knowledge/collections/${seg(collectionId)}/documents`,
     ),
   uploadDocument: (
     collectionId: string,
@@ -3174,7 +3191,7 @@ export const obleth = {
     options?: AuditOptions,
   ) =>
     api<KnowledgeDocument>(
-      `/knowledge/collections/${collectionId}/documents`,
+      `/knowledge/collections/${seg(collectionId)}/documents`,
       {
         method: "POST",
         headers: auditActorHeaders(options),
@@ -3182,33 +3199,33 @@ export const obleth = {
       },
     ),
   deleteDocument: (id: string, options?: AuditOptions) =>
-    api<void>(`/knowledge/documents/${id}`, {
+    api<void>(`/knowledge/documents/${seg(id)}`, {
       method: "DELETE",
       headers: auditActorHeaders(options),
     }),
   reindexCollection: (id: string, options?: AuditOptions) =>
-    api<KnowledgeReindexResult>(`/knowledge/collections/${id}/reindex`, {
+    api<KnowledgeReindexResult>(`/knowledge/collections/${seg(id)}/reindex`, {
       method: "POST",
       headers: auditActorHeaders(options),
     }),
   reindexDocument: (id: string, options?: AuditOptions) =>
-    api<KnowledgeDocument>(`/knowledge/documents/${id}/reindex`, {
+    api<KnowledgeDocument>(`/knowledge/documents/${seg(id)}/reindex`, {
       method: "POST",
       headers: auditActorHeaders(options),
     }),
   searchCollection: (id: string, body: { query: string; top_k?: number }) =>
-    api<KnowledgeHit[]>(`/knowledge/collections/${id}/search`, {
+    api<KnowledgeHit[]>(`/knowledge/collections/${seg(id)}/search`, {
       method: "POST",
       body: JSON.stringify(body),
     }),
   getModelCollections: (modelId: string) =>
-    api<ModelKnowledgeCollections>(`/models/${modelId}/knowledge`),
+    api<ModelKnowledgeCollections>(`/models/${seg(modelId)}/knowledge`),
   setModelCollections: (
     modelId: string,
     collection_ids: string[],
     options?: AuditOptions,
   ) =>
-    api<ModelKnowledgeCollections>(`/models/${modelId}/knowledge`, {
+    api<ModelKnowledgeCollections>(`/models/${seg(modelId)}/knowledge`, {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ collection_ids }),

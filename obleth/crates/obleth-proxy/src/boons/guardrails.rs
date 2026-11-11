@@ -31,6 +31,16 @@ impl GuardrailsBlock {
             reason: "content policy scanner unavailable",
         }
     }
+
+    /// An answer the scanners could not be given: too large to hold, or not a
+    /// completion at all. Under a policy that blocks or redacts, what cannot be
+    /// read is not passed on.
+    pub(crate) fn unchecked() -> Self {
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            reason: "the response could not be checked against the content policy",
+        }
+    }
 }
 
 /// Outcome of the tier-2 harm classifier. Kept distinct from a boolean so
@@ -58,20 +68,18 @@ const MIN_LABEL_MASS: f64 = 0.05;
 // ---------------------------------------------------------------------------
 
 /// Extract plain text from a message `content` value, handling both the string
-/// form and the multimodal array-of-parts form (text parts only).
+/// form and the multimodal array-of-parts form. A part's `text` is read
+/// whatever the part calls itself (`text`, `input_text`, no type at all): the
+/// name is the caller's to choose, and a model server that reads the part
+/// reads its text.
 fn content_to_text(content: &Value) -> String {
     match content {
         Value::String(s) => s.clone(),
         Value::Array(parts) => parts
             .iter()
-            .filter_map(|p| {
-                if p.get("type").and_then(|t| t.as_str()) == Some("text") {
-                    p.get("text")
-                        .and_then(|t| t.as_str())
-                        .map(|s| s.to_string())
-                } else {
-                    None
-                }
+            .filter_map(|p| match p {
+                Value::String(s) => Some(s.clone()),
+                _ => p.get("text").and_then(|t| t.as_str()).map(str::to_string),
             })
             .collect::<Vec<_>>()
             .join("\n"),
@@ -83,17 +91,48 @@ pub(super) fn extract_message_text(msg: &Value) -> String {
     msg.get("content").map(content_to_text).unwrap_or_default()
 }
 
-/// Pointers within a completion that carry assistant-authored text a guardrails
-/// scanner must see: the visible `content` plus the reasoning/"thinking"
-/// channels different providers expose. A reasoning channel restates the same
-/// material, so leaving it unscanned would let blocked/redacted content leak
-/// straight through it.
+/// Where one choice of a completion carries text the model wrote, which a
+/// guardrails scanner must see: the visible `content` (`text` on the legacy
+/// completions shape), a refusal, and the reasoning/"thinking" channels
+/// different providers expose. A reasoning channel restates the same material,
+/// so leaving it unscanned would let blocked/redacted content leak straight
+/// through it.
 const OUTPUT_TEXT_POINTERS: &[&str] = &[
-    "/choices/0/message/content",
-    "/choices/0/message/reasoning_content",
-    "/choices/0/message/reasoning",
-    "/choices/0/message/provider_specific_fields/reasoning",
+    "/message/content",
+    "/message/refusal",
+    "/message/reasoning_content",
+    "/message/reasoning",
+    "/message/provider_specific_fields/reasoning",
+    "/text",
 ];
+
+/// Calls `each` with every value in a completion that carries the model's text:
+/// the fields of [`OUTPUT_TEXT_POINTERS`] in every choice, not only the first
+/// (a client that asks for `n: 2` gets two answers), and the arguments of each
+/// tool or function call, which are the model's words as much as its content is.
+fn each_output_text(completion: &mut Value, mut each: impl FnMut(&mut Value)) {
+    let Some(choices) = completion.get_mut("choices").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for choice in choices {
+        for ptr in OUTPUT_TEXT_POINTERS {
+            if let Some(text) = choice.pointer_mut(ptr) {
+                each(text);
+            }
+        }
+        if let Some(arguments) = choice.pointer_mut("/message/function_call/arguments") {
+            each(arguments);
+        }
+        let calls = choice
+            .pointer_mut("/message/tool_calls")
+            .and_then(Value::as_array_mut);
+        for call in calls.into_iter().flatten() {
+            if let Some(arguments) = call.pointer_mut("/function/arguments") {
+                each(arguments);
+            }
+        }
+    }
+}
 
 /// Whether a message with this role is input the tenant's scanners must see:
 /// everything but the model's own turns and tool output, so `user`, `system`,
@@ -196,13 +235,16 @@ fn redact_fields_in_place(json: &mut Value, scanners: &[String], ban_keywords: &
 /// any reasoning channel) so scanners see the reasoning trace, not just the
 /// visible answer.
 pub(crate) fn extract_completion_text(completion: &Value) -> String {
-    OUTPUT_TEXT_POINTERS
-        .iter()
-        .filter_map(|ptr| completion.pointer(ptr))
-        .map(content_to_text)
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut texts: Vec<String> = Vec::new();
+    // Read through the walk that redaction uses, so both see the same fields.
+    let mut completion = completion.clone();
+    each_output_text(&mut completion, |text| {
+        let text = content_to_text(text);
+        if !text.is_empty() {
+            texts.push(text);
+        }
+    });
+    texts.join("\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -449,10 +491,18 @@ fn redact_output_in_place(
     ban_keywords: &[String],
 ) -> bool {
     let mut changed = false;
-    for ptr in OUTPUT_TEXT_POINTERS {
-        if let Some(content) = completion.pointer_mut(ptr) {
-            if redact_content_in_place(content, scanners, ban_keywords) {
-                changed = true;
+    each_output_text(completion, |content| {
+        if redact_content_in_place(content, scanners, ban_keywords) {
+            changed = true;
+        }
+    });
+    // Token log-probabilities spell the answer out token by token, so they
+    // would give back what was just taken out.
+    if changed {
+        let choices = completion.get_mut("choices").and_then(Value::as_array_mut);
+        for choice in choices.into_iter().flatten() {
+            if let Some(logprobs) = choice.get_mut("logprobs") {
+                *logprobs = Value::Null;
             }
         }
     }
@@ -493,10 +543,15 @@ fn redact_content_in_place(
         Value::Array(parts) => {
             let mut changed = false;
             for part in parts.iter_mut() {
-                if part.get("type").and_then(|t| t.as_str()) != Some("text") {
-                    continue;
-                }
-                if let Some(Value::String(s)) = part.get_mut("text") {
+                // Bare strings and any part with text, as `content_to_text` reads.
+                let text = match part {
+                    Value::String(s) => Some(s),
+                    _ => match part.get_mut("text") {
+                        Some(Value::String(s)) => Some(s),
+                        _ => None,
+                    },
+                };
+                if let Some(s) = text {
                     let redacted = redact_text(s, scanners, ban_keywords);
                     if redacted != *s {
                         *s = redacted;
@@ -1432,18 +1487,94 @@ mod tests {
                 }
             }]
         });
-        // Mirror apply_output's redact loop.
-        for ptr in OUTPUT_TEXT_POINTERS {
-            if let Some(c) = completion.pointer_mut(ptr) {
-                redact_content_in_place(c, &policy.output_scanners, &policy.ban_keywords);
-            }
-        }
+        redact_output_in_place(
+            &mut completion,
+            &policy.output_scanners,
+            &policy.ban_keywords,
+        );
         let serialized = completion.to_string();
         assert!(
             !serialized.contains("tacos"),
             "reasoning channels must be redacted: {serialized}"
         );
         assert!(serialized.matches("[REDACTED]").count() >= 3);
+    }
+
+    /// A part's text is scanned and redacted whatever the part calls itself.
+    #[test]
+    fn text_in_a_part_of_any_type_is_read() {
+        let content = serde_json::json!([
+            {"type": "text", "text": "tacos one"},
+            {"type": "input_text", "text": "tacos two"},
+            {"text": "tacos three"},
+            "tacos four",
+            {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}
+        ]);
+        assert_eq!(content_to_text(&content).matches("tacos").count(), 4);
+        let mut redacted = content.clone();
+        assert!(redact_content_in_place(
+            &mut redacted,
+            &["ban_keywords".to_string()],
+            &["tacos".to_string()]
+        ));
+        let text = redacted.to_string();
+        assert!(!text.contains("tacos"), "{text}");
+        assert_eq!(text.matches("[REDACTED]").count(), 4);
+        assert!(text.contains("https://example.com/a.png"));
+    }
+
+    /// The model's words reach the client in more places than the first choice's
+    /// content: a second choice, a tool call's arguments, the legacy `text`, and
+    /// token log-probabilities that spell the answer out again.
+    #[test]
+    fn every_place_an_answer_carries_text_is_scanned_and_redacted() {
+        let policy = GuardrailsPolicy {
+            action: GuardrailsAction::Redact,
+            input_scanners: vec![],
+            output_scanners: vec!["ban_keywords".into()],
+            guard_model: None,
+            ban_keywords: vec!["tacos".into()],
+            fail_open: true,
+        };
+        let mut completion = serde_json::json!({
+            "choices": [
+                {"message": {"content": "nothing here"},
+                 "logprobs": {"content": [{"token": "ta"}, {"token": "cos"}]}},
+                {"message": {"content": "tacos, the second answer", "refusal": "no tacos",
+                             "tool_calls": [{"function": {"name": "order", "arguments": "{\"dish\":\"tacos\"}"}}],
+                             "function_call": {"name": "order", "arguments": "{\"dish\":\"tacos\"}"}},
+                 "logprobs": {"content": [{"token": "ta"}, {"token": "cos"}]}},
+                {"text": "tacos, as a legacy completion"}
+            ]
+        });
+        let text = extract_completion_text(&completion);
+        assert_eq!(text.matches("tacos").count(), 5, "{text}");
+        let block = GuardrailsPolicy {
+            action: GuardrailsAction::Block,
+            ..policy.clone()
+        };
+        assert!(run_tier1_output_block(&text, &block).is_some());
+        assert!(redact_output_in_place(
+            &mut completion,
+            &policy.output_scanners,
+            &policy.ban_keywords
+        ));
+        let serialized = completion.to_string();
+        assert!(!serialized.contains("tacos"), "{serialized}");
+        assert_eq!(serialized.matches("[REDACTED]").count(), 5, "{serialized}");
+        // The tokens that would spell it out again are gone with it.
+        assert!(completion["choices"][0]["logprobs"].is_null());
+        assert!(completion["choices"][1]["logprobs"].is_null());
+
+        // An answer with nothing to redact keeps its log-probabilities.
+        let mut clean = serde_json::json!({"choices": [{"message": {"content": "salad"},
+            "logprobs": {"content": [{"token": "salad"}]}}]});
+        assert!(!redact_output_in_place(
+            &mut clean,
+            &policy.output_scanners,
+            &policy.ban_keywords
+        ));
+        assert!(clean["choices"][0]["logprobs"].is_object());
     }
 
     /// A single-token completion whose first-token distribution is `entries`.

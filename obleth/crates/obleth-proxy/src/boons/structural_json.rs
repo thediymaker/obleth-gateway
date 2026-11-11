@@ -61,6 +61,8 @@ fn encode_table_body(arr: &[Value]) -> Option<(usize, String)> {
         return None;
     }
     let mut col_set: BTreeSet<&str> = BTreeSet::new();
+    // What the objects spend on naming their keys, which is all a table saves.
+    let (mut pairs, mut key_bytes) = (0usize, 0usize);
     for item in arr {
         let obj = item.as_object()?;
         if obj.is_empty() {
@@ -71,9 +73,20 @@ fn encode_table_body(arr: &[Value]) -> Option<(usize, String)> {
                 return None; // column names can't contain newlines
             }
             col_set.insert(k.as_str());
+            pairs += 1;
+            key_bytes = key_bytes.saturating_add(k.len());
         }
     }
     let cols: Vec<&str> = col_set.into_iter().collect();
+    // A table has a cell, and so a comma, for every row under every column. When
+    // the objects share few keys that is rows × columns of nothing: thousands of
+    // objects with a key each would be written as gigabytes before being found
+    // longer than the original. Such a table can never be the shorter form (it
+    // saves at most each pair's quoted key, colon and comma), so it is not built.
+    let cells = arr.len().saturating_mul(cols.len());
+    if cells > key_bytes + 4 * pairs + 2 * arr.len() {
+        return None;
+    }
     let mut out = String::new();
     let header: Vec<String> = cols.iter().map(|k| csv_escape(k)).collect();
     out.push_str(&header.join(","));
@@ -396,6 +409,31 @@ mod tests {
         let value = json!([{"a": 1}, {"b": 2}]);
         let table = try_encode_table(&value).expect("now encodes via union keys");
         assert_eq!(reconstruct_table(&table), Some(value));
+    }
+
+    /// Objects that share no keys would make a table of rows × columns empty
+    /// cells: gigabytes from a few hundred kilobytes. It can never be the shorter
+    /// form, so it is not built.
+    #[test]
+    fn a_table_that_cannot_be_shorter_is_not_built() {
+        let sparse: Vec<Value> = (0..50_000)
+            .map(|i| serde_json::json!({ format!("k{i}"): 1 }))
+            .collect();
+        let started = std::time::Instant::now();
+        assert!(encode_table_body(&sparse).is_none());
+        assert!(!is_qualifying_array(&sparse));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        // A few missing cells still leave a table that is worth making.
+        let mostly: Vec<Value> = (0..200)
+            .map(|i| {
+                if i % 10 == 0 {
+                    serde_json::json!({"name": format!("n{i}"), "value": i, "note": "x"})
+                } else {
+                    serde_json::json!({"name": format!("n{i}"), "value": i})
+                }
+            })
+            .collect();
+        assert!(encode_table_body(&mostly).is_some());
     }
 
     #[test]

@@ -77,29 +77,43 @@ pub(crate) fn admission_timeout() -> Duration {
     })
 }
 
-/// The canonical spelling of a POST path, when it differs from the request's.
+/// The canonical spelling of a request path, when it differs from the request's.
 ///
-/// Repeated and trailing slashes are removed, and the bare `/responses`, `/messages`,
-/// `/messages/count_tokens`, and `/verdicts` spellings map to their `/v1` forms. Without this,
-/// `/v1/responses/` or `/responses` skipped the translation shims and was
-/// forwarded to the upstream's own endpoint, so a tenant's guardrails never saw
-/// it, and `/v1/chat/completions/` lost its chat classification (and with it
-/// output guardrails and every chat-only boon).
-fn canonical_post_path(path: &str) -> Option<String> {
-    // Runs of `/` collapse to one, so `//v1/responses` cannot skip the shim
-    // (the upstream URL builder strips leading slashes and would forward it).
+/// Repeated and trailing slashes are removed and a repeated version prefix
+/// (`/v1/v1/…`, what a client sends when its base URL already ends in `/v1`) is
+/// read as one. For POST, the bare `/responses`, `/messages`,
+/// `/messages/count_tokens`, and `/verdicts` spellings map to their `/v1` forms.
+///
+/// Every method is canonicalized, once, before anything looks at the path: the
+/// shims, the job, file and batch routes, the request type, and the upstream
+/// URL all read the same spelling. When only POST was, `GET //v1/videos` or
+/// `/v1/v1/videos/{id}` matched no job route, skipped its ownership check, and
+/// was forwarded to the backend, whose URL builder dropped the extra slash or
+/// prefix; `/v1/responses/` or `/responses` skipped the translation shims, so
+/// a tenant's guardrails never saw it, and `/v1/chat/completions/` lost its
+/// chat classification (and with it output guardrails and every chat-only boon).
+fn canonical_path(method: &Method, path: &str) -> Option<String> {
+    // Runs of `/` collapse to one, so `//v1/responses` cannot skip the shim.
     let mut collapsed = String::with_capacity(path.len());
     for c in path.chars() {
         if !(c == '/' && collapsed.ends_with('/')) {
             collapsed.push(c);
         }
     }
-    let trimmed = collapsed.trim_end_matches('/');
+    let mut trimmed = collapsed.trim_end_matches('/');
+    while let Some(rest) = trimmed.strip_prefix("/v1/v1") {
+        if !(rest.is_empty() || rest.starts_with('/')) {
+            break;
+        }
+        // Drops the first `/v1`; what is left still starts with one.
+        trimmed = &trimmed["/v1".len()..];
+    }
+    let post = method == Method::POST;
     let mapped = match trimmed {
-        "/responses" => crate::responses::RESPONSES_PATH,
-        "/messages" => crate::messages::MESSAGES_PATH,
-        "/messages/count_tokens" => crate::messages::COUNT_TOKENS_PATH,
-        "/verdicts" => crate::verdicts::VERDICTS_PATH,
+        "/responses" if post => crate::responses::RESPONSES_PATH,
+        "/messages" if post => crate::messages::MESSAGES_PATH,
+        "/messages/count_tokens" if post => crate::messages::COUNT_TOKENS_PATH,
+        "/verdicts" if post => crate::verdicts::VERDICTS_PATH,
         other => other,
     };
     (!mapped.is_empty() && mapped != path).then(|| mapped.to_string())
@@ -115,15 +129,13 @@ pub async fn proxy_handler(state: State<AppState>, mut req: Request<Body>) -> Re
     // Likewise the effort the Responses and Messages shims carry over: a
     // caller sets effort in the body, never with the gateway's own header.
     req.headers_mut().remove(crate::reasoning::EFFORT_HEADER);
-    if req.method() == Method::POST {
-        if let Some(canonical) = canonical_post_path(req.uri().path()) {
-            let pq = match req.uri().query() {
-                Some(q) => format!("{canonical}?{q}"),
-                None => canonical,
-            };
-            if let Ok(uri) = pq.parse() {
-                *req.uri_mut() = uri;
-            }
+    if let Some(canonical) = canonical_path(req.method(), req.uri().path()) {
+        let pq = match req.uri().query() {
+            Some(q) => format!("{canonical}?{q}"),
+            None => canonical,
+        };
+        if let Ok(uri) = pq.parse() {
+            *req.uri_mut() = uri;
         }
     }
     // The router serves the exact `/v1/verdicts` path; its other spellings
@@ -1132,6 +1144,20 @@ async fn run_pipeline(
         }
     }
 
+    // ---- only known endpoints go on to an upstream ----
+    // What is left is forwarded to a model's upstream with the operator's key
+    // for it, so it must be a call the gateway knows how to admit, guard, and
+    // meter: an inference endpoint (POST) or model discovery (GET). Any other
+    // method or path used to be forwarded as it came whenever the body named
+    // an allowed model, which reached whatever else that upstream serves
+    // (stored completions, files, fine-tunes, a model server's management
+    // routes). There is no setting that opens other routes: an endpoint worth
+    // serving is added to `REGISTERED_MODEL_PATHS`, where it is admitted and
+    // metered like the rest.
+    if batch.is_none() && !is_forwarded(&method, &path) {
+        return error_json(StatusCode::NOT_FOUND, "unknown endpoint");
+    }
+
     // ---- request flight-recorder tracer ----
     let mut tracer: Option<crate::tracer::SpanRecorder> = if resolved.tracing_enabled {
         tracing::debug!(request_id = %request_id, "tracing enabled — recording spans");
@@ -1166,6 +1192,16 @@ async fn run_pipeline(
     };
     let mut json: serde_json::Value =
         serde_json::from_slice(&body_bytes).unwrap_or(serde_json::Value::Null);
+    // `stream` decides how the answer is read and what it is billed from. A
+    // value that is neither true nor false (`1`, `"true"`) reads as "not a
+    // stream" here while a model server may still stream for it, and that
+    // answer would be billed from the estimate instead of its usage.
+    if json
+        .get("stream")
+        .is_some_and(|v| !v.is_boolean() && !v.is_null())
+    {
+        return error_json(StatusCode::BAD_REQUEST, "stream must be true or false");
+    }
     // File-upload endpoints (audio transcription/translation, image edits and
     // variations) send the model as a `multipart/form-data` field alongside
     // the uploaded file, not as JSON. Parse the fields once so we can resolve
@@ -1704,7 +1740,10 @@ async fn run_pipeline(
     // discovery endpoints are the only model-less passthroughs the gateway
     // serves, so they stay allowed. A request that DID name a registered model on
     // an unusual path (`route` is Some) is still forwarded untouched.
-    if route.is_none() && request_type_for_path(&path) == "other" && !is_models_endpoint(&path) {
+    // The endpoints the gateway knows have answered above when the model is not
+    // registered, so nothing should reach this; it stays as the last line
+    // before a request could go to the default upstream.
+    if route.is_none() && !is_models_endpoint(&path) {
         return error_json(StatusCode::NOT_FOUND, "unknown endpoint");
     }
     // ---- per-tenant model allowlist (Phase 4) ----
@@ -2517,10 +2556,11 @@ async fn run_pipeline(
 
     // From here on every exit settles through `settle_guard`, so the
     // per-minute bucket and any term reservation are reconciled exactly once
-    // on every path — including a client that disconnects before upstream
-    // headers arrive, which settles as nothing generated (zero tokens, 499).
-    // Once an upstream answer starts, `arm_estimate` switches that fallback
-    // to the admission estimate.
+    // on every path — including a client that disconnects before the request
+    // is sent upstream, which settles as nothing run (zero tokens, 499).
+    // `arm_dispatched` switches that fallback to the prompt once the request
+    // goes to a model server, and `arm_estimate` to the admission estimate
+    // once an answer starts.
     let mut accounting = StreamAccounting {
         state: state.clone(),
         request_id,
@@ -2769,6 +2809,7 @@ async fn run_pipeline(
     // Which target answered: a job lives on the backend that accepted it.
     let mut served_target = 0usize;
 
+    accounting.arm_dispatched(&mut settle_guard);
     'targets: for (ti, target) in targets.iter().enumerate() {
         let url = build_upstream_url(&target.base, &path, &query);
         last_url = url.clone();
@@ -3594,6 +3635,33 @@ async fn run_pipeline(
                         content_type_str.clone(),
                     )
                 }
+            }
+            // An answer too large to hold, or not a completion, cannot be given
+            // to the scanners. Under a policy that blocks or redacts it is not
+            // passed on unread; with no such policy it goes through as it came.
+            None if plan.guardrails.is_some() => {
+                drop(permit);
+                let block = crate::boons::guardrails::GuardrailsBlock::unchecked();
+                tracing::warn!(
+                    bytes = buf.len(),
+                    truncated,
+                    "a response under an output content policy could not be read; not passed on"
+                );
+                let tokens = UpstreamUsage::uncached(est.input_tokens, est.estimated_output_tokens);
+                let total_ms = request_start.elapsed().as_millis() as u32;
+                let _ = settle_guard
+                    .complete(accounting.settle(
+                        tokens,
+                        ttft_ms,
+                        total_ms,
+                        block.status.as_u16(),
+                        None,
+                    ))
+                    .await;
+                if let Some(t) = tracer.take() {
+                    t.finish("error");
+                }
+                return error_json(block.status, block.reason);
             }
             None => (
                 Bytes::from(std::mem::take(&mut buf)),
@@ -4629,19 +4697,24 @@ impl StreamAccounting {
     }
 
     /// Cancellation fallback settling as status 499. `tokens` is `None` before
-    /// the upstream has answered (nothing generated, billed nothing) and the
-    /// estimate afterwards. Runtime shutdown remains best-effort, just like
-    /// the asynchronous telemetry sink; a partial answer is never cached.
+    /// the request has gone to a model server (nothing run, billed nothing),
+    /// the prompt alone once it has (the server read it, and with a
+    /// non-streaming request may have written the whole answer before its
+    /// first byte comes back), and the estimate once the answer has started.
+    /// Runtime shutdown remains best-effort, just like the asynchronous
+    /// telemetry sink; a partial answer is never cached.
     fn on_cancel(&self, tokens: Option<UpstreamUsage>) -> impl FnOnce() + Send + 'static {
         let mut accounting = self.clone();
         move || {
             let elapsed = accounting.request_start.elapsed().as_millis() as u32;
             accounting.fail(
                 obleth_config::ErrorClass::ClientCancel,
-                if tokens.is_none() {
-                    "client disconnected before the model answered"
-                } else {
-                    "client disconnected while the answer was being sent"
+                match &tokens {
+                    None => "client disconnected before the request reached the model",
+                    Some(tokens) if tokens.output == 0 => {
+                        "client disconnected before the model answered"
+                    }
+                    Some(_) => "client disconnected while the answer was being sent",
                 },
             );
             let (tokens, billed) = match tokens {
@@ -4654,6 +4727,14 @@ impl StreamAccounting {
 
     pub(crate) fn unbilled_guard(&self) -> crate::completion::CompletionGuard {
         crate::completion::CompletionGuard::new(self.on_cancel(None))
+    }
+
+    /// From the moment a request goes to a model server, a client that
+    /// disconnects is billed its prompt: the server has read it, and closing
+    /// the connection just before the answer would otherwise make the work
+    /// free. A request the gateway itself fails or times out is still unbilled.
+    pub(crate) fn arm_dispatched(&self, guard: &mut crate::completion::CompletionGuard) {
+        guard.rearm(self.on_cancel(Some(UpstreamUsage::uncached(self.est.input_tokens, 0))));
     }
 
     fn arm_estimate(&self, guard: &mut crate::completion::CompletionGuard) {
@@ -6244,7 +6325,11 @@ fn is_model_info_endpoint(path: &str) -> bool {
     path == "/model/info" || path == "/v1/model/info"
 }
 
-/// OpenAI endpoints that must name a registered model.
+/// The inference endpoints the gateway forwards to a model's upstream, in their
+/// canonical spelling. Each is a POST that must name a registered model. The
+/// request type, and so the guardrails and metering a call gets, is read from
+/// the path's ending (`request_type_for_path`), which is safe only because no
+/// other path with that ending is forwarded.
 const REGISTERED_MODEL_PATHS: &[&str] = &[
     "/v1/chat/completions",
     "/v1/completions",
@@ -6258,10 +6343,32 @@ const REGISTERED_MODEL_PATHS: &[&str] = &[
     "/v1/images/variations",
     crate::jobs::VIDEOS_PATH,
     crate::jobs::MESHES_PATH,
+    "/v1/rerank",
+    "/v1/reranking",
+    "/rerank",
+    "/reranking",
+    "/v1/moderations",
+    "/v1/score",
+    "/score",
+    "/v1/tokenize",
+    "/v1/detokenize",
+    "/tokenize",
+    "/detokenize",
+    "/v1/pooling",
+    "/pooling",
+    "/v1/classify",
+    "/classify",
 ];
 
 fn requires_registered_model(path: &str) -> bool {
     REGISTERED_MODEL_PATHS.contains(&path)
+}
+
+/// Whether the pipeline may send this request on to an upstream: an inference
+/// endpoint or model discovery, and nothing else.
+fn is_forwarded(method: &Method, path: &str) -> bool {
+    (method == Method::POST && requires_registered_model(path))
+        || (method == Method::GET && is_models_endpoint(path))
 }
 
 /// True when the endpoint takes a file upload, so the OpenAI spec sends it as
@@ -6711,13 +6818,28 @@ fn backoff_for(base: Duration, attempt: u32) -> Duration {
 /// outright. Legitimate OpenAI-compatible paths never contain `..`, encoded
 /// dots, or encoded separators.
 pub(crate) fn has_path_traversal(path: &str) -> bool {
-    let lowered = path.to_ascii_lowercase();
-    // Encoded dot (`%2e`) or separators (`%2f` `/`, `%5c` `\`) can reconstruct a
-    // traversal after the upstream decodes them; none are valid here.
-    if lowered.contains("%2e") || lowered.contains("%2f") || lowered.contains("%5c") {
-        return true;
+    // A percent-escape of a letter, digit, `-._~`, or a separator spells a
+    // path the routes here would not recognize but an upstream that decodes
+    // before routing would (`/v1/%76ideos/{id}` is its `/v1/videos/{id}`), and
+    // `%2e`, `%2f`, `%5c` can rebuild a traversal. No client needs to escape
+    // those, so any such escape, and a `%` that starts none, is refused.
+    let bytes = path.as_bytes();
+    let mut i = 0;
+    while let Some(at) = bytes[i..].iter().position(|b| *b == b'%') {
+        let at = i + at;
+        let hex = |b: Option<&u8>| b.and_then(|b| (*b as char).to_digit(16));
+        let (Some(hi), Some(lo)) = (hex(bytes.get(at + 1)), hex(bytes.get(at + 2))) else {
+            return true;
+        };
+        let decoded = (hi * 16 + lo) as u8;
+        if decoded.is_ascii_alphanumeric() || b"-._~/\\".contains(&decoded) {
+            return true;
+        }
+        i = at + 3;
     }
-    path.split(['/', '\\']).any(|seg| seg == "..")
+    // `.` is refused with `..`: the upstream's URL parser drops it, so
+    // `/v1/./videos` would be forwarded as `/v1/videos` without matching it here.
+    path.split(['/', '\\']).any(|seg| seg == ".." || seg == ".")
 }
 
 pub(crate) fn build_upstream_url(base: &str, path: &str, query: &str) -> String {
@@ -7473,21 +7595,21 @@ mod tests {
     use super::{
         admit_request_for, anthropic_error, apply_multipart_text_view,
         backfill_max_tokens_for_count_tokens, backoff_for, build_targets, build_upstream_url,
-        canonical_post_path, clamp_max_tokens, compute_modality_cost, context_overflow_response,
+        canonical_path, clamp_max_tokens, compute_modality_cost, context_overflow_response,
         conversation_seed, effective_request_type, end_user_for, forward_headers,
         has_input_guardrails, has_path_traversal, input_guardrails_unscannable, is_chat_path,
-        is_models_collection, is_models_endpoint, is_multipart_endpoint, is_retryable_status,
-        looks_like_context_length_error, messages_input_estimate, multipart_text_view,
-        output_guardrails_unenforceable, parse_multipart, prepare_upstream_body, redress_error,
-        request_type_for_path, requires_registered_model, resolve_conversation,
-        response_cache_name, route_keeps_sessions, session_hash_order, should_translate_as_stream,
-        strip_beta_query, strip_tool_strict, sure_overflow, surface, tenant_active_now,
-        weighted_order, MultipartField, RequestMeta, TooLong, END_USER_HEADER,
+        is_forwarded, is_models_collection, is_models_endpoint, is_multipart_endpoint,
+        is_retryable_status, looks_like_context_length_error, messages_input_estimate,
+        multipart_text_view, output_guardrails_unenforceable, parse_multipart,
+        prepare_upstream_body, redress_error, request_type_for_path, requires_registered_model,
+        resolve_conversation, response_cache_name, route_keeps_sessions, session_hash_order,
+        should_translate_as_stream, strip_beta_query, strip_tool_strict, sure_overflow, surface,
+        tenant_active_now, weighted_order, MultipartField, RequestMeta, TooLong, END_USER_HEADER,
         REGISTERED_MODEL_PATHS, SEED_CAP,
     };
     use crate::router::{BoonGrants, Candidate, Intent, RequestFeatures, RouterWeights};
     use axum::body::{Body, Bytes};
-    use axum::http::{header, HeaderMap, Response, StatusCode};
+    use axum::http::{header, HeaderMap, Method, Response, StatusCode};
     use chrono::{DateTime, TimeZone, Utc};
     use obleth_config::{ResolvedEndpoint, ResolvedKey, ResolvedModel, WeeklyWindow};
     use std::collections::HashMap;
@@ -7623,43 +7745,133 @@ mod tests {
     }
 
     #[test]
+    fn every_method_reads_one_spelling_of_a_path() {
+        for method in [Method::GET, Method::DELETE, Method::POST] {
+            for (sent, read) in [
+                ("//v1/videos", "/v1/videos"),
+                ("/v1//videos/vid_1/content", "/v1/videos/vid_1/content"),
+                ("/v1/videos/", "/v1/videos"),
+                ("/v1/v1/videos/vid_1", "/v1/videos/vid_1"),
+                ("/v1/v1/v1/responses", "/v1/responses"),
+                ("//v1//v1/batches/b_1", "/v1/batches/b_1"),
+                ("/v1/v1", "/v1"),
+            ] {
+                assert_eq!(
+                    canonical_path(&method, sent).as_deref(),
+                    Some(read),
+                    "{method} {sent}"
+                );
+            }
+            assert_eq!(canonical_path(&method, "/v1/videos"), None);
+            assert_eq!(canonical_path(&method, "/v1/v1beta/x"), None);
+        }
+        // The bare spellings are POST endpoints.
+        assert_eq!(canonical_path(&Method::GET, "/responses"), None);
+        // What skipped the job routes now reaches them.
+        for sent in ["//v1/videos", "/v1/v1/videos"] {
+            let read = canonical_path(&Method::GET, sent).unwrap();
+            assert!(
+                crate::jobs::follow_up(&Method::GET, &read).is_some(),
+                "{sent}"
+            );
+        }
+        let read = canonical_path(&Method::DELETE, "/v1/v1/videos/vid_1").unwrap();
+        assert!(crate::jobs::follow_up(&Method::DELETE, &read).is_some());
+    }
+
+    #[test]
+    fn odd_spellings_of_a_path_are_refused() {
+        for path in [
+            "/v1/./videos",
+            "/./v1/responses",
+            "/v1/videos/.",
+            "/v1/%76ideos/vid_1",
+            "/v1/%56IDEOS",
+            "/v1/chat%2Dcompletions",
+            "/v1/x%7e",
+            "/v1/x%",
+            "/v1/x%2",
+            "/v1/x%zz",
+        ] {
+            assert!(has_path_traversal(path), "{path}");
+        }
+        for path in [
+            "/v1/models/my%20model",
+            "/v1/models/org%3Amodel",
+            "/v1/models/gpt.4",
+            "/v1/files/file-abc.jsonl",
+        ] {
+            assert!(!has_path_traversal(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn only_known_endpoints_are_forwarded() {
+        for path in REGISTERED_MODEL_PATHS {
+            assert!(is_forwarded(&Method::POST, path), "{path}");
+            for method in [Method::GET, Method::DELETE, Method::PUT, Method::PATCH] {
+                assert!(!is_forwarded(&method, path), "{method} {path}");
+            }
+        }
+        for path in ["/v1/models", "/v1/models/gpt-4o", "/model/info"] {
+            assert!(is_forwarded(&Method::GET, path), "{path}");
+            assert!(!is_forwarded(&Method::POST, path), "{path}");
+            assert!(!is_forwarded(&Method::DELETE, path), "{path}");
+        }
+        // Whatever else an upstream serves, and endpoints under another prefix.
+        for (method, path) in [
+            (Method::GET, "/stats"),
+            (Method::GET, "/v1/files"),
+            (Method::GET, "/v1/chat/completions"),
+            (Method::POST, "/v1/fine_tuning/jobs"),
+            (Method::POST, "/v1/files"),
+            (Method::POST, "/internal/chat/completions"),
+            (Method::POST, "/v1/audio/anything"),
+            (Method::POST, "/v1/videos/vid_1/remix"),
+            (Method::POST, "/"),
+        ] {
+            assert!(!is_forwarded(&method, path), "{method} {path}");
+        }
+    }
+
+    #[test]
     fn post_paths_are_canonicalized_before_surface_dispatch() {
         assert_eq!(
-            canonical_post_path("/responses").as_deref(),
+            canonical_path(&Method::POST, "/responses").as_deref(),
             Some("/v1/responses")
         );
         assert_eq!(
-            canonical_post_path("/v1/responses/").as_deref(),
+            canonical_path(&Method::POST, "/v1/responses/").as_deref(),
             Some("/v1/responses")
         );
         assert_eq!(
-            canonical_post_path("/messages").as_deref(),
+            canonical_path(&Method::POST, "/messages").as_deref(),
             Some("/v1/messages")
         );
         assert_eq!(
-            canonical_post_path("/messages/count_tokens/").as_deref(),
+            canonical_path(&Method::POST, "/messages/count_tokens/").as_deref(),
             Some("/v1/messages/count_tokens")
         );
         assert_eq!(
-            canonical_post_path("/verdicts").as_deref(),
+            canonical_path(&Method::POST, "/verdicts").as_deref(),
             Some("/v1/verdicts")
         );
         assert_eq!(
-            canonical_post_path("/v1/chat/completions//").as_deref(),
+            canonical_path(&Method::POST, "/v1/chat/completions//").as_deref(),
             Some("/v1/chat/completions")
         );
         // Repeated slashes collapse, so a doubled prefix cannot skip a shim.
         assert_eq!(
-            canonical_post_path("//v1/responses").as_deref(),
+            canonical_path(&Method::POST, "//v1/responses").as_deref(),
             Some("/v1/responses")
         );
         assert_eq!(
-            canonical_post_path("/v1//messages").as_deref(),
+            canonical_path(&Method::POST, "/v1//messages").as_deref(),
             Some("/v1/messages")
         );
         // Already canonical, or nothing to trim: untouched.
-        assert_eq!(canonical_post_path("/v1/chat/completions"), None);
-        assert_eq!(canonical_post_path("/"), None);
+        assert_eq!(canonical_path(&Method::POST, "/v1/chat/completions"), None);
+        assert_eq!(canonical_path(&Method::POST, "/"), None);
         // Normalization runs before the shim dispatch in `proxy_handler`.
         let src = include_str!("proxy.rs");
         let handler = src
@@ -7667,7 +7879,7 @@ mod tests {
             .expect("proxy_handler");
         let canon = handler
             + src[handler..]
-                .find("canonical_post_path(req.uri().path())")
+                .find("canonical_path(req.method(), req.uri().path())")
                 .expect("normalization");
         let shim = handler
             + src[handler..]

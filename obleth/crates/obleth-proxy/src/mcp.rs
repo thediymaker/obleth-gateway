@@ -24,6 +24,36 @@ use crate::state::AppState;
 
 const MCP_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
+/// Calls one key may make to one MCP server in a minute. An MCP call carries no
+/// tokens, so the budgets that meter model traffic do not see it; this keeps a
+/// key from flooding a server, or spending the operator's allowance with the
+/// service behind it. Ten a second sustained is far above what an agent's tool
+/// use needs.
+const CALLS_PER_MINUTE: u32 = 600;
+
+/// Request headers that stay at the gateway.
+const CLIENT_ONLY_HEADERS: &[&str] = &[
+    "cookie",
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-forwarded-port",
+    "x-real-ip",
+];
+
+/// Response headers an MCP server's answer keeps on its way to the caller.
+const RESPONSE_HEADERS: &[&str] = &[
+    "content-type",
+    "cache-control",
+    "mcp-session-id",
+    "mcp-protocol-version",
+    "www-authenticate",
+    "retry-after",
+    "allow",
+    "x-accel-buffering",
+];
+
 /// Count one call to an MCP server in its daily stats: `tool` for a model's
 /// tool call in the gateway's tool loop, otherwise a client's direct request
 /// through `/mcp/<name>`. Fire and forget: stats never slow or fail a request.
@@ -209,6 +239,48 @@ async fn handle(
             true,
         );
     }
+    // The server is reached with the operator's credential for it, so a key
+    // reaches it only when the operator opened it to the key's tenant. A server
+    // opened to no one serves only the models granted its tools. The dashboard's
+    // own key is the operator's: it checks every server it lists.
+    let operator = resolved.tenant_id == obleth_store::Store::CONTROL_PLANE_TENANT_ID;
+    if !operator && !server.allowed_tenants.contains(&resolved.tenant_id) {
+        ledger(&server.name, StatusCode::FORBIDDEN);
+        return (
+            error_json(
+                StatusCode::FORBIDDEN,
+                "this key's tenant may not use this mcp server",
+            ),
+            true,
+        );
+    }
+
+    // ---- rate limit: per key and server, before the body is read ----
+    match state
+        .redis
+        .count_call(
+            &format!("mcp:{}", server.name),
+            &resolved.key_id,
+            CALLS_PER_MINUTE,
+        )
+        .await
+    {
+        Ok((true, _)) => {}
+        Ok((false, wait)) => {
+            ledger(&server.name, StatusCode::TOO_MANY_REQUESTS);
+            let mut resp = error_json(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many calls to this mcp server; try again shortly",
+            );
+            if let Ok(value) = header::HeaderValue::from_str(&wait.to_string()) {
+                resp.headers_mut().insert(header::RETRY_AFTER, value);
+            }
+            return (resp, true);
+        }
+        // The count is a safeguard, not a gate on identity: when it cannot be
+        // kept, the call goes through and the failure is logged.
+        Err(e) => tracing::warn!(error = %e, "mcp call count not recorded"),
+    }
 
     // ---- forward upstream ----
     let body_bytes = match axum::body::to_bytes(body, MCP_BODY_LIMIT).await {
@@ -225,6 +297,12 @@ async fn handle(
         parts.uri.query(),
     );
     let mut fwd_headers = forward_headers(&headers);
+    // The server is the operator's, reached with the operator's credential. A
+    // caller's cookies and the addresses a proxy recorded for them are no part
+    // of an MCP call.
+    for name in CLIENT_ONLY_HEADERS {
+        fwd_headers.remove(*name);
+    }
     if let Some(auth) = &server.auth_header {
         if let Ok(v) = header::HeaderValue::from_str(auth) {
             fwd_headers.insert(header::AUTHORIZATION, v);
@@ -285,20 +363,14 @@ async fn handle(
     );
     ledger(&server.name, status);
 
-    // Forward the upstream response headers, dropping only what the re-stream
-    // invalidates. MCP streamable-HTTP servers carry protocol state in
-    // headers — notably `mcp-session-id` on the initialize response — so
-    // stripping them breaks every follow-up request in the session.
+    // Pass on the response headers MCP uses and no others. Streamable-HTTP
+    // servers carry protocol state in headers, notably `mcp-session-id` on the
+    // initialize response, so those must survive. Anything else an upstream
+    // sends (cookies, CORS grants, redirects) would be said by the gateway's
+    // own origin to every caller, so it stops here.
     let mut builder = Response::builder().status(status);
     if let Some(headers_out) = builder.headers_mut() {
-        for (name, value) in upstream.headers() {
-            match name.as_str() {
-                "transfer-encoding" | "content-length" | "connection" => continue,
-                _ => {
-                    headers_out.insert(name.clone(), value.clone());
-                }
-            }
-        }
+        *headers_out = passed_on(upstream.headers());
         if !headers_out.contains_key(header::CONTENT_TYPE) {
             headers_out.insert(
                 header::CONTENT_TYPE,
@@ -316,6 +388,17 @@ async fn handle(
         .body(Body::from_stream(stream))
         .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"));
     (resp, true)
+}
+
+/// The headers of an MCP server's answer that go on to the caller.
+fn passed_on(upstream: &header::HeaderMap) -> header::HeaderMap {
+    let mut out = header::HeaderMap::new();
+    for (name, value) in upstream {
+        if RESPONSE_HEADERS.contains(&name.as_str()) {
+            out.append(name.clone(), value.clone());
+        }
+    }
+    out
 }
 
 #[derive(serde::Deserialize)]
@@ -372,6 +455,80 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
+    fn an_mcp_answer_keeps_only_the_headers_mcp_uses() {
+        use axum::http::header::{HeaderMap, HeaderValue};
+        let mut upstream = HeaderMap::new();
+        for (name, value) in [
+            ("content-type", "text/event-stream"),
+            ("mcp-session-id", "s-1"),
+            ("mcp-protocol-version", "2025-06-18"),
+            ("www-authenticate", "Bearer"),
+            ("set-cookie", "sid=1; Domain=gateway.example"),
+            ("access-control-allow-origin", "*"),
+            ("access-control-allow-credentials", "true"),
+            ("location", "https://elsewhere.example/"),
+            ("content-length", "12"),
+            ("transfer-encoding", "chunked"),
+            ("x-powered-by", "something"),
+        ] {
+            upstream.insert(name, HeaderValue::from_static(value));
+        }
+        let mut kept: Vec<&str> = super::passed_on(&upstream)
+            .keys()
+            .map(|name| name.as_str())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|name| match name {
+                "content-type" => "content-type",
+                "mcp-session-id" => "mcp-session-id",
+                "mcp-protocol-version" => "mcp-protocol-version",
+                "www-authenticate" => "www-authenticate",
+                _ => "unexpected",
+            })
+            .collect();
+        kept.sort_unstable();
+        assert_eq!(
+            kept,
+            [
+                "content-type",
+                "mcp-protocol-version",
+                "mcp-session-id",
+                "www-authenticate"
+            ]
+        );
+        // A caller's cookies and recorded addresses stay at the gateway.
+        let src = include_str!("mcp.rs");
+        let handler = &src[..src.find("\nmod tests {").expect("the test module")];
+        assert!(handler.contains("for name in CLIENT_ONLY_HEADERS"));
+        assert!(super::CLIENT_ONLY_HEADERS.contains(&"cookie"));
+    }
+
+    /// A key reaches a server only when the operator opened it to the key's
+    /// tenant, and the check comes before anything is sent upstream.
+    #[test]
+    fn a_server_is_reached_only_by_the_tenants_it_is_opened_to() {
+        let src = include_str!("mcp.rs");
+        let handler = &src[..src.find("\nmod tests {").expect("the test module")];
+        let gate = handler
+            .find("!operator && !server.allowed_tenants.contains(&resolved.tenant_id)")
+            .expect("the tenant gate");
+        let send = handler
+            .find("// ---- forward upstream ----")
+            .expect("the forward");
+        assert!(gate < send);
+        // A key's calls to a server are counted, after the gate and before the
+        // body is read or anything is sent.
+        let count = handler.find(".count_call(").expect("the call count");
+        assert!(gate < count && count < send);
+        // An entry cached before the list existed admits no one.
+        let old: obleth_config::ResolvedMcpServer = serde_json::from_str(
+            r#"{"name":"files","upstream_url":"http://mcp.invalid/mcp","auth_header":null,"enabled":true}"#,
+        )
+        .unwrap();
+        assert!(old.allowed_tenants.is_empty());
+    }
+
+    #[test]
     fn an_mcp_call_is_a_request_log_row() {
         let mut key = crate::boons::test_support::test_key();
         key.key_name = "jlee379-cli".into();
@@ -416,8 +573,8 @@ mod tests {
         let logged = &handler[handler
             .find("From here every answer is a row in the ledger")
             .expect("the marker")..];
-        assert_eq!(logged.matches("return (").count(), 4);
-        assert_eq!(logged.matches("ledger(&").count(), 5);
+        assert_eq!(logged.matches("return (").count(), 6);
+        assert_eq!(logged.matches("ledger(&").count(), 7);
         assert!(!logged.contains(", false)"));
     }
 

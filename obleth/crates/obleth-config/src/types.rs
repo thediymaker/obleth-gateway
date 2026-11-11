@@ -1095,6 +1095,10 @@ pub struct McpServer {
     /// Stored encrypted-at-rest in production.
     pub auth_header: Option<String>,
     pub enabled: bool,
+    /// The tenants whose keys may call the server through `/mcp/{name}`. Empty
+    /// means none: a server is closed to direct calls until tenants are named.
+    #[serde(default)]
+    pub allowed_tenants: Vec<Uuid>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -1106,6 +1110,10 @@ pub struct ResolvedMcpServer {
     pub upstream_url: String,
     pub auth_header: Option<String>,
     pub enabled: bool,
+    /// See [`McpServer::allowed_tenants`]. An entry cached before the field
+    /// existed reads as empty, so it admits no one until it is published again.
+    #[serde(default)]
+    pub allowed_tenants: Vec<Uuid>,
 }
 
 /// A response stored in the exact-match cache. Bodies are UTF-8 (JSON or SSE
@@ -3864,6 +3872,9 @@ pub struct McpServerBackup {
     pub upstream_url: String,
     pub auth_header: Option<String>,
     pub enabled: bool,
+    /// Absent in a backup made before the field existed: restored as no tenants.
+    #[serde(default)]
+    pub allowed_tenants: Vec<Uuid>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 

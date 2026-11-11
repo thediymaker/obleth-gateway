@@ -539,17 +539,45 @@ fn message_text(content: Option<&serde_json::Value>) -> String {
 /// keep inline are removed, whitespace is collapsed, and only the first
 /// [`FINGERPRINT_MAX_BYTES`] count.
 fn normalize(text: &str) -> String {
-    let mut text = text.to_string();
+    let mut text = std::borrow::Cow::Borrowed(text);
     for (open, close) in [("<think>", "</think>"), ("<details", "</details>")] {
-        while let Some(start) = text.find(open) {
-            match text[start..].find(close) {
-                Some(len) => text.replace_range(start..start + len + close.len(), " "),
-                None => text.truncate(start),
-            }
+        if text.contains(open) {
+            text = std::borrow::Cow::Owned(without_blocks(&text, open, close));
         }
     }
-    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Only the head counts, so only the head is collapsed: the text is a
+    // client's, and can be as long as a request may be.
+    let mut collapsed = String::new();
+    for word in text.split_whitespace() {
+        if !collapsed.is_empty() {
+            collapsed.push(' ');
+        }
+        collapsed.push_str(word);
+        if collapsed.len() >= FINGERPRINT_MAX_BYTES {
+            break;
+        }
+    }
     super::head_bytes(&collapsed, FINGERPRINT_MAX_BYTES).to_string()
+}
+
+/// `text` with each `open … close` block replaced by a space, and everything
+/// from an unclosed `open` on dropped. One pass: the time follows the text's
+/// length however many blocks it holds.
+fn without_blocks(text: &str, open: &str, close: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(open) {
+        out.push_str(&rest[..start]);
+        match rest[start..].find(close) {
+            Some(len) => {
+                out.push(' ');
+                rest = &rest[start + len + close.len()..];
+            }
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -559,6 +587,23 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The text is a client's and can be megabytes of blocks: reading it takes
+    /// time that follows its length, and only its head is kept.
+    #[test]
+    fn normalizing_takes_time_that_follows_the_text() {
+        assert_eq!(
+            normalize("a <think>plan</think>  b\n<details open>x</details>c <think>cut off"),
+            "a b c"
+        );
+        let started = std::time::Instant::now();
+        let blocks = "<think></think>".repeat(400_000);
+        assert_eq!(normalize(&format!("{blocks}tail")), "tail");
+        let words = "w ".repeat(4_000_000);
+        assert_eq!(normalize(&words).len(), FINGERPRINT_MAX_BYTES);
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    }
+
     use crate::routing::IntentSource;
     use serde_json::json;
 

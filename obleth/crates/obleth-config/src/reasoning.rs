@@ -371,8 +371,12 @@ pub fn messages_effort(body: &Value) -> Result<Option<ReasoningLevel>, String> {
 fn parse_raw(raw: Option<&Value>) -> Result<Option<ReasoningLevel>, String> {
     match raw {
         None | Some(Value::Null) => Ok(None),
-        Some(Value::String(s)) => ReasoningLevel::parse(s).map(Some).ok_or_else(|| s.clone()),
-        Some(other) => Err(other.to_string()),
+        // What was asked for goes into the request log as written, so only its
+        // head is kept: the value is a client's and can be megabytes.
+        Some(Value::String(s)) => ReasoningLevel::parse(s)
+            .map(Some)
+            .ok_or_else(|| s.chars().take(64).collect()),
+        Some(other) => Err(other.to_string().chars().take(64).collect()),
     }
 }
 

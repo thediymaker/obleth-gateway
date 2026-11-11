@@ -174,7 +174,20 @@ async fn post_slack(
     title: &str,
     detail: &str,
 ) -> Result<(), String> {
-    let text = format!("*obleth alert*: {title}\n*Issue*: `{key}`\n{detail}");
+    // Titles and details quote what callers sent (a model name, a path). Slack
+    // reads `<…>` as a link or a mention such as `<!channel>`, so its three
+    // control characters are escaped the way its API asks.
+    let plain = |text: &str| {
+        text.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
+    let text = format!(
+        "*obleth alert*: {}\n*Issue*: `{}`\n{}",
+        plain(title),
+        plain(key),
+        plain(detail)
+    );
     let response = http
         .post(webhook_url)
         .json(&serde_json::json!({ "text": text }))

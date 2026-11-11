@@ -11,7 +11,7 @@
 
 Point your clients at obleth and register your models. The gateway adds identity, weighted fairshare admission, automatic model selection, health verification, and cost, energy, and chargeback accounting on top of any OpenAI-compatible backend — vLLM, SGLang, llama.cpp, OpenAI, Together, or your own servers. On HPC clusters it launches models as Slurm jobs and keeps them running; on Kubernetes it sizes each model's pool from the replicas that are actually ready. Clients keep their existing OpenAI or Anthropic SDKs; only the base URL changes.
 
-**One endpoint for every kind of model.** Chat and completions, the Responses API, embeddings, rerank, moderation, speech, transcription and translation, image generation, edits and variations, video jobs (the OpenAI Videos API), the Anthropic Messages API (so Claude Code works against your own models), MCP servers at `/mcp/<name>`, and typed decisions at `/v1/verdicts`. Every surface runs the same admission, budgets, guardrails, and accounting.
+**One endpoint for every kind of model.** Chat and completions, the Responses API, embeddings, rerank, moderation, speech, transcription and translation, image generation, edits and variations, video jobs (the OpenAI Videos API), the Anthropic Messages API (so Claude Code works against your own models), MCP servers at `/mcp/<name>` (each open to the tenants you name for it), and typed decisions at `/v1/verdicts`. Every model surface runs the same admission, budgets, guardrails, and accounting; MCP calls are authenticated, gated per tenant and logged, and are not metered against token budgets.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset=".github/assets/architecture-dark.svg">

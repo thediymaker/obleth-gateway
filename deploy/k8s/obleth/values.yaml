@@ -92,11 +92,15 @@ obleth:
   # redis://:<password>@<release>-redis:6379), and OBLETH_CLICKHOUSE_PASSWORD
   # (clickhouse.enabled). See examples/values-production.yaml.
   existingSecret: ""
+  # Strict SSRF mode (OBLETH_BLOCK_PRIVATE_NETWORKS=1): admin-registered
+  # upstream URLs may not point at private, loopback or carrier-grade NAT
+  # addresses, except the ranges in allowedPrivateCidrs. Off by default so
+  # in-cluster api_base values work.
+  blockPrivateNetworks: false
   # SSRF allowlist for admin-registered upstream URLs (comma-separated CIDRs).
   # Default SSRF policy permits private/LAN targets (RFC1918, loopback, etc.) so
   # in-cluster api_base values work without this field. Only required when
-  # OBLETH_BLOCK_PRIVATE_NETWORKS=1 (strict mode) — then list trusted ranges,
-  # e.g. "10.0.0.0/8".
+  # blockPrivateNetworks is true — then list trusted ranges, e.g. "10.0.0.0/8".
   allowedPrivateCidrs: ""
   upstreamBaseUrl: ""   # empty -> defaults to the in-chart benchmark fixture backend
   # OTLP/HTTP trace export endpoint (e.g. http://my-collector:4318). Empty disables.

@@ -63,6 +63,13 @@ function userRow(store: Store, id: string): Row | undefined {
   return store.user.find((u) => u.id === id);
 }
 
+describe("sign-in through an identity provider", () => {
+  it("never joins an existing account by email address", () => {
+    const auth = mod.createAuth(memoryAdapter(emptyStore()), "x".repeat(32));
+    expect(auth.options.account?.accountLinking?.enabled).toBe(false);
+  });
+});
+
 describe("built-in admin endpoints respect the admin-removal guard", { timeout: 30_000 }, () => {
   it("refuses set-role, ban, remove, and update-user against the caller", async () => {
     const { store, auth, self, headers } = await twoAdmins();

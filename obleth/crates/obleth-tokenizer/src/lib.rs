@@ -101,10 +101,12 @@ fn count_content<T: Tokenizer + ?Sized>(tk: &T, content: &Value) -> u32 {
 }
 
 fn estimate_output_tokens(body: &Value, input_tokens: u32) -> u32 {
-    if let Some(max) = body
-        .get("max_tokens")
-        .or_else(|| body.get("max_completion_tokens"))
-        .and_then(Value::as_u64)
+    // A request may carry both names for the cap. Which one a model server
+    // honours is its own choice, so the reservation covers the larger.
+    if let Some(max) = ["max_tokens", "max_completion_tokens"]
+        .iter()
+        .filter_map(|name| body.get(*name).and_then(Value::as_u64))
+        .max()
     {
         // Clamp in u64 first: casting a value above u32::MAX truncates it
         // (u32::MAX + 1 would become a zero-token reservation).
@@ -130,6 +132,18 @@ mod tests {
         assert!(est.input_tokens > 0);
         // no max_tokens -> default ceiling
         assert_eq!(est.estimated_output_tokens, DEFAULT_OUTPUT_CEILING);
+    }
+
+    /// A request can name its cap twice; the server chooses which it honours,
+    /// so the estimate covers the larger.
+    #[test]
+    fn the_larger_of_two_caps_is_estimated() {
+        let body = json!({"prompt": "abc", "max_tokens": 1, "max_completion_tokens": 4000});
+        assert_eq!(estimate_output_tokens(&body, 1), 4000);
+        let body = json!({"prompt": "abc", "max_tokens": 64, "max_completion_tokens": 8});
+        assert_eq!(estimate_output_tokens(&body, 1), 64);
+        let body = json!({"prompt": "abc", "max_completion_tokens": 12});
+        assert_eq!(estimate_output_tokens(&body, 1), 12);
     }
 
     #[test]
