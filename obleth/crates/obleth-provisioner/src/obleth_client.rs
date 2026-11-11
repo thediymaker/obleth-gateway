@@ -1,8 +1,29 @@
 use crate::config::ProvisionerConfig;
 use crate::domain::ReplicaView;
 use async_trait::async_trait;
-use obleth_config::{ManagedModelSpec, SlurmSettings};
+use obleth_config::{ManagedBackoff, ManagedModelSpec, SlurmSettings};
+use std::collections::HashMap;
 use uuid::Uuid;
+
+/// Provisioner-reported details of a replica (`PATCH /replicas/{id}`).
+/// `None` leaves a field as it is; an empty `state_detail` or `log_path`
+/// clears it.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct ReplicaDetails {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_ends_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replace_requested: Option<bool>,
+}
 
 #[async_trait]
 pub trait OblethClient: Send + Sync {
@@ -55,6 +76,39 @@ pub trait OblethClient: Send + Sync {
     /// Record (or clear with `None`) the provisioner's last submit error for a
     /// model, so the dashboard can show it.
     async fn set_provision_error(&self, model_id: Uuid, error: Option<&str>) -> anyhow::Result<()>;
+    /// Every model's name by id, in one read.
+    async fn model_names(&self) -> anyhow::Result<HashMap<Uuid, String>> {
+        Ok(HashMap::new())
+    }
+    /// Record a new replica and where its job's output goes.
+    async fn create_replica_with_log(
+        &self,
+        model_id: Uuid,
+        slurm_job_id: &str,
+        port_base: i64,
+        _log_path: Option<&str>,
+    ) -> anyhow::Result<Uuid> {
+        self.create_replica(model_id, slurm_job_id, port_base).await
+    }
+    /// Update a replica's Slurm times, plain-sentence detail, log path, port
+    /// or replacement flag.
+    #[allow(dead_code)]
+    async fn patch_replica_details(
+        &self,
+        _replica_id: Uuid,
+        _details: &ReplicaDetails,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    /// Record a managed model's failure count and pause (backoff) state.
+    #[allow(dead_code)]
+    async fn set_managed_backoff(
+        &self,
+        _model_id: Uuid,
+        _backoff: &ManagedBackoff,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// Map a JSON array of replica rows (`ModelReplica`) into `ReplicaView`s. Rows
@@ -135,6 +189,9 @@ pub struct TickReport {
     pub status: &'static str,
     /// Idle reason or error text; empty for `ok`.
     pub detail: String,
+    /// Things an operator should know even when the tick worked, as plain
+    /// sentences ("2 cancels failed: ...", "The Slurm token expires in 2 days.").
+    pub warnings: Vec<String>,
 }
 
 impl TickReport {
@@ -142,20 +199,46 @@ impl TickReport {
         Self {
             status: "ok",
             detail: String::new(),
+            warnings: Vec::new(),
         }
     }
     pub fn idle(reason: &str) -> Self {
         Self {
             status: "idle",
             detail: reason.to_string(),
+            warnings: Vec::new(),
         }
     }
     pub fn error(detail: &str) -> Self {
         Self {
             status: "error",
             detail: detail.to_string(),
+            warnings: Vec::new(),
         }
     }
+    /// The same report carrying `warnings`.
+    pub fn with_warnings(mut self, warnings: Vec<String>) -> Self {
+        self.warnings = warnings;
+        self
+    }
+}
+
+/// Most warnings carried per tick, and the longest each may be.
+const TICK_WARNINGS_MAX: usize = 8;
+const TICK_WARNING_MAX_LEN: usize = 200;
+
+/// The tick warnings as a JSON array that is safe as a header value.
+fn warnings_header(warnings: &[String]) -> Option<String> {
+    let list: Vec<String> = warnings
+        .iter()
+        .map(|w| header_safe(w, TICK_WARNING_MAX_LEN))
+        .filter(|w| !w.is_empty())
+        .take(TICK_WARNINGS_MAX)
+        .collect();
+    if list.is_empty() {
+        return None;
+    }
+    serde_json::to_string(&list).ok()
 }
 
 /// Longest tick detail we put on the wire. Error chains can be long; the
@@ -253,26 +336,15 @@ impl OblethClient for HttpObleth {
         // /managed is per-model; the provisioner needs them all. List models,
         // then GET each /managed. (A bulk /managed route exists and is a fine
         // future optimization; v1 keeps the surface minimal.)
-        let models = self.get_array("/models").await?;
-        let mut out = Vec::new();
-        for m in models {
-            let id = m.get("id").and_then(|x| x.as_str()).unwrap_or_default();
-            if id.is_empty() {
-                continue;
-            }
-            // An unmanaged model answers 200 `null`; an error status must not
-            // read as "unmanaged" (that would drain the model's replicas).
-            let spec: Option<ManagedModelSpec> = self
-                .req(reqwest::Method::GET, &format!("/models/{id}/managed"))
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
-            if let Some(s) = spec {
-                if s.enabled {
-                    out.push(s);
-                }
+        // One read of every spec. An error status fails the whole list (it
+        // must not read as "nothing is managed", which would drain replicas).
+        let rows = self.get_array("/managed").await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let spec: ManagedModelSpec = serde_json::from_value(row)
+                .map_err(|e| anyhow::anyhow!("GET /managed: unreadable spec: {e}"))?;
+            if spec.enabled {
+                out.push(spec);
             }
         }
         Ok(out)
@@ -290,6 +362,9 @@ impl OblethClient for HttpObleth {
             if !detail.is_empty() {
                 req = req.header("X-Obleth-Provisioner-Tick-Detail", detail);
             }
+            if let Some(w) = warnings_header(&t.warnings) {
+                req = req.header("X-Obleth-Provisioner-Tick-Warnings", w);
+            }
         }
         let s: SlurmSettings = req.send().await?.error_for_status()?.json().await?;
         Ok(Some(s))
@@ -300,6 +375,7 @@ impl OblethClient for HttpObleth {
             .req(reqwest::Method::GET, &format!("/models/{model_id}"))
             .send()
             .await?
+            .error_for_status()?
             .json()
             .await?;
         Ok(m.get("model_name")
@@ -369,10 +445,16 @@ impl OblethClient for HttpObleth {
     }
 
     async fn delete_replica(&self, replica_id: Uuid) -> anyhow::Result<()> {
-        self.req(reqwest::Method::DELETE, &format!("/replicas/{replica_id}"))
-            .send()
-            .await?
-            .error_for_status()?;
+        // `force` drops the row outright. Without it the gateway treats a
+        // DELETE of a live replica as "cancel it", which is the operator's
+        // action, not the provisioner's clean-up of a finished row.
+        self.req(
+            reqwest::Method::DELETE,
+            &format!("/replicas/{replica_id}?force=true"),
+        )
+        .send()
+        .await?
+        .error_for_status()?;
         Ok(())
     }
 
@@ -489,6 +571,78 @@ impl OblethClient for HttpObleth {
         Ok(())
     }
 
+    async fn model_names(&self) -> anyhow::Result<HashMap<Uuid, String>> {
+        let rows = self.get_array("/models").await?;
+        Ok(rows
+            .iter()
+            .filter_map(|m| {
+                let id = m.get("id")?.as_str()?.parse().ok()?;
+                let name = m.get("model_name")?.as_str()?.to_string();
+                Some((id, name))
+            })
+            .collect())
+    }
+
+    async fn create_replica_with_log(
+        &self,
+        model_id: Uuid,
+        slurm_job_id: &str,
+        port_base: i64,
+        log_path: Option<&str>,
+    ) -> anyhow::Result<Uuid> {
+        let v: serde_json::Value = self
+            .req(
+                reqwest::Method::POST,
+                &format!("/models/{model_id}/replicas"),
+            )
+            .json(&serde_json::json!({
+                "slurm_job_id": slurm_job_id,
+                "port_base": port_base,
+                "log_path": log_path,
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        v.get("id")
+            .and_then(|x| x.as_str())
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| anyhow::anyhow!("create_replica: response missing a valid id: {v}"))
+    }
+
+    async fn patch_replica_details(
+        &self,
+        replica_id: Uuid,
+        details: &ReplicaDetails,
+    ) -> anyhow::Result<()> {
+        if *details == ReplicaDetails::default() {
+            return Ok(());
+        }
+        self.req(reqwest::Method::PATCH, &format!("/replicas/{replica_id}"))
+            .json(details)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    async fn set_managed_backoff(
+        &self,
+        model_id: Uuid,
+        backoff: &ManagedBackoff,
+    ) -> anyhow::Result<()> {
+        self.req(
+            reqwest::Method::PUT,
+            &format!("/models/{model_id}/managed/backoff"),
+        )
+        .json(backoff)
+        .send()
+        .await?
+        .error_for_status()?;
+        Ok(())
+    }
+
     async fn set_provision_error(&self, model_id: Uuid, error: Option<&str>) -> anyhow::Result<()> {
         self.req(
             reqwest::Method::PATCH,
@@ -577,6 +731,50 @@ mod tests {
         );
         let c = admin_stub(200, "[]").await;
         assert!(c.list_managed_models().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn managed_specs_come_from_one_list_and_disabled_ones_are_skipped() {
+        let c = admin_stub(
+            200,
+            r#"[{"model_id":"00000000-0000-0000-0000-000000000001","enabled":true,"partition":"","gres":"","nodes":1,"image":"","preamble":"","log_output_dir":"","launch_command":"x","serving_port":8000,"health_path":"/health","target_replicas":1,"max_job_failures":0,"paused_until":"2030-01-01T00:00:00Z","paused_reason":"Paused.","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"},
+                {"model_id":"00000000-0000-0000-0000-000000000002","enabled":false,"partition":"","gres":"","nodes":1,"image":"","preamble":"","log_output_dir":"","launch_command":"x","serving_port":8000,"health_path":"/health","target_replicas":1,"max_job_failures":0,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}]"#,
+        )
+        .await;
+        let specs = c.list_managed_models().await.unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].paused_reason.as_deref(), Some("Paused."));
+        assert!(specs[0].paused_until.is_some());
+        // Fields an older gateway does not send take their defaults.
+        assert_eq!(specs[0].startup_timeout_mins, 60);
+        assert_eq!(specs[0].handoff_mins, 15);
+    }
+
+    #[tokio::test]
+    async fn model_names_are_read_in_one_list() {
+        let c = admin_stub(
+            200,
+            r#"[{"id":"00000000-0000-0000-0000-000000000001","model_name":"a"},{"id":"bad","model_name":"b"}]"#,
+        )
+        .await;
+        let names = c.model_names().await.unwrap();
+        assert_eq!(names.len(), 1);
+        assert_eq!(names.values().next().map(String::as_str), Some("a"));
+        let c = admin_stub(500, "[]").await;
+        assert!(c.model_names().await.is_err());
+        let c = admin_stub(404, r#"{"error":"not found"}"#).await;
+        assert!(c.model_name(Uuid::nil()).await.is_err());
+    }
+
+    #[test]
+    fn tick_warnings_travel_as_a_bounded_json_header() {
+        assert_eq!(warnings_header(&[]), None);
+        let w = warnings_header(&["The Slurm token\nexpires in 2 days.".into(), String::new()])
+            .unwrap();
+        assert_eq!(w, r#"["The Slurm token expires in 2 days."]"#);
+        let many: Vec<String> = (0..20).map(|i| format!("w{i}")).collect();
+        let parsed: Vec<String> = serde_json::from_str(&warnings_header(&many).unwrap()).unwrap();
+        assert_eq!(parsed.len(), TICK_WARNINGS_MAX);
     }
 
     #[tokio::test]

@@ -21,7 +21,8 @@ use std::time::Duration;
 /// Outcome of one loop iteration, so the loop can log idle/active transitions
 /// without spamming a line every tick.
 enum Tick {
-    Ran,
+    /// A reconcile tick ran; carries warnings for the operator.
+    Ran(Vec<String>),
     Idle(&'static str),
 }
 
@@ -64,8 +65,8 @@ async fn main() -> anyhow::Result<()> {
     });
     loop {
         match run_once(&cfg, &obleth, &http, &resolver, &mut probe_failures).await {
-            Ok(Tick::Ran) => {
-                obleth.set_last_tick(TickReport::ok());
+            Ok(Tick::Ran(warnings)) => {
+                obleth.set_last_tick(TickReport::ok().with_warnings(warnings));
                 if last_idle.take().is_some() {
                     tracing::info!("slurm active; reconciling managed models");
                 }
@@ -158,16 +159,33 @@ async fn run_once(
     // Refresh operator hostname→IP overrides from settings each tick, so edits in
     // the dashboard take effect without restarting the provisioner.
     resolver.set_aliases(settings.node_alias_map());
-    let slurm = Slurmrestd::new(
+    // `auto` (the default) resolves to the newest API version the server
+    // offers that this build supports; the answer is cached for ten minutes.
+    let slurm = Slurmrestd::connect(
         http.clone(),
         &settings.slurmrestd_url,
         &settings.slurmrestd_api_version,
         &settings.slurm_user,
         &settings.slurm_jwt,
     )
-    .with_hf_token(&settings.hf_token);
+    .await?
+    .with_hf_token(&settings.hf_token)
+    .with_job_name_prefix(&cfg.job_name_prefix);
+    // One authenticated read every tick, so a rejected token shows as an
+    // error tick even when no replica would otherwise call Slurm.
+    let token_warning =
+        slurm::token_expiry_warning(&settings.slurm_jwt, chrono::Utc::now().timestamp());
+    if let Err(e) = slurm.check_auth().await {
+        // A rejected token that has also expired says so.
+        let rejected = slurm::slurm_api_error(&e)
+            .is_some_and(|se| se.kind == slurm::SlurmErrorKind::TokenRejected);
+        match token_warning.filter(|_| rejected) {
+            Some(w) => anyhow::bail!("{e} {w}"),
+            None => return Err(e),
+        }
+    }
     tick(cfg, &slurm, obleth, http, resolver, probe_failures).await?;
-    Ok(Tick::Ran)
+    Ok(Tick::Ran(token_warning.into_iter().collect()))
 }
 
 /// Breaker for the job lookups: `Some(n)` when there are at least two distinct
@@ -198,6 +216,12 @@ async fn tick(
 ) -> anyhow::Result<()> {
     let specs = obleth.list_managed_models().await?; // obleth down -> bail (held). enabled only.
     let all_replicas = obleth.list_all_replicas().await?; // obleth down -> bail (held)
+    // Every model's name in one read; a model missing from it is looked up
+    // on its own below.
+    let names = obleth.model_names().await.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "model list read failed; looking names up one by one");
+        HashMap::new()
+    });
 
     // Drop self-heal streaks for replicas that no longer exist or are no longer
     // healthy (restarted, lost, draining) so the map can't grow unbounded.
@@ -275,7 +299,11 @@ async fn tick(
         // Claim this model's replicas so the drain pass below ignores them, even
         // if we end up skipping this model for a transient reason.
         let mut replicas = by_model.remove(&spec.model_id).unwrap_or_default();
-        let model_name = match obleth.model_name(spec.model_id).await {
+        let looked_up = match names.get(&spec.model_id) {
+            Some(n) => Ok(n.clone()),
+            None => obleth.model_name(spec.model_id).await,
+        };
+        let model_name = match looked_up {
             Ok(n) if !n.is_empty() => n,
             Ok(_) => {
                 tracing::warn!(model_id = %spec.model_id, "model has empty name; skipping this tick");
@@ -304,7 +332,9 @@ async fn tick(
             if r.state == "starting" || r.state == "pending" || r.state == "healthy" {
                 if let Some(j) = jobs.get(&r.slurm_job_id) {
                     if j.state == domain::JobState::Running {
-                        match j.nodes.first() {
+                        // The batch host runs the server; for a multi-node
+                        // job the node list alone does not say which one.
+                        match j.probe_host().map(str::to_string).as_ref() {
                             None => {
                                 tracing::warn!(
                                     replica_id = %r.id,
@@ -621,9 +651,15 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl SlurmClient for FakeSlurm {
-        async fn submit(&self, job: &JobSubmit) -> anyhow::Result<String> {
+        async fn submit(
+            &self,
+            job: &JobSubmit,
+        ) -> anyhow::Result<obleth_provisioner::slurm::SubmittedJob> {
             self.submitted.lock().unwrap().push(job.name.clone());
-            Ok("999".into())
+            Ok(obleth_provisioner::slurm::SubmittedJob {
+                job_id: "999".into(),
+                notes: vec![],
+            })
         }
         async fn cancel(&self, job_id: &str) -> anyhow::Result<()> {
             self.cancelled.lock().unwrap().push(job_id.to_string());
@@ -672,6 +708,7 @@ mod tests {
             nodes: vec![],
             raw_state: "PENDING".into(),
             reason: None,
+            ..Default::default()
         }
     }
 
