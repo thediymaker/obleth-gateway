@@ -65,6 +65,9 @@ const COMPRESS_PREFIX: &str = "obleth:compress:";
 /// built here from the hash the proxy supplies (see `query_vector_key`),
 /// mirroring `compress_key`.
 const KNOWLEDGE_QUERY_PREFIX: &str = "obleth:knowledge:q:";
+/// Vision-boon image descriptions, per tenant, keyed by a hash of the image,
+/// the describer and its prompt.
+const VISION_PREFIX: &str = "obleth:vision:";
 /// `auto` conversation records and answered-request markers, per tenant.
 const AUTO_TURN_PREFIX: &str = "obleth:auto:";
 /// Crash-guard strikes: how many model-server engine deaths one request (by
@@ -424,6 +427,37 @@ impl RedisStore {
         let mut conn = self.conn.clone();
         let v: Option<String> = conn.get(Self::compress_key(tenant, hash)).await?;
         Ok(v)
+    }
+
+    fn vision_key(tenant: &Uuid, hash: &str) -> String {
+        format!("{VISION_PREFIX}{tenant}:{hash}")
+    }
+
+    /// Fetch a tenant's stored description of an image by its hash, or `None`
+    /// when it has expired, was never stored, or belongs to another tenant.
+    pub async fn vision_get(&self, tenant: &Uuid, hash: &str) -> Result<Option<String>> {
+        let mut conn = self.conn.clone();
+        let v: Option<String> = conn.get(Self::vision_key(tenant, hash)).await?;
+        Ok(v)
+    }
+
+    /// Store a description of an image for a tenant, expiring after
+    /// `ttl_secs`. A `ttl_secs` of 0 skips the write, as with `compress_put`.
+    pub async fn vision_put(
+        &self,
+        tenant: &Uuid,
+        hash: &str,
+        text: &str,
+        ttl_secs: u64,
+    ) -> Result<()> {
+        if ttl_secs == 0 {
+            return Ok(());
+        }
+        let mut conn = self.conn.clone();
+        let _: () = conn
+            .set_ex(Self::vision_key(tenant, hash), text, ttl_secs)
+            .await?;
+        Ok(())
     }
 
     fn auto_turn_key(tenant: &Uuid, hash: &str) -> String {
@@ -1249,6 +1283,34 @@ mod tests {
             .await
             .unwrap();
         assert!(exists, "stored under obleth:compress:<tenant>:<sha>");
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    #[tokio::test]
+    async fn an_image_description_is_kept_for_its_tenant_only() {
+        let Ok(url) = std::env::var("OBLETH_TEST_REDIS_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let store = RedisStore::connect(&url).await.expect("connect");
+        let (owner, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let hash = format!("h-{}", Uuid::new_v4());
+        assert!(store.vision_get(&owner, &hash).await.unwrap().is_none());
+        store
+            .vision_put(&owner, &hash, "a red error toast", 60)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.vision_get(&owner, &hash).await.unwrap().as_deref(),
+            Some("a red error toast")
+        );
+        assert!(
+            store.vision_get(&other, &hash).await.unwrap().is_none(),
+            "another tenant must not read a description by its hash"
+        );
+        let unkept = format!("h-{}", Uuid::new_v4());
+        store.vision_put(&owner, &unkept, "x", 0).await.unwrap();
+        assert!(store.vision_get(&owner, &unkept).await.unwrap().is_none());
     }
 
     /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.

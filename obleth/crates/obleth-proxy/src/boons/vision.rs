@@ -23,6 +23,9 @@ pub(super) struct VisionOutcome {
     /// Images that couldn't be described and were swapped for a short note
     /// saying so.
     pub noted: u32,
+    /// Of the described images, those whose description was kept from an
+    /// earlier request rather than asked for again.
+    pub reused: u32,
 }
 
 /// Rewrite image content parts into text descriptions using the configured
@@ -69,24 +72,55 @@ pub(super) async fn apply(
     // The first `max_images` are described; the rest only get a note.
     let cap = cfg.max_images as usize;
     let (targets, past_cap) = images.split_at(images.len().min(cap));
+    let prompt = cfg.prompt();
 
-    // Pass 2: describe all images concurrently (the set is already bounded by
-    // `max_images`), so total added latency is one round trip, not one per image.
-    let outcomes = futures_util::future::join_all(targets.iter().map(|(_, _, url)| {
+    // Pass 2: one description per distinct image. A conversation sends its
+    // earlier images again on every turn, so a description kept from an
+    // earlier turn (same tenant, describer and prompt) is reused rather than
+    // asked for again; a request that repeats an image asks once.
+    let hashes: Vec<String> = targets
+        .iter()
+        .map(|(_, _, url)| description_hash(&describer.model_name, prompt, url))
+        .collect();
+    let mut distinct: Vec<(&str, &str)> = Vec::new();
+    for (hash, (_, _, url)) in hashes.iter().zip(targets) {
+        if !distinct.iter().any(|(h, _)| *h == hash.as_str()) {
+            distinct.push((hash, url));
+        }
+    }
+    let kept = futures_util::future::join_all(distinct.iter().map(|(hash, _)| async move {
+        if cfg.cache_ttl_secs == 0 {
+            return None;
+        }
+        match state.redis.vision_get(&key.tenant_id, hash).await {
+            Ok(text) => text,
+            Err(e) => {
+                tracing::warn!(error = %e, "vision boon description lookup failed; describing the image");
+                None
+            }
+        }
+    }))
+    .await;
+
+    // Every image not described before is described now, concurrently (the
+    // set is already bounded by `max_images`), so the added latency is one
+    // round trip, not one per image.
+    let to_describe: Vec<usize> = (0..distinct.len()).filter(|i| kept[*i].is_none()).collect();
+    let described = futures_util::future::join_all(to_describe.iter().map(|i| {
         super::chat_call(
             state,
             &describer,
-            describe_request(&describer.upstream_model, &cfg.describe_prompt, url),
+            describe_request(&describer.upstream_model, prompt, distinct[*i].1),
             timeout,
         )
     }))
     .await;
 
-    // Pass 3: swap every image for its description, or for a note saying why
-    // there isn't one.
-    let mut swaps = Vec::with_capacity(images.len());
-    for ((mi, pi, _), outcome) in targets.iter().zip(outcomes) {
-        match outcome {
+    let mut found: Vec<Result<String, &'static str>> =
+        kept.into_iter().map(|k| k.ok_or(NOTE_FAILED)).collect();
+    let kept_before: Vec<bool> = found.iter().map(Result::is_ok).collect();
+    for (i, outcome) in to_describe.into_iter().zip(described) {
+        found[i] = match outcome {
             Ok(result) => {
                 super::bill_helper_call(
                     state,
@@ -100,7 +134,22 @@ pub(super) async fn apply(
                         result.output_tokens,
                     ),
                 );
-                swaps.push(((*mi, *pi), Swap::Described(result.text)));
+                let text = result.text.trim().to_string();
+                if cfg.cache_ttl_secs > 0 {
+                    let redis = state.redis.clone();
+                    let (tenant, hash, text, ttl) = (
+                        key.tenant_id,
+                        distinct[i].0.to_string(),
+                        text.clone(),
+                        cfg.cache_ttl_secs,
+                    );
+                    tokio::spawn(async move {
+                        if let Err(e) = redis.vision_put(&tenant, &hash, &text, ttl).await {
+                            tracing::warn!(error = %e, "vision boon description not kept");
+                        }
+                    });
+                }
+                Ok(text)
             }
             Err(e) => {
                 tracing::warn!(
@@ -108,14 +157,34 @@ pub(super) async fn apply(
                     model = %describer.model_name,
                     "vision boon describe call failed; noting the image instead"
                 );
-                let why = if e.to_string().contains("timed out") {
+                Err(if e.to_string().contains("timed out") {
                     NOTE_TIMED_OUT
                 } else {
                     NOTE_FAILED
-                };
-                swaps.push(((*mi, *pi), Swap::Note(why.into())));
+                })
             }
+        };
+    }
+
+    // Pass 3: swap every image for its description, or for a note saying why
+    // there isn't one.
+    let mut swaps = Vec::with_capacity(images.len());
+    let mut reused = 0;
+    for ((mi, pi, _), hash) in targets.iter().zip(&hashes) {
+        let i = distinct
+            .iter()
+            .position(|(h, _)| *h == hash.as_str())
+            .expect("every hash is in distinct");
+        if kept_before[i] {
+            reused += 1;
         }
+        swaps.push((
+            (*mi, *pi),
+            match &found[i] {
+                Ok(text) => Swap::Described(text.clone()),
+                Err(why) => Swap::Note((*why).into()),
+            },
+        ));
     }
     let note = format!("only the first {cap} images in a request are described");
     swaps.extend(
@@ -123,7 +192,10 @@ pub(super) async fn apply(
             .iter()
             .map(|(mi, pi, _)| ((*mi, *pi), Swap::Note(note.clone()))),
     );
-    swap_parts(json, swaps)
+    VisionOutcome {
+        reused,
+        ..swap_parts(json, swaps)
+    }
 }
 
 const NOTE_NO_DESCRIBER: &str = "the image describer isn't available";
@@ -197,7 +269,16 @@ fn swap_parts(
     outcome
 }
 
+/// Longest description asked for. A description runs a few hundred tokens; the
+/// cap stops a describer that starts repeating itself from running to the
+/// timeout.
+const DESCRIBE_MAX_TOKENS: u32 = 700;
+
 /// The chat-completions body sent to the describer for a single image.
+///
+/// The image comes before the prompt, the order vision models are trained on.
+/// Temperature 0 gives the same image the same description, so the model
+/// reading it can reuse its prompt cache on the next turn.
 fn describe_request(upstream_model: &str, prompt: &str, image_url: &str) -> Value {
     json!({
         "model": upstream_model,
@@ -205,13 +286,20 @@ fn describe_request(upstream_model: &str, prompt: &str, image_url: &str) -> Valu
             {
                 "role": "user",
                 "content": [
-                    { "type": "text", "text": prompt },
                     { "type": "image_url", "image_url": { "url": image_url } },
+                    { "type": "text", "text": prompt },
                 ],
             }
         ],
-        "temperature": 0.2,
+        "temperature": 0,
+        "max_tokens": DESCRIBE_MAX_TOKENS,
     })
+}
+
+/// What a kept description is filed under: the image, the describer and the
+/// prompt, so a change to either describes the image again.
+fn description_hash(describer: &str, prompt: &str, image_url: &str) -> String {
+    obleth_config::content_hash(&format!("{describer}\n{prompt}\n{image_url}"))
 }
 
 #[cfg(test)]
@@ -271,7 +359,8 @@ mod tests {
             out,
             VisionOutcome {
                 described: 1,
-                noted: 0
+                noted: 0,
+                reused: 0
             }
         );
         assert_eq!(
@@ -295,7 +384,8 @@ mod tests {
             out,
             VisionOutcome {
                 described: 0,
-                noted: 1
+                noted: 1,
+                reused: 0
             }
         );
         let text = json["messages"][1]["content"][1]["text"].as_str().unwrap();
@@ -317,10 +407,21 @@ mod tests {
     fn describe_request_shape() {
         let body = describe_request("llava:13b", "describe it", "http://img/x.png");
         assert_eq!(body["model"], "llava:13b");
-        assert_eq!(body["messages"][0]["content"][0]["text"], "describe it");
         assert_eq!(
-            body["messages"][0]["content"][1]["image_url"]["url"],
-            "http://img/x.png"
+            body["messages"][0]["content"][0]["image_url"]["url"], "http://img/x.png",
+            "the image comes first"
         );
+        assert_eq!(body["messages"][0]["content"][1]["text"], "describe it");
+        assert_eq!(body["temperature"], 0);
+        assert_eq!(body["max_tokens"], DESCRIBE_MAX_TOKENS);
+    }
+
+    #[test]
+    fn a_description_is_filed_under_the_image_describer_and_prompt() {
+        let h = description_hash("d", "p", "data:image/png;base64,AAAA");
+        assert_eq!(h, description_hash("d", "p", "data:image/png;base64,AAAA"));
+        assert_ne!(h, description_hash("d", "p", "data:image/png;base64,AAAB"));
+        assert_ne!(h, description_hash("e", "p", "data:image/png;base64,AAAA"));
+        assert_ne!(h, description_hash("d", "q", "data:image/png;base64,AAAA"));
     }
 }

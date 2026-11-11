@@ -1716,6 +1716,8 @@ export interface BoonSettingsView {
   vision_describe_prompt: string;
   vision_max_images: number;
   vision_timeout_ms: number;
+  /** How long an image description is kept and reused, in seconds (0 = off). */
+  vision_cache_ttl_secs: number;
   structured_output_enabled: boolean;
   structured_output_fixer_model: string | null;
   structured_output_max_repair_attempts: number;
@@ -1784,6 +1786,7 @@ export interface UpdateBoonSettings {
   vision_describe_prompt?: string;
   vision_max_images?: number;
   vision_timeout_ms?: number;
+  vision_cache_ttl_secs?: number;
   structured_output_enabled?: boolean;
   structured_output_fixer_model?: string | null;
   structured_output_max_repair_attempts?: number;

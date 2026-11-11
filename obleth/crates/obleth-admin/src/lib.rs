@@ -3099,6 +3099,8 @@ pub struct BoonSettingsView {
     pub vision_describe_prompt: String,
     pub vision_max_images: u32,
     pub vision_timeout_ms: u64,
+    /// How long an image description is kept and reused, in seconds (0 = off).
+    pub vision_cache_ttl_secs: u64,
     pub structured_output_enabled: bool,
     pub structured_output_fixer_model: Option<String>,
     pub structured_output_max_repair_attempts: u32,
@@ -3160,9 +3162,10 @@ impl BoonSettingsView {
         BoonSettingsView {
             vision_enabled: s.vision.enabled,
             vision_fallback_model: s.vision.fallback_model.clone(),
-            vision_describe_prompt: s.vision.describe_prompt.clone(),
+            vision_describe_prompt: s.vision.prompt().to_string(),
             vision_max_images: s.vision.max_images,
             vision_timeout_ms: s.vision.timeout_ms,
+            vision_cache_ttl_secs: s.vision.cache_ttl_secs,
             structured_output_enabled: s.structured_output.enabled,
             structured_output_fixer_model: s.structured_output.fixer_model.clone(),
             structured_output_max_repair_attempts: s.structured_output.max_repair_attempts,
@@ -3233,6 +3236,10 @@ pub struct UpdateBoonSettings {
     pub vision_max_images: Option<u32>,
     #[serde(default)]
     pub vision_timeout_ms: Option<u64>,
+    /// How long an image description is kept and reused, in seconds. 0 turns
+    /// the reuse off.
+    #[serde(default)]
+    pub vision_cache_ttl_secs: Option<u64>,
     #[serde(default)]
     pub structured_output_enabled: Option<bool>,
     /// `model_name` of the JSON-repair fixer model. Empty string clears it
@@ -3645,6 +3652,9 @@ async fn put_boon_settings(
                 .vision_timeout_ms
                 .filter(|ms| *ms > 0)
                 .unwrap_or(existing.vision.timeout_ms),
+            cache_ttl_secs: body
+                .vision_cache_ttl_secs
+                .unwrap_or(existing.vision.cache_ttl_secs),
         },
         structured_output: StructuredOutputBoonSettings {
             enabled: body
@@ -3845,6 +3855,7 @@ async fn put_boon_settings(
                 "vision_fallback_model": settings.vision.fallback_model,
                 "vision_max_images": settings.vision.max_images,
                 "vision_timeout_ms": settings.vision.timeout_ms,
+                "vision_cache_ttl_secs": settings.vision.cache_ttl_secs,
                 "structured_output_enabled": settings.structured_output.enabled,
                 "structured_output_fixer_model": settings.structured_output.fixer_model,
                 "structured_output_max_repair_attempts": settings.structured_output.max_repair_attempts,

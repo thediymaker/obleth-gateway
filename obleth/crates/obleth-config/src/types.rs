@@ -2443,13 +2443,30 @@ impl AutoRouterSettings {
 
 /// Default prompt sent to the vision model when describing an image for a
 /// non-vision model. Operators can override it from the control plane.
-pub const DEFAULT_VISION_DESCRIBE_PROMPT: &str = "You are assisting a text-only \
+///
+/// It asks only for what is clearly visible and to say when something can't
+/// be read: small describers otherwise guess at fine text and numbers. It
+/// doesn't mention the reader being a text-only model, which some describers
+/// took to mean that no image had been sent.
+pub const DEFAULT_VISION_DESCRIBE_PROMPT: &str = "Describe this image for someone \
+who cannot see it: the main subjects and what they are doing, the setting, all \
+readable text (verbatim), and any UI elements, code, diagrams, charts or layout. \
+State only what you can clearly see. If text or a number is too small or blurry \
+to read, say so instead of guessing. Be concise but complete.";
+
+/// The earlier default prompt. A saved setting still equal to it was never
+/// edited by an operator, so it follows the current default instead.
+const PREVIOUS_VISION_DESCRIBE_PROMPT: &str = "You are assisting a text-only \
 model that cannot see images. Describe this image in thorough, faithful detail: \
 all visible text (verbatim), UI elements, code, diagrams, charts, layout, and \
 any information needed to reason about it. Be concise but complete.";
 
 fn default_vision_describe_prompt() -> String {
     DEFAULT_VISION_DESCRIBE_PROMPT.to_string()
+}
+
+fn default_vision_cache_ttl_secs() -> u64 {
+    6 * 60 * 60
 }
 
 fn default_vision_max_images() -> u32 {
@@ -2527,6 +2544,11 @@ pub struct VisionBoonSettings {
     /// relay is abandoned and the original request passes through unchanged.
     #[serde(default = "default_vision_timeout_ms")]
     pub timeout_ms: u64,
+    /// How long a description is kept and reused, in seconds. A conversation
+    /// sends its earlier images again on every turn; with this, each image is
+    /// described once. 0 turns the reuse off.
+    #[serde(default = "default_vision_cache_ttl_secs")]
+    pub cache_ttl_secs: u64,
 }
 
 impl Default for VisionBoonSettings {
@@ -2537,11 +2559,22 @@ impl Default for VisionBoonSettings {
             describe_prompt: default_vision_describe_prompt(),
             max_images: default_vision_max_images(),
             timeout_ms: default_vision_timeout_ms(),
+            cache_ttl_secs: default_vision_cache_ttl_secs(),
         }
     }
 }
 
 impl VisionBoonSettings {
+    /// The prompt the describer is sent: the saved one, unless it is still the
+    /// previous default, which follows the current default.
+    pub fn prompt(&self) -> &str {
+        if self.describe_prompt.trim() == PREVIOUS_VISION_DESCRIBE_PROMPT {
+            DEFAULT_VISION_DESCRIBE_PROMPT
+        } else {
+            &self.describe_prompt
+        }
+    }
+
     /// True when the vision boon is enabled and points at a fallback model.
     pub fn active(&self) -> bool {
         self.enabled
@@ -4065,6 +4098,24 @@ mod tests {
         let map = s.node_alias_map();
         assert_eq!(map.len(), 1);
         assert_eq!(map.get("node001").map(String::as_str), Some("10.0.0.2"));
+    }
+
+    #[test]
+    fn vision_prompt_left_at_the_earlier_default_follows_the_new_one() {
+        let mut v = VisionBoonSettings {
+            describe_prompt: PREVIOUS_VISION_DESCRIBE_PROMPT.to_string(),
+            ..Default::default()
+        };
+        assert_eq!(v.prompt(), DEFAULT_VISION_DESCRIBE_PROMPT);
+        v.describe_prompt = "Describe the chart only.".into();
+        assert_eq!(v.prompt(), "Describe the chart only.");
+    }
+
+    #[test]
+    fn vision_settings_saved_before_the_cache_reuse_descriptions() {
+        let v: VisionBoonSettings =
+            serde_json::from_str(r#"{"enabled":true,"fallback_model":"m"}"#).unwrap();
+        assert_eq!(v.cache_ttl_secs, 6 * 60 * 60);
     }
 
     #[test]

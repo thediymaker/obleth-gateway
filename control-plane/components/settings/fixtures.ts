@@ -11,7 +11,7 @@ export const router = (over: Partial<AutoRouterSettingsView> = {}): AutoRouterSe
 }) as AutoRouterSettingsView;
 
 export const boons = (over: Partial<BoonSettingsView> = {}): BoonSettingsView => ({
-  vision_enabled: false, vision_fallback_model: null, vision_describe_prompt: "Describe it.", vision_max_images: 6, vision_timeout_ms: 30000,
+  vision_enabled: false, vision_fallback_model: null, vision_describe_prompt: "Describe it.", vision_max_images: 6, vision_timeout_ms: 30000, vision_cache_ttl_secs: 21600,
   structured_output_enabled: false, structured_output_fixer_model: null, structured_output_max_repair_attempts: 1, structured_output_timeout_ms: 30000,
   tool_loop_enabled: false, tool_loop_max_turns: 4, tool_loop_tool_timeout_ms: 30000, tool_loop_deadline_secs: 300, tool_loop_nudge: "Use tools.",
   compression_enabled: false, compression_min_tokens: 128, compression_max_segments: 64, compression_original_ttl_secs: 3600, compression_max_lossy_segments: 4,
