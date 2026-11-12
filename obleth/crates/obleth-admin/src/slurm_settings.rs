@@ -146,11 +146,18 @@ impl SlurmSettingsView {
         self.jwt_expires_in_secs = jwt.expires_in_secs;
         self.jwt_user = slurm_values::slurm_jwt_claims(&s.slurm_jwt).and_then(|c| c.sun);
         let found = recall_discovery(&s.slurmrestd_url, &s.slurm_user);
-        self.resolved_api_version = if slurm_values::is_auto_api_version(&s.slurmrestd_api_version)
-        {
+        let pinned = s.slurmrestd_api_version.trim();
+        self.resolved_api_version = if slurm_values::is_auto_api_version(pinned) {
             found.as_ref().and_then(|d| d.resolved.clone())
         } else {
-            Some(s.slurmrestd_api_version.trim().to_string())
+            match found.as_ref() {
+                // A pin the server doesn't serve: the provisioner uses the
+                // newest version it does serve.
+                Some(d) if !d.available.is_empty() && !d.available.iter().any(|v| v == pinned) => {
+                    slurm_values::pick_api_version(&d.available)
+                }
+                _ => Some(pinned.to_string()),
+            }
         };
         if let Some(d) = found {
             self.available_api_versions = d.available;
@@ -574,14 +581,17 @@ fn api_health(
             },
         }
     } else if !available.is_empty() && !available.contains(&configured) {
-        let suggestion = slurm_values::pick_api_version(&available)
-            .map(|v| format!(" or to {v}"))
-            .unwrap_or_default();
+        // The provisioner falls back to the newest supported version the
+        // server serves, so the test checks that one too and names it.
+        let fallback = slurm_values::pick_api_version(&available);
+        let uses = fallback
+            .as_ref()
+            .map(|v| format!(" obleth uses {v} until you set the API version to auto or to {v}."))
+            .unwrap_or_else(|| " Set the API version to auto.".to_string());
         (
-            Some(configured.clone()),
+            fallback,
             Some(format!(
-                "This slurmrestd does not serve API version {configured}; it serves {}. Set \
-                 the API version to auto{suggestion}.",
+                "This slurmrestd does not serve API version {configured}; it serves {}.{uses}",
                 available.join(", ")
             )),
         )
@@ -1353,7 +1363,12 @@ mod tests {
         let e = a.error.unwrap();
         assert!(e.contains("does not serve API version v0.0.40"), "{e}");
         assert!(e.contains("v0.0.42, v0.0.43, v0.0.44, v0.0.45"), "{e}");
-        assert!(e.contains("auto or to v0.0.45"), "{e}");
+        assert!(
+            e.contains("obleth uses v0.0.45 until you set the API version to auto or to v0.0.45"),
+            "{e}"
+        );
+        // The test goes on with the version the provisioner falls back to.
+        assert_eq!(a.resolved.as_deref(), Some("v0.0.45"));
         let a = api_health("auto", &Ok(vec!["v0.0.39".into()]));
         assert!(
             !a.ok
