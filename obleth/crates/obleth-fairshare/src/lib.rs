@@ -1145,7 +1145,7 @@ impl Pool {
         self.group_weight
             .insert(req.group.clone(), req.group_weight.max(1));
         self.key_weight.insert(req.key, req.key_weight.max(1));
-        self.key_tenant.insert(req.key, req.tenant);
+        self.set_key_tenant(req.key, req.tenant);
         match &req.end_user {
             Some(end_user) => {
                 self.key_end_user.insert(req.key, end_user.clone());
@@ -1172,13 +1172,28 @@ impl Pool {
         }
     }
 
+    /// Record `key`'s tenant. A key moved to another tenant leaves the old
+    /// one's idle set, and its standing, measured against the old tenant's
+    /// key clock, is dropped so it starts at the new one's.
+    fn set_key_tenant(&mut self, key: Uuid, tenant: Uuid) {
+        let Some(old) = self.key_tenant.insert(key, tenant) else {
+            return;
+        };
+        if old != tenant {
+            if let Some(idle) = self.key_idle.get_mut(&old) {
+                idle.remove(&key);
+            }
+            self.key_served.remove(&key);
+        }
+    }
+
     fn track_waiter_meta(&mut self, tenant: Uuid, key: Uuid, w: &Waiter) {
         self.tenant_weight.insert(tenant, w.weight.max(1));
         self.tenant_group.insert(tenant, w.group.clone());
         self.group_weight
             .insert(w.group.clone(), w.group_weight.max(1));
         self.key_weight.insert(key, w.key_weight.max(1));
-        self.key_tenant.insert(key, tenant);
+        self.set_key_tenant(key, tenant);
         match &w.end_user {
             Some(end_user) => {
                 self.key_end_user.insert(key, end_user.clone());
@@ -1384,6 +1399,9 @@ impl Pool {
         let began = *served;
         *served += cost as f64;
         let began = began / self.key_weight_of(&key);
+        if let Some(idle) = self.key_idle.get_mut(&tenant) {
+            idle.remove(&key);
+        }
         self.advance_key_clock(tenant, began);
     }
 
@@ -1394,6 +1412,13 @@ impl Pool {
     /// so a key held at its cap cannot pull it down, and a key that sends
     /// one request at a time moves it as much as a backlogged one does.
     /// Quiet keys the clock has reached are forgotten.
+    ///
+    /// The clock is not held back by requests still running. That keeps a
+    /// key that arrives from being credited with time before it came, at a
+    /// cost to a key that sends one request at a time next to a backlogged
+    /// sibling: the clock can pass it while its request runs, so it comes
+    /// back level with the sibling and gets about one request per sibling
+    /// request, whatever its weight or request size.
     ///
     /// Keys with nothing behind them start at the clock and so go first: new
     /// keys arriving more slowly than the tenant is served take turns with a
@@ -1428,7 +1453,7 @@ impl Pool {
         let mut active = Vec::new();
         let mut caught_up = Vec::new();
         for key in idle {
-            if !self.key_quiet(&tenant, key) {
+            if !self.key_idle_here(&tenant, key) {
                 active.push(*key);
             } else if self.key_standing(key) <= clock {
                 caught_up.push(*key);
@@ -1456,6 +1481,12 @@ impl Pool {
     fn key_quiet(&self, tenant: &Uuid, key: &Uuid) -> bool {
         self.queues.get(tenant).is_none_or(|q| q.key_len(key) == 0)
             && !self.key_in_flight.contains_key(key)
+    }
+
+    /// `key` is quiet and still belongs to `tenant`, so it may be forgotten
+    /// from `tenant`'s idle set.
+    fn key_idle_here(&self, tenant: &Uuid, key: &Uuid) -> bool {
+        self.key_tenant.get(key) == Some(tenant) && self.key_quiet(tenant, key)
     }
 
     /// Where a key of `tenant` starts, in `key_served`: its tenant's key
@@ -1564,6 +1595,9 @@ impl Pool {
             let entry = self.key_served.entry(req.key).or_insert(start);
             if *entry < start {
                 *entry = start;
+            }
+            if let Some(idle) = self.key_idle.get_mut(&req.tenant) {
+                idle.remove(&req.key);
             }
         }
         self.queues.entry(req.tenant).or_default().push(
@@ -2133,8 +2167,8 @@ impl Pool {
         // A key that is idle and at or below its tenant's key clock would be
         // raised to it on return anyway, so its entry carries no information
         // worth keeping. One above the clock is kept until the clock reaches
-        // it.
-        if self.key_quiet(&tenant, &key) {
+        // it. A key since moved to another tenant is that tenant's to keep.
+        if self.key_tenant.get(&key).is_none_or(|t| *t == tenant) && self.key_quiet(&tenant, &key) {
             if self.key_served.get(&key).copied().unwrap_or(0.0) <= self.key_start(tenant, key) {
                 self.forget_key(&key);
             } else {
@@ -2160,10 +2194,17 @@ impl Pool {
         if idle.len() <= MAX_IDLE_KEYS_PER_TENANT {
             return;
         }
-        let smallest = self.key_idle[&tenant]
+        let (here, gone): (Vec<Uuid>, Vec<Uuid>) = self.key_idle[&tenant]
             .iter()
-            .copied()
+            .partition(|k| self.key_idle_here(&tenant, k));
+        let smallest = here
+            .into_iter()
             .min_by(|a, b| self.key_standing(a).total_cmp(&self.key_standing(b)));
+        if let Some(idle) = self.key_idle.get_mut(&tenant) {
+            for key in gone.iter().chain(smallest.iter()) {
+                idle.remove(key);
+            }
+        }
         if let Some(smallest) = smallest {
             self.forget_key(&smallest);
         }
@@ -2189,7 +2230,9 @@ impl Pool {
     fn forget_tenant(&mut self, tenant: &Uuid) {
         if let Some(idle) = self.key_idle.remove(tenant) {
             for key in &idle {
-                self.forget_key(key);
+                if self.key_idle_here(tenant, key) {
+                    self.forget_key(key);
+                }
             }
         }
         self.served.remove(tenant);
@@ -4023,6 +4066,10 @@ mod tests {
             key
         }
 
+        fn is_running(&self, key: Uuid) -> bool {
+            self.running.iter().any(|(_, k)| *k == key)
+        }
+
         /// Grant until `key` gets a slot: how many grants went first.
         fn grants_before(&mut self, key: Uuid) -> usize {
             let mut before = 0;
@@ -4071,6 +4118,13 @@ mod tests {
         sim.queue(tenant, other, 2_000);
         assert!(sim.grants_before(other) <= 1);
         sim.queue(tenant, other, 2_000);
+        assert!(
+            !sim.pool
+                .key_idle
+                .get(&tenant)
+                .is_some_and(|i| i.contains(&other)),
+            "a key that comes back is no longer idle"
+        );
         let ahead = sim.grants_before(other);
         assert!(
             (19..=21).contains(&ahead),
@@ -4271,6 +4325,86 @@ mod tests {
             );
         }
         assert!(sim.pool.key_idle[&tenant].len() <= MAX_IDLE_KEYS_PER_TENANT);
+    }
+
+    /// A key sending one small request at a time, its next as each one
+    /// finishes, next to a sibling with a backlog of long requests, gets at
+    /// least one request per sibling request. (Before the key clock it got
+    /// far fewer: it came back behind everything the tenant had been served.)
+    #[test]
+    fn one_at_a_time_key_keeps_pace_with_a_busy_sibling() {
+        let mut sim = Sim::new(2);
+        let (tenant, busy, light) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for _ in 0..500 {
+            sim.queue(tenant, busy, 2_000);
+        }
+        sim.grant();
+        sim.grant();
+        sim.queue(tenant, light, 100);
+        let mut key = sim.grant();
+        let (mut light_grants, mut busy_grants) = (0, 0);
+        for _ in 0..300 {
+            if key == light {
+                light_grants += 1;
+            } else {
+                busy_grants += 1;
+            }
+            key = if sim.is_running(light) {
+                // The light request finishes and the key sends its next one
+                // before the freed slot is handed on.
+                let at = sim.running.iter().position(|(_, k)| *k == light).unwrap();
+                let (t, k) = sim.running.remove(at).unwrap();
+                sim.pool.release(t, k);
+                sim.queue(tenant, light, 100);
+                let (next, _) = sim.pool.take_next(sim.pool.cap);
+                let (t, k, _) = next.unwrap();
+                sim.running.push_back((t, k));
+                k
+            } else {
+                // Long busy requests: the oldest one finishes.
+                sim.grant()
+            };
+        }
+        assert!(
+            light_grants >= busy_grants,
+            "light key got {light_grants} grants and the busy key {busy_grants}"
+        );
+    }
+
+    /// A key moved to another tenant leaves the old tenant's idle set, and
+    /// forgetting the old tenant leaves the key, now running and capped under
+    /// the new tenant, alone.
+    #[test]
+    fn moved_key_is_left_alone_by_its_old_tenant() {
+        let mut sim = Sim::new(1);
+        let (old, new) = (Uuid::new_v4(), Uuid::new_v4());
+        let (busy, moved) = (Uuid::new_v4(), Uuid::new_v4());
+        for _ in 0..3 {
+            sim.queue(old, busy, 100);
+        }
+        sim.grant();
+        sim.queue(old, moved, 2_000);
+        sim.grants_before(moved);
+        sim.grant();
+        assert!(sim.pool.key_idle[&old].contains(&moved));
+
+        let capped = || AdmitRequest::new(new, "m", 100).key(moved, 100).key_cap(1);
+        sim.queue_req(capped());
+        assert!(!sim
+            .pool
+            .key_idle
+            .get(&old)
+            .is_some_and(|i| i.contains(&moved)));
+        while sim.pool.queues.contains_key(&old) {
+            sim.grant();
+        }
+        sim.grants_before(moved);
+        sim.queue_req(capped());
+        sim.pool.forget_tenant(&old);
+        assert_eq!(sim.pool.key_tenant.get(&moved), Some(&new));
+        assert_eq!(sim.pool.key_cap.get(&moved), Some(&1));
+        assert!(sim.pool.key_served.contains_key(&moved));
+        assert!(!sim.pool.key_open(&moved), "the key is at its cap of 1");
     }
 
     /// A queued request counts as passed only when session affinity served
