@@ -14,6 +14,10 @@ export default async function DeploymentPage({ params }: { params: Promise<{ nam
   await requireAdmin();
   const name = decodeURIComponent((await params).name);
   const [data, audit] = await Promise.all([loadDeployments(), safe(obleth.audit(500), [] as AuditEntry[])]);
+  // A failed read isn't a missing deployment: say so rather than 404 or send the page to Models.
+  if (data.failed?.includes("models") || data.failed?.includes("specs")) {
+    throw new Error("obleth couldn't read the models or their launch settings just now. Try again in a moment.");
+  }
   const model = data.models.find((m) => m.model_name === name) ?? data.models.find((m) => m.aliases?.includes(name));
   if (!model) notFound();
   if (model.model_name !== name) redirect(deploymentHref(model.model_name));

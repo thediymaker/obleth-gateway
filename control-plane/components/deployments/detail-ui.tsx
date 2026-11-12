@@ -73,7 +73,10 @@ const ACTION_WORDS: Record<string, string> = {
   put_managed_model: "Launch settings saved",
   delete_managed_model: "Stopped launching it",
   clear_lost_replicas: "Cleared failed launches",
-  clear_provision_error: "Dismissed a submit error",
+  clear_provision_error: "Submit error cleared",
+  retry_managed_model: "Asked it to try launching again",
+  roll_managed_model: "Replacing running replicas one at a time",
+  restart_replica: "Replica restarted",
   create_model: "Model added",
   update_model: "Model settings saved",
   set_model_capacity: "Capacity changed",
@@ -92,7 +95,7 @@ export function ChangesList({ changes }: { changes: AuditEntry[] }) {
         ) : (
           changes.map((e) => {
             const d = (e.detail ?? {}) as Record<string, unknown>;
-            const detail = e.action === "put_managed_model" ? `${d.enabled === false ? "paused · " : ""}${d.target_replicas ?? "?"} replicas · ${d.partition ?? ""}` : "";
+            const detail = e.action === "put_managed_model" ? `${d.target_replicas ?? "?"} replica${d.target_replicas === 1 ? "" : "s"}${d.partition ? ` on ${d.partition}` : ""}${d.enabled === false ? ", paused" : ""}` : "";
             return (
               <div key={e.id} className="grid grid-cols-[140px_minmax(0,1fr)_minmax(0,220px)] gap-3 border-t border-border py-2 text-[12.5px] first:border-t-0">
                 <span className="font-mono text-[11.5px] text-muted-foreground">{new Date(e.ts).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</span>
