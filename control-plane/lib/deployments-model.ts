@@ -596,7 +596,7 @@ export function preflightChecks(input: {
     out.push(!fit.known ? { ok: true, text: `obleth couldn't read ${fit.name}'s nodes, so it can't check the fit` } : fit.fits ? { ok: true, text: `One replica fits a ${fit.name} node` } : { ok: false, text: `Doesn't fit ${fit.name}: ${fit.reason}` });
     if (input.minutes && fit.maxMinutes) out.push(input.minutes <= fit.maxMinutes ? { ok: true, text: `${walltimeLabel(input.minutes)} is inside ${fit.name}'s ${walltimeLabel(fit.maxMinutes)} limit` } : { ok: false, text: `${walltimeLabel(input.minutes)} is over ${fit.name}'s ${walltimeLabel(fit.maxMinutes)} limit` });
   } else {
-    out.push({ ok: false, text: "Pick a partition" });
+    out.push({ ok: true, text: "No partition is picked, so Slurm uses the cluster's default partition" });
   }
   if (input.account && input.accounts.length) {
     const has = input.accounts.includes(input.account);

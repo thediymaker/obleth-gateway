@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState, useTransition } from "react";
+import { useEffect, useMemo, useState, useTransition } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Check } from "lucide-react";
@@ -8,12 +8,14 @@ import { launchRecipeAction, saveRecipeFromFormAction } from "@/app/actions";
 import { Configure } from "@/components/deployments/new/configure";
 import { Picker, type Picked, type PickerTab } from "@/components/deployments/new/picker";
 import { Review } from "@/components/deployments/new/review";
+import { SlurmConnection } from "@/components/deployments/slurm-connection";
 import { Notice } from "@/components/models/ui";
 import type { RecipeCard } from "@/components/recipes/recipe-card";
 import { baselineForm, formProblems, getField, setField, toOverrides, type DeployForm, type FieldPath } from "@/lib/deploy-form";
-import { deploymentHref } from "@/lib/deployments-model";
+import { deploymentHref, provisionerHealth, START_PROVISIONER } from "@/lib/deployments-model";
+import type { SlurmSettingsView } from "@/lib/obleth";
 import { learnFrom, type LaunchRecord } from "@/lib/launch-learning";
-import { EMPTY_CLUSTER, type ClusterValues } from "@/lib/recipe-inputs";
+import { EMPTY_CLUSTER, resolveClusterTokens, type ClusterValues } from "@/lib/recipe-inputs";
 import { savedName } from "@/lib/recipe-save";
 import { useClusterResources } from "@/lib/use-cluster-resources";
 import { cn } from "@/lib/utils";
@@ -39,10 +41,12 @@ function Steps({ step, onPick, reached }: { step: Step; onPick: (s: Step) => voi
   );
 }
 
-export function NewDeployment({ recipes, takenNames, slurmOn, initialRecipe, cluster = EMPTY_CLUSTER, launches = [] }: {
+export function NewDeployment({ recipes, takenNames, slurmOn, slurm, initialRecipe, cluster = EMPTY_CLUSTER, launches = [] }: {
   recipes: RecipeCard[];
   takenNames: string[];
   slurmOn: boolean;
+  /** The Slurm settings; undefined when they couldn't be read, null when absent. */
+  slurm?: SlurmSettingsView | null;
   initialRecipe?: string;
   cluster?: ClusterValues;
   launches?: LaunchRecord[];
@@ -64,6 +68,19 @@ export function NewDeployment({ recipes, takenNames, slurmOn, initialRecipe, clu
   const [saveAs, setSaveAs] = useState({ on: false, name: "" });
   const [pending, start] = useTransition();
   const [error, setError] = useState<string | null>(null);
+  const [connectionOpen, setConnectionOpen] = useState(false);
+  const slurmUnread = slurm === undefined && !slurmOn;
+  const prov = slurm ? provisionerHealth(slurm) : null;
+
+  // A cluster default set on the connection sheet fills the values still
+  // waiting for it, without losing anything else filled in.
+  useEffect(() => {
+    setForm((f) => {
+      if (!f) return f;
+      const inputs = Object.fromEntries(Object.entries(f.inputs).map(([k, v]) => [k, /\{\{\s*cluster\./.test(v) ? resolveClusterTokens(v, cluster) : v]));
+      return JSON.stringify(inputs) === JSON.stringify(f.inputs) ? f : { ...f, inputs };
+    });
+  }, [cluster]);
 
   const card = usable.find((r) => r.id === (form?.recipe ?? picked?.recipeId));
   const partitionMax = useMemo(() => {
@@ -140,16 +157,23 @@ export function NewDeployment({ recipes, takenNames, slurmOn, initialRecipe, clu
         <Steps step={step} onPick={(s) => (s === 2 && step === 1 ? begin() : go(s))} reached={reached} />
       </div>
 
-      {!slurmOn && (
+      {slurmUnread ? (
+        <Notice strong>obleth couldn&apos;t read the Slurm settings just now, so it can&apos;t tell whether Slurm is set up. Reload the page to try again.</Notice>
+      ) : !slurmOn ? (
         <Notice strong>Slurm isn&apos;t set up on this gateway yet, so nothing can be launched. <Link href="/deployments?slurm=1" className="underline underline-offset-2">Set up Slurm ›</Link></Notice>
-      )}
+      ) : prov?.kind === "never" ? (
+        <Notice strong>No provisioner has run yet, so nothing will be launched. {START_PROVISIONER}</Notice>
+      ) : prov?.kind === "stopped" ? (
+        <Notice strong>The provisioner isn&apos;t running, so nothing is launched until it&apos;s back. {START_PROVISIONER}</Notice>
+      ) : null}
+      {connectionOpen && slurm && <SlurmConnection settings={slurm} replicas={0} onClose={() => setConnectionOpen(false)} onSaved={() => router.refresh()} />}
 
       {step === 1 && <Picker recipes={recipes} launches={launches} resources={resources} tab={tab} onTab={setTab} picked={picked} onPick={setPicked} onNext={begin} />}
       {step === 2 && form && base && card?.preview && learned && (
-        <Configure card={card} form={form} base={base} learnedPaths={learnedPaths} learned={learned} problems={problems} resources={resources} cv={cluster} weightsGb={picked?.hf?.weightsGb ?? card.preview.weightsGb ?? null} view={view} onView={setView} onChange={change} onBack={() => go(1)} onNext={() => go(3)} />
+        <Configure card={card} form={form} base={base} learnedPaths={learnedPaths} learned={learned} problems={problems} resources={resources} cv={cluster} weightsGb={picked?.hf?.weightsGb ?? card.preview.weightsGb ?? null} view={view} onView={setView} onChange={change} onBack={() => go(1)} onNext={() => go(3)} onOpenConnection={slurm ? () => setConnectionOpen(true) : undefined} />
       )}
       {step === 3 && form && card?.preview && (
-        <Review card={card} form={form} cv={cluster} script={script} onScript={setScript} problems={problems} slurmOn={slurmOn} pending={pending} error={error} saveAs={saveAs} onSaveAs={setSaveAs} onBack={() => go(2)} onLaunch={launch} />
+        <Review card={card} form={form} cv={cluster} script={script} onScript={setScript} problems={problems} slurmOn={slurmOn || slurmUnread} pending={pending} error={error} saveAs={saveAs} onSaveAs={setSaveAs} onBack={() => go(2)} onLaunch={launch} />
       )}
     </div>
   );

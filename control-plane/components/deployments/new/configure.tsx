@@ -115,6 +115,8 @@ export interface ConfigureProps {
   onChange: (form: DeployForm, learnedPath?: FieldPath) => void;
   onBack: () => void;
   onNext: () => void;
+  /** Opens the Slurm connection on this page, so nothing filled in is lost. */
+  onOpenConnection?: () => void;
 }
 
 export function Configure(props: ConfigureProps) {
@@ -179,13 +181,13 @@ export function Configure(props: ConfigureProps) {
           <YamlEditor form={form} base={base} inputNames={p.inputs.map((i) => i.name)} problems={problems} learned={learned} learnedPaths={props.learnedPaths} onChange={(f) => props.onChange(f)} />
         ) : (
           <>
-            <Section title="Partition" note={resources.partitions.length ? "Read from the cluster" : "The cluster's partitions couldn't be read"}>
+            <Section title="Partition" note={resources.partitions.length ? (resources.error ? `Read from the cluster, but some of it is missing: ${resources.error}` : "Read from the cluster") : resources.error ?? "The cluster's partitions couldn't be read, so type one, or leave it blank for the cluster's default"}>
               {resources.partitions.length ? (
                 <div className="grid gap-2.5 px-5 pb-4 lg:grid-cols-3">
                   {fits.map((f) => <PartitionCard key={f.name} f={f} on={form.slurm.partition === f.name} nodes={form.slurm.nodes} onPick={() => set("slurm.partition", f.name)} />)}
                 </div>
               ) : (
-                <div className="px-5 pb-4"><input aria-label="Partition" value={form.slurm.partition} onChange={(e) => set("slurm.partition", e.target.value)} placeholder="Partition name" className={cn(input, "w-64 font-mono text-[12.5px]")} /></div>
+                <div className="px-5 pb-4"><input aria-label="Partition" value={form.slurm.partition} onChange={(e) => set("slurm.partition", e.target.value)} placeholder="Blank: the cluster's default" className={cn(input, "w-64 font-mono text-[12.5px]")} /></div>
               )}
               {problemAt("slurm.partition") && <p className="px-5 pb-3 text-[12px] font-medium">! {problemAt("slurm.partition")}</p>}
             </Section>
@@ -238,12 +240,12 @@ export function Configure(props: ConfigureProps) {
                 {learned.prefillWhy["slurm.qos"] && props.learnedPaths.has("slurm.qos") && <Why>{learned.prefillWhy["slurm.qos"]}</Why>}
                 {suggestionsAt("slurm.qos").map((s) => <Hint key={s.title} s={s} onApply={apply} />)}
               </Row>
-              <Row label="Walltime" hint="When a job's time is up, obleth submits another to keep the count." source={sourceOf("slurm.time_limit")} saved={saved} problem={problemAt("slurm.time_limit")}>
+              <Row label="Walltime" hint="Slurm ends each job at this limit, and obleth starts another to keep the count. With one replica the model is down until the new job serves, so keep two or pick the longest walltime." source={sourceOf("slurm.time_limit")} saved={saved} problem={problemAt("slurm.time_limit")}>
                 <Walltime value={form.slurm.time_limit} max={fit?.maxMinutes ?? null} onChange={(v) => set("slurm.time_limit", v)} />
                 {suggestionsAt("slurm.time_limit").map((s) => <Hint key={s.title} s={s} onApply={apply} />)}
               </Row>
               {!nodeOptions && (
-                <Row label="Nodes" hint="Per replica. More than one only if the script spreads across them." source={sourceOf("slurm.nodes")} saved={saved} problem={problemAt("slurm.nodes")}>
+                <Row label="Nodes" hint="How many nodes each replica's job gets. Use more than one only when the script spreads the model across them." source={sourceOf("slurm.nodes")} saved={saved} problem={problemAt("slurm.nodes")}>
                   <input aria-label="Nodes" inputMode="numeric" value={String(form.slurm.nodes)} onChange={(e) => set("slurm.nodes", Number(e.target.value) || 0)} className={cn(input, "w-24 font-mono text-[12.5px]")} />
                   {suggestionsAt("slurm.nodes").map((s) => <Hint key={s.title} s={s} onApply={apply} />)}
                 </Row>
@@ -255,7 +257,7 @@ export function Configure(props: ConfigureProps) {
                   ))}
                 </div>
               </Row>
-              <Row label="Only on nodes with" hint="Slurm features (constraint)." source={sourceOf("slurm.constraints")} saved={saved}>
+              <Row label="Only on nodes with" hint="Only run on nodes that have all of these Slurm features." source={sourceOf("slurm.constraints")} saved={saved}>
                 <Constraints value={form.slurm.constraints} features={featuresOf(resources, form.slurm.partition)} onChange={(v) => set("slurm.constraints", v)} />
               </Row>
               <Row label="Avoid nodes" hint="None of the replicas will run on these." source={sourceOf("slurm.exclude")} saved={saved}>
@@ -264,14 +266,14 @@ export function Configure(props: ConfigureProps) {
               </Row>
             </Section>
 
-            <Section title="Container and paths" note={<>Cluster defaults are set on the <Link href="/deployments?slurm=1" className="underline underline-offset-[3px]">Slurm connection</Link>; changes here are for this deployment only</>}>
+            <Section title="Container and paths" note={<>Cluster defaults are set on the {props.onOpenConnection ? <button type="button" onClick={props.onOpenConnection} className="underline underline-offset-[3px]">Slurm connection</button> : <Link href="/deployments?slurm=1" className="underline underline-offset-[3px]">Slurm connection</Link>}; changes here are for this deployment only</>}>
               {paths.map((i) => (
                 <Row key={i.name} label={i.label || i.name} hint={i.help} source={sourceOf(`inputs.${i.name}`)} saved={saved} problem={problemAt(`inputs.${i.name}`)}>
                   <InputControl spec={i} value={form.inputs[i.name] ?? ""} onChange={(v) => set(`inputs.${i.name}`, v)} />
                 </Row>
               ))}
-              <Row label="Job logs" hint="Where Slurm writes each job's output." source={sourceOf("slurm.log_output_dir")} saved={saved}>
-                <input aria-label="Job logs" value={form.slurm.log_output_dir} onChange={(e) => set("slurm.log_output_dir", e.target.value)} placeholder="Slurm's default (the job's working directory)" className={cn(input, "w-full font-mono text-[12.5px]")} />
+              <Row label="Job logs" hint="The folder Slurm writes each job's output to, as a full path. Slurm doesn't create this folder. Create it first and make sure the Slurm user can write to it, or jobs fail before they start." source={sourceOf("slurm.log_output_dir")} saved={saved} problem={problemAt("slurm.log_output_dir")}>
+                <input aria-label="Job logs" value={form.slurm.log_output_dir} onChange={(e) => set("slurm.log_output_dir", e.target.value)} placeholder="Empty: the job's working folder, /tmp on the node" className={cn(input, "w-full font-mono text-[12.5px]")} />
               </Row>
               {cv.setup.trim() && p.rawBody.includes("cluster.setup") && (
                 <Row label="Load before launch" hint="Runs at the top of the job." source="cluster" saved={saved}>
@@ -287,14 +289,14 @@ export function Configure(props: ConfigureProps) {
               <Row label="API model name" hint="What clients send as model." source={sourceOf("name")} saved={saved} problem={problemAt("name")}>
                 <input aria-label="API model name" value={form.name} onChange={(e) => set("name", e.target.value)} className={cn(input, "w-80 font-mono text-[12.5px]")} />
               </Row>
-              <Row label="Replicas" hint="Failed launches count jobs on record, each forgotten 15 minutes after it ends. 0 never stops." source={["serving.keep_running", "serving.serve_from", "serving.stop_after_failed_launches"].some((x) => changed.has(x)) ? "changed" : "recipe"} saved={saved} problem={problemAt("serving.keep_running") ?? problemAt("serving.serve_from")}>
+              <Row label="Replicas" hint="Models calls it healthy once Healthy when replicas answer; requests go to every healthy replica either way. A launch fails when its job ends, or never answers, before it serves; after Stop after failed launches of them, obleth stops trying until you say Try again. Set it to 0 to never stop." source={["serving.keep_running", "serving.serve_from", "serving.stop_after_failed_launches"].some((x) => changed.has(x)) ? "changed" : "recipe"} saved={saved} problem={problemAt("serving.keep_running") ?? problemAt("serving.serve_from")}>
                 <div className="grid gap-2.5 sm:grid-cols-3">
-                  {([["serving.keep_running", "Keep running"], ["serving.serve_from", "Serve once this many are healthy"], ["serving.stop_after_failed_launches", "Stop after failed launches"]] as const).map(([path, label]) => (
+                  {([["serving.keep_running", "Keep running"], ["serving.serve_from", "Healthy when"], ["serving.stop_after_failed_launches", "Stop after failed launches"]] as const).map(([path, label]) => (
                     <label key={path} className="flex flex-col gap-1 text-[12px] text-muted-foreground">{label}<input aria-label={label} inputMode="numeric" value={String(getField(form, path) ?? "")} onChange={(e) => set(path, Number(e.target.value) || 0)} className={cn(input, "font-mono text-[12.5px] text-foreground")} /></label>
                   ))}
                 </div>
               </Row>
-              <Row label="Health check" hint="The port comes from $OBLETH_SERVING_PORT." source={sourceOf("serving.health_path")} saved={saved} problem={problemAt("serving.health_path")}>
+              <Row label="Health check" hint="The path obleth checks until the model answers. obleth passes each job a free port as $OBLETH_SERVING_PORT, and the server must listen on it." source={sourceOf("serving.health_path")} saved={saved} problem={problemAt("serving.health_path")}>
                 <input aria-label="Health path" value={form.serving.health_path} onChange={(e) => set("serving.health_path", e.target.value)} className={cn(input, "w-56 font-mono text-[12.5px]")} />
               </Row>
             </Section>

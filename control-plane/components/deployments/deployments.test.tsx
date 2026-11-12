@@ -312,7 +312,7 @@ describe("a new deployment", () => {
   it("won't go on while a required value has no cluster default", async () => {
     await render(<NewDeployment recipes={[recipe]} takenNames={[]} slurmOn initialRecipe="glm-5.2-multiuser" />);
     await act(async () => button("Choose where it runs →").click());
-    expect(host.textContent).toContain("Weight cache uses a cluster default that isn't set");
+    expect(host.textContent).toContain("Weight cache comes from Cluster defaults › Weight cache, which isn't set");
     expect(button("Review the script →").disabled).toBe(true);
     await type(host.querySelector<HTMLInputElement>('input[aria-label="Weight cache"]')!, "/scratch/me");
     expect(button("Review the script →").disabled).toBe(false);

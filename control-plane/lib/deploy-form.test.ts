@@ -32,7 +32,7 @@ describe("the deploy form", () => {
   it("checks against the cluster and suggests near misses", () => {
     const f = setField(setField(setField(base, "slurm.partition", "gh200"), "slurm.qos", "lng"), "slurm.time_limit", "8-00:00:00");
     const msgs = formProblems(f, p, resources, []).map((x) => x.message);
-    expect(msgs).toContain("lng isn't a QoS your user has. Did you mean long?");
+    expect(msgs).toContain("There's no QoS called lng on this cluster. Did you mean long?");
     expect(msgs.some((m) => m.includes("over gh200's 7 days limit"))).toBe(true);
   });
 
@@ -40,6 +40,16 @@ describe("the deploy form", () => {
     const r = { ...resources, partitions: [{ ...resources.partitions[0], allowed_accounts: ["ai-research"] }], accounts: ["ai-research", "grp_rcadmins"] };
     const f = setField(setField(base, "slurm.partition", "gh200"), "slurm.account", "grp_rcadmins");
     expect(formProblems(f, p, r, []).map((x) => x.message)).toContain("gh200 doesn't take grp_rcadmins. It takes ai-research.");
+  });
+
+  it("allows a blank partition, rejects a relative log folder and bad gres, and names a missing cluster default", () => {
+    const withImage = { ...p, inputs: [{ name: "image", label: "Container image", type: "path" as const, default: "{{cluster.image.vllm}}", required: true }] };
+    const f = setField(setField(setField(baselineForm("x", withImage, EMPTY_CLUSTER), "slurm.log_output_dir", "logs"), "slurm.gres", "gpu:"), "inputs.image", "{{cluster.image.vllm}}");
+    const msgs = formProblems(f, withImage, resources, []).map((x) => x.message);
+    expect(msgs.some((m) => m.includes("partition"))).toBe(false);
+    expect(msgs.some((m) => m.startsWith("Job logs must be a full path"))).toBe(true);
+    expect(msgs.some((m) => m.startsWith("Write GPUs as Slurm gres"))).toBe(true);
+    expect(msgs).toContain("Container image comes from Cluster defaults › Image per engine › vLLM, which isn't set. Set it on the Slurm connection, or type a value here for this launch");
   });
 
   it("round-trips through YAML, writing only what changed", () => {

@@ -2829,7 +2829,6 @@ export async function launchRecipeAction(recipeId: string, overrides: DeployOver
     if (models.some((m) => m.model_name === createBody.model_name || m.aliases?.includes(createBody.model_name) || m.variants?.some((v) => v.name === createBody.model_name))) {
       return { ok: false, error: `A model called ${createBody.model_name} already exists. Pick another name.` };
     }
-    if (!managedBody.partition) return { ok: false, error: "Pick a partition." };
     // A launched model starts staged, like one added by hand: it is made
     // active on its page once it has been tried. It can already do what the
     // recipe's flags turned on, e.g. function calling.
