@@ -712,7 +712,7 @@ export async function loadRecipeCards(): Promise<RecipeCard[]> {
     try {
       return { id, text: readRecipeText(id) };
     } catch (e) {
-      return { id, text: null, error: `Can't be read: ${(e as Error).message}` };
+      return { id, text: null, error: `the file can't be opened (${(e as Error).message})` };
     }
   });
   const parsed = docs.map((d): ParsedRecipe => (d.text === null ? { id: d.id, valid: false, error: d.error, warnings: [] } : parseRecipe(d.id, d.text)));

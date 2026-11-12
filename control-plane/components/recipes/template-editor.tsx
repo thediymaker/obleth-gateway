@@ -1,6 +1,6 @@
 "use client";
 
-// Template editor dialog for creating, editing, and cloning recipe templates.
+// Recipe editor dialog for creating, editing, and copying saved recipes.
 //
 // Validation strategy: parseRecipe lives in sbatch-recipes.ts which imports
 // node:fs at the module level. Importing it into a "use client" component would
@@ -22,6 +22,44 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+
+// A minimal recipe in the shipped shape: the server listens on the port obleth
+// picks for each replica and serves under the deployment's name.
+const RECIPE_PLACEHOLDER = [
+  "---",
+  "name: My model",
+  "engine: vllm",
+  "kind: model",
+  "model: org/model",
+  "model_type: chat",
+  "api_model_name: my-model",
+  "health_path: /health",
+  "target_replicas: 1",
+  "max_job_failures: 2",
+  "inputs:",
+  "  - name: context",
+  "    label: Context length",
+  "    type: number",
+  "    default: 32768",
+  "    required: true",
+  "  - name: cache",
+  "    label: Weight cache",
+  "    type: path",
+  '    default: "{{cluster.cache}}"',
+  "    required: true",
+  "---",
+  "#!/bin/bash -l",
+  "#SBATCH --gres=gpu:1",
+  "#SBATCH --cpus-per-task=8",
+  "#SBATCH --mem=48G",
+  "{{cluster.setup}}",
+  "set -euo pipefail",
+  'export HF_HOME="{{cache}}"',
+  "exec vllm serve org/model \\",
+  "  --served-model-name {{api_model_name}} \\",
+  '  --host 0.0.0.0 --port "$OBLETH_SERVING_PORT" \\',
+  "  --max-model-len {{context}}",
+].join("\n");
 
 export interface TemplateEditorProps {
   open: boolean;
@@ -60,7 +98,7 @@ export function TemplateEditor({
 
   function handleSave() {
     if (!name.trim()) {
-      setError("Template name is required.");
+      setError("Name the recipe.");
       return;
     }
     setError(null);
@@ -76,17 +114,17 @@ export function TemplateEditor({
   }
 
   const isNew = !initial?.id;
-  const title = isNew ? "New template" : "Edit template";
+  const title = isNew ? "New recipe" : "Edit recipe";
   const description = isNew
-    ? "Author a new recipe template stored in the database."
-    : `Editing "${initial?.name ?? initial?.id}". Changes apply only to the saved template.`;
+    ? "Write a recipe: a header that says what it serves and the job script that serves it. It is saved on this gateway, under Saved."
+    : `Editing "${initial?.name ?? initial?.id}". Changes apply only to this saved recipe.`;
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent className="grid max-h-[85vh] w-[min(720px,calc(100vw-2rem))] max-w-none grid-rows-[auto_minmax(0,1fr)_auto] gap-0 overflow-hidden p-0">
         <DialogHeader className="border-b border-border/70 bg-background/35 px-6 py-4 pr-12">
           <p className="mb-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-            Recipe template
+            Recipe
           </p>
           <DialogTitle className="text-lg">{title}</DialogTitle>
           <DialogDescription className="mt-1">{description}</DialogDescription>
@@ -95,7 +133,7 @@ export function TemplateEditor({
         <div className="min-h-0 overflow-y-auto px-6 py-4 space-y-4">
           <div className="space-y-1.5">
             <Label htmlFor="template-name" className="text-xs font-medium">
-              Template name
+              Name
             </Label>
             <Input
               id="template-name"
@@ -123,7 +161,7 @@ export function TemplateEditor({
               rows={18}
               spellCheck={false}
               className="w-full resize-y rounded-md border border-input bg-background/70 px-3 py-2 font-mono text-xs leading-relaxed shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
-              placeholder={"---\nname: My Template\nengine: vllm\nmodel_type: chat\napi_model_name: my-model\nport: 8000\ntarget_replicas: 2\n---\n#!/bin/bash\n# sbatch script here"}
+              placeholder={RECIPE_PLACEHOLDER}
             />
           </div>
 
@@ -144,7 +182,7 @@ export function TemplateEditor({
             Cancel
           </Button>
           <Button type="button" onClick={handleSave} disabled={pending}>
-            {pending ? "Saving..." : "Save template"}
+            {pending ? "Saving…" : "Save recipe"}
           </Button>
         </DialogFooter>
       </DialogContent>
