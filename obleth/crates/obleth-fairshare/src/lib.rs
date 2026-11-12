@@ -1016,13 +1016,17 @@ struct Pool {
     /// Which end user a derived key stands for (dashboards only).
     key_end_user: HashMap<Uuid, EndUser>,
     virtual_time: f64,
-    /// Per tenant, the virtual time of its keys, in `key_served / key_weight`:
-    /// the lowest standing among its keys with a request queued, as of the
-    /// tenant's last grant from the queue. A key that comes back with nothing
-    /// queued is placed here, level with the keys it now competes with. The
-    /// pool's `virtual_time` is the wrong place for it: that is a tenant
-    /// total, the service of every key in the tenant together.
+    /// Per tenant, the virtual time of its keys, in `key_served / key_weight`
+    /// (a key's standing). A key that comes back with nothing queued is
+    /// raised to it, so it rejoins level with the keys it now competes with.
+    /// The pool's `virtual_time` is the wrong place for that: it is a tenant
+    /// total, the service of every key in the tenant together. See
+    /// [`Pool::advance_key_clock`].
     key_clock: HashMap<Uuid, f64>,
+    /// Per tenant, its keys with nothing queued or running that are kept
+    /// because they stand above the key clock. Each is forgotten once the
+    /// clock reaches it.
+    key_idle: HashMap<Uuid, HashSet<Uuid>>,
     /// When the pool last became idle (no permits, no waiters); `None` while
     /// it is in use.
     idle_since: Option<Instant>,
@@ -1082,6 +1086,7 @@ impl Pool {
             key_end_user: HashMap::new(),
             virtual_time: 0.0,
             key_clock: HashMap::new(),
+            key_idle: HashMap::new(),
             idle_since: None,
             pending: HashMap::new(),
             probing: false,
@@ -1369,7 +1374,77 @@ impl Pool {
             vt
         }) += cost as f64;
         let start = self.key_start(tenant, key);
-        *self.key_served.entry(key).or_insert(start) += cost as f64;
+        let served = self.key_served.entry(key).or_insert(start);
+        let began = *served;
+        *served += cost as f64;
+        let began = began / self.key_weight_of(&key);
+        self.advance_key_clock(tenant, began);
+    }
+
+    /// Start-time fair queueing among one tenant's keys, after a grant to
+    /// one of them that started from standing `began`. The tenant's key
+    /// clock moves up to the lowest standing among its keys that are queued
+    /// and could be picked, or to `began` when none is. It never moves back,
+    /// so a key held at its cap cannot pull it down, and a key that sends
+    /// one request at a time moves it as much as a backlogged one does.
+    /// Quiet keys the clock has reached are forgotten.
+    fn advance_key_clock(&mut self, tenant: Uuid, began: f64) {
+        let waiting = self
+            .queues
+            .get(&tenant)
+            .into_iter()
+            .flat_map(|q| q.keys.iter())
+            .filter(|(k, d)| !d.is_empty() && self.key_open(k))
+            .map(|(k, _)| self.key_standing(k))
+            .fold(f64::INFINITY, f64::min);
+        let target = if waiting.is_finite() { waiting } else { began };
+        let clock = self.key_clock.entry(tenant).or_insert(0.0);
+        if target <= *clock {
+            return;
+        }
+        *clock = target;
+        self.forget_caught_up_keys(tenant);
+    }
+
+    /// Forget `tenant`'s kept idle keys that its key clock has reached: on
+    /// return they would be raised to it anyway. Keys that have become
+    /// active again leave the idle set.
+    fn forget_caught_up_keys(&mut self, tenant: Uuid) {
+        let Some(idle) = self.key_idle.get(&tenant) else {
+            return;
+        };
+        let clock = self.key_clock.get(&tenant).copied().unwrap_or(0.0);
+        let mut active = Vec::new();
+        let mut caught_up = Vec::new();
+        for key in idle {
+            if !self.key_quiet(&tenant, key) {
+                active.push(*key);
+            } else if self.key_standing(key) <= clock {
+                caught_up.push(*key);
+            }
+        }
+        if let Some(idle) = self.key_idle.get_mut(&tenant) {
+            for key in &active {
+                idle.remove(key);
+            }
+        }
+        for key in &caught_up {
+            self.forget_key(key);
+        }
+        if self.key_idle.get(&tenant).is_some_and(HashSet::is_empty) {
+            self.key_idle.remove(&tenant);
+        }
+    }
+
+    /// A key's standing: its service over its weight.
+    fn key_standing(&self, key: &Uuid) -> f64 {
+        self.key_served.get(key).copied().unwrap_or(0.0) / self.key_weight_of(key)
+    }
+
+    /// Nothing of `key` is queued or running.
+    fn key_quiet(&self, tenant: &Uuid, key: &Uuid) -> bool {
+        self.queues.get(tenant).is_none_or(|q| q.key_len(key) == 0)
+            && !self.key_in_flight.contains_key(key)
     }
 
     /// Where a key of `tenant` starts, in `key_served`: its tenant's key
@@ -1556,7 +1631,7 @@ impl Pool {
             }
             self.track_waiter_meta(tenant, key, &waiter);
             self.occupy(tenant, key, waiter.cost);
-            self.advance_virtual_time(tenant);
+            self.advance_virtual_time();
             return (Some((tenant, key, waiter)), dropped);
         }
     }
@@ -1815,7 +1890,7 @@ impl Pool {
             if !self.key_open(key) {
                 continue;
             }
-            let score = self.key_served.get(key).copied().unwrap_or(0.0) / self.key_weight_of(key);
+            let score = self.key_standing(key);
             let better = match best {
                 None => true,
                 Some((_, best_score, best_enqueued)) => {
@@ -1829,11 +1904,7 @@ impl Pool {
         best.map(|(k, _, _)| k)
     }
 
-    /// After a grant to `tenant`: move the pool's virtual time to the lowest
-    /// `served` among tenants still queued, and `tenant`'s key clock to the
-    /// lowest standing among its keys still queued. Either stays put when
-    /// nothing is left queued for it.
-    fn advance_virtual_time(&mut self, tenant: Uuid) {
+    fn advance_virtual_time(&mut self) {
         let min_active = self
             .queues
             .iter()
@@ -1842,17 +1913,6 @@ impl Pool {
             .fold(f64::INFINITY, f64::min);
         if min_active.is_finite() {
             self.virtual_time = min_active;
-        }
-        let min_key = self
-            .queues
-            .get(&tenant)
-            .into_iter()
-            .flat_map(|q| q.keys.iter())
-            .filter(|(_, d)| !d.is_empty())
-            .filter_map(|(k, _)| Some(self.key_served.get(k)? / self.key_weight_of(k)))
-            .fold(f64::INFINITY, f64::min);
-        if min_key.is_finite() {
-            self.key_clock.insert(tenant, min_key);
         }
     }
 
@@ -1930,7 +1990,7 @@ impl Pool {
         waiter.jumped = oldest.is_some_and(|t| t < waiter.enqueued);
         self.track_waiter_meta(tenant, key, &waiter);
         self.occupy(tenant, key, waiter.cost);
-        self.advance_virtual_time(tenant);
+        self.advance_virtual_time();
         Some((tenant, key, waiter))
     }
 
@@ -2047,7 +2107,7 @@ impl Pool {
                 let jumped = at > 0 || self.oldest_eligible().is_some_and(|t| t < waiter.enqueued);
                 self.track_waiter_meta(tenant, key, &waiter);
                 self.charge(tenant, key, waiter.cost);
-                self.advance_virtual_time(tenant);
+                self.advance_virtual_time();
                 let waited = waiter.enqueued.elapsed();
                 let grant = Grant::new(hold.tenant, hold.key, waiter.session, jumped);
                 self.send(grant, waiter.respond, Admission::Queued, waited);
@@ -2060,18 +2120,15 @@ impl Pool {
 
     fn forget_if_quiet(&mut self, tenant: Uuid, key: Uuid) {
         // A key that is idle and at or below its tenant's key clock would be
-        // placed there on return anyway, so its entry carries no information
-        // worth keeping.
-        let key_queued = self
-            .queues
-            .get(&tenant)
-            .map(|q| q.key_len(&key))
-            .unwrap_or(0);
-        if key_queued == 0
-            && !self.key_in_flight.contains_key(&key)
-            && self.key_served.get(&key).copied().unwrap_or(0.0) <= self.key_start(tenant, key)
-        {
-            self.forget_key(&key);
+        // raised to it on return anyway, so its entry carries no information
+        // worth keeping. One above the clock is kept until the clock reaches
+        // it.
+        if self.key_quiet(&tenant, &key) {
+            if self.key_served.get(&key).copied().unwrap_or(0.0) <= self.key_start(tenant, key) {
+                self.forget_key(&key);
+            } else {
+                self.key_idle.entry(tenant).or_default().insert(key);
+            }
         }
         // The same rule for the tenant, so tenants that have gone quiet (or
         // have been deleted) stop showing up in the pool's share tree.
@@ -2085,6 +2142,11 @@ impl Pool {
     }
 
     fn forget_key(&mut self, key: &Uuid) {
+        if let Some(tenant) = self.key_tenant.get(key).copied() {
+            if let Some(idle) = self.key_idle.get_mut(&tenant) {
+                idle.remove(key);
+            }
+        }
         self.key_served.remove(key);
         self.key_weight.remove(key);
         self.key_cap.remove(key);
@@ -2106,6 +2168,7 @@ impl Pool {
             self.forget_key(key);
         }
         self.key_clock.remove(tenant);
+        self.key_idle.remove(tenant);
         self.served.remove(tenant);
         self.served_base.remove(tenant);
         self.tenant_weight.remove(tenant);
@@ -2148,6 +2211,7 @@ impl Pool {
         self.key_end_user.clear();
         self.virtual_time = 0.0;
         self.key_clock.clear();
+        self.key_idle.clear();
     }
 
     /// Per-group in-flight/queued totals, for the history sampler. Cheaper
@@ -3889,64 +3953,60 @@ mod tests {
         assert_eq!(score("many"), score("one"));
     }
 
-    /// One tenant on a one-slot pool, with `busy` holding the slot and 200
-    /// requests of 100 tokens queued behind it.
-    struct OneTenant {
+    /// A pool of `slots` driven by hand: requests are queued, and each grant
+    /// first frees the oldest running slot when the pool is full.
+    struct Sim {
         pool: Pool,
-        tenant: Uuid,
-        busy: Uuid,
-        running: Uuid,
+        running: VecDeque<(Uuid, Uuid)>,
         callers: Vec<oneshot::Receiver<Admitted>>,
     }
 
-    impl OneTenant {
-        fn new() -> Self {
+    impl Sim {
+        fn new(slots: usize) -> Self {
             let (tx, _rx) = mpsc::unbounded_channel();
-            let pool = Pool::new(
-                PoolKey::Model("m".into()),
-                FairshareAlgorithm::Weighted,
-                1,
-                tx,
-            );
-            let (tenant, busy) = (Uuid::new_v4(), Uuid::new_v4());
-            let mut t = OneTenant {
-                pool,
-                tenant,
-                busy,
-                running: busy,
+            Sim {
+                pool: Pool::new(
+                    PoolKey::Model("m".into()),
+                    FairshareAlgorithm::Weighted,
+                    slots,
+                    tx,
+                ),
+                running: VecDeque::new(),
                 callers: Vec::new(),
-            };
-            t.pool
-                .track_meta(&AdmitRequest::new(tenant, "m", 100).key(busy, 100));
-            t.pool.occupy(tenant, busy, 100);
-            for _ in 0..200 {
-                t.queue(busy, 100);
             }
-            t
         }
 
-        fn queue(&mut self, key: Uuid, cost: u32) {
-            let req = AdmitRequest::new(self.tenant, "m", cost).key(key, 100);
+        fn queue(&mut self, tenant: Uuid, key: Uuid, cost: u32) {
+            self.queue_req(AdmitRequest::new(tenant, "m", cost).key(key, 100));
+        }
+
+        fn queue_req(&mut self, req: AdmitRequest) {
             self.pool.track_meta(&req);
             let (respond, admitted) = oneshot::channel();
             self.pool.enqueue(req, respond, Instant::now(), false);
             self.callers.push(admitted);
         }
 
-        /// Hand the slot on, one grant at a time, until `key` has it: how
-        /// many of `busy`'s requests went first.
-        fn busy_ahead_of(&mut self, key: Uuid) -> usize {
-            let mut ahead = 0;
-            loop {
-                self.pool.release(self.tenant, self.running);
-                let (next, _) = self.pool.take_next(1);
-                self.running = next.expect("a request is queued").1;
-                if self.running == key {
-                    return ahead;
-                }
-                assert_eq!(self.running, self.busy);
-                ahead += 1;
+        /// Free the oldest running slot if the pool is full, then grant the
+        /// next request. Returns its key.
+        fn grant(&mut self) -> Uuid {
+            if self.running.len() >= self.pool.cap {
+                let (tenant, key) = self.running.pop_front().expect("pool is full");
+                self.pool.release(tenant, key);
             }
+            let (next, _) = self.pool.take_next(self.pool.cap);
+            let (tenant, key, _) = next.expect("a request can be granted");
+            self.running.push_back((tenant, key));
+            key
+        }
+
+        /// Grant until `key` gets a slot: how many grants went first.
+        fn grants_before(&mut self, key: Uuid) -> usize {
+            let mut before = 0;
+            while self.grant() != key {
+                before += 1;
+            }
+            before
         }
     }
 
@@ -3957,11 +4017,16 @@ mod tests {
     /// other keys of the tenant were served before it.
     #[test]
     fn returning_key_starts_level_with_its_siblings() {
-        let mut t = OneTenant::new();
+        let mut sim = Sim::new(1);
+        let (tenant, busy) = (Uuid::new_v4(), Uuid::new_v4());
+        for _ in 0..200 {
+            sim.queue(tenant, busy, 100);
+        }
+        sim.grant();
         for i in 0..5 {
             let other = Uuid::new_v4();
-            t.queue(other, 2_000);
-            let ahead = t.busy_ahead_of(other);
+            sim.queue(tenant, other, 2_000);
+            let ahead = sim.grants_before(other);
             assert!(
                 ahead <= 1,
                 "key {i} waited for {ahead} of the backlogged key's requests"
@@ -3974,16 +4039,168 @@ mod tests {
     /// as much.
     #[test]
     fn returning_key_keeps_the_service_it_is_ahead_by() {
-        let mut t = OneTenant::new();
-        let other = Uuid::new_v4();
-        t.queue(other, 2_000);
-        assert!(t.busy_ahead_of(other) <= 1);
-        t.queue(other, 2_000);
-        let ahead = t.busy_ahead_of(other);
+        let mut sim = Sim::new(1);
+        let (tenant, busy, other) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for _ in 0..200 {
+            sim.queue(tenant, busy, 100);
+        }
+        sim.grant();
+        sim.queue(tenant, other, 2_000);
+        assert!(sim.grants_before(other) <= 1);
+        sim.queue(tenant, other, 2_000);
+        let ahead = sim.grants_before(other);
         assert!(
             (19..=21).contains(&ahead),
             "2,000 tokens ahead is 20 requests of 100, not {ahead}"
         );
+    }
+
+    /// No saved-up credit: a key that went quiet while its sibling was served
+    /// is raised to the clock, at its own weight, and does not take a run of
+    /// grants when it comes back with a backlog.
+    #[test]
+    fn idle_key_is_raised_to_the_clock_at_its_weight() {
+        for weight in [100, 50, 300] {
+            let mut sim = Sim::new(1);
+            let (tenant, busy, other) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+            let other_req = || AdmitRequest::new(tenant, "m", 100).key(other, weight);
+            for _ in 0..300 {
+                sim.queue(tenant, busy, 100);
+            }
+            sim.grant();
+            sim.queue_req(other_req());
+            sim.grants_before(other);
+            for _ in 0..50 {
+                assert_eq!(sim.grant(), busy);
+            }
+            for _ in 0..10 {
+                sim.queue_req(other_req());
+            }
+            // Over the next grants the two share by weight; without the raise
+            // the returning key would take all ten in a row.
+            let (mut run, mut longest) = (0, 0);
+            for _ in 0..20 {
+                if sim.grant() == other {
+                    run += 1;
+                    longest = longest.max(run);
+                } else {
+                    run = 0;
+                }
+            }
+            let allowed = (weight as usize).div_ceil(100) + 1;
+            assert!(
+                longest <= allowed,
+                "weight {weight}: {longest} grants in a row after coming back"
+            );
+        }
+    }
+
+    /// The clock moves with every grant to the tenant, not only while two of
+    /// its keys are queued together. A key that sends one request at a time,
+    /// in a tenant with nothing else queued, does not build a lead that a new
+    /// sibling with a backlog could take.
+    #[test]
+    fn one_at_a_time_key_has_no_lead_for_a_new_sibling_to_take() {
+        let mut sim = Sim::new(1);
+        let (tenant, other_tenant) = (Uuid::new_v4(), Uuid::new_v4());
+        let (one_at_a_time, newcomer, flood) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for _ in 0..500 {
+            sim.queue(other_tenant, flood, 100);
+        }
+        sim.grant();
+        for _ in 0..50 {
+            sim.queue(tenant, one_at_a_time, 100);
+            sim.grants_before(one_at_a_time);
+        }
+        for _ in 0..80 {
+            sim.queue(tenant, newcomer, 100);
+        }
+        sim.queue(tenant, one_at_a_time, 100);
+        let mut newcomer_first = 0;
+        loop {
+            let key = sim.grant();
+            if key == one_at_a_time {
+                break;
+            }
+            if key == newcomer {
+                newcomer_first += 1;
+            }
+        }
+        assert!(
+            newcomer_first <= 2,
+            "the new key got {newcomer_first} grants before the one-at-a-time key"
+        );
+    }
+
+    /// A queued key held at its own cap cannot be picked, so it does not hold
+    /// the clock down: a new key starts level with the open backlogged key,
+    /// not with the capped one far behind it.
+    #[test]
+    fn capped_key_does_not_hold_the_clock_back() {
+        let mut sim = Sim::new(3);
+        let tenant = Uuid::new_v4();
+        let (capped, open, newcomer) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for _ in 0..1_000 {
+            sim.queue_req(
+                AdmitRequest::new(tenant, "m", 100)
+                    .key(capped, 100)
+                    .key_cap(1),
+            );
+            sim.queue(tenant, open, 100);
+        }
+        for _ in 0..300 {
+            sim.grant();
+        }
+        for _ in 0..200 {
+            sim.queue(tenant, newcomer, 100);
+        }
+        let mut newcomer_first = 0;
+        loop {
+            let key = sim.grant();
+            if key == open {
+                break;
+            }
+            if key == newcomer {
+                newcomer_first += 1;
+            }
+        }
+        assert!(
+            newcomer_first <= 2,
+            "the new key got {newcomer_first} grants before the open backlogged key"
+        );
+    }
+
+    /// Keys that come and go are forgotten once the clock reaches them, even
+    /// in a tenant that is never quiet, and a stream of new keys takes turns
+    /// with the backlogged key rather than starving it.
+    #[test]
+    fn passing_keys_are_forgotten_and_do_not_starve_the_busy_key() {
+        let mut sim = Sim::new(1);
+        let (tenant, busy) = (Uuid::new_v4(), Uuid::new_v4());
+        for _ in 0..1_000 {
+            sim.queue(tenant, busy, 100);
+        }
+        sim.grant();
+        let mut busy_grants = 0;
+        for _ in 0..200 {
+            let passing = Uuid::new_v4();
+            sim.queue(tenant, passing, 300);
+            busy_grants += sim.grants_before(passing);
+            assert!(
+                sim.pool.key_tenant.len() <= 6,
+                "{} keys tracked",
+                sim.pool.key_tenant.len()
+            );
+        }
+        assert!(
+            busy_grants >= 190,
+            "busy key got {busy_grants} grants in 200 turns"
+        );
+        for _ in 0..10 {
+            assert_eq!(sim.grant(), busy);
+        }
+        assert_eq!(sim.pool.key_tenant.len(), 1, "only the busy key is left");
+        assert!(sim.pool.key_idle.is_empty());
     }
 
     /// A queued request counts as passed only when session affinity served
