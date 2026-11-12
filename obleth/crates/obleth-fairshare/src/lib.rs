@@ -109,6 +109,11 @@ pub const UNROUTED_POOL: &str = "(unrouted)";
 /// drops it.
 pub const IDLE_POOL_TTL: Duration = Duration::from_secs(600);
 
+/// Most idle keys a pool keeps per tenant for the lead they have over the
+/// tenant's key clock. Past it, the key with the smallest lead is forgotten,
+/// which forgives that lead.
+const MAX_IDLE_KEYS_PER_TENANT: usize = 512;
+
 /// Housekeeping period: a sixtieth of the idle TTL, kept between 1 and 10 s.
 fn housekeeping_interval(idle_pool_ttl: Duration) -> Duration {
     (idle_pool_ttl / 60).clamp(Duration::from_secs(1), Duration::from_secs(10))
@@ -1025,7 +1030,8 @@ struct Pool {
     key_clock: HashMap<Uuid, f64>,
     /// Per tenant, its keys with nothing queued or running that are kept
     /// because they stand above the key clock. Each is forgotten once the
-    /// clock reaches it.
+    /// clock reaches it, and the set holds at most
+    /// [`MAX_IDLE_KEYS_PER_TENANT`].
     key_idle: HashMap<Uuid, HashSet<Uuid>>,
     /// When the pool last became idle (no permits, no waiters); `None` while
     /// it is in use.
@@ -1388,6 +1394,11 @@ impl Pool {
     /// so a key held at its cap cannot pull it down, and a key that sends
     /// one request at a time moves it as much as a backlogged one does.
     /// Quiet keys the clock has reached are forgotten.
+    ///
+    /// Keys with nothing behind them start at the clock and so go first: new
+    /// keys arriving more slowly than the tenant is served take turns with a
+    /// backlogged sibling, and a stream of them as fast as the tenant is
+    /// served takes all of it, as fair queueing does.
     fn advance_key_clock(&mut self, tenant: Uuid, began: f64) {
         let waiting = self
             .queues
@@ -2127,7 +2138,7 @@ impl Pool {
             if self.key_served.get(&key).copied().unwrap_or(0.0) <= self.key_start(tenant, key) {
                 self.forget_key(&key);
             } else {
-                self.key_idle.entry(tenant).or_default().insert(key);
+                self.keep_idle_key(tenant, key);
             }
         }
         // The same rule for the tenant, so tenants that have gone quiet (or
@@ -2138,6 +2149,23 @@ impl Pool {
             && self.served.get(&tenant).copied().unwrap_or(0.0) <= self.virtual_time
         {
             self.forget_tenant(&tenant);
+        }
+    }
+
+    /// Keep an idle `key` for its lead over `tenant`'s key clock, forgetting
+    /// the tenant's idle key with the smallest lead if that makes too many.
+    fn keep_idle_key(&mut self, tenant: Uuid, key: Uuid) {
+        let idle = self.key_idle.entry(tenant).or_default();
+        idle.insert(key);
+        if idle.len() <= MAX_IDLE_KEYS_PER_TENANT {
+            return;
+        }
+        let smallest = self.key_idle[&tenant]
+            .iter()
+            .copied()
+            .min_by(|a, b| self.key_standing(a).total_cmp(&self.key_standing(b)));
+        if let Some(smallest) = smallest {
+            self.forget_key(&smallest);
         }
     }
 
@@ -2155,20 +2183,15 @@ impl Pool {
     }
 
     /// Only called for a tenant with no in-flight slot and an empty queue,
-    /// so none of its keys has one either. Its keys go with it: their
-    /// standings are measured from the tenant's key clock, which goes too.
+    /// so none of its keys has one either. The idle keys kept for their lead
+    /// go with it. Its key clock stays until the pool is reset, so any key
+    /// still tracked stays measured against it.
     fn forget_tenant(&mut self, tenant: &Uuid) {
-        let keys: Vec<Uuid> = self
-            .key_tenant
-            .iter()
-            .filter(|(_, t)| *t == tenant)
-            .map(|(k, _)| *k)
-            .collect();
-        for key in &keys {
-            self.forget_key(key);
+        if let Some(idle) = self.key_idle.remove(tenant) {
+            for key in &idle {
+                self.forget_key(key);
+            }
         }
-        self.key_clock.remove(tenant);
-        self.key_idle.remove(tenant);
         self.served.remove(tenant);
         self.served_base.remove(tenant);
         self.tenant_weight.remove(tenant);
@@ -4171,8 +4194,8 @@ mod tests {
     }
 
     /// Keys that come and go are forgotten once the clock reaches them, even
-    /// in a tenant that is never quiet, and a stream of new keys takes turns
-    /// with the backlogged key rather than starving it.
+    /// in a tenant that is never quiet, and new keys arriving more slowly
+    /// than the tenant is served take turns with the backlogged key.
     #[test]
     fn passing_keys_are_forgotten_and_do_not_starve_the_busy_key() {
         let mut sim = Sim::new(1);
@@ -4201,6 +4224,53 @@ mod tests {
         }
         assert_eq!(sim.pool.key_tenant.len(), 1, "only the busy key is left");
         assert!(sim.pool.key_idle.is_empty());
+    }
+
+    /// New keys arriving at half the rate the tenant is served leave a
+    /// backlogged sibling about half the grants.
+    #[test]
+    fn slower_stream_of_new_keys_leaves_the_busy_key_its_turns() {
+        let mut sim = Sim::new(1);
+        let (tenant, busy) = (Uuid::new_v4(), Uuid::new_v4());
+        for _ in 0..1_000 {
+            sim.queue(tenant, busy, 100);
+        }
+        let mut busy_grants = 0;
+        for round in 0..400 {
+            if round % 2 == 0 {
+                sim.queue(tenant, Uuid::new_v4(), 100);
+            }
+            if sim.grant() == busy {
+                busy_grants += 1;
+            }
+        }
+        assert!(
+            (180..=220).contains(&busy_grants),
+            "busy key got {busy_grants} of 400 grants"
+        );
+        assert!(sim.pool.key_tenant.len() <= 4);
+    }
+
+    /// In a tenant that is never quiet and is served only by new keys, the
+    /// key clock does not move, so served keys stay above it. The pool still
+    /// keeps no more than its bound of them.
+    #[test]
+    fn idle_keys_kept_for_a_never_quiet_tenant_are_bounded() {
+        let mut sim = Sim::new(4);
+        let tenant = Uuid::new_v4();
+        for _ in 0..3 {
+            sim.queue(tenant, Uuid::new_v4(), 100);
+        }
+        for _ in 0..(MAX_IDLE_KEYS_PER_TENANT * 3) {
+            sim.queue(tenant, Uuid::new_v4(), 100);
+            sim.grant();
+            let tracked = sim.pool.key_tenant.len();
+            assert!(
+                tracked <= MAX_IDLE_KEYS_PER_TENANT + 8,
+                "{tracked} keys tracked"
+            );
+        }
+        assert!(sim.pool.key_idle[&tenant].len() <= MAX_IDLE_KEYS_PER_TENANT);
     }
 
     /// A queued request counts as passed only when session affinity served
