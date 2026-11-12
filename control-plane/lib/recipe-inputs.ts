@@ -33,6 +33,9 @@ export interface RecipeInput {
   /** flag: what the launched model can do when it's on, e.g. a tool parser
    *  means function calling. Set on the model it creates. */
   capabilities?: ModelCapability[];
+  /** flag: what the launched model can no longer do when it's on, e.g. a
+   *  text-only switch drops vision. Wins over the recipe's `capabilities`. */
+  drops?: ModelCapability[];
   /** Default per node count ("1" → "270"), for values that follow Runs on. */
   by_nodes?: Record<string, string>;
 }
@@ -50,7 +53,32 @@ export interface ClusterValues {
 export const EMPTY_CLUSTER: ClusterValues = { cache: "", images: "", logs: "", setup: "", image: {} };
 
 const CLUSTER_TOKEN = /\{\{\s*cluster\.([a-z_]+)(?:\.([a-zA-Z0-9_.-]+))?\s*\}\}/g;
-const INPUT_TOKEN = /\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}/g;
+const INPUT_TOKEN = /\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}/g;
+/** Any {{...}} token, for finding ones nothing fills. */
+const ANY_TOKEN = /\{\{[^{}]*\}\}/g;
+
+/** The cluster values a recipe may name, for the loader's check. */
+export function knownClusterToken(key: string, sub?: string): boolean {
+  if (key === "image") return !!sub;
+  return !sub && (key === "cache" || key === "images" || key === "logs" || key === "setup");
+}
+
+/** Every {{cluster.*}} token in a text, as written ("cluster.image.vllm"). */
+export function clusterTokens(text: string): { key: string; sub?: string; text: string }[] {
+  return [...text.matchAll(CLUSTER_TOKEN)].map((m) => ({ key: m[1], sub: m[2], text: m[2] ? `cluster.${m[1]}.${m[2]}` : `cluster.${m[1]}` }));
+}
+
+/** The input names a text refers to as {{name}} (cluster tokens excluded). */
+export function inputTokens(text: string): string[] {
+  return [...new Set([...text.matchAll(INPUT_TOKEN)].map((m) => m[1]))];
+}
+
+/** {{...}} tokens that look like a recipe token (they start with a letter) but
+ *  are neither an input name nor a cluster value, as written. Other braces,
+ *  such as a Go template's {{.ID}}, are left alone. */
+export function malformedTokens(text: string): string[] {
+  return [...new Set((text.match(ANY_TOKEN) ?? []).filter((t) => /^\{\{\s*[A-Za-z_]/.test(t) && !/^\{\{\s*[a-zA-Z_][a-zA-Z0-9_]*\s*\}\}$/.test(t) && !/^\{\{\s*cluster\.[a-z_]+(?:\.[a-zA-Z0-9_.-]+)?\s*\}\}$/.test(t)))];
+}
 
 /** Join an image name onto the images folder unless it is already a path. */
 function imagePath(value: string, dir: string): string {
@@ -133,21 +161,38 @@ export function inputProblems(inputs: RecipeInput[], values: Record<string, stri
   return inputs.map((i) => inputProblem(i, values[i.name])).filter((p): p is string => !!p);
 }
 
-/** The capabilities the flags that are on give the launched model, in
- *  MODEL_CAPABILITIES order. A flag left unset follows its default. */
+/** What a rendered job script turns on by its engine flags alone: a tool
+ *  parser (vLLM, SGLang) or llama-server's --jinja templates mean tool calls,
+ *  wherever the flag came from (a flag input, the free-text extras, the script). */
+export function scriptCapabilities(script: string): ModelCapability[] {
+  // Comments don't count: a commented-out flag isn't passed.
+  const code = script.split("\n").filter((l) => !/^\s*#/.test(l)).join("\n");
+  const tools = /(^|\s)--(tool-call-parser|enable-auto-tool-choice)(\s|=|$)/m.test(code) || (/\bllama-server\b/.test(code) && /(^|\s)--jinja(\s|$)/m.test(code));
+  return tools ? ["function_calling", "tool_choice"] : [];
+}
+
+/** The capabilities the launched model gets, in MODEL_CAPABILITIES order: the
+ *  recipe's always-on `capabilities`, those of flags that are on, and those the
+ *  rendered script's engine flags imply, minus what an on flag `drops`. A flag
+ *  left unset follows its default. */
 export function inputCapabilities(
   inputs: RecipeInput[],
   values: Record<string, string> | undefined,
   cv: ClusterValues,
   nodes?: number,
+  extra: { always?: readonly ModelCapability[]; script?: string } = {},
 ): ModelCapability[] {
-  const on = new Set<ModelCapability>();
+  const on = new Set<ModelCapability>(extra.always ?? []);
+  if (extra.script) for (const c of scriptCapabilities(extra.script)) on.add(c);
+  const dropped = new Set<ModelCapability>();
   for (const input of inputs) {
-    if (input.type !== "flag" || !input.capabilities?.length) continue;
+    if (input.type !== "flag" || (!input.capabilities?.length && !input.drops?.length)) continue;
     const given = values?.[input.name]?.trim();
-    if (isOn(given ? given : inputDefault(input, cv, nodes))) for (const c of input.capabilities) on.add(c);
+    if (!isOn(given ? given : inputDefault(input, cv, nodes))) continue;
+    for (const c of input.capabilities ?? []) on.add(c);
+    for (const c of input.drops ?? []) dropped.add(c);
   }
-  return MODEL_CAPABILITIES.filter((c) => on.has(c));
+  return MODEL_CAPABILITIES.filter((c) => on.has(c) && !dropped.has(c));
 }
 
 /** What {{name}} becomes for one input and value. */
@@ -159,10 +204,12 @@ function rendered(input: RecipeInput, value: string): string {
 /**
  * Fill a script: each declared {{input}} gets its value (or default), then the
  * {{cluster.*}} tokens get the cluster's values. An optional input with no
- * value becomes empty, never a literal {{name}}. Undeclared {{…}} and all shell
- * ${…}/$(…) pass through, and filled-in text is never re-scanned for inputs.
- * With `strict`, a required input without a value throws (the server's launch
- * path); without it, the token is left for the review to show.
+ * value becomes empty, never a literal {{name}}. A value given as empty stays
+ * empty (the default is used only when no value is given), except for a flag,
+ * which has no empty state. Shell ${…}/$(…) pass through, and filled-in text is
+ * never re-scanned for inputs. With `strict` (the server's launch path), a
+ * required input without a value, or any {{…}} left unfilled, throws; without
+ * it, the token is left for the review to show.
  */
 export function renderScript(
   body: string,
@@ -174,7 +221,7 @@ export function renderScript(
   const resolved = new Map<string, string>();
   for (const input of inputs) {
     const given = values?.[input.name];
-    const value = given !== undefined && given.trim() !== "" ? given.trim() : inputDefault(input, cv, opts.nodes);
+    const value = given !== undefined && (given.trim() !== "" || input.type !== "flag") ? given.trim() : inputDefault(input, cv, opts.nodes);
     if (!value && input.type !== "flag") {
       if (input.required && opts.strict) throw new Error(`required input "${input.name}" has no value`);
       // An optional input left empty adds nothing; a required one keeps its
@@ -186,11 +233,18 @@ export function renderScript(
   }
   // Built-ins ({{api_model_name}}) fill tokens no input declares.
   for (const [k, v] of Object.entries(opts.builtins ?? {})) if (!resolved.has(k) && v) resolved.set(k, v);
-  const filled = body.replace(INPUT_TOKEN, (m, name: string) => (resolved.has(name) ? (resolved.get(name) as string) : m));
+  const unfilled = new Set<string>(malformedTokens(body));
+  const filled = body.replace(INPUT_TOKEN, (m, name: string) => {
+    if (resolved.has(name)) return resolved.get(name) as string;
+    if (!inputs.some((i) => i.name === name)) unfilled.add(m);
+    return m;
+  });
   const out = resolveClusterTokens(filled, cv);
   if (opts.strict) {
     const missing = missingClusterValues(out, cv);
     if (missing.length) throw new Error(`the cluster default${missing.length === 1 ? "" : "s"} ${missing.join(", ")} ${missing.length === 1 ? "isn't" : "aren't"} set; set ${missing.length === 1 ? "it" : "them"} on the Slurm connection`);
+    const left = [...unfilled];
+    if (left.length) throw new Error(`the script uses ${left.join(", ")}, which no input of the recipe fills; declare ${left.length === 1 ? "it" : "them"} under inputs or remove ${left.length === 1 ? "it" : "them"}`);
   }
   return out;
 }

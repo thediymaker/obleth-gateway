@@ -29,7 +29,7 @@ describe("save as recipe", () => {
   });
 
   it("sets this node count's entry of a per-node default", () => {
-    const src = "---\nname: t\nengine: vllm\nmodel_type: chat\napi_model_name: t\nport: 8000\ninputs:\n  - name: gb\n    type: number\n    default: 270\n    by_nodes: { \"1\": 270, \"4\": 20 }\n---\nrun {{gb}}\n";
+    const src = "---\nname: t\nengine: vllm\nmodel_type: chat\napi_model_name: t\nport: 8000\ninputs:\n  - name: gb\n    type: number\n    default: 270\n    by_nodes: { \"1\": 270, \"4\": 20 }\n---\nrun {{gb}} --port $OBLETH_SERVING_PORT\n";
     const r = parseRecipe("t", src);
     const f = setField(setField(baselineForm("t", buildDeployPreview(r)!, cv), "slurm.nodes", 4), "inputs.gb", "30");
     const saved = parseRecipe("s", savedRecipeText(src, f, { name: "t2", basedOn: "t" }));

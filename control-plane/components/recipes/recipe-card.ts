@@ -42,6 +42,10 @@ export interface RecipeDeployPreview {
   env?: Record<string, string>;
   description?: string;
   tested?: RecipeTest[];
+  /** The context window the launch gives the model, in tokens, when known. */
+  contextWindow?: number;
+  /** What the launched model can do with the recipe's defaults. */
+  capabilities?: string[];
 }
 
 export interface RecipeCard {

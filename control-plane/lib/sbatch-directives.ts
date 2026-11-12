@@ -19,6 +19,32 @@ export interface ParsedDirectives {
   log_output_dir?: string;
   chdir?: string;
   warnings: string[];
+  /** Directives obleth can't apply, as written ("--mem-per-gpu=80G"). A
+   *  recipe that has any is refused by the loader. */
+  unapplied?: string[];
+}
+
+/** Why an `#SBATCH` directive can't be used, and what to write instead. */
+export function unappliedAdvice(flag: string): string {
+  const key = flag.replace(/^-+/, "").split("=")[0];
+  switch (key) {
+    case "mem-per-gpu":
+    case "mem-per-cpu":
+      return `${flag} can't be applied; use --mem with the memory the whole node needs.`;
+    case "gpus":
+    case "gpus-per-node":
+    case "G":
+      return `${flag} can't be applied; give a GPU count such as --gres=gpu:1.`;
+    case "job-name":
+    case "J":
+      return `${flag} can't be applied; obleth names each job after the deployment, so remove the line.`;
+    case "ntasks":
+    case "n":
+    case "ntasks-per-node":
+      return `${flag} can't be applied; a replica runs one task, so set CPUs with --cpus-per-task.`;
+    default:
+      return `${flag} can't be applied; obleth sends only partition, account, QoS, time, nodes, GPUs (--gres or --gpus), CPUs per task, memory, constraint, exclude, output and chdir.`;
+  }
 }
 
 /** Canonical long-form key for a directive token (maps short flags to long). */
@@ -172,7 +198,10 @@ export function parseSbatchDirectives(script: string): ParsedDirectives {
       case "gpus": {
         const g = gpusAsGres(value);
         if (g && !out.gres) out.gres = g;
-        else if (!g) out.warnings.push(`--${key}=${value} (not applied: set GPUs as gres, such as gpu:4)`);
+        else if (!g) {
+          out.warnings.push(`--${key}=${value} (not applied: set GPUs as gres, such as gpu:4)`);
+          (out.unapplied ??= []).push(`--${key}=${value}`);
+        }
         break;
       }
       case "cpus-per-task": {
@@ -219,6 +248,7 @@ export function parseSbatchDirectives(script: string): ParsedDirectives {
       default:
         const flagStr = key.startsWith("-") ? key : `--${key}`;
         out.warnings.push(`${flagStr} (not applied)`);
+        (out.unapplied ??= []).push(value ? `${flagStr}=${value}` : flagStr);
     }
   }
   return out;

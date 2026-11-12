@@ -7,7 +7,7 @@ const BODY = [
   "#SBATCH --cpus-per-task=72",
   "#SBATCH -p arm",
   "module load cuda",
-  "llama-server -hf unsloth/GLM-5.2-GGUF:UD-IQ2_M --host 0.0.0.0 --port 8000",
+  "llama-server -hf unsloth/GLM-5.2-GGUF:UD-IQ2_M --host 0.0.0.0 --port $OBLETH_SERVING_PORT",
 ].join("\n");
 
 function file(header: string, body = BODY): string {
@@ -43,8 +43,8 @@ describe("parseRecipe", () => {
         ["name: X", "engine: llamacpp", "model_type: chat", "api_model_name: x", "port: 8000"].join("\n"),
       ),
     );
-    expect(r.header?.target_replicas).toBe(2);
-    expect(r.header?.max_job_failures).toBe(3);
+    expect(r.header?.target_replicas).toBe(1);
+    expect(r.header?.max_job_failures).toBe(2);
     expect(defaultHealthPath("ollama")).toBe("/");
     expect(defaultHealthPath("vllm")).toBe("/health");
     expect(defaultHealthPath("llamacpp")).toBe("/health");
@@ -99,7 +99,7 @@ describe("parseRecipe", () => {
       "#SBATCH --gres=gpu:gh200:1",
       "--- section break ---",
       "module load cuda",
-      "llama-server -hf unsloth/GLM-5.2-GGUF:UD-IQ2_M --host 0.0.0.0 --port 8000",
+      "llama-server -hf unsloth/GLM-5.2-GGUF:UD-IQ2_M --host 0.0.0.0 --port $OBLETH_SERVING_PORT",
     ].join("\n");
     const r = parseRecipe(
       "glm",

@@ -21,7 +21,7 @@ const VALID = [
   "---",
   "#!/bin/bash -l",
   "#SBATCH -p arm",
-  "llama-server -hf unsloth/GLM-5.2-GGUF:UD-IQ2_M --port 8000",
+  "llama-server -hf unsloth/GLM-5.2-GGUF:UD-IQ2_M --port $OBLETH_SERVING_PORT",
 ].join("\n");
 
 let dir: string;
@@ -122,7 +122,7 @@ describe("loadRecipeCards merge (file + DB)", () => {
     "---",
     "#!/bin/bash -l",
     "#SBATCH -p gpu",
-    "ollama serve",
+    "OLLAMA_HOST=0.0.0.0:$OBLETH_SERVING_PORT ollama serve",
   ].join("\n");
 
   beforeEach(() => {
@@ -190,7 +190,7 @@ describe("resolveRecipeById (file-first, then DB)", () => {
     "port: 8000",
     "---",
     "#!/bin/bash -l",
-    "vllm serve",
+    "vllm serve --port $OBLETH_SERVING_PORT",
   ].join("\n");
 
   afterEach(() => {
