@@ -308,6 +308,8 @@ function scriptProblems(h: RecipeHeader, body: string, directives: ParsedDirecti
   if (fixed) errors.push(`The script starts a server on the fixed port ${fixed[1]}. Use --port "$OBLETH_SERVING_PORT" so each replica gets its own port.`);
   for (const flag of directives.unapplied ?? []) errors.push(`#SBATCH ${unappliedAdvice(flag)}`);
   for (const i of h.inputs) {
+    // A flag that only marks what the model can do needn't appear in the script.
+    if (i.type === "flag" && !i.adds && (i.capabilities?.length || i.drops?.length)) continue;
     if (!inputTokens(`${body}\n${h.context_window ?? ""}`).includes(i.name)) warnings.push(`The input ${i.name} isn't used in the script, so changing it does nothing.`);
   }
   if (!(KNOWN_ENGINES as readonly string[]).includes(h.engine)) {

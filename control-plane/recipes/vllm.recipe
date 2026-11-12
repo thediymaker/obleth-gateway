@@ -11,6 +11,7 @@ health_path: /health
 target_replicas: 1
 max_job_failures: 2
 env:
+  # The first start downloads the weights; don't let vLLM give up while it loads.
   VLLM_ENGINE_READY_TIMEOUT_S: "3600"
 tested:
   - hardware: "1× A100 80 GB"
@@ -22,39 +23,51 @@ inputs:
     label: Hugging Face model
     type: text
     required: true
-    help: The repo id, e.g. Qwen/Qwen3-32B.
+    help: The repo id, such as Qwen/Qwen3-32B, or a folder on the cluster that holds the weights.
   - name: context
     label: Context length
     type: number
     min: 1024
-    help: Leave empty for the model's own maximum.
+    default: 32768
+    required: true
+    unit: tokens
+    help: The longest prompt and answer together. A longer context needs more GPU memory, and the model's own maximum may not fit.
+  - name: extra
+    label: More vLLM flags
+    type: text
+    help: "Anything else to pass to vllm serve, written as on its command line, such as --enable-auto-tool-choice --tool-call-parser hermes."
   - name: image
     label: Container image
     type: path
     default: "{{cluster.image.vllm}}"
-    required: true
+    help: The image the server runs in. Leave it empty to run vllm from the node's PATH, for example after the cluster's setup lines load it.
   - name: cache
     label: Weight cache
     type: path
     default: "{{cluster.cache}}"
     required: true
-  - name: extra
-    label: More vLLM flags
-    type: text
-    help: Anything else for vllm serve, e.g. --enable-auto-tool-choice --tool-call-parser hermes.
+    help: Where the weights are kept between jobs. Use shared storage, so a restart on another node doesn't download them again.
 ---
 #!/bin/bash -l
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
-set -euo pipefail
+# The cluster's setup lines run before strict mode, since site scripts often
+# read unset variables.
 {{cluster.setup}}
-export HF_HOME={{cache}}
-CONTEXT="{{context}}"
-apptainer exec --nv --bind {{cache}} {{image}} \
-  vllm serve {{model}} \
-    --served-model-name {{api_model_name}} \
-    --host 0.0.0.0 --port "$OBLETH_SERVING_PORT" \
-    --tensor-parallel-size "${SLURM_GPUS_ON_NODE:-1}" \
-    ${CONTEXT:+--max-model-len "$CONTEXT"} \
-    {{extra}}
+set -euo pipefail
+export HF_HOME="{{cache}}"
+# In the image when one is set, with the cluster's container command
+# (OBLETH_CONTAINER_RUN, "apptainer exec --nv" when unset); else from the node's PATH.
+IMAGE="{{image}}"
+RUN=()
+if [ -n "$IMAGE" ]; then
+  read -r -a RUN <<< "${OBLETH_CONTAINER_RUN:-apptainer exec --nv}"
+  RUN+=(--bind "$HF_HOME" "$IMAGE")
+fi
+exec ${RUN[@]+"${RUN[@]}"} vllm serve {{model}} \
+  --served-model-name {{api_model_name}} \
+  --host 0.0.0.0 --port "$OBLETH_SERVING_PORT" \
+  --tensor-parallel-size "${SLURM_GPUS_ON_NODE:-1}" \
+  --max-model-len {{context}} \
+  {{extra}}
