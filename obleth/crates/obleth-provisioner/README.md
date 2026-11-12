@@ -32,6 +32,8 @@ Every tick (`OBLETH_PROVISIONER_INTERVAL_SECS`, default 15 s):
    version when it is `auto` (the newest of v0.0.40 to v0.0.45 the server
    lists, cached for 10 minutes), and makes one authenticated read (the
    partition list) so a rejected token fails the tick even with no replicas.
+   A pinned version the server doesn't serve falls back to the newest one it
+   does serve, with a warning; a pin that works is kept.
 2. **Look up the tracked jobs by id**: only the jobs the replica rows point at,
    never a listing of the whole controller. A clean "not found" means the job
    is gone. A transport error, or a rejected token, holds the whole tick with no
@@ -174,5 +176,6 @@ sudo systemctl enable --now obleth-provisioner
 ## Documentation
 
 Setup, the job script contract, replica lifecycle and troubleshooting are in
-the docs: [Launch on Slurm](https://obleth.com/docs/deployments/slurm-provisioning)
-and [Replicas and failures](https://obleth.com/docs/deployments/slurm-replicas).
+the docs: [Launch on Slurm](https://obleth.com/docs/deployments/slurm-provisioning),
+[Job scripts](https://obleth.com/docs/deployments/job-script) and
+[Replicas and failures](https://obleth.com/docs/deployments/slurm-replicas).
