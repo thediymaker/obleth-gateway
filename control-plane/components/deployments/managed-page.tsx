@@ -567,7 +567,8 @@ export function ManagedPage({ modelId, initial, changes }: { modelId: string; in
               <DropdownMenuItem onSelect={() => router.push(modelHref(model.model_name))}>Model settings</DropdownMenuItem>
               {model.enabled && <DropdownMenuItem onSelect={() => router.push(`/playground?model=${encodeURIComponent(model.model_name)}`)}>Try in Playground</DropdownMenuItem>}
               {surge && <DropdownMenuItem disabled={current.length === 0} onSelect={roll}>Apply to running replicas…</DropdownMenuItem>}
-              <DropdownMenuItem disabled={current.length === 0} onSelect={restartAll}>{surge ? "Restart all at once…" : "Restart all replicas…"}</DropdownMenuItem>
+              {/* A newer gateway restarts surge-first, one at a time, which is what Apply does. */}
+              {!surge && <DropdownMenuItem disabled={current.length === 0} onSelect={restartAll}>Restart all replicas…</DropdownMenuItem>}
               {fromRecipe && <DropdownMenuItem onSelect={() => setSaveName(`${engine ?? model.model_name} · ${spec.partition}${spec.nodes > 1 ? ` · ${spec.nodes} nodes` : ""}`)}>Save as recipe…</DropdownMenuItem>}
               <DropdownMenuSeparator />
               <DropdownMenuItem onSelect={() => setRemoving(true)}>Remove deployment…</DropdownMenuItem>
