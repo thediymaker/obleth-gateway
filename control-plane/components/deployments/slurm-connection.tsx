@@ -32,7 +32,7 @@ export function apiVersionLine(s: Pick<SlurmSettingsView, "slurmrestd_api_versio
   const auto = set === "auto";
   const served = s.available_api_versions?.length ? `slurmrestd serves ${s.available_api_versions.join(", ")}${s.slurm_release ? ` (Slurm ${s.slurm_release})` : ""}.` : null;
   const using = s.resolved_api_version ? (auto ? `Automatic picked ${s.resolved_api_version}.` : `obleth uses ${s.resolved_api_version}.`) : auto ? "Automatic picks the newest version slurmrestd serves that obleth supports." : null;
-  const mismatch = !auto && s.available_api_versions?.length && !s.available_api_versions.includes(set) ? `slurmrestd doesn't serve ${set}, so every request fails. Set it to auto.` : null;
+  const mismatch = !auto && s.available_api_versions?.length && !s.available_api_versions.includes(set) ? `slurmrestd doesn't serve ${set}, so obleth uses the newest version it does serve. Set it to auto.` : null;
   return [mismatch, using, served].filter(Boolean).join(" ") || null;
 }
 

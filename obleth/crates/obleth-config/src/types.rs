@@ -970,7 +970,7 @@ pub struct ManagedModelSpec {
     #[serde(default)]
     pub mem: Option<String>,
     pub image: String,
-    /// Shell lines injected before `apptainer exec` in the batch script.
+    /// Shell lines injected before the launch command in the batch script.
     /// Use this to load modules or set PATH on your cluster, e.g. `module load apptainer`.
     pub preamble: String,
     /// Directory for Slurm stdout/stderr files. When non-empty, jobs write

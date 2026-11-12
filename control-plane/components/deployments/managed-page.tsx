@@ -402,6 +402,9 @@ export function ManagedPage({ modelId, initial, changes }: { modelId: string; in
   const cap = model.max_in_flight ?? 0;
   const engine = typeof spec.launcher_spec?.name === "string" ? (spec.launcher_spec.name as string) : null;
   const fromRecipe = typeof spec.launcher_spec?.recipe_id === "string";
+  // Launches from this version on record a digest of the script they sent, so
+  // Save as recipe can tell an edited script and keep it.
+  const keepsScriptEdits = typeof spec.launcher_spec?.script_digest === "string";
   const prov = provisionerHealth(data.slurm);
   const provisionerOk = prov.kind === "ok";
   const replicasUnread = !!data.failed?.includes("replicas");
@@ -586,7 +589,7 @@ export function ManagedPage({ modelId, initial, changes }: { modelId: string; in
           <input aria-label="Recipe name" value={saveName} onChange={(e) => setSaveName(e.target.value)} className="h-9 min-w-[260px] flex-1 rounded-lg border border-input bg-background px-3 text-[13px]" />
           <Button type="submit" size="sm" className="h-9" disabled={pending || !saveName.trim()}>Save</Button>
           <Button type="button" variant="ghost" size="sm" className="h-9" onClick={() => setSaveName(null)}>Cancel</Button>
-          <span className="basis-full text-[12px] text-muted-foreground">Keeps the partition, account, QoS, walltime, replica counts and the recipe&apos;s values this deployment runs with. Edits to the job script made here aren&apos;t kept: the new recipe uses the original recipe&apos;s script. To keep script edits, copy the recipe under Recipes and change its script.</span>
+          <span className="basis-full text-[12px] text-muted-foreground">Keeps the partition, account, QoS, walltime, replica counts and the recipe&apos;s values this deployment runs with. {keepsScriptEdits ? "The new recipe uses the job script as it runs now, with edits made at launch or here. Values already filled in, such as paths and setup lines, stay as they are." : "This deployment was launched before edits could be kept, so the new recipe uses the original recipe's script. To keep script edits, copy the recipe under Recipes and change its script."}</span>
         </form>
       )}
 
