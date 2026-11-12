@@ -213,7 +213,7 @@ pub fn error_from_response(status: u16, body: &[u8], what: &str, version: &str) 
             format!(
                 "slurmrestd rejected the Slurm token while {what} (HTTP {status}). The token \
                  may have expired or belong to another user. Mint a new one with `scontrol \
-                 token` and save it in the Slurm settings."
+                 token lifespan=2592000` and save it in the Slurm settings."
             ),
         ),
         404 if env.errors.is_empty() => SlurmApiError::new(
