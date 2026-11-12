@@ -878,6 +878,10 @@ struct Waiter {
     /// The local fast path would have admitted it on arrival; in shared mode
     /// it is still reported as fast if its first claim succeeds.
     fast: bool,
+    /// Shared mode: the tenant that owned its key when its local slot was
+    /// charged. A refused claim undoes the charge only if the key has not
+    /// moved since, because a move starts the key's standing again.
+    charged_owner: Option<Uuid>,
     respond: oneshot::Sender<Admitted>,
 }
 
@@ -1443,7 +1447,7 @@ impl Pool {
             .into_iter()
             .flat_map(|q| q.keys.iter())
             .filter(|(k, d)| !d.is_empty() && self.key_open(k))
-            .map(|(k, _)| self.key_standing(k))
+            .map(|(k, _)| self.queued_standing(&tenant, k))
             .fold(f64::INFINITY, f64::min);
         let target = if waiting.is_finite() { waiting } else { began };
         let clock = self.key_clock.entry(tenant).or_insert(0.0);
@@ -1487,6 +1491,19 @@ impl Pool {
     /// A key's standing: its service over its weight.
     fn key_standing(&self, key: &Uuid) -> f64 {
         self.key_served.get(key).copied().unwrap_or(0.0) / self.key_weight_of(key)
+    }
+
+    /// Where `key` ranks among the keys queued under `tenant`. A request left
+    /// under a tenant the key has since moved away from ranks no higher than
+    /// that tenant's key clock: its standing is measured on its new owner's
+    /// clock, which may be far from this one.
+    fn queued_standing(&self, tenant: &Uuid, key: &Uuid) -> f64 {
+        let standing = self.key_standing(key);
+        if self.key_tenant.get(key).is_none_or(|t| t == tenant) {
+            standing
+        } else {
+            standing.min(self.key_clock.get(tenant).copied().unwrap_or(0.0))
+        }
     }
 
     /// Nothing of `key` is queued, under any tenant, or running.
@@ -1628,6 +1645,7 @@ impl Pool {
                 passed: 0,
                 enqueued,
                 fast,
+                charged_owner: None,
                 respond,
             },
         );
@@ -1687,6 +1705,7 @@ impl Pool {
             }
             self.track_waiter_meta(tenant, key, &waiter);
             self.occupy(tenant, key, waiter.cost);
+            waiter.charged_owner = Some(self.key_owner(&key, tenant));
             self.advance_virtual_time();
             return (Some((tenant, key, waiter)), dropped);
         }
@@ -1768,9 +1787,13 @@ impl Pool {
         if let Some(served) = self.served.get_mut(&tenant) {
             *served -= waiter.cost as f64;
         }
-        if let Some(served) = self.key_served.get_mut(&key) {
-            *served -= waiter.cost as f64;
+        let owner = self.key_owner(&key, tenant);
+        if waiter.charged_owner.is_none_or(|o| o == owner) {
+            if let Some(served) = self.key_served.get_mut(&key) {
+                *served -= waiter.cost as f64;
+            }
         }
+        waiter.charged_owner = None;
         waiter.fast = false;
         waiter.jumped = false;
         self.queues.entry(tenant).or_default().reinsert(key, waiter);
@@ -1946,7 +1969,7 @@ impl Pool {
             if !self.key_open(key) {
                 continue;
             }
-            let score = self.key_standing(key);
+            let score = self.queued_standing(tenant, key);
             let better = match best {
                 None => true,
                 Some((_, best_score, best_enqueued)) => {
@@ -2046,6 +2069,7 @@ impl Pool {
         waiter.jumped = oldest.is_some_and(|t| t < waiter.enqueued);
         self.track_waiter_meta(tenant, key, &waiter);
         self.occupy(tenant, key, waiter.cost);
+        waiter.charged_owner = Some(self.key_owner(&key, tenant));
         self.advance_virtual_time();
         Some((tenant, key, waiter))
     }
@@ -4499,6 +4523,84 @@ mod tests {
             .key_idle
             .get(&old)
             .is_some_and(|i| i.contains(&moved)));
+    }
+
+    /// A request left under a key's old tenant ranks on that tenant's clock,
+    /// not its new owner's: when the owner's clock is far ahead it is still
+    /// granted about as soon as a new key of the old tenant would be.
+    #[test]
+    fn leftover_request_ranks_on_its_queue_tenants_clock() {
+        let mut sim = Sim::new(1);
+        let (old, new) = (Uuid::new_v4(), Uuid::new_v4());
+        let (a1, a2, b1, moved) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        for _ in 0..3_000 {
+            sim.queue(old, a1, 100);
+            sim.queue(old, a2, 100);
+            sim.queue(new, b1, 100);
+        }
+        for _ in 0..3_000 {
+            sim.grant();
+        }
+        assert!(sim.pool.key_clock[&new] > sim.pool.key_clock[&old] * 1.5);
+        sim.queue(old, moved, 100);
+        sim.queue(new, moved, 100);
+        let mut before = 0;
+        while sim.pool.queues[&old].key_len(&moved) > 0 {
+            sim.grant();
+            before += 1;
+        }
+        assert!(before <= 6, "the left-over request waited {before} grants");
+    }
+
+    /// Shared mode: a claim refused after the key moved does not undo a
+    /// charge made before the move, so the key's standing stays at or above
+    /// its new tenant's clock.
+    #[test]
+    fn refused_claim_after_a_move_keeps_the_new_standing() {
+        let mut sim = Sim::new(2);
+        let (old, new) = (Uuid::new_v4(), Uuid::new_v4());
+        let (busy, moved) = (Uuid::new_v4(), Uuid::new_v4());
+        for _ in 0..100 {
+            sim.queue(new, busy, 100);
+        }
+        for _ in 0..50 {
+            sim.grant();
+        }
+        sim.queue(old, moved, 500);
+        while sim.running.len() >= sim.pool.cap {
+            let (t, k) = sim.running.pop_front().unwrap();
+            sim.pool.release(t, k);
+        }
+        let mut taken = None;
+        while taken.is_none() {
+            let (next, _) = sim.pool.take_next(sim.pool.cap);
+            let (t, k, w) = next.expect("a request can be taken");
+            if k == moved {
+                taken = Some((t, k, w));
+            } else {
+                sim.running.push_back((t, k));
+                let (t, k) = sim.running.pop_front().unwrap();
+                sim.pool.release(t, k);
+            }
+        }
+        let (tenant, key, waiter) = taken.unwrap();
+        sim.queue(new, moved, 100);
+        let start = sim.pool.key_start(new, moved);
+        sim.pool.requeue(PendingClaim {
+            tenant,
+            key,
+            waiter,
+        });
+        let served = sim.pool.key_served[&moved];
+        assert!(
+            served >= start,
+            "standing {served} fell below the new tenant's start {start}"
+        );
     }
 
     /// A queued request counts as passed only when session affinity served
