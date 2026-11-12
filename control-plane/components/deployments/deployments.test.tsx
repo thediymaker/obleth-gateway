@@ -3,7 +3,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { launchRecipeAction, setDeploymentEnabledAction, setDeploymentReplicasAction, setSlurmSettingsAction, testSlurmConnectionAction } from "@/app/actions";
+import { launchRecipeAction, retryDeploymentAction, rollDeploymentAction, setModelStatusAction, setDeploymentEnabledAction, setDeploymentReplicasAction, setSlurmSettingsAction, testSlurmConnectionAction } from "@/app/actions";
 import { DeploymentsList } from "./deployments-list";
 import { ManagedPage } from "./managed-page";
 import { NewDeployment } from "./new-deployment";
@@ -21,6 +21,9 @@ vi.mock("@/app/actions", () => ({
   saveRecipeFromDeploymentAction: vi.fn(async () => ({ ok: true, id: "r1" })),
   removeDeploymentAction: vi.fn(async () => ({ ok: true })),
   restartReplicaAction: vi.fn(async () => ({ ok: true })),
+  retryDeploymentAction: vi.fn(async () => ({ ok: true })),
+  rollDeploymentAction: vi.fn(async () => ({ ok: true })),
+  setModelStatusAction: vi.fn(async () => ({ ok: true })),
   clearLostReplicasAction: vi.fn(async () => ({ ok: true })),
   deleteTemplateAction: vi.fn(async () => ({ ok: true })),
   saveTemplateAction: vi.fn(async () => ({ ok: true })),
@@ -154,7 +157,7 @@ describe("what the Slurm connection reports", () => {
       enabled: true, slurmrestd_url: "http://slurm:6820", slurmrestd_api_version: "auto", slurm_user: "obleth", jwt_set: true, jwt_last4: "a1b2", node_aliases: [],
       provisioner_running: true, provisioner_last_seen_secs: 4, provisioner_tick_status: "ok", resolved_api_version: "v0.0.44", available_api_versions: ["v0.0.42", "v0.0.43", "v0.0.44"],
       jwt_user: "obleth", jwt_expires_in_secs: 1200, stored_encrypted: false, provisioner_warnings: ["2 cancels failed: timeout"],
-    } as DeploymentsData["slurm"];
+    } as unknown as DeploymentsData["slurm"];
     vi.mocked(testSlurmConnectionAction).mockResolvedValueOnce({ ok: true, health: { jwt: { set: true, expired: false, expires_at: null }, ping: { ok: false, status_code: 404, latency_ms: 3, error: null }, problems: ["slurmrestd doesn't serve v0.0.40. Set API version to auto."] } } as never);
     await render(<DeploymentsList initial={data({ slurm })} recipes={[]} tab="deployments" slurmSheet />);
     const sheet = document.querySelector('[role="dialog"][aria-label="Slurm connection"]')!;
@@ -204,7 +207,7 @@ describe("a Slurm deployment's page", () => {
     const lost = [1, 2, 3].map(() => replica({ state: "lost", last_message: "FAILED — NonZeroExitCode" }));
     await render(<ManagedPage modelId="m1" initial={data({ replicas: lost })} changes={[]} />);
     const why = host.querySelector('[aria-label="Why it stopped"]')!;
-    expect(why.textContent).toContain("The last 3 jobs ended without becoming healthy");
+    expect(why.textContent).toContain("3 jobs ended in the last 15 minutes, which reached the limit of 3");
     expect(why.textContent).toContain("FAILED — NonZeroExitCode");
     expect(why.textContent).toContain("Job 42's output is in logs, in the file ending -42.out");
   });
@@ -212,8 +215,66 @@ describe("a Slurm deployment's page", () => {
   it("says a job's output stayed on its node when Job logs isn't set", async () => {
     const lost = [1, 2, 3].map(() => replica({ state: "lost", last_message: "FAILED — NonZeroExitCode" }));
     await render(<ManagedPage modelId="m1" initial={data({ specs: [spec({ log_output_dir: "" })], replicas: lost })} changes={[]} />);
-    expect(host.querySelector('[aria-label="Why it stopped"]')!.textContent).toContain("Job logs isn't set, so job 42's output stayed in Slurm's default place, /tmp on gh-007.");
+    expect(host.querySelector('[aria-label="Why it stopped"]')!.textContent).toContain("Job logs isn't set, so job 42's output went to /tmp on gh-007.");
     expect(host.querySelector<HTMLInputElement>('input[name="slurm_log_output_dir"]')!.value).toBe("");
+  });
+});
+
+describe("what a deployment's page reports from a newer gateway", () => {
+  const newer = (over: Partial<ManagedModelSpec> = {}) => spec({ startup_timeout_mins: 60, handoff_mins: 15, paused_reason: null, paused_until: null, ...over });
+
+  it("says when launches are paused and offers Try again", async () => {
+    const until = new Date(Date.now() + 30 * 60_000).toISOString();
+    await render(<ManagedPage modelId="m1" initial={data({ specs: [newer({ paused_reason: "3 launches in a row failed", paused_until: until })], replicas: [] })} changes={[]} />);
+    const why = host.querySelector('[aria-label="Why it stopped"]')!;
+    expect(why.textContent).toContain("3 launches in a row failed. obleth tries again at");
+    await act(async () => button("Try again").click());
+    expect(retryDeploymentAction).toHaveBeenCalledWith("m1");
+  });
+
+  it("puts a refused submit in a sentence with what to change, never the raw body alone", async () => {
+    await render(<ManagedPage modelId="m1" initial={data({ specs: [newer({ last_provision_error: "Slurm rejected the job: Requested node configuration is not available." })], replicas: [] })} changes={[]} />);
+    const why = host.querySelector('[aria-label="Why it stopped"]')!;
+    expect(why.textContent).toContain("No node in the partition has what one job asks for");
+    expect(host.textContent).not.toContain("No jobs yet");
+  });
+
+  it("shows a replica's detail, port, log and time limit, and a requeued job as queued", async () => {
+    const ends = new Date(Date.now() + 3 * 3_600_000).toISOString();
+    const replicas = [
+      replica({ state: "healthy", last_message: "RUNNING", port: 8003, log_path: "/shared/logs/obleth-glm-42.out", job_ends_at: ends, job_started_at: new Date(Date.now() - 600_000).toISOString() }),
+      replica({ state: "pending", slurm_job_id: "43", last_message: "PENDING — BeginTime", job_started_at: new Date().toISOString() }),
+    ];
+    await render(<ManagedPage modelId="m1" initial={data({ specs: [newer()], replicas })} changes={[]} />);
+    const a = host.querySelector('[aria-label="Replica A"]')!;
+    expect(a.textContent).toContain("port 8003");
+    expect(a.textContent).toContain("Job 42's output is going to /shared/logs/obleth-glm-42.out.");
+    expect(a.textContent).toMatch(/Time limit at .*; a replacement starts at /);
+    expect(host.querySelector('[aria-label="Replica B"]')!.textContent).toContain("Slurm put the job back in the queue");
+  });
+
+  it("asks before a scale-down cancels a serving job, and before a restart", async () => {
+    await render(<ManagedPage modelId="m1" initial={data({ specs: [newer()], replicas: [replica({ state: "healthy", last_message: "RUNNING" }), replica({ state: "healthy", last_message: "RUNNING" })] })} changes={[]} />);
+    await act(async () => button("One fewer replica").click());
+    expect(document.body.textContent).toContain("which is serving now. Requests move to the others.");
+    expect(setDeploymentReplicasAction).not.toHaveBeenCalled();
+    await act(async () => button("Cancel the job").click());
+    expect(setDeploymentReplicasAction).toHaveBeenCalledWith("m1", 1);
+  });
+
+  it("offers Make it live for a staged model that serves", async () => {
+    const staged = model({ effective_status: "staged" } as Partial<ModelRoute>);
+    await render(<ManagedPage modelId="m1" initial={data({ models: [staged], specs: [newer()], replicas: [replica({ state: "healthy", last_message: "RUNNING" })] })} changes={[]} />);
+    expect(host.textContent).toContain("Serving, but not listed yet.");
+    await act(async () => button("Make it live").click());
+    expect(setModelStatusAction).toHaveBeenCalledWith("m1", { status: "active" });
+  });
+
+  it("says no provisioner has run yet, and how to start one", async () => {
+    await render(<ManagedPage modelId="m1" initial={data({ slurm: { enabled: true, provisioner_running: false, provisioner_last_seen_secs: null } as DeploymentsData["slurm"], replicas: [] })} changes={[]} />);
+    expect(host.textContent).toContain("No provisioner has run yet, so nothing will be launched.");
+    expect(host.textContent).toContain("obleth-provisioner.service");
+    expect(host.textContent).not.toContain("next pass");
   });
 });
 

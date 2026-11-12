@@ -38,7 +38,7 @@ import type {
   SlurmHealthView,
 } from "@/lib/obleth";
 import { requireAdmin } from "@/lib/auth/roles";
-import { validateManagedModelForm } from "@/lib/managed-model-schema";
+import { specFormValues, validateManagedModelForm } from "@/lib/managed-model-schema";
 import { parseUpstreamHeaders } from "@/lib/upstream-headers";
 import { resolveRecipeById, resolveRecipeText, buildManagedFromRecipe, parseRecipe, type DeployOverrides } from "@/lib/sbatch-recipes";
 import { unixLineEndings } from "@/lib/sbatch-directives";
@@ -2606,6 +2606,43 @@ export async function clearLostReplicasAction(modelId: string): Promise<ActionRe
   return { ok: true };
 }
 
+/**
+ * Let a deployment that stopped launching try again now: clears a pause after
+ * failed launches and its backoff, and the last refused submit. A gateway
+ * without the retry endpoint gets its failed jobs cleared instead.
+ */
+export async function retryDeploymentAction(modelId: string): Promise<ActionResult> {
+  const session = await requireAdmin();
+  try {
+    try {
+      await obleth.retryManagedModel(modelId, { auditActor: session.email });
+    } catch (e) {
+      if (!(e instanceof OblethApiError) || (e.status !== 404 && e.status !== 405)) throw e;
+      await obleth.clearLostReplicas(modelId, { auditActor: session.email });
+    }
+    await obleth.clearProvisionError(modelId, { auditActor: session.email }).catch(() => undefined);
+  } catch (e) {
+    return actionError(e);
+  }
+  refreshDeployments();
+  return { ok: true };
+}
+
+/** Replace every running replica one at a time, each new job serving before the old one stops. */
+export async function rollDeploymentAction(modelId: string): Promise<ActionResult> {
+  const session = await requireAdmin();
+  try {
+    await obleth.rollManagedModel(modelId, { auditActor: session.email });
+  } catch (e) {
+    if (e instanceof OblethApiError && (e.status === 404 || e.status === 405)) {
+      return { ok: false, error: "This gateway can't replace replicas one at a time yet. Restart them one by one, waiting for each new one to serve." };
+    }
+    return actionError(e);
+  }
+  refreshDeployments();
+  return { ok: true };
+}
+
 export async function restartReplicaAction(replicaId: string): Promise<ActionResult> {
   const session = await requireAdmin();
   try { await obleth.restartReplica(replicaId, { auditActor: session.email }); }
@@ -2680,6 +2717,9 @@ function specToPut(s: ManagedModelSpec): PutManagedModel {
     target_replicas: s.target_replicas,
     max_job_failures: s.max_job_failures,
     launcher_spec: s.launcher_spec ?? null,
+    // Sent only when the gateway reported them, so an older one isn't sent fields it doesn't know.
+    ...(s.startup_timeout_mins !== undefined ? { startup_timeout_mins: s.startup_timeout_mins } : {}),
+    ...(s.handoff_mins !== undefined ? { handoff_mins: s.handoff_mins } : {}),
   };
 }
 
@@ -2714,13 +2754,14 @@ export async function saveDeploymentSettingsAction(formData: FormData): Promise<
   const id = trimmed(formData.get("id"));
   const values: Record<string, string> = {};
   for (const [k, v] of formData.entries()) if (typeof v === "string" && k.startsWith("slurm_")) values[k] = v;
-  const errors = validateManagedModelForm(values);
-  const first = Object.values(errors)[0];
-  if (first) return { ok: false, error: first, saved: [] };
   const text = (k: string) => (values[`slurm_${k}`] ?? "").trim();
   const nullable = (k: string) => text(k) || null;
   const int = (k: string) => Number(text(k));
   const res = await changeSpec(id, (b) => {
+    // Check only what this save changes: a value stored earlier (by a launch,
+    // or under an older check) shouldn't block an unrelated edit.
+    const first = Object.values(validateManagedModelForm(values, specFormValues(b)))[0];
+    if (first) return first;
     // The browser sends a textarea with CRLF line endings; bash needs LF.
     const script = unixLineEndings(values.slurm_script_body ?? b.script_body ?? "");
     if (!script.trim() && !(b.launch_command ?? "").trim()) return "The script can't be empty.";
@@ -2743,6 +2784,8 @@ export async function saveDeploymentSettingsAction(formData: FormData): Promise<
       target_replicas: int("target_replicas"),
       min_replicas: int("min_replicas"),
       max_job_failures: int("max_job_failures"),
+      ...(text("startup_timeout_mins") ? { startup_timeout_mins: int("startup_timeout_mins") } : {}),
+      ...(text("handoff_mins") ? { handoff_mins: int("handoff_mins") } : {}),
     };
   });
   return res.ok ? { ok: true } : { ok: false, error: res.error, saved: [] };
@@ -2791,7 +2834,14 @@ export async function launchRecipeAction(recipeId: string, overrides: DeployOver
     // active on its page once it has been tried. It can already do what the
     // recipe's flags turned on, e.g. function calling.
     const created = await obleth.createModel({ ...createBody, status: "staged" }, { auditActor: session.email });
-    await obleth.putManagedModel(created.id, managedBody, { auditActor: session.email });
+    try {
+      await obleth.putManagedModel(created.id, managedBody, { auditActor: session.email });
+    } catch (e) {
+      // Don't leave a model with no launch settings behind: it would block a
+      // retry under the same name.
+      await obleth.deleteModel(created.id, { auditActor: session.email }).catch(() => undefined);
+      throw e;
+    }
     refreshDeployments();
     return { ok: true, name: created.model_name };
   } catch (e) {

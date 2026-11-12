@@ -34,7 +34,20 @@ const SHORT_TO_LONG: Record<string, string> = {
   "-o": "output",
   "-e": "error",
   "-D": "chdir",
+  "-G": "gpus",
 };
+
+/**
+ * `--gpus-per-node` and `--gpus` (`-G`) as gres: `4` → `gpu:4`,
+ * `h100:4` → `gpu:h100:4`. `--gpus` is a total for the job, which is the
+ * same per node for a one-node replica. Null when the value isn't a count.
+ */
+export function gpusAsGres(value: string): string | null {
+  const v = value.trim();
+  const m = /^(?:([A-Za-z0-9_.-]+):)?(\d+)$/.exec(v);
+  if (!m) return null;
+  return m[1] ? `gpu:${m[1]}:${m[2]}` : `gpu:${m[2]}`;
+}
 
 /** Split one directive (already stripped of `#SBATCH` and comments) into key + value. */
 function splitDirective(rest: string): { key: string; value: string } | null {
@@ -91,7 +104,7 @@ export function stripSbatchDirectives(script: string): string {
 }
 
 /** The placement settings a deployment's page edits, by the field they set. */
-export type PlacementKey = "partition" | "gres" | "cpus_per_task" | "mem" | "nodes" | "account" | "qos" | "time_limit" | "constraints" | "exclude";
+export type PlacementKey = "partition" | "gres" | "cpus_per_task" | "mem" | "nodes" | "account" | "qos" | "time_limit" | "constraints" | "exclude" | "log_output_dir";
 
 const PLACEMENT_OF: Record<string, PlacementKey> = {
   partition: "partition",
@@ -104,7 +117,21 @@ const PLACEMENT_OF: Record<string, PlacementKey> = {
   time: "time_limit",
   constraint: "constraints",
   exclude: "exclude",
+  "gpus-per-node": "gres",
+  gpus: "gres",
+  output: "log_output_dir",
+  error: "log_output_dir",
 };
+
+/** A directive's value as the setting it maps to takes it, or null when it can't. */
+function settingValue(key: string, value: string): string | null {
+  if (key === "gpus-per-node" || key === "gpus") return gpusAsGres(value);
+  if (key === "output" || key === "error") {
+    const dir = dirname(value);
+    return dir && dir !== "." && dir.startsWith("/") ? dir : null;
+  }
+  return value;
+}
 
 export interface SbatchLine {
   /** The directive as written, without `#SBATCH`, e.g. "--mem=500G". */
@@ -121,7 +148,9 @@ export function sbatchLines(script: string): SbatchLine[] {
     if (!isDirective(line)) continue;
     const text = stripComment(line.trim().slice("#SBATCH".length));
     const parsed = readDirective(line);
-    out.push({ text, value: parsed?.value ?? "", setting: (parsed && PLACEMENT_OF[parsed.key]) ?? null });
+    const setting = (parsed && PLACEMENT_OF[parsed.key]) ?? null;
+    const value = parsed && setting ? settingValue(parsed.key, parsed.value) : null;
+    out.push({ text, value: value ?? parsed?.value ?? "", setting: value != null ? setting : null });
   }
   return out;
 }
@@ -139,6 +168,13 @@ export function parseSbatchDirectives(script: string): ParsedDirectives {
       case "gres":
         out.gres = value;
         break;
+      case "gpus-per-node":
+      case "gpus": {
+        const g = gpusAsGres(value);
+        if (g && !out.gres) out.gres = g;
+        else if (!g) out.warnings.push(`--${key}=${value} (not applied: set GPUs as gres, such as gpu:4)`);
+        break;
+      }
       case "cpus-per-task": {
         if (value) {
           const n = Number(value);
