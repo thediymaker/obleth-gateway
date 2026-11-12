@@ -197,7 +197,7 @@ async fn run_once(
     resolver.set_aliases(settings.node_alias_map());
     // `auto` (the default) resolves to the newest API version the server
     // offers that this build supports; the answer is cached for ten minutes.
-    let slurm = Slurmrestd::connect(
+    let mut slurm = Slurmrestd::connect(
         http.clone(),
         &settings.slurmrestd_url,
         &settings.slurmrestd_api_version,
@@ -211,7 +211,42 @@ async fn run_once(
     // error tick even when no replica would otherwise call Slurm.
     let token_warning =
         slurm::token_expiry_warning(&settings.slurm_jwt, chrono::Utc::now().timestamp());
-    if let Err(e) = slurm.check_auth().await {
+    let mut auth = slurm.check_auth().await;
+    // A pinned API version the server no longer serves (an old default kept
+    // across a Slurm upgrade) falls back to the newest one it does serve, with
+    // a warning, instead of failing every tick. A pin that works is kept.
+    let mut version_warning = None;
+    let pinned_not_served = auth
+        .as_ref()
+        .err()
+        .and_then(slurm::slurm_api_error)
+        .is_some_and(|se| {
+            se.kind == slurm::SlurmErrorKind::NotServed
+                && !obleth_config::slurm::is_auto_api_version(&settings.slurmrestd_api_version)
+        });
+    if pinned_not_served {
+        let fallback = Slurmrestd::connect(
+            http.clone(),
+            &settings.slurmrestd_url,
+            "auto",
+            &settings.slurm_user,
+            &settings.slurm_jwt,
+        )
+        .await;
+        if let Ok(fallback) = fallback {
+            version_warning = Some(format!(
+                "slurmrestd doesn't serve the configured API version {}, so obleth uses {}, the \
+                 newest one it serves. Set the API version to auto in the Slurm settings.",
+                settings.slurmrestd_api_version.trim(),
+                fallback.version()
+            ));
+            slurm = fallback
+                .with_hf_token(&settings.hf_token)
+                .with_job_name_prefix(&cfg.job_name_prefix);
+            auth = slurm.check_auth().await;
+        }
+    }
+    if let Err(e) = auth {
         // A rejected token that has also expired says so.
         let rejected = slurm::slurm_api_error(&e)
             .is_some_and(|se| se.kind == slurm::SlurmErrorKind::TokenRejected);
@@ -220,7 +255,7 @@ async fn run_once(
             None => return Err(e),
         }
     }
-    let mut warnings: Vec<String> = token_warning.into_iter().collect();
+    let mut warnings: Vec<String> = version_warning.into_iter().chain(token_warning).collect();
     warnings.extend(tick(cfg, &slurm, obleth, http, resolver, mem).await?);
     Ok(Tick::Ran(warnings))
 }
