@@ -9,7 +9,7 @@ COPY schema ./schema
 COPY obleth ./obleth
 WORKDIR /app/obleth
 # Release builds inject the commit + timestamp, reported to the gateway on each
-# poll and surfaced under Settings -> Slurm. Must be set before cargo build:
+# poll and shown on the dashboard's Slurm connection (Deployments). Must be set before cargo build:
 # option_env! reads them at compile time.
 ARG GIT_SHA
 ARG BUILD_TIMESTAMP
@@ -25,6 +25,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && useradd --system --uid 10001 --gid obleth --no-create-home obleth
 COPY --from=builder /app/obleth/target/release/obleth-provisioner /usr/local/bin/obleth-provisioner
 USER 10001:10001
-# No EXPOSE / HEALTHCHECK: the provisioner makes only outbound calls and has no
-# inbound endpoint.
+# No EXPOSE / HEALTHCHECK: the provisioner has no inbound endpoint. Its outbound
+# calls go to the Management API, slurmrestd and the model servers on the nodes.
 ENTRYPOINT ["obleth-provisioner"]

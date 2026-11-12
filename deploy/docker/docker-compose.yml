@@ -269,11 +269,13 @@ services:
   # the `slurm` profile. Opt in by adding `slurm` to COMPOSE_PROFILES in .env
   # (config), then it builds and starts with the same one command as the rest of
   # the stack (`docker compose up -d --build`). It keeps each enabled managed
-  # model at its target replica count on a preemptible Slurm cluster via
-  # slurmrestd. All cluster specifics are per-model (Management API). The
-  # slurmrestd connection details + the master enable switch live in system-wide
-  # settings (dashboard → Settings → Slurm), fetched from the Management API each
-  # tick — so this service only needs to reach the admin API.
+  # model at its target replica count on a Slurm cluster via slurmrestd. All
+  # cluster specifics are per-model (Management API). The slurmrestd connection
+  # and the master enable switch live in system-wide settings (dashboard:
+  # Deployments > Set up Slurm), fetched from the Management API each tick.
+  # It calls the admin API, slurmrestd, and the model servers on the compute
+  # nodes (health probes and warm-up on each replica's port window); the obleth
+  # service must reach those node ports too, since it routes requests there.
   obleth-provisioner:
     profiles: ["slurm"]
     image: ghcr.io/thediymaker/obleth-gateway/obleth-provisioner:${OBLETH_VERSION:-latest}
@@ -291,6 +293,10 @@ services:
       # crates/obleth-provisioner/src/config.rs.
       OBLETH_PROVISIONER_RESTART_AFTER_FAILURES: ${OBLETH_PROVISIONER_RESTART_AFTER_FAILURES:-20}
       RUST_LOG: info,obleth_provisioner=debug
+    # On SIGTERM the provisioner finishes the tick in progress before exiting,
+    # so a submitted job is always recorded. A tick can run past Docker's 10 s
+    # default (slurmrestd calls, node probes, submits).
+    stop_grace_period: 120s
     depends_on:
       obleth: { condition: service_started }
 

@@ -1,10 +1,13 @@
 {{- if .Values.provisioner.enabled }}
 # Optional Slurm provisioner plugin (mirrors the docker-compose `slurm` profile).
-# Keeps each enabled managed model at its target replica count on a preemptible
-# Slurm cluster via slurmrestd. It makes only outbound calls — to the Management
-# API (this chart's obleth service) and to slurmrestd — so it needs no Service,
-# ports, or probes. slurmrestd connection details + the master enable switch live
-# in system-wide settings (dashboard -> Settings -> Slurm), fetched each tick.
+# Keeps each enabled managed model at its target replica count on a Slurm
+# cluster via slurmrestd. It makes only outbound calls, so it needs no Service,
+# ports, or probes: to the Management API (this chart's obleth service), to
+# slurmrestd, and to the model servers on the compute nodes (health probes and
+# warm-up on each replica's port window). An egress policy must allow all three;
+# the obleth pods also need the node ports, since they route requests there.
+# The slurmrestd connection and the master enable switch live in system-wide
+# settings (dashboard: Deployments > Set up Slurm), fetched each tick.
 #
 # Singleton: this is a reconciler, so exactly one replica must run. `Recreate`
 # ensures a rollout tears down the old pod before starting the new one, so two
@@ -50,5 +53,8 @@ spec:
             - { name: OBLETH_PROVISIONER_INTERVAL_SECS, value: {{ .Values.provisioner.intervalSecs | quote }} }
             - { name: OBLETH_PROVISIONER_RESTART_AFTER_FAILURES, value: {{ .Values.provisioner.restartAfterFailures | quote }} }
             - { name: RUST_LOG, value: {{ .Values.provisioner.logLevel | quote }} }
+            {{- with .Values.provisioner.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           resources: {{- toYaml .Values.provisioner.resources | nindent 12 }}
 {{- end }}
