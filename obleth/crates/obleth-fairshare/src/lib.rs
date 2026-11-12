@@ -878,10 +878,10 @@ struct Waiter {
     /// The local fast path would have admitted it on arrival; in shared mode
     /// it is still reported as fast if its first claim succeeds.
     fast: bool,
-    /// Shared mode: the tenant that owned its key when its local slot was
-    /// charged. A refused claim undoes the charge only if the key has not
-    /// moved since, because a move starts the key's standing again.
-    charged_owner: Option<Uuid>,
+    /// Shared mode: its key's move count (`Pool::key_moves`) when its local
+    /// slot was charged. A refused claim undoes the key's charge only if the
+    /// key has not moved since, because a move starts its standing again.
+    charged_moves: Option<u64>,
     respond: oneshot::Sender<Admitted>,
 }
 
@@ -1037,6 +1037,8 @@ struct Pool {
     /// clock reaches it, and the set holds at most
     /// [`MAX_IDLE_KEYS_PER_TENANT`].
     key_idle: HashMap<Uuid, HashSet<Uuid>>,
+    /// How many times each tracked key has moved to another tenant.
+    key_moves: HashMap<Uuid, u64>,
     /// When the pool last became idle (no permits, no waiters); `None` while
     /// it is in use.
     idle_since: Option<Instant>,
@@ -1097,6 +1099,7 @@ impl Pool {
             virtual_time: 0.0,
             key_clock: HashMap::new(),
             key_idle: HashMap::new(),
+            key_moves: HashMap::new(),
             idle_since: None,
             pending: HashMap::new(),
             probing: false,
@@ -1149,7 +1152,7 @@ impl Pool {
         self.group_weight
             .insert(req.group.clone(), req.group_weight.max(1));
         self.key_weight.insert(req.key, req.key_weight.max(1));
-        self.set_key_tenant(req.key, req.tenant);
+        let moved_from = self.set_key_tenant(req.key, req.tenant);
         match &req.end_user {
             Some(end_user) => {
                 self.key_end_user.insert(req.key, end_user.clone());
@@ -1174,29 +1177,72 @@ impl Pool {
                 self.key_cap.remove(&req.key);
             }
         }
+        if let Some(old) = moved_from {
+            self.move_queued(req.key, old, req.tenant);
+        }
+    }
+
+    /// A key moved from `from` to `to`: its requests still queued under
+    /// `from` move to `to`'s queue, in arrival order, and take `to`'s
+    /// weight, group and cap. So a key is only ever queued under the tenant
+    /// that owns it.
+    fn move_queued(&mut self, key: Uuid, from: Uuid, to: Uuid) {
+        let Some(queue) = self.queues.get_mut(&from) else {
+            return;
+        };
+        let Some(waiters) = queue.keys.remove(&key) else {
+            return;
+        };
+        queue.len -= waiters.len();
+        if queue.is_empty() {
+            self.queues.remove(&from);
+        }
+        for mut waiter in waiters {
+            self.retarget_waiter(&mut waiter, to);
+            self.queues.entry(to).or_default().reinsert(key, waiter);
+        }
+    }
+
+    /// Give a waiter `tenant`'s weight, group and cap, as last recorded.
+    fn retarget_waiter(&self, waiter: &mut Waiter, tenant: Uuid) {
+        if let Some(weight) = self.tenant_weight.get(&tenant) {
+            waiter.weight = *weight;
+        }
+        if let Some(group) = self.tenant_group.get(&tenant) {
+            waiter.group = group.clone();
+            if let Some(weight) = self.group_weight.get(group) {
+                waiter.group_weight = *weight;
+            }
+        }
+        waiter.tenant_max_in_flight = self.tenant_cap.get(&tenant).copied();
     }
 
     /// Record `key`'s tenant, as of its latest admission. A key moved to
     /// another tenant leaves the old one's idle set, and its standing,
     /// measured against the old tenant's key clock, starts again at the new
-    /// one's.
-    fn set_key_tenant(&mut self, key: Uuid, tenant: Uuid) {
-        let Some(old) = self.key_tenant.insert(key, tenant) else {
-            return;
-        };
-        if old != tenant {
-            if let Some(idle) = self.key_idle.get_mut(&old) {
-                idle.remove(&key);
-            }
-            let start = self.key_start(tenant, key);
-            self.key_served.insert(key, start);
+    /// one's. Returns the tenant it moved from.
+    fn set_key_tenant(&mut self, key: Uuid, tenant: Uuid) -> Option<Uuid> {
+        let old = self.key_tenant.insert(key, tenant)?;
+        if old == tenant {
+            return None;
         }
+        if let Some(idle) = self.key_idle.get_mut(&old) {
+            idle.remove(&key);
+        }
+        let start = self.key_start(tenant, key);
+        self.key_served.insert(key, start);
+        *self.key_moves.entry(key).or_insert(0) += 1;
+        Some(old)
+    }
+
+    fn key_moves_of(&self, key: &Uuid) -> u64 {
+        self.key_moves.get(key).copied().unwrap_or(0)
     }
 
     /// The tenant `key` belongs to now: the one its latest admission named.
-    /// A request queued before a move is still granted and billed under the
-    /// tenant it queued in, but the key's standing, clock and idle state are
-    /// kept with its owner.
+    /// A request already running, or a session slot held, under the old
+    /// tenant when the key moved is still billed there, but the key's
+    /// standing, clock and idle state are kept with its owner.
     fn key_owner(&self, key: &Uuid, fallback: Uuid) -> Uuid {
         self.key_tenant.get(key).copied().unwrap_or(fallback)
     }
@@ -1447,7 +1493,7 @@ impl Pool {
             .into_iter()
             .flat_map(|q| q.keys.iter())
             .filter(|(k, d)| !d.is_empty() && self.key_open(k))
-            .map(|(k, _)| self.queued_standing(&tenant, k))
+            .map(|(k, _)| self.key_standing(k))
             .fold(f64::INFINITY, f64::min);
         let target = if waiting.is_finite() { waiting } else { began };
         let clock = self.key_clock.entry(tenant).or_insert(0.0);
@@ -1491,19 +1537,6 @@ impl Pool {
     /// A key's standing: its service over its weight.
     fn key_standing(&self, key: &Uuid) -> f64 {
         self.key_served.get(key).copied().unwrap_or(0.0) / self.key_weight_of(key)
-    }
-
-    /// Where `key` ranks among the keys queued under `tenant`. A request left
-    /// under a tenant the key has since moved away from ranks no higher than
-    /// that tenant's key clock: its standing is measured on its new owner's
-    /// clock, which may be far from this one.
-    fn queued_standing(&self, tenant: &Uuid, key: &Uuid) -> f64 {
-        let standing = self.key_standing(key);
-        if self.key_tenant.get(key).is_none_or(|t| t == tenant) {
-            standing
-        } else {
-            standing.min(self.key_clock.get(tenant).copied().unwrap_or(0.0))
-        }
     }
 
     /// Nothing of `key` is queued, under any tenant, or running.
@@ -1645,7 +1678,7 @@ impl Pool {
                 passed: 0,
                 enqueued,
                 fast,
-                charged_owner: None,
+                charged_moves: None,
                 respond,
             },
         );
@@ -1705,7 +1738,7 @@ impl Pool {
             }
             self.track_waiter_meta(tenant, key, &waiter);
             self.occupy(tenant, key, waiter.cost);
-            waiter.charged_owner = Some(self.key_owner(&key, tenant));
+            waiter.charged_moves = Some(self.key_moves_of(&key));
             self.advance_virtual_time();
             return (Some((tenant, key, waiter)), dropped);
         }
@@ -1787,16 +1820,24 @@ impl Pool {
         if let Some(served) = self.served.get_mut(&tenant) {
             *served -= waiter.cost as f64;
         }
-        let owner = self.key_owner(&key, tenant);
-        if waiter.charged_owner.is_none_or(|o| o == owner) {
+        if waiter
+            .charged_moves
+            .is_none_or(|m| m == self.key_moves_of(&key))
+        {
             if let Some(served) = self.key_served.get_mut(&key) {
                 *served -= waiter.cost as f64;
             }
         }
-        waiter.charged_owner = None;
+        waiter.charged_moves = None;
         waiter.fast = false;
         waiter.jumped = false;
-        self.queues.entry(tenant).or_default().reinsert(key, waiter);
+        // A key that moved while its claim was out goes back in line under
+        // its new tenant.
+        let owner = self.key_owner(&key, tenant);
+        if owner != tenant {
+            self.retarget_waiter(&mut waiter, owner);
+        }
+        self.queues.entry(owner).or_default().reinsert(key, waiter);
         self.queued_total += 1;
     }
 
@@ -1969,7 +2010,7 @@ impl Pool {
             if !self.key_open(key) {
                 continue;
             }
-            let score = self.queued_standing(tenant, key);
+            let score = self.key_standing(key);
             let better = match best {
                 None => true,
                 Some((_, best_score, best_enqueued)) => {
@@ -2069,7 +2110,7 @@ impl Pool {
         waiter.jumped = oldest.is_some_and(|t| t < waiter.enqueued);
         self.track_waiter_meta(tenant, key, &waiter);
         self.occupy(tenant, key, waiter.cost);
-        waiter.charged_owner = Some(self.key_owner(&key, tenant));
+        waiter.charged_moves = Some(self.key_moves_of(&key));
         self.advance_virtual_time();
         Some((tenant, key, waiter))
     }
@@ -2253,6 +2294,7 @@ impl Pool {
             }
         }
         self.key_served.remove(key);
+        self.key_moves.remove(key);
         self.key_weight.remove(key);
         self.key_cap.remove(key);
         self.key_tenant.remove(key);
@@ -2314,6 +2356,7 @@ impl Pool {
         self.virtual_time = 0.0;
         self.key_clock.clear();
         self.key_idle.clear();
+        self.key_moves.clear();
     }
 
     /// Per-group in-flight/queued totals, for the history sampler. Cheaper
@@ -4443,51 +4486,6 @@ mod tests {
         assert!(!sim.pool.key_open(&moved), "the key is at its cap of 1");
     }
 
-    /// A request queued under a key's old tenant and granted after the key
-    /// moved is billed to the old tenant, but the key's standing stays on its
-    /// new tenant's clock and the key stays the new tenant's.
-    #[test]
-    fn leftover_request_under_the_old_tenant_does_not_move_the_key_back() {
-        let mut sim = Sim::new(1);
-        let (old, new) = (Uuid::new_v4(), Uuid::new_v4());
-        let (old_busy, new_busy, moved) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-        for _ in 0..300 {
-            sim.queue(old, old_busy, 100);
-        }
-        for _ in 0..100 {
-            sim.grant();
-        }
-        sim.queue(old, moved, 100);
-        for _ in 0..2 {
-            sim.queue(new, moved, 100);
-        }
-        for _ in 0..300 {
-            sim.queue(new, new_busy, 100);
-        }
-        // Grant until the request left under the old tenant has run.
-        while sim
-            .pool
-            .queues
-            .get(&old)
-            .is_some_and(|q| q.key_len(&moved) > 0)
-        {
-            sim.grant();
-        }
-        sim.grant();
-        assert_eq!(sim.pool.key_tenant.get(&moved), Some(&new));
-        assert!(!sim
-            .pool
-            .key_idle
-            .get(&old)
-            .is_some_and(|i| i.contains(&moved)));
-        let clock = sim.pool.key_clock.get(&new).copied().unwrap_or(0.0);
-        let standing = sim.pool.key_standing(&moved);
-        assert!(
-            standing <= clock + 2.0,
-            "standing {standing} is measured against the new tenant's clock {clock}"
-        );
-    }
-
     /// A key moved while it still had a request running under its old tenant
     /// is forgotten, or kept idle under its new tenant, once the last of its
     /// requests ends, whichever tenant that request ran under.
@@ -4523,38 +4521,6 @@ mod tests {
             .key_idle
             .get(&old)
             .is_some_and(|i| i.contains(&moved)));
-    }
-
-    /// A request left under a key's old tenant ranks on that tenant's clock,
-    /// not its new owner's: when the owner's clock is far ahead it is still
-    /// granted about as soon as a new key of the old tenant would be.
-    #[test]
-    fn leftover_request_ranks_on_its_queue_tenants_clock() {
-        let mut sim = Sim::new(1);
-        let (old, new) = (Uuid::new_v4(), Uuid::new_v4());
-        let (a1, a2, b1, moved) = (
-            Uuid::new_v4(),
-            Uuid::new_v4(),
-            Uuid::new_v4(),
-            Uuid::new_v4(),
-        );
-        for _ in 0..3_000 {
-            sim.queue(old, a1, 100);
-            sim.queue(old, a2, 100);
-            sim.queue(new, b1, 100);
-        }
-        for _ in 0..3_000 {
-            sim.grant();
-        }
-        assert!(sim.pool.key_clock[&new] > sim.pool.key_clock[&old] * 1.5);
-        sim.queue(old, moved, 100);
-        sim.queue(new, moved, 100);
-        let mut before = 0;
-        while sim.pool.queues[&old].key_len(&moved) > 0 {
-            sim.grant();
-            before += 1;
-        }
-        assert!(before <= 6, "the left-over request waited {before} grants");
     }
 
     /// Shared mode: a claim refused after the key moved does not undo a
@@ -4601,6 +4567,83 @@ mod tests {
             served >= start,
             "standing {served} fell below the new tenant's start {start}"
         );
+        assert_eq!(
+            sim.pool.queues[&new].key_len(&moved),
+            2,
+            "it went back in line under its new tenant"
+        );
+        assert!(!sim
+            .pool
+            .queues
+            .get(&old)
+            .is_some_and(|q| q.key_len(&moved) > 0));
+    }
+
+    /// Shared mode: a key moved away and back while its claims were out does
+    /// not have charges the moves already discarded undone again.
+    #[test]
+    fn refused_claims_after_moving_away_and_back_stay_at_the_clock() {
+        let mut sim = Sim::new(8);
+        let (a, b, key) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        sim.queue(a, key, 1_000);
+        sim.queue(a, key, 1_000);
+        let mut claims = Vec::new();
+        for _ in 0..2 {
+            let (next, _) = sim.pool.take_next(sim.pool.cap);
+            let (tenant, key, waiter) = next.expect("a request can be taken");
+            claims.push(PendingClaim {
+                tenant,
+                key,
+                waiter,
+            });
+        }
+        sim.queue(b, key, 100);
+        sim.queue(a, key, 100);
+        let start = sim.pool.key_start(a, key);
+        for claim in claims {
+            sim.pool.requeue(claim);
+        }
+        let served = sim.pool.key_served[&key];
+        assert!(
+            served >= start,
+            "standing {served} fell below the clock's {start}"
+        );
+    }
+
+    /// A key's requests still queued under its old tenant move with it, in
+    /// order, and take the new tenant's group; the old tenant's own keys keep
+    /// its slots.
+    #[test]
+    fn moved_keys_queued_requests_move_with_it() {
+        let mut sim = Sim::new(1);
+        let (old, new) = (Uuid::new_v4(), Uuid::new_v4());
+        let (sibling, moved) = (Uuid::new_v4(), Uuid::new_v4());
+        let under = |tenant: Uuid, group: &str, key: Uuid| {
+            AdmitRequest::new(tenant, "m", 100)
+                .key(key, 100)
+                .group(group, 100)
+        };
+        for _ in 0..300 {
+            sim.queue_req(under(old, "g-old", sibling));
+        }
+        for _ in 0..40 {
+            sim.queue_req(under(old, "g-old", moved));
+        }
+        for _ in 0..10 {
+            sim.grant();
+        }
+        let left = sim.pool.queues[&old].key_len(&moved);
+        assert!(left > 0);
+        sim.queue_req(under(new, "g-new", moved));
+        assert_eq!(sim.pool.queues[&old].key_len(&moved), 0);
+        let queue = &sim.pool.queues[&new].keys[&moved];
+        assert_eq!(queue.len(), left + 1);
+        assert!(queue.iter().all(|w| w.group == "g-new"));
+        assert!(queue
+            .iter()
+            .zip(queue.iter().skip(1))
+            .all(|(x, y)| x.enqueued <= y.enqueued));
+        assert_eq!(sim.pool.key_tenant[&moved], new);
     }
 
     /// A queued request counts as passed only when session affinity served
