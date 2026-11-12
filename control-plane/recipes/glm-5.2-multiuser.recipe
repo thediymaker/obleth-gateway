@@ -79,7 +79,7 @@ fi
 exec ${RUN[@]+"${RUN[@]}"} llama-server -hf unsloth/GLM-5.2-GGUF:UD-IQ2_M \
   --alias {{api_model_name}} \
   --host 0.0.0.0 --port "$OBLETH_SERVING_PORT" \
-  -ngl 99 --ctx-size {{context}} --parallel {{parallel}} --threads "$(nproc)" \
+  -ngl 99 --ctx-size {{context}} --parallel {{parallel}} --threads "${SLURM_CPUS_ON_NODE:-$(nproc)}" \
   --n-cpu-moe {{cpu_moe}} \
   --batch-size 2048 --ubatch-size 512 \
   --cache-type-k q8_0 --cache-type-v q8_0 \

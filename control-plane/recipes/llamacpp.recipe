@@ -77,6 +77,6 @@ fi
 exec ${RUN[@]+"${RUN[@]}"} llama-server -hf {{model}} \
   --alias {{api_model_name}} \
   --host 0.0.0.0 --port "$OBLETH_SERVING_PORT" \
-  -ngl 99 --ctx-size {{context}} --parallel {{parallel}} --threads "$(nproc)" \
+  -ngl 99 --ctx-size {{context}} --parallel {{parallel}} --threads "${SLURM_CPUS_ON_NODE:-$(nproc)}" \
   --cont-batching --flash-attn on --jinja \
   {{extra}}
