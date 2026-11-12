@@ -12,11 +12,15 @@ mod warmup;
 // discovery code into the binary too, where it is unused (dead-code warnings).
 pub(crate) use obleth_provisioner::{domain, slurm};
 
+use chrono::{DateTime, Utc};
 use config::ProvisionerConfig;
-use obleth_client::{HttpObleth, OblethClient, TickReport};
-use obleth_provisioner::slurm::{SlurmClient, Slurmrestd};
+use domain::{Action, JobInfo, JobState, ReplicaView};
+use obleth_client::{HttpObleth, ModelIdentity, OblethClient, TickReport};
+use obleth_config::{ManagedBackoff, ManagedModelSpec};
+use obleth_provisioner::slurm::{SlurmClient, SlurmErrorKind, Slurmrestd};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
+use uuid::Uuid;
 
 /// Outcome of one loop iteration, so the loop can log idle/active transitions
 /// without spamming a line every tick.
@@ -30,6 +34,42 @@ enum Tick {
 /// stable for a job's lifetime; a few minutes catches the rare case of a node
 /// rebooting onto a new address without hammering DNS.
 const RESOLVE_TTL_SECS: u64 = 300;
+
+/// How often Slurm's node addresses (NodeAddr) are read again while jobs run.
+const NODE_ADDR_REFRESH: Duration = Duration::from_secs(600);
+
+/// How long after a submit that got no answer the model's submits wait while
+/// the accounting database is checked for the job. Slurm records a job there
+/// within seconds of accepting it.
+const UNCERTAIN_SUBMIT_SECS: i64 = 180;
+
+/// What the reconcile loop remembers between ticks. In memory on purpose: the
+/// provisioner is a singleton, and a restart only resets these streaks and
+/// clocks (worst case: a remedy waits one more window).
+#[derive(Default)]
+struct Memory {
+    /// Self-heal: net failed health probes per healthy replica.
+    probe_failures: HashMap<Uuid, i64>,
+    /// When each replica started waiting on something the planner times: a
+    /// pending job Slurm will not start, or a serving replica awaiting its
+    /// replacement.
+    waiting_since: HashMap<Uuid, DateTime<Utc>>,
+    /// Submits that got no answer, by model, until the job is found or the
+    /// wait is over.
+    uncertain: HashMap<Uuid, Vec<UncertainSubmit>>,
+    /// When Slurm's node addresses were last read.
+    node_addrs_read: Option<std::time::Instant>,
+}
+
+/// A submit whose answer was lost: Slurm may or may not have the job.
+#[derive(Debug, Clone)]
+struct UncertainSubmit {
+    job_name: String,
+    port_base: i64,
+    /// `<working dir>/<job name>`: the job's output is `<this>-<id>.out`.
+    log_prefix: String,
+    at: DateTime<Utc>,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -50,11 +90,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Track the last idle reason so we only log on transitions.
     let mut last_idle: Option<&'static str> = None;
-    // Self-heal state: consecutive failed health probes per healthy replica.
-    // In-memory on purpose — the provisioner is a singleton, and a restart
-    // merely resets the streaks (worst case: remediation is delayed by
-    // `restart_after_failures` ticks). No schema for a transient counter.
-    let mut probe_failures: HashMap<uuid::Uuid, i64> = HashMap::new();
+    let mut mem = Memory::default();
     // Long-lived so its success cache survives across ticks: once a node name is
     // resolved (or aliased) the provisioner stops touching DNS for it.
     let resolver = resolve::HostResolver::new(Duration::from_secs(RESOLVE_TTL_SECS));
@@ -64,7 +100,7 @@ async fn main() -> anyhow::Result<()> {
         let _ = shutdown_tx.send(true);
     });
     loop {
-        match run_once(&cfg, &obleth, &http, &resolver, &mut probe_failures).await {
+        match run_once(&cfg, &obleth, &http, &resolver, &mut mem).await {
             Ok(Tick::Ran(warnings)) => {
                 obleth.set_last_tick(TickReport::ok().with_warnings(warnings));
                 if last_idle.take().is_some() {
@@ -144,7 +180,7 @@ async fn run_once(
     obleth: &dyn OblethClient,
     http: &reqwest::Client,
     resolver: &resolve::HostResolver,
-    probe_failures: &mut HashMap<uuid::Uuid, i64>,
+    mem: &mut Memory,
 ) -> anyhow::Result<Tick> {
     let settings = match obleth.get_slurm_settings().await? {
         Some(s) => s,
@@ -184,26 +220,75 @@ async fn run_once(
             None => return Err(e),
         }
     }
-    tick(cfg, &slurm, obleth, http, resolver, probe_failures).await?;
-    Ok(Tick::Ran(token_warning.into_iter().collect()))
+    let mut warnings: Vec<String> = token_warning.into_iter().collect();
+    warnings.extend(tick(cfg, &slurm, obleth, http, resolver, mem).await?);
+    Ok(Tick::Ran(warnings))
 }
 
-/// Breaker for the job lookups: `Some(n)` when there are at least two distinct
-/// jobs behind live replicas and *none* of them came back. A whole fleet going
-/// missing in one tick is far likelier a wrong cluster/URL/API version than
-/// real deaths, and each miss would otherwise become a MarkLost + resubmit.
-/// Only replicas the planner would mark lost count: `lost`/`draining` rows are
-/// expected to point at purged jobs (and must stay GC-able).
-fn all_live_jobs_vanished(
-    replicas: &[domain::ReplicaView],
-    jobs: &HashMap<String, domain::JobInfo>,
-) -> Option<usize> {
+/// Jobs behind live replicas that Slurm no longer knows, when that is every
+/// one of them and there are at least two. A whole fleet going missing in
+/// one tick is far likelier a wrong cluster, URL or API version than real
+/// deaths, so the tick checks the accounting database before it believes
+/// it. Only replicas the planner would mark lost count: `lost`/`draining`
+/// rows are expected to point at purged jobs, and a replica the operator
+/// stopped is let go whatever Slurm says.
+fn vanished_fleet(
+    replicas: &[ReplicaView],
+    jobs: &HashMap<String, JobInfo>,
+) -> Option<Vec<String>> {
     let live: HashSet<&str> = replicas
         .iter()
-        .filter(|r| r.state != "lost" && r.state != "draining" && !r.slurm_job_id.is_empty())
+        .filter(|r| {
+            r.state != "lost"
+                && r.state != "draining"
+                && !r.cancel_requested
+                && !r.slurm_job_id.is_empty()
+        })
         .map(|r| r.slurm_job_id.as_str())
         .collect();
-    (live.len() >= 2 && live.iter().all(|id| !jobs.contains_key(*id))).then_some(live.len())
+    let mut ids: Vec<String> = live.iter().map(|s| s.to_string()).collect();
+    ids.sort();
+    (live.len() >= 2 && live.iter().all(|id| !jobs.contains_key(*id))).then_some(ids)
+}
+
+/// Counts failed actions by kind, for the tick's warnings.
+#[derive(Default)]
+struct ActionFailures(Vec<(&'static str, usize, String)>);
+
+impl ActionFailures {
+    fn add(&mut self, kind: &'static str, error: String) {
+        match self.0.iter_mut().find(|(k, ..)| *k == kind) {
+            Some(entry) => entry.1 += 1,
+            None => self.0.push((kind, 1, error)),
+        }
+    }
+
+    /// One plain sentence per kind, e.g. "2 job cancels failed. The first:
+    /// Slurm refused cancelling job 12: Access/permission denied."
+    fn sentences(&self) -> Vec<String> {
+        self.0
+            .iter()
+            .map(|(kind, n, first)| {
+                let first = first.trim().trim_end_matches('.');
+                if *n == 1 {
+                    format!("A {kind} failed: {first}.")
+                } else {
+                    format!("{n} {kind}s failed. The first: {first}.")
+                }
+            })
+            .collect()
+    }
+}
+
+/// A model's work for this tick, gathered before anything is changed so the
+/// fleet guard can look at every probe at once.
+struct ModelWork<'a> {
+    spec: &'a ManagedModelSpec,
+    identity: ModelIdentity,
+    replicas: Vec<ReplicaView>,
+    health: HashMap<Uuid, u16>,
+    notes: HashMap<Uuid, String>,
+    hold_submits: bool,
 }
 
 async fn tick(
@@ -212,31 +297,36 @@ async fn tick(
     obleth: &dyn OblethClient,
     http: &reqwest::Client,
     resolver: &resolve::HostResolver,
-    probe_failures: &mut HashMap<uuid::Uuid, i64>,
-) -> anyhow::Result<()> {
+    mem: &mut Memory,
+) -> anyhow::Result<Vec<String>> {
+    let now = chrono::Utc::now();
+    let mut warnings: Vec<String> = Vec::new();
+    let mut failures = ActionFailures::default();
     let specs = obleth.list_managed_models().await?; // obleth down -> bail (held). enabled only.
     let all_replicas = obleth.list_all_replicas().await?; // obleth down -> bail (held)
                                                           // Every model's name in one read; a model missing from it is looked up
                                                           // on its own below.
-    let names = obleth.model_names().await.unwrap_or_else(|e| {
+    let identities = obleth.model_identities().await.unwrap_or_else(|e| {
         tracing::warn!(error = %e, "model list read failed; looking names up one by one");
         HashMap::new()
     });
 
-    // Drop self-heal streaks for replicas that no longer exist or are no longer
-    // healthy (restarted, lost, draining) so the map can't grow unbounded.
-    probe_failures.retain(|id, _| {
+    // Drop self-heal streaks and wait clocks of replicas that no longer exist
+    // or are no longer healthy, so the maps can't grow unbounded.
+    mem.probe_failures.retain(|id, _| {
         all_replicas
             .iter()
             .any(|r| r.id == *id && r.state == "healthy")
     });
+    mem.waiting_since
+        .retain(|id, _| all_replicas.iter().any(|r| r.id == *id));
 
     // Look up Slurm state for just the jobs we track, by id — never the whole
     // controller (which on a busy cluster is huge and OOM-kills us). A clean
     // "not found" leaves a job out of the map, which the planner reads as gone;
     // a transport/HTTP error bails the whole tick so an unreachable Slurm is
     // never mistaken for a fleet of dead jobs (no destructive action while held).
-    let mut jobs: HashMap<String, domain::JobInfo> = HashMap::new();
+    let mut jobs: HashMap<String, JobInfo> = HashMap::new();
     // Lost rows only age out, so their jobs are not looked up: a lookup
     // error on a long-gone job must not hold every model's tick.
     for id in all_replicas
@@ -255,32 +345,80 @@ async fn tick(
             Err(e) => return Err(e.context("slurm job lookup failed; holding tick")),
         }
     }
-    if let Some(n) = all_live_jobs_vanished(&all_replicas, &jobs) {
-        tracing::error!(
-            jobs = n,
-            "slurmrestd reports every tracked job as not found; holding tick \
-             (check the slurmrestd URL/API version and cluster)"
-        );
-        anyhow::bail!("all {n} tracked slurm jobs reported not found; holding tick");
+    if let Some(ids) = vanished_fleet(&all_replicas, &jobs) {
+        // The accounting database keeps jobs the controller has purged: a job
+        // it shows as ended really ended. Anything it cannot confirm is left
+        // as it is (and keeps its slot) until Slurm knows it again or the
+        // operator stops that replica.
+        let mut held = Vec::new();
+        for id in &ids {
+            match slurm.accounting_job(id).await {
+                Ok(Some(info)) if info.state == JobState::Gone => {
+                    jobs.insert(id.clone(), info);
+                }
+                _ => held.push(id.clone()),
+            }
+        }
+        if !held.is_empty() {
+            tracing::error!(
+                jobs = held.len(),
+                "slurmrestd reports every tracked job as not found and accounting cannot \
+                 confirm they ended; leaving those replicas as they are \
+                 (check the slurmrestd URL/API version and cluster)"
+            );
+            for id in &held {
+                jobs.insert(
+                    id.clone(),
+                    JobInfo {
+                        job_id: id.clone(),
+                        state: JobState::Unknown,
+                        ..Default::default()
+                    },
+                );
+            }
+            warnings.push(format!(
+                "Slurm no longer knows any of the {} jobs obleth is tracking ({}), and its accounting \
+                 database could not confirm that they ended. obleth leaves those replicas as they are \
+                 in case the slurmrestd URL or cluster changed. If the jobs really ended, stop each \
+                 replica on its deployment and obleth starts new ones.",
+                held.len(),
+                held.join(", ")
+            ));
+        }
+    }
+
+    // Slurm's own node addresses, read now and then while jobs run, so nodes
+    // with cluster-only names are reached without per-node aliases.
+    let any_running = jobs.values().any(|j| j.state == JobState::Running);
+    if any_running
+        && mem
+            .node_addrs_read
+            .is_none_or(|t| t.elapsed() >= NODE_ADDR_REFRESH)
+    {
+        mem.node_addrs_read = Some(std::time::Instant::now());
+        match slurm.node_addresses().await {
+            Ok(addrs) => resolver.set_node_addresses(addrs),
+            Err(e) => {
+                tracing::debug!(error = %e, "node address read failed; using aliases and DNS")
+            }
+        }
     }
 
     // Annotate each replica with its live Slurm status so the dashboard shows why
     // a job is pending or what state it is in. Only non-terminal jobs (terminal
     // ones get the planner's MarkLost message) and only when the message changed,
-    // so we don't write every tick.
-    for r in &all_replicas {
+    // so we don't write every tick. Draining rows are left alone: their last
+    // update marks when the drain started.
+    for r in all_replicas.iter().filter(|r| r.state != "draining") {
         if let Some(job) = jobs.get(&r.slurm_job_id) {
-            if matches!(
-                job.state,
-                domain::JobState::Pending | domain::JobState::Running
-            ) {
+            if matches!(job.state, JobState::Pending | JobState::Running) {
                 let msg = slurm::job_status_message(&job.raw_state, job.reason.as_deref());
                 if r.last_message.as_deref() != Some(msg.as_str()) {
                     // Once the job runs, record its allocation: the gateway
                     // stamps the launch's start time when nodes first arrive,
                     // which is what splits queue time from load time in the
                     // launch history.
-                    let nodes = (job.state == domain::JobState::Running && !job.nodes.is_empty())
+                    let nodes = (job.state == JobState::Running && !job.nodes.is_empty())
                         .then(|| job.nodes.join(","));
                     if let Err(e) = obleth
                         .patch_replica(r.id, None, nodes.as_deref(), None, Some(&msg))
@@ -295,188 +433,160 @@ async fn tick(
 
     // Group every known replica by model so we can both reconcile the enabled
     // models and drain whatever rows belong to models that have left the set.
-    let mut by_model: HashMap<uuid::Uuid, Vec<domain::ReplicaView>> = HashMap::new();
+    let mut by_model: HashMap<Uuid, Vec<ReplicaView>> = HashMap::new();
     for r in all_replicas.iter().cloned() {
         by_model.entry(r.model_id).or_default().push(r);
     }
+    // Port windows in use by every model's live replicas: a new window never
+    // overlaps one of them, so two replicas never share a port.
+    // A submit whose answer was lost may still start, so its window stays
+    // taken until the job is found or given up on.
+    let mut live_bases: Vec<i64> = all_replicas
+        .iter()
+        .filter(|r| r.state != "lost")
+        .map(|r| r.port_base)
+        .chain(mem.uncertain.values().flatten().map(|u| u.port_base))
+        .collect();
+    let mut tracked: HashSet<String> = all_replicas
+        .iter()
+        .filter(|r| r.state != "lost")
+        .map(|r| r.slurm_job_id.clone())
+        .collect();
 
-    // 1. Reconcile each enabled managed model toward its target.
+    // 1. Gather each enabled model's state and probe its replicas.
+    let mut work: Vec<ModelWork> = Vec::new();
     for spec in &specs {
         // Claim this model's replicas so the drain pass below ignores them, even
         // if we end up skipping this model for a transient reason.
         let mut replicas = by_model.remove(&spec.model_id).unwrap_or_default();
-        let looked_up = match names.get(&spec.model_id) {
-            Some(n) => Ok(n.clone()),
-            None => obleth.model_name(spec.model_id).await,
-        };
-        let model_name = match looked_up {
-            Ok(n) if !n.is_empty() => n,
-            Ok(_) => {
-                tracing::warn!(model_id = %spec.model_id, "model has empty name; skipping this tick");
-                continue;
-            }
-            Err(e) => {
-                tracing::warn!(model_id = %spec.model_id, error = %e, "model_name lookup failed; skipping this tick");
-                continue;
-            }
-        };
-
-        // Probe every replica with a running job. "pending" means the job was
-        // submitted but we haven't seen it Running yet; once Slurm transitions
-        // the job to Running, the replica is still "pending" (there is no
-        // separate MarkStarting step), so both pre-promotion states are probed —
-        // and healthy ones are re-probed for self-heal (see below).
-        let mut health: HashMap<uuid::Uuid, u16> = HashMap::new();
-        for r in &replicas {
-            // Probe replicas awaiting promotion, stranded "healthy" rows with no
-            // endpoint linked (a prior promote whose endpoint write failed, so
-            // the planner can re-promote and re-link), AND every promoted
-            // healthy replica — the last so self-heal can spot a zombie job
-            // (Slurm still says RUNNING, but the inference server inside it is
-            // dead) and restart it instead of leaving the model unhealthy
-            // forever.
-            if r.state == "starting" || r.state == "pending" || r.state == "healthy" {
-                if let Some(j) = jobs.get(&r.slurm_job_id) {
-                    if j.state == domain::JobState::Running {
-                        // The batch host runs the server; for a multi-node
-                        // job the node list alone does not say which one.
-                        match j.probe_host().map(str::to_string).as_ref() {
-                            None => {
-                                tracing::warn!(
-                                    replica_id = %r.id,
-                                    job_id = %r.slurm_job_id,
-                                    "job is RUNNING but slurmrestd returned no nodes; \
-                                     cannot probe health — check slurmrestd response"
-                                );
-                            }
-                            Some(node) => {
-                                // Resolve the node name to an address ONCE per tick
-                                // (cached across ticks) and probe by that address,
-                                // so a flaky resolver can't make a live replica
-                                // flap unhealthy. Falls back to the name on a miss.
-                                let probe_host =
-                                    resolver.resolve(node).await.unwrap_or_else(|| node.clone());
-                                // Probe the whole window concurrently rather than
-                                // sequentially: a not-yet-up replica otherwise costs
-                                // port_span * health_timeout of serial waits every
-                                // tick (8 * 5s = 40s with the defaults), which can
-                                // exceed the tick interval and stall the loop.
-                                let mut set = tokio::task::JoinSet::new();
-                                for p in r.port_base..(r.port_base + cfg.port_span) {
-                                    // Skip ports outside the valid TCP range so a high
-                                    // serving_port + window can't wrap on the u16 cast.
-                                    if p <= 0 || p > u16::MAX as i64 {
-                                        continue;
-                                    }
-                                    let http = http.clone();
-                                    let host = probe_host.clone();
-                                    let health_path = spec.health_path.clone();
-                                    let timeout = cfg.health_timeout_secs;
-                                    set.spawn(async move {
-                                        let api_base = format!("http://{host}:{p}");
-                                        (
-                                            p,
-                                            probe::is_healthy(
-                                                &http,
-                                                &api_base,
-                                                &health_path,
-                                                timeout,
-                                            )
-                                            .await,
-                                        )
-                                    });
-                                }
-                                // The bound port is whichever responds healthy; pick
-                                // the lowest for a stable, deterministic choice.
-                                let mut found: Option<u16> = None;
-                                while let Some(res) = set.join_next().await {
-                                    if let Ok((p, true)) = res {
-                                        let p = p as u16;
-                                        found = Some(found.map_or(p, |cur| cur.min(p)));
-                                    }
-                                }
-                                if let Some(p) = found {
-                                    tracing::info!(
-                                        replica_id = %r.id,
-                                        job_id = %r.slurm_job_id,
-                                        port = p,
-                                        "health probe: healthy"
-                                    );
-                                    health.insert(r.id, p);
-                                } else {
-                                    tracing::info!(
-                                        replica_id = %r.id,
-                                        job_id = %r.slurm_job_id,
-                                        port_base = r.port_base,
-                                        port_span = cfg.port_span,
-                                        "health probe: not yet healthy"
-                                    );
-                                }
-                            }
-                        }
-                    }
+        let identity = match identities.get(&spec.model_id) {
+            Some(i) => i.clone(),
+            None => match obleth.model_identity(spec.model_id).await {
+                Ok(i) => i,
+                Err(e) => {
+                    tracing::warn!(model_id = %spec.model_id, error = %e, "model lookup failed; skipping this tick");
+                    continue;
                 }
-            }
+            },
+        };
+        if identity.name.is_empty() {
+            tracing::warn!(model_id = %spec.model_id, "model has empty name; skipping this tick");
+            continue;
         }
+        let hold_submits = adopt_lost_submits(
+            spec,
+            &identity,
+            slurm,
+            obleth,
+            &mut replicas,
+            &mut tracked,
+            &mut jobs,
+            mem,
+            now,
+            &mut warnings,
+        )
+        .await;
+        let (health, notes) =
+            probe_model(cfg, http, resolver, spec, &identity, &replicas, &jobs).await;
+        work.push(ModelWork {
+            spec,
+            identity,
+            replicas,
+            health,
+            notes,
+            hold_submits,
+        });
+    }
 
-        // Self-heal bookkeeping: judge each healthy replica's probe outcome,
-        // pull the gateway's endpoint-health verdicts (its check is a real
-        // 1-token inference — it catches zombies whose metadata GET still
-        // answers), and collect restart candidates. Endpoint fetch is
-        // best-effort: without it the GET-probe signal still works.
-        plan::update_probe_failures(&replicas, &jobs, &health, probe_failures);
+    // Fleet guard: when every probed healthy replica of every model failed at
+    // once, the fault is almost certainly on the provisioner's own path to
+    // the nodes. Hold every self-heal restart and leave the streaks alone.
+    let probed_rows: Vec<ReplicaView> = work.iter().flat_map(|w| w.replicas.clone()).collect();
+    let all_health: HashMap<Uuid, u16> = work
+        .iter()
+        .flat_map(|w| w.health.iter().map(|(k, v)| (*k, *v)))
+        .collect();
+    let path_down = plan::probe_path_down(&probed_rows, &jobs, &all_health);
+    if let Some(n) = path_down {
+        tracing::error!(
+            replicas = n,
+            "every health probe failed; holding self-heal restarts"
+        );
+        warnings.push(format!(
+            "The provisioner could not reach any of the {n} running model servers, so it is not \
+             restarting any of them. Check the network between the provisioner and the compute nodes."
+        ));
+    }
+
+    // 2. Plan and apply each model.
+    for w in &mut work {
+        let spec = w.spec;
+        if path_down.is_none() {
+            plan::update_probe_failures(&w.replicas, &jobs, &w.health, &mut mem.probe_failures);
+        }
+        // The gateway's endpoint verdicts (its check is a real inference, so
+        // it catches zombies whose metadata GET still answers). Best-effort:
+        // without them the probe signal still works, and the phantom sweep
+        // waits for a good snapshot.
         let endpoints = match obleth.list_endpoints(spec.model_id).await {
             Ok(e) => Some(e),
             Err(e) => {
                 tracing::warn!(model_id = %spec.model_id, error = %e,
-                    "endpoint health lookup failed; self-heal using probe signal only");
+                    "endpoint lookup failed; self-heal using probe signal only");
                 None
             }
         };
-        let endpoints_slice = endpoints.as_deref().unwrap_or(&[]);
-        let restart = plan::restart_candidates(
-            &replicas,
-            probe_failures,
-            cfg.restart_after_failures,
-            endpoints_slice,
-        );
-        // If the endpoint list came back cleanly this tick, null out any healthy
-        // replica whose endpoint_id is dangling — the endpoint was removed out of
-        // band and there is no FK to null it for us — so the planner re-promotes
-        // and relinks a fresh endpoint instead of leaving the model short one (the
-        // "2 healthy replicas, 1 endpoint" split). Skipped when the fetch failed,
-        // so a transient error can't strip the whole fleet's endpoints at once.
+        let heal = if path_down.is_some() {
+            plan::SelfHeal::default()
+        } else {
+            plan::self_heal_candidates(
+                &w.replicas,
+                &mem.probe_failures,
+                cfg.restart_after_failures,
+                endpoints.as_deref().unwrap_or(&[]),
+            )
+        };
         if let Some(eps) = &endpoints {
-            let live: HashSet<uuid::Uuid> = eps.iter().map(|ep| ep.id).collect();
-            plan::clear_dangling_endpoints(&mut replicas, &live);
+            let live: HashSet<Uuid> = eps.iter().map(|ep| ep.id).collect();
+            plan::clear_dangling_endpoints(&mut w.replicas, &live);
         }
-
-        let mut live_port_bases: Vec<i64> = replicas
-            .iter()
-            .filter(|r| r.state != "lost" && r.state != "draining")
-            .map(|r| r.port_base)
-            .collect();
-
+        let waited = waited_secs(&mut mem.waiting_since, &w.replicas, &jobs, &heal, now);
         let view = plan::ManagedSpecView {
             target_replicas: spec.target_replicas,
-            max_job_failures: spec.max_job_failures,
+            startup_timeout_mins: spec.startup_timeout_mins,
+            handoff_mins: spec.handoff_mins,
+            paused_until: spec.paused_until,
+            removed: false,
         };
-        let actions = plan::plan(
-            &view,
-            &replicas,
-            &jobs,
-            &health,
-            &restart,
-            cfg.lost_retention_secs,
-        );
+        let prefix = format!("{}{}-", cfg.job_name_prefix, w.identity.name);
+        let mut actions = plan::plan(&plan::PlanInput {
+            spec: &view,
+            replicas: &w.replicas,
+            jobs: &jobs,
+            health: &w.health,
+            probe_notes: &w.notes,
+            self_heal: &heal,
+            waited_secs: &waited,
+            endpoints: endpoints.as_deref().map(|e| (e, prefix.as_str())),
+            now,
+            lost_retention_secs: cfg.lost_retention_secs,
+        });
+        if w.hold_submits {
+            actions.retain(|a| !matches!(a, Action::Submit));
+        }
+
+        let mut outcome = plan::LaunchOutcome::default();
+        let mut stop_submits = false;
         for action in &actions {
-            // Reserve a distinct window per Submit *before* applying, so several
-            // Submits in one tick don't all collapse onto the same port_base
-            // (live_port_bases is recomputed per tick, not per action otherwise).
-            let port_base = if matches!(action, domain::Action::Submit) {
-                let b =
-                    plan::next_free_window_base(spec.serving_port, cfg.port_span, &live_port_bases);
-                live_port_bases.push(b);
+            let is_submit = matches!(action, Action::Submit);
+            if is_submit && stop_submits {
+                continue;
+            }
+            // Reserve a distinct window per Submit *before* applying, so
+            // several Submits in one tick (of any model) never share ports.
+            let port_base = if is_submit {
+                let b = plan::next_free_window_base(spec.serving_port, cfg.port_span, &live_bases);
+                live_bases.push(b);
                 b
             } else {
                 0
@@ -484,7 +594,7 @@ async fn tick(
             match executor::apply(
                 action,
                 spec.model_id,
-                &model_name,
+                &w.identity.name,
                 Some(spec),
                 &cfg.job_name_prefix,
                 cfg.port_span,
@@ -495,37 +605,70 @@ async fn tick(
             )
             .await
             {
-                Err(e) => tracing::warn!(?action, error = %e, "action failed; continuing"),
-                // A just-promoted replica is healthy by /health but may still be
-                // cold for its first forward pass. Fire a throwaway warmup
-                // inference, detached, so the slow cold first token is paid here
-                // instead of by the first real user — and never stalls the tick.
-                Ok(()) => {
-                    if cfg.warmup_timeout_secs > 0 {
-                        if let domain::Action::Promote { api_base, .. } = action {
-                            let http = http.clone();
-                            // Warm up against the resolved IP too, so the slow cold
-                            // first token isn't paid on a DNS miss.
-                            let api_base = resolver.resolve_url_host(api_base).await;
-                            let model_name = model_name.clone();
-                            let budget = Duration::from_secs(cfg.warmup_timeout_secs);
-                            tokio::spawn(async move {
-                                match warmup::warm_up(&http, &api_base, budget).await {
-                                    Ok(()) => tracing::info!(
-                                        model = %model_name, %api_base,
-                                        "warmup inference completed"
-                                    ),
-                                    Err(e) => tracing::warn!(
-                                        model = %model_name, %api_base, error = %e,
-                                        "warmup inference failed (best-effort)"
-                                    ),
-                                }
-                            });
+                Err(e) => {
+                    tracing::warn!(?action, error = %e, "action failed; continuing");
+                    failures.add(action.kind(), format!("{e:#}"));
+                    if is_submit {
+                        match slurm::slurm_api_error(&e).map(|se| se.kind) {
+                            Some(SlurmErrorKind::Rejected) => {
+                                outcome.rejected = Some(e.to_string());
+                                stop_submits = true;
+                            }
+                            // No usable answer: Slurm may have the job. Hold
+                            // this model's submits and look for it by name.
+                            Some(SlurmErrorKind::NoAnswer | SlurmErrorKind::Unavailable) => {
+                                let job = slurm::job_submit_from_spec(
+                                    spec,
+                                    &w.identity.name,
+                                    &cfg.job_name_prefix,
+                                    port_base,
+                                    cfg.port_span,
+                                );
+                                mem.uncertain.entry(spec.model_id).or_default().push(
+                                    UncertainSubmit {
+                                        log_prefix: format!(
+                                            "{}/{}",
+                                            slurm::job_working_dir(&job),
+                                            job.name
+                                        ),
+                                        job_name: job.name,
+                                        port_base,
+                                        at: now,
+                                    },
+                                );
+                                stop_submits = true;
+                            }
+                            _ => {}
                         }
+                    }
+                }
+                Ok(problem) => {
+                    if let Some(p) = problem {
+                        failures.add(action.kind(), p);
+                    }
+                    if plan::is_failed_launch(action, &w.replicas) {
+                        outcome.failed += 1;
+                        outcome.last_failure = plan::failure_phrase(action);
+                    }
+                    if let Action::Promote {
+                        replica_id,
+                        api_base,
+                        ..
+                    } = action
+                    {
+                        // A launch served (not a relink of a serving replica).
+                        if w.replicas
+                            .iter()
+                            .any(|r| r.id == *replica_id && r.state != "healthy")
+                        {
+                            outcome.served = true;
+                        }
+                        spawn_warmup(cfg, http, resolver, api_base, &w.identity).await;
                     }
                 }
             }
         }
+        record_backoff(spec, &outcome, now, obleth, &mut failures).await;
 
         // Migrate any already-registered endpoint that still points at a node
         // *name* to its resolved IP, so existing healthy replicas stop depending
@@ -535,7 +678,7 @@ async fn tick(
         // failure here never holds the tick. Only runs on a good endpoint
         // snapshot (fetch succeeded above).
         if let Some(eps) = &endpoints {
-            for r in &replicas {
+            for r in &w.replicas {
                 if r.state != "healthy" {
                     continue;
                 }
@@ -564,28 +707,39 @@ async fn tick(
         }
     }
 
-    // 2. Drain models that still have replicas but are no longer in the enabled
-    //    managed set (disabled, deleted, or never-managed). Reconcile them toward
-    //    target 0: cancel live jobs, mark gone ones lost, GC old lost rows. No
-    //    Submit/Promote fires at target 0, so the missing spec is fine.
+    // 3. Drain models that still have replicas but are no longer in the enabled
+    //    managed set (paused, deleted, or never-managed). Reconcile them toward
+    //    target 0: drain and cancel live jobs, mark gone ones lost, GC old lost
+    //    rows. No Submit/Promote fires at target 0, so the missing spec is fine.
+    let drain_view = plan::ManagedSpecView {
+        removed: true,
+        ..Default::default()
+    };
     for (model_id, replicas) in by_model {
-        let model_name = obleth.model_name(model_id).await.unwrap_or_default();
-        tracing::info!(%model_id, replicas = replicas.len(), "draining replicas for unmanaged model");
-        let view = plan::ManagedSpecView {
-            target_replicas: 0,
-            max_job_failures: 0,
+        let model_name = match identities.get(&model_id) {
+            Some(i) => i.name.clone(),
+            None => obleth
+                .model_identity(model_id)
+                .await
+                .map(|i| i.name)
+                .unwrap_or_default(),
         };
-        let actions = plan::plan(
-            &view,
-            &replicas,
-            &jobs,
-            &HashMap::new(),
-            &HashSet::new(),
-            cfg.lost_retention_secs,
-        );
+        tracing::info!(%model_id, replicas = replicas.len(), "draining replicas for unmanaged model");
+        let actions = plan::plan(&plan::PlanInput {
+            spec: &drain_view,
+            replicas: &replicas,
+            jobs: &jobs,
+            health: &HashMap::new(),
+            probe_notes: &HashMap::new(),
+            self_heal: &plan::SelfHeal::default(),
+            waited_secs: &HashMap::new(),
+            endpoints: None,
+            now,
+            lost_retention_secs: cfg.lost_retention_secs,
+        });
         for action in &actions {
             // Drain reconciles toward target 0, so no Submit fires; port_base is unused.
-            if let Err(e) = executor::apply(
+            match executor::apply(
                 action,
                 model_id,
                 &model_name,
@@ -599,23 +753,333 @@ async fn tick(
             )
             .await
             {
-                tracing::warn!(?action, error = %e, "drain action failed; continuing");
+                Err(e) => {
+                    tracing::warn!(?action, error = %e, "drain action failed; continuing");
+                    failures.add(action.kind(), format!("{e:#}"));
+                }
+                Ok(Some(p)) => failures.add(action.kind(), p),
+                Ok(None) => {}
             }
         }
     }
 
     // Orphan jobs (submitted but never recorded) are prevented at the source:
-    // the Submit executor cancels a job if recording its replica fails. So there
-    // is no periodic cluster-wide scan here — we never list the whole controller.
-    Ok(())
+    // the Submit executor cancels a job if recording its replica fails, and a
+    // submit whose answer was lost is looked up by name before the model
+    // submits again. There is no cluster-wide scan: we never list the whole
+    // controller.
+    warnings.extend(failures.sentences());
+    Ok(warnings)
+}
+
+/// Seconds each replica has been waiting on something the planner times out:
+/// a pending job with a reason Slurm will not clear, or a serving replica
+/// that is being replaced. Starts the clock on first sight and stops it when
+/// the condition clears.
+fn waited_secs(
+    since: &mut HashMap<Uuid, DateTime<Utc>>,
+    replicas: &[ReplicaView],
+    jobs: &HashMap<String, JobInfo>,
+    heal: &plan::SelfHeal,
+    now: DateTime<Utc>,
+) -> HashMap<Uuid, i64> {
+    let mut out = HashMap::new();
+    for r in replicas {
+        let waiting = match r.state.as_str() {
+            "healthy" => {
+                r.replace_requested || heal.dead.contains(&r.id) || heal.zombie.contains(&r.id)
+            }
+            "pending" | "starting" => jobs
+                .get(&r.slurm_job_id)
+                .is_some_and(|j| plan::stuck_reason(j).is_some()),
+            _ => false,
+        };
+        if waiting {
+            let t = *since.entry(r.id).or_insert(now);
+            out.insert(r.id, (now - t).num_seconds());
+        } else {
+            since.remove(&r.id);
+        }
+    }
+    out
+}
+
+/// Submits of this model whose answer was lost: look the job up by name in
+/// the accounting database and track it when found. Returns true while the
+/// model's submits must wait (a lost answer that is still recent and not
+/// found yet), so a lost answer never turns into a second job.
+#[allow(clippy::too_many_arguments)]
+async fn adopt_lost_submits(
+    spec: &ManagedModelSpec,
+    identity: &ModelIdentity,
+    slurm: &dyn SlurmClient,
+    obleth: &dyn OblethClient,
+    replicas: &mut Vec<ReplicaView>,
+    tracked: &mut HashSet<String>,
+    jobs: &mut HashMap<String, JobInfo>,
+    mem: &mut Memory,
+    now: DateTime<Utc>,
+    warnings: &mut Vec<String>,
+) -> bool {
+    let Some(lost) = mem.uncertain.remove(&spec.model_id) else {
+        return false;
+    };
+    let mut keep = Vec::new();
+    for u in lost {
+        let recent = (now - u.at).num_seconds() < UNCERTAIN_SUBMIT_SECS;
+        let found = match slurm.find_live_jobs_by_name(&u.job_name).await {
+            Ok(found) => found,
+            Err(e) => {
+                tracing::warn!(model = %identity.name, error = %e, "accounting lookup failed");
+                if recent {
+                    keep.push(u);
+                } else {
+                    warnings.push(format!(
+                        "A job submit for {} got no answer, and obleth could not check Slurm's \
+                         accounting database, so a second job may be running. Look for jobs named \
+                         {} with squeue and cancel any that the deployment does not list.",
+                        identity.name, u.job_name
+                    ));
+                }
+                continue;
+            }
+        };
+        // A live job of this name that no replica tracks, submitted around
+        // the time of the lost answer.
+        let hit = found.into_iter().find(|j| {
+            !tracked.contains(&j.job_id)
+                && j.submit_time
+                    .is_none_or(|t| (t - u.at).num_seconds().abs() <= UNCERTAIN_SUBMIT_SECS)
+        });
+        let Some(found_job) = hit else {
+            if recent {
+                keep.push(u);
+            }
+            continue;
+        };
+        let log_path = format!("{}-{}.out", u.log_prefix, found_job.job_id);
+        match obleth
+            .create_replica_with_log(
+                spec.model_id,
+                &found_job.job_id,
+                u.port_base,
+                Some(&log_path),
+            )
+            .await
+        {
+            Ok(id) => {
+                tracing::warn!(model = %identity.name, job_id = %found_job.job_id,
+                    "adopted a job whose submit answer was lost");
+                tracked.insert(found_job.job_id.clone());
+                let info = match slurm.get_job(&found_job.job_id).await {
+                    Ok(Some(info)) => info,
+                    _ => found_job.clone(),
+                };
+                jobs.insert(found_job.job_id.clone(), info);
+                replicas.push(ReplicaView {
+                    id,
+                    model_id: spec.model_id,
+                    slurm_job_id: found_job.job_id.clone(),
+                    state: "pending".into(),
+                    port_base: u.port_base,
+                    log_path: Some(log_path),
+                    ..Default::default()
+                });
+                warnings.push(format!(
+                    "A job submit for {} got no answer, but Slurm had accepted it as job {}. \
+                     obleth now tracks that job.",
+                    identity.name, found_job.job_id
+                ));
+            }
+            Err(e) => {
+                tracing::warn!(model = %identity.name, error = %e, "could not record an adopted job");
+                keep.push(u);
+            }
+        }
+    }
+    let hold = !keep.is_empty();
+    if hold {
+        warnings.push(format!(
+            "A job submit for {} got no answer from slurmrestd. obleth is checking whether Slurm \
+             started the job before it submits again.",
+            identity.name
+        ));
+        mem.uncertain.insert(spec.model_id, keep);
+    }
+    hold
+}
+
+/// Probe every replica of a model whose job runs: the port the job reported
+/// in its comment when it did, else every port of its window. A port passes
+/// when the health path answers and the server lists this model (or lists
+/// none). Returns the passing port per replica, and a note for a replica
+/// whose port answers for another model.
+async fn probe_model(
+    cfg: &ProvisionerConfig,
+    http: &reqwest::Client,
+    resolver: &resolve::HostResolver,
+    spec: &ManagedModelSpec,
+    identity: &ModelIdentity,
+    replicas: &[ReplicaView],
+    jobs: &HashMap<String, JobInfo>,
+) -> (HashMap<Uuid, u16>, HashMap<Uuid, String>) {
+    let mut health = HashMap::new();
+    let mut notes = HashMap::new();
+    let expected = identity.served_names();
+    for r in replicas {
+        if !matches!(r.state.as_str(), "pending" | "starting" | "healthy") {
+            continue;
+        }
+        let Some(job) = jobs
+            .get(&r.slurm_job_id)
+            .filter(|j| j.state == JobState::Running)
+        else {
+            continue;
+        };
+        // The batch host runs the server; for a multi-node job the node list
+        // alone does not say which one.
+        let Some(node) = job.probe_host() else {
+            tracing::warn!(
+                replica_id = %r.id,
+                job_id = %r.slurm_job_id,
+                "job is RUNNING but slurmrestd returned no nodes; \
+                 cannot probe health — check slurmrestd response"
+            );
+            continue;
+        };
+        // Resolve the node name to an address once per tick (cached across
+        // ticks) and probe by that address, so a flaky resolver can't make a
+        // live replica flap unhealthy. Falls back to the name on a miss.
+        let host = resolver
+            .resolve(node)
+            .await
+            .unwrap_or_else(|| node.to_string());
+        let ports: Vec<i64> = match job.reported_port {
+            Some(p) => vec![p],
+            None => (r.port_base..r.port_base + cfg.port_span).collect(),
+        };
+        // Probe the ports concurrently: a not-yet-up replica otherwise costs
+        // port_span * health_timeout of serial waits every tick.
+        let mut set = tokio::task::JoinSet::new();
+        for p in ports
+            .into_iter()
+            .filter(|p| (1..=u16::MAX as i64).contains(p))
+        {
+            let http = http.clone();
+            let host = host.clone();
+            let health_path = spec.health_path.clone();
+            let expected = expected.clone();
+            let timeout = cfg.health_timeout_secs;
+            set.spawn(async move {
+                let p = p as u16;
+                let res =
+                    probe::probe_port(&http, &host, p, &health_path, &expected, timeout).await;
+                (p, res)
+            });
+        }
+        let mut serving: Option<u16> = None;
+        let mut other: Option<(u16, Vec<String>)> = None;
+        while let Some(res) = set.join_next().await {
+            match res {
+                Ok((p, probe::PortProbe::Serving)) => {
+                    serving = Some(serving.map_or(p, |cur| cur.min(p)));
+                }
+                Ok((p, probe::PortProbe::OtherModel(list)))
+                    if other.as_ref().is_none_or(|(cur, _)| p < *cur) =>
+                {
+                    other = Some((p, list));
+                }
+                _ => {}
+            }
+        }
+        if let Some(p) = serving {
+            tracing::info!(replica_id = %r.id, job_id = %r.slurm_job_id, port = p, "health probe: healthy");
+            health.insert(r.id, p);
+        } else if let Some((p, list)) = other {
+            tracing::warn!(replica_id = %r.id, port = p, served = ?list,
+                "health probe: another model answers on the port");
+            notes.insert(
+                r.id,
+                probe::other_model_detail(p, &list, identity.expected()),
+            );
+        } else {
+            tracing::info!(replica_id = %r.id, job_id = %r.slurm_job_id,
+                port_base = r.port_base, reported_port = ?job.reported_port,
+                "health probe: not yet healthy");
+        }
+    }
+    (health, notes)
+}
+
+/// Record the model's failure count and pause state when this tick changed
+/// them.
+async fn record_backoff(
+    spec: &ManagedModelSpec,
+    outcome: &plan::LaunchOutcome,
+    now: DateTime<Utc>,
+    obleth: &dyn OblethClient,
+    failures: &mut ActionFailures,
+) {
+    let current = ManagedBackoff {
+        failed_launches: spec.failed_launches,
+        backoff_step: spec.backoff_step,
+        paused_reason: spec.paused_reason.clone(),
+        paused_until: spec.paused_until,
+    };
+    let Some(next) = plan::next_backoff(&current, spec.max_job_failures, outcome, now) else {
+        return;
+    };
+    if let Some(until) = next
+        .paused_until
+        .filter(|u| Some(*u) != current.paused_until)
+    {
+        tracing::warn!(model_id = %spec.model_id, %until, reason = ?next.paused_reason,
+            "pausing submits");
+    }
+    if let Err(e) = obleth.set_managed_backoff(spec.model_id, &next).await {
+        failures.add("pause update", format!("{e:#}"));
+    }
+}
+
+/// A just-promoted replica is healthy by its health path but may still be
+/// cold for its first forward pass. Fire a throwaway warmup inference,
+/// detached, so the slow cold first token is paid here instead of by the
+/// first real user — and never stalls the tick.
+async fn spawn_warmup(
+    cfg: &ProvisionerConfig,
+    http: &reqwest::Client,
+    resolver: &resolve::HostResolver,
+    api_base: &str,
+    identity: &ModelIdentity,
+) {
+    if cfg.warmup_timeout_secs == 0 {
+        return;
+    }
+    let http = http.clone();
+    // Warm up against the resolved IP too, so the slow cold first token isn't
+    // paid on a DNS miss.
+    let api_base = resolver.resolve_url_host(api_base).await;
+    let model_name = identity.name.clone();
+    let prefer = identity.served_names();
+    let budget = Duration::from_secs(cfg.warmup_timeout_secs);
+    tokio::spawn(async move {
+        match warmup::warm_up_preferring(&http, &api_base, &prefer, budget).await {
+            Ok(()) => tracing::info!(model = %model_name, %api_base, "warmup inference completed"),
+            Err(e) => tracing::warn!(
+                model = %model_name, %api_base, error = %e,
+                "warmup inference failed (best-effort)"
+            ),
+        }
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{ClusterResources, JobInfo, JobState, JobSubmit, ReplicaView};
+    use crate::domain::{ClusterResources, JobSubmit};
     use crate::obleth_client::MockObleth;
-    use std::sync::atomic::Ordering;
+    use obleth_provisioner::slurm::SlurmApiError;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
 
     #[tokio::test]
@@ -652,8 +1116,14 @@ mod tests {
     #[derive(Default)]
     struct FakeSlurm {
         jobs: HashMap<String, JobInfo>,
+        /// What the accounting database knows; absent = no accounting.
+        accounting: Option<HashMap<String, JobInfo>>,
+        /// Live jobs found by name.
+        by_name: Mutex<Vec<JobInfo>>,
         cancelled: Mutex<Vec<String>>,
         submitted: Mutex<Vec<String>>,
+        submit_gets_no_answer: AtomicBool,
+        cancel_refused: AtomicBool,
     }
     #[async_trait::async_trait]
     impl SlurmClient for FakeSlurm {
@@ -662,12 +1132,23 @@ mod tests {
             job: &JobSubmit,
         ) -> anyhow::Result<obleth_provisioner::slurm::SubmittedJob> {
             self.submitted.lock().unwrap().push(job.name.clone());
+            if self.submit_gets_no_answer.load(Ordering::SeqCst) {
+                return Err(SlurmApiError {
+                    kind: SlurmErrorKind::NoAnswer,
+                    status: None,
+                    message: "slurmrestd did not answer in time.".into(),
+                }
+                .into());
+            }
             Ok(obleth_provisioner::slurm::SubmittedJob {
                 job_id: "999".into(),
                 notes: vec![],
             })
         }
         async fn cancel(&self, job_id: &str) -> anyhow::Result<()> {
+            if self.cancel_refused.load(Ordering::SeqCst) {
+                anyhow::bail!("Slurm refused cancelling job {job_id}: Access/permission denied");
+            }
             self.cancelled.lock().unwrap().push(job_id.to_string());
             Ok(())
         }
@@ -676,6 +1157,15 @@ mod tests {
         }
         async fn discover_resources(&self) -> anyhow::Result<ClusterResources> {
             Ok(ClusterResources::default())
+        }
+        async fn find_live_jobs_by_name(&self, _name: &str) -> anyhow::Result<Vec<JobInfo>> {
+            Ok(self.by_name.lock().unwrap().clone())
+        }
+        async fn accounting_job(&self, job_id: &str) -> anyhow::Result<Option<JobInfo>> {
+            match &self.accounting {
+                Some(a) => Ok(a.get(job_id).cloned()),
+                None => anyhow::bail!("no accounting database"),
+            }
         }
     }
 
@@ -699,11 +1189,10 @@ mod tests {
             model_id: uuid::Uuid::new_v4(),
             slurm_job_id: job.into(),
             state: state.into(),
-            endpoint_id: None,
             age_secs: 60,
+            updated_secs: 60,
             port_base: 8000,
-            last_message: None,
-            cancel_requested: false,
+            ..Default::default()
         }
     }
 
@@ -711,25 +1200,39 @@ mod tests {
         JobInfo {
             job_id: id.into(),
             state: JobState::Pending,
-            nodes: vec![],
             raw_state: "PENDING".into(),
-            reason: None,
             ..Default::default()
         }
     }
 
-    async fn run_tick(slurm: &FakeSlurm, obleth: &MockObleth) -> anyhow::Result<()> {
+    fn managed(target: i64) -> ManagedModelSpec {
+        ManagedModelSpec {
+            model_id: uuid::Uuid::new_v4(),
+            launch_command: "serve".into(),
+            target_replicas: target,
+            ..Default::default()
+        }
+    }
+
+    async fn run_tick_with(
+        slurm: &FakeSlurm,
+        obleth: &MockObleth,
+        mem: &mut Memory,
+    ) -> anyhow::Result<Vec<String>> {
         let resolver = resolve::HostResolver::new(Duration::from_secs(300));
-        let mut probe_failures = HashMap::new();
         tick(
             &cfg(),
             slurm,
             obleth,
             &reqwest::Client::new(),
             &resolver,
-            &mut probe_failures,
+            mem,
         )
         .await
+    }
+
+    async fn run_tick(slurm: &FakeSlurm, obleth: &MockObleth) -> anyhow::Result<Vec<String>> {
+        run_tick_with(slurm, obleth, &mut Memory::default()).await
     }
 
     fn nothing_destructive(slurm: &FakeSlurm, obleth: &MockObleth) {
@@ -762,15 +1265,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tick_holds_when_every_tracked_job_vanishes() {
-        // Two live replicas, Slurm answers "no such job" for both: far more
-        // likely a wrong cluster/version than a fleet that died in one tick.
+    async fn a_vanished_fleet_is_held_with_a_warning_when_accounting_cannot_confirm() {
+        // Two live replicas, Slurm answers "no such job" for both and there is
+        // no accounting database: far more likely a wrong cluster/version
+        // than a fleet that died in one tick.
         let slurm = FakeSlurm::default();
         let obleth = MockObleth::default();
         *obleth.replicas.lock().unwrap() = vec![replica("1", "healthy"), replica("2", "pending")];
-        let err = run_tick(&slurm, &obleth).await.unwrap_err();
-        assert!(format!("{err:#}").contains("holding tick"), "{err:#}");
+        let warnings = run_tick(&slurm, &obleth).await.unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("no longer knows any of the 2 jobs")),
+            "{warnings:?}"
+        );
         nothing_destructive(&slurm, &obleth);
+    }
+
+    #[tokio::test]
+    async fn a_vanished_fleet_that_accounting_shows_ended_is_marked_lost() {
+        let ended = |id: &str| JobInfo {
+            job_id: id.into(),
+            state: JobState::Gone,
+            raw_state: "TIMEOUT".into(),
+            ..Default::default()
+        };
+        let slurm = FakeSlurm {
+            accounting: Some(HashMap::from([
+                ("1".to_string(), ended("1")),
+                ("2".to_string(), ended("2")),
+            ])),
+            ..Default::default()
+        };
+        let obleth = MockObleth::default();
+        *obleth.replicas.lock().unwrap() = vec![replica("1", "healthy"), replica("2", "pending")];
+        let warnings = run_tick(&slurm, &obleth).await.unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let lost = obleth
+            .patched
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, s)| s.as_deref() == Some("lost"))
+            .count();
+        assert_eq!(lost, 2);
+    }
+
+    #[tokio::test]
+    async fn a_stopped_replica_is_let_go_even_when_its_job_vanished() {
+        let slurm = FakeSlurm::default();
+        let obleth = MockObleth::default();
+        let mut stopped = replica("1", "healthy");
+        stopped.cancel_requested = true;
+        let id = stopped.id;
+        *obleth.replicas.lock().unwrap() = vec![stopped, replica("2", "pending")];
+        let mut slurm = slurm;
+        slurm.jobs.insert("2".into(), pending_job("2"));
+        run_tick(&slurm, &obleth).await.unwrap();
+        assert!(obleth
+            .patched
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(i, s)| *i == id && s.as_deref() == Some("lost")));
     }
 
     #[tokio::test]
@@ -798,7 +1355,7 @@ mod tests {
         let slurm = FakeSlurm::default();
         let obleth = MockObleth::default();
         let mut old_lost = replica("1", "lost");
-        old_lost.age_secs = 10_000;
+        old_lost.updated_secs = 10_000;
         let old_lost_id = old_lost.id;
         *obleth.replicas.lock().unwrap() = vec![old_lost, replica("2", "draining")];
         run_tick(&slurm, &obleth).await.unwrap();
@@ -823,5 +1380,151 @@ mod tests {
             .unwrap()
             .iter()
             .any(|(i, s)| *i == id && s.as_deref() == Some("lost")));
+    }
+
+    #[tokio::test]
+    async fn a_submit_without_an_answer_holds_submits_and_adopts_the_job_slurm_has() {
+        let slurm = FakeSlurm::default();
+        slurm.submit_gets_no_answer.store(true, Ordering::SeqCst);
+        let obleth = MockObleth::default();
+        let spec = managed(1);
+        let model_id = spec.model_id;
+        *obleth.managed.lock().unwrap() = vec![spec];
+        let mut mem = Memory::default();
+
+        let warnings = run_tick_with(&slurm, &obleth, &mut mem).await.unwrap();
+        assert_eq!(slurm.submitted.lock().unwrap().len(), 1);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("A job submit failed")),
+            "{warnings:?}"
+        );
+        assert!(mem.uncertain.contains_key(&model_id));
+
+        // Next tick: Slurm's accounting has not seen it yet, so nothing is
+        // submitted again.
+        slurm.submit_gets_no_answer.store(false, Ordering::SeqCst);
+        let warnings = run_tick_with(&slurm, &obleth, &mut mem).await.unwrap();
+        assert_eq!(slurm.submitted.lock().unwrap().len(), 1, "held");
+        assert!(
+            warnings.iter().any(|w| w.contains("got no answer")),
+            "{warnings:?}"
+        );
+
+        // Then it shows up: the job is tracked instead of submitted twice.
+        slurm.by_name.lock().unwrap().push(JobInfo {
+            job_id: "4242".into(),
+            state: JobState::Pending,
+            ..Default::default()
+        });
+        run_tick_with(&slurm, &obleth, &mut mem).await.unwrap();
+        assert_eq!(slurm.submitted.lock().unwrap().len(), 1, "no second job");
+        let created = obleth.created_replicas.lock().unwrap();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].1, "4242");
+        assert!(!mem.uncertain.contains_key(&model_id));
+    }
+
+    #[tokio::test]
+    async fn refused_cancels_surface_as_tick_warnings() {
+        let mut slurm = FakeSlurm::default();
+        slurm.jobs.insert("1".into(), pending_job("1"));
+        slurm.cancel_refused.store(true, Ordering::SeqCst);
+        let obleth = MockObleth::default();
+        // A pending replica of a model that left the managed set drains at once.
+        *obleth.replicas.lock().unwrap() = vec![replica("1", "pending")];
+        let warnings = run_tick(&slurm, &obleth).await.unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("A job cancel failed: Slurm refused cancelling job 1")),
+            "{warnings:?}"
+        );
+        // The replica is out of service and draining, so the cancel is retried.
+        assert!(obleth
+            .patched
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, s)| s.as_deref() == Some("draining")));
+    }
+
+    #[tokio::test]
+    async fn the_provisioner_losing_every_node_holds_self_heal() {
+        // Two healthy replicas whose servers nobody can reach (a closed port
+        // on localhost): the fleet guard holds restarts and says so.
+        let running = |id: &str| JobInfo {
+            job_id: id.into(),
+            state: JobState::Running,
+            raw_state: "RUNNING".into(),
+            nodes: vec!["127.0.0.1".into()],
+            reported_port: Some(1),
+            ..Default::default()
+        };
+        let mut slurm = FakeSlurm::default();
+        slurm.jobs.insert("1".into(), running("1"));
+        slurm.jobs.insert("2".into(), running("2"));
+        let obleth = MockObleth::default();
+        let spec = managed(2);
+        let mut a = replica("1", "healthy");
+        let mut b = replica("2", "healthy");
+        a.model_id = spec.model_id;
+        b.model_id = spec.model_id;
+        *obleth.managed.lock().unwrap() = vec![spec];
+        *obleth.replicas.lock().unwrap() = vec![a, b];
+        let mut mem = Memory::default();
+        let warnings = run_tick_with(&slurm, &obleth, &mut mem).await.unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("could not reach any of the 2 running model servers")),
+            "{warnings:?}"
+        );
+        assert!(mem.probe_failures.is_empty(), "streaks do not advance");
+        assert!(slurm.cancelled.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn action_failures_read_as_sentences() {
+        let mut f = ActionFailures::default();
+        f.add(
+            "job cancel",
+            "Slurm refused cancelling job 1: denied.".into(),
+        );
+        f.add(
+            "job cancel",
+            "Slurm refused cancelling job 2: denied.".into(),
+        );
+        f.add("replica update", "admin API timed out".into());
+        assert_eq!(
+            f.sentences(),
+            vec![
+                "2 job cancels failed. The first: Slurm refused cancelling job 1: denied.",
+                "A replica update failed: admin API timed out.",
+            ]
+        );
+    }
+
+    #[test]
+    fn wait_clocks_start_on_first_sight_and_stop_when_cleared() {
+        let mut since = HashMap::new();
+        let mut r = replica("1", "healthy");
+        r.replace_requested = true;
+        let t0 = chrono::Utc::now();
+        let heal = plan::SelfHeal::default();
+        let w = waited_secs(&mut since, &[r.clone()], &HashMap::new(), &heal, t0);
+        assert_eq!(w.get(&r.id), Some(&0));
+        let w = waited_secs(
+            &mut since,
+            &[r.clone()],
+            &HashMap::new(),
+            &heal,
+            t0 + chrono::Duration::seconds(90),
+        );
+        assert_eq!(w.get(&r.id), Some(&90));
+        r.replace_requested = false;
+        waited_secs(&mut since, &[r.clone()], &HashMap::new(), &heal, t0);
+        assert!(since.is_empty());
     }
 }

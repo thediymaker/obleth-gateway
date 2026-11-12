@@ -49,6 +49,8 @@ pub struct JobInfo {
     pub time_limit_mins: Option<i64>,
     /// True when the job has no time limit.
     pub time_limit_unlimited: bool,
+    /// When the job was submitted, when reported (accounting records).
+    pub submit_time: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl JobInfo {
@@ -99,21 +101,49 @@ pub struct JobSubmit {
     pub script: String,
 }
 
-/// Minimal projection of a `ModelReplica` (Plan 1) the planner reasons over.
-#[derive(Debug, Clone)]
+/// Minimal projection of a `ModelReplica` the planner reasons over.
+#[derive(Debug, Clone, Default)]
 pub struct ReplicaView {
     pub id: Uuid,
     pub model_id: Uuid,
     pub slurm_job_id: String,
     pub state: String, // pending|starting|healthy|draining|lost
     pub endpoint_id: Option<Uuid>,
-    pub age_secs: i64, // now - created_at, for GC + cancel ordering
+    pub age_secs: i64, // now - created_at, for cancel ordering
+    /// now - updated_at. For a `lost` row this is how long ago it was lost
+    /// (nothing patches a lost row), and for a `draining` row how long it has
+    /// been draining (the status annotation skips draining rows).
+    pub updated_secs: i64,
     pub port_base: i64,
     /// Current replica message, so the tick can diff before re-patching.
     pub last_message: Option<String>,
-    /// Operator requested a restart: cancel this replica's job (regardless of
-    /// target) so the resubmit-to-target launches a fresh one.
+    /// The operator asked to stop this replica: drain and cancel it, and let
+    /// the replica count bring in a new one.
     pub cancel_requested: bool,
+    /// The operator asked to replace this replica without an outage: start a
+    /// successor first and drain this one once the successor serves.
+    pub replace_requested: bool,
+    /// The Slurm start time the replica was promoted under (set at
+    /// promotion, so `Some` also means the replica has served).
+    pub job_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the running job reaches its time limit, as last recorded.
+    pub job_ends_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The plain-sentence detail currently shown for the replica.
+    pub state_detail: Option<String>,
+    /// The port the server was found on (set at promotion).
+    pub port: Option<i64>,
+    /// Nodes recorded on the row (comma-separated): the allocation once the
+    /// job ran, then the promoted host.
+    pub nodes: Option<String>,
+    /// Where the job's output goes, when known.
+    pub log_path: Option<String>,
+}
+
+impl ReplicaView {
+    /// True once the replica has been promoted at least once: it served.
+    pub fn has_served(&self) -> bool {
+        self.state == "healthy" || self.job_started_at.is_some() || self.port.is_some()
+    }
 }
 
 /// One of a model's registered endpoints, as the gateway sees it — including
@@ -219,29 +249,79 @@ pub struct NodeInfo {
 pub enum Action {
     /// Submit one new job and record a replica row.
     Submit,
-    /// Job is running + healthy: register endpoint + mark replica healthy.
-    Promote { replica_id: Uuid, api_base: String },
+    /// Job is running + healthy: register endpoint + mark replica healthy,
+    /// recording the Slurm times and the port it was promoted under.
+    Promote {
+        replica_id: Uuid,
+        api_base: String,
+        port: i64,
+        job_started_at: Option<chrono::DateTime<chrono::Utc>>,
+        job_ends_at: Option<chrono::DateTime<chrono::Utc>>,
+    },
+    /// A promoted replica stopped serving where it was registered (Slurm
+    /// requeued, suspended or restarted the job): remove its endpoint at once
+    /// and put it back to `pending` until it serves again.
+    Demote {
+        replica_id: Uuid,
+        endpoint_id: Option<Uuid>,
+        detail: String,
+    },
     /// Job vanished/terminal: deregister endpoint (if any) + mark replica lost.
     /// `raw_state`/`reason` are Slurm's terminal state and reason when the job
     /// is still visible in slurmrestd (e.g. `TIMEOUT`, `OUT_OF_MEMORY`); both
     /// `None` when the job is gone from the listing. See [`lost_message`].
+    /// `failed_launch` is true when the job ended without ever serving and
+    /// counts toward the model's failure limit.
     MarkLost {
         replica_id: Uuid,
         endpoint_id: Option<Uuid>,
         raw_state: Option<String>,
         reason: Option<String>,
+        failed_launch: bool,
     },
-    /// Excess/restarted replica: deregister its endpoint, cancel its job, mark
-    /// draining. `endpoint_id` is the linked endpoint to remove from rotation up
-    /// front so the proxy stops routing to the dying backend immediately.
+    /// Take a replica out of service: deregister its endpoint first so the
+    /// proxy stops routing to it, then mark it draining. With `cancel_now`
+    /// the job is cancelled in the same step; otherwise it keeps running for
+    /// the drain grace period (in-flight requests finish) and a later
+    /// [`Action::CancelJob`] cancels it.
     Cancel {
         replica_id: Uuid,
         job_id: String,
         endpoint_id: Option<Uuid>,
         reason: CancelReason,
+        cancel_now: bool,
     },
-    /// GC a long-dead `lost` replica row.
+    /// A draining replica's grace period is over: cancel its job.
+    CancelJob { replica_id: Uuid, job_id: String },
+    /// GC a long-dead `lost` (or finished `draining`) replica row.
     Delete { replica_id: Uuid },
+    /// Remove an endpoint this provisioner registered whose replica no longer
+    /// serves (a delete that failed earlier, or a duplicate).
+    DeleteEndpoint { endpoint_id: Uuid },
+    /// Record what is happening with a replica. `detail` `Some("")` clears the
+    /// plain-sentence detail; `None` leaves it. `job_ends_at` records a new
+    /// time-limit end from Slurm.
+    Annotate {
+        replica_id: Uuid,
+        detail: Option<String>,
+        job_ends_at: Option<chrono::DateTime<chrono::Utc>>,
+    },
+}
+
+impl Action {
+    /// Short name for counting failures in tick warnings.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Action::Submit => "job submit",
+            Action::Promote { .. } => "replica promotion",
+            Action::Demote { .. } => "replica demotion",
+            Action::MarkLost { .. } => "replica update",
+            Action::Cancel { .. } | Action::CancelJob { .. } => "job cancel",
+            Action::Delete { .. } => "replica clean-up",
+            Action::DeleteEndpoint { .. } => "endpoint removal",
+            Action::Annotate { .. } => "replica update",
+        }
+    }
 }
 
 /// The replica message recorded with a `lost` state: `job ended: <STATE>`,
@@ -264,10 +344,66 @@ pub fn lost_message(raw_state: Option<&str>, reason: Option<&str>) -> String {
 pub enum CancelReason {
     /// Over target: normal scale-down.
     ScaleDown,
-    /// Operator hit the restart action (`cancel_requested` on the row).
+    /// The operator stopped this replica (`cancel_requested` on the row), or
+    /// asked to replace one that was not serving yet.
     OperatorRestart,
     /// Self-heal: the job still reports RUNNING but the replica failed
     /// consecutive health probes (zombie job) — cancel so the resubmit-to-target
     /// replaces it with a fresh one.
     ProbeFailed,
+    /// The server did not become healthy within the startup timeout.
+    StartupTimeout,
+    /// The job sat pending with a reason Slurm will not clear by waiting
+    /// (held, or a request the partition or QOS can never run).
+    Stuck,
+    /// A successor serves, so this replica (near its time limit, or flagged
+    /// for replacement) is retired.
+    Replaced,
+    /// The deployment was paused or removed.
+    Removed,
+}
+
+impl CancelReason {
+    /// The replica's message when it starts draining.
+    pub fn message(self) -> &'static str {
+        match self {
+            CancelReason::ScaleDown => "scaled down",
+            CancelReason::OperatorRestart => "restart requested",
+            CancelReason::ProbeFailed => "restarting: failed health probes while job running",
+            CancelReason::StartupTimeout => "cancelled: server did not become healthy in time",
+            CancelReason::Stuck => "cancelled: job could not start",
+            CancelReason::Replaced => "replaced: a successor is serving",
+            CancelReason::Removed => "stopping: deployment paused or removed",
+        }
+    }
+
+    /// A plain sentence for the dashboard while the replica drains.
+    pub fn detail(self) -> &'static str {
+        match self {
+            CancelReason::ScaleDown => {
+                "The replica count went down, so obleth stops this replica after its requests finish."
+            }
+            CancelReason::OperatorRestart => "Stopping this replica as requested.",
+            CancelReason::ProbeFailed => {
+                "The server stopped answering health checks while its job kept running, so obleth cancelled the job. A new replica replaces it."
+            }
+            CancelReason::StartupTimeout => {
+                "The server did not become healthy within the startup timeout, so obleth cancelled the job. Check the job's output for the cause."
+            }
+            CancelReason::Stuck => {
+                "Slurm could not start this job as asked, so obleth cancelled it. Check the partition, account, time limit and resources on the deployment."
+            }
+            CancelReason::Replaced => {
+                "A replacement is serving, so obleth stops this replica after its requests finish."
+            }
+            CancelReason::Removed => {
+                "The deployment was paused or removed, so obleth stops this replica after its requests finish."
+            }
+        }
+    }
+
+    /// True when the cancelled job counts as a failed launch.
+    pub fn is_failed_launch(self) -> bool {
+        matches!(self, CancelReason::StartupTimeout | CancelReason::Stuck)
+    }
 }

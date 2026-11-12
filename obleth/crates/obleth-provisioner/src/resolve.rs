@@ -10,7 +10,8 @@
 //!
 //! This resolver takes DNS off the hot path. It prefers operator-supplied
 //! hostname→IP overrides (Slurm settings, editable in the dashboard), then an IP
-//! literal as-is, then a cached prior success, and only then a retried system
+//! literal as-is, then the address Slurm itself records for the node
+//! (`NodeAddr`), then a cached prior success, and only then a retried system
 //! lookup. The provisioner registers replica endpoints by the resolved **IP**,
 //! so once a node is resolved (or aliased) neither the probe nor the proxy
 //! touches DNS again for it.
@@ -37,6 +38,8 @@ struct CacheEntry {
 /// across the per-tick probe loop and the executor's promotion path.
 pub struct HostResolver {
     aliases: Mutex<HashMap<String, String>>,
+    /// Slurm's NodeAddr for nodes whose address differs from their name.
+    node_addrs: Mutex<HashMap<String, String>>,
     cache: Mutex<HashMap<String, CacheEntry>>,
     ttl: Duration,
 }
@@ -45,6 +48,7 @@ impl HostResolver {
     pub fn new(ttl: Duration) -> Self {
         Self {
             aliases: Mutex::new(HashMap::new()),
+            node_addrs: Mutex::new(HashMap::new()),
             cache: Mutex::new(HashMap::new()),
             ttl,
         }
@@ -58,9 +62,21 @@ impl HostResolver {
         }
     }
 
+    /// Replace Slurm's node-name → NodeAddr map (read from the cluster's node
+    /// list now and then). Entries naming the node itself are ignored.
+    pub fn set_node_addresses(&self, addrs: HashMap<String, String>) {
+        if let Ok(mut a) = self.node_addrs.lock() {
+            *a = addrs
+                .into_iter()
+                .filter(|(name, addr)| !addr.trim().is_empty() && addr.trim() != name)
+                .collect();
+        }
+    }
+
     /// Resolve `host` to an address string. Order: operator alias → IP-literal
-    /// passthrough → fresh cache → retried system DNS → stale cache. `None` only
-    /// when the host is unknown, every lookup failed, and nothing was cached.
+    /// passthrough → Slurm's NodeAddr → fresh cache → retried system DNS →
+    /// stale cache. `None` only when the host is unknown, every lookup failed,
+    /// and nothing was cached.
     pub async fn resolve(&self, host: &str) -> Option<String> {
         let host = host.trim();
         if host.is_empty() {
@@ -74,6 +90,19 @@ impl HostResolver {
         if host.parse::<IpAddr>().is_ok() {
             return Some(host.to_string());
         }
+        // 3. The address Slurm records for the node. An IP is used as is; a
+        //    name is what DNS is asked for instead of the node name.
+        let node_addr = self
+            .node_addrs
+            .lock()
+            .ok()
+            .and_then(|a| a.get(host).cloned());
+        let host = match node_addr {
+            Some(addr) if addr.parse::<IpAddr>().is_ok() => return Some(addr),
+            Some(addr) => addr,
+            None => host.to_string(),
+        };
+        let host = host.as_str();
         // 3. Fresh cache hit.
         if let Some(ip) = self.cache.lock().ok().and_then(|c| {
             c.get(host)
@@ -158,6 +187,22 @@ mod tests {
             "10.0.0.7".to_string(),
         )]));
         assert_eq!(r.resolve("node001").await.as_deref(), Some("10.0.0.7"));
+    }
+
+    #[tokio::test]
+    async fn aliases_come_before_slurm_node_addresses() {
+        let r = resolver();
+        r.set_node_addresses(HashMap::from([
+            ("gpu01".to_string(), "10.1.0.1".to_string()),
+            ("gpu02".to_string(), "10.1.0.2".to_string()),
+            ("gpu03".to_string(), "gpu03".to_string()),
+        ]));
+        r.set_aliases(HashMap::from([(
+            "gpu01".to_string(),
+            "10.9.9.9".to_string(),
+        )]));
+        assert_eq!(r.resolve("gpu01").await.as_deref(), Some("10.9.9.9"));
+        assert_eq!(r.resolve("gpu02").await.as_deref(), Some("10.1.0.2"));
     }
 
     #[tokio::test]

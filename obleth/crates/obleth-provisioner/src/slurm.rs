@@ -54,6 +54,13 @@ pub trait SlurmClient: Send + Sync {
     async fn node_addresses(&self) -> anyhow::Result<HashMap<String, String>> {
         Ok(HashMap::new())
     }
+    /// One job from the accounting database, which still has jobs the
+    /// controller has purged. `Ok(None)` when it does not know the job (or the
+    /// job is not obleth's); `Err` when there is no accounting database or it
+    /// cannot be read.
+    async fn accounting_job(&self, _job_id: &str) -> anyhow::Result<Option<JobInfo>> {
+        anyhow::bail!("this Slurm client has no accounting database")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -871,6 +878,7 @@ fn job_info_from_record(j: JobRecord) -> JobInfo {
         end_time: unix_time(&j.end_time),
         time_limit_mins: time_limit.flatten().filter(|m| *m > 0),
         time_limit_unlimited: matches!(time_limit, Some(None)),
+        submit_time: None,
     }
 }
 
@@ -1193,37 +1201,44 @@ pub fn slurm_release(v: &serde_json::Value) -> Option<String> {
     ))
 }
 
-/// One slurmdbd job record: enough to find a live job by name.
+/// One slurmdbd job record as a [`JobInfo`]: its id, state, reason, nodes,
+/// name, owner and submit, start and end times.
+fn db_job_info(j: &serde_json::Value) -> Option<JobInfo> {
+    let state = j.get("state");
+    let flags = job_state_flags(state.and_then(|s| s.get("current"))?);
+    let time = |k: &str| j.get("time").and_then(|t| t.get(k)).and_then(unix_time);
+    let info = JobInfo {
+        job_id: job_id_to_string(j.get("job_id")?),
+        state: map_job_state_flags(&flags),
+        raw_state: base_state(&flags).unwrap_or_default(),
+        reason: state
+            .and_then(|s| s.get("reason"))
+            .and_then(|r| r.as_str())
+            .map(str::to_string)
+            .filter(|r| !r.trim().is_empty() && !r.eq_ignore_ascii_case("none")),
+        nodes: expand_nodelist(j.get("nodes").and_then(|n| n.as_str()).unwrap_or("")),
+        name: j.get("name").and_then(|n| n.as_str()).map(String::from),
+        user: j.get("user").and_then(|u| u.as_str()).map(String::from),
+        state_flags: flags,
+        submit_time: time("submission"),
+        start_time: time("start"),
+        end_time: time("end"),
+        ..Default::default()
+    };
+    (!info.job_id.is_empty()).then_some(info)
+}
+
+/// The live (pending or running) jobs in a slurmdbd job list with exactly
+/// this name, owned by `user` when one is configured.
 fn parse_db_jobs(v: &serde_json::Value, user: &str, name: &str) -> Vec<JobInfo> {
     v.get("jobs")
         .and_then(|j| j.as_array())
         .into_iter()
         .flatten()
-        .filter(|j| j.get("name").and_then(|n| n.as_str()) == Some(name))
-        .filter(|j| {
-            user.is_empty()
-                || j.get("user")
-                    .and_then(|u| u.as_str())
-                    .is_none_or(|u| u == user)
-        })
-        .filter_map(|j| {
-            let flags = job_state_flags(j.get("state").and_then(|s| s.get("current"))?);
-            let state = map_job_state_flags(&flags);
-            if !matches!(state, JobState::Pending | JobState::Running) {
-                return None;
-            }
-            Some(JobInfo {
-                job_id: job_id_to_string(j.get("job_id")?),
-                state,
-                raw_state: base_state(&flags).unwrap_or_default(),
-                nodes: expand_nodelist(j.get("nodes").and_then(|n| n.as_str()).unwrap_or("")),
-                name: Some(name.to_string()),
-                user: j.get("user").and_then(|u| u.as_str()).map(String::from),
-                state_flags: flags,
-                ..Default::default()
-            })
-        })
-        .filter(|j| !j.job_id.is_empty())
+        .filter_map(db_job_info)
+        .filter(|j| j.name.as_deref() == Some(name))
+        .filter(|j| user.is_empty() || j.user.as_deref().is_none_or(|u| u == user))
+        .filter(|j| matches!(j.state, JobState::Pending | JobState::Running))
         .collect()
 }
 
@@ -1557,6 +1572,40 @@ impl SlurmClient for Slurmrestd {
         }
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
         Ok(parse_db_jobs(&v, &self.user, name))
+    }
+
+    async fn accounting_job(&self, job_id: &str) -> anyhow::Result<Option<JobInfo>> {
+        let what = format!("looking up job {job_id} in the accounting database");
+        let (status, body) = self
+            .send(
+                self.http.get(self.url("slurmdb", &format!("job/{job_id}"))),
+                &what,
+            )
+            .await?;
+        if envelope(&body)
+            .errors
+            .iter()
+            .any(SlurmMessage::is_job_not_found)
+        {
+            return Ok(None);
+        }
+        if !(200..300).contains(&status) {
+            return Err(error_from_response(status, &body, &what, &self.version).into());
+        }
+        let v: serde_json::Value = serde_json::from_slice(&body).map_err(|_| {
+            SlurmApiError::new(
+                SlurmErrorKind::Unavailable,
+                Some(status),
+                format!("slurmrestd answered {what} with something that is not JSON."),
+            )
+        })?;
+        Ok(v.get("jobs")
+            .and_then(|a| a.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(db_job_info)
+            .find(|j| j.job_id == job_id)
+            .filter(|j| self.is_ours(j)))
     }
 
     async fn node_addresses(&self) -> anyhow::Result<HashMap<String, String>> {
@@ -2697,6 +2746,21 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].job_id, "1");
         assert_eq!(found[0].nodes, ["n1"]);
+    }
+
+    #[test]
+    fn accounting_records_carry_end_state_reason_and_times() {
+        let j = serde_json::json!({
+            "job_id": 7, "name": "obleth-m", "user": "svc",
+            "state": { "current": ["TIMEOUT"], "reason": "None" },
+            "time": { "submission": 1_700_000_000, "start": 1_700_000_060, "end": 1_700_003_660 },
+        });
+        let info = db_job_info(&j).unwrap();
+        assert_eq!(info.state, JobState::Gone);
+        assert_eq!(info.raw_state, "TIMEOUT");
+        assert_eq!(info.reason, None);
+        assert_eq!(info.submit_time.map(|t| t.timestamp()), Some(1_700_000_000));
+        assert_eq!(info.start_time.map(|t| t.timestamp()), Some(1_700_000_060));
     }
 
     #[test]

@@ -1,20 +1,26 @@
 use crate::domain::*;
-use crate::obleth_client::OblethClient;
+use crate::obleth_client::{OblethClient, ReplicaDetails};
 use crate::resolve::HostResolver;
 use crate::slurm::{job_submit_from_spec, SlurmClient};
 use obleth_config::ManagedModelSpec;
 
-/// Apply one action. Errors are returned so the loop can log + continue.
+/// Apply one action.
+///
+/// `Ok(None)`: it applied. `Ok(Some(problem))`: its main effect applied but a
+/// follow-up step failed (a cancel Slurm refused after the replica was taken
+/// out of service, which the drain retries); the caller reports it. `Err`:
+/// nothing that matters changed, and the next tick plans it again.
 ///
 /// `submit_spec` is the full managed spec, required only for `Submit` (it carries
-/// partition/image/launch details). Drain actions (`Cancel`/`MarkLost`/`Delete`)
-/// and `Promote` only need `model_id`, so they still run for a model whose spec
-/// has been disabled or deleted while replicas are being torn down.
+/// partition/image/launch details). Drain actions and `Promote` only need
+/// `model_id`, so they still run for a model whose spec has been disabled or
+/// deleted while replicas are being torn down.
 ///
 /// `port_span` is the per-replica port window width (from config). `port_base` is
 /// the disjoint window base reserved for this `Submit` by the caller — reserving
 /// it in `main.rs` (rather than recomputing here) keeps multiple `Submit`s in the
-/// same tick from all landing on the same base. Ignored for non-`Submit` actions.
+/// same tick, and every model's replicas, on windows of their own. Ignored for
+/// non-`Submit` actions.
 #[allow(clippy::too_many_arguments)]
 pub async fn apply(
     action: &Action,
@@ -27,7 +33,7 @@ pub async fn apply(
     slurm: &dyn SlurmClient,
     obleth: &dyn OblethClient,
     resolver: &HostResolver,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<String>> {
     match action {
         Action::Submit => {
             let spec = submit_spec.ok_or_else(|| {
@@ -43,8 +49,9 @@ pub async fn apply(
                     submitted.job_id
                 }
                 Err(e) => {
-                    // Slurm rejected the submit (e.g. bad account/partition/qos).
-                    // Surface it in the dashboard, best-effort, then propagate.
+                    // Slurm rejected the submit (e.g. bad account/partition/qos),
+                    // or no answer came back. Surface it in the dashboard,
+                    // best-effort, then propagate.
                     let _ = obleth
                         .set_provision_error(model_id, Some(&e.to_string()))
                         .await;
@@ -52,8 +59,8 @@ pub async fn apply(
                 }
             };
             // Record the replica that tracks this job. If recording fails, the job
-            // is already running with nothing pointing at it — and we no longer
-            // scan the cluster for orphans — so cancel it (compensating action).
+            // is already running with nothing pointing at it — and we never list
+            // the cluster for orphans — so cancel it (compensating action).
             let log_path = crate::slurm::job_log_path(&job, &job_id);
             if let Err(e) = obleth
                 .create_replica_with_log(model_id, &job_id, port_base, Some(&log_path))
@@ -73,6 +80,9 @@ pub async fn apply(
         Action::Promote {
             replica_id,
             api_base,
+            port,
+            job_started_at,
+            job_ends_at,
         } => {
             // Register the endpoint by resolved IP so neither the gateway's
             // health check nor the data-plane proxy has to resolve the node name
@@ -82,7 +92,7 @@ pub async fn apply(
             let node = host_from_api_base(api_base);
             let ip_api_base = resolver.resolve_url_host(api_base).await;
             tracing::info!(%replica_id, %ip_api_base, node = %node, model = model_name, "promoting replica to healthy");
-            let name = format!("{job_prefix}{model_name}-{replica_id}");
+            let name = endpoint_name(job_prefix, model_name, *replica_id);
             // Idempotent: reuse an existing endpoint with this deterministic name
             // (e.g. when a prior tick created it but failed to patch the replica),
             // otherwise create one. If the existing one still points at the node
@@ -103,13 +113,48 @@ pub async fn apply(
                         .await?
                 }
             };
+            let details = ReplicaDetails {
+                job_started_at: *job_started_at,
+                job_ends_at: *job_ends_at,
+                port: Some(*port),
+                state_detail: Some(String::new()),
+                ..Default::default()
+            };
             obleth
-                .patch_replica(
+                .patch_replica_with_details(
                     *replica_id,
                     Some("healthy"),
                     Some(&node),
                     Some(ep),
                     Some("promoted"),
+                    &details,
+                )
+                .await?;
+        }
+        Action::Demote {
+            replica_id,
+            endpoint_id,
+            detail,
+        } => {
+            // Out of rotation first. A failed delete leaves the replica as it
+            // is, so the next tick tries again instead of leaving an endpoint
+            // that points at a server that is gone.
+            if let Some(ep) = endpoint_id {
+                obleth.delete_endpoint(model_id, *ep).await?;
+            }
+            tracing::warn!(%replica_id, model = model_name, %detail, "replica stopped serving where it was registered");
+            let details = ReplicaDetails {
+                state_detail: Some(detail.clone()),
+                ..Default::default()
+            };
+            obleth
+                .patch_replica_with_details(
+                    *replica_id,
+                    Some("pending"),
+                    None,
+                    None,
+                    Some("requeued or restarted by Slurm"),
+                    &details,
                 )
                 .await?;
         }
@@ -118,17 +163,29 @@ pub async fn apply(
             endpoint_id,
             raw_state,
             reason,
+            failed_launch,
         } => {
             if let Some(ep) = endpoint_id {
-                // best-effort: a missing endpoint is fine, but log real failures so
-                // phantom endpoints don't accumulate unnoticed.
-                if let Err(e) = obleth.delete_endpoint(model_id, *ep).await {
-                    tracing::warn!(endpoint_id = %ep, error = %e, "failed to deregister endpoint on mark-lost");
-                }
+                obleth.delete_endpoint(model_id, *ep).await?;
             }
             let message = lost_message(raw_state.as_deref(), reason.as_deref());
+            let details = ReplicaDetails {
+                state_detail: Some(lost_detail(
+                    raw_state.as_deref(),
+                    reason.as_deref(),
+                    *failed_launch,
+                )),
+                ..Default::default()
+            };
             obleth
-                .patch_replica(*replica_id, Some("lost"), None, None, Some(&message))
+                .patch_replica_with_details(
+                    *replica_id,
+                    Some("lost"),
+                    None,
+                    None,
+                    Some(&message),
+                    &details,
+                )
                 .await?;
         }
         Action::Cancel {
@@ -136,35 +193,99 @@ pub async fn apply(
             job_id,
             endpoint_id,
             reason,
+            cancel_now,
         } => {
             // Deregister the endpoint first so the proxy stops routing to this
-            // backend immediately — otherwise it lingers in rotation (still
-            // "healthy") until the job goes fully Gone a tick later, and requests
-            // hit the dying backend (502). Best-effort: a missing endpoint is fine.
+            // backend immediately. If that fails, nothing else happens this
+            // tick: cancelling a job that still takes requests would 502 them.
             if let Some(ep) = endpoint_id {
-                if let Err(e) = obleth.delete_endpoint(model_id, *ep).await {
-                    tracing::warn!(endpoint_id = %ep, error = %e, "failed to deregister endpoint on cancel");
-                }
+                obleth.delete_endpoint(model_id, *ep).await?;
             }
-            let message = match reason {
-                CancelReason::ScaleDown => "scaled down",
-                CancelReason::OperatorRestart => "restart requested",
-                CancelReason::ProbeFailed => "restarting: failed health probes while job running",
-            };
             if *reason == CancelReason::ProbeFailed {
                 tracing::warn!(%replica_id, %job_id, model = model_name,
                     "self-heal: cancelling zombie replica (job RUNNING, probes failing)");
             }
-            slurm.cancel(job_id).await?;
+            // A cancel Slurm refuses is retried by the drain after its grace
+            // period, so the replica is marked draining either way.
+            let cancel_problem = if *cancel_now {
+                slurm.cancel(job_id).await.err().map(|e| format!("{e:#}"))
+            } else {
+                None
+            };
+            let details = ReplicaDetails {
+                state_detail: Some(reason.detail().to_string()),
+                ..Default::default()
+            };
             obleth
-                .patch_replica(*replica_id, Some("draining"), None, None, Some(message))
+                .patch_replica_with_details(
+                    *replica_id,
+                    Some("draining"),
+                    None,
+                    None,
+                    Some(reason.message()),
+                    &details,
+                )
+                .await?;
+            return Ok(cancel_problem);
+        }
+        Action::CancelJob { replica_id, job_id } => {
+            slurm.cancel(job_id).await?;
+            // Recording it restarts the grace clock, so a job that lingers
+            // (COMPLETING) is asked again only after another grace period.
+            obleth
+                .patch_replica(*replica_id, None, None, None, Some("cancelled"))
                 .await?;
         }
         Action::Delete { replica_id } => {
             obleth.delete_replica(*replica_id).await?;
         }
+        Action::DeleteEndpoint { endpoint_id } => {
+            tracing::info!(%endpoint_id, model = model_name, "removing an endpoint whose replica no longer serves");
+            obleth.delete_endpoint(model_id, *endpoint_id).await?;
+        }
+        Action::Annotate {
+            replica_id,
+            detail,
+            job_ends_at,
+        } => {
+            let details = ReplicaDetails {
+                state_detail: detail.clone(),
+                job_ends_at: *job_ends_at,
+                ..Default::default()
+            };
+            obleth.patch_replica_details(*replica_id, &details).await?;
+        }
     }
-    Ok(())
+    Ok(None)
+}
+
+/// The deterministic name of a replica's endpoint.
+pub fn endpoint_name(job_prefix: &str, model_name: &str, replica_id: uuid::Uuid) -> String {
+    format!("{job_prefix}{model_name}-{replica_id}")
+}
+
+/// The dashboard sentence for a replica whose job ended.
+fn lost_detail(raw_state: Option<&str>, reason: Option<&str>, failed_launch: bool) -> String {
+    let how = match (raw_state, reason) {
+        (Some(s), Some(r)) => format!("{s}, {r}"),
+        (Some(s), None) => s.to_string(),
+        (None, _) => String::new(),
+    };
+    if failed_launch {
+        return if how.is_empty() {
+            "The job disappeared from Slurm before the server became healthy. The job's output usually says why.".to_string()
+        } else {
+            format!("The job ended ({how}) before the server became healthy. The job's output usually says why.")
+        };
+    }
+    match raw_state {
+        None => "The job is no longer in Slurm.".to_string(),
+        Some("TIMEOUT") => "The job reached its time limit.".to_string(),
+        Some("PREEMPTED") => "Slurm preempted the job.".to_string(),
+        Some("NODE_FAIL") => "The job's node failed.".to_string(),
+        Some("CANCELLED") => "The job was cancelled outside obleth.".to_string(),
+        Some(_) => format!("The job ended ({how})."),
+    }
 }
 
 /// Extract the host from an endpoint's `api_base` URL for display/recording
@@ -374,6 +495,9 @@ mod tests {
             &Action::Promote {
                 replica_id: rid,
                 api_base: "http://gpu7:8000/v1".into(),
+                port: 8000,
+                job_started_at: chrono::DateTime::from_timestamp(1_700_000_000, 0),
+                job_ends_at: None,
             },
             s.model_id,
             "nemotron",
@@ -397,6 +521,13 @@ mod tests {
         assert!(patched
             .iter()
             .any(|p| p.0 == rid && p.1.as_deref() == Some("healthy")));
+        // The run it was promoted under and the port are recorded, and any
+        // earlier detail is cleared.
+        let details = obleth.details.lock().unwrap();
+        let (_, d) = details.iter().find(|(id, _)| *id == rid).unwrap();
+        assert_eq!(d.port, Some(8000));
+        assert_eq!(d.job_started_at.map(|t| t.timestamp()), Some(1_700_000_000));
+        assert_eq!(d.state_detail.as_deref(), Some(""));
     }
 
     #[test]
@@ -420,6 +551,7 @@ mod tests {
                 endpoint_id: Some(ep),
                 raw_state: None,
                 reason: None,
+                failed_launch: true,
             },
             Uuid::new_v4(),
             "nemotron",
@@ -453,6 +585,7 @@ mod tests {
                 endpoint_id: None,
                 raw_state: Some("OUT_OF_MEMORY".into()),
                 reason: Some("OutOfMemory".into()),
+                failed_launch: true,
             },
             Uuid::new_v4(),
             "nemotron",
@@ -488,6 +621,7 @@ mod tests {
                 job_id: "j9".into(),
                 endpoint_id: Some(ep),
                 reason: CancelReason::ScaleDown,
+                cancel_now: true,
             },
             Uuid::new_v4(),
             "nemotron",
@@ -521,6 +655,7 @@ mod tests {
                 job_id: "j9".into(),
                 endpoint_id: None,
                 reason: CancelReason::ScaleDown,
+                cancel_now: true,
             },
             Uuid::new_v4(),
             "nemotron",
@@ -590,6 +725,135 @@ mod tests {
         assert!(
             perr.iter().any(|(id, e)| *id == s.model_id && e.is_none()),
             "clears on success"
+        );
+    }
+
+    async fn run(
+        action: &Action,
+        slurm: &MockSlurm,
+        obleth: &MockObleth,
+    ) -> anyhow::Result<Option<String>> {
+        apply(
+            action,
+            Uuid::new_v4(),
+            "nemotron",
+            None,
+            "obleth-",
+            8,
+            8000,
+            slurm,
+            obleth,
+            &resolver(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn demote_removes_the_endpoint_and_puts_the_replica_back_to_pending() {
+        let slurm = mock_slurm();
+        let obleth = MockObleth::default();
+        let (rid, ep) = (Uuid::new_v4(), Uuid::new_v4());
+        let action = Action::Demote {
+            replica_id: rid,
+            endpoint_id: Some(ep),
+            detail: crate::plan::REQUEUED_DETAIL.into(),
+        };
+        run(&action, &slurm, &obleth).await.unwrap();
+        assert_eq!(*obleth.deleted_endpoints.lock().unwrap(), vec![ep]);
+        assert!(obleth
+            .patched
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p.0 == rid && p.1.as_deref() == Some("pending")));
+        let details = obleth.details.lock().unwrap();
+        assert_eq!(
+            details[0].1.state_detail.as_deref(),
+            Some(crate::plan::REQUEUED_DETAIL)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_endpoint_delete_changes_nothing_so_the_next_tick_retries() {
+        let slurm = mock_slurm();
+        let obleth = MockObleth::default();
+        obleth
+            .fail_delete_endpoint
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let ep = Some(Uuid::new_v4());
+        let actions = [
+            Action::Demote {
+                replica_id: Uuid::new_v4(),
+                endpoint_id: ep,
+                detail: "x".into(),
+            },
+            Action::MarkLost {
+                replica_id: Uuid::new_v4(),
+                endpoint_id: ep,
+                raw_state: None,
+                reason: None,
+                failed_launch: false,
+            },
+            Action::Cancel {
+                replica_id: Uuid::new_v4(),
+                job_id: "j1".into(),
+                endpoint_id: ep,
+                reason: CancelReason::ScaleDown,
+                cancel_now: true,
+            },
+        ];
+        for a in &actions {
+            assert!(run(a, &slurm, &obleth).await.is_err(), "{a:?}");
+        }
+        assert!(obleth.patched.lock().unwrap().is_empty());
+        assert!(
+            slurm.cancelled.lock().unwrap().is_empty(),
+            "no cancel while it takes requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_graceful_drain_cancels_the_job_only_after_the_grace() {
+        let slurm = mock_slurm();
+        let obleth = MockObleth::default();
+        let rid = Uuid::new_v4();
+        let drain = Action::Cancel {
+            replica_id: rid,
+            job_id: "j7".into(),
+            endpoint_id: Some(Uuid::new_v4()),
+            reason: CancelReason::Replaced,
+            cancel_now: false,
+        };
+        run(&drain, &slurm, &obleth).await.unwrap();
+        assert!(slurm.cancelled.lock().unwrap().is_empty());
+        assert!(obleth
+            .patched
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p.0 == rid && p.1.as_deref() == Some("draining")));
+        let later = Action::CancelJob {
+            replica_id: rid,
+            job_id: "j7".into(),
+        };
+        run(&later, &slurm, &obleth).await.unwrap();
+        assert_eq!(*slurm.cancelled.lock().unwrap(), vec!["j7".to_string()]);
+    }
+
+    #[test]
+    fn lost_details_say_whether_the_launch_failed() {
+        assert!(
+            lost_detail(Some("FAILED"), Some("NonZeroExitCode"), true).starts_with(
+                "The job ended (FAILED, NonZeroExitCode) before the server became healthy."
+            )
+        );
+        assert_eq!(
+            lost_detail(Some("TIMEOUT"), None, false),
+            "The job reached its time limit."
+        );
+        assert_eq!(
+            lost_detail(None, None, false),
+            "The job is no longer in Slurm."
         );
     }
 }

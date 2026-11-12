@@ -26,10 +26,12 @@ pub struct ProvisionerConfig {
     /// 20 ticks is ~5 minutes of the server not answering at all. A single-
     /// threaded server (llama.cpp) that briefly misses a probe while busy and
     /// passes the next never accumulates toward it. `0` disables self-heal
-    /// restarts. Restarts are additionally capped at one per model per tick, so
-    /// a probe-side network problem rolls replicas gradually instead of mass-
-    /// cancelling a fleet. The gateway's inference-based endpoint check is a
-    /// separate, faster zombie signal (see `plan::restart_candidates`).
+    /// restarts. Restarts are capped at one per model per tick, the last
+    /// serving replica is replaced surge-first rather than cancelled, and
+    /// nothing restarts while every probe fails at once (a fault on the
+    /// provisioner's own path to the nodes). The gateway's fresh,
+    /// inference-based endpoint check is a separate zombie signal (see
+    /// `plan::self_heal_candidates`).
     pub restart_after_failures: i64,
     pub port_span: i64,
     /// Job-name prefix used to tag and later find this gateway's jobs.
