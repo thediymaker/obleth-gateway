@@ -303,7 +303,7 @@ impl TickReport {
 
 /// Most warnings carried per tick, and the longest each may be.
 const TICK_WARNINGS_MAX: usize = 8;
-const TICK_WARNING_MAX_LEN: usize = 200;
+const TICK_WARNING_MAX_LEN: usize = 400;
 
 /// The tick warnings as a JSON array that is safe as a header value.
 fn warnings_header(warnings: &[String]) -> Option<String> {

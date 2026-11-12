@@ -361,7 +361,7 @@ async fn tick(
         }
         if !held.is_empty() {
             tracing::error!(
-                jobs = held.len(),
+                jobs = ?held,
                 "slurmrestd reports every tracked job as not found and accounting cannot \
                  confirm they ended; leaving those replicas as they are \
                  (check the slurmrestd URL/API version and cluster)"
@@ -377,12 +377,10 @@ async fn tick(
                 );
             }
             warnings.push(format!(
-                "Slurm no longer knows any of the {} jobs obleth is tracking ({}), and its accounting \
-                 database could not confirm that they ended. obleth leaves those replicas as they are \
-                 in case the slurmrestd URL or cluster changed. If the jobs really ended, stop each \
-                 replica on its deployment and obleth starts new ones.",
-                held.len(),
-                held.join(", ")
+                "Slurm no longer knows any of the {} jobs obleth tracks, and its accounting database \
+                 could not confirm that they ended, so obleth leaves those replicas alone. If the jobs \
+                 really ended, stop each replica on its deployment and obleth starts new ones.",
+                held.len()
             ));
         }
     }

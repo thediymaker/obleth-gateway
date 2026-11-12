@@ -556,9 +556,8 @@ pub fn plan(input: &PlanInput) -> Vec<Action> {
 
     // Retire replicas once enough others serve: k of them can go while the
     // serving count stays at target. Handoffs go in order of their time
-    // limits, others oldest first. A replacement the operator asked for (or
-    // self-heal) also goes once its successor had the startup timeout to
-    // come up.
+    // limits, others oldest first. A replacement the operator asked for also
+    // goes once its successor had the startup timeout to come up.
     let healthy_after = (serving.len() + promoting.len()) as i64 - cancelled_healthy as i64;
     let hr = retiring.len() as i64;
     let mut k = hr.min((healthy_after + hr - target).max(0));
@@ -568,7 +567,10 @@ pub fn plan(input: &PlanInput) -> Vec<Action> {
     });
     for (r, why) in retiring {
         let waited = input.waited_secs.get(&r.id).copied().unwrap_or(0);
-        let gave_up = !matches!(why, Retire::Handoff(_))
+        // Only an operator's replacement goes without a serving successor:
+        // an unhealthy replica keeps its slot (the fault may be on the
+        // provisioner's side), and a handoff ends at the time limit anyway.
+        let gave_up = why == Retire::Requested
             && spec.startup_timeout_mins > 0
             && waited >= spec.startup_timeout_mins * 60;
         if k > 0 || gave_up {
@@ -1618,6 +1620,18 @@ mod tests {
             cancel_of(&c.plan(), c.replicas[0].id),
             Some((CancelReason::Replaced, false))
         );
+    }
+
+    #[test]
+    fn an_unhealthy_last_replica_keeps_its_slot_until_a_successor_serves() {
+        let mut c = Case::new(spec(1));
+        c.replicas = vec![served("1", Some(Uuid::new_v4()), "n1", mins_ago(300))];
+        c.jobs = HashMap::from([running("1", "n1", mins_ago(300))]);
+        c.heal.dead.insert(c.replicas[0].id);
+        c.waited.insert(c.replicas[0].id, 7200);
+        let a = c.plan();
+        assert!(cancel_of(&a, c.replicas[0].id).is_none(), "{a:?}");
+        assert_eq!(submits(&a), 1);
     }
 
     #[test]
