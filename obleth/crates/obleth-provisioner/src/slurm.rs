@@ -569,8 +569,10 @@ const DEFAULT_SHEBANG: &str = "#!/bin/bash -l";
 
 /// Build a version-agnostic JobSubmit from a model's spec. The job is named
 /// `{prefix}{model_name}` (made safe for file names). The script runs the
-/// operator's launch command inside their apptainer image, or, when `image`
-/// is blank, directly on the node. Nothing about a specific cluster is assumed.
+/// operator's launch command inside their image with the cluster's container
+/// command (`$OBLETH_CONTAINER_RUN`, `apptainer exec --nv` when unset, as the
+/// shipped recipes do), or, when `image` is blank, directly on the node.
+/// Nothing about a specific cluster is assumed.
 pub fn job_submit_from_spec(
     spec: &ManagedModelSpec,
     model_name: &str,
@@ -598,8 +600,9 @@ pub fn job_submit_from_spec(
     let exec_line = if image.is_empty() {
         launch_command
     } else {
+        // Unquoted on purpose: the container command is several words.
         format!(
-            "apptainer exec --nv {image} {cmd}",
+            "${{OBLETH_CONTAINER_RUN:-apptainer exec --nv}} {image} {cmd}",
             image = shell_quote(image),
             cmd = launch_command,
         )
@@ -1965,9 +1968,9 @@ mod tests {
         let j = job_submit_from_spec(&spec(), "nemotron", "obleth-", 8000, 8);
         assert_eq!(j.name, "obleth-nemotron");
         assert_eq!(j.partition, "gpu-preempt");
-        assert!(j
-            .script
-            .contains("apptainer exec --nv 'vllm.sif' vllm serve nemotron"));
+        assert!(j.script.contains(
+            "${OBLETH_CONTAINER_RUN:-apptainer exec --nv} 'vllm.sif' vllm serve nemotron"
+        ));
     }
 
     #[test]
@@ -2024,9 +2027,9 @@ mod tests {
             !j.script.contains("module load"),
             "no preamble lines when preamble is empty"
         );
-        assert!(j
-            .script
-            .contains("apptainer exec --nv 'vllm.sif' vllm serve nemotron"));
+        assert!(j.script.contains(
+            "${OBLETH_CONTAINER_RUN:-apptainer exec --nv} 'vllm.sif' vllm serve nemotron"
+        ));
     }
 
     #[test]
@@ -2034,9 +2037,9 @@ mod tests {
         let mut s = spec();
         s.image = "weird'$(rm -rf /); image.sif".into();
         let j = job_submit_from_spec(&s, "nemotron", "obleth-", 8000, 8);
-        assert!(j
-            .script
-            .contains("apptainer exec --nv 'weird'\\''$(rm -rf /); image.sif'"));
+        assert!(j.script.contains(
+            "${OBLETH_CONTAINER_RUN:-apptainer exec --nv} 'weird'\\''$(rm -rf /); image.sif'"
+        ));
     }
 
     #[test]

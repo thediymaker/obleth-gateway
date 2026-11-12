@@ -97,7 +97,7 @@ pub struct JobSubmit {
     pub mem_mb: Option<i64>,
     /// Directory for stdout/stderr files; empty means Slurm default.
     pub log_output_dir: String,
-    /// Shell script the job runs (apptainer exec ... <launch_command>).
+    /// Shell script the job runs (the container command, image and <launch_command>).
     pub script: String,
 }
 
