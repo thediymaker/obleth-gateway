@@ -97,7 +97,7 @@ describe("the Deployments list", () => {
     expect(table.textContent).toContain("glm-5-3-flash");
     expect(table.textContent).not.toContain("static-proxy");
     expect(table.textContent).toContain("1 queued: Resources");
-    expect(host.textContent).toContain("1 on Kubernetes, 0 replicas ready · 1 on Slurm, 1 starting · 1 needs you");
+    expect(host.textContent).toContain("1 on Kubernetes, 0 replicas ready · 1 on Slurm · 1 needs you");
     await act(async () => button("Needs you 1").click());
     expect(table.textContent).not.toContain("glm-5.2");
     expect(table.textContent).toContain("No replicas ready");
