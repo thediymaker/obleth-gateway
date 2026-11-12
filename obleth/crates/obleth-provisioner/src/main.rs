@@ -589,6 +589,8 @@ async fn tick(
             startup_timeout_mins: spec.startup_timeout_mins,
             handoff_mins: spec.handoff_mins,
             paused_until: spec.paused_until,
+            failed_launches: spec.failed_launches,
+            max_job_failures: spec.max_job_failures,
             removed: false,
         };
         let prefix = format!("{}{}-", cfg.job_name_prefix, w.identity.name);

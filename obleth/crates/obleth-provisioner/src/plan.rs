@@ -60,6 +60,11 @@ pub struct ManagedSpecView {
     pub handoff_mins: i64,
     /// No submits before this time.
     pub paused_until: Option<DateTime<Utc>>,
+    /// Failed launches counted so far, and the limit that pauses submits
+    /// (0 = no limit). The planner adds this tick's failures before it
+    /// submits, so reaching the limit lets no extra job through.
+    pub failed_launches: i64,
+    pub max_job_failures: i64,
     /// The model left the managed set (paused or removed): everything drains.
     pub removed: bool,
 }
@@ -509,7 +514,22 @@ pub fn plan(input: &PlanInput) -> Vec<Action> {
     // replaced, so their successors are submitted now.
     let target = spec.target_replicas.max(0);
     let alive = (queued.len() + loading.len() + serving.len()) as i64 + unknown;
-    let paused = spec.paused_until.is_some_and(|t| t > now);
+    // The failures this tick records count now, as `next_backoff` will count
+    // them once the actions are applied: a tick that marks the last allowed
+    // failure must not also submit its replacement.
+    let failed_now = actions
+        .iter()
+        .filter(|a| is_failed_launch(a, input.replicas))
+        .count() as i64;
+    let served_now = actions.iter().any(|a| {
+        matches!(a, Action::Promote { replica_id, .. }
+            if input.replicas.iter().any(|r| r.id == *replica_id && r.state != "healthy"))
+    });
+    let counted = if served_now { 0 } else { spec.failed_launches };
+    let limit_reached = spec.max_job_failures > 0
+        && failed_now > 0
+        && counted + failed_now >= spec.max_job_failures;
+    let paused = spec.paused_until.is_some_and(|t| t > now) || limit_reached;
     let mut cancelled_healthy = 0usize;
     if alive < target && !paused {
         for _ in 0..(target - alive) {
@@ -1299,6 +1319,32 @@ mod tests {
         }));
         assert_eq!(submits(&a), 1);
         assert!(is_failed_launch(&a[0], &c.replicas));
+    }
+
+    #[test]
+    fn the_failure_that_reaches_the_limit_submits_no_replacement() {
+        // Limit 2, one failure already counted: this tick's failure is the
+        // second, so it pauses and no third job goes out.
+        let mut s = spec(1);
+        s.max_job_failures = 2;
+        s.failed_launches = 1;
+        let mut c = Case::new(s.clone());
+        c.replicas = vec![rv("pending", "1", None, 600)];
+        c.jobs = HashMap::from([ended("1", "FAILED")]);
+        assert_eq!(submits(&c.plan()), 0);
+        // Below the limit the replacement still goes out.
+        s.failed_launches = 0;
+        let mut c = Case::new(s.clone());
+        c.replicas = vec![rv("pending", "1", None, 600)];
+        c.jobs = HashMap::from([ended("1", "FAILED")]);
+        assert_eq!(submits(&c.plan()), 1);
+        // No limit: always replaced.
+        s.max_job_failures = 0;
+        s.failed_launches = 5;
+        let mut c = Case::new(s);
+        c.replicas = vec![rv("pending", "1", None, 600)];
+        c.jobs = HashMap::from([ended("1", "FAILED")]);
+        assert_eq!(submits(&c.plan()), 1);
     }
 
     #[test]
