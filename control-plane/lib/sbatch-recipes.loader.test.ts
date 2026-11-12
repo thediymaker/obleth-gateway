@@ -143,6 +143,14 @@ describe("loadRecipeCards merge (file + DB)", () => {
     expect(fileCard?.recipeId).toBeUndefined();
   });
 
+  it("shows a file it can't read as a card saying why, instead of leaving it out", async () => {
+    symlinkSync(path.join(dir, "missing-target"), path.join(dir, "broken.recipe"));
+    const cards = await loadRecipeCards();
+    const broken = cards.find((c) => c.id === "broken");
+    expect(broken?.valid).toBe(false);
+    expect(broken?.error).toMatch(/^the file can't be opened/);
+  });
+
   it("file card body is the full raw document (starts with ---), not just the script", async () => {
     writeFileSync(path.join(dir, "glm.recipe"), VALID);
     const cards = await loadRecipeCards();
