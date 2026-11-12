@@ -511,14 +511,14 @@ pub fn token_expiry_warning(jwt: &str, now_unix: i64) -> Option<String> {
     if left <= 0 {
         let at = chrono::DateTime::from_timestamp(exp, 0)?;
         Some(format!(
-            "The Slurm token expired at {} UTC. Mint a new one with `scontrol token` and save it \
-             in the Slurm settings.",
+            "The Slurm token expired at {} UTC. Mint a new one with `scontrol token \
+             lifespan=2592000` and save it in the Slurm settings.",
             at.format("%Y-%m-%d %H:%M")
         ))
     } else if left <= TOKEN_WARN_SECS {
         Some(format!(
-            "The Slurm token expires in {}. Mint a new one with `scontrol token` and save it in \
-             the Slurm settings.",
+            "The Slurm token expires in {}. Mint a new one with `scontrol token \
+             lifespan=2592000` and save it in the Slurm settings.",
             plain_duration(left)
         ))
     } else {

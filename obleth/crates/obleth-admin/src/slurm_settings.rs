@@ -221,7 +221,7 @@ fn settings_warnings(s: &SlurmSettings, now: i64, stored_encrypted: bool) -> Vec
         if s.enabled {
             out.push(
                 "Slurm is on but no token is saved, so slurmrestd will refuse requests unless it \
-                 trusts this host. Paste the output of `scontrol token`."
+                 trusts this host. Paste the output of `scontrol token lifespan=2592000`."
                     .to_string(),
             );
         }
@@ -857,7 +857,8 @@ pub async fn test_slurm_settings(State(state): State<AdminState>) -> Result<Json
     let mut problems: Vec<String> = Vec::new();
     if !jwt.set {
         problems.push(
-            "No Slurm token is saved. Paste the output of `scontrol token` into the token field."
+            "No Slurm token is saved. Paste the output of `scontrol token lifespan=2592000` into the \
+             token field."
                 .to_string(),
         );
     } else if jwt.expired {
