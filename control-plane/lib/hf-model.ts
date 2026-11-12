@@ -30,6 +30,23 @@ export interface HfModel {
   engines: EngineFit[];
   /** The engine to preselect. */
   recommended: EngineId | null;
+  /** The repo's task on Hugging Face, e.g. "text-generation". */
+  pipelineTag?: string | null;
+  /** The kind of model obleth registers it as, read from the task. */
+  servedAs?: string;
+}
+
+/** The model type obleth registers for a Hugging Face task. */
+export function modelTypeForTask(task: string | null | undefined): string {
+  switch (task) {
+    case "feature-extraction":
+    case "sentence-similarity":
+      return "embedding";
+    case "automatic-speech-recognition":
+      return "audio_transcription";
+    default:
+      return "chat";
+  }
 }
 
 interface HfSibling {
@@ -46,6 +63,7 @@ interface HfApiModel {
   cardData?: { license?: string };
   gated?: boolean | string;
   tags?: string[];
+  pipeline_tag?: string;
 }
 
 const GB = 1e9;
@@ -105,6 +123,8 @@ export function readHfModel(repo: string, api: HfApiModel): HfModel {
     ggufQuants,
     engines,
     recommended: hfFormat ? "vllm" : pickQuant ? "llamacpp" : null,
+    pipelineTag: api.pipeline_tag ?? null,
+    servedAs: modelTypeForTask(api.pipeline_tag),
   };
 }
 
@@ -122,9 +142,9 @@ export async function lookupHfModel(input: string, fetchImpl: typeof fetch = fet
   try {
     res = await fetchImpl(`https://huggingface.co/api/models/${repo}?blobs=true`, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(10_000), cache: "no-store" });
   } catch {
-    throw new Error("Couldn't reach huggingface.co from the dashboard. Pick an engine and type the model instead.");
+    throw new Error("Couldn't reach huggingface.co from the dashboard. Pick an engine below and type the model, or a folder on the cluster that holds it.");
   }
-  if (res.status === 404 || res.status === 401) throw new Error(`No public model called ${repo} on Hugging Face.`);
-  if (!res.ok) throw new Error(`Hugging Face answered ${res.status}. Try again, or pick an engine and type the model.`);
+  if (res.status === 404 || res.status === 401) throw new Error(`Hugging Face has no public model called ${repo}: it is private, gated behind a sign-in, or doesn't exist. To launch it anyway, pick an engine below and type the model.`);
+  if (!res.ok) throw new Error(`Hugging Face answered ${res.status}. Try again, or pick an engine below and type the model.`);
   return readHfModel(repo, (await res.json()) as HfApiModel);
 }

@@ -7,6 +7,11 @@
 // cluster value ({{cluster.cache}}, {{cluster.image.vllm}}, …), which comes
 // from the Slurm connection's cluster defaults, so no recipe hard-codes a path.
 
+/** The rule every served model name follows (the same as for a model added
+ *  by hand): it goes into job scripts as one shell word. */
+export const MODEL_NAME_RE = /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/;
+export const MODEL_NAME_RULE = "use lowercase letters, numbers, dashes and dots, starting and ending with a letter or number";
+
 export type InputType = "text" | "choice" | "number" | "path" | "flag";
 
 /** The model flags a recipe input can turn on, named as in a recipe. */

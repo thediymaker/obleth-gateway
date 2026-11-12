@@ -6,7 +6,7 @@ import type { RecipeDeployPreview } from "@/components/recipes/recipe-card";
 import { accountsFor, gresCount, memToMb, partitionFits, parseTimeLimit, walltimeLabel } from "@/lib/deployments-model";
 import type { ClusterResources } from "@/lib/obleth";
 import { GRES_RE } from "@/lib/managed-model-schema";
-import { inputDefaults, inputProblem, type ClusterValues } from "@/lib/recipe-inputs";
+import { inputDefaults, inputProblem, MODEL_NAME_RE, MODEL_NAME_RULE, type ClusterValues } from "@/lib/recipe-inputs";
 import type { DeployOverrides } from "@/lib/sbatch-recipes";
 
 export interface SlurmFields {
@@ -37,6 +37,9 @@ export interface DeployForm {
   slurm: SlurmFields;
   env: Record<string, string>;
   serving: ServingFields;
+  /** The kind of model to register, when it differs from the recipe's (an
+   *  engine recipe serving an embedding model, say). */
+  model_type?: string;
 }
 
 /** A dotted path into the form, e.g. "slurm.account" or "inputs.context". */
@@ -46,7 +49,7 @@ export type FieldPath = string;
 export type Source = "recipe" | "cluster" | "learned" | "changed" | "default";
 
 /** The form as the recipe (and cluster defaults) would launch it. */
-export function baselineForm(recipeId: string, p: RecipeDeployPreview, cv: ClusterValues, overrides: { name?: string; inputs?: Record<string, string> } = {}): DeployForm {
+export function baselineForm(recipeId: string, p: RecipeDeployPreview, cv: ClusterValues, overrides: { name?: string; inputs?: Record<string, string>; modelType?: string } = {}): DeployForm {
   const nodes = p.nodes ?? 1;
   return {
     recipe: recipeId,
@@ -69,9 +72,10 @@ export function baselineForm(recipeId: string, p: RecipeDeployPreview, cv: Clust
     serving: {
       keep_running: p.targetReplicas ?? 1,
       serve_from: 1,
-      stop_after_failed_launches: p.maxJobFailures ?? 3,
+      stop_after_failed_launches: p.maxJobFailures ?? 2,
       health_path: p.healthPath,
     },
+    ...(overrides.modelType && overrides.modelType !== p.modelType ? { model_type: overrides.modelType } : {}),
   };
 }
 
@@ -106,6 +110,7 @@ export function toOverrides(form: DeployForm): DeployOverrides {
   const target = Math.max(0, Math.floor(form.serving.keep_running) || 0) || 1;
   return {
     api_model_name: form.name.trim(),
+    ...(form.model_type ? { model_type: form.model_type } : {}),
     partition: s.partition,
     account: s.account,
     qos: s.qos,
@@ -140,6 +145,7 @@ export function formProblems(form: DeployForm, p: RecipeDeployPreview, resources
   const out: Problem[] = [];
   const name = form.name.trim();
   if (!name) out.push({ path: "name", message: "Name it: this is what clients send as model" });
+  else if (!MODEL_NAME_RE.test(name)) out.push({ path: "name", message: `Names ${MODEL_NAME_RULE}, since clients send it as model and the job passes it to the server as one word` });
   else if (takenNames.includes(name)) out.push({ path: "name", message: `A model called ${name} already exists` });
   for (const input of p.inputs) {
     const value = form.inputs[input.name];

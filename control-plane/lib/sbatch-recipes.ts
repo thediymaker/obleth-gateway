@@ -14,7 +14,7 @@ import { z } from "zod";
 import type { RecipeCard, RecipeDeployPreview } from "@/components/recipes/recipe-card";
 import { toRecipeCards } from "@/components/recipes/recipe-card";
 import { parseSbatchDirectives, stripSbatchDirectives, unappliedAdvice, unixLineEndings, type ParsedDirectives } from "./sbatch-directives";
-import { clusterTokens, EMPTY_CLUSTER, inputCapabilities, inputTokens, knownClusterToken, malformedTokens, MODEL_CAPABILITIES, renderScript, type ClusterValues, type ModelCapability, type RecipeInput } from "./recipe-inputs";
+import { clusterTokens, EMPTY_CLUSTER, MODEL_NAME_RE, MODEL_NAME_RULE, inputCapabilities, inputTokens, knownClusterToken, malformedTokens, MODEL_CAPABILITIES, renderScript, type ClusterValues, type ModelCapability, type RecipeInput } from "./recipe-inputs";
 import { splitFrontmatter } from "./recipe-frontmatter";
 import type { PutManagedModel } from "@/lib/obleth";
 import { obleth } from "@/lib/obleth";
@@ -112,9 +112,7 @@ export function defaultHealthPath(engine: string): string {
   return normalizeEngine(engine) === "ollama" ? "/" : "/health";
 }
 
-/** The rule every served model name follows (the same as for a model added by hand). */
-export const MODEL_NAME_RE = /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/;
-export const MODEL_NAME_RULE = "use lowercase letters, numbers, dashes and dots, starting and ending with a letter or number";
+export { MODEL_NAME_RE, MODEL_NAME_RULE };
 
 /** The header keys a recipe may use, in the order the shipped recipes write them. */
 export const HEADER_KEYS = [

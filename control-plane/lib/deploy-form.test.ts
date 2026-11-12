@@ -73,3 +73,16 @@ describe("the deploy form", () => {
     expect(yamlToForm("env:\n  A:\n", base, []).form?.env).toEqual({});
   });
 });
+
+describe("launch names and model type", () => {
+  it("refuses a name the engine or shell would split, and carries a model type from the lookup", async () => {
+    const { baselineForm, formProblems, toOverrides } = await import("./deploy-form");
+    const { EMPTY_CLUSTER } = await import("./recipe-inputs");
+    const preview = { apiModelName: "m", modelType: "chat", engine: "vllm", port: 8000, healthPath: "/health", targetReplicas: 1, maxJobFailures: 2, partition: "", scriptBody: "", rawBody: "", warnings: [], inputs: [], kind: "engine" as const };
+    const resources = { partitions: [], accounts: [], qos: [] } as unknown as Parameters<typeof formProblems>[2];
+    const f = baselineForm("vllm", preview, EMPTY_CLUSTER, { name: "Gemma 4", modelType: "embedding" });
+    expect(formProblems(f, preview, resources, []).map((p) => p.path)).toContain("name");
+    expect(toOverrides(f).model_type).toBe("embedding");
+    expect(baselineForm("vllm", { ...preview, maxJobFailures: undefined as unknown as number }, EMPTY_CLUSTER).serving.stop_after_failed_launches).toBe(2);
+  });
+});

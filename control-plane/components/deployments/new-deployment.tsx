@@ -102,7 +102,7 @@ export function NewDeployment({ recipes, takenNames, slurmOn, slurm, initialReci
     const c = usable.find((r) => r.id === picked?.recipeId);
     if (!c?.preview || !picked) return;
     if (form && form.recipe === c.id && base && reached > 1 && !picked.hf) return go(2);
-    let b = baselineForm(c.id, c.preview, cluster, { name: picked.name, inputs: picked.inputs });
+    let b = baselineForm(c.id, c.preview, cluster, { name: picked.name, inputs: picked.inputs, modelType: picked.hf?.servedAs });
     // A saved recipe whose name is already taken starts with a free variant.
     if (takenNames.includes(b.name)) {
       let i = 2;

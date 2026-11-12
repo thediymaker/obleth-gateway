@@ -24,7 +24,7 @@ export interface Picked {
   hf?: HfModel;
 }
 
-export const ENGINE_NAMES: Record<string, string> = { vllm: "vLLM", sglang: "SGLang", llamacpp: "llama.cpp", "llama.cpp": "llama.cpp", ollama: "Ollama" };
+export const ENGINE_NAMES: Record<string, string> = { vllm: "vLLM", sglang: "SGLang", llamacpp: "llama.cpp", ollama: "Ollama" };
 
 export function engineName(e: string | undefined): string {
   return e ? ENGINE_NAMES[e] ?? e : "—";
@@ -58,7 +58,8 @@ export function Picker({ recipes, launches, resources, tab, onTab, picked, onPic
   const usable = recipes.filter((r) => r.valid && r.preview);
   const saved = usable.filter((r) => r.source === "db");
   const library = usable.filter((r) => r.source === "file" && r.preview?.kind !== "engine");
-  const engines = usable.filter((r) => r.source === "file" && r.preview?.kind === "engine");
+  // Engine recipes for any model: a site's saved copies first, then the library's.
+  const engines = [...usable.filter((r) => r.source === "db" && r.preview?.kind === "engine"), ...usable.filter((r) => r.source === "file" && r.preview?.kind === "engine")];
   const [query, setQuery] = useState("");
   const [engine, setEngine] = useState("all");
   const [fitsOnly, setFitsOnly] = useState(false);
@@ -192,8 +193,10 @@ function FromHuggingFace({ engines, picked, onPick, onNext }: { engines: RecipeC
   const [model, setModel] = useState<HfModel | null>(picked?.hf ?? null);
   const [error, setError] = useState<string | null>(null);
   const [pending, start] = useTransition();
-  const byEngine = new Map(engines.map((e) => [e.engine ?? "", e]));
-  const chosen = model ? engines.find((e) => e.id === picked?.recipeId) : undefined;
+  // The first recipe for each engine id (saved copies come first).
+  const byEngine = new Map<string, RecipeCard>();
+  for (const e of engines) if (e.engine && !byEngine.has(e.engine)) byEngine.set(e.engine, e);
+  const chosen = engines.find((e) => e.id === picked?.recipeId);
 
   function look() {
     setError(null);
@@ -213,7 +216,7 @@ function FromHuggingFace({ engines, picked, onPick, onNext }: { engines: RecipeC
     const fit = m.engines.find((e) => e.engine === engine);
     const recipe = byEngine.get(engine);
     if (!fit?.ok || !recipe || !fit.model) return;
-    onPick({ recipeId: recipe.id, inputs: { model: fit.model }, name: engine === "ollama" ? fit.model : nameFromRepo(m.id), hf: m });
+    onPick({ recipeId: recipe.id, inputs: { model: fit.model }, name: nameFromRepo(m.id), hf: m });
   }
 
   return (
@@ -227,6 +230,26 @@ function FromHuggingFace({ engines, picked, onPick, onNext }: { engines: RecipeC
       </form>
       {error && <Notice strong onDismiss={() => setError(null)}>{error}</Notice>}
       {!model && !error && <p className="text-[13px] text-muted-foreground">obleth reads the repo&apos;s files and config, then lists the engines that can run it. Nothing is downloaded until the job starts.</p>}
+      {!model && engines.length > 0 && (
+        <section aria-label="Launch with an engine" className="overflow-hidden rounded-xl border border-border bg-card">
+          <div className="px-5 py-3.5">
+            <span className="text-sm font-semibold">Or launch with an engine and type the model</span>
+            <p className="text-[12.5px] text-muted-foreground">For a private repo, a model on a cluster folder, or when huggingface.co can&apos;t be reached. The next step asks for the model.</p>
+          </div>
+          {engines.map((e) => {
+            const on = picked?.recipeId === e.id && !picked?.hf;
+            return (
+              <button key={`${e.source}:${e.id}`} type="button" aria-pressed={on} onClick={() => onPick({ recipeId: e.id })} className={cn("grid w-full grid-cols-[110px_minmax(0,1fr)] items-center gap-3.5 border-t border-border px-5 py-3 text-left text-[13px]", on ? "bg-secondary/70" : "hover:bg-secondary/30")}>
+                <span className="font-semibold">{engineName(e.engine)}</span>
+                <span className="text-secondary-foreground">{e.source === "db" ? `${e.name}, saved on this gateway` : e.description}</span>
+              </button>
+            );
+          })}
+          <div className="flex justify-end border-t border-border px-5 py-3">
+            <Button type="button" className="h-10" disabled={!chosen} onClick={onNext}>{chosen ? `Continue with ${engineName(chosen.engine)} →` : "Pick an engine"}</Button>
+          </div>
+        </section>
+      )}
       {model && (
         <div className="grid gap-4 xl:grid-cols-[360px_minmax(0,1fr)]">
           <section aria-label="Read from Hugging Face" className="flex flex-col gap-3 rounded-xl border border-border bg-card px-5 py-4">
