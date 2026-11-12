@@ -3,7 +3,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { launchRecipeAction, setDeploymentEnabledAction, setDeploymentReplicasAction, setSlurmSettingsAction } from "@/app/actions";
+import { launchRecipeAction, setDeploymentEnabledAction, setDeploymentReplicasAction, setSlurmSettingsAction, testSlurmConnectionAction } from "@/app/actions";
 import { DeploymentsList } from "./deployments-list";
 import { ManagedPage } from "./managed-page";
 import { NewDeployment } from "./new-deployment";
@@ -145,6 +145,27 @@ describe("the Slurm connection", () => {
     expect(setSlurmSettingsAction).not.toHaveBeenCalled();
     await act(async () => button("Turn off").click());
     expect(setSlurmSettingsAction).toHaveBeenCalledWith(expect.objectContaining({ enabled: false }));
+  });
+});
+
+describe("what the Slurm connection reports", () => {
+  it("shows the API version, the token's user and expiry, plaintext storage, and test problems as sentences", async () => {
+    const slurm = {
+      enabled: true, slurmrestd_url: "http://slurm:6820", slurmrestd_api_version: "auto", slurm_user: "obleth", jwt_set: true, jwt_last4: "a1b2", node_aliases: [],
+      provisioner_running: true, provisioner_last_seen_secs: 4, provisioner_tick_status: "ok", resolved_api_version: "v0.0.44", available_api_versions: ["v0.0.42", "v0.0.43", "v0.0.44"],
+      jwt_user: "obleth", jwt_expires_in_secs: 1200, stored_encrypted: false, provisioner_warnings: ["2 cancels failed: timeout"],
+    } as DeploymentsData["slurm"];
+    vi.mocked(testSlurmConnectionAction).mockResolvedValueOnce({ ok: true, health: { jwt: { set: true, expired: false, expires_at: null }, ping: { ok: false, status_code: 404, latency_ms: 3, error: null }, problems: ["slurmrestd doesn't serve v0.0.40. Set API version to auto."] } } as never);
+    await render(<DeploymentsList initial={data({ slurm })} recipes={[]} tab="deployments" slurmSheet />);
+    const sheet = document.querySelector('[role="dialog"][aria-label="Slurm connection"]')!;
+    expect(sheet.textContent).toContain("Automatic picked v0.0.44. slurmrestd serves v0.0.42, v0.0.43, v0.0.44.");
+    expect(sheet.textContent).toContain("The Slurm token for obleth expires in 20 minutes");
+    expect(sheet.textContent).toContain("Mint a new token with scontrol token lifespan=2592000 and paste it here.");
+    expect(sheet.textContent).toContain("stored in plaintext");
+    expect(sheet.textContent).toContain("2 cancels failed: timeout");
+    await act(async () => button("Test the connection").click());
+    expect(sheet.textContent).toContain("slurmrestd answered 404");
+    expect(sheet.textContent).toContain("slurmrestd doesn't serve v0.0.40. Set API version to auto.");
   });
 });
 

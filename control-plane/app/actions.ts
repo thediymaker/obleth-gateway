@@ -2343,8 +2343,12 @@ export async function setSlurmSettingsAction(
   body: UpdateSlurmSettings,
 ): Promise<ActionResult> {
   const session = await requireAdmin();
+  let warnings: string[] = [];
   try {
-    await obleth.setSlurmSettings(body, { auditActor: session.email });
+    const saved = await obleth.setSlurmSettings(body, { auditActor: session.email });
+    // Plain sentences about what was saved, such as a token that expires soon.
+    // Older gateways don't send them.
+    warnings = Array.isArray(saved?.warnings) ? saved.warnings.filter((w) => typeof w === "string" && w.trim()) : [];
   } catch (e) {
     return actionError(e);
   }
@@ -2352,7 +2356,7 @@ export async function setSlurmSettingsAction(
   revalidatePath("/settings");
   // The model-create dialog gates the Slurm option on these settings.
   revalidatePath("/models");
-  return { ok: true };
+  return warnings.length ? { ok: true, warnings } : { ok: true };
 }
 
 export async function testSlurmConnectionAction(): Promise<
