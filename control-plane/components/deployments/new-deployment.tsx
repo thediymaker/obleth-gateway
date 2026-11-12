@@ -137,7 +137,7 @@ export function NewDeployment({ recipes, takenNames, slurmOn, slurm, initialReci
     setError(null);
     start(async () => {
       if (saveAs.on) {
-        const saved = await saveRecipeFromFormAction(card.id, form, { name: saveAs.name, model: card.preview?.kind === "engine" ? form.inputs.model : undefined, weightsGb: picked?.hf?.weightsGb ?? null });
+        const saved = await saveRecipeFromFormAction(card.id, form, { name: saveAs.name, model: card.preview?.kind === "engine" ? form.inputs.model : undefined, weightsGb: picked?.hf?.weightsGb ?? null, ...(script !== null ? { script } : {}) });
         if (!saved.ok) return setError(`Not launched: saving the recipe failed. ${saved.error}`);
       }
       const res = await launchRecipeAction(card.id, { ...toOverrides(form), ...(script !== null ? { script_body: script } : {}) });

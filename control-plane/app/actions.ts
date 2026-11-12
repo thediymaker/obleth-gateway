@@ -40,10 +40,10 @@ import type {
 import { requireAdmin } from "@/lib/auth/roles";
 import { specFormValues, validateManagedModelForm } from "@/lib/managed-model-schema";
 import { parseUpstreamHeaders } from "@/lib/upstream-headers";
-import { resolveRecipeById, resolveRecipeText, buildManagedFromRecipe, parseRecipe, type DeployOverrides } from "@/lib/sbatch-recipes";
+import { resolveRecipeById, resolveRecipeText, buildManagedFromRecipe, parseRecipe, scriptDigest, type DeployOverrides } from "@/lib/sbatch-recipes";
 import { unixLineEndings } from "@/lib/sbatch-directives";
 import { clusterValuesFrom, inputDefaults, type ClusterValues } from "@/lib/recipe-inputs";
-import { savedRecipeText, type SaveAs } from "@/lib/recipe-save";
+import { retokenizeName, savedRecipeText, type SaveAs } from "@/lib/recipe-save";
 import type { DeployForm } from "@/lib/deploy-form";
 import { lookupHfModel, type HfModel } from "@/lib/hf-model";
 import { parseUpstreamModelList, normalizeBase, type UpstreamModel } from "@/lib/provider-import";
@@ -2875,7 +2875,7 @@ export async function saveRecipeFromDeploymentAction(modelId: string, name: stri
     const [spec, models] = await Promise.all([obleth.getManagedModel(modelId), obleth.listModels()]);
     const model = models.find((m) => m.id === modelId);
     if (!model || !spec) return { ok: false, error: "That deployment no longer exists." };
-    const ls = (spec.launcher_spec ?? {}) as { recipe_id?: string; inputs?: Record<string, string>; env?: Record<string, string> };
+    const ls = (spec.launcher_spec ?? {}) as { recipe_id?: string; inputs?: Record<string, string>; env?: Record<string, string>; script?: string; script_digest?: string };
     if (!ls.recipe_id) return { ok: false, error: "This deployment wasn't launched from a recipe." };
     const recipe = await resolveRecipeById(ls.recipe_id);
     if (!recipe?.header) return { ok: false, error: "The recipe it was launched from no longer exists." };
@@ -2900,7 +2900,13 @@ export async function saveRecipeFromDeploymentAction(modelId: string, name: stri
       serving: { keep_running: spec.target_replicas, serve_from: spec.min_replicas, stop_after_failed_launches: spec.max_job_failures, health_path: spec.health_path },
     };
     const model_ = recipe.header.kind === "engine" ? ls.inputs?.model : undefined;
-    return await saveRecipeFromFormAction(ls.recipe_id, form, { name, model: model_ });
+    // The script it runs: changed on the deployment's page after launch (the
+    // submitted script no longer matches what the launch sent), edited at
+    // launch, or the recipe's own.
+    const live = spec.script_body ?? "";
+    const changedSince = !!ls.script_digest && !!live && scriptDigest(live) !== ls.script_digest;
+    const script = changedSince ? retokenizeName(live, model.model_name) : ls.script;
+    return await saveRecipeFromFormAction(ls.recipe_id, form, { name, model: model_, ...(script !== undefined ? { script } : {}) });
   } catch (e) {
     return actionError(e);
   }
@@ -2926,7 +2932,7 @@ export async function deployRecipeAction(
   if (!recipe.valid) return { ok: false, error: recipe.error ?? "recipe is invalid" };
 
   try {
-    const { createBody, managedBody } = buildManagedFromRecipe(recipe, overrides);
+    const { createBody, managedBody } = buildManagedFromRecipe(recipe, overrides, await clusterValues());
     // A launched model starts staged, like one added by hand: it is made
     // active on its page once it has been tried. It can already do what the
     // recipe's flags turned on, e.g. function calling.
