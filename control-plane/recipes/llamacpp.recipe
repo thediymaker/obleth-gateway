@@ -3,7 +3,7 @@ name: llama.cpp
 description: "Any GGUF model with llama-server, fetched from Hugging Face. Runs a native llama-server on the node's PATH, or one in a container image."
 engine: llamacpp
 kind: engine
-requires: "llama-server built for the node's GPU and CPU (arm64 + CUDA on Grace Hopper)"
+requires: "A llama-server built for the node's CPU and GPU, in a container image or on the node's PATH"
 model_type: chat
 api_model_name: my-model
 port: 8000
@@ -24,48 +24,59 @@ inputs:
     label: GGUF on Hugging Face
     type: text
     required: true
-    help: "repo:quant, e.g. unsloth/Qwen3-32B-GGUF:Q4_K_M."
+    help: The repo and quantization, such as unsloth/Qwen3-32B-GGUF:Q4_K_M.
   - name: context
     label: Context length
     type: number
     min: 1024
     default: 32768
+    required: true
+    unit: tokens
+    help: The longest prompt and answer together, shared by the requests running at once. A longer context needs more memory.
   - name: parallel
     label: Requests at once
     type: number
     min: 1
     max: 64
     default: 4
+  - name: extra
+    label: More llama-server flags
+    type: text
+    help: "Anything else to pass to llama-server, written as on its command line, such as --n-cpu-moe 60 to keep MoE experts in CPU memory."
   - name: image
     label: Container image
     type: path
     default: "{{cluster.image.llamacpp}}"
-    help: Leave empty to run the llama-server on the node's PATH.
+    help: The image the server runs in. Leave it empty to run llama-server from the node's PATH, for example after the cluster's setup lines load it.
   - name: cache
     label: Weight cache
     type: path
     default: "{{cluster.cache}}"
     required: true
-  - name: extra
-    label: More llama-server flags
-    type: text
-    help: "e.g. --n-cpu-moe 60 to keep MoE experts in CPU memory."
+    help: Where the weights are kept between jobs. Use shared storage, so a restart on another node doesn't download them again.
 ---
 #!/bin/bash -l
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
-set -euo pipefail
+# The cluster's setup lines run before strict mode, since site scripts often
+# read unset variables.
 {{cluster.setup}}
-export LLAMA_CACHE={{cache}}
-IMAGE="{{image}}"
+set -euo pipefail
+export LLAMA_CACHE="{{cache}}"
 # The official image keeps llama-server and its libraries in /app, which
-# neither PATH nor the library path includes under apptainer.
+# neither PATH nor the library path includes when it runs this way.
+# In the image when one is set, with the cluster's container command
+# (OBLETH_CONTAINER_RUN, "apptainer exec --nv" when unset); else from the node's PATH.
+IMAGE="{{image}}"
+RUN=()
 if [ -n "$IMAGE" ]; then
-  RUN=(apptainer exec --nv --bind {{cache}} "$IMAGE" sh -c 'PATH=/app:$PATH LD_LIBRARY_PATH=/app:${LD_LIBRARY_PATH:-} exec "$0" "$@"')
-else RUN=(); fi
-"${RUN[@]}" llama-server -hf {{model}} \
-  --host 0.0.0.0 --port "$OBLETH_SERVING_PORT" --alias {{api_model_name}} \
-  -ngl 99 --ctx-size {{context}} --parallel {{parallel}} --threads "$(nproc)" \
+  read -r -a RUN <<< "${OBLETH_CONTAINER_RUN:-apptainer exec --nv}"
+  RUN+=(--bind "$LLAMA_CACHE" "$IMAGE" sh -c 'PATH=/app:$PATH LD_LIBRARY_PATH=/app:${LD_LIBRARY_PATH:-} exec "$0" "$@"')
+fi
+exec ${RUN[@]+"${RUN[@]}"} llama-server -hf {{model}} \
+  --alias {{api_model_name}} \
+  --host 0.0.0.0 --port "$OBLETH_SERVING_PORT" \
+  -ngl 99 --ctx-size {{context}} --parallel {{parallel}} --threads "${SLURM_CPUS_ON_NODE:-$(nproc)}" \
   --cont-batching --flash-attn on --jinja \
   {{extra}}

@@ -12,7 +12,7 @@ const file = (extraHeader = "", body?: string) =>
     extraHeader,
     "---",
     body ??
-      ["#!/bin/bash -l", "#SBATCH --gres=gpu:1   # comment", "#SBATCH -p arm", "llama-server -hf repo:Q4 --port 8000"].join("\n"),
+      ["#!/bin/bash -l", "#SBATCH --gres=gpu:1   # comment", "#SBATCH -p arm", "llama-server -hf repo:Q4 --port $OBLETH_SERVING_PORT"].join("\n"),
   ]
     .filter(Boolean)
     .join("\n");
@@ -31,8 +31,8 @@ describe("buildManagedFromRecipe", () => {
       gres: "gpu:1",
       serving_port: 8000,
       health_path: "/health",
-      target_replicas: 2,
-      max_job_failures: 3,
+      target_replicas: 1,
+      max_job_failures: 2,
       launch_command: "",
       image: "",
     });
@@ -47,8 +47,8 @@ describe("buildManagedFromRecipe", () => {
   });
 
   it("stores a script edited at launch with Unix line endings", () => {
-    const p = buildManagedFromRecipe(parseRecipe("glm", file()), { script_body: "#!/bin/bash -l\r\n#SBATCH --mem=500G\r\nllama-server --port 8000\r\n" });
-    expect(p.managedBody.script_body).toBe("#!/bin/bash -l\nllama-server --port 8000\n");
+    const p = buildManagedFromRecipe(parseRecipe("glm", file()), { script_body: "#!/bin/bash -l\r\n#SBATCH --mem=500G\r\nllama-server --port $OBLETH_SERVING_PORT\r\n" });
+    expect(p.managedBody.script_body).toBe("#!/bin/bash -l\nllama-server --port $OBLETH_SERVING_PORT\n");
   });
 
   it("applies api_model_name and target_replicas overrides", () => {
@@ -103,7 +103,7 @@ describe("buildManagedFromRecipe", () => {
     const p = buildManagedFromRecipe(
       parseRecipe(
         "glm",
-        file("", ["#!/bin/bash -l", "#SBATCH --chdir=/scratch/run", "llama-server --port 8000"].join("\n")),
+        file("", ["#!/bin/bash -l", "#SBATCH --chdir=/scratch/run", "llama-server --port $OBLETH_SERVING_PORT"].join("\n")),
       ),
     );
     const lines = (p.managedBody.script_body ?? "").split("\n");
@@ -128,7 +128,7 @@ describe("buildManagedFromRecipe", () => {
           "api_model_name: o",
           "port: 11434",
           "---",
-          "ollama serve",
+          "OLLAMA_HOST=0.0.0.0:$OBLETH_SERVING_PORT ollama serve",
         ].join("\n"),
       ),
     );
@@ -145,7 +145,7 @@ describe("buildManagedFromRecipe", () => {
       "    adds: --enable-auto-tool-choice --tool-call-parser hermes",
       "    capabilities: [function_calling, tool_choice]",
     ].join("\n");
-    const toolsBody = ["#!/bin/bash -l", "#SBATCH -p arm", "vllm serve m --port 8000 {{tools}}"].join("\n");
+    const toolsBody = ["#!/bin/bash -l", "#SBATCH -p arm", "vllm serve m --port $OBLETH_SERVING_PORT {{tools}}"].join("\n");
 
     it("turns on what a flag that is on declares", () => {
       const p = buildManagedFromRecipe(parseRecipe("t", file(tools, toolsBody)));
@@ -167,7 +167,7 @@ describe("buildManagedFromRecipe", () => {
     it("refuses capabilities on an input that isn't a flag, or one it doesn't know", () => {
       const onText = parseRecipe("t", file(["inputs:", "  - name: extra", "    capabilities: [function_calling]"].join("\n")));
       expect(onText.valid).toBe(false);
-      expect(onText.error).toContain("capabilities only go on a flag input");
+      expect(onText.error).toContain("capabilities and drops only go on a flag input");
       const unknown = parseRecipe("t", file(tools.replace("[function_calling, tool_choice]", "[telepathy]")));
       expect(unknown.valid).toBe(false);
     });
@@ -179,7 +179,7 @@ describe("buildManagedFromRecipe", () => {
 
   it("uses overrides.script_body instead of recipe.body when set", () => {
     const p = buildManagedFromRecipe(parseRecipe("glm", file()), {
-      script_body: "#!/bin/bash -l\n# OVERRIDE_MARKER\nllama-server --port 8000",
+      script_body: "#!/bin/bash -l\n# OVERRIDE_MARKER\nllama-server --port $OBLETH_SERVING_PORT",
     });
     expect(p.managedBody.script_body).toContain("OVERRIDE_MARKER");
     expect(p.managedBody.script_body).not.toContain("llama-server -hf repo:Q4");
@@ -199,11 +199,11 @@ describe("buildManagedFromRecipe", () => {
         "  - name: model",
         "    default: /default.sif",
         "---",
-        "original body {{model}}",
+        "original body {{model}} --port $OBLETH_SERVING_PORT",
       ].join("\n"),
     );
     const p = buildManagedFromRecipe(recipe, {
-      script_body: "#!/bin/bash -l\napptainer exec {{model}} serve",
+      script_body: "#!/bin/bash -l\napptainer exec {{model}} serve --port $OBLETH_SERVING_PORT",
       variables: { model: "/custom.sif" },
     });
     expect(p.managedBody.script_body).toContain("/custom.sif");
@@ -224,7 +224,7 @@ describe("buildManagedFromRecipe", () => {
     const p = buildManagedFromRecipe(
       parseRecipe(
         "glm",
-        file("", ["#!/bin/bash -l", "#SBATCH --chdir=/data/o'brien", "llama-server --port 8000"].join("\n")),
+        file("", ["#!/bin/bash -l", "#SBATCH --chdir=/data/o'brien", "llama-server --port $OBLETH_SERVING_PORT"].join("\n")),
       ),
     );
     const lines = (p.managedBody.script_body ?? "").split("\n");
@@ -242,8 +242,8 @@ describe("buildDeployPreview", () => {
       engine: "llamacpp",
       port: 8000,
       healthPath: "/health",
-      targetReplicas: 2,
-      maxJobFailures: 3,
+      targetReplicas: 1,
+      maxJobFailures: 2,
       partition: "arm",
       gres: "gpu:1",
     });
@@ -262,7 +262,7 @@ describe("buildDeployPreview", () => {
       "  - name: model",
       "    default: /default.sif",
       "---",
-      "apptainer exec {{model}} serve",
+      "apptainer exec {{model}} serve --port $OBLETH_SERVING_PORT",
     ].join("\n");
     const p = buildDeployPreview(parseRecipe("glm", recipeText));
     // rawBody must contain the placeholder, not the substituted value

@@ -19,10 +19,15 @@ export function useClusterResources(): ClusterResources {
   const { data } = useQuery({
     queryKey: ["slurm", "resources"],
     queryFn: async (): Promise<ClusterResources> => {
-      const r = await fetch("/api/live/slurm/resources");
-      if (!r.ok) return EMPTY;
-      const d = await r.json();
-      if (!d || d.error) return EMPTY;
+      const r = await fetch("/api/live/slurm/resources").catch(() => null);
+      if (!r) return { ...EMPTY, error: "obleth couldn't reach the gateway to read the cluster." };
+      const d = await r.json().catch(() => null);
+      // A newer gateway sends what it could read plus a sentence about what it
+      // couldn't; an error from the proxy itself carries no lists.
+      if (!r.ok || !d || !Array.isArray(d.partitions)) {
+        const why = d && typeof d.error === "string" ? d.error : `the gateway answered ${r.status}`;
+        return { ...EMPTY, error: `obleth couldn't read the cluster: ${why}` };
+      }
       return { ...EMPTY, ...d };
     },
     staleTime: 60_000,

@@ -8,7 +8,7 @@ import { Setting, Switch, TextField } from "@/components/models/fields";
 import { Notice, Sheet } from "@/components/models/ui";
 import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm-dialog";
-import { duration } from "@/lib/deployments-model";
+import { duration, MINT_TOKEN, START_PROVISIONER, tokenExpiry } from "@/lib/deployments-model";
 import { cn } from "@/lib/utils";
 import type { NodeAlias, SlurmHealthView, SlurmSettingsView, UpdateSlurmSettings } from "@/lib/obleth";
 
@@ -21,6 +21,21 @@ const ENGINES: { id: string; label: string; placeholder: string }[] = [
   { id: "ollama", label: "Ollama", placeholder: "ollama.sif" },
 ];
 
+/** A token pasted as `SLURM_JWT=...` or `export SLURM_JWT=...`, as `scontrol token` prints it, is just the token. */
+export function cleanJwt(raw: string): string {
+  return raw.trim().replace(/^export\s+/, "").replace(/^SLURM_JWT\s*=\s*/, "").replace(/^["']|["']$/g, "").trim();
+}
+
+/** The API version setting in words: what is set, what it resolved to, and what slurmrestd serves. */
+export function apiVersionLine(s: Pick<SlurmSettingsView, "slurmrestd_api_version"> & Partial<Pick<SlurmSettingsView, "resolved_api_version" | "available_api_versions" | "slurm_release">>): string | null {
+  const set = (s.slurmrestd_api_version || "auto").trim();
+  const auto = set === "auto";
+  const served = s.available_api_versions?.length ? `slurmrestd serves ${s.available_api_versions.join(", ")}${s.slurm_release ? ` (Slurm ${s.slurm_release})` : ""}.` : null;
+  const using = s.resolved_api_version ? (auto ? `Automatic picked ${s.resolved_api_version}.` : `obleth uses ${s.resolved_api_version}.`) : auto ? "Automatic picks the newest version slurmrestd serves that obleth supports." : null;
+  const mismatch = !auto && s.available_api_versions?.length && !s.available_api_versions.includes(set) ? `slurmrestd doesn't serve ${set}, so obleth uses ${s.resolved_api_version && s.resolved_api_version !== set ? s.resolved_api_version : "the newest version it does serve"}. Set it to auto.` : null;
+  return [mismatch, mismatch ? null : using, served].filter(Boolean).join(" ") || null;
+}
+
 function since(secs: number | null): string {
   if (secs == null) return "never";
   return secs < 5 ? "just now" : `${duration(secs * 1000)} ago`;
@@ -31,20 +46,20 @@ export function provisionerLine(s: SlurmSettingsView): { glyph: "on" | "half" | 
   if (!s.provisioner_running) {
     return {
       glyph: "off",
-      text: `Provisioner not running · last seen ${since(s.provisioner_last_seen_secs)}`,
-      detail: "Saving here only stores the connection. The obleth-provisioner process launches jobs: in Kubernetes set provisioner.enabled=true; in Docker add slurm to COMPOSE_PROFILES.",
+      text: s.provisioner_last_seen_secs == null ? "No provisioner has run yet, so nothing is launched" : `The provisioner stopped. It was last seen ${since(s.provisioner_last_seen_secs)}`,
+      detail: `Saving here only stores the connection; the obleth-provisioner process launches the jobs. ${START_PROVISIONER}`,
     };
   }
-  const failing = s.provisioner_tick_status != null && s.provisioner_tick_status !== "ok" && s.provisioner_tick_status !== "idle" && (s.provisioner_held_secs ?? 0) > 60;
+  const failing = s.provisioner_tick_status === "error" && ((s.provisioner_held_secs ?? 0) > 60 || (s.provisioner_last_ok_secs ?? 0) > 60 || s.provisioner_last_ok_secs == null);
   if (failing) {
     return {
       glyph: "half",
-      text: `Provisioner running, but its passes are failing · last good pass ${since(s.provisioner_last_ok_secs)}`,
-      detail: `${s.provisioner_tick_detail ? `${s.provisioner_tick_detail}. ` : ""}Replica states on Deployments are frozen until this clears. Test the connection below.`,
+      text: `The provisioner is running, but its passes are failing. Its last good pass was ${since(s.provisioner_last_ok_secs)}`,
+      detail: `${s.provisioner_tick_detail ? `${s.provisioner_tick_detail.replace(/\.?$/, ".")} ` : ""}Replica states on Deployments are frozen until this clears. Test the connection below to see why.`,
     };
   }
   const version = s.provisioner_version ? ` · ${s.provisioner_version}${s.provisioner_git_sha ? ` ${s.provisioner_git_sha.slice(0, 7)}` : ""}` : "";
-  return { glyph: "on", text: `Provisioner checked in ${since(s.provisioner_last_seen_secs)}${s.provisioner_tick_status === "idle" ? " · idle" : ""}${version}` };
+  return { glyph: "on", text: `Provisioner checked in ${since(s.provisioner_last_seen_secs)}${s.provisioner_tick_status === "idle" ? ", with nothing to do" : ""}${version}` };
 }
 
 /** How obleth reaches slurmrestd to launch models as jobs. Moved here from Settings. */
@@ -59,16 +74,19 @@ export function SlurmConnection({ settings, replicas, onClose, onSaved }: { sett
   const [health, setHealth] = useState<SlurmHealthView | null>(null);
   const [testError, setTestError] = useState<string | null>(null);
   const line = provisionerLine(settings);
+  const token = tokenExpiry(settings);
+  const versionLine = apiVersionLine(settings);
+  const [saveWarnings, setSaveWarnings] = useState<string[]>([]);
 
   const save = useCallback(async (data: FormData): Promise<SaveResult> => {
     const body: UpdateSlurmSettings = {
       enabled: data.get("enabled") === "on",
       slurmrestd_url: String(data.get("url") ?? "").trim(),
-      slurmrestd_api_version: String(data.get("api_version") ?? "").trim() || "v0.0.40",
+      slurmrestd_api_version: String(data.get("api_version") ?? "").trim() || "auto",
       slurm_user: String(data.get("user") ?? "").trim(),
       node_aliases: (JSON.parse(String(data.get("aliases") || "[]")) as NodeAlias[]).map((a) => ({ host: a.host.trim(), ip: a.ip.trim() })).filter((a) => a.host || a.ip),
     };
-    const jwt = String(data.get("jwt") ?? "").trim();
+    const jwt = cleanJwt(String(data.get("jwt") ?? ""));
     if (jwt) body.slurm_jwt = jwt;
     body.cluster_defaults = {
       cache_dir: String(data.get("cache_dir") ?? "").trim(),
@@ -84,6 +102,7 @@ export function SlurmConnection({ settings, replicas, onClose, onSaved }: { sett
     const res = await setSlurmSettingsAction(body);
     if (!res.ok) return { ok: false, error: res.error, saved: [] };
     setHealth(null);
+    setSaveWarnings(res.warnings ?? []);
     onSaved();
     return { ok: true };
   }, [onSaved]);
@@ -92,7 +111,7 @@ export function SlurmConnection({ settings, replicas, onClose, onSaved }: { sett
     if (settings.enabled && data.get("enabled") !== "on") {
       return confirm({
         title: "Turn Slurm off?",
-        description: `obleth stops launching and replacing jobs.${replicas ? ` The ${replicas} running now keep their nodes, and their state freezes; to release them, set those deployments to 0 replicas first.` : ""}`,
+        description: `obleth stops launching and replacing jobs.${replicas ? ` The ${replicas} jobs running now keep their nodes and keep using the account until their walltime ends, and their state on Deployments stops updating. To release them, pause those deployments first and wait for their jobs to stop.` : ""}`,
         confirmLabel: "Turn off",
       });
     }
@@ -112,7 +131,6 @@ export function SlurmConnection({ settings, replicas, onClose, onSaved }: { sett
     });
   }
 
-  const jwt = health?.jwt;
   return (
     <>
       {confirmElement}
@@ -129,22 +147,11 @@ export function SlurmConnection({ settings, replicas, onClose, onSaved }: { sett
             <span className="text-xs text-muted-foreground">{settings.slurmrestd_url ? "Uses what's saved." : "Save a URL first."}</span>
           </div>
           {testError && <Notice strong onDismiss={() => setTestError(null)}>{testError}</Notice>}
-          {health && (
-            <div className="flex flex-col gap-1.5 rounded-lg border border-border px-3 py-2.5 text-[12.5px]">
-              <span className="flex items-center gap-2">
-                {health.ping.ok ? <Glyph glyph="on" className="h-[7px] w-[7px]" /> : <span className="rounded-full bg-foreground px-1.5 text-[10.5px] font-semibold text-background">failed</span>}
-                <span className="font-medium">slurmrestd</span>
-                <span className="text-muted-foreground">{health.ping.ok ? `answered in ${health.ping.latency_ms} ms` : health.ping.error ?? `no answer${health.ping.status_code ? ` (${health.ping.status_code})` : ""}`}</span>
-              </span>
-              <span className="flex items-center gap-2">
-                {jwt && jwt.set && !jwt.expired ? <Glyph glyph="on" className="h-[7px] w-[7px]" /> : <span className="rounded-full bg-foreground px-1.5 text-[10.5px] font-semibold text-background">{jwt?.set ? "expired" : "missing"}</span>}
-                <span className="font-medium">JWT</span>
-                <span className="text-muted-foreground">
-                  {!jwt?.set ? "not set" : jwt.expires_at ? `${jwt.expired ? "expired" : "expires"} ${new Date(jwt.expires_at).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}` : "valid, no expiry"}
-                </span>
-              </span>
-            </div>
-          )}
+          {health && <HealthResult health={health} />}
+          {saveWarnings.map((w) => <Notice key={w} strong onDismiss={() => setSaveWarnings((x) => x.filter((y) => y !== w))}>{w}</Notice>)}
+          {settings.enabled && (settings.provisioner_warnings ?? []).map((w) => (
+            <p key={w} role="status" className="rounded-md border border-foreground/60 px-2.5 py-1.5 text-[12.5px] font-medium">{w}</p>
+          ))}
         </div>
 
         <SettingsForm id="slurm" sectionOf={sectionOf} labelOf={labelOf} save={save} confirmSave={confirmSave} bar="panel" ariaLabel="Slurm connection">
@@ -159,17 +166,21 @@ export function SlurmConnection({ settings, replicas, onClose, onSaved }: { sett
             <Switch name="enabled" label="Launch models on Slurm" checked={enabled} onChange={setEnabled} />
             {!enabled && settings.enabled && <span className="text-xs font-medium">Running jobs keep their nodes; nothing new is launched or replaced.</span>}
           </Setting>
-          <Setting label="slurmrestd" hint="The REST daemon's address and the API version it speaks." fields={["url", "api_version"]} className="px-6">
+          <Setting label="slurmrestd" hint="The REST daemon's address, and the API version obleth speaks to it. Leave the version on auto unless you need a particular one; obleth supports v0.0.40 to v0.0.45." fields={["url", "api_version"]} className="px-6">
             <div className="flex flex-wrap items-center gap-2">
               <TextField name="url" label="slurmrestd URL" type="url" defaultValue={settings.slurmrestd_url} placeholder="http://slurm:6820" mono className="min-w-0 flex-1" />
-              <TextField name="api_version" label="API version" defaultValue={settings.slurmrestd_api_version || "v0.0.40"} placeholder="v0.0.40" mono className="w-28" />
+              <TextField name="api_version" label="API version" defaultValue={settings.slurmrestd_api_version || "auto"} placeholder="auto" mono className="w-28" />
             </div>
+            {versionLine && <span className="text-xs text-secondary-foreground">{versionLine}</span>}
           </Setting>
-          <Setting label="Sign-in" hint={settings.jwt_set ? `A JWT ending ${settings.jwt_last4 ?? "····"} is set. Paste a new one to replace it; it's never shown.` : "The user jobs run as, and a slurmrestd JWT for it. The JWT is stored encrypted."} fields={["user", "jwt"]} className="px-6">
+          <Setting label="Sign-in" hint={`${settings.jwt_set ? `A JWT ending ${settings.jwt_last4 ?? "····"} is set. Paste a new one to replace it; it's never shown.` : "The user jobs run as, and a slurmrestd JWT for it."} A token made with plain scontrol token expires in 30 minutes, so make one that lasts: run ${MINT_TOKEN} as the Slurm user and paste what it prints.`} fields={["user", "jwt"]} className="px-6">
             <div className="flex flex-wrap items-center gap-2">
               <TextField name="user" label="Slurm user" defaultValue={settings.slurm_user} placeholder="obleth" autoComplete="off" mono className="w-40" />
               <TextField name="jwt" label="Slurm JWT" type="password" autoComplete="new-password" defaultValue="" placeholder={settings.jwt_set ? `•••• ${settings.jwt_last4 ?? ""} (set)` : "Paste the JWT"} mono className="min-w-0 flex-1" />
             </div>
+            {token && <span className={cn("text-xs", token.attention ? "font-medium text-foreground" : "text-secondary-foreground")}>{token.text}{token.attention ? ` Mint a new token with ${MINT_TOKEN} and paste it here.` : ""}</span>}
+            {settings.jwt_set && settings.jwt_user && settings.slurm_user && settings.jwt_user !== settings.slurm_user && <span className="text-xs font-medium">The token is for {settings.jwt_user}, but the Slurm user here is {settings.slurm_user}. Jobs run as the token&apos;s user.</span>}
+            {settings.stored_encrypted === false && <span className="text-xs text-secondary-foreground">Tokens are stored in plaintext because the gateway has no encryption key. Set OBLETH_ENCRYPTION_KEY on the gateway to store them encrypted.</span>}
           </Setting>
           <Setting label="Node addresses" hint="Only if obleth's pods can't resolve node names: map each to an IP, and replicas are reached by IP instead of DNS." fields={["aliases"]} className="px-6">
             <input type="hidden" name="aliases" value={JSON.stringify(aliases)} />
@@ -185,7 +196,7 @@ export function SlurmConnection({ settings, replicas, onClose, onSaved }: { sett
           </Setting>
           </div>
           <div hidden={tab !== "defaults"}>
-          <p className="px-6 pb-2 pt-3.5 text-[12.5px] leading-relaxed text-muted-foreground">Recipes fill these in as {"{{cluster.cache}}"}, {"{{cluster.image.vllm}}"} and so on, so no recipe names a path on this cluster. A launch can still change them for itself.</p>
+          <p className="px-6 pb-2 pt-3.5 text-[12.5px] leading-relaxed text-muted-foreground">Recipes fill these in as {"{{cluster.cache}}"}, {"{{cluster.image.vllm}}"} and so on, so no recipe names a path on this cluster. Each launch copies them into its job script, so a change here affects only new launches; deployments already launched keep what they launched with until you edit their script.</p>
           <Setting label="Weight cache" hint="Where models are downloaded (HF_HOME). Shared, fast storage the nodes can all reach." fields={["cache_dir"]} className="px-6">
             <TextField name="cache_dir" label="Weight cache" defaultValue={cd.cache_dir} placeholder="/scratch/obleth/hf-cache" mono />
           </Setting>
@@ -199,13 +210,13 @@ export function SlurmConnection({ settings, replicas, onClose, onSaved }: { sett
             </div>
             <span className="text-xs text-muted-foreground">An image only runs on one kind of CPU. If some partitions are Arm (Grace Hopper) and others x86, keep one image of each and put <code className="font-mono">$(uname -m)</code> in the name, such as <code className="font-mono">vllm-$(uname -m).sif</code>: each job then runs vllm-x86_64.sif or vllm-aarch64.sif to match its node. <code className="font-mono">apptainer pull --arch arm64</code> fetches the Arm image from any node. A recipe says which engine version it needs.</span>
           </Setting>
-          <Setting label="Job logs" hint="Where Slurm writes each job's output, unless a recipe says otherwise." fields={["log_dir"]} className="px-6">
-            <TextField name="log_dir" label="Job logs" defaultValue={cd.log_dir} placeholder="Slurm's default" mono />
+          <Setting label="Job logs" hint="The folder Slurm writes each job's output to, unless a deployment sets its own. Slurm doesn't create this folder. Create it first and make sure the Slurm user can write to it, or jobs fail before they start. Use a full path on storage the login nodes can read." fields={["log_dir"]} className="px-6">
+            <TextField name="log_dir" label="Job logs" defaultValue={cd.log_dir} placeholder="Empty: the job's working folder, /tmp on the node" mono />
           </Setting>
           <Setting label="Load before launch" hint="Lines run at the top of every job, such as module loads." fields={["setup"]} className="px-6">
             <textarea name="setup" aria-label="Load before launch" defaultValue={cd.setup} rows={3} spellCheck={false} placeholder="module load apptainer" className="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-[12.5px]" />
           </Setting>
-          <Setting label="Hugging Face token" hint={settings.hf_token_set ? `A token ending ${settings.hf_token_last4 ?? "····"} is set. Every job gets it as HF_TOKEN, for gated models; it's never in a script or shown.` : "For gated models. Every job gets it as HF_TOKEN; it's stored encrypted and never shown."} fields={["hf_token", "hf_clear"]} className="px-6">
+          <Setting label="Hugging Face token" hint={settings.hf_token_set ? `A token ending ${settings.hf_token_last4 ?? "····"} is set. Every job gets it as HF_TOKEN, for gated models; it's never in a script or shown.` : `For gated models. Every job gets it as HF_TOKEN; it's ${settings.stored_encrypted === false ? "stored in plaintext (the gateway has no encryption key)" : "stored encrypted"} and never shown.`} fields={["hf_token", "hf_clear"]} className="px-6">
             <TextField name="hf_token" label="Hugging Face token" type="password" autoComplete="new-password" defaultValue="" placeholder={settings.hf_token_set ? `•••• ${settings.hf_token_last4 ?? ""} (set)` : "hf_…"} mono />
             {settings.hf_token_set && <label className="flex items-center gap-2 text-[12.5px] text-secondary-foreground"><input type="checkbox" name="hf_clear" className="h-4 w-4 accent-foreground" />Remove the stored token</label>}
           </Setting>
@@ -213,5 +224,55 @@ export function SlurmConnection({ settings, replicas, onClose, onSaved }: { sett
         </SettingsForm>
       </Sheet>
     </>
+  );
+}
+
+/** What Test the connection found: each check, then every problem as a sentence. */
+function HealthResult({ health }: { health: SlurmHealthView }) {
+  const jwt = health.jwt;
+  const Bad = ({ children }: { children: string }) => <span className="rounded-full bg-foreground px-1.5 text-[10.5px] font-semibold text-background">{children}</span>;
+  const Ok = () => <Glyph glyph="on" className="h-[7px] w-[7px]" />;
+  const ping = health.ping;
+  const pingText = ping.ok
+    ? `answered in ${ping.latency_ms} ms${health.slurmctld ? `; slurmctld is ${health.slurmctld === "UP" ? "up" : "down"}` : ""}${health.slurm_release ? `; Slurm ${health.slurm_release}` : ""}`
+    : ping.error ?? (ping.status_code ? `slurmrestd answered ${ping.status_code}` : "no answer");
+  return (
+    <div className="flex flex-col gap-1.5 rounded-lg border border-border px-3 py-2.5 text-[12.5px]">
+      <span className="flex items-center gap-2">
+        {ping.ok ? <Ok /> : <Bad>failed</Bad>}
+        <span className="font-medium">slurmrestd</span>
+        <span className="text-muted-foreground">{pingText}</span>
+      </span>
+      {health.api && (
+        <span className="flex items-center gap-2">
+          {health.api.ok ? <Ok /> : <Bad>failed</Bad>}
+          <span className="font-medium">API version</span>
+          <span className="text-muted-foreground">
+            {health.api.error ?? `${health.api.configured === "auto" || !health.api.configured ? "auto, " : `${health.api.configured}, `}using ${health.api.resolved ?? "none"}`}
+            {health.api.available.length ? `; slurmrestd serves ${health.api.available.join(", ")}` : ""}
+          </span>
+        </span>
+      )}
+      {health.auth && (
+        <span className="flex items-center gap-2">
+          {health.auth.ok ? <Ok /> : <Bad>rejected</Bad>}
+          <span className="font-medium">Sign-in</span>
+          <span className="text-muted-foreground">{health.auth.ok ? "slurmrestd accepted the token" : health.auth.error ?? "slurmrestd rejected the token"}</span>
+        </span>
+      )}
+      <span className="flex items-center gap-2">
+        {jwt && jwt.set && !jwt.expired ? <Ok /> : <Bad>{jwt?.set ? "expired" : "missing"}</Bad>}
+        <span className="font-medium">JWT</span>
+        <span className="text-muted-foreground">
+          {!jwt?.set ? "not set" : jwt.expires_at ? `${jwt.expired ? "expired" : "expires"} ${new Date(jwt.expires_at).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}` : "valid, no expiry"}
+        </span>
+      </span>
+      {!!health.problems?.length && (
+        <ul className="mt-1 flex list-disc flex-col gap-1 pl-5 font-medium text-foreground">
+          {health.problems.map((p) => <li key={p}>{p}</li>)}
+        </ul>
+      )}
+      {health.problems && health.problems.length === 0 && <span className="text-secondary-foreground">No problems found.</span>}
+    </div>
   );
 }

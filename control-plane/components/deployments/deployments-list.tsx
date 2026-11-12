@@ -16,13 +16,17 @@ import { Select } from "@/components/ui/select";
 import type { RecipeCard } from "@/components/recipes/recipe-card";
 import type { DeploymentsData } from "@/lib/deployments-data";
 import {
+  attentionWords,
   buildDeploymentRows,
   countReplicas,
   deploymentHref,
   deploymentsLine,
   filterDeployments,
   nodeState,
+  provisionerHealth,
   sortDeployments,
+  START_PROVISIONER,
+  tokenExpiry,
   type DeploymentRow,
   type DeploySort,
   type RunsFilter,
@@ -78,9 +82,18 @@ export function DeploymentsList({ initial, recipes, tab: initialTab, slurmSheet 
   const queued = slurm.reduce((n, r) => { const c = countReplicas(r.replicas); return n + c.queued + c.running; }, 0);
   const namespaces = new Map<string, number>();
   for (const r of k8s) { const ns = r.discovery?.status?.namespace; if (ns) namespaces.set(ns, (namespaces.get(ns) ?? 0) + 1); }
-  const nodeCounts = { idle: 0, busy: 0, down: 0 };
+  const nodeCounts = { idle: 0, busy: 0, asleep: 0, down: 0 };
   for (const n of resources.nodes) nodeCounts[nodeState(n.state)] += 1;
   const nodesTotal = resources.nodes.length;
+  const prov = provisionerHealth(data.slurm);
+  const token = data.slurm ? tokenExpiry(data.slurm) : null;
+  const apiVersion = data.slurm?.resolved_api_version ?? data.slurm?.slurmrestd_api_version;
+  const slurmProblems = [
+    prov.kind === "never" && slurm.length ? `No provisioner has run yet, so nothing is launched. ${START_PROVISIONER}` : null,
+    prov.kind === "failing" ? `The provisioner's passes are failing, so replica states below may be out of date${prov.detail ? `: ${prov.detail}` : "."}` : null,
+    token?.attention ? `${token.text} Mint a new token with scontrol token lifespan=2592000 and paste it on the Slurm connection.` : null,
+    ...(data.slurm?.provisioner_warnings ?? []),
+  ].filter((x): x is string => !!x);
 
   const switchTab = (t: "deployments" | "recipes") => {
     setTab(t);
@@ -95,6 +108,11 @@ export function DeploymentsList({ initial, recipes, tab: initialTab, slurmSheet 
   return (
     <div className="mx-auto flex max-w-[1600px] flex-col gap-[18px]">
       {slurmOpen && data.slurm && <SlurmConnection settings={data.slurm} replicas={queued + slurmReady} onClose={closeSlurm} onSaved={() => { void live.refetch(); router.refresh(); }} />}
+      {!!data.failed?.length && (
+        <p role="status" className="rounded-lg border border-foreground/60 px-3 py-2 text-[13px] text-foreground">
+          obleth couldn&apos;t read {data.failed.map((f) => ({ models: "the models", specs: "the launch settings", replicas: "the replicas", slurm: "the Slurm settings" })[f] ?? f).join(", ")} just now, so some of this page may be missing. It tries again every 15 seconds.
+        </p>
+      )}
       <div className="flex flex-wrap items-end justify-between gap-4">
         <div className="flex min-w-0 flex-col gap-1.5">
           <h1 className="text-[26px] font-semibold tracking-tight">Deployments</h1>
@@ -146,32 +164,37 @@ export function DeploymentsList({ initial, recipes, tab: initialTab, slurmSheet 
                 {slurmOn && (
                   <span className="inline-flex items-center gap-2 text-xs text-secondary-foreground">
                     <Glyph glyph={data.slurm?.provisioner_running ? (data.slurm.provisioner_tick_status === "error" ? "half" : "on") : "off"} className="h-[7px] w-[7px]" />
-                    {data.slurm?.provisioner_running ? `Provisioner checked in ${ago(data.slurm.provisioner_last_seen_secs)}${data.slurm.provisioner_tick_status === "error" ? " · its last pass failed" : ""}` : "Provisioner not running"}
+                    {data.slurm?.provisioner_running ? `Provisioner checked in ${ago(data.slurm.provisioner_last_seen_secs)}${data.slurm.provisioner_tick_status === "error" ? ", and its last pass failed" : ""}` : prov.kind === "never" ? "No provisioner has run yet" : `Provisioner stopped, last seen ${ago(data.slurm?.provisioner_last_seen_secs)}`}
                   </span>
                 )}
               </div>
               {slurmOn ? (
                 <>
+                  {slurmProblems.map((p) => (
+                    <p key={p} role="status" className="rounded-md border border-foreground/60 px-2.5 py-1.5 text-[12.5px] font-medium text-foreground">{p}</p>
+                  ))}
+                  {resources.error && <p className="text-[12.5px] text-secondary-foreground">{resources.error}</p>}
                   {nodesTotal > 0 ? (
                     <div className="flex flex-col gap-1.5">
                       <div className="flex h-2 gap-0.5 overflow-hidden rounded-[3px] bg-muted" aria-hidden="true">
                         <span className="bg-foreground" style={{ width: `${(nodeCounts.idle / nodesTotal) * 100}%` }} />
                         <span className="bg-muted-foreground/60" style={{ width: `${(nodeCounts.busy / nodesTotal) * 100}%` }} />
+                        <span className="bg-muted-foreground/25" style={{ width: `${(nodeCounts.asleep / nodesTotal) * 100}%` }} />
                         <span className="border border-border" style={{ width: `${(nodeCounts.down / nodesTotal) * 100}%` }} />
                       </div>
                       <span className="text-xs text-muted-foreground">
-                        {nodesTotal} nodes in {resources.partitions.length} partitions · {nodeCounts.idle} idle · {nodeCounts.busy} busy{nodeCounts.down ? ` · ${nodeCounts.down} down or draining` : ""} · {data.slurm?.slurmrestd_api_version}
+                        {nodesTotal} nodes in {resources.partitions.length} partitions: {nodeCounts.idle} idle, {nodeCounts.busy} busy{nodeCounts.asleep ? `, ${nodeCounts.asleep} asleep (Slurm starts them when a job needs them, in a few minutes)` : ""}{nodeCounts.down ? `, ${nodeCounts.down} down or draining` : ""}.{apiVersion ? ` API ${apiVersion}.` : ""}
                       </span>
                     </div>
                   ) : (
-                    <p className="text-[12.5px] text-secondary-foreground">Connected to {data.slurm?.slurmrestd_url || "slurmrestd"}. The cluster&apos;s partitions and nodes will show here.</p>
+                    <p className="text-[12.5px] text-secondary-foreground">{resources.error ? "No nodes could be read, so none are shown." : `Slurm is set up to use ${data.slurm?.slurmrestd_url || "slurmrestd"}, but it hasn't listed any nodes yet. Test the connection to see why.`}</p>
                   )}
                   <p className="text-xs text-muted-foreground">{slurm.length ? `${slurmReady} of ${slurmWanted} replicas serving${queued ? ` · ${queued} starting` : ""}` : "Nothing launched yet."} <button type="button" onClick={() => setSlurmOpen(true)} className="text-secondary-foreground underline underline-offset-2 hover:text-foreground">Slurm connection</button></p>
                 </>
               ) : (
                 <p className="text-[12.5px] text-secondary-foreground">
                   obleth can launch models as jobs on a Slurm cluster, keep them at a replica count, and route to them once healthy.{" "}
-                  <button type="button" onClick={() => setSlurmOpen(true)} disabled={!data.slurm} className="text-foreground underline underline-offset-2 disabled:no-underline disabled:text-muted-foreground">{data.slurm ? "Set up Slurm ›" : "Slurm settings couldn't be read"}</button>
+                  <button type="button" onClick={() => setSlurmOpen(true)} disabled={!data.slurm} className="text-foreground underline underline-offset-2 disabled:no-underline disabled:text-muted-foreground">{data.slurm ? "Set up Slurm ›" : "obleth couldn't read the Slurm settings just now"}</button>
                 </p>
               )}
             </section>
@@ -186,7 +209,7 @@ export function DeploymentsList({ initial, recipes, tab: initialTab, slurmSheet 
               emphasis={attention.length > 0}
               pressed={runs === "attention"}
               onClick={attention.length ? () => setRuns(runs === "attention" ? "all" : "attention") : undefined}
-              detail={attention.length ? attention.map((r) => `${r.model.model_name} ${r.view.state === "stopped" ? "stopped" : "has no replicas"}`).join(" · ") : "Nothing stopped or empty"}
+              detail={attention.length ? attention.map((r) => `${r.model.model_name} ${attentionWords(r.view.state)}`).join(", ") : "Nothing stopped or empty"}
             />
             <Tile
               label="Pools full now"
@@ -269,7 +292,7 @@ export function DeploymentsList({ initial, recipes, tab: initialTab, slurmSheet 
             </div>
             <div className="flex flex-wrap justify-between gap-2 border-t border-border px-[18px] py-3 text-[12.5px] text-muted-foreground">
               <span>{shown.length === rows.length ? `${rows.length} deployments` : `${shown.length} of ${rows.length} deployments`} · click one for its page</span>
-              <span>Filled dot serving · half dot starting · dashed not running · white pill needs you</span>
+              <span>A filled dot means serving, a half dot starting, a dashed one not running. A filled pill marks a deployment that needs you.</span>
             </div>
           </section>
         </>

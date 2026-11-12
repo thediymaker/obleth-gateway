@@ -1,180 +1,697 @@
 use crate::domain::*;
+use chrono::{DateTime, Utc};
+use obleth_config::ManagedBackoff;
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
-/// Smallest free disjoint window base for a new replica: serving_port + i*span
-/// for the smallest i whose base is not already taken by a live replica.
+/// How long a replica that is being retired keeps its job after its endpoint
+/// is removed, so requests already in flight can finish.
+pub const DRAIN_GRACE_SECS: i64 = 60;
+
+/// Highest TCP port a window may use.
+const MAX_PORT: i64 = 65_535;
+
+/// Lowest base the window search goes down to when every window above the
+/// serving port is taken.
+const MIN_FALLBACK_PORT: i64 = 1024;
+
+/// Smallest window base `serving_port + i*span` whose window
+/// `[base, base + span)` overlaps none of the live windows. `live_port_bases`
+/// holds the bases of every live replica of every model (all windows are
+/// `span` wide), so two replicas never share a port, whatever their models'
+/// serving ports. When every window above the serving port is taken, the
+/// search continues below it; only when nothing is free at all does it fall
+/// back to the serving port.
 pub fn next_free_window_base(serving_port: i64, span: i64, live_port_bases: &[i64]) -> i64 {
     let span = span.max(1);
-    let mut i = 0i64;
-    loop {
-        let base = serving_port + i * span;
-        if !live_port_bases.contains(&base) {
+    let free = |b: i64| {
+        !live_port_bases
+            .iter()
+            .any(|&o| b < o + span && o < b + span)
+    };
+    let mut base = serving_port.max(1);
+    while base + span - 1 <= MAX_PORT {
+        if free(base) {
             return base;
         }
-        i += 1;
+        base += span;
+    }
+    let mut base = serving_port - span;
+    while base >= MIN_FALLBACK_PORT {
+        if free(base) {
+            return base;
+        }
+        base -= span;
+    }
+    serving_port
+}
+
+/// The slice of ManagedModelSpec the planner needs (keeps it decoupled from the
+/// full DB struct in tests).
+#[derive(Debug, Clone, Default)]
+pub struct ManagedSpecView {
+    pub target_replicas: i64,
+    /// Minutes a running job's server may take to become healthy (0 = never
+    /// give up). Also how long a job may sit pending for a reason Slurm will
+    /// not clear by waiting.
+    pub startup_timeout_mins: i64,
+    /// Minutes before a job's time limit at which a replacement is started
+    /// (0 = off).
+    pub handoff_mins: i64,
+    /// No submits before this time.
+    pub paused_until: Option<DateTime<Utc>>,
+    /// Failed launches counted so far, and the limit that pauses submits
+    /// (0 = no limit). The planner adds this tick's failures before it
+    /// submits, so reaching the limit lets no extra job through.
+    pub failed_launches: i64,
+    pub max_job_failures: i64,
+    /// The model left the managed set (paused or removed): everything drains.
+    pub removed: bool,
+}
+
+/// Self-heal verdicts for healthy replicas, from [`self_heal_candidates`].
+#[derive(Debug, Clone, Default)]
+pub struct SelfHeal {
+    /// The server has stopped answering the provisioner's probes (sustained)
+    /// and the gateway has no fresh healthy verdict for it.
+    pub dead: HashSet<Uuid>,
+    /// The server answers probes but the gateway's fresh inference check
+    /// keeps failing (a zombie).
+    pub zombie: HashSet<Uuid>,
+}
+
+/// Everything the planner reads for one model. Pure data: the planner does
+/// no I/O.
+pub struct PlanInput<'a> {
+    pub spec: &'a ManagedSpecView,
+    pub replicas: &'a [ReplicaView],
+    /// Slurm's view of each tracked job, by job id. Absent = gone.
+    pub jobs: &'a HashMap<String, JobInfo>,
+    /// Passing probes (health path answered and the server lists the right
+    /// model): replica id -> port.
+    pub health: &'a HashMap<Uuid, u16>,
+    /// Why a probe did not pass, when there is something useful to say (a
+    /// different model answers on the port).
+    pub probe_notes: &'a HashMap<Uuid, String>,
+    pub self_heal: &'a SelfHeal,
+    /// Seconds a replica has been waiting on something: a pending job with a
+    /// reason Slurm will not clear, or a serving replica awaiting its
+    /// replacement. Absent = 0.
+    pub waited_secs: &'a HashMap<Uuid, i64>,
+    /// This model's endpoints from a good snapshot this tick, and the name
+    /// prefix the provisioner gives them (`{job_prefix}{model_name}-`).
+    /// `None` skips the phantom-endpoint sweep.
+    pub endpoints: Option<(&'a [EndpointView], &'a str)>,
+    pub now: DateTime<Utc>,
+    pub lost_retention_secs: i64,
+}
+
+/// Why a healthy replica is being replaced.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Retire {
+    /// Its job is near its time limit; carries the end.
+    Handoff(DateTime<Utc>),
+    /// The operator asked for a replacement (restart or roll).
+    Requested,
+    /// Self-heal: it fails health checks and is the last serving replica, or
+    /// the gateway's inference check fails.
+    Unhealthy,
+}
+
+/// Plain sentence for a job Slurm put back in the queue.
+pub const REQUEUED_DETAIL: &str = "Slurm put the job back in the queue (preempted or its node failed); it will start again when resources free up.";
+
+/// Plain sentence for a job that restarted under the same id on a new start.
+fn restarted_detail(job: &JobInfo) -> String {
+    match job.probe_host() {
+        Some(host) => format!(
+            "Slurm restarted the job on {host}, so obleth stopped sending it requests until the server answers again."
+        ),
+        None => "Slurm restarted the job, so obleth stopped sending it requests until the server answers again.".to_string(),
     }
 }
 
-/// Pure reconcile. `jobs` is keyed by slurm_job_id; `health` is keyed by
-/// replica id and carries the discovered port for `starting`/`pending` replicas.
-/// `restart` holds replica ids the self-heal loop wants restarted (healthy rows
-/// whose job still reports RUNNING but which keep failing health probes).
-pub fn plan(
-    spec: &ManagedSpecView,
-    replicas: &[ReplicaView],
-    jobs: &HashMap<String, JobInfo>,
-    health: &HashMap<Uuid, u16>,
-    restart: &HashSet<Uuid>,
-    lost_retention_secs: i64,
-) -> Vec<Action> {
-    let mut actions = Vec::new();
-    let mut alive = 0i64;
-    // Self-heal restarts are capped at one per model per tick: if the
-    // provisioner itself loses the network path to the nodes, every probe fails
-    // at once, and an uncapped restart would mass-cancel a whole fleet of
-    // actually-fine replicas. Rolling one at a time keeps capacity up and gives
-    // the operator (and the held-reconcile alert) time to notice.
-    let mut restart_budget = 1usize;
-    // Replicas with a live job, eligible to be cancelled if we're over target.
-    // (replica_id, job_id, endpoint_id, rank, age) where lower rank = cancel first.
-    let mut cancellable: Vec<(Uuid, String, Option<Uuid>, u8, i64)> = Vec::new();
+/// How a pending job's reason reads, when it is one Slurm will not clear by
+/// waiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stuck {
+    /// Held by an admin, the user, or after a failed launch.
+    Held,
+    /// The request can never run where it was sent (partition or QOS limits,
+    /// bad constraints, an account it may not use).
+    NeverRuns,
+    /// A per-user or per-account job limit that the deployment's own running
+    /// jobs keep full.
+    Limited,
+}
 
-    for r in replicas {
-        // GC dead rows past retention; they don't count as alive.
+const NEVER_RUNS_REASONS: &[&str] = &[
+    "badconstraints",
+    "partitionconfig",
+    "partitiontimelimit",
+    "partitionnodelimit",
+    "dependencyneversatisfied",
+    "invalidaccount",
+    "invalidqos",
+    "accountnotallowed",
+    "qosnotallowed",
+    "nodesdesignatedforotherjobs",
+];
+
+const LIMITED_REASONS: &[&str] = &[
+    "qosmaxjobsperuserlimit",
+    "qosmaxjobsperaccount",
+    "assocmaxjobslimit",
+    "qosmaxsubmitjobperuserlimit",
+    "assocmaxsubmitjoblimit",
+];
+
+/// Classify a pending job's reason. `None` for ordinary waiting (Resources,
+/// Priority, ...), which clears on its own.
+pub fn stuck_reason(job: &JobInfo) -> Option<Stuck> {
+    if job.state != JobState::Pending {
+        return None;
+    }
+    if job
+        .state_flags
+        .iter()
+        .any(|f| f == "REQUEUE_HOLD" || f == "RESV_DEL_HOLD")
+    {
+        return Some(Stuck::Held);
+    }
+    let reason = job.reason.as_deref()?.trim();
+    let key: String = reason
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if key.contains("held") {
+        Some(Stuck::Held)
+    } else if NEVER_RUNS_REASONS.contains(&key.as_str())
+        || key.ends_with("perjob")
+        || key.ends_with("perjoblimit")
+        || key.contains("maxwallduration")
+    {
+        Some(Stuck::NeverRuns)
+    } else if LIMITED_REASONS.contains(&key.as_str()) {
+        Some(Stuck::Limited)
+    } else {
+        None
+    }
+}
+
+/// The dashboard sentence for a stuck pending job.
+pub fn stuck_detail(kind: Stuck, reason: Option<&str>, startup_timeout_mins: i64) -> String {
+    let why = reason
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .map(|r| format!(" ({r})"))
+        .unwrap_or_default();
+    let head = match kind {
+        Stuck::Held => format!(
+            "Slurm is holding this job{why}, so it will not start until the hold is released."
+        ),
+        Stuck::NeverRuns => format!(
+            "Slurm says this job cannot start as asked{why}. Check the partition, account, time limit and resources on the deployment."
+        ),
+        Stuck::Limited => format!(
+            "Slurm will not start this job while other jobs fill a job limit{why}. Lower the replica count or ask for a higher limit."
+        ),
+    };
+    if startup_timeout_mins > 0 {
+        format!(
+            "{head} If it still cannot start after {startup_timeout_mins} minutes, obleth cancels it and counts a failed launch."
+        )
+    } else {
+        head
+    }
+}
+
+/// True when a job that ended without ever serving counts as a failed launch.
+/// Preemption, a failed node, an outside cancel and a federation revoke are
+/// not the launch's fault.
+pub fn counts_as_failed_launch(raw_state: Option<&str>) -> bool {
+    !matches!(
+        raw_state.map(str::trim),
+        Some("PREEMPTED" | "NODE_FAIL" | "CANCELLED" | "REVOKED" | "DEADLINE")
+    )
+}
+
+/// When a healthy replica's job is close enough to its time limit that a
+/// replacement should start now: the job's end. `None` when the handoff is
+/// off, the job has no limit, or the limit is so short that a replacement
+/// would itself be due at once.
+fn handoff_due(job: &JobInfo, handoff_mins: i64, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    if handoff_mins <= 0 || job.time_limit_unlimited {
+        return None;
+    }
+    let end = job.end_time?;
+    let limit_mins = job
+        .time_limit_mins
+        .or_else(|| job.start_time.map(|s| (end - s).num_minutes()))?;
+    if limit_mins <= 2 * handoff_mins {
+        return None;
+    }
+    ((end - now).num_seconds() <= handoff_mins * 60).then_some(end)
+}
+
+/// True when a promoted replica's job is no longer the run it was promoted
+/// under: Slurm started it again (requeue, restart), or it now runs on
+/// another node.
+fn restarted_elsewhere(r: &ReplicaView, job: &JobInfo) -> bool {
+    if let (Some(promoted), Some(started)) = (r.job_started_at, job.start_time) {
+        if promoted.timestamp() != started.timestamp() {
+            return true;
+        }
+    }
+    match (r.nodes.as_deref().map(str::trim), job.probe_host()) {
+        (Some(nodes), Some(host)) if !nodes.is_empty() => {
+            !nodes.split(',').any(|n| n.trim() == host)
+        }
+        _ => false,
+    }
+}
+
+/// True when a running job has had longer than the startup timeout to
+/// become healthy.
+fn startup_timed_out(job: &JobInfo, startup_timeout_mins: i64, now: DateTime<Utc>) -> bool {
+    startup_timeout_mins > 0
+        && job
+            .start_time
+            .is_some_and(|s| (now - s).num_seconds() >= startup_timeout_mins * 60)
+}
+
+/// Pure reconcile for one model. See [`PlanInput`] for what it reads.
+///
+/// Replicas whose job runs elsewhere than where they were promoted are
+/// demoted at once; jobs near their time limit, and replicas the operator
+/// asked to replace, get a successor first and are drained only once enough
+/// replicas serve; a job that never becomes healthy or never starts is
+/// cancelled after the startup timeout and counts as a failed launch.
+pub fn plan(input: &PlanInput) -> Vec<Action> {
+    let spec = input.spec;
+    let now = input.now;
+    let jobs = input.jobs;
+    let mut actions = Vec::new();
+    // Replicas that leave service this tick (their own action removes their
+    // endpoint), and the endpoints those actions remove.
+    let mut leaving: HashSet<Uuid> = HashSet::new();
+    // Desired detail per replica, for replicas no other action annotates.
+    let mut details: HashMap<Uuid, Option<String>> = HashMap::new();
+    let mut ends_at: HashMap<Uuid, DateTime<Utc>> = HashMap::new();
+
+    let mut queued: Vec<&ReplicaView> = Vec::new();
+    let mut loading: Vec<&ReplicaView> = Vec::new();
+    let mut promoting: HashSet<Uuid> = HashSet::new();
+    let mut healthy: Vec<(&ReplicaView, &JobInfo)> = Vec::new();
+    let mut unknown = 0i64;
+
+    let cancel = |r: &ReplicaView, reason: CancelReason, cancel_now: bool| Action::Cancel {
+        replica_id: r.id,
+        job_id: r.slurm_job_id.clone(),
+        endpoint_id: r.endpoint_id,
+        reason,
+        cancel_now,
+    };
+
+    for r in input.replicas {
+        let job = jobs.get(&r.slurm_job_id);
         if r.state == "lost" {
-            if r.age_secs >= lost_retention_secs {
+            // Aged from when it was lost, not created: a launch that failed
+            // after a long queue or load stays visible for the full retention.
+            if r.updated_secs >= input.lost_retention_secs {
                 actions.push(Action::Delete { replica_id: r.id });
             }
             continue;
         }
         if r.state == "draining" {
-            // Cancelled on purpose. Once the job is actually gone, delete the row
-            // directly. Not MarkLost -- "lost" counts toward the failure limit,
-            // and a drain is not a failure. While the job is still pending/running
-            // the cancel is in flight, so wait for it to terminate.
-            if matches!(
-                jobs.get(&r.slurm_job_id).map(|j| j.state),
-                None | Some(JobState::Gone)
-            ) {
-                actions.push(Action::Delete { replica_id: r.id });
-            }
-            continue;
-        }
-
-        // Operator-requested restart (cancel_requested) or self-heal restart
-        // (in the `restart` set): cancel this replica's job now (regardless of
-        // target) so the resubmit-to-target below launches a fresh one. Don't
-        // count it as alive. After cancel it becomes "draining" (skipped above)
-        // until its job goes Gone and the row is GC'd, which clears the flag.
-        // Operator restarts are never budget-limited; self-heal ones are.
-        let self_heal = !r.cancel_requested && restart.contains(&r.id) && restart_budget > 0;
-        if (r.cancel_requested || self_heal)
-            && matches!(
-                jobs.get(&r.slurm_job_id).map(|j| j.state),
-                Some(JobState::Pending | JobState::Running)
-            )
-        {
-            if self_heal {
-                restart_budget -= 1;
-            }
-            actions.push(Action::Cancel {
-                replica_id: r.id,
-                job_id: r.slurm_job_id.clone(),
-                endpoint_id: r.endpoint_id,
-                reason: if r.cancel_requested {
-                    CancelReason::OperatorRestart
-                } else {
-                    CancelReason::ProbeFailed
-                },
-            });
-            continue;
-        }
-
-        match jobs.get(&r.slurm_job_id).map(|j| j.state) {
-            None | Some(JobState::Gone) => {
-                // Carry Slurm's terminal state when the job is still listed, so
-                // the launch history records why it ended (TIMEOUT, OOM, ...).
-                let job = jobs.get(&r.slurm_job_id);
-                actions.push(Action::MarkLost {
+            // Cancelled on purpose. Once the job is gone, delete the row (not
+            // MarkLost: a drain is not a failure). While it still runs, the
+            // grace period lets in-flight requests finish, then the job is
+            // cancelled (again, if an earlier cancel did not take).
+            match job.map(|j| j.state) {
+                None | Some(JobState::Gone) => actions.push(Action::Delete { replica_id: r.id }),
+                Some(_) if r.updated_secs >= DRAIN_GRACE_SECS => actions.push(Action::CancelJob {
                     replica_id: r.id,
-                    endpoint_id: r.endpoint_id,
-                    raw_state: job
-                        .map(|j| j.raw_state.trim().to_string())
-                        .filter(|s| !s.is_empty()),
-                    reason: job.and_then(|j| j.reason.clone()),
-                });
-                // not alive
+                    job_id: r.slurm_job_id.clone(),
+                }),
+                Some(_) => {}
             }
-            Some(JobState::Pending) => {
-                alive += 1;
-                cancellable.push((r.id, r.slurm_job_id.clone(), r.endpoint_id, 0, r.age_secs));
-                // cancel pending first
-            }
-            Some(JobState::Running) => {
-                alive += 1;
-                // Promote on a passing health check. This covers fresh replicas
-                // ("pending" replicas haven't been probed yet — they were waiting
-                // for the job to leave Slurm-PENDING — so treat them like
-                // "starting") AND self-heals a replica stranded as "healthy" with
-                // no endpoint linked (e.g. a prior promote whose endpoint write
-                // failed, or one whose endpoint was removed out of band — see
-                // `clear_dangling_endpoints`, which nulls that reference before
-                // planning): the planner would otherwise never re-promote a
-                // "healthy" row, leaving the model permanently short an endpoint.
-                let needs_promote = r.state == "starting"
-                    || r.state == "pending"
-                    || (r.state == "healthy" && r.endpoint_id.is_none());
-                if needs_promote {
-                    if let Some(&port) = health.get(&r.id) {
-                        let node = jobs
-                            .get(&r.slurm_job_id)
-                            .and_then(|j| j.nodes.first().cloned())
-                            .unwrap_or_default();
-                        actions.push(Action::Promote {
-                            replica_id: r.id,
-                            api_base: endpoint_api_base(&node, port as i64),
-                        });
-                    }
-                    cancellable.push((r.id, r.slurm_job_id.clone(), r.endpoint_id, 1, r.age_secs));
-                } else {
-                    cancellable.push((r.id, r.slurm_job_id.clone(), r.endpoint_id, 2, r.age_secs));
-                    // healthy: cancel last
+            continue;
+        }
+        let Some(job) = job.filter(|j| j.state != JobState::Gone) else {
+            // Carry Slurm's terminal state when the job is still listed, so
+            // the launch history records why it ended (TIMEOUT, OOM, ...).
+            let raw_state = job
+                .map(|j| j.raw_state.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let failed_launch = !r.has_served()
+                && !r.cancel_requested
+                && counts_as_failed_launch(raw_state.as_deref());
+            actions.push(Action::MarkLost {
+                replica_id: r.id,
+                endpoint_id: r.endpoint_id,
+                raw_state,
+                reason: job.and_then(|j| j.reason.clone()),
+                failed_launch,
+            });
+            leaving.insert(r.id);
+            continue;
+        };
+        if job.state == JobState::Unknown {
+            // A state this build does not know: count it as alive and leave
+            // it alone rather than tear it down on a guess.
+            unknown += 1;
+            continue;
+        }
+        if r.cancel_requested {
+            // The operator stopped this replica: a serving one drains first.
+            actions.push(cancel(
+                r,
+                CancelReason::OperatorRestart,
+                r.state != "healthy",
+            ));
+            leaving.insert(r.id);
+            continue;
+        }
+        match job.state {
+            JobState::Pending => {
+                if r.state == "healthy" {
+                    // Requeued or suspended: it no longer serves where it was
+                    // registered. Out of rotation now; promoted again when it
+                    // serves.
+                    actions.push(Action::Demote {
+                        replica_id: r.id,
+                        endpoint_id: r.endpoint_id,
+                        detail: REQUEUED_DETAIL.to_string(),
+                    });
+                    leaving.insert(r.id);
+                    queued.push(r);
+                    continue;
                 }
+                if r.replace_requested {
+                    // Not serving yet: replace it at once.
+                    actions.push(cancel(r, CancelReason::OperatorRestart, true));
+                    leaving.insert(r.id);
+                    continue;
+                }
+                if let Some(kind) = stuck_reason(job) {
+                    let waited = input.waited_secs.get(&r.id).copied().unwrap_or(0);
+                    if spec.startup_timeout_mins > 0 && waited >= spec.startup_timeout_mins * 60 {
+                        actions.push(cancel(r, CancelReason::Stuck, true));
+                        leaving.insert(r.id);
+                        continue;
+                    }
+                    details.insert(
+                        r.id,
+                        Some(stuck_detail(
+                            kind,
+                            job.reason.as_deref(),
+                            spec.startup_timeout_mins,
+                        )),
+                    );
+                } else if job.is_requeued() {
+                    details.insert(r.id, Some(REQUEUED_DETAIL.to_string()));
+                } else {
+                    details.insert(r.id, None);
+                }
+                queued.push(r);
             }
+            JobState::Running => {
+                if job.end_time.is_some() && job.end_time != r.job_ends_at {
+                    if let Some(end) = job.end_time {
+                        ends_at.insert(r.id, end);
+                    }
+                }
+                if r.state == "healthy" {
+                    if restarted_elsewhere(r, job) {
+                        actions.push(Action::Demote {
+                            replica_id: r.id,
+                            endpoint_id: r.endpoint_id,
+                            detail: restarted_detail(job),
+                        });
+                        leaving.insert(r.id);
+                        loading.push(r);
+                        continue;
+                    }
+                    if r.endpoint_id.is_none() {
+                        // Healthy with no endpoint linked (a promote whose
+                        // endpoint write failed, or one removed out of band):
+                        // promote again to relink it.
+                        if let Some(&port) = input.health.get(&r.id) {
+                            actions.push(promote(r, job, port));
+                            promoting.insert(r.id);
+                        }
+                    }
+                    healthy.push((r, job));
+                    continue;
+                }
+                // Submitted, running, not serving yet.
+                if r.replace_requested {
+                    actions.push(cancel(r, CancelReason::OperatorRestart, true));
+                    leaving.insert(r.id);
+                    continue;
+                }
+                if let Some(&port) = input.health.get(&r.id) {
+                    actions.push(promote(r, job, port));
+                    promoting.insert(r.id);
+                } else if startup_timed_out(job, spec.startup_timeout_mins, now) {
+                    actions.push(cancel(r, CancelReason::StartupTimeout, true));
+                    leaving.insert(r.id);
+                    continue;
+                } else {
+                    details.insert(r.id, input.probe_notes.get(&r.id).cloned());
+                }
+                loading.push(r);
+            }
+            JobState::Gone | JobState::Unknown => unreachable!("handled above"),
         }
     }
 
+    // Sort the healthy replicas into serving and retiring.
+    let mut serving: Vec<&ReplicaView> = Vec::new();
+    let mut retiring: Vec<(&ReplicaView, Retire)> = Vec::new();
+    let mut dead: Vec<&ReplicaView> = Vec::new();
+    let mut requested: Vec<&ReplicaView> = Vec::new();
+    for &(r, job) in &healthy {
+        if input.self_heal.dead.contains(&r.id) {
+            dead.push(r);
+        } else if input.self_heal.zombie.contains(&r.id) {
+            retiring.push((r, Retire::Unhealthy));
+        } else if let Some(end) = handoff_due(job, spec.handoff_mins, now) {
+            retiring.push((r, Retire::Handoff(end)));
+        } else if r.replace_requested {
+            requested.push(r);
+        } else {
+            serving.push(r);
+        }
+    }
+    // Operator replacements (restart, roll) go one at a time: the oldest is
+    // replaced first and the others keep serving until it is done.
+    requested.sort_by_key(|r| std::cmp::Reverse(r.age_secs));
+    let mut requested = requested.into_iter();
+    if let Some(r) = requested.next() {
+        retiring.push((r, Retire::Requested));
+    }
+    serving.extend(requested);
+    // A server that stopped answering is cancelled at once when another
+    // replica serves (at most one per tick, so a probe-side fault cannot
+    // empty a fleet); the last one is replaced surge-first instead.
+    let mut self_heal_budget = 1usize;
+    for r in dead {
+        if !serving.is_empty() && self_heal_budget > 0 {
+            self_heal_budget -= 1;
+            actions.push(cancel(r, CancelReason::ProbeFailed, true));
+            leaving.insert(r.id);
+        } else if serving.is_empty() {
+            retiring.push((r, Retire::Unhealthy));
+        } else {
+            serving.push(r);
+        }
+    }
+
+    // Submit or scale down. Retiring replicas do not count: they are being
+    // replaced, so their successors are submitted now.
     let target = spec.target_replicas.max(0);
-    // A job found gone on this tick is marked lost by this tick's actions, so
-    // it counts too. Counting only rows already lost let one more job through
-    // than the limit says (limit 2: a third job was submitted).
-    let lost_count = replicas.iter().filter(|r| r.state == "lost").count() as i64
-        + actions
-            .iter()
-            .filter(|a| matches!(a, Action::MarkLost { .. }))
-            .count() as i64;
-    let failure_limit_hit = spec.max_job_failures > 0 && lost_count >= spec.max_job_failures;
-    if alive < target && !failure_limit_hit {
+    let alive = (queued.len() + loading.len() + serving.len()) as i64 + unknown;
+    // The failures this tick records count now, as `next_backoff` will count
+    // them once the actions are applied: a tick that marks the last allowed
+    // failure must not also submit its replacement.
+    let failed_now = actions
+        .iter()
+        .filter(|a| is_failed_launch(a, input.replicas))
+        .count() as i64;
+    let served_now = actions.iter().any(|a| {
+        matches!(a, Action::Promote { replica_id, .. }
+            if input.replicas.iter().any(|r| r.id == *replica_id && r.state != "healthy"))
+    });
+    let counted = if served_now { 0 } else { spec.failed_launches };
+    let limit_reached = spec.max_job_failures > 0
+        && failed_now > 0
+        && counted + failed_now >= spec.max_job_failures;
+    let paused = spec.paused_until.is_some_and(|t| t > now) || limit_reached;
+    let mut cancelled_healthy = 0usize;
+    if alive < target && !paused {
         for _ in 0..(target - alive) {
             actions.push(Action::Submit);
         }
     } else if alive > target {
-        // cancel excess: pending first, then starting, then healthy; oldest first within a rank.
-        cancellable.sort_by(|a, b| a.3.cmp(&b.3).then(b.4.cmp(&a.4)));
-        for (id, job_id, endpoint_id, _, _) in
-            cancellable.into_iter().take((alive - target) as usize)
-        {
-            actions.push(Action::Cancel {
-                replica_id: id,
-                job_id,
-                endpoint_id,
-                reason: CancelReason::ScaleDown,
+        // Queued jobs newest first (the oldest has the most queue priority),
+        // then loading ones newest first (the oldest is closest to serving),
+        // then serving ones oldest first (closest to their time limit). A job
+        // in a state this build does not know is never picked.
+        let mut order: Vec<(&ReplicaView, bool)> = Vec::new();
+        let mut q = queued.clone();
+        q.sort_by_key(|r| r.age_secs);
+        order.extend(q.into_iter().map(|r| (r, true)));
+        let mut l: Vec<&ReplicaView> = loading.clone();
+        l.sort_by_key(|r| (promoting.contains(&r.id), r.age_secs));
+        order.extend(l.into_iter().map(|r| (r, true)));
+        let mut s = serving.clone();
+        s.sort_by_key(|r| std::cmp::Reverse(r.age_secs));
+        order.extend(s.into_iter().map(|r| (r, false)));
+        for (r, not_serving) in order.into_iter().take((alive - target) as usize) {
+            let reason = if spec.removed {
+                CancelReason::Removed
+            } else {
+                CancelReason::ScaleDown
+            };
+            promoting.remove(&r.id);
+            if !not_serving {
+                cancelled_healthy += 1;
+            }
+            // The cancel replaces a promote or demote planned for it above
+            // (it removes the endpoint itself).
+            actions.retain(|a| match a {
+                Action::Promote { replica_id, .. } | Action::Demote { replica_id, .. } => {
+                    *replica_id != r.id
+                }
+                _ => true,
+            });
+            actions.push(cancel(r, reason, not_serving));
+            leaving.insert(r.id);
+            details.remove(&r.id);
+        }
+    }
+
+    // Retire replicas once enough others serve: k of them can go while the
+    // serving count stays at target. Handoffs go in order of their time
+    // limits, others oldest first. A replacement the operator asked for also
+    // goes once its successor had the startup timeout to come up.
+    let healthy_after = (serving.len() + promoting.len()) as i64 - cancelled_healthy as i64;
+    let hr = retiring.len() as i64;
+    let mut k = hr.min((healthy_after + hr - target).max(0));
+    retiring.sort_by_key(|(r, why)| match why {
+        Retire::Handoff(end) => (0, end.timestamp(), 0),
+        _ => (1, 0, -r.age_secs),
+    });
+    for (r, why) in retiring {
+        let waited = input.waited_secs.get(&r.id).copied().unwrap_or(0);
+        // Only an operator's replacement goes without a serving successor:
+        // an unhealthy replica keeps its slot (the fault may be on the
+        // provisioner's side), and a handoff ends at the time limit anyway.
+        let gave_up = why == Retire::Requested
+            && spec.startup_timeout_mins > 0
+            && waited >= spec.startup_timeout_mins * 60;
+        if k > 0 || gave_up {
+            k -= 1;
+            let reason = if spec.removed {
+                CancelReason::Removed
+            } else {
+                CancelReason::Replaced
+            };
+            actions.push(cancel(r, reason, false));
+            leaving.insert(r.id);
+            continue;
+        }
+        let detail = match why {
+            Retire::Handoff(end) if paused => format!(
+                "This job reaches its time limit at {} UTC. New jobs are paused, so no replacement is starting.",
+                end.format("%H:%M")
+            ),
+            Retire::Handoff(end) => format!(
+                "This job reaches its time limit at {} UTC. A replacement is starting, and this replica stops once the replacement serves.",
+                end.format("%H:%M")
+            ),
+            Retire::Requested => {
+                "A replacement is starting, and this replica stops once the replacement serves."
+                    .to_string()
+            }
+            Retire::Unhealthy => "This replica is failing health checks. A replacement is starting, and this replica stops once the replacement serves.".to_string(),
+        };
+        details.insert(r.id, Some(detail));
+    }
+    for r in &serving {
+        details.entry(r.id).or_insert(None);
+    }
+
+    // Plain-sentence details and Slurm end times, only where they changed.
+    let mut annotated: Vec<&ReplicaView> = input
+        .replicas
+        .iter()
+        .filter(|r| !leaving.contains(&r.id) && !promoting.contains(&r.id))
+        .collect();
+    annotated.sort_by_key(|r| r.id);
+    for r in annotated {
+        let detail = details.get(&r.id).and_then(|want| {
+            let want = want.as_deref().unwrap_or("");
+            (r.state_detail.as_deref().unwrap_or("") != want).then(|| want.to_string())
+        });
+        let job_ends_at = ends_at.get(&r.id).copied();
+        if detail.is_some() || job_ends_at.is_some() {
+            actions.push(Action::Annotate {
+                replica_id: r.id,
+                detail,
+                job_ends_at,
             });
         }
     }
 
+    // Endpoints this provisioner registered whose replica no longer serves
+    // under them: an earlier delete that failed, or a duplicate.
+    if let Some((endpoints, prefix)) = input.endpoints {
+        let removed: HashSet<Uuid> = input
+            .replicas
+            .iter()
+            .filter(|r| leaving.contains(&r.id))
+            .filter_map(|r| r.endpoint_id)
+            .collect();
+        for ep in endpoints {
+            let Some(rid) = ep
+                .name
+                .strip_prefix(prefix)
+                .and_then(|rest| rest.parse::<Uuid>().ok())
+            else {
+                continue;
+            };
+            if removed.contains(&ep.id) {
+                continue;
+            }
+            let keep = promoting.contains(&rid)
+                || input.replicas.iter().any(|r| {
+                    r.id == rid
+                        && r.state == "healthy"
+                        && !leaving.contains(&r.id)
+                        && r.endpoint_id.is_none_or(|e| e == ep.id)
+                });
+            if !keep {
+                actions.push(Action::DeleteEndpoint { endpoint_id: ep.id });
+            }
+        }
+    }
+
     actions
+}
+
+fn promote(r: &ReplicaView, job: &JobInfo, port: u16) -> Action {
+    let node = job.probe_host().unwrap_or_default();
+    Action::Promote {
+        replica_id: r.id,
+        api_base: endpoint_api_base(node, port as i64),
+        port: port as i64,
+        job_started_at: job.start_time,
+        job_ends_at: job.end_time,
+    }
 }
 
 /// Build the OpenAI-compatible `api_base` for a promoted replica's endpoint.
@@ -191,26 +708,24 @@ fn endpoint_api_base(node: &str, serving_port: i64) -> String {
     format!("http://{node}:{serving_port}/v1")
 }
 
-/// Null out a `healthy` replica's `endpoint_id` when it points at an endpoint
-/// the gateway no longer has registered.
+/// Null out a replica's `endpoint_id` when it points at an endpoint the
+/// gateway no longer has registered.
 ///
-/// `model_replicas` has no foreign key to `model_endpoints` (it was dropped), so
-/// when an endpoint is removed out of band — a manual "Disable"/delete in the
-/// dashboard's Reliability tab, or a cancel/mark-lost whose endpoint delete
-/// landed but whose replica patch didn't — the replica keeps a *dangling*
-/// reference. The planner's re-promote path fires only on `endpoint_id.is_none()`,
-/// so such a row would sit "healthy" forever, serving a phantom the model no
-/// longer has (the classic "2 healthy replicas, 1 endpoint" split). Nulling the
-/// dangling id here lets that path relink a fresh endpoint next.
+/// `model_replicas` has no foreign key to `model_endpoints`, so when an
+/// endpoint is removed out of band (a manual delete in the dashboard, or a
+/// demote/cancel whose endpoint delete landed) the replica keeps a dangling
+/// reference. The planner's re-promote path fires only on
+/// `endpoint_id.is_none()`, so such a healthy row would never relink, and a
+/// later cancel would try to delete an endpoint that is long gone. Nulling
+/// the dangling id here (in this tick's view) fixes both.
 ///
 /// `known_endpoints` MUST be a reliable snapshot from a successful fetch this
 /// tick — never call this with an empty set derived from a failed lookup, or a
 /// transient error would strip every replica's endpoint at once.
 pub fn clear_dangling_endpoints(replicas: &mut [ReplicaView], known_endpoints: &HashSet<Uuid>) {
     for r in replicas.iter_mut() {
-        if r.state == "healthy"
-            && r.endpoint_id
-                .is_some_and(|ep| !known_endpoints.contains(&ep))
+        if r.endpoint_id
+            .is_some_and(|ep| !known_endpoints.contains(&ep))
         {
             r.endpoint_id = None;
         }
@@ -242,13 +757,7 @@ pub fn update_probe_failures(
     counts: &mut HashMap<Uuid, i64>,
 ) {
     for r in replicas {
-        if r.state != "healthy" {
-            continue;
-        }
-        let Some(j) = jobs.get(&r.slurm_job_id) else {
-            continue;
-        };
-        if j.state != JobState::Running || j.nodes.is_empty() {
+        if probed_healthy_job(r, jobs).is_none() {
             continue;
         }
         if health.contains_key(&r.id) {
@@ -267,6 +776,37 @@ pub fn update_probe_failures(
     }
 }
 
+/// The job of a healthy replica the tick probes: running, with a host.
+fn probed_healthy_job<'a>(
+    r: &ReplicaView,
+    jobs: &'a HashMap<String, JobInfo>,
+) -> Option<&'a JobInfo> {
+    if r.state != "healthy" {
+        return None;
+    }
+    jobs.get(&r.slurm_job_id)
+        .filter(|j| j.state == JobState::Running && j.probe_host().is_some())
+}
+
+/// Fleet guard for self-heal: true when at least two healthy replicas were
+/// probed this tick (across every model) and every one of them failed. A
+/// whole fleet going dark in one tick is far likelier a fault on the
+/// provisioner's own path to the nodes (network policy, route, MTU) than
+/// real deaths, so the probe counters must not advance and nothing is
+/// restarted on the probe signal.
+pub fn probe_path_down(
+    replicas: &[ReplicaView],
+    jobs: &HashMap<String, JobInfo>,
+    health: &HashMap<Uuid, u16>,
+) -> Option<usize> {
+    let probed: Vec<Uuid> = replicas
+        .iter()
+        .filter(|r| probed_healthy_job(r, jobs).is_some())
+        .map(|r| r.id)
+        .collect();
+    (probed.len() >= 2 && probed.iter().all(|id| !health.contains_key(id))).then_some(probed.len())
+}
+
 /// Consecutive failed *gateway* checks of a replica's endpoint that count as a
 /// restart signal. The gateway's check is a real 1-token inference at a slow
 /// cadence (minutes), so two failures is already a sustained outage — and it
@@ -274,104 +814,309 @@ pub fn update_probe_failures(
 /// answers metadata instantly but hangs forever on inference).
 const GATEWAY_UNHEALTHY_CHECKS: i64 = 2;
 
-/// Ignore the gateway's endpoint verdict when it is older than this — e.g.
-/// when scheduled model health checks are disabled, a stale `unhealthy` row
-/// must not keep restarting a replica that recovered long ago.
-const GATEWAY_CHECK_MAX_AGE_SECS: i64 = 3600;
+/// The gateway's endpoint verdict is used only when it is at most this old.
+/// Its checks run every few minutes by default; an older verdict (checks
+/// turned off, or the gateway behind) says nothing about the server now.
+pub const GATEWAY_FRESH_SECS: i64 = 1800;
 
-/// Which healthy replicas self-heal should restart this tick. Two independent
-/// signals, either suffices:
+/// Which healthy replicas self-heal should act on this tick:
 ///
-/// 1. the provisioner's own port-window probe has been failing for
-///    `probe_threshold` net ticks (`probe_failures`, maintained by
-///    `update_probe_failures`, which decays on a pass) — the server is not
-///    answering at all, sustained rather than a transient flap;
-/// 2. the gateway's health check of the replica's registered endpoint is
-///    `unhealthy` with at least `GATEWAY_UNHEALTHY_CHECKS` consecutive
-///    failures and a recent check — the server answers GETs but fails real
-///    inference (zombie).
+/// - `dead`: the provisioner's own probe has failed for `probe_threshold` net
+///   ticks (`probe_failures`, maintained by `update_probe_failures`, which
+///   decays on a pass) and the gateway has no fresh healthy verdict for the
+///   replica's endpoint (a fresh healthy one means the gateway still reaches
+///   and serves it, so the fault is on the provisioner's side);
+/// - `zombie`: the gateway's fresh check of the replica's endpoint is
+///   `unhealthy` with at least `GATEWAY_UNHEALTHY_CHECKS` consecutive
+///   failures: the server answers GETs but fails real inference.
 ///
-/// `probe_threshold <= 0` disables self-heal entirely (both signals). The
-/// planner additionally caps restarts at one per model per tick.
-pub fn restart_candidates(
+/// `probe_threshold <= 0` disables self-heal entirely (both signals).
+pub fn self_heal_candidates(
     replicas: &[ReplicaView],
     probe_failures: &HashMap<Uuid, i64>,
     probe_threshold: i64,
     endpoints: &[EndpointView],
-) -> HashSet<Uuid> {
+) -> SelfHeal {
+    let mut out = SelfHeal::default();
     if probe_threshold <= 0 {
-        return HashSet::new();
+        return out;
     }
-    let unhealthy_eps: HashSet<Uuid> = endpoints
-        .iter()
-        .filter(|e| {
+    for r in replicas.iter().filter(|r| r.state == "healthy") {
+        let fresh = r
+            .endpoint_id
+            .and_then(|id| endpoints.iter().find(|e| e.id == id))
+            .filter(|e| e.checked_secs_ago.is_some_and(|s| s <= GATEWAY_FRESH_SECS));
+        let gateway_healthy = fresh.is_some_and(|e| e.health_status.as_deref() == Some("healthy"));
+        let gateway_unhealthy = fresh.is_some_and(|e| {
             e.health_status.as_deref() == Some("unhealthy")
                 && e.consecutive_failures >= GATEWAY_UNHEALTHY_CHECKS
-                && e.checked_secs_ago
-                    .is_some_and(|s| s <= GATEWAY_CHECK_MAX_AGE_SECS)
-        })
-        .map(|e| e.id)
-        .collect();
-    replicas
-        .iter()
-        .filter(|r| {
-            r.state == "healthy"
-                && (probe_failures.get(&r.id).copied().unwrap_or(0) >= probe_threshold
-                    || r.endpoint_id.is_some_and(|ep| unhealthy_eps.contains(&ep)))
-        })
-        .map(|r| r.id)
-        .collect()
+        });
+        let probe_dead = probe_failures.get(&r.id).copied().unwrap_or(0) >= probe_threshold;
+        if probe_dead && !gateway_healthy {
+            out.dead.insert(r.id);
+        } else if gateway_unhealthy {
+            out.zombie.insert(r.id);
+        }
+    }
+    out
 }
 
-/// The slice of ManagedModelSpec the planner needs (keeps it decoupled from the
-/// full DB struct in tests).
-pub struct ManagedSpecView {
-    pub target_replicas: i64,
-    /// Stop submitting new jobs when this many lost replicas are visible (0 = no limit).
-    pub max_job_failures: i64,
+/// What one tick's applied actions did to a model's launch record.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LaunchOutcome {
+    /// Launches that failed this tick (ended without serving, startup
+    /// timeout, or stuck in the queue).
+    pub failed: i64,
+    /// How the last of them ended, as a short phrase.
+    pub last_failure: Option<String>,
+    /// A replica was promoted (a launch served).
+    pub served: bool,
+    /// Slurm refused a submit outright; carries its plain sentence.
+    pub rejected: Option<String>,
+}
+
+/// Minutes to wait after the n-th consecutive backoff: 5, 15, 30, 60, then
+/// hourly.
+pub fn backoff_minutes(step: i64) -> i64 {
+    match step {
+        i64::MIN..=1 => 5,
+        2 => 15,
+        3 => 30,
+        _ => 60,
+    }
+}
+
+/// The model's new failure and pause state after a tick, or `None` when it
+/// does not change. A launch that served resets the count and lifts any
+/// pause. Failed launches add up; reaching `max_job_failures` (when it is
+/// above 0) pauses submits on the backoff ladder. A rejected submit backs off
+/// on the same ladder whatever the limit.
+pub fn next_backoff(
+    current: &ManagedBackoff,
+    max_job_failures: i64,
+    outcome: &LaunchOutcome,
+    now: DateTime<Utc>,
+) -> Option<ManagedBackoff> {
+    let mut next = current.clone();
+    if outcome.served {
+        next = ManagedBackoff::default();
+    }
+    if outcome.failed > 0 {
+        next.failed_launches += outcome.failed;
+        if max_job_failures > 0 && next.failed_launches >= max_job_failures {
+            next.backoff_step += 1;
+            next.paused_until =
+                Some(now + chrono::Duration::minutes(backoff_minutes(next.backoff_step)));
+            let n = next.failed_launches;
+            let launches = if n == 1 {
+                "1 launch".to_string()
+            } else {
+                format!("{n} launches in a row")
+            };
+            next.paused_reason = Some(match &outcome.last_failure {
+                Some(how) => format!(
+                    "{launches} ended before the server became healthy; the last one {how}."
+                ),
+                None => format!("{launches} ended before the server became healthy."),
+            });
+        }
+    }
+    if let Some(msg) = &outcome.rejected {
+        next.backoff_step += 1;
+        next.paused_until =
+            Some(now + chrono::Duration::minutes(backoff_minutes(next.backoff_step)));
+        next.paused_reason = Some(msg.clone());
+    }
+    (next != *current).then_some(next)
+}
+
+/// A short phrase for how a failed launch ended, for the pause reason.
+pub fn failure_phrase(action: &Action) -> Option<String> {
+    match action {
+        Action::MarkLost {
+            raw_state, reason, ..
+        } => Some(match (raw_state.as_deref(), reason.as_deref()) {
+            (Some(s), Some(r)) => format!("ended {s} ({r})"),
+            (Some(s), None) => format!("ended {s}"),
+            _ => "disappeared from Slurm".to_string(),
+        }),
+        Action::Cancel {
+            reason: CancelReason::StartupTimeout,
+            ..
+        } => Some("did not become healthy within the startup timeout".to_string()),
+        Action::Cancel {
+            reason: CancelReason::Stuck,
+            ..
+        } => Some("could not start in the Slurm queue".to_string()),
+        _ => None,
+    }
+}
+
+/// True when applying `action` records a failed launch. A replica that has
+/// served once (and was then requeued) is not a failed launch.
+pub fn is_failed_launch(action: &Action, replicas: &[ReplicaView]) -> bool {
+    match action {
+        Action::MarkLost { failed_launch, .. } => *failed_launch,
+        Action::Cancel {
+            replica_id, reason, ..
+        } => {
+            reason.is_failed_launch()
+                && !replicas
+                    .iter()
+                    .any(|r| r.id == *replica_id && r.has_served())
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+
+    fn now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 1, 10, 12, 0, 0).unwrap()
+    }
+
+    fn mins_ago(m: i64) -> DateTime<Utc> {
+        now() - chrono::Duration::minutes(m)
+    }
 
     fn rv(state: &str, job: &str, ep: Option<Uuid>, age: i64) -> ReplicaView {
         ReplicaView {
             id: Uuid::new_v4(),
-            model_id: Uuid::new_v4(),
             slurm_job_id: job.into(),
             state: state.into(),
             endpoint_id: ep,
             age_secs: age,
-            port_base: 0,
-            last_message: None,
-            cancel_requested: false,
+            updated_secs: age,
+            port_base: 8000,
+            ..Default::default()
         }
     }
+
+    /// A replica that was promoted on `node` under a job that started at
+    /// `started`.
+    fn served(job: &str, ep: Option<Uuid>, node: &str, started: DateTime<Utc>) -> ReplicaView {
+        ReplicaView {
+            nodes: Some(node.into()),
+            job_started_at: Some(started),
+            port: Some(8000),
+            ..rv("healthy", job, ep, 600)
+        }
+    }
+
     fn job(id: &str, st: JobState, nodes: &[&str]) -> (String, JobInfo) {
         (
-            id.into(),
+            id.to_string(),
             JobInfo {
                 job_id: id.into(),
                 state: st,
                 nodes: nodes.iter().map(|s| s.to_string()).collect(),
-                raw_state: String::new(),
-                reason: None,
+                raw_state: match st {
+                    JobState::Pending => "PENDING",
+                    JobState::Running => "RUNNING",
+                    JobState::Gone => "COMPLETED",
+                    JobState::Unknown => "WEIRD",
+                }
+                .into(),
+                ..Default::default()
             },
         )
     }
+
+    fn running(id: &str, node: &str, started: DateTime<Utc>) -> (String, JobInfo) {
+        let (k, mut j) = job(id, JobState::Running, &[node]);
+        j.start_time = Some(started);
+        (k, j)
+    }
+
+    fn ended(id: &str, raw: &str) -> (String, JobInfo) {
+        let (k, mut j) = job(id, JobState::Gone, &[]);
+        j.raw_state = raw.into();
+        (k, j)
+    }
+
     fn spec(target: i64) -> ManagedSpecView {
         ManagedSpecView {
             target_replicas: target,
-            max_job_failures: 0,
+            startup_timeout_mins: 60,
+            handoff_mins: 15,
+            ..Default::default()
         }
     }
-    fn spec_with_limit(target: i64, limit: i64) -> ManagedSpecView {
-        ManagedSpecView {
-            target_replicas: target,
-            max_job_failures: limit,
+
+    /// One planner run with everything optional defaulted.
+    #[derive(Default)]
+    struct Case {
+        spec: ManagedSpecView,
+        replicas: Vec<ReplicaView>,
+        jobs: HashMap<String, JobInfo>,
+        health: HashMap<Uuid, u16>,
+        notes: HashMap<Uuid, String>,
+        heal: SelfHeal,
+        waited: HashMap<Uuid, i64>,
+        endpoints: Option<(Vec<EndpointView>, String)>,
+    }
+
+    impl Case {
+        fn new(spec: ManagedSpecView) -> Self {
+            Case {
+                spec,
+                ..Default::default()
+            }
+        }
+        fn plan(&self) -> Vec<Action> {
+            plan(&PlanInput {
+                spec: &self.spec,
+                replicas: &self.replicas,
+                jobs: &self.jobs,
+                health: &self.health,
+                probe_notes: &self.notes,
+                self_heal: &self.heal,
+                waited_secs: &self.waited,
+                endpoints: self
+                    .endpoints
+                    .as_ref()
+                    .map(|(e, p)| (e.as_slice(), p.as_str())),
+                now: now(),
+                lost_retention_secs: 900,
+            })
         }
     }
+
+    fn count(actions: &[Action], f: impl Fn(&Action) -> bool) -> usize {
+        actions.iter().filter(|a| f(a)).count()
+    }
+
+    fn submits(actions: &[Action]) -> usize {
+        count(actions, |a| matches!(a, Action::Submit))
+    }
+
+    fn cancel_of(actions: &[Action], id: Uuid) -> Option<(CancelReason, bool)> {
+        actions.iter().find_map(|a| match a {
+            Action::Cancel {
+                replica_id,
+                reason,
+                cancel_now,
+                ..
+            } if *replica_id == id => Some((*reason, *cancel_now)),
+            _ => None,
+        })
+    }
+
+    fn detail_of(actions: &[Action], id: Uuid) -> Option<String> {
+        actions.iter().find_map(|a| match a {
+            Action::Annotate {
+                replica_id,
+                detail: Some(d),
+                ..
+            } if *replica_id == id => Some(d.clone()),
+            _ => None,
+        })
+    }
+
+    // ---- port windows ----
 
     #[test]
     fn next_free_window_base_empty_returns_serving_port() {
@@ -380,542 +1125,706 @@ mod tests {
 
     #[test]
     fn next_free_window_base_skips_taken_slots() {
-        // [8000] taken → next is 8008
         assert_eq!(next_free_window_base(8000, 8, &[8000]), 8008);
-        // [8000, 8016] taken → 8008 is free (first gap)
-        assert_eq!(next_free_window_base(8000, 8, &[8000, 8016]), 8008);
+        assert_eq!(next_free_window_base(8000, 8, &[8000, 8008]), 8016);
+        assert_eq!(next_free_window_base(8000, 8, &[8008]), 8000);
     }
 
     #[test]
+    fn windows_never_overlap_across_models_with_different_serving_ports() {
+        // Model A holds 8000-8007; model B serves on 8001. B's window must
+        // not share a port with A's.
+        let b = next_free_window_base(8001, 8, &[8000]);
+        assert!(b >= 8008, "B got {b}, overlapping A's 8000-8007");
+        // And a third model on 8004 clears both.
+        let c = next_free_window_base(8004, 8, &[8000, b]);
+        assert!(c + 8 <= 8000 || c >= 8008, "{c}");
+        assert!(c + 8 <= b || c >= b + 8, "{c} overlaps {b}");
+    }
+
+    #[test]
+    fn window_search_goes_below_the_serving_port_when_the_top_is_full() {
+        assert_eq!(next_free_window_base(65_528, 8, &[65_528]), 65_520);
+    }
+
+    // ---- basics ----
+
+    #[test]
     fn empty_state_submits_target() {
-        let actions = plan(
-            &spec(2),
-            &[],
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashSet::new(),
-            900,
-        );
-        assert_eq!(actions.iter().filter(|a| **a == Action::Submit).count(), 2);
+        assert_eq!(submits(&Case::new(spec(2)).plan()), 2);
     }
 
     #[test]
     fn healthy_at_target_does_nothing() {
-        let r1 = rv("healthy", "j1", Some(Uuid::new_v4()), 100);
-        let r2 = rv("healthy", "j2", Some(Uuid::new_v4()), 100);
-        let jobs = HashMap::from([
-            job("j1", JobState::Running, &["n1"]),
-            job("j2", JobState::Running, &["n2"]),
-        ]);
-        let actions = plan(
-            &spec(2),
-            &[r1, r2],
-            &jobs,
-            &HashMap::new(),
-            &HashSet::new(),
-            900,
-        );
-        assert!(actions.is_empty(), "got {actions:?}");
+        let mut c = Case::new(spec(1));
+        c.replicas = vec![served("1", Some(Uuid::new_v4()), "n1", mins_ago(30))];
+        c.jobs = HashMap::from([running("1", "n1", mins_ago(30))]);
+        c.health.insert(c.replicas[0].id, 8000);
+        assert!(c.plan().is_empty(), "{:?}", c.plan());
     }
 
     #[test]
-    fn starting_and_running_and_healthy_promotes_with_url() {
-        let r = rv("starting", "j1", None, 30);
-        let id = r.id;
-        let jobs = HashMap::from([job("j1", JobState::Running, &["gpu7"])]);
-        let health = HashMap::from([(id, 8000u16)]);
-        let actions = plan(&spec(1), &[r], &jobs, &health, &HashSet::new(), 900);
+    fn running_replica_is_promoted_on_the_port_that_passed() {
+        let mut c = Case::new(spec(1));
+        c.replicas = vec![rv("pending", "1", None, 60)];
+        c.jobs = HashMap::from([running("1", "n1", mins_ago(2))]);
+        c.health.insert(c.replicas[0].id, 8003);
+        let a = c.plan();
         assert_eq!(
-            actions,
+            a,
             vec![Action::Promote {
-                replica_id: id,
-                api_base: "http://gpu7:8000/v1".into()
+                replica_id: c.replicas[0].id,
+                api_base: "http://n1:8003/v1".into(),
+                port: 8003,
+                job_started_at: Some(mins_ago(2)),
+                job_ends_at: None,
             }]
         );
+    }
+
+    #[test]
+    fn loading_replica_is_not_promoted_and_not_oversubmitted() {
+        let mut c = Case::new(spec(1));
+        c.replicas = vec![rv("pending", "1", None, 60)];
+        c.jobs = HashMap::from([running("1", "n1", mins_ago(2))]);
+        assert!(c.plan().is_empty());
+    }
+
+    #[test]
+    fn a_wrong_model_on_the_port_is_shown_on_the_replica() {
+        let mut c = Case::new(spec(1));
+        c.replicas = vec![rv("pending", "1", None, 60)];
+        c.jobs = HashMap::from([running("1", "n1", mins_ago(2))]);
+        c.notes.insert(
+            c.replicas[0].id,
+            "The server on port 8001 serves qwen3, not my-model.".into(),
+        );
+        let a = c.plan();
+        assert_eq!(submits(&a), 0);
+        assert!(detail_of(&a, c.replicas[0].id).unwrap().contains("qwen3"));
     }
 
     #[test]
     fn healthy_without_endpoint_is_repromoted() {
-        // Stranded "healthy" with no endpoint linked (a prior promote whose
-        // endpoint write failed) must be re-promoted so it relinks an endpoint.
-        let r = rv("healthy", "j1", None, 300);
-        let id = r.id;
-        let jobs = HashMap::from([job("j1", JobState::Running, &["gpu7"])]);
-        let health = HashMap::from([(id, 8000u16)]);
-        let actions = plan(&spec(1), &[r], &jobs, &health, &HashSet::new(), 900);
-        assert_eq!(
-            actions,
-            vec![Action::Promote {
-                replica_id: id,
-                api_base: "http://gpu7:8000/v1".into()
-            }]
-        );
+        let mut c = Case::new(spec(1));
+        c.replicas = vec![served("1", None, "n1", mins_ago(30))];
+        c.jobs = HashMap::from([running("1", "n1", mins_ago(30))]);
+        c.health.insert(c.replicas[0].id, 8000);
+        assert!(matches!(c.plan().as_slice(), [Action::Promote { .. }]));
     }
 
     #[test]
-    fn healthy_with_endpoint_is_not_repromoted() {
-        // A properly-linked healthy replica must NOT be re-promoted, even if a
-        // stale health entry exists for it.
-        let r = rv("healthy", "j1", Some(Uuid::new_v4()), 300);
-        let id = r.id;
-        let jobs = HashMap::from([job("j1", JobState::Running, &["gpu7"])]);
-        let health = HashMap::from([(id, 8000u16)]);
-        let actions = plan(&spec(1), &[r], &jobs, &health, &HashSet::new(), 900);
-        assert!(actions.is_empty(), "got {actions:?}");
-    }
-
-    #[test]
-    fn clear_dangling_endpoints_nulls_only_missing_healthy_refs() {
-        let live_ep = Uuid::new_v4();
-        let dead_ep = Uuid::new_v4();
-        let mut replicas = vec![
-            rv("healthy", "j1", Some(live_ep), 100), // still registered -> kept
-            rv("healthy", "j2", Some(dead_ep), 100), // removed out of band -> nulled
-            rv("healthy", "j3", None, 100),          // already none -> unchanged
-            rv("starting", "j4", Some(dead_ep), 100), // not healthy -> left alone
+    fn clear_dangling_endpoints_nulls_missing_refs_in_any_state() {
+        let live = Uuid::new_v4();
+        let mut rs = vec![
+            rv("healthy", "1", Some(live), 1),
+            rv("healthy", "2", Some(Uuid::new_v4()), 1),
+            rv("pending", "3", Some(Uuid::new_v4()), 1),
         ];
-        clear_dangling_endpoints(&mut replicas, &HashSet::from([live_ep]));
-        assert_eq!(replicas[0].endpoint_id, Some(live_ep));
-        assert_eq!(replicas[1].endpoint_id, None);
-        assert_eq!(replicas[2].endpoint_id, None);
-        assert_eq!(replicas[3].endpoint_id, Some(dead_ep));
+        clear_dangling_endpoints(&mut rs, &HashSet::from([live]));
+        assert_eq!(rs[0].endpoint_id, Some(live));
+        assert_eq!(rs[1].endpoint_id, None);
+        assert_eq!(rs[2].endpoint_id, None);
     }
 
     #[test]
-    fn dangling_endpoint_is_repromoted_after_clear() {
-        // End-to-end for the "2 healthy replicas, 1 endpoint" split: a healthy
-        // replica whose endpoint was removed out of band is nulled by
-        // clear_dangling_endpoints, then re-promoted by the planner so it relinks
-        // a fresh endpoint instead of serving a phantom forever.
-        let dead_ep = Uuid::new_v4();
-        let mut replicas = vec![rv("healthy", "j1", Some(dead_ep), 300)];
-        let id = replicas[0].id;
-        let jobs = HashMap::from([job("j1", JobState::Running, &["gpu7"])]);
-        let health = HashMap::from([(id, 8000u16)]);
-        // Gateway no longer has that endpoint registered.
-        clear_dangling_endpoints(&mut replicas, &HashSet::new());
-        let actions = plan(&spec(1), &replicas, &jobs, &health, &HashSet::new(), 900);
+    fn an_unknown_job_state_is_left_alone_and_counts_as_alive() {
+        let mut c = Case::new(spec(1));
+        c.replicas = vec![served("1", Some(Uuid::new_v4()), "n1", mins_ago(5))];
+        c.jobs = HashMap::from([job("1", JobState::Unknown, &["n1"])]);
+        assert!(c.plan().is_empty());
+    }
+
+    // ---- requeue, suspend, restart ----
+
+    #[test]
+    fn a_requeued_job_is_demoted_at_once_and_still_counts() {
+        let ep = Uuid::new_v4();
+        let mut c = Case::new(spec(1));
+        c.replicas = vec![served("1", Some(ep), "n1", mins_ago(30))];
+        let (k, mut j) = job("1", JobState::Pending, &[]);
+        j.state_flags = vec!["PENDING".into(), "REQUEUED".into()];
+        j.restart_count = 1;
+        c.jobs = HashMap::from([(k, j)]);
+        let a = c.plan();
         assert_eq!(
-            actions,
-            vec![Action::Promote {
-                replica_id: id,
-                api_base: "http://gpu7:8000/v1".into()
+            a,
+            vec![Action::Demote {
+                replica_id: c.replicas[0].id,
+                endpoint_id: Some(ep),
+                detail: REQUEUED_DETAIL.into(),
             }]
         );
     }
 
     #[test]
-    fn starting_but_unhealthy_does_not_promote_and_does_not_oversubmit() {
-        let r = rv("starting", "j1", None, 30);
-        let jobs = HashMap::from([job("j1", JobState::Running, &["gpu7"])]);
-        let health: HashMap<Uuid, u16> = HashMap::new();
-        let actions = plan(&spec(1), &[r], &jobs, &health, &HashSet::new(), 900);
-        // still "alive" (counts toward target), so no submit, no promote.
-        assert!(actions.is_empty(), "got {actions:?}");
+    fn a_job_restarted_on_another_node_is_demoted() {
+        let mut c = Case::new(spec(1));
+        c.replicas = vec![served("1", Some(Uuid::new_v4()), "n1", mins_ago(30))];
+        c.jobs = HashMap::from([running("1", "n2", mins_ago(1))]);
+        c.health.insert(c.replicas[0].id, 8000);
+        let a = c.plan();
+        assert_eq!(a.len(), 1, "{a:?}");
+        match &a[0] {
+            Action::Demote { detail, .. } => assert!(detail.contains("n2"), "{detail}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(submits(&a), 0);
     }
 
     #[test]
-    fn preempted_job_marks_lost_and_resubmits() {
-        let ep = Uuid::new_v4();
-        let r = rv("healthy", "j1", Some(ep), 500);
-        let id = r.id;
-        // job gone from slurm entirely
-        let actions = plan(
-            &spec(1),
-            &[r],
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashSet::new(),
-            900,
-        );
-        assert!(actions.contains(&Action::MarkLost {
-            replica_id: id,
-            endpoint_id: Some(ep),
-            raw_state: None,
+    fn a_new_start_time_on_the_same_node_is_demoted_too() {
+        let mut c = Case::new(spec(1));
+        c.replicas = vec![served("1", Some(Uuid::new_v4()), "n1", mins_ago(30))];
+        c.jobs = HashMap::from([running("1", "n1", mins_ago(1))]);
+        assert!(matches!(c.plan().as_slice(), [Action::Demote { .. }]));
+    }
+
+    #[test]
+    fn a_demoted_replica_is_promoted_again_when_it_serves() {
+        let mut c = Case::new(spec(1));
+        let mut r = served("1", None, "n1", mins_ago(30));
+        r.state = "pending".into();
+        r.state_detail = Some(REQUEUED_DETAIL.into());
+        c.replicas = vec![r];
+        c.jobs = HashMap::from([running("1", "n2", mins_ago(1))]);
+        c.health.insert(c.replicas[0].id, 8000);
+        match c.plan().as_slice() {
+            [Action::Promote {
+                api_base,
+                job_started_at,
+                ..
+            }] => {
+                assert_eq!(api_base, "http://n2:8000/v1");
+                assert_eq!(*job_started_at, Some(mins_ago(1)));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // ---- failure accounting ----
+
+    #[test]
+    fn a_launch_that_never_served_counts_as_failed() {
+        let mut c = Case::new(spec(1));
+        c.replicas = vec![rv("pending", "1", None, 600)];
+        c.jobs = HashMap::from([ended("1", "FAILED")]);
+        let a = c.plan();
+        assert!(a.contains(&Action::MarkLost {
+            replica_id: c.replicas[0].id,
+            endpoint_id: None,
+            raw_state: Some("FAILED".into()),
             reason: None,
+            failed_launch: true,
         }));
-        assert!(actions.contains(&Action::Submit));
+        assert_eq!(submits(&a), 1);
+        assert!(is_failed_launch(&a[0], &c.replicas));
     }
 
     #[test]
-    fn excess_replicas_are_cancelled_pending_first() {
-        let healthy = rv("healthy", "j1", Some(Uuid::new_v4()), 1000);
-        let pending = rv("pending", "j2", None, 10);
-        let pid = pending.id;
-        let jobs = HashMap::from([
-            job("j1", JobState::Running, &["n1"]),
-            job("j2", JobState::Pending, &[""]),
-        ]);
-        let actions = plan(
-            &spec(1),
-            &[healthy, pending],
-            &jobs,
-            &HashMap::new(),
-            &HashSet::new(),
-            900,
-        );
-        assert_eq!(
-            actions,
-            vec![Action::Cancel {
-                replica_id: pid,
-                job_id: "j2".into(),
-                endpoint_id: None,
-                reason: CancelReason::ScaleDown
-            }]
-        );
+    fn the_failure_that_reaches_the_limit_submits_no_replacement() {
+        // Limit 2, one failure already counted: this tick's failure is the
+        // second, so it pauses and no third job goes out.
+        let mut s = spec(1);
+        s.max_job_failures = 2;
+        s.failed_launches = 1;
+        let mut c = Case::new(s.clone());
+        c.replicas = vec![rv("pending", "1", None, 600)];
+        c.jobs = HashMap::from([ended("1", "FAILED")]);
+        assert_eq!(submits(&c.plan()), 0);
+        // Below the limit the replacement still goes out.
+        s.failed_launches = 0;
+        let mut c = Case::new(s.clone());
+        c.replicas = vec![rv("pending", "1", None, 600)];
+        c.jobs = HashMap::from([ended("1", "FAILED")]);
+        assert_eq!(submits(&c.plan()), 1);
+        // No limit: always replaced.
+        s.max_job_failures = 0;
+        s.failed_launches = 5;
+        let mut c = Case::new(s);
+        c.replicas = vec![rv("pending", "1", None, 600)];
+        c.jobs = HashMap::from([ended("1", "FAILED")]);
+        assert_eq!(submits(&c.plan()), 1);
     }
 
     #[test]
-    fn cancel_requested_replica_is_cancelled_and_replaced() {
-        let ep = Uuid::new_v4();
-        let mut r = rv("healthy", "j1", Some(ep), 100);
+    fn walltime_and_preemption_after_serving_are_not_failures() {
+        for raw in ["TIMEOUT", "PREEMPTED", "NODE_FAIL", "FAILED"] {
+            let mut c = Case::new(spec(1));
+            c.replicas = vec![served("1", Some(Uuid::new_v4()), "n1", mins_ago(300))];
+            c.jobs = HashMap::from([ended("1", raw)]);
+            let a = c.plan();
+            assert!(
+                a.iter().any(|x| matches!(
+                    x,
+                    Action::MarkLost {
+                        failed_launch: false,
+                        ..
+                    }
+                )),
+                "{raw}: {a:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn preemption_and_outside_cancels_before_serving_are_not_failures() {
+        for raw in ["PREEMPTED", "NODE_FAIL", "CANCELLED"] {
+            let mut c = Case::new(spec(1));
+            c.replicas = vec![rv("pending", "1", None, 60)];
+            c.jobs = HashMap::from([ended("1", raw)]);
+            assert!(!is_failed_launch(&c.plan()[0], &c.replicas), "{raw}");
+        }
+        // A job gone without a trace while it never served does count.
+        let mut c = Case::new(spec(1));
+        c.replicas = vec![rv("starting", "1", None, 60)];
+        assert!(is_failed_launch(&c.plan()[0], &c.replicas));
+    }
+
+    #[test]
+    fn a_stopped_replica_ending_is_not_a_failure() {
+        let mut c = Case::new(spec(1));
+        let mut r = rv("pending", "1", None, 60);
         r.cancel_requested = true;
-        let id = r.id;
-        let jobs = HashMap::from([job("j1", JobState::Running, &["n1"])]);
-        let actions = plan(&spec(1), &[r], &jobs, &HashMap::new(), &HashSet::new(), 900);
-        // Cancelled (with its endpoint) regardless of target, and a fresh replica
-        // submitted to refill — i.e. a restart.
-        assert!(actions.contains(&Action::Cancel {
-            replica_id: id,
-            job_id: "j1".into(),
-            endpoint_id: Some(ep),
-            reason: CancelReason::OperatorRestart
-        }));
-        assert!(actions.contains(&Action::Submit));
+        c.replicas = vec![r];
+        c.jobs = HashMap::from([ended("1", "CANCELLED")]);
+        assert!(!is_failed_launch(&c.plan()[0], &c.replicas));
     }
 
     #[test]
-    fn cancel_carries_the_replicas_endpoint_id() {
-        let ep = Uuid::new_v4();
-        let h1 = rv("healthy", "j1", Some(ep), 1000); // oldest -> cancelled first within rank
-        let h1id = h1.id;
-        let h2 = rv("healthy", "j2", Some(Uuid::new_v4()), 500);
-        let jobs = HashMap::from([
-            job("j1", JobState::Running, &["n1"]),
-            job("j2", JobState::Running, &["n2"]),
+    fn lost_rows_age_from_when_they_were_lost() {
+        let mut c = Case::new(spec(0));
+        let mut fresh = rv("lost", "1", None, 10_000);
+        fresh.updated_secs = 30;
+        let mut old = rv("lost", "2", None, 10_000);
+        old.updated_secs = 901;
+        c.replicas = vec![fresh, old];
+        assert_eq!(
+            c.plan(),
+            vec![Action::Delete {
+                replica_id: c.replicas[1].id
+            }]
+        );
+    }
+
+    #[test]
+    fn paused_models_do_not_submit_until_the_pause_ends() {
+        let mut s = spec(2);
+        s.paused_until = Some(now() + chrono::Duration::minutes(5));
+        assert_eq!(submits(&Case::new(s.clone()).plan()), 0);
+        s.paused_until = Some(now() - chrono::Duration::seconds(1));
+        assert_eq!(submits(&Case::new(s).plan()), 2);
+    }
+
+    #[test]
+    fn backoff_ladder_is_5_15_30_60_then_hourly() {
+        let steps: Vec<i64> = (1..=6).map(backoff_minutes).collect();
+        assert_eq!(steps, vec![5, 15, 30, 60, 60, 60]);
+    }
+
+    #[test]
+    fn failures_pause_at_the_limit_and_climb_the_ladder() {
+        let fail = |how: &str| LaunchOutcome {
+            failed: 1,
+            last_failure: Some(how.into()),
+            ..Default::default()
+        };
+        let b0 = ManagedBackoff::default();
+        let b1 = next_backoff(&b0, 2, &fail("ended FAILED"), now()).unwrap();
+        assert_eq!((b1.failed_launches, b1.backoff_step), (1, 0));
+        assert!(b1.paused_until.is_none());
+        let b2 = next_backoff(&b1, 2, &fail("ended FAILED (OutOfMemory)"), now()).unwrap();
+        assert_eq!(b2.backoff_step, 1);
+        assert_eq!(b2.paused_until, Some(now() + chrono::Duration::minutes(5)));
+        let reason = b2.paused_reason.clone().unwrap();
+        assert!(reason.starts_with("2 launches in a row"), "{reason}");
+        assert!(reason.contains("OutOfMemory"), "{reason}");
+        let b3 = next_backoff(&b2, 2, &fail("ended FAILED"), now()).unwrap();
+        assert_eq!(b3.backoff_step, 2);
+        assert_eq!(b3.paused_until, Some(now() + chrono::Duration::minutes(15)));
+        // A launch that serves resets everything.
+        let ok = LaunchOutcome {
+            served: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            next_backoff(&b3, 2, &ok, now()),
+            Some(ManagedBackoff::default())
+        );
+        // Nothing happened: no write.
+        assert_eq!(next_backoff(&b0, 2, &LaunchOutcome::default(), now()), None);
+        // No limit: failures are counted but never pause.
+        let b = next_backoff(&b0, 0, &fail("ended FAILED"), now()).unwrap();
+        assert!(b.paused_until.is_none() && b.failed_launches == 1);
+    }
+
+    #[test]
+    fn a_rejected_submit_backs_off_whatever_the_limit() {
+        let out = LaunchOutcome {
+            rejected: Some("Slurm rejected the job: Invalid account.".into()),
+            ..Default::default()
+        };
+        let b = next_backoff(&ManagedBackoff::default(), 0, &out, now()).unwrap();
+        assert_eq!(b.backoff_step, 1);
+        assert_eq!(b.paused_until, Some(now() + chrono::Duration::minutes(5)));
+        assert_eq!(
+            b.paused_reason.as_deref(),
+            Some("Slurm rejected the job: Invalid account.")
+        );
+        let b2 = next_backoff(&b, 0, &out, now()).unwrap();
+        assert_eq!(b2.paused_until, Some(now() + chrono::Duration::minutes(15)));
+    }
+
+    // ---- startup timeout and stuck jobs ----
+
+    #[test]
+    fn a_server_that_never_becomes_healthy_is_cancelled_after_the_startup_timeout() {
+        let mut c = Case::new(spec(1));
+        c.replicas = vec![rv("pending", "1", None, 4000)];
+        c.jobs = HashMap::from([running("1", "n1", mins_ago(59))]);
+        assert!(c.plan().is_empty());
+        c.jobs = HashMap::from([running("1", "n1", mins_ago(61))]);
+        let a = c.plan();
+        assert_eq!(
+            cancel_of(&a, c.replicas[0].id),
+            Some((CancelReason::StartupTimeout, true))
+        );
+        assert_eq!(submits(&a), 1, "a replacement is submitted");
+        assert!(is_failed_launch(&a[0], &c.replicas));
+        // 0 never gives up.
+        c.spec.startup_timeout_mins = 0;
+        assert!(c.plan().is_empty());
+    }
+
+    #[test]
+    fn a_requeued_replica_that_served_is_not_a_failed_launch_on_timeout() {
+        let mut c = Case::new(spec(1));
+        let mut r = served("1", None, "n1", mins_ago(500));
+        r.state = "pending".into();
+        c.replicas = vec![r];
+        c.jobs = HashMap::from([running("1", "n2", mins_ago(61))]);
+        let a = c.plan();
+        assert_eq!(
+            cancel_of(&a, c.replicas[0].id),
+            Some((CancelReason::StartupTimeout, true))
+        );
+        assert!(!is_failed_launch(&a[0], &c.replicas));
+    }
+
+    #[test]
+    fn a_held_job_is_flagged_then_cancelled_after_the_startup_timeout() {
+        let mut c = Case::new(spec(1));
+        c.replicas = vec![rv("pending", "1", None, 60)];
+        let (k, mut j) = job("1", JobState::Pending, &[]);
+        j.reason = Some("JobHeldAdmin".into());
+        c.jobs = HashMap::from([(k, j)]);
+        let a = c.plan();
+        assert_eq!(submits(&a), 0);
+        let d = detail_of(&a, c.replicas[0].id).unwrap();
+        assert!(d.contains("holding") && d.contains("JobHeldAdmin"), "{d}");
+        c.waited.insert(c.replicas[0].id, 3600);
+        let a = c.plan();
+        assert_eq!(
+            cancel_of(&a, c.replicas[0].id),
+            Some((CancelReason::Stuck, true))
+        );
+        assert_eq!(submits(&a), 1);
+    }
+
+    #[test]
+    fn stuck_reasons_are_classified() {
+        let with = |reason: &str| {
+            let (_, mut j) = job("1", JobState::Pending, &[]);
+            j.reason = Some(reason.into());
+            stuck_reason(&j)
+        };
+        assert_eq!(with("JobHeldUser"), Some(Stuck::Held));
+        assert_eq!(with("launch failed requeued held"), Some(Stuck::Held));
+        assert_eq!(with("BadConstraints"), Some(Stuck::NeverRuns));
+        assert_eq!(with("PartitionConfig"), Some(Stuck::NeverRuns));
+        assert_eq!(
+            with("QOSMaxWallDurationPerJobLimit"),
+            Some(Stuck::NeverRuns)
+        );
+        assert_eq!(with("QOSMaxGRESPerJob"), Some(Stuck::NeverRuns));
+        assert_eq!(with("QOSMaxJobsPerUserLimit"), Some(Stuck::Limited));
+        assert_eq!(with("Resources"), None);
+        assert_eq!(with("Priority"), None);
+    }
+
+    // ---- handoff and replacement ----
+
+    fn near_limit(id: &str, node: &str, ends_in_mins: i64) -> (String, JobInfo) {
+        let (k, mut j) = running(id, node, mins_ago(240 - ends_in_mins));
+        j.time_limit_mins = Some(240);
+        j.end_time = Some(now() + chrono::Duration::minutes(ends_in_mins));
+        (k, j)
+    }
+
+    #[test]
+    fn a_job_near_its_time_limit_gets_a_successor_first() {
+        let mut c = Case::new(spec(1));
+        let mut old = served("1", Some(Uuid::new_v4()), "n1", mins_ago(230));
+        old.job_ends_at = Some(now() + chrono::Duration::minutes(10));
+        c.replicas = vec![old];
+        c.jobs = HashMap::from([near_limit("1", "n1", 10)]);
+        c.health.insert(c.replicas[0].id, 8000);
+        let a = c.plan();
+        assert_eq!(submits(&a), 1);
+        assert!(cancel_of(&a, c.replicas[0].id).is_none(), "kept serving");
+        let d = detail_of(&a, c.replicas[0].id).unwrap();
+        assert!(d.contains("12:10 UTC"), "{d}");
+    }
+
+    #[test]
+    fn the_old_replica_drains_once_its_successor_serves() {
+        let mut c = Case::new(spec(1));
+        let old = served("1", Some(Uuid::new_v4()), "n1", mins_ago(235));
+        let new = served("2", Some(Uuid::new_v4()), "n2", mins_ago(5));
+        c.replicas = vec![old, new];
+        c.jobs = HashMap::from([near_limit("1", "n1", 5), running("2", "n2", mins_ago(5))]);
+        let a = c.plan();
+        assert_eq!(submits(&a), 0);
+        assert_eq!(
+            cancel_of(&a, c.replicas[0].id),
+            Some((CancelReason::Replaced, false))
+        );
+        assert!(cancel_of(&a, c.replicas[1].id).is_none());
+    }
+
+    #[test]
+    fn the_old_replica_drains_on_the_tick_its_successor_is_promoted() {
+        let mut c = Case::new(spec(1));
+        let old = served("1", Some(Uuid::new_v4()), "n1", mins_ago(235));
+        let new = rv("pending", "2", None, 600);
+        c.replicas = vec![old, new];
+        c.jobs = HashMap::from([near_limit("1", "n1", 5), running("2", "n2", mins_ago(5))]);
+        c.health.insert(c.replicas[1].id, 8008);
+        let a = c.plan();
+        let promote = a
+            .iter()
+            .position(|x| matches!(x, Action::Promote { .. }))
+            .unwrap();
+        let drain = a
+            .iter()
+            .position(|x| matches!(x, Action::Cancel { .. }))
+            .unwrap();
+        assert!(promote < drain, "the successor is registered first: {a:?}");
+        assert_eq!(submits(&a), 0);
+    }
+
+    #[test]
+    fn no_handoff_when_the_limit_is_too_short_or_off() {
+        let mut c = Case::new(spec(1));
+        c.replicas = vec![served("1", Some(Uuid::new_v4()), "n1", mins_ago(15))];
+        let (k, mut j) = running("1", "n1", mins_ago(15));
+        j.time_limit_mins = Some(20);
+        j.end_time = Some(now() + chrono::Duration::minutes(5));
+        c.replicas[0].job_ends_at = j.end_time;
+        c.jobs = HashMap::from([(k, j)]);
+        assert!(c.plan().is_empty());
+        c.jobs = HashMap::from([near_limit("1", "n1", 5)]);
+        c.replicas[0].job_ends_at = Some(now() + chrono::Duration::minutes(5));
+        c.replicas[0].job_started_at = Some(mins_ago(235));
+        c.spec.handoff_mins = 0;
+        assert!(c.plan().is_empty(), "{:?}", c.plan());
+    }
+
+    #[test]
+    fn a_roll_replaces_one_replica_at_a_time() {
+        let mut c = Case::new(spec(2));
+        let mut a1 = served("1", Some(Uuid::new_v4()), "n1", mins_ago(60));
+        a1.replace_requested = true;
+        a1.age_secs = 7200;
+        let mut a2 = served("2", Some(Uuid::new_v4()), "n2", mins_ago(30));
+        a2.replace_requested = true;
+        c.replicas = vec![a1, a2];
+        c.jobs = HashMap::from([
+            running("1", "n1", mins_ago(60)),
+            running("2", "n2", mins_ago(30)),
         ]);
-        let actions = plan(
-            &spec(1),
-            &[h1, h2],
-            &jobs,
-            &HashMap::new(),
-            &HashSet::new(),
-            900,
+        let a = c.plan();
+        assert_eq!(submits(&a), 1, "{a:?}");
+        assert!(
+            detail_of(&a, c.replicas[0].id).is_some(),
+            "the oldest goes first"
+        );
+        assert!(detail_of(&a, c.replicas[1].id).is_none());
+    }
+
+    #[test]
+    fn a_replacement_that_never_serves_still_restarts_after_the_timeout() {
+        let mut c = Case::new(spec(1));
+        let mut old = served("1", Some(Uuid::new_v4()), "n1", mins_ago(120));
+        old.replace_requested = true;
+        c.replicas = vec![old, rv("pending", "2", None, 60)];
+        let (k, j) = job("2", JobState::Pending, &[]);
+        c.jobs = HashMap::from([running("1", "n1", mins_ago(120)), (k, j)]);
+        assert!(cancel_of(&c.plan(), c.replicas[0].id).is_none());
+        c.waited.insert(c.replicas[0].id, 3600);
+        assert_eq!(
+            cancel_of(&c.plan(), c.replicas[0].id),
+            Some((CancelReason::Replaced, false))
+        );
+    }
+
+    #[test]
+    fn an_unhealthy_last_replica_keeps_its_slot_until_a_successor_serves() {
+        let mut c = Case::new(spec(1));
+        c.replicas = vec![served("1", Some(Uuid::new_v4()), "n1", mins_ago(300))];
+        c.jobs = HashMap::from([running("1", "n1", mins_ago(300))]);
+        c.heal.dead.insert(c.replicas[0].id);
+        c.waited.insert(c.replicas[0].id, 7200);
+        let a = c.plan();
+        assert!(cancel_of(&a, c.replicas[0].id).is_none(), "{a:?}");
+        assert_eq!(submits(&a), 1);
+    }
+
+    #[test]
+    fn replacing_a_replica_that_does_not_serve_yet_cancels_it_at_once() {
+        let mut c = Case::new(spec(1));
+        let mut r = rv("pending", "1", None, 60);
+        r.replace_requested = true;
+        c.replicas = vec![r];
+        c.jobs = HashMap::from([job("1", JobState::Pending, &[])]);
+        let a = c.plan();
+        assert_eq!(
+            cancel_of(&a, c.replicas[0].id),
+            Some((CancelReason::OperatorRestart, true))
+        );
+        assert_eq!(submits(&a), 1);
+    }
+
+    #[test]
+    fn stopping_a_serving_replica_drains_it_first() {
+        let mut c = Case::new(spec(1));
+        let mut r = served("1", Some(Uuid::new_v4()), "n1", mins_ago(30));
+        r.cancel_requested = true;
+        c.replicas = vec![r];
+        c.jobs = HashMap::from([running("1", "n1", mins_ago(30))]);
+        let a = c.plan();
+        assert_eq!(
+            cancel_of(&a, c.replicas[0].id),
+            Some((CancelReason::OperatorRestart, false))
+        );
+        assert_eq!(submits(&a), 1);
+    }
+
+    // ---- scale-down and drain ----
+
+    #[test]
+    fn scale_down_keeps_the_oldest_queued_job_and_drains_serving_gracefully() {
+        let mut c = Case::new(spec(1));
+        c.replicas = vec![
+            rv("pending", "old", None, 21_600),
+            rv("pending", "mid", None, 60),
+            rv("pending", "new", None, 30),
+        ];
+        c.jobs = HashMap::from([
+            job("old", JobState::Pending, &[]),
+            job("mid", JobState::Pending, &[]),
+            job("new", JobState::Pending, &[]),
+        ]);
+        let a = c.plan();
+        assert!(cancel_of(&a, c.replicas[0].id).is_none(), "{a:?}");
+        assert_eq!(
+            cancel_of(&a, c.replicas[1].id),
+            Some((CancelReason::ScaleDown, true))
         );
         assert_eq!(
-            actions,
+            cancel_of(&a, c.replicas[2].id),
+            Some((CancelReason::ScaleDown, true))
+        );
+
+        // Serving replicas go last, oldest first, with a graceful drain.
+        let mut c = Case::new(spec(1));
+        let mut older = served("a", Some(Uuid::new_v4()), "n1", mins_ago(300));
+        older.age_secs = 18_000;
+        let newer = served("b", Some(Uuid::new_v4()), "n2", mins_ago(10));
+        c.replicas = vec![older, newer, rv("starting", "c", None, 120)];
+        c.jobs = HashMap::from([
+            running("a", "n1", mins_ago(300)),
+            running("b", "n2", mins_ago(10)),
+            running("c", "n3", mins_ago(1)),
+        ]);
+        let a = c.plan();
+        assert_eq!(
+            cancel_of(&a, c.replicas[2].id),
+            Some((CancelReason::ScaleDown, true))
+        );
+        assert_eq!(
+            cancel_of(&a, c.replicas[0].id),
+            Some((CancelReason::ScaleDown, false))
+        );
+        assert!(cancel_of(&a, c.replicas[1].id).is_none());
+    }
+
+    #[test]
+    fn a_requeued_replica_picked_for_scale_down_is_cancelled_not_demoted() {
+        let ep = Uuid::new_v4();
+        let mut c = Case::new(spec(0));
+        c.replicas = vec![served("1", Some(ep), "n1", mins_ago(30))];
+        c.jobs = HashMap::from([job("1", JobState::Pending, &[])]);
+        assert_eq!(
+            c.plan(),
             vec![Action::Cancel {
-                replica_id: h1id,
-                job_id: "j1".into(),
+                replica_id: c.replicas[0].id,
+                job_id: "1".into(),
                 endpoint_id: Some(ep),
-                reason: CancelReason::ScaleDown
+                reason: CancelReason::ScaleDown,
+                cancel_now: true,
             }]
         );
     }
 
     #[test]
-    fn pending_replica_with_running_job_is_promoted_when_healthy() {
-        // Replicas are created in "pending" state. Once the Slurm job transitions
-        // to Running they should be promoted directly (no separate MarkStarting
-        // step), just like a "starting" replica would be.
-        let r = rv("pending", "j1", None, 30);
-        let id = r.id;
-        let jobs = HashMap::from([job("j1", JobState::Running, &["gpu7"])]);
-        let health = HashMap::from([(id, 8000u16)]);
-        let actions = plan(&spec(1), &[r], &jobs, &health, &HashSet::new(), 900);
+    fn a_removed_model_drains_everything() {
+        let mut s = spec(0);
+        s.removed = true;
+        let mut c = Case::new(s);
+        c.replicas = vec![served("1", Some(Uuid::new_v4()), "n1", mins_ago(30))];
+        c.jobs = HashMap::from([running("1", "n1", mins_ago(30))]);
         assert_eq!(
-            actions,
-            vec![Action::Promote {
-                replica_id: id,
-                api_base: "http://gpu7:8000/v1".into()
-            }]
+            cancel_of(&c.plan(), c.replicas[0].id),
+            Some((CancelReason::Removed, false))
         );
     }
 
     #[test]
-    fn pending_replica_with_running_job_and_unhealthy_does_not_promote() {
-        let r = rv("pending", "j1", None, 30);
-        let jobs = HashMap::from([job("j1", JobState::Running, &["gpu7"])]);
-        let health: HashMap<Uuid, u16> = HashMap::new();
-        let actions = plan(&spec(1), &[r], &jobs, &health, &HashSet::new(), 900);
-        assert!(actions.is_empty(), "got {actions:?}");
-    }
-
-    #[test]
-    fn old_lost_rows_are_gced() {
-        let r = rv("lost", "j1", None, 5000);
-        let id = r.id;
-        let actions = plan(
-            &spec(0),
-            &[r],
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashSet::new(),
-            900,
-        );
-        assert!(actions.contains(&Action::Delete { replica_id: id }));
-    }
-
-    #[test]
-    fn failure_limit_suppresses_submit_when_reached() {
-        // 3 lost replicas, limit = 3 → no new Submit
-        let lost: Vec<ReplicaView> = (0..3)
-            .map(|i| rv("lost", &format!("j{i}"), None, 60))
-            .collect();
-        let actions = plan(
-            &spec_with_limit(2, 3),
-            &lost,
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashSet::new(),
-            900,
-        );
-        assert!(
-            !actions.contains(&Action::Submit),
-            "submit must be suppressed at limit"
-        );
-    }
-
-    #[test]
-    fn failure_limit_counts_the_job_that_just_ended() {
-        // limit = 2: one job already lost, and the replacement's job is gone
-        // on this tick. That is the second failure, so nothing new is submitted.
-        let replicas = vec![rv("lost", "j0", None, 60), rv("pending", "j1", None, 30)];
-        let actions = plan(
-            &spec_with_limit(1, 2),
-            &replicas,
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashSet::new(),
-            900,
-        );
-        assert!(actions.iter().any(|a| matches!(a, Action::MarkLost { .. })));
-        assert!(
-            !actions.contains(&Action::Submit),
-            "the second failure reaches a limit of 2"
-        );
-    }
-
-    #[test]
-    fn failure_limit_allows_submit_below_threshold() {
-        // 2 lost replicas, limit = 5 → still submits
-        let lost: Vec<ReplicaView> = (0..2)
-            .map(|i| rv("lost", &format!("j{i}"), None, 60))
-            .collect();
-        let actions = plan(
-            &spec_with_limit(2, 5),
-            &lost,
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashSet::new(),
-            900,
-        );
-        assert!(actions.contains(&Action::Submit));
-    }
-
-    #[test]
-    fn zero_limit_means_no_cap() {
-        // 100 lost replicas, limit = 0 → unlimited, still submits
-        let lost: Vec<ReplicaView> = (0..100)
-            .map(|i| rv("lost", &format!("j{i}"), None, 60))
-            .collect();
-        let actions = plan(
-            &spec(2),
-            &lost,
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashSet::new(),
-            900,
-        );
-        assert!(actions.contains(&Action::Submit));
-    }
-
-    #[test]
-    fn terminal_job_still_listed_marks_lost_with_its_slurm_state() {
-        // The job is still visible in slurmrestd in a terminal state: MarkLost
-        // carries Slurm's state and reason for the launch history.
-        let ep = Uuid::new_v4();
-        let r = rv("healthy", "j1", Some(ep), 500);
-        let id = r.id;
-        let (k, mut info) = job("j1", JobState::Gone, &["n1"]);
-        info.raw_state = "TIMEOUT".into();
-        info.reason = Some("TimeLimit".into());
-        let jobs = HashMap::from([(k, info)]);
-        let actions = plan(&spec(1), &[r], &jobs, &HashMap::new(), &HashSet::new(), 900);
-        assert!(
-            actions.contains(&Action::MarkLost {
-                replica_id: id,
-                endpoint_id: Some(ep),
-                raw_state: Some("TIMEOUT".into()),
-                reason: Some("TimeLimit".into()),
-            }),
-            "got {actions:?}"
-        );
-        assert!(actions.contains(&Action::Submit));
-    }
-
-    #[test]
-    fn lost_message_formats_state_reason_and_gone() {
-        assert_eq!(lost_message(None, None), "job gone");
-        assert_eq!(lost_message(Some(""), Some("x")), "job gone");
-        assert_eq!(lost_message(Some("FAILED"), None), "job ended: FAILED");
-        assert_eq!(
-            lost_message(Some("OUT_OF_MEMORY"), Some("OutOfMemory")),
-            "job ended: OUT_OF_MEMORY (OutOfMemory)"
-        );
-    }
-
-    #[test]
-    fn draining_replica_with_gone_job_is_deleted() {
-        // Job already terminated (Gone) -> the stuck draining row must be deleted.
-        let r = rv("draining", "j1", None, 120);
-        let id = r.id;
-        let jobs = HashMap::from([job("j1", JobState::Gone, &[])]);
-        let actions = plan(&spec(1), &[r], &jobs, &HashMap::new(), &HashSet::new(), 900);
-        assert!(
-            actions.contains(&Action::Delete { replica_id: id }),
-            "got {actions:?}"
-        );
-    }
-
-    #[test]
-    fn draining_replica_with_absent_job_is_deleted() {
-        // Job purged from Slurm entirely (absent from the map) -> delete the row.
-        let r = rv("draining", "j1", None, 120);
-        let id = r.id;
-        let actions = plan(
-            &spec(1),
-            &[r],
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashSet::new(),
-            900,
-        );
-        assert!(
-            actions.contains(&Action::Delete { replica_id: id }),
-            "got {actions:?}"
-        );
-    }
-
-    #[test]
-    fn draining_replica_with_running_job_is_left_alone() {
-        // Cancel still in flight (job not yet gone) -> no action for this replica.
-        let r = rv("draining", "j1", None, 10);
-        let id = r.id;
-        let jobs = HashMap::from([job("j1", JobState::Running, &["n1"])]);
-        // spec target 0 so the only possible action would concern this replica.
-        let actions = plan(&spec(0), &[r], &jobs, &HashMap::new(), &HashSet::new(), 900);
-        assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::Delete { replica_id } if *replica_id == id)),
-            "draining replica with a live job must be left alone; got {actions:?}"
-        );
-    }
-
-    #[test]
-    fn zombie_replica_in_restart_set_is_cancelled_and_replaced() {
-        // Slurm says RUNNING but the replica keeps failing probes (self-heal
-        // decided it's a zombie): cancel it — with its endpoint, so it leaves
-        // rotation immediately — and submit a fresh replacement this tick.
-        let ep = Uuid::new_v4();
-        let r = rv("healthy", "j1", Some(ep), 600);
-        let id = r.id;
-        let jobs = HashMap::from([job("j1", JobState::Running, &["n1"])]);
-        let restart = HashSet::from([id]);
-        let actions = plan(&spec(1), &[r], &jobs, &HashMap::new(), &restart, 900);
-        assert!(actions.contains(&Action::Cancel {
-            replica_id: id,
-            job_id: "j1".into(),
-            endpoint_id: Some(ep),
-            reason: CancelReason::ProbeFailed
-        }));
-        assert!(actions.contains(&Action::Submit));
-    }
-
-    #[test]
-    fn self_heal_restarts_are_capped_at_one_per_tick() {
-        // Two zombies at once (e.g. the provisioner lost its network path to the
-        // nodes): only ONE may be restarted per tick, so a false positive rolls
-        // the fleet gradually instead of mass-cancelling it.
-        let r1 = rv("healthy", "j1", Some(Uuid::new_v4()), 600);
-        let r2 = rv("healthy", "j2", Some(Uuid::new_v4()), 500);
-        let restart = HashSet::from([r1.id, r2.id]);
-        let jobs = HashMap::from([
-            job("j1", JobState::Running, &["n1"]),
-            job("j2", JobState::Running, &["n2"]),
+    fn draining_replicas_are_cancelled_after_the_grace_and_deleted_when_gone() {
+        let mut c = Case::new(spec(0));
+        let mut fresh = rv("draining", "1", None, 600);
+        fresh.updated_secs = 10;
+        let mut due = rv("draining", "2", None, 600);
+        due.updated_secs = DRAIN_GRACE_SECS;
+        c.replicas = vec![fresh, due, rv("draining", "3", None, 600)];
+        c.jobs = HashMap::from([
+            running("1", "n1", mins_ago(30)),
+            running("2", "n2", mins_ago(30)),
+            ended("3", "CANCELLED"),
         ]);
-        let actions = plan(&spec(2), &[r1, r2], &jobs, &HashMap::new(), &restart, 900);
-        let cancels = actions
-            .iter()
-            .filter(|a| matches!(a, Action::Cancel { .. }))
-            .count();
-        let submits = actions.iter().filter(|a| **a == Action::Submit).count();
+        let a = c.plan();
         assert_eq!(
-            cancels, 1,
-            "exactly one self-heal restart per tick: {actions:?}"
-        );
-        assert_eq!(
-            submits, 1,
-            "one replacement for the one cancel: {actions:?}"
-        );
-    }
-
-    #[test]
-    fn restart_set_is_ignored_when_job_already_gone() {
-        // The job died between the probe and the plan: MarkLost wins (normal
-        // lost/resubmit path), no Cancel is sent for a job that no longer exists.
-        let ep = Uuid::new_v4();
-        let r = rv("healthy", "j1", Some(ep), 600);
-        let id = r.id;
-        let restart = HashSet::from([id]);
-        let actions = plan(
-            &spec(1),
-            &[r],
-            &HashMap::new(),
-            &HashMap::new(),
-            &restart,
-            900,
-        );
-        assert!(actions.contains(&Action::MarkLost {
-            replica_id: id,
-            endpoint_id: Some(ep),
-            raw_state: None,
-            reason: None,
-        }));
-        assert!(
-            !actions.iter().any(|a| matches!(a, Action::Cancel { .. })),
-            "no cancel for a gone job: {actions:?}"
+            a,
+            vec![
+                Action::CancelJob {
+                    replica_id: c.replicas[1].id,
+                    job_id: "2".into()
+                },
+                Action::Delete {
+                    replica_id: c.replicas[2].id
+                },
+            ]
         );
     }
 
-    #[test]
-    fn operator_restart_is_not_consumed_by_the_self_heal_budget() {
-        // An operator cancel_requested and a self-heal restart in the same tick:
-        // both fire — the budget only limits self-heal cancels.
-        let mut r1 = rv("healthy", "j1", Some(Uuid::new_v4()), 600);
-        r1.cancel_requested = true;
-        let r2 = rv("healthy", "j2", Some(Uuid::new_v4()), 500);
-        let restart = HashSet::from([r1.id, r2.id]);
-        let jobs = HashMap::from([
-            job("j1", JobState::Running, &["n1"]),
-            job("j2", JobState::Running, &["n2"]),
-        ]);
-        let actions = plan(&spec(2), &[r1, r2], &jobs, &HashMap::new(), &restart, 900);
-        let cancels = actions
-            .iter()
-            .filter(|a| matches!(a, Action::Cancel { .. }))
-            .count();
-        assert_eq!(cancels, 2, "operator + one self-heal: {actions:?}");
-    }
-
-    // --- restart_candidates (self-heal restart signals) ---
+    // ---- self-heal ----
 
     fn ep(id: Uuid, status: &str, failures: i64, checked_secs_ago: Option<i64>) -> EndpointView {
         EndpointView {
             id,
-            name: "ep".into(),
-            api_base: "http://node:8000/v1".into(),
+            name: String::new(),
+            api_base: String::new(),
             priority: 100,
             weight: 100,
             enabled: true,
@@ -926,134 +1835,127 @@ mod tests {
     }
 
     #[test]
-    fn probe_failures_past_threshold_are_candidates() {
-        let r = rv("healthy", "j1", Some(Uuid::new_v4()), 600);
-        let counts = HashMap::from([(r.id, 3i64)]);
-        let set = restart_candidates(std::slice::from_ref(&r), &counts, 3, &[]);
-        assert!(set.contains(&r.id));
-        // below threshold -> not a candidate
-        let counts = HashMap::from([(r.id, 2i64)]);
-        assert!(restart_candidates(&[r], &counts, 3, &[]).is_empty());
-    }
-
-    #[test]
-    fn gateway_unhealthy_endpoint_is_a_candidate_even_when_get_probe_passes() {
-        // The zombie case from production: Ollama answers /v1/models instantly
-        // (provisioner GET probe passes, counter stays 0) but hangs on real
-        // inference — the gateway's endpoint check says unhealthy. Restart it.
-        let ep_id = Uuid::new_v4();
-        let r = rv("healthy", "j1", Some(ep_id), 600);
-        let eps = [ep(ep_id, "unhealthy", 528, Some(60))];
-        let set = restart_candidates(std::slice::from_ref(&r), &HashMap::new(), 3, &eps);
-        assert!(set.contains(&r.id));
-    }
-
-    #[test]
-    fn gateway_signal_requires_failures_and_recency() {
-        let ep_id = Uuid::new_v4();
-        let r = rv("healthy", "j1", Some(ep_id), 600);
-        // only one failed check -> not yet
-        let eps = [ep(ep_id, "unhealthy", 1, Some(60))];
-        assert!(restart_candidates(std::slice::from_ref(&r), &HashMap::new(), 3, &eps).is_empty());
-        // stale verdict (checks disabled long ago) -> ignored
-        let eps = [ep(ep_id, "unhealthy", 528, Some(90_000))];
-        assert!(restart_candidates(std::slice::from_ref(&r), &HashMap::new(), 3, &eps).is_empty());
-        // never checked -> ignored
-        let mut never = ep(ep_id, "unhealthy", 528, None);
-        never.checked_secs_ago = None;
-        assert!(
-            restart_candidates(std::slice::from_ref(&r), &HashMap::new(), 3, &[never]).is_empty()
+    fn probe_path_down_needs_two_probed_replicas_all_failing() {
+        let a = rv("healthy", "1", None, 1);
+        let b = rv("healthy", "2", None, 1);
+        let jobs = HashMap::from([
+            running("1", "n1", mins_ago(5)),
+            running("2", "n2", mins_ago(5)),
+        ]);
+        let rs = vec![a.clone(), b.clone()];
+        assert_eq!(probe_path_down(&rs, &jobs, &HashMap::new()), Some(2));
+        assert_eq!(
+            probe_path_down(&rs, &jobs, &HashMap::from([(a.id, 8000)])),
+            None
         );
-        // healthy endpoint -> ignored
-        let eps = [ep(ep_id, "healthy", 0, Some(60))];
-        assert!(restart_candidates(&[r], &HashMap::new(), 3, &eps).is_empty());
+        assert_eq!(probe_path_down(&rs[..1], &jobs, &HashMap::new()), None);
     }
 
     #[test]
-    fn zero_threshold_disables_both_signals() {
-        let ep_id = Uuid::new_v4();
-        let r = rv("healthy", "j1", Some(ep_id), 600);
-        let counts = HashMap::from([(r.id, 99i64)]);
-        let eps = [ep(ep_id, "unhealthy", 528, Some(60))];
-        assert!(restart_candidates(&[r], &counts, 0, &eps).is_empty());
+    fn self_heal_uses_only_fresh_gateway_verdicts() {
+        let (e1, e2, e3) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let dead_vetoed = rv("healthy", "1", Some(e1), 1);
+        let dead = rv("healthy", "2", Some(e2), 1);
+        let zombie = rv("healthy", "3", Some(e3), 1);
+        let stale = rv("healthy", "4", Some(Uuid::new_v4()), 1);
+        let failures = HashMap::from([(dead_vetoed.id, 20), (dead.id, 20)]);
+        let eps = vec![
+            ep(e1, "healthy", 0, Some(60)),
+            ep(e2, "healthy", 0, Some(GATEWAY_FRESH_SECS + 1)),
+            ep(e3, "unhealthy", 2, Some(60)),
+            ep(
+                stale.endpoint_id.unwrap(),
+                "unhealthy",
+                5,
+                Some(GATEWAY_FRESH_SECS + 1),
+            ),
+        ];
+        let rs = vec![
+            dead_vetoed.clone(),
+            dead.clone(),
+            zombie.clone(),
+            stale.clone(),
+        ];
+        let h = self_heal_candidates(&rs, &failures, 20, &eps);
+        assert_eq!(h.dead, HashSet::from([dead.id]));
+        assert_eq!(h.zombie, HashSet::from([zombie.id]));
+        let off = self_heal_candidates(&rs, &failures, 0, &eps);
+        assert!(off.dead.is_empty() && off.zombie.is_empty());
     }
 
     #[test]
-    fn non_healthy_replicas_are_never_candidates() {
-        // A starting replica's endpoint doesn't exist yet; a draining one is
-        // already being reconciled away. Only promoted healthy rows restart.
-        let ep_id = Uuid::new_v4();
-        let mut r = rv("draining", "j1", Some(ep_id), 600);
-        let eps = [ep(ep_id, "unhealthy", 528, Some(60))];
-        assert!(restart_candidates(&[r.clone()], &HashMap::new(), 3, &eps).is_empty());
-        r.state = "starting".into();
-        assert!(restart_candidates(&[r], &HashMap::new(), 3, &eps).is_empty());
+    fn a_dead_server_is_cancelled_when_another_serves_but_the_last_one_is_replaced_first() {
+        let mut c = Case::new(spec(2));
+        let a = served("1", Some(Uuid::new_v4()), "n1", mins_ago(30));
+        let b = served("2", Some(Uuid::new_v4()), "n2", mins_ago(30));
+        c.replicas = vec![a.clone(), b];
+        c.jobs = HashMap::from([
+            running("1", "n1", mins_ago(30)),
+            running("2", "n2", mins_ago(30)),
+        ]);
+        c.heal.dead.insert(a.id);
+        let acts = c.plan();
+        assert_eq!(
+            cancel_of(&acts, a.id),
+            Some((CancelReason::ProbeFailed, true))
+        );
+        assert_eq!(submits(&acts), 1);
+
+        let mut c = Case::new(spec(1));
+        c.replicas = vec![a.clone()];
+        c.jobs = HashMap::from([running("1", "n1", mins_ago(30))]);
+        c.heal.dead.insert(a.id);
+        let acts = c.plan();
+        assert!(
+            cancel_of(&acts, a.id).is_none(),
+            "the last replica keeps its slot"
+        );
+        assert_eq!(submits(&acts), 1, "a successor starts first");
     }
 
-    // --- update_probe_failures (self-heal counters) ---
+    #[test]
+    fn self_heal_cancels_at_most_one_per_tick() {
+        let mut c = Case::new(spec(3));
+        let rs: Vec<ReplicaView> = (1..=3)
+            .map(|i| {
+                served(
+                    &i.to_string(),
+                    Some(Uuid::new_v4()),
+                    &format!("n{i}"),
+                    mins_ago(30),
+                )
+            })
+            .collect();
+        c.jobs = (1..=3)
+            .map(|i| running(&i.to_string(), &format!("n{i}"), mins_ago(30)))
+            .collect();
+        c.heal.dead = HashSet::from([rs[0].id, rs[1].id]);
+        c.replicas = rs;
+        let a = c.plan();
+        assert_eq!(
+            count(&a, |x| matches!(x, Action::Cancel { .. })),
+            1,
+            "{a:?}"
+        );
+    }
+
+    #[test]
+    fn a_zombie_is_replaced_surge_first() {
+        let mut c = Case::new(spec(1));
+        c.replicas = vec![served("1", Some(Uuid::new_v4()), "n1", mins_ago(30))];
+        c.jobs = HashMap::from([running("1", "n1", mins_ago(30))]);
+        c.heal.zombie.insert(c.replicas[0].id);
+        let a = c.plan();
+        assert_eq!(submits(&a), 1);
+        assert!(cancel_of(&a, c.replicas[0].id).is_none());
+    }
 
     #[test]
     fn probe_failure_counter_increments_on_miss_and_decays_on_pass() {
-        let r = rv("healthy", "j1", Some(Uuid::new_v4()), 600);
-        let id = r.id;
-        let jobs = HashMap::from([job("j1", JobState::Running, &["n1"])]);
+        let r = rv("healthy", "1", None, 1);
+        let jobs = HashMap::from([running("1", "n1", mins_ago(5))]);
         let mut counts = HashMap::new();
-
-        // probed, not in health map -> failed -> increments
-        update_probe_failures(
-            std::slice::from_ref(&r),
-            &jobs,
-            &HashMap::new(),
-            &mut counts,
-        );
-        update_probe_failures(
-            std::slice::from_ref(&r),
-            &jobs,
-            &HashMap::new(),
-            &mut counts,
-        );
-        assert_eq!(counts.get(&id), Some(&2));
-
-        // passing probe decays by one (not a full reset), so an intermittent
-        // flap can't keep re-arming the counter from zero.
-        let health = HashMap::from([(id, 8000u16)]);
-        update_probe_failures(std::slice::from_ref(&r), &jobs, &health, &mut counts);
-        assert_eq!(counts.get(&id), Some(&1));
-
-        // decaying past one drops the entry entirely.
-        update_probe_failures(&[r], &jobs, &health, &mut counts);
-        assert_eq!(counts.get(&id), None);
-    }
-
-    #[test]
-    fn flapping_replica_never_reaches_restart_threshold() {
-        // A single-threaded server that alternates miss/pass on the tick beat
-        // must not accumulate toward a restart: increments and decays cancel out.
-        let r = rv("healthy", "j1", Some(Uuid::new_v4()), 600);
-        let id = r.id;
-        let jobs = HashMap::from([job("j1", JobState::Running, &["n1"])]);
-        let miss: HashMap<Uuid, u16> = HashMap::new();
-        let pass = HashMap::from([(id, 8000u16)]);
-        let mut counts = HashMap::new();
-        for i in 0..40 {
-            let health = if i % 2 == 0 { &miss } else { &pass };
-            update_probe_failures(std::slice::from_ref(&r), &jobs, health, &mut counts);
-            assert!(
-                counts.get(&id).copied().unwrap_or(0) <= 1,
-                "flap must stay near zero, got {counts:?} at i={i}"
-            );
-        }
-    }
-
-    #[test]
-    fn sustained_failure_climbs_to_threshold() {
-        // A genuinely dead server misses every probe -> the counter climbs one
-        // per tick and crosses the default self-heal threshold.
-        let r = rv("healthy", "j1", Some(Uuid::new_v4()), 600);
-        let id = r.id;
-        let jobs = HashMap::from([job("j1", JobState::Running, &["n1"])]);
-        let mut counts = HashMap::new();
-        for _ in 0..20 {
+        for _ in 0..3 {
             update_probe_failures(
                 std::slice::from_ref(&r),
                 &jobs,
@@ -1061,44 +1963,86 @@ mod tests {
                 &mut counts,
             );
         }
-        assert_eq!(counts.get(&id), Some(&20));
+        assert_eq!(counts.get(&r.id), Some(&3));
+        let pass = HashMap::from([(r.id, 8000u16)]);
+        update_probe_failures(std::slice::from_ref(&r), &jobs, &pass, &mut counts);
+        assert_eq!(counts.get(&r.id), Some(&2));
+        update_probe_failures(std::slice::from_ref(&r), &jobs, &pass, &mut counts);
+        update_probe_failures(std::slice::from_ref(&r), &jobs, &pass, &mut counts);
+        assert!(!counts.contains_key(&r.id));
+    }
+
+    #[test]
+    fn flapping_replica_never_reaches_restart_threshold() {
+        let r = rv("healthy", "1", None, 1);
+        let jobs = HashMap::from([running("1", "n1", mins_ago(5))]);
+        let pass = HashMap::from([(r.id, 8000u16)]);
+        let mut counts = HashMap::new();
+        for i in 0..100 {
+            let h = if i % 2 == 0 {
+                HashMap::new()
+            } else {
+                pass.clone()
+            };
+            update_probe_failures(std::slice::from_ref(&r), &jobs, &h, &mut counts);
+            assert!(counts.get(&r.id).copied().unwrap_or(0) <= 1);
+        }
     }
 
     #[test]
     fn probe_failure_counter_ignores_unjudgeable_replicas() {
-        // Booting (starting), job not RUNNING, or no nodes reported: a probe
-        // miss there is expected and must not accrue toward a restart.
-        let starting = rv("starting", "j1", None, 30);
-        let pending_job = rv("healthy", "j2", Some(Uuid::new_v4()), 600);
-        let no_nodes = rv("healthy", "j3", Some(Uuid::new_v4()), 600);
-        let gone = rv("healthy", "j4", Some(Uuid::new_v4()), 600);
+        let loading = rv("starting", "1", None, 1);
+        let queued = rv("healthy", "2", None, 1);
         let jobs = HashMap::from([
-            job("j1", JobState::Running, &["n1"]),
-            job("j2", JobState::Pending, &[""]),
-            job("j3", JobState::Running, &[]),
+            running("1", "n1", mins_ago(5)),
+            job("2", JobState::Pending, &[]),
         ]);
         let mut counts = HashMap::new();
-        update_probe_failures(
-            &[starting, pending_job, no_nodes, gone],
-            &jobs,
-            &HashMap::new(),
-            &mut counts,
-        );
-        assert!(counts.is_empty(), "got {counts:?}");
+        update_probe_failures(&[loading, queued], &jobs, &HashMap::new(), &mut counts);
+        assert!(counts.is_empty());
     }
 
+    // ---- phantom endpoints ----
+
     #[test]
-    fn draining_replica_with_pending_job_is_left_alone() {
-        // Cancel sent but the job is still queued (Pending) -> wait, don't delete.
-        let r = rv("draining", "j1", None, 10);
-        let id = r.id;
-        let jobs = HashMap::from([job("j1", JobState::Pending, &[""])]);
-        let actions = plan(&spec(0), &[r], &jobs, &HashMap::new(), &HashSet::new(), 900);
-        assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::Delete { replica_id } if *replica_id == id)),
-            "draining replica with a pending job must be left alone; got {actions:?}"
-        );
+    fn endpoints_left_behind_by_failed_deletes_are_removed() {
+        let prefix = "obleth-m-".to_string();
+        let linked = Uuid::new_v4();
+        let mut c = Case::new(spec(1));
+        let live = served("1", Some(linked), "n1", mins_ago(30));
+        let gone_replica = Uuid::new_v4();
+        let leftover = Uuid::new_v4();
+        let duplicate = Uuid::new_v4();
+        let operator = Uuid::new_v4();
+        let named = |id: Uuid, rid: Uuid| EndpointView {
+            name: format!("{prefix}{rid}"),
+            ..ep(id, "healthy", 0, None)
+        };
+        c.endpoints = Some((
+            vec![
+                named(linked, live.id),
+                named(duplicate, live.id),
+                named(leftover, gone_replica),
+                EndpointView {
+                    name: "my-own-endpoint".into(),
+                    ..ep(operator, "healthy", 0, None)
+                },
+            ],
+            prefix,
+        ));
+        c.replicas = vec![live];
+        c.jobs = HashMap::from([running("1", "n1", mins_ago(30))]);
+        let a = c.plan();
+        let mut deleted: Vec<Uuid> = a
+            .iter()
+            .filter_map(|x| match x {
+                Action::DeleteEndpoint { endpoint_id } => Some(*endpoint_id),
+                _ => None,
+            })
+            .collect();
+        deleted.sort();
+        let mut want = vec![duplicate, leftover];
+        want.sort();
+        assert_eq!(deleted, want);
     }
 }

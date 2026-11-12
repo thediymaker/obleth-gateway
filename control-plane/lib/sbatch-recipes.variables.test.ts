@@ -11,7 +11,7 @@ const withVars = (varsYaml: string) =>
     "port: 8000",
     varsYaml,
     "---",
-    "apptainer exec {{image}} serve",
+    "apptainer exec {{image}} serve --port $OBLETH_SERVING_PORT",
   ].join("\n");
 
 describe("recipe variables parsing", () => {
@@ -49,7 +49,7 @@ describe("recipe variables parsing", () => {
   });
 
   it("treats a missing variables block as no variables", () => {
-    const r = parseRecipe("t", withVars("description: none"));
+    const r = parseRecipe("t", withVars("description: none").replace("{{image}}", "/x.sif"));
     expect(r.valid).toBe(true);
     expect(r.header?.variables).toBeUndefined();
   });
@@ -63,17 +63,22 @@ const recipeWithBody = (body: string) =>
       "api_model_name: m", "port: 8000",
       "variables:", "  - name: image", "    default: /default.sif",
       "  - name: tag", "    required: true",
-      "---", body,
+      "---", `${body} --port $OBLETH_SERVING_PORT`,
     ].join("\n"),
   );
 
 describe("recipe variable substitution", () => {
-  it("substitutes declared {{vars}} and leaves shell ${} and undeclared {{}} alone", () => {
-    const r = recipeWithBody("run {{image}} --tag {{tag}} --home ${HOME} --x {{undeclared}}");
+  it("substitutes declared {{vars}} and leaves shell ${} alone", () => {
+    const r = recipeWithBody("run {{image}} --tag {{ tag }} --home ${HOME}");
     const p = buildManagedFromRecipe(r, { variables: { image: "/my.sif", tag: "q4" } });
     expect(p.managedBody.script_body).toContain("run /my.sif --tag q4");
     expect(p.managedBody.script_body).toContain("${HOME}");
-    expect(p.managedBody.script_body).toContain("{{undeclared}}");
+  });
+
+  it("refuses a recipe whose script uses a token no input declares", () => {
+    const r = recipeWithBody("run {{image}} {{tag}} --x {{modle}}");
+    expect(r.valid).toBe(false);
+    expect(r.error).toContain("{{modle}}");
   });
 
   it("falls back to the declared default when a value is omitted", () => {
@@ -101,7 +106,7 @@ describe("recipe variable substitution", () => {
         "---", "name: T", "engine: ollama", "model_type: chat",
         "api_model_name: m", "port: 8000",
         "variables:", "  - name: opt",
-        "---", "run {{opt}}",
+        "---", "run {{opt}} --port $OBLETH_SERVING_PORT",
       ].join("\n"),
     );
     const p = buildManagedFromRecipe(r, { variables: {} });

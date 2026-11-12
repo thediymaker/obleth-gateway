@@ -21,7 +21,7 @@ const VALID = [
   "---",
   "#!/bin/bash -l",
   "#SBATCH -p arm",
-  "llama-server -hf unsloth/GLM-5.2-GGUF:UD-IQ2_M --port 8000",
+  "llama-server -hf unsloth/GLM-5.2-GGUF:UD-IQ2_M --port $OBLETH_SERVING_PORT",
 ].join("\n");
 
 let dir: string;
@@ -122,7 +122,7 @@ describe("loadRecipeCards merge (file + DB)", () => {
     "---",
     "#!/bin/bash -l",
     "#SBATCH -p gpu",
-    "ollama serve",
+    "OLLAMA_HOST=0.0.0.0:$OBLETH_SERVING_PORT ollama serve",
   ].join("\n");
 
   beforeEach(() => {
@@ -141,6 +141,14 @@ describe("loadRecipeCards merge (file + DB)", () => {
     const fileCard = cards.find((c) => c.id === "glm");
     expect(fileCard?.source).toBe("file");
     expect(fileCard?.recipeId).toBeUndefined();
+  });
+
+  it("shows a file it can't read as a card saying why, instead of leaving it out", async () => {
+    symlinkSync(path.join(dir, "missing-target"), path.join(dir, "broken.recipe"));
+    const cards = await loadRecipeCards();
+    const broken = cards.find((c) => c.id === "broken");
+    expect(broken?.valid).toBe(false);
+    expect(broken?.error).toMatch(/^the file can't be opened/);
   });
 
   it("file card body is the full raw document (starts with ---), not just the script", async () => {
@@ -190,7 +198,7 @@ describe("resolveRecipeById (file-first, then DB)", () => {
     "port: 8000",
     "---",
     "#!/bin/bash -l",
-    "vllm serve",
+    "vllm serve --port $OBLETH_SERVING_PORT",
   ].join("\n");
 
   afterEach(() => {

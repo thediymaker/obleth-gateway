@@ -45,6 +45,7 @@ describe("replicas", () => {
     expect(replicaPhase(replica({ last_message: "PENDING — Priority" }))).toBe("queued");
     expect(replicaPhase(replica({ last_message: "RUNNING" }))).toBe("running");
     expect(replicaPhase(replica({ state: "healthy" }))).toBe("serving");
+    expect(replicaPhase(replica({ state: "healthy", last_message: "PENDING — BeginTime" }))).toBe("queued");
     expect(countReplicas([replica({ state: "healthy" }), replica({ last_message: "RUNNING" }), replica({ state: "lost" })])).toEqual({ healthy: 1, queued: 0, running: 1, draining: 0, lost: 1 });
   });
 });
@@ -53,13 +54,34 @@ describe("a Slurm deployment's state", () => {
   it("is serving at its target and starting below it, with Slurm's reason", () => {
     expect(managedState(spec(), [replica({ state: "healthy" }), replica({ state: "healthy" })]).state).toBe("serving");
     const v = managedState(spec(), [replica({ state: "healthy" }), replica({ last_message: "PENDING — Resources" })]);
-    expect(v).toEqual({ state: "starting", why: "1 queued: Resources", attention: false });
+    expect(v).toEqual({ state: "serving", why: "1 of 2 serving · 1 queued: Resources", attention: false });
+    const w = managedState(spec({ min_replicas: 2 }), [replica({ state: "healthy" }), replica({ last_message: "PENDING — Resources" })]);
+    expect(w).toEqual({ state: "starting", why: "1 serving · 1 queued: Resources", attention: false });
+  });
+
+  it("can't start when Slurm holds every queued job for a reason that won't clear", () => {
+    const v = managedState(spec({ target_replicas: 1 }), [replica({ last_message: "PENDING — PartitionTimeLimit" })]);
+    expect(v).toMatchObject({ state: "blocked", attention: true });
+    expect(managedState(spec({ target_replicas: 1 }), [replica({ last_message: "PENDING — QOSGrpGRES" })]).state).toBe("starting");
+  });
+
+  it("is stopped while the gateway pauses launches, and says when it tries again", () => {
+    const now = Date.parse("2026-09-28T12:00:00Z");
+    const v = managedState(spec({ startup_timeout_mins: 60, paused_reason: "3 launches failed", paused_until: "2026-09-28T12:30:00Z" }), [], now);
+    expect(v.state).toBe("stopped");
+    expect(v.why).toMatch(/^launches paused, tries again at /);
+    expect(managedState(spec({ startup_timeout_mins: 60, paused_until: "2026-09-28T11:30:00Z" }), [], now).state).toBe("not-running");
+  });
+
+  it("a gateway that pauses itself doesn't count lost rows against the limit", () => {
+    const lost = [1, 2, 3].map(() => replica({ state: "lost" }));
+    expect(managedState(spec({ startup_timeout_mins: 60, paused_reason: null, paused_until: null }), lost).state).toBe("not-running");
   });
 
   it("is stopped once failed launches reach the limit, even with a replica serving", () => {
     const lost = [1, 2, 3].map(() => replica({ state: "lost", last_message: "job gone" }));
-    expect(managedState(spec(), lost)).toMatchObject({ state: "stopped", attention: true, why: "3 failed launches" });
-    expect(managedState(spec(), [...lost, replica({ state: "healthy" })]).why).toBe("3 failed launches · 1 still serving");
+    expect(managedState(spec(), lost)).toMatchObject({ state: "stopped", attention: true, why: "3 jobs ended" });
+    expect(managedState(spec(), [...lost, replica({ state: "healthy" })]).why).toBe("3 jobs ended · 1 still serving");
     expect(managedState(spec({ max_job_failures: 0 }), lost).state).toBe("not-running");
   });
 
@@ -91,7 +113,7 @@ describe("rows", () => {
       ["glm-5-3-flash", "kubernetes", 10, null, "aibrix-system-llm / glm-5-3-flash"],
     ]);
     expect(rows[1].poolCap).toBe(160);
-    expect(deploymentsLine(rows)).toBe("1 on Kubernetes, 10 replicas ready · 1 on Slurm, 1 starting");
+    expect(deploymentsLine(rows)).toBe("1 on Kubernetes, 10 replicas ready · 1 on Slurm");
   });
 });
 
@@ -166,7 +188,7 @@ describe("Slurm arithmetic", () => {
     const checks = preflightChecks({ fit: gh, minutes: 4320, nameFree: false, name: "glm-5.2", account: "other", accounts: resources.accounts, qos: "normal", qosList: resources.qos });
     expect(checks.filter((c) => !c.ok).map((c) => c.text)).toEqual([
       "3 days is over gh200's 2 days limit",
-      "Your Slurm user has no association with other",
+      "There's no account called other on this cluster",
       "A model called glm-5.2 already exists",
     ]);
   });
@@ -186,5 +208,34 @@ describe("accounts a partition takes", () => {
     const raw = 'slurmrestd submit failed (500 Internal Server Error): {"errors":[{"description":"Batch job submission failed","error":"Invalid account or account/partition combination specified","error_number":2045}],"warnings":[{"description":"Expected OpenAPI type=array"}]}';
     expect(slurmErrorText(raw)).toBe("Invalid account or account/partition combination specified");
     expect(slurmErrorText("connection refused")).toBe("connection refused");
+  });
+});
+
+describe("the Slurm connection in words", () => {
+  it("says when the token expires and flags one that is close", async () => {
+    const { tokenExpiry, provisionerHealth, pendingReason, refusalAdvice, jobEndLine, scaleDownVictim } = await import("./deployments-model");
+    const now = Date.parse("2026-09-28T12:00:00Z");
+    expect(tokenExpiry({ jwt_set: true, jwt_expires_in_secs: 1800, jwt_user: "svc" }, now)).toMatchObject({ attention: true, text: expect.stringContaining("for svc expires in 30 minutes") });
+    expect(tokenExpiry({ jwt_set: true, jwt_expires_in_secs: -5 }, now)?.expired).toBe(true);
+    expect(tokenExpiry({ jwt_set: true, jwt_expires_in_secs: 20 * 86_400 }, now)?.attention).toBe(false);
+    expect(tokenExpiry({ jwt_set: true }, now)).toBeNull();
+    const base = { enabled: true, provisioner_running: true, provisioner_tick_status: "error", provisioner_tick_detail: "511", provisioner_last_ok_secs: 300, provisioner_held_secs: 300, provisioner_last_seen_secs: 5 } as never;
+    expect(provisionerHealth(base)).toMatchObject({ kind: "failing", detail: "511" });
+    expect(provisionerHealth({ enabled: true, provisioner_running: false, provisioner_last_seen_secs: null } as never).kind).toBe("never");
+    expect(pendingReason("QOSMaxWallDurationPerJobLimit")?.blocks).toBe(true);
+    expect(pendingReason("Resources")?.blocks).toBe(false);
+    expect(refusalAdvice("Slurm rejected the job: Requested node configuration is not available.")).toMatch(/No node in the partition/);
+    expect(jobEndLine("2026-09-28T14:20:00Z", 15, now)).toMatch(/^Time limit at .*; a replacement starts at /);
+    expect(jobEndLine(null, 15, now)).toBeNull();
+    const r = (state: string, msg: string | null, at: string) => ({ state, last_message: msg, created_at: at });
+    expect(scaleDownVictim([r("healthy", "RUNNING", "1"), r("pending", "PENDING — Priority", "2"), r("pending", "PENDING — Priority", "3")])?.created_at).toBe("3");
+    expect(scaleDownVictim([r("healthy", "RUNNING", "1"), r("healthy", "RUNNING", "2")])?.created_at).toBe("1");
+  });
+
+  it("counts asleep nodes as available and never blocks on a partition with no node data", () => {
+    expect(nodeState(["IDLE", "POWERED_DOWN"])).toBe("asleep");
+    expect(nodeState(["DOWN", "POWERED_DOWN"])).toBe("down");
+    const [p] = partitionFits({ partitions: [{ name: "x", nodes: [], default_time: null, max_time: null }], nodes: [], accounts: [], qos: [] }, { gpus: 1, cpus: 1, memMb: 1 });
+    expect(p).toMatchObject({ fits: true, known: false });
   });
 });

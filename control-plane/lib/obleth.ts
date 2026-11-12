@@ -489,6 +489,17 @@ export interface ManagedModelSpec {
   launcher_spec?: Record<string, unknown> | null;
   last_provision_error?: string | null;
   last_provision_error_at?: string | null;
+  /** Minutes a running job may take to become healthy before it is cancelled
+   *  and counted as a failed launch; 0 never gives up. Absent from older gateways. */
+  startup_timeout_mins?: number;
+  /** Minutes before a healthy job's time limit that its replacement is
+   *  submitted; 0 turns handoff off. Absent from older gateways. */
+  handoff_mins?: number;
+  /** Why submits are paused after too many failed launches or refused
+   *  submits; null when they aren't. Absent from older gateways. */
+  paused_reason?: string | null;
+  /** When submits resume on their own (RFC 3339); null when not paused. */
+  paused_until?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -516,6 +527,9 @@ export interface PutManagedModel {
   target_replicas?: number;
   max_job_failures?: number;
   launcher_spec?: Record<string, unknown> | null;
+  /** Older gateways ignore these; the gateway applies its defaults when omitted. */
+  startup_timeout_mins?: number;
+  handoff_mins?: number;
 }
 
 export type ClusterResources = {
@@ -539,11 +553,18 @@ export type ClusterResources = {
     state?: string[];
     alloc_cpus?: number | null;
     alloc_memory_mb?: number | null;
+    /** Slurm's NodeAddr when it differs from the name. Absent from older gateways. */
+    address?: string | null;
   }[];
   accounts: string[];
   qos: string[];
   /** The Slurm user's associations; `partition` null covers every partition. Absent from older gateways. */
-  associations?: { account: string; partition: string | null; qos: string[] }[];
+  associations?: { account: string; partition: string | null; qos: string[]; user?: string | null }[];
+  /** Why some or all of the cluster couldn't be read, as a sentence; null when
+   *  every read worked. Absent from older gateways. */
+  error?: string | null;
+  /** True when some reads failed and the rest is shown. */
+  partial?: boolean;
 };
 
 export interface ModelReplica {
@@ -555,6 +576,19 @@ export interface ModelReplica {
   state: string; // pending|starting|healthy|draining|lost
   last_message: string | null;
   cancel_requested?: boolean;
+  // The fields below are absent from older gateways.
+  /** A restart asked for: a successor is started before this job is stopped. */
+  replace_requested?: boolean;
+  /** Slurm's start time for the job this replica was promoted under (RFC 3339). */
+  job_started_at?: string | null;
+  /** When Slurm will end the job (its time limit), while it runs (RFC 3339). */
+  job_ends_at?: string | null;
+  /** A plain sentence about where the replica is, for the dashboard. */
+  state_detail?: string | null;
+  /** Where this job's output goes, or null when unknown. */
+  log_path?: string | null;
+  /** The port the server was found on. */
+  port?: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -1450,13 +1484,30 @@ export interface SlurmSettingsView {
   // keys off.
   provisioner_last_ok_secs: number | null;
   provisioner_held_secs: number | null;
+  // The fields below are absent from older gateways.
+  // The stored token's expiry and user (its `sun` claim; not secret).
+  jwt_expires_at?: string | null;
+  jwt_expires_in_secs?: number | null;
+  jwt_user?: string | null;
+  // The API version "auto" resolved to, and every version slurmrestd serves.
+  resolved_api_version?: string | null;
+  available_api_versions?: string[];
+  slurm_release?: string | null;
+  // False when the gateway has no encryption key and stores tokens in plaintext.
+  stored_encrypted?: boolean;
+  // Plain sentences from the provisioner's last pass, e.g. a token about to expire.
+  provisioner_warnings?: string[];
+  // On a PUT response: plain sentences about what was saved.
+  warnings?: string[];
 }
 
+/** A partial update: an omitted field keeps its stored value; an empty string clears it. */
 export interface UpdateSlurmSettings {
-  enabled: boolean;
-  slurmrestd_url: string;
+  enabled?: boolean;
+  slurmrestd_url?: string;
+  /** "auto" (or empty) picks the newest version slurmrestd serves. */
   slurmrestd_api_version?: string;
-  slurm_user: string;
+  slurm_user?: string;
   // Write-only: omit/empty to keep the stored JWT, send a value to replace it.
   slurm_jwt?: string | null;
   // Full replacement set of node hostname → IP overrides. Blank rows are dropped
@@ -1504,9 +1555,29 @@ export interface SlurmPingHealth {
   error: string | null;
 }
 
+export interface SlurmApiHealth {
+  configured: string;
+  resolved: string | null;
+  available: string[];
+  ok: boolean;
+  error: string | null;
+}
+
+export interface SlurmAuthHealth {
+  ok: boolean;
+  error: string | null;
+}
+
 export interface SlurmHealthView {
   jwt: SlurmJwtHealth;
   ping: SlurmPingHealth;
+  // The fields below are absent from older gateways.
+  api?: SlurmApiHealth;
+  auth?: SlurmAuthHealth;
+  slurmctld?: "UP" | "DOWN" | null;
+  slurm_release?: string | null;
+  /** Every problem found, as a plain sentence that says what to do. */
+  problems?: string[];
 }
 
 export interface AutoRouterSettingsView {
@@ -2738,6 +2809,18 @@ export const obleth = {
       method: "PATCH",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ error: null }),
+    }),
+  /** Clear a failure pause and its backoff, so the next pass submits. */
+  retryManagedModel: (id: string, options?: AuditOptions) =>
+    api<unknown>(`/models/${seg(id)}/managed/retry`, {
+      method: "POST",
+      headers: auditActorHeaders(options),
+    }),
+  /** Replace every live replica one at a time, each new job started before the old one is stopped. */
+  rollManagedModel: (id: string, options?: AuditOptions) =>
+    api<unknown>(`/models/${seg(id)}/managed/roll`, {
+      method: "POST",
+      headers: auditActorHeaders(options),
     }),
   slurmResources: () => api<ClusterResources>(`/slurm/resources`),
   listRecipes: () => api<Recipe[]>(`/recipes`),

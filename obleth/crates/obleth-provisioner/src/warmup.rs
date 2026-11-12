@@ -28,9 +28,21 @@ use std::time::Duration;
 /// whole point is to absorb a slow cold first token.
 ///
 /// Returns `Err` on any failure so the caller can log it; never panics.
+#[cfg(test)]
 pub async fn warm_up(
     http: &reqwest::Client,
     api_base: &str,
+    budget: Duration,
+) -> anyhow::Result<()> {
+    warm_up_preferring(http, api_base, &[], budget).await
+}
+
+/// [`warm_up`], warming the listed model whose id is one of `prefer` (the
+/// model the replica was launched for) when the server lists several.
+pub async fn warm_up_preferring(
+    http: &reqwest::Client,
+    api_base: &str,
+    prefer: &[String],
     budget: Duration,
 ) -> anyhow::Result<()> {
     let base = api_base.trim_end_matches('/');
@@ -49,12 +61,18 @@ pub async fn warm_up(
         .json()
         .await
         .context("warmup: /models body was not JSON")?;
-    let model_id = models
+    let ids: Vec<&str> = models
         .get("data")
         .and_then(|d| d.as_array())
-        .and_then(|a| a.first())
-        .and_then(|m| m.get("id"))
-        .and_then(|x| x.as_str())
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m.get("id").and_then(|x| x.as_str()))
+        .collect();
+    let model_id = ids
+        .iter()
+        .copied()
+        .find(|id| crate::probe::names_match(id, prefer))
+        .or_else(|| ids.first().copied())
         .context("warmup: /models response had no data[0].id")?;
 
     // 2. Fire a minimal completion. `max_tokens: 1` keeps the generation

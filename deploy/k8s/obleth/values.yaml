@@ -428,11 +428,13 @@ benchmarkBackend:
   tokenMs: 3
   concurrency: 256
 
-# Optional Slurm provisioner plugin. Off by default — enable only when serving
+# Optional Slurm provisioner plugin. Off by default: enable only when serving
 # models on a Slurm cluster. It keeps enabled managed models at their target
-# replica count via slurmrestd. slurmrestd connection details and the master
-# enable switch are configured at runtime in the dashboard (Settings -> Slurm),
-# not here; this only controls whether the reconciler process is deployed.
+# replica count via slurmrestd. The slurmrestd connection and the master enable
+# switch are configured at runtime in the dashboard (Deployments > Set up
+# Slurm), not here; this only controls whether the reconciler is deployed. It
+# calls the Management API, slurmrestd, and the model servers on the compute
+# nodes (each replica's port window), so egress policies must allow all three.
 # Runs as a singleton (replicas:1, Recreate) — do not scale it.
 provisioner:
   enabled: false
@@ -452,6 +454,11 @@ provisioner:
   resources:
     requests: { cpu: "50m", memory: "64Mi" }
     limits: { cpu: "500m", memory: "256Mi" }
+  # Extra environment variables for the provisioner container, for settings
+  # without their own value here, e.g.:
+  #   - { name: OBLETH_PROVISIONER_HEALTH_TIMEOUT_SECS, value: "10" }
+  #   - { name: OBLETH_PROVISIONER_WARMUP_TIMEOUT_SECS, value: "900" }
+  extraEnv: []
 
 # Optional neural prose compression sidecar. Off by default — enable only when
 # you want extractive prose compression backed by the ONNX scoring model. The

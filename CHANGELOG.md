@@ -4,6 +4,58 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
+## v2.6.0
+
+Deployments on Slurm work on current Slurm releases and keep a model serving through walltime, preemption, node failure, restarts and setting changes. A launch that keeps failing pauses with a reason instead of resubmitting forever, and Slurm's refusals, token expiry and network faults are reported as sentences with what to do.
+
+> **Upgrade notes.** Postgres migration `0041` adds columns for the new deployment settings and replica details, and allows a replica count of 0. It also replaces the environment values stored in existing launch-history rows with `(hidden)`; the variable names are kept. The gateway applies it when it starts.
+>
+> - **Upgrade the gateway and the provisioner together.** The provisioner reads the new fields and calls the new routes. The dashboard works with an older gateway, without pauses, surge-first restarts or **Apply to running replicas**.
+> - **The API version is now `auto`.** A connection saved with the old default `v0.0.40` keeps it. Current Slurm releases don't serve that version; when slurmrestd doesn't, the provisioner uses the newest version it does serve and warns until you set the connection to `auto`.
+> - **Jobs are submitted with requeue off.** A preempted job, or one whose node fails, now ends, and obleth submits a new one. Before, Slurm put it back in the queue under the same id while obleth kept routing to the old node.
+> - **Recipes are checked more strictly.** A recipe with an unknown key, an undeclared `{{token}}`, a fixed `--port` or no `$OBLETH_SERVING_PORT`, or an `#SBATCH` line obleth can't send is shown as invalid with the reason, including recipes saved in the database. Fix them on the Recipes tab.
+> - **Mint a long-lived Slurm token.** A plain `scontrol token` lasts 30 minutes; use `scontrol token lifespan=2592000` (30 days). Tokens are encrypted at rest only when `OBLETH_ENCRYPTION_KEY` is set, and the Slurm connection now says when they aren't.
+
+**Deployments on Slurm**
+
+- **The API version is found for you.** The connection's API version defaults to `auto`: obleth reads the versions slurmrestd lists and uses the newest of v0.0.40 to v0.0.45 it supports. Current Slurm releases no longer serve v0.0.40, the old default (Slurm 26.05 serves v0.0.42 to v0.0.45), so every call answered 404 and every submit failed as "error decoding response body". A pinned version the server doesn't serve is named with the ones it does, and the provisioner falls back to the newest of those with a warning; a pinned version that works is kept.
+- **Test the connection checks what matters.** It reports the versions served and the one in use, the Slurm release, an authenticated read of the partition list (slurmrestd answers a ping even with an expired token), whether slurmctld answers, and the token's user and expiry. Every problem is listed as a sentence with what to do, and the ping is no longer green when the token is rejected or slurmctld is down.
+- **Token expiry is visible before it stops anything.**
+  - The Slurm card and the connection sheet show the token's user and when it expires, without a test. Saving a token that expires within 7 days, or whose user isn't the Slurm user, returns a warning.
+  - Within 3 days of expiry, Settings › Needs you has a finding and each provisioner pass reports a warning. Each pass makes one authenticated read, so a rejected token shows as a failing pass even with no replicas.
+  - A token pasted as `scontrol token` prints it (`SLURM_JWT=...`) is cleaned up. `PUT /api/v1/settings/slurm` now changes only the fields it carries, so a script can rotate the token alone; before, an omitted field was cleared, which turned Slurm off.
+- **Two deployments on one node no longer answer for each other.** Port windows are now unique across every live replica of every model. The job records the port it bound in its comment (`obleth-port=<port>`) and the provisioner checks that port. Before promoting a replica it reads `GET /v1/models`, and a server that lists other models doesn't count: the replica says which model answered instead. Before, two deployments on port 8000 on one node could register the second at the first one's server.
+- **Preemption and node failure are handled.** Jobs are submitted with requeue off, so they end and are replaced. A job that comes back anyway (requeued, suspended, or restarted on another node) leaves the endpoints at once and is added again when it serves at its new place.
+- **Walltime no longer takes the model down.** A new per-deployment setting, Start a replacement (`handoff_mins`, default 15), starts a new job that long before a serving job's time limit and stops the old one once the new one serves. It is skipped for time limits of at most twice that long.
+- **Restarts and setting changes start the new job first.**
+  - Restart on a replica keeps it serving until its replacement serves, then drains it, so restarting the only replica no longer takes the model down.
+  - Apply to running replicas (`POST /api/v1/models/{id}/managed/roll`) replaces every running replica with the saved settings, one at a time. It replaces Restart all at once, which on this gateway did the same thing.
+  - Scaling down drains a serving replica: its endpoint is removed, requests in flight get 60 seconds, then the job is cancelled. Queued jobs go newest first, so the oldest keeps its place. `DELETE /api/v1/replicas/{id}` on a live replica now cancels its job (202) instead of dropping the row and leaving the job running.
+  - A replica count of 0 keeps a deployment with nothing running.
+- **Failed launches pause the deployment instead of looping.**
+  - Only launches count: a job that ends before its server ever served, one not healthy Give up loading after it started (`startup_timeout_mins`, default 60), or one stuck in the queue. A job that served and then hit its walltime, was preempted or lost its node no longer counts. Before, ended jobs were forgotten 15 minutes after submit, so the limit rarely tripped and a crashing model was resubmitted forever.
+  - At the limit, submits pause for 5, 15, 30, 60 minutes, then hourly, with a reason in a sentence. Try again (`POST /api/v1/models/{id}/managed/retry`) lifts the pause. A launch that serves resets the count. Paused deployments are listed under Settings › Needs you.
+  - A running job whose server never answers is cancelled at the startup timeout, instead of holding its GPUs until walltime.
+- **Slurm's refusals read as sentences, and aren't resubmitted every 15 seconds.** A refused submit is shown as "Slurm rejected the job: <reason>. (job_submit said: <message>.)" with the setting to change, not the raw JSON body, and pauses that deployment on the same ladder. A queued job held for a reason that won't clear by waiting (a hold, a partition or QoS limit it can never meet, a job limit its own replicas keep full) shows Can't start, and is cancelled and replaced after the startup timeout.
+- **A lost submit answer no longer starts a second job.** When a submit times out or slurmrestd fails mid-answer, that deployment's submits wait up to 3 minutes while the provisioner looks for the job in Slurm's accounting database, and adopts it if found.
+- **Self-healing doesn't empty a fleet.** When every serving replica fails the provisioner's check at once, nothing restarts and the Slurm connection warns about the network path. A dead server is cancelled only while another replica serves; the last one, and one the gateway's own check keeps failing, are replaced new job first. A gateway verdict older than 30 minutes is ignored.
+- **Every tracked job missing at once no longer holds every pass.** The provisioner asks the accounting database; jobs it confirms ended are replaced, and the rest are left alone with a warning.
+- **The job's environment, folder and output are documented and shown.** Each replica shows where its job writes. Jobs run in their Job logs folder, or `/tmp`, and write `<job name>-<job id>.out` there. Job names are made safe for file names. A script without a shebang gets `#!/bin/bash -l`, so the module system is set up.
+- **Multi-node jobs are checked on their batch host.** Slurm's compressed node lists (`gpu[01-04]`) are expanded, and nodes are reached through Slurm's own node addresses when no alias is set.
+- **The dashboard says what is going on.** A deployment page says when the provisioner's passes are failing and why, since replica states stop changing until they recover, and the launch form says when no provisioner has ever run. Each replica card shows Slurm's pending reason as a sentence, its port, its output, its time limit and when its replacement starts. A launched model, which starts staged, gets a Make it live button. "Serve from" is now Healthy when, and counts the deployment as serving once that many replicas serve. Scaling down or restarting a serving replica asks first.
+- **Recipes:**
+  - The loader refuses unknown keys (with a "did you mean" hint), undeclared `{{tokens}}`, a script that never uses `$OBLETH_SERVING_PORT` or passes a fixed `--port`, and `#SBATCH` lines obleth can't send, with what to write instead.
+  - `context_window:` sets the context the model is created with, from a number or an input; launches used to create every model with 8192. `capabilities:` lists what a model can always do, such as `[vision]`, and a flag's `drops:` removes one. Tool-calling flags in the rendered script mark the model for function calling wherever they came from.
+  - The shipped recipes share one shape: cluster setup before strict mode, the server `exec`ed, `0.0.0.0` and `$OBLETH_SERVING_PORT`, the container command from `OBLETH_CONTAINER_RUN` (`apptainer exec --nv` when unset, also for a deployment defined by image and launch command through the API), and the server run from the node's `PATH` when the image is empty. vLLM recipes use every GPU the job gets, llama.cpp sizes its threads from `SLURM_CPUS_ON_NODE`, and Ollama recipes pull only when the model isn't cached and serve under the deployment's name.
+  - Defaults are now 1 replica and 2 failed launches, as in every shipped recipe. Save as recipe keeps a script edited at launch or on the deployment's page.
+- **Secrets stay out of history.** Environment values and secret-looking inputs are hidden in launch history and the audit log. Backups now carry managed deployments and recipes, and leave out the endpoints the provisioner registers.
+
+**Deployment**
+
+- The Helm chart's `provisioner.extraEnv` adds environment variables to the provisioner container, for the settings without their own value, such as `OBLETH_PROVISIONER_HEALTH_TIMEOUT_SECS`.
+- Docker Compose gives the provisioner 120 seconds to stop, so it finishes the pass in progress and records any job it submitted.
+- The chart, Compose file and provisioner README now say that the provisioner and the gateway both reach the model servers on the compute nodes, which an egress policy must allow.
+
 ## v2.5.0
 
 **Security**

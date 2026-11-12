@@ -384,6 +384,11 @@ async fn compute(state: &AdminState) -> Result<AdviceReport> {
         vision_describer: vision_describer.as_deref(),
         now_ms: now,
     });
+    let slurm = state.store.get_slurm_settings().await?.unwrap_or_default();
+    if slurm.enabled {
+        let managed = state.store.list_managed_models().await?;
+        findings.extend(slurm_findings(&slurm, &managed, &models, now));
+    }
     rank(&mut findings);
 
     let router = state
@@ -730,6 +735,105 @@ pub fn run_checks(inp: &Inputs<'_>) -> Vec<AdviceFinding> {
     platform_failures(inp, &mut out);
     waiting_for_room(inp, &mut out);
     long_answers(inp, &mut out);
+    out
+}
+
+/// Slurm findings: a token that expires within three days or has expired,
+/// and a managed model whose submits are paused. Pure, for tests.
+pub fn slurm_findings(
+    settings: &obleth_config::SlurmSettings,
+    managed: &[obleth_config::ManagedModelSpec],
+    models: &[ModelRoute],
+    now_ms: i64,
+) -> Vec<AdviceFinding> {
+    let mut out = Vec::new();
+    let now = now_ms / 1000;
+    let exp = obleth_config::slurm::slurm_jwt_claims(&settings.slurm_jwt).and_then(|c| c.exp);
+    if let Some(exp) = exp {
+        let left = exp - now;
+        if left <= obleth_provisioner::slurm::TOKEN_WARN_SECS {
+            let at = chrono::DateTime::from_timestamp(exp, 0)
+                .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+                .unwrap_or_default();
+            let (title, detail) = if left <= 0 {
+                (
+                    "The Slurm token has expired".to_string(),
+                    "slurmrestd refuses every request, so no Slurm deployment can start, and \
+                     running ones are not watched. Mint a new token with `scontrol token \
+                     lifespan=2592000` and save it in the Slurm settings."
+                        .to_string(),
+                )
+            } else {
+                (
+                    format!(
+                        "The Slurm token expires in {}",
+                        obleth_provisioner::slurm::plain_duration(left)
+                    ),
+                    "When it expires slurmrestd refuses every request and Slurm deployments \
+                     stop being managed. Mint a new token with `scontrol token \
+                     lifespan=2592000` and save it in the Slurm settings."
+                        .to_string(),
+                )
+            };
+            out.push(AdviceFinding {
+                key: format!("slurm_token_expiry:{exp}"),
+                check: "slurm_token".into(),
+                severity: "act".into(),
+                title,
+                detail,
+                evidence: vec![AdviceEvidence {
+                    label: "Expires".into(),
+                    value: at,
+                }],
+                models: vec![],
+                fix: None,
+                logs: None,
+                judgment: None,
+                weight: 1,
+            });
+        }
+    }
+    for m in managed.iter().filter(|m| m.enabled) {
+        let Some(reason) = m.paused_reason.as_deref() else {
+            continue;
+        };
+        if m.paused_until
+            .is_some_and(|u| u.timestamp_millis() <= now_ms)
+        {
+            continue;
+        }
+        let name = models
+            .iter()
+            .find(|r| r.id == m.model_id)
+            .map(|r| r.model_name.clone())
+            .unwrap_or_else(|| m.model_id.to_string());
+        let mut evidence = vec![AdviceEvidence {
+            label: "Failed launches in a row".into(),
+            value: m.failed_launches.to_string(),
+        }];
+        if let Some(until) = m.paused_until {
+            evidence.push(AdviceEvidence {
+                label: "Next try".into(),
+                value: until.format("%Y-%m-%d %H:%M UTC").to_string(),
+            });
+        }
+        out.push(AdviceFinding {
+            key: format!("slurm_paused:{}", m.model_id),
+            check: "slurm_paused".into(),
+            severity: "act".into(),
+            title: format!("{name} has stopped starting jobs on Slurm"),
+            detail: format!(
+                "{reason} Fix the cause (the job's log usually says it), then press Try again \
+                 on the deployment to start a job now."
+            ),
+            evidence,
+            models: vec![name],
+            fix: None,
+            logs: None,
+            judgment: None,
+            weight: u64::try_from(m.failed_launches.max(1)).unwrap_or(1),
+        });
+    }
     out
 }
 
@@ -1524,5 +1628,61 @@ mod tests {
         let body = verdicts_body("judge", &f[0]);
         assert!(body["questions"]["fix_is_safe"].is_object());
         assert_eq!(body["model"], "judge");
+    }
+
+    #[test]
+    fn slurm_findings_cover_token_expiry_and_paused_models() {
+        use base64::Engine;
+        let now_ms = 1_700_000_000_000;
+        let tok = |exp: i64| {
+            let enc = |b: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+            format!("{}.{}.s", enc("{}"), enc(&format!(r#"{{"exp":{exp}}}"#)))
+        };
+        let settings = |jwt: String| obleth_config::SlurmSettings {
+            enabled: true,
+            slurm_jwt: jwt,
+            ..Default::default()
+        };
+        let none = slurm_findings(
+            &settings(tok(1_700_000_000 + 10 * 86_400)),
+            &[],
+            &[],
+            now_ms,
+        );
+        assert!(none.is_empty());
+        let f = slurm_findings(&settings(tok(1_700_000_000 + 2 * 86_400)), &[], &[], now_ms);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].title, "The Slurm token expires in 2 days");
+        assert_eq!(f[0].severity, "act");
+        let f = slurm_findings(&settings(tok(1_700_000_000 - 5)), &[], &[], now_ms);
+        assert_eq!(f[0].title, "The Slurm token has expired");
+
+        let id = Uuid::new_v4();
+        let paused = obleth_config::ManagedModelSpec {
+            model_id: id,
+            paused_reason: Some("Three launches in a row ended before the server answered.".into()),
+            paused_until: chrono::DateTime::from_timestamp(1_700_000_600, 0),
+            failed_launches: 3,
+            ..Default::default()
+        };
+        let lifted = obleth_config::ManagedModelSpec {
+            model_id: Uuid::new_v4(),
+            paused_reason: Some("old".into()),
+            paused_until: chrono::DateTime::from_timestamp(1_699_999_000, 0),
+            ..Default::default()
+        };
+        let mut route = route("glm", false, &[]);
+        route.id = id;
+        let f = slurm_findings(
+            &settings(String::new()),
+            &[paused, lifted],
+            &[route],
+            now_ms,
+        );
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].key, format!("slurm_paused:{id}"));
+        assert_eq!(f[0].title, "glm has stopped starting jobs on Slurm");
+        assert!(f[0].detail.starts_with("Three launches"));
+        assert_eq!(f[0].models, ["glm"]);
     }
 }

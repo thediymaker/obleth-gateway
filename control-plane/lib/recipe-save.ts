@@ -16,6 +16,19 @@ export interface SaveAs {
   /** Input values as the cluster defaults resolve them, to tell "left as the
    *  cluster default" apart from a value someone typed. */
   clusterResolved?: Record<string, string>;
+  /** The script to save in place of the source recipe's, e.g. one edited at
+   *  launch. Kept as written, tokens and #SBATCH lines included. */
+  script?: string;
+}
+
+/** A deployment's submitted script, made reusable: the served name becomes
+ *  {{api_model_name}} again so the saved recipe can launch under another name.
+ *  Only whole words are replaced (after a space, = or quote), so a repo id that
+ *  contains the name, such as org/name, is left alone. */
+export function retokenizeName(script: string, name: string): string {
+  if (!name) return script;
+  const esc = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return script.replace(new RegExp(`(^|[\\s="'])${esc}(?=$|[\\s"'])`, "gm"), "$1{{api_model_name}}");
 }
 
 /** "Nemotron 3 Ultra on Grace Hopper · gh200 · 4 nodes". */
@@ -101,5 +114,6 @@ export function savedRecipeText(source: string, form: DeployForm, as: SaveAs): s
       if (isMap(byNodes) && value !== "") (byNodes as unknown as YAMLMap<string, unknown>).set(String(form.slurm.nodes), plain(value));
     }
   }
-  return `---\n${doc.toString({ lineWidth: 0 })}---\n${split.body}`;
+  const body = as.script !== undefined ? as.script.replace(/\r\n/g, "\n").replace(/^\n+/, "") : split.body;
+  return `---\n${doc.toString({ lineWidth: 0 })}---\n${body}`;
 }

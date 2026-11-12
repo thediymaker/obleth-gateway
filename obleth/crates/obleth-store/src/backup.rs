@@ -153,7 +153,13 @@ impl Store {
         let model_endpoints = sqlx::query(
             "select id, model_id, name, api_base, api_key, priority, weight, enabled,
                     max_in_flight, created_at
-             from model_endpoints order by created_at",
+             from model_endpoints
+             -- Endpoints the Slurm provisioner registered for a running job
+             -- point at a node and port that will be gone; the provisioner
+             -- registers fresh ones from the managed spec.
+             where id not in (select endpoint_id from model_replicas
+                              where endpoint_id is not null)
+             order by created_at",
         )
         .fetch_all(&self.pool)
         .await?
@@ -207,8 +213,28 @@ impl Store {
             .collect::<Result<Vec<_>>>()?;
 
         let model_families = self.list_model_families().await?;
+        let managed_models = self
+            .list_managed_models()
+            .await?
+            .iter()
+            .map(obleth_config::ManagedModelBackup::from)
+            .collect();
+        let recipes = self
+            .list_recipes()
+            .await?
+            .into_iter()
+            .map(|r| obleth_config::RecipeBackup {
+                id: r.id,
+                name: r.name,
+                body: r.body,
+                author: r.author,
+                created_at: r.created_at,
+            })
+            .collect();
 
         Ok(BackupData {
+            managed_models,
+            recipes,
             fairshare_groups,
             tenants,
             api_keys,
@@ -676,6 +702,87 @@ impl Store {
             tally(&mut report.model_families, &row)?;
         }
 
+        for m in &data.managed_models {
+            let row = sqlx::query(
+                "insert into managed_models
+                    (model_id, enabled, partition, gres, nodes, constraints, exclude, account,
+                     qos, time_limit, cpus_per_task, mem, image, preamble, log_output_dir,
+                     launch_command, script_body, serving_port, health_path, target_replicas,
+                     min_replicas, max_job_failures, launcher_spec, startup_timeout_mins,
+                     handoff_mins, created_at)
+                 values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
+                         $20,$21,$22,$23,$24,$25,$26)
+                 on conflict (model_id) do update set
+                    enabled = excluded.enabled, partition = excluded.partition,
+                    gres = excluded.gres, nodes = excluded.nodes,
+                    constraints = excluded.constraints, exclude = excluded.exclude,
+                    account = excluded.account, qos = excluded.qos,
+                    time_limit = excluded.time_limit, cpus_per_task = excluded.cpus_per_task,
+                    mem = excluded.mem, image = excluded.image, preamble = excluded.preamble,
+                    log_output_dir = excluded.log_output_dir,
+                    launch_command = excluded.launch_command,
+                    script_body = excluded.script_body, serving_port = excluded.serving_port,
+                    health_path = excluded.health_path,
+                    target_replicas = excluded.target_replicas,
+                    min_replicas = excluded.min_replicas,
+                    max_job_failures = excluded.max_job_failures,
+                    launcher_spec = excluded.launcher_spec,
+                    startup_timeout_mins = excluded.startup_timeout_mins,
+                    handoff_mins = excluded.handoff_mins, updated_at = now()
+                 returning (xmax = 0) as inserted",
+            )
+            .bind(m.model_id)
+            .bind(m.enabled)
+            .bind(&m.partition)
+            .bind(&m.gres)
+            .bind(m.nodes.max(1))
+            .bind(&m.constraints)
+            .bind(&m.exclude)
+            .bind(&m.account)
+            .bind(&m.qos)
+            .bind(&m.time_limit)
+            .bind(m.cpus_per_task)
+            .bind(&m.mem)
+            .bind(&m.image)
+            .bind(&m.preamble)
+            .bind(&m.log_output_dir)
+            .bind(&m.launch_command)
+            .bind(&m.script_body)
+            .bind(m.serving_port)
+            .bind(&m.health_path)
+            .bind(m.target_replicas.max(0))
+            .bind(m.min_replicas.clamp(0, m.target_replicas.max(0)))
+            .bind(m.max_job_failures.max(0))
+            .bind(m.launcher_spec.as_ref().map(sqlx::types::Json))
+            .bind(m.startup_timeout_mins.max(0))
+            .bind(m.handoff_mins.max(0))
+            .bind(m.created_at)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(restore_db_error)?;
+            tally(&mut report.managed_models, &row)?;
+        }
+
+        for r in &data.recipes {
+            let row = sqlx::query(
+                "insert into recipes (id, name, body, author, created_at)
+                 values ($1, $2, $3, $4, $5)
+                 on conflict (id) do update set
+                    name = excluded.name, body = excluded.body,
+                    author = excluded.author, updated_at = now()
+                 returning (xmax = 0) as inserted",
+            )
+            .bind(r.id)
+            .bind(&r.name)
+            .bind(&r.body)
+            .bind(&r.author)
+            .bind(r.created_at)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(restore_db_error)?;
+            tally(&mut report.recipes, &row)?;
+        }
+
         tx.commit().await?;
         Ok(report)
     }
@@ -1026,8 +1133,120 @@ mod tests {
             .await
             .expect("create endpoint");
 
+        // A Slurm deployment spec, and a provisioner-registered endpoint
+        // linked to one of its replicas: the spec is backed up, the endpoint
+        // (a node and port that will not survive) is not.
+        store
+            .upsert_managed_model(crate::UpsertManagedModel {
+                model_id: model.id,
+                enabled: false,
+                partition: "gpu".into(),
+                gres: "gpu:1".into(),
+                nodes: 1,
+                constraints: None,
+                exclude: None,
+                account: None,
+                qos: None,
+                time_limit: Some("4:00:00".into()),
+                cpus_per_task: None,
+                mem: None,
+                image: String::new(),
+                preamble: String::new(),
+                log_output_dir: String::new(),
+                launch_command: "serve".into(),
+                script_body: "#!/bin/bash\nserve\n".into(),
+                serving_port: 8000,
+                health_path: "/health".into(),
+                target_replicas: 2,
+                min_replicas: 1,
+                max_job_failures: 3,
+                launcher_spec: None,
+                startup_timeout_mins: 45,
+                handoff_mins: 10,
+            })
+            .await
+            .expect("upsert managed");
+        let job_endpoint = store
+            .create_model_endpoint(
+                model.id,
+                "obleth-job",
+                "http://10.0.0.9:8000/v1",
+                None,
+                0,
+                100,
+                true,
+                None,
+            )
+            .await
+            .expect("create job endpoint");
+        let replica = store
+            .create_replica(model.id, "4242", Some(8000))
+            .await
+            .expect("create replica");
+        store
+            .set_replica_runtime(replica.id, None, Some(job_endpoint.id))
+            .await
+            .expect("link endpoint");
+        let recipe = store
+            .upsert_recipe(crate::UpsertRecipe {
+                id: None,
+                name: format!("r-{}", uuid::Uuid::new_v4()),
+                body: "#!/bin/bash\nserve\n".into(),
+                author: "test".into(),
+            })
+            .await
+            .expect("upsert recipe");
+
         // Export carries the stored hash and the tenant config.
         let data = store.export_backup_data().await.expect("export");
+        let managed = data
+            .managed_models
+            .iter()
+            .find(|m| m.model_id == model.id)
+            .expect("managed spec in export");
+        assert_eq!(managed.target_replicas, 2);
+        assert_eq!(managed.startup_timeout_mins, 45);
+        assert_eq!(managed.handoff_mins, 10);
+        assert!(data.recipes.iter().any(|r| r.id == recipe.id));
+        assert!(data.model_endpoints.iter().any(|e| e.id == endpoint.id));
+        assert!(
+            !data.model_endpoints.iter().any(|e| e.id == job_endpoint.id),
+            "endpoints the provisioner registered for a job are left out"
+        );
+        sqlx::query("update managed_models set target_replicas = 5 where model_id = $1")
+            .bind(model.id)
+            .execute(&store.pool)
+            .await
+            .expect("drift managed");
+        store.delete_recipe(recipe.id).await.expect("delete recipe");
+        let report = store
+            .restore_backup_data(&data)
+            .await
+            .expect("restore managed");
+        assert!(report.managed_models.updated >= 1);
+        assert!(report.recipes.inserted >= 1);
+        let m = store
+            .get_managed_model(model.id)
+            .await
+            .expect("get managed")
+            .expect("present");
+        assert_eq!(m.target_replicas, 2);
+        assert!(store
+            .get_recipe(recipe.id)
+            .await
+            .expect("get recipe")
+            .is_some());
+        store
+            .delete_replica(replica.id)
+            .await
+            .expect("delete replica");
+        store.delete_recipe(recipe.id).await.expect("delete recipe");
+        // Later restores in this test must not bring the recipe back.
+        let data = {
+            let mut d = data;
+            d.recipes.retain(|r| r.id != recipe.id);
+            d
+        };
         let exported_key = data
             .api_keys
             .iter()

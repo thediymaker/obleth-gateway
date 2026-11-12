@@ -5,7 +5,8 @@ import { Document, isMap, isScalar, LineCounter, parseDocument, type Node as Yam
 import type { RecipeDeployPreview } from "@/components/recipes/recipe-card";
 import { accountsFor, gresCount, memToMb, partitionFits, parseTimeLimit, walltimeLabel } from "@/lib/deployments-model";
 import type { ClusterResources } from "@/lib/obleth";
-import { inputDefaults, inputProblem, type ClusterValues } from "@/lib/recipe-inputs";
+import { GRES_RE } from "@/lib/managed-model-schema";
+import { inputDefaults, inputProblem, MODEL_NAME_RE, MODEL_NAME_RULE, type ClusterValues } from "@/lib/recipe-inputs";
 import type { DeployOverrides } from "@/lib/sbatch-recipes";
 
 export interface SlurmFields {
@@ -36,6 +37,9 @@ export interface DeployForm {
   slurm: SlurmFields;
   env: Record<string, string>;
   serving: ServingFields;
+  /** The kind of model to register, when it differs from the recipe's (an
+   *  engine recipe serving an embedding model, say). */
+  model_type?: string;
 }
 
 /** A dotted path into the form, e.g. "slurm.account" or "inputs.context". */
@@ -45,7 +49,7 @@ export type FieldPath = string;
 export type Source = "recipe" | "cluster" | "learned" | "changed" | "default";
 
 /** The form as the recipe (and cluster defaults) would launch it. */
-export function baselineForm(recipeId: string, p: RecipeDeployPreview, cv: ClusterValues, overrides: { name?: string; inputs?: Record<string, string> } = {}): DeployForm {
+export function baselineForm(recipeId: string, p: RecipeDeployPreview, cv: ClusterValues, overrides: { name?: string; inputs?: Record<string, string>; modelType?: string } = {}): DeployForm {
   const nodes = p.nodes ?? 1;
   return {
     recipe: recipeId,
@@ -68,9 +72,10 @@ export function baselineForm(recipeId: string, p: RecipeDeployPreview, cv: Clust
     serving: {
       keep_running: p.targetReplicas ?? 1,
       serve_from: 1,
-      stop_after_failed_launches: p.maxJobFailures ?? 3,
+      stop_after_failed_launches: p.maxJobFailures ?? 2,
       health_path: p.healthPath,
     },
+    ...(overrides.modelType && overrides.modelType !== p.modelType ? { model_type: overrides.modelType } : {}),
   };
 }
 
@@ -105,6 +110,7 @@ export function toOverrides(form: DeployForm): DeployOverrides {
   const target = Math.max(0, Math.floor(form.serving.keep_running) || 0) || 1;
   return {
     api_model_name: form.name.trim(),
+    ...(form.model_type ? { model_type: form.model_type } : {}),
     partition: s.partition,
     account: s.account,
     qos: s.qos,
@@ -139,32 +145,54 @@ export function formProblems(form: DeployForm, p: RecipeDeployPreview, resources
   const out: Problem[] = [];
   const name = form.name.trim();
   if (!name) out.push({ path: "name", message: "Name it: this is what clients send as model" });
+  else if (!MODEL_NAME_RE.test(name)) out.push({ path: "name", message: `Names ${MODEL_NAME_RULE}, since clients send it as model and the job passes it to the server as one word` });
   else if (takenNames.includes(name)) out.push({ path: "name", message: `A model called ${name} already exists` });
   for (const input of p.inputs) {
-    const why = inputProblem(input, form.inputs[input.name]);
+    const value = form.inputs[input.name];
+    const missing = /\{\{\s*cluster\.([a-z]+)(?:\.([A-Za-z0-9_-]+))?\s*\}\}/.exec(value ?? "");
+    const why = missing ? missingDefault(input.label || input.name, missing[1], missing[2]) : inputProblem(input, value);
     if (why) out.push({ path: `inputs.${input.name}`, message: why });
   }
   const s = form.slurm;
-  if (!s.partition.trim()) out.push({ path: "slurm.partition", message: "Pick a partition" });
-  else if (resources.partitions.length && !resources.partitions.some((x) => x.name === s.partition)) out.push({ path: "slurm.partition", message: `There's no ${s.partition} partition on this cluster` });
+  // A blank partition is the cluster's default partition.
+  if (s.partition.trim() && resources.partitions.length && !resources.partitions.some((x) => x.name === s.partition)) out.push({ path: "slurm.partition", message: `There's no ${s.partition} partition on this cluster` });
   const takes = s.partition ? accountsFor(resources, s.partition) : null;
-  if (s.account && resources.accounts.length && !resources.accounts.includes(s.account)) out.push({ path: "slurm.account", message: `${s.account} isn't an account your Slurm user can charge${suggest(s.account, resources.accounts)}` });
+  // With associations, the account list is the Slurm user's own; without, it is every account on the cluster.
+  const own = !!resources.associations?.length;
+  if (s.account && resources.accounts.length && !resources.accounts.includes(s.account)) out.push({ path: "slurm.account", message: own ? `${s.account} isn't an account your Slurm user can charge${suggest(s.account, resources.accounts)}` : `There's no account called ${s.account} on this cluster${suggest(s.account, resources.accounts)}` });
   else if (s.account && takes && !takes.includes(s.account)) out.push({ path: "slurm.account", message: takes.length ? `${s.partition} doesn't take ${s.account}. It takes ${takes.join(", ")}.` : `${s.partition} doesn't take any of your accounts.` });
-  if (s.qos && resources.qos.length && !resources.qos.includes(s.qos)) out.push({ path: "slurm.qos", message: `${s.qos} isn't a QoS your user has${suggest(s.qos, resources.qos)}` });
+  if (s.qos && resources.qos.length && !resources.qos.includes(s.qos)) out.push({ path: "slurm.qos", message: `There's no QoS called ${s.qos} on this cluster${suggest(s.qos, resources.qos)}` });
   const minutes = parseTimeLimit(s.time_limit);
   if (s.time_limit.trim() && minutes == null) out.push({ path: "slurm.time_limit", message: "Walltime should look like D-HH:MM:SS" });
   const fit = partitionFits(resources, { gpus: gresCount(s.gres), cpus: s.cpus_per_task ? Number(s.cpus_per_task) : null, memMb: memToMb(s.mem) }).find((f) => f.name === s.partition);
   if (fit && !fit.fits) out.push({ path: "slurm.partition", message: `One replica doesn't fit a ${fit.name} node: ${fit.reason}` });
-  if (fit && minutes && fit.maxMinutes && minutes > fit.maxMinutes) out.push({ path: "slurm.time_limit", message: `${walltimeLabel(minutes)} is over ${fit.name}'s ${walltimeLabel(fit.maxMinutes)} limit` });
+  if (fit && minutes && fit.maxMinutes && minutes > fit.maxMinutes) out.push({ path: "slurm.time_limit", message: `${walltimeLabel(minutes)} is over ${fit.name}'s ${walltimeLabel(fit.maxMinutes)} limit, so Slurm would hold the job and never start it` });
   if (!Number.isInteger(s.nodes) || s.nodes < 1) out.push({ path: "slurm.nodes", message: "Nodes must be a whole number, 1 or more" });
   if (s.cpus_per_task.trim() && !(Number(s.cpus_per_task) > 0)) out.push({ path: "slurm.cpus_per_task", message: "CPUs must be a number" });
   if (s.mem.trim() && s.mem.trim() !== "0" && memToMb(s.mem) == null) out.push({ path: "slurm.mem", message: "Memory should look like 560G, or 0 for all of it" });
+  if (s.gres.trim() && !GRES_RE.test(s.gres.trim())) out.push({ path: "slurm.gres", message: "Write GPUs as Slurm gres, such as gpu:1, gpu:h100:2 or gpu:1,shard:1" });
+  const logs = s.log_output_dir.trim();
+  if (logs && !logs.startsWith("/") && !logs.includes("{{")) out.push({ path: "slurm.log_output_dir", message: "Job logs must be a full path starting with /. A relative folder would end up under /tmp on the node" });
   for (const k of Object.keys(form.env)) if (k && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) out.push({ path: `env.${k}`, message: `${k} isn't a valid variable name` });
   const sv = form.serving;
   if (!(sv.keep_running >= 1)) out.push({ path: "serving.keep_running", message: "Keep at least 1 running" });
-  if (sv.serve_from > sv.keep_running) out.push({ path: "serving.serve_from", message: "Can't serve from more replicas than are kept running" });
+  if (sv.serve_from > sv.keep_running) out.push({ path: "serving.serve_from", message: "Healthy when can't be more than the replicas kept running" });
   if (!sv.health_path.startsWith("/")) out.push({ path: "serving.health_path", message: "The health check is a path starting with /" });
   return out;
+}
+
+/** Where an unset cluster default lives, so the message can name it. */
+const DEFAULT_NAME: Record<string, string> = {
+  cache: "Cluster defaults › Weight cache",
+  images: "Cluster defaults › Images folder",
+  logs: "Cluster defaults › Job logs",
+  setup: "Cluster defaults › Load before launch",
+};
+const ENGINE_NAME: Record<string, string> = { vllm: "vLLM", sglang: "SGLang", llamacpp: "llama.cpp", ollama: "Ollama" };
+
+function missingDefault(label: string, key: string, sub?: string): string {
+  const where = key === "image" && sub ? `Cluster defaults › Image per engine › ${ENGINE_NAME[sub] ?? sub}` : DEFAULT_NAME[key] ?? `the cluster default ${key}`;
+  return `${label} comes from ${where}, which isn't set. Set it on the Slurm connection, or type a value here for this launch`;
 }
 
 /** ". Did you mean long?" for a near miss, else "". */

@@ -112,6 +112,7 @@ const SCHEMA_V38: &str =
     include_str!("../../../../schema/postgres/0038_model_session_affinity.sql");
 const SCHEMA_V39: &str = include_str!("../../../../schema/postgres/0039_batches.sql");
 const SCHEMA_V40: &str = include_str!("../../../../schema/postgres/0040_mcp_server_tenants.sql");
+const SCHEMA_V41: &str = include_str!("../../../../schema/postgres/0041_slurm_connector.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -147,6 +148,7 @@ pub struct UpsertRecipe {
 }
 
 /// Input for `upsert_managed_model` (no timestamps; the DB sets them).
+#[derive(Debug, Clone)]
 pub struct UpsertManagedModel {
     pub model_id: Uuid,
     pub enabled: bool,
@@ -171,7 +173,26 @@ pub struct UpsertManagedModel {
     pub min_replicas: i64,
     pub max_job_failures: i64,
     pub launcher_spec: Option<serde_json::Value>,
+    /// Minutes a running job may take to serve; 0 never gives up.
+    pub startup_timeout_mins: i64,
+    /// Minutes before the time limit a replacement starts; 0 is off.
+    pub handoff_mins: i64,
 }
+
+/// Provisioner-reported replica details. `None` keeps the stored value.
+#[derive(Debug, Clone, Default)]
+pub struct ReplicaDetailsUpdate {
+    pub job_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub job_ends_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// An empty string clears it.
+    pub state_detail: Option<String>,
+    /// An empty string clears it.
+    pub log_path: Option<String>,
+    pub port: Option<i64>,
+    pub replace_requested: Option<bool>,
+}
+
+pub use obleth_config::ManagedBackoff;
 
 /// Validate a caller-supplied tag list and re-serialize what survives to the
 /// storage form: bare `base` when the declared level is 1 (the untiered
@@ -268,6 +289,7 @@ impl Store {
             sqlx::raw_sql(SCHEMA_V38).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V39).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V40).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V41).execute(&mut *conn).await?;
             Ok(())
         }
         .await;
@@ -2724,7 +2746,8 @@ impl Store {
              qos, time_limit, cpus_per_task, mem, image, preamble, log_output_dir, launch_command, \
              script_body, serving_port, \
              health_path, target_replicas, min_replicas, max_job_failures, launcher_spec, \
-             last_provision_error, last_provision_error_at, created_at, updated_at \
+             last_provision_error, last_provision_error_at, startup_timeout_mins, handoff_mins, \
+             paused_reason, paused_until, failed_launches, backoff_step, created_at, updated_at \
              from managed_models where model_id = $1",
         )
         .bind(model_id)
@@ -2752,7 +2775,8 @@ impl Store {
              qos, time_limit, cpus_per_task, mem, image, preamble, log_output_dir, launch_command, \
              script_body, serving_port, \
              health_path, target_replicas, min_replicas, max_job_failures, launcher_spec, \
-             last_provision_error, last_provision_error_at, created_at, updated_at \
+             last_provision_error, last_provision_error_at, startup_timeout_mins, handoff_mins, \
+             paused_reason, paused_until, failed_launches, backoff_step, created_at, updated_at \
              from managed_models order by model_id",
         )
         .fetch_all(&self.pool)
@@ -2766,8 +2790,9 @@ impl Store {
                 (model_id, enabled, partition, gres, nodes, constraints, exclude,
                  account, qos, time_limit, cpus_per_task, mem, image, preamble, log_output_dir,
                  launch_command, script_body,
-                 serving_port, health_path, target_replicas, min_replicas, max_job_failures, launcher_spec)
-             values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
+                 serving_port, health_path, target_replicas, min_replicas, max_job_failures, launcher_spec,
+                 startup_timeout_mins, handoff_mins)
+             values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
              on conflict (model_id) do update set
                 enabled = excluded.enabled, partition = excluded.partition,
                 gres = excluded.gres, nodes = excluded.nodes,
@@ -2781,12 +2806,15 @@ impl Store {
                 target_replicas = excluded.target_replicas,
                 min_replicas = excluded.min_replicas,
                 max_job_failures = excluded.max_job_failures,
-                launcher_spec = excluded.launcher_spec, updated_at = now()
+                launcher_spec = excluded.launcher_spec,
+                startup_timeout_mins = excluded.startup_timeout_mins,
+                handoff_mins = excluded.handoff_mins, updated_at = now()
              returning model_id, enabled, partition, gres, nodes, constraints, exclude, account, \
              qos, time_limit, cpus_per_task, mem, image, preamble, log_output_dir, launch_command, \
              script_body, serving_port, \
              health_path, target_replicas, min_replicas, max_job_failures, launcher_spec, \
-             last_provision_error, last_provision_error_at, created_at, updated_at",
+             last_provision_error, last_provision_error_at, startup_timeout_mins, handoff_mins, \
+             paused_reason, paused_until, failed_launches, backoff_step, created_at, updated_at",
         )
         .bind(m.model_id)
         .bind(m.enabled)
@@ -2807,13 +2835,16 @@ impl Store {
         .bind(&m.script_body)
         .bind(m.serving_port)
         .bind(&m.health_path)
-        .bind(m.target_replicas.max(1))
+        // 0 keeps the spec but runs no replicas. The API rejects values out
+        // of range with a message; these bounds only guard other callers.
+        .bind(m.target_replicas.max(0))
         // The health floor cannot exceed the count the reconciler submits toward;
-        // otherwise the model could never reach `min_replicas` healthy and would
-        // be wedged below its floor forever. Clamp to [1, target_replicas].
-        .bind(m.min_replicas.clamp(1, m.target_replicas.max(1)))
+        // otherwise the model could never reach `min_replicas` healthy.
+        .bind(m.min_replicas.clamp(0, m.target_replicas.max(0)))
         .bind(m.max_job_failures.max(0))
         .bind(m.launcher_spec.as_ref().map(sqlx::types::Json))
+        .bind(m.startup_timeout_mins.max(0))
+        .bind(m.handoff_mins.max(0))
         .fetch_one(&self.pool)
         .await?;
         managed_model_from_row(&row)
@@ -2901,6 +2932,32 @@ impl Store {
         slurm_job_id: &str,
         port_base: Option<i64>,
     ) -> Result<ModelReplica> {
+        self.create_replica_with_log(model_id, slurm_job_id, port_base, None)
+            .await
+    }
+
+    /// [`create_replica`](Self::create_replica), also recording where the
+    /// job's output goes.
+    pub async fn create_replica_with_log(
+        &self,
+        model_id: Uuid,
+        slurm_job_id: &str,
+        port_base: Option<i64>,
+        log_path: Option<&str>,
+    ) -> Result<ModelReplica> {
+        // The launch row keeps the launcher panel state with environment
+        // values and secret-looking inputs hidden: launch history outlives
+        // the deployment.
+        let launcher_spec: Option<serde_json::Value> =
+            sqlx::query_scalar::<_, Option<sqlx::types::Json<serde_json::Value>>>(
+                "select launcher_spec from managed_models where model_id = $1",
+            )
+            .bind(model_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .flatten()
+            .map(|j| obleth_config::slurm::redact_launcher_spec(&j.0));
+        let log_path = log_path.map(str::trim).filter(|p| !p.is_empty());
         // Idempotent: a retried insert for the same (model_id, slurm_job_id)
         // returns the existing row instead of erroring on the unique index.
         //
@@ -2910,11 +2967,14 @@ impl Store {
         // retried insert the launch row already exists and is left alone.
         let row = sqlx::query(
             "with r as (
-                insert into model_replicas (id, model_id, slurm_job_id, port_base)
-                values ($1, $2, $3, $4)
-                on conflict (model_id, slurm_job_id) do update set updated_at = now()
+                insert into model_replicas (id, model_id, slurm_job_id, port_base, log_path)
+                values ($1, $2, $3, $4, $6)
+                on conflict (model_id, slurm_job_id) do update set
+                    log_path = coalesce(model_replicas.log_path, excluded.log_path),
+                    updated_at = now()
                 returning id, model_id, slurm_job_id, nodes, endpoint_id, state,
-                          last_message, port_base, cancel_requested, created_at, updated_at
+                          last_message, port_base, cancel_requested, replace_requested, job_started_at,
+                    job_ends_at, state_detail, log_path, port, created_at, updated_at
              ), launch as (
                 insert into deployment_launches
                     (id, model_id, model_name, recipe_id, slurm_job_id, partition, account,
@@ -2923,7 +2983,7 @@ impl Store {
                 select r.id, r.model_id, m.model_name, mm.launcher_spec->>'recipe_id',
                        r.slurm_job_id, mm.partition, mm.account, mm.qos, mm.time_limit,
                        mm.gres, mm.nodes, mm.cpus_per_task, mm.mem, mm.exclude,
-                       mm.constraints, mm.launcher_spec, r.created_at
+                       mm.constraints, $5::jsonb, r.created_at
                 from r
                 join models m on m.id = r.model_id
                 left join managed_models mm on mm.model_id = r.model_id
@@ -2935,15 +2995,117 @@ impl Store {
         .bind(model_id)
         .bind(slurm_job_id)
         .bind(port_base)
+        .bind(launcher_spec.map(sqlx::types::Json))
+        .bind(log_path)
         .fetch_one(&self.pool)
         .await?;
         replica_from_row(&row)
     }
 
+    /// Flag a replica for surge-first replacement: the provisioner submits a
+    /// successor and drains this one once the successor serves. `false` when
+    /// no replica with that id exists.
+    pub async fn request_replica_replace(&self, id: Uuid) -> Result<bool> {
+        let res = sqlx::query(
+            "update model_replicas set replace_requested = true, updated_at = now() where id = $1",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Flag every live replica (not draining, lost, or already being
+    /// replaced) of a model for surge-first replacement. Returns how many.
+    pub async fn request_model_roll(&self, model_id: Uuid) -> Result<u64> {
+        let res = sqlx::query(
+            "update model_replicas set replace_requested = true, updated_at = now()
+             where model_id = $1 and state in ('pending','starting','healthy')
+               and not replace_requested and not cancel_requested",
+        )
+        .bind(model_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Update the provisioner-reported details of a replica. `None` keeps a
+    /// field; an empty `state_detail` or `log_path` clears it.
+    pub async fn set_replica_details(
+        &self,
+        id: Uuid,
+        d: &ReplicaDetailsUpdate,
+    ) -> Result<ModelReplica> {
+        let row = sqlx::query(
+            "update model_replicas set
+                 job_started_at = coalesce($2, job_started_at),
+                 job_ends_at = coalesce($3, job_ends_at),
+                 state_detail = case when $4::text is null then state_detail
+                                     else nullif($4, '') end,
+                 log_path = case when $5::text is null then log_path
+                                 else nullif($5, '') end,
+                 port = coalesce($6, port),
+                 replace_requested = coalesce($7, replace_requested),
+                 updated_at = now()
+             where id = $1
+             returning id, model_id, slurm_job_id, nodes, endpoint_id, state,
+                       last_message, port_base, cancel_requested, replace_requested,
+                       job_started_at, job_ends_at, state_detail, log_path, port,
+                       created_at, updated_at",
+        )
+        .bind(id)
+        .bind(d.job_started_at)
+        .bind(d.job_ends_at)
+        .bind(d.state_detail.as_deref())
+        .bind(d.log_path.as_deref())
+        .bind(d.port)
+        .bind(d.replace_requested)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+        replica_from_row(&row)
+    }
+
+    /// Record the provisioner's failure and pause state for a managed model.
+    /// `paused_until = None` with `paused_reason = None` lifts a pause.
+    /// No-op if the model has no managed_models row.
+    pub async fn set_managed_backoff(&self, model_id: Uuid, b: &ManagedBackoff) -> Result<()> {
+        sqlx::query(
+            "update managed_models set
+                 failed_launches = $2, backoff_step = $3,
+                 paused_reason = $4, paused_until = $5, updated_at = now()
+             where model_id = $1",
+        )
+        .bind(model_id)
+        .bind(b.failed_launches.max(0))
+        .bind(b.backoff_step.max(0))
+        .bind(b.paused_reason.as_deref().filter(|r| !r.trim().is_empty()))
+        .bind(b.paused_until)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// "Try again": lift a pause and reset the failure count and backoff so
+    /// the next pass submits. `false` when the model has no managed spec.
+    pub async fn clear_managed_backoff(&self, model_id: Uuid) -> Result<bool> {
+        let res = sqlx::query(
+            "update managed_models set
+                 failed_launches = 0, backoff_step = 0, paused_reason = null,
+                 paused_until = null, updated_at = now()
+             where model_id = $1",
+        )
+        .bind(model_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
     pub async fn list_replicas(&self, model_id: Uuid) -> Result<Vec<ModelReplica>> {
         let rows = sqlx::query(
             "select id, model_id, slurm_job_id, nodes, endpoint_id, state,
-                    last_message, port_base, cancel_requested, created_at, updated_at
+                    last_message, port_base, cancel_requested, replace_requested, job_started_at,
+                    job_ends_at, state_detail, log_path, port, created_at, updated_at
              from model_replicas where model_id = $1 order by created_at",
         )
         .bind(model_id)
@@ -2955,7 +3117,8 @@ impl Store {
     pub async fn all_replicas(&self) -> Result<Vec<ModelReplica>> {
         let rows = sqlx::query(
             "select id, model_id, slurm_job_id, nodes, endpoint_id, state,
-                    last_message, port_base, cancel_requested, created_at, updated_at
+                    last_message, port_base, cancel_requested, replace_requested, job_started_at,
+                    job_ends_at, state_detail, log_path, port, created_at, updated_at
              from model_replicas order by model_id, created_at",
         )
         .fetch_all(&self.pool)
@@ -2978,7 +3141,8 @@ impl Store {
                 update model_replicas set state = $2, last_message = $3, updated_at = now()
                 where id = $1
                 returning id, model_id, slurm_job_id, nodes, endpoint_id, state,
-                          last_message, port_base, cancel_requested, created_at, updated_at
+                          last_message, port_base, cancel_requested, replace_requested, job_started_at,
+                    job_ends_at, state_detail, log_path, port, created_at, updated_at
              ), launch as (
                 update deployment_launches l set
                     started_at = case when $4 then coalesce(l.started_at, now())
@@ -3028,7 +3192,8 @@ impl Store {
                        endpoint_id = coalesce($3, endpoint_id), updated_at = now()
                 where id = $1
                 returning id, model_id, slurm_job_id, nodes, endpoint_id, state,
-                          last_message, port_base, cancel_requested, created_at, updated_at
+                          last_message, port_base, cancel_requested, replace_requested, job_started_at,
+                    job_ends_at, state_detail, log_path, port, created_at, updated_at
              ), launch as (
                 update deployment_launches l set
                     nodes = coalesce(l.nodes, $2),
@@ -3054,7 +3219,8 @@ impl Store {
             "update model_replicas set last_message = $2, updated_at = now()
              where id = $1
              returning id, model_id, slurm_job_id, nodes, endpoint_id, state,
-                       last_message, port_base, cancel_requested, created_at, updated_at",
+                       last_message, port_base, cancel_requested, replace_requested, job_started_at,
+                    job_ends_at, state_detail, log_path, port, created_at, updated_at",
         )
         .bind(id)
         .bind(message)
@@ -3081,7 +3247,8 @@ impl Store {
     pub async fn get_replica(&self, id: Uuid) -> Result<Option<ModelReplica>> {
         let row = sqlx::query(
             "select id, model_id, slurm_job_id, nodes, endpoint_id, state,
-                    last_message, port_base, cancel_requested, created_at, updated_at
+                    last_message, port_base, cancel_requested, replace_requested, job_started_at,
+                    job_ends_at, state_detail, log_path, port, created_at, updated_at
              from model_replicas where id = $1",
         )
         .bind(id)
@@ -4518,6 +4685,12 @@ fn managed_model_from_row(row: &PgRow) -> Result<ManagedModelSpec> {
         launcher_spec: launcher_spec.map(|j| j.0),
         last_provision_error: row.try_get("last_provision_error")?,
         last_provision_error_at: row.try_get("last_provision_error_at")?,
+        startup_timeout_mins: row.try_get("startup_timeout_mins")?,
+        handoff_mins: row.try_get("handoff_mins")?,
+        paused_reason: row.try_get("paused_reason")?,
+        paused_until: row.try_get("paused_until")?,
+        failed_launches: row.try_get("failed_launches")?,
+        backoff_step: row.try_get("backoff_step")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -4534,6 +4707,12 @@ fn replica_from_row(row: &PgRow) -> Result<ModelReplica> {
         last_message: row.try_get("last_message")?,
         port_base: row.try_get("port_base")?,
         cancel_requested: row.try_get("cancel_requested")?,
+        replace_requested: row.try_get("replace_requested")?,
+        job_started_at: row.try_get("job_started_at")?,
+        job_ends_at: row.try_get("job_ends_at")?,
+        state_detail: row.try_get("state_detail")?,
+        log_path: row.try_get("log_path")?,
+        port: row.try_get("port")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -6916,6 +7095,8 @@ mod tests {
                 min_replicas: 1,
                 max_job_failures: 0,
                 launcher_spec: Some(serde_json::json!({"backendId":"llamacpp"})),
+                startup_timeout_mins: 60,
+                handoff_mins: 15,
             })
             .await
             .expect("upsert");
@@ -7019,6 +7200,8 @@ mod tests {
                 min_replicas: 1,
                 max_job_failures: 0,
                 launcher_spec: None,
+                startup_timeout_mins: 60,
+                handoff_mins: 15,
             })
             .await
             .expect("managed");
@@ -7047,6 +7230,245 @@ mod tests {
         assert_eq!(m.last_provision_error, None);
         assert!(m.last_provision_error_at.is_none());
 
+        // Clean up so the shared test DB doesn't accumulate managed models.
+        store.delete_managed_model(model.id).await.expect("delete");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn managed_backoff_replace_and_details() {
+        let Some(url) = crate::test_support::test_db_url() else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        let mut fixtures = FixtureGuard::new(&store);
+
+        let model_name = format!("m-{}", Uuid::new_v4());
+        let args = default_test_model(&model_name);
+        let model = store
+            .create_model(
+                args.0,
+                args.1,
+                args.2,
+                args.3,
+                args.4,
+                args.5,
+                args.6,
+                args.7,
+                args.8,
+                args.9,
+                args.10,
+                args.11,
+                args.12,
+                args.13,
+                args.14,
+                args.15,
+                args.16,
+                args.17,
+                args.18,
+                &args.19,
+                &args.20,
+                &args.21,
+                args.22,
+                args.23,
+                true,
+                "",
+                "",
+                "",
+                &[],
+                "",
+                &Default::default(),
+                0.0,
+                "static",
+                &Default::default(),
+                &[],
+            )
+            .await
+            .expect("model");
+        fixtures.track_model(model.id);
+        store
+            .upsert_managed_model(UpsertManagedModel {
+                model_id: model.id,
+                enabled: true,
+                partition: "gpu-preempt".into(),
+                gres: "gpu:h100:1".into(),
+                nodes: 1,
+                constraints: None,
+                exclude: None,
+                account: None,
+                qos: None,
+                time_limit: None,
+                cpus_per_task: None,
+                mem: None,
+                image: "vllm.sif".into(),
+                preamble: String::new(),
+                log_output_dir: String::new(),
+                launch_command: "vllm serve perr-model".into(),
+                script_body: String::new(),
+                serving_port: 8000,
+                health_path: "/health".into(),
+                target_replicas: 1,
+                min_replicas: 1,
+                max_job_failures: 0,
+                launcher_spec: None,
+                startup_timeout_mins: 60,
+                handoff_mins: 15,
+            })
+            .await
+            .expect("managed");
+
+        // Zero replicas is a valid target; the floor follows it down.
+        let mut zero = UpsertManagedModel {
+            model_id: model.id,
+            enabled: true,
+            partition: String::new(),
+            gres: String::new(),
+            nodes: 1,
+            constraints: None,
+            exclude: None,
+            account: None,
+            qos: None,
+            time_limit: None,
+            cpus_per_task: None,
+            mem: None,
+            image: String::new(),
+            preamble: String::new(),
+            log_output_dir: String::new(),
+            launch_command: "serve".into(),
+            script_body: String::new(),
+            serving_port: 8000,
+            health_path: "/health".into(),
+            target_replicas: 0,
+            min_replicas: 1,
+            max_job_failures: 2,
+            launcher_spec: Some(serde_json::json!({ "env": { "HF_TOKEN": "s3cret" } })),
+            startup_timeout_mins: 30,
+            handoff_mins: 0,
+        };
+        let m = store
+            .upsert_managed_model(zero.clone())
+            .await
+            .expect("zero");
+        assert_eq!((m.target_replicas, m.min_replicas), (0, 0));
+        assert_eq!((m.startup_timeout_mins, m.handoff_mins), (30, 0));
+        zero.target_replicas = 1;
+        store.upsert_managed_model(zero).await.expect("one");
+
+        let until = chrono::Utc::now() + chrono::Duration::minutes(5);
+        store
+            .set_managed_backoff(
+                model.id,
+                &ManagedBackoff {
+                    failed_launches: 2,
+                    backoff_step: 1,
+                    paused_reason: Some("Two launches in a row ended before serving.".into()),
+                    paused_until: Some(until),
+                },
+            )
+            .await
+            .expect("pause");
+        let m = store
+            .get_managed_model(model.id)
+            .await
+            .expect("get")
+            .expect("some");
+        assert_eq!((m.failed_launches, m.backoff_step), (2, 1));
+        assert!(m.paused_reason.is_some() && m.paused_until.is_some());
+        assert!(store.clear_managed_backoff(model.id).await.expect("retry"));
+        let m = store
+            .get_managed_model(model.id)
+            .await
+            .expect("get")
+            .expect("some");
+        assert_eq!((m.failed_launches, m.backoff_step), (0, 0));
+        assert!(m.paused_reason.is_none() && m.paused_until.is_none());
+        assert!(!store
+            .clear_managed_backoff(Uuid::new_v4())
+            .await
+            .expect("none"));
+
+        let r = store
+            .create_replica_with_log(model.id, "j-backoff", Some(8000), Some("/tmp/x-1.out"))
+            .await
+            .expect("replica");
+        assert_eq!(r.log_path.as_deref(), Some("/tmp/x-1.out"));
+        assert!(!r.replace_requested);
+        // The launch row hides environment values.
+        let spec: serde_json::Value =
+            sqlx::query_scalar::<_, sqlx::types::Json<serde_json::Value>>(
+                "select launcher_spec from deployment_launches where id = $1",
+            )
+            .bind(r.id)
+            .fetch_one(&store.pool)
+            .await
+            .expect("launch")
+            .0;
+        assert_eq!(spec["env"]["HF_TOKEN"], "(hidden)");
+
+        let started = chrono::Utc::now();
+        let r2 = store
+            .set_replica_details(
+                r.id,
+                &ReplicaDetailsUpdate {
+                    job_started_at: Some(started),
+                    state_detail: Some("Waiting in the queue.".into()),
+                    port: Some(8001),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("details");
+        assert_eq!(r2.port, Some(8001));
+        assert_eq!(r2.state_detail.as_deref(), Some("Waiting in the queue."));
+        assert_eq!(
+            r2.log_path.as_deref(),
+            Some("/tmp/x-1.out"),
+            "None keeps a field"
+        );
+        let r3 = store
+            .set_replica_details(
+                r.id,
+                &ReplicaDetailsUpdate {
+                    state_detail: Some(String::new()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("clear detail");
+        assert_eq!(r3.state_detail, None);
+        assert_eq!(r3.port, Some(8001));
+
+        assert!(store.request_replica_replace(r.id).await.expect("replace"));
+        assert!(
+            store
+                .get_replica(r.id)
+                .await
+                .expect("get")
+                .expect("row")
+                .replace_requested
+        );
+        assert!(!store
+            .request_replica_replace(Uuid::new_v4())
+            .await
+            .expect("none"));
+        let other = store
+            .create_replica(model.id, "j-backoff-2", Some(8008))
+            .await
+            .expect("replica 2");
+        assert_eq!(store.request_model_roll(model.id).await.expect("roll"), 1);
+        assert!(
+            store
+                .get_replica(other.id)
+                .await
+                .expect("get")
+                .expect("row")
+                .replace_requested
+        );
+
+        store.delete_replica(r.id).await.expect("delete r");
+        store.delete_replica(other.id).await.expect("delete other");
         // Clean up so the shared test DB doesn't accumulate managed models.
         store.delete_managed_model(model.id).await.expect("delete");
     }
@@ -7512,6 +7934,8 @@ mod tests {
                 min_replicas: 1,
                 max_job_failures: 0,
                 launcher_spec: Some(serde_json::json!({"source":"recipe","recipe_id":recipe_id})),
+                startup_timeout_mins: 60,
+                handoff_mins: 15,
             })
             .await
             .expect("upsert managed");

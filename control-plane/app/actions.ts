@@ -38,12 +38,12 @@ import type {
   SlurmHealthView,
 } from "@/lib/obleth";
 import { requireAdmin } from "@/lib/auth/roles";
-import { validateManagedModelForm } from "@/lib/managed-model-schema";
+import { specFormValues, validateManagedModelForm } from "@/lib/managed-model-schema";
 import { parseUpstreamHeaders } from "@/lib/upstream-headers";
-import { resolveRecipeById, resolveRecipeText, buildManagedFromRecipe, parseRecipe, type DeployOverrides } from "@/lib/sbatch-recipes";
+import { resolveRecipeById, resolveRecipeText, buildManagedFromRecipe, parseRecipe, scriptDigest, type DeployOverrides } from "@/lib/sbatch-recipes";
 import { unixLineEndings } from "@/lib/sbatch-directives";
 import { clusterValuesFrom, inputDefaults, type ClusterValues } from "@/lib/recipe-inputs";
-import { savedRecipeText, type SaveAs } from "@/lib/recipe-save";
+import { retokenizeName, savedRecipeText, type SaveAs } from "@/lib/recipe-save";
 import type { DeployForm } from "@/lib/deploy-form";
 import { lookupHfModel, type HfModel } from "@/lib/hf-model";
 import { parseUpstreamModelList, normalizeBase, type UpstreamModel } from "@/lib/provider-import";
@@ -2343,8 +2343,12 @@ export async function setSlurmSettingsAction(
   body: UpdateSlurmSettings,
 ): Promise<ActionResult> {
   const session = await requireAdmin();
+  let warnings: string[] = [];
   try {
-    await obleth.setSlurmSettings(body, { auditActor: session.email });
+    const saved = await obleth.setSlurmSettings(body, { auditActor: session.email });
+    // Plain sentences about what was saved, such as a token that expires soon.
+    // Older gateways don't send them.
+    warnings = Array.isArray(saved?.warnings) ? saved.warnings.filter((w) => typeof w === "string" && w.trim()) : [];
   } catch (e) {
     return actionError(e);
   }
@@ -2352,7 +2356,7 @@ export async function setSlurmSettingsAction(
   revalidatePath("/settings");
   // The model-create dialog gates the Slurm option on these settings.
   revalidatePath("/models");
-  return { ok: true };
+  return warnings.length ? { ok: true, warnings } : { ok: true };
 }
 
 export async function testSlurmConnectionAction(): Promise<
@@ -2602,6 +2606,43 @@ export async function clearLostReplicasAction(modelId: string): Promise<ActionRe
   return { ok: true };
 }
 
+/**
+ * Let a deployment that stopped launching try again now: clears a pause after
+ * failed launches and its backoff, and the last refused submit. A gateway
+ * without the retry endpoint gets its failed jobs cleared instead.
+ */
+export async function retryDeploymentAction(modelId: string): Promise<ActionResult> {
+  const session = await requireAdmin();
+  try {
+    try {
+      await obleth.retryManagedModel(modelId, { auditActor: session.email });
+    } catch (e) {
+      if (!(e instanceof OblethApiError) || (e.status !== 404 && e.status !== 405)) throw e;
+      await obleth.clearLostReplicas(modelId, { auditActor: session.email });
+    }
+    await obleth.clearProvisionError(modelId, { auditActor: session.email }).catch(() => undefined);
+  } catch (e) {
+    return actionError(e);
+  }
+  refreshDeployments();
+  return { ok: true };
+}
+
+/** Replace every running replica one at a time, each new job serving before the old one stops. */
+export async function rollDeploymentAction(modelId: string): Promise<ActionResult> {
+  const session = await requireAdmin();
+  try {
+    await obleth.rollManagedModel(modelId, { auditActor: session.email });
+  } catch (e) {
+    if (e instanceof OblethApiError && (e.status === 404 || e.status === 405)) {
+      return { ok: false, error: "This gateway can't replace replicas one at a time yet. Restart them one by one, waiting for each new one to serve." };
+    }
+    return actionError(e);
+  }
+  refreshDeployments();
+  return { ok: true };
+}
+
 export async function restartReplicaAction(replicaId: string): Promise<ActionResult> {
   const session = await requireAdmin();
   try { await obleth.restartReplica(replicaId, { auditActor: session.email }); }
@@ -2676,6 +2717,9 @@ function specToPut(s: ManagedModelSpec): PutManagedModel {
     target_replicas: s.target_replicas,
     max_job_failures: s.max_job_failures,
     launcher_spec: s.launcher_spec ?? null,
+    // Sent only when the gateway reported them, so an older one isn't sent fields it doesn't know.
+    ...(s.startup_timeout_mins !== undefined ? { startup_timeout_mins: s.startup_timeout_mins } : {}),
+    ...(s.handoff_mins !== undefined ? { handoff_mins: s.handoff_mins } : {}),
   };
 }
 
@@ -2710,13 +2754,14 @@ export async function saveDeploymentSettingsAction(formData: FormData): Promise<
   const id = trimmed(formData.get("id"));
   const values: Record<string, string> = {};
   for (const [k, v] of formData.entries()) if (typeof v === "string" && k.startsWith("slurm_")) values[k] = v;
-  const errors = validateManagedModelForm(values);
-  const first = Object.values(errors)[0];
-  if (first) return { ok: false, error: first, saved: [] };
   const text = (k: string) => (values[`slurm_${k}`] ?? "").trim();
   const nullable = (k: string) => text(k) || null;
   const int = (k: string) => Number(text(k));
   const res = await changeSpec(id, (b) => {
+    // Check only what this save changes: a value stored earlier (by a launch,
+    // or under an older check) shouldn't block an unrelated edit.
+    const first = Object.values(validateManagedModelForm(values, specFormValues(b)))[0];
+    if (first) return first;
     // The browser sends a textarea with CRLF line endings; bash needs LF.
     const script = unixLineEndings(values.slurm_script_body ?? b.script_body ?? "");
     if (!script.trim() && !(b.launch_command ?? "").trim()) return "The script can't be empty.";
@@ -2739,6 +2784,8 @@ export async function saveDeploymentSettingsAction(formData: FormData): Promise<
       target_replicas: int("target_replicas"),
       min_replicas: int("min_replicas"),
       max_job_failures: int("max_job_failures"),
+      ...(text("startup_timeout_mins") ? { startup_timeout_mins: int("startup_timeout_mins") } : {}),
+      ...(text("handoff_mins") ? { handoff_mins: int("handoff_mins") } : {}),
     };
   });
   return res.ok ? { ok: true } : { ok: false, error: res.error, saved: [] };
@@ -2782,12 +2829,18 @@ export async function launchRecipeAction(recipeId: string, overrides: DeployOver
     if (models.some((m) => m.model_name === createBody.model_name || m.aliases?.includes(createBody.model_name) || m.variants?.some((v) => v.name === createBody.model_name))) {
       return { ok: false, error: `A model called ${createBody.model_name} already exists. Pick another name.` };
     }
-    if (!managedBody.partition) return { ok: false, error: "Pick a partition." };
     // A launched model starts staged, like one added by hand: it is made
     // active on its page once it has been tried. It can already do what the
     // recipe's flags turned on, e.g. function calling.
     const created = await obleth.createModel({ ...createBody, status: "staged" }, { auditActor: session.email });
-    await obleth.putManagedModel(created.id, managedBody, { auditActor: session.email });
+    try {
+      await obleth.putManagedModel(created.id, managedBody, { auditActor: session.email });
+    } catch (e) {
+      // Don't leave a model with no launch settings behind: it would block a
+      // retry under the same name.
+      await obleth.deleteModel(created.id, { auditActor: session.email }).catch(() => undefined);
+      throw e;
+    }
     refreshDeployments();
     return { ok: true, name: created.model_name };
   } catch (e) {
@@ -2822,7 +2875,7 @@ export async function saveRecipeFromDeploymentAction(modelId: string, name: stri
     const [spec, models] = await Promise.all([obleth.getManagedModel(modelId), obleth.listModels()]);
     const model = models.find((m) => m.id === modelId);
     if (!model || !spec) return { ok: false, error: "That deployment no longer exists." };
-    const ls = (spec.launcher_spec ?? {}) as { recipe_id?: string; inputs?: Record<string, string>; env?: Record<string, string> };
+    const ls = (spec.launcher_spec ?? {}) as { recipe_id?: string; inputs?: Record<string, string>; env?: Record<string, string>; script?: string; script_digest?: string };
     if (!ls.recipe_id) return { ok: false, error: "This deployment wasn't launched from a recipe." };
     const recipe = await resolveRecipeById(ls.recipe_id);
     if (!recipe?.header) return { ok: false, error: "The recipe it was launched from no longer exists." };
@@ -2847,7 +2900,13 @@ export async function saveRecipeFromDeploymentAction(modelId: string, name: stri
       serving: { keep_running: spec.target_replicas, serve_from: spec.min_replicas, stop_after_failed_launches: spec.max_job_failures, health_path: spec.health_path },
     };
     const model_ = recipe.header.kind === "engine" ? ls.inputs?.model : undefined;
-    return await saveRecipeFromFormAction(ls.recipe_id, form, { name, model: model_ });
+    // The script it runs: changed on the deployment's page after launch (the
+    // submitted script no longer matches what the launch sent), edited at
+    // launch, or the recipe's own.
+    const live = spec.script_body ?? "";
+    const changedSince = !!ls.script_digest && !!live && scriptDigest(live) !== ls.script_digest;
+    const script = changedSince ? retokenizeName(live, model.model_name) : ls.script;
+    return await saveRecipeFromFormAction(ls.recipe_id, form, { name, model: model_, ...(script !== undefined ? { script } : {}) });
   } catch (e) {
     return actionError(e);
   }
@@ -2873,7 +2932,7 @@ export async function deployRecipeAction(
   if (!recipe.valid) return { ok: false, error: recipe.error ?? "recipe is invalid" };
 
   try {
-    const { createBody, managedBody } = buildManagedFromRecipe(recipe, overrides);
+    const { createBody, managedBody } = buildManagedFromRecipe(recipe, overrides, await clusterValues());
     // A launched model starts staged, like one added by hand: it is made
     // active on its page once it has been tried. It can already do what the
     // recipe's flags turned on, e.g. function calling.

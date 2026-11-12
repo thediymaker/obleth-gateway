@@ -13,11 +13,12 @@ export default async function NewDeploymentPage({ searchParams }: { searchParams
   const [recipes, models, slurm, launches] = await Promise.all([
     loadRecipeCards(),
     safe(obleth.listModels(), [] as ModelRoute[]),
-    safe<SlurmSettingsView | null>(obleth.getSlurmSettings(), null),
+    obleth.getSlurmSettings().then((v): SlurmSettingsView | null => v, () => undefined),
     // Recent launches across all recipes: the form learns from its own recipe's
     // and reads cluster-wide facts (queue waits, failing nodes) from the rest.
     safe(obleth.listDeploymentLaunches({ limit: 500 }), [] as DeploymentLaunch[]),
   ]);
   const taken = models.flatMap((m) => [m.model_name, ...(m.aliases ?? [])]);
-  return <NewDeployment recipes={recipes} takenNames={taken} slurmOn={!!slurm?.enabled} initialRecipe={recipe} cluster={clusterValuesFrom(slurm?.cluster_defaults)} launches={launches} />;
+  // undefined: the settings couldn't be read, which isn't the same as Slurm being off.
+  return <NewDeployment recipes={recipes} takenNames={taken} slurmOn={!!slurm?.enabled} slurm={slurm} initialRecipe={recipe} cluster={clusterValuesFrom(slurm?.cluster_defaults)} launches={launches} />;
 }

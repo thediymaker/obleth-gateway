@@ -166,6 +166,18 @@ describe("sbatchLines", () => {
     ]);
   });
 
+  it("reads GPU counts as gres and an output path as Job logs", () => {
+    const lines = sbatchLines(["#SBATCH --gpus-per-node=4", "#SBATCH -G h100:2", "#SBATCH --output=/shared/logs/%x-%j.out", "#SBATCH -o rel/%j.out", "#SBATCH --gpus=a:b"].join("\n"));
+    expect(lines.map((l) => [l.value, l.setting])).toEqual([
+      ["gpu:4", "gres"],
+      ["gpu:h100:2", "gres"],
+      ["/shared/logs", "log_output_dir"],
+      ["rel/%j.out", null],
+      ["a:b", null],
+    ]);
+    expect(parseSbatchDirectives("#SBATCH --gpus-per-node=4").gres).toBe("gpu:4");
+  });
+
   it("is empty for a script without directives", () => {
     expect(sbatchLines("#!/bin/bash\nvllm serve m\n")).toEqual([]);
   });

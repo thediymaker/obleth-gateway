@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ggufQuant, parseRepoId, readHfModel } from "./hf-model";
+import { ggufQuant, lookupHfModel, parseRepoId, readHfModel } from "./hf-model";
 
 describe("reading a Hugging Face repo", () => {
   it("reads safetensors weights and suggests vLLM", () => {
@@ -30,5 +30,16 @@ describe("reading a Hugging Face repo", () => {
     expect(parseRepoId("https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/tree/main")).toBe("deepseek-ai/DeepSeek-V4.1-Flash");
     expect(parseRepoId(" Qwen/Qwen3-32B ")).toBe("Qwen/Qwen3-32B");
     expect(parseRepoId("not a model")).toBeNull();
+  });
+
+  it("registers an embedding or speech model as that kind", () => {
+    expect(readHfModel("Qwen/Qwen3-Embedding-8B", { pipeline_tag: "feature-extraction" }).servedAs).toBe("embedding");
+    expect(readHfModel("openai/whisper-large-v3", { pipeline_tag: "automatic-speech-recognition" }).servedAs).toBe("audio_transcription");
+    expect(readHfModel("Qwen/Qwen3-32B", { pipeline_tag: "text-generation" }).servedAs).toBe("chat");
+  });
+
+  it("says a 401 may be a private repo and points at the engines", async () => {
+    const fetch401 = (async () => new Response("", { status: 401 })) as unknown as typeof fetch;
+    await expect(lookupHfModel("org/secret", fetch401)).rejects.toThrow(/private.*pick an engine below/);
   });
 });

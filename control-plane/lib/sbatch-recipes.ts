@@ -13,8 +13,8 @@ import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 import type { RecipeCard, RecipeDeployPreview } from "@/components/recipes/recipe-card";
 import { toRecipeCards } from "@/components/recipes/recipe-card";
-import { parseSbatchDirectives, stripSbatchDirectives, unixLineEndings, type ParsedDirectives } from "./sbatch-directives";
-import { EMPTY_CLUSTER, inputCapabilities, MODEL_CAPABILITIES, renderScript, type ClusterValues, type ModelCapability, type RecipeInput } from "./recipe-inputs";
+import { parseSbatchDirectives, stripSbatchDirectives, unappliedAdvice, unixLineEndings, type ParsedDirectives } from "./sbatch-directives";
+import { clusterTokens, EMPTY_CLUSTER, MODEL_NAME_RE, MODEL_NAME_RULE, inputCapabilities, inputTokens, knownClusterToken, malformedTokens, MODEL_CAPABILITIES, renderScript, type ClusterValues, type ModelCapability, type RecipeInput } from "./recipe-inputs";
 import { splitFrontmatter } from "./recipe-frontmatter";
 import type { PutManagedModel } from "@/lib/obleth";
 import { obleth } from "@/lib/obleth";
@@ -32,6 +32,8 @@ export interface RecipeHeader {
   engine: string;
   model_type: string;
   api_model_name: string;
+  /** The first port of each replica's port window. The server must listen on
+   *  $OBLETH_SERVING_PORT, which obleth picks inside that window. */
   port: number;
   health_path?: string;
   min_replicas?: number;
@@ -62,6 +64,11 @@ export interface RecipeHeader {
   weights_gb?: number;
   /** What the image must provide, e.g. "vLLM 0.22.0 or later". */
   requires?: string;
+  /** The context window the server is started with, in tokens; may name an
+   *  input, e.g. "{{context}}". Without it, an input called `context` is used. */
+  context_window?: string;
+  /** What the model can always do when served this way, e.g. [vision]. */
+  capabilities?: ModelCapability[];
   /** Node counts offered as "Runs on"; `nodes` is the default. */
   node_options?: number[];
   /** A sentence per node count saying what it means for this model. */
@@ -91,15 +98,82 @@ export interface ParsedRecipe {
   warnings: string[];
 }
 
-export function defaultHealthPath(engine: string): string {
-  return engine === "ollama" ? "/" : "/health";
+/** The engines obleth knows, by their id in a recipe's `engine:`. */
+export const KNOWN_ENGINES = ["vllm", "sglang", "llamacpp", "ollama"] as const;
+const ENGINE_ALIASES: Record<string, string> = { "llama.cpp": "llamacpp", "llama-cpp": "llamacpp", llama_cpp: "llamacpp", "llama-server": "llamacpp" };
+
+/** A recipe's engine as obleth names it: "llama.cpp" → "llamacpp". */
+export function normalizeEngine(engine: string): string {
+  const e = engine.trim().toLowerCase();
+  return ENGINE_ALIASES[e] ?? e;
 }
+
+export function defaultHealthPath(engine: string): string {
+  return normalizeEngine(engine) === "ollama" ? "/" : "/health";
+}
+
+export { MODEL_NAME_RE, MODEL_NAME_RULE };
+
+/** The header keys a recipe may use, in the order the shipped recipes write them. */
+export const HEADER_KEYS = [
+  "name", "description", "engine", "kind", "model", "weights_gb", "requires",
+  "model_type", "api_model_name", "context_window", "capabilities",
+  "port", "health_path", "target_replicas", "min_replicas", "max_job_failures",
+  "partition", "account", "qos", "time_limit", "nodes", "node_options", "node_notes",
+  "gres", "cpus_per_task", "mem", "constraints", "exclude", "log_output_dir",
+  "based_on", "env", "tested", "inputs", "variables",
+] as const;
+const INPUT_KEYS = ["name", "label", "type", "default", "required", "help", "options", "min", "max", "unit", "adds", "capabilities", "drops", "by_nodes"] as const;
+const VARIABLE_KEYS = ["name", "label", "default", "required"] as const;
+const TEST_KEYS = ["hardware", "engine", "date", "result"] as const;
+
+/** Common slips, for the "did you mean" hint. */
+const KEY_HINTS: Record<string, string> = {
+  time: "time_limit", walltime: "time_limit", health: "health_path", gpus: "gres", gpu: "gres",
+  cpus: "cpus_per_task", memory: "mem", replicas: "target_replicas", constraint: "constraints",
+  output: "log_output_dir", log_dir: "log_output_dir", logs: "log_output_dir", served_model_name: "api_model_name",
+  model_name: "api_model_name", context: "context_window", max_model_len: "context_window",
+  capability: "capabilities", input: "inputs", environment: "env", option: "options", choices: "options",
+};
+
+function unknownKeyProblem(where: string, key: string, allowed: readonly string[]): string {
+  const norm = key.trim().toLowerCase().replace(/-/g, "_");
+  const hint = allowed.includes(norm) ? norm : KEY_HINTS[norm] && allowed.includes(KEY_HINTS[norm]) ? KEY_HINTS[norm] : null;
+  return `${where}: "${key}" isn't a recipe setting${hint ? `; did you mean ${hint}?` : "."}`;
+}
+
+/** Unknown keys in the header and its lists, as sentences. */
+function unknownKeys(raw: unknown): string[] {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
+  const out: string[] = [];
+  const h = raw as Record<string, unknown>;
+  for (const k of Object.keys(h)) if (!(HEADER_KEYS as readonly string[]).includes(k)) out.push(unknownKeyProblem("header", k, HEADER_KEYS));
+  const lists: [string, readonly string[]][] = [["inputs", INPUT_KEYS], ["variables", VARIABLE_KEYS], ["tested", TEST_KEYS]];
+  for (const [list, keys] of lists) {
+    const items = h[list];
+    if (!Array.isArray(items)) continue;
+    items.forEach((item, i) => {
+      if (!item || typeof item !== "object") return;
+      const name = (item as { name?: unknown }).name;
+      const where = `${list}.${i}${typeof name === "string" ? ` (${name})` : ""}`;
+      for (const k of Object.keys(item)) if (!keys.includes(k)) out.push(unknownKeyProblem(where, k, keys));
+    });
+  }
+  return out;
+}
+
+// YAML 1.2 reads `no` and "false" as strings, and coercing them would make
+// them true; accept the spellings people write and refuse anything else.
+const yesNo = z.union([
+  z.boolean(),
+  z.enum(["true", "false", "yes", "no", "on", "off", "True", "False", "Yes", "No"]).transform((v) => ["true", "yes", "on"].includes(v.toLowerCase())),
+], { errorMap: () => ({ message: "must be true or false" }) });
 
 const VariableSchema = z.object({
   name: z.string().regex(/^[a-zA-Z_][a-zA-Z0-9_]*$/, "invalid variable name"),
   label: z.string().optional(),
   default: z.string().optional(),
-  required: z.coerce.boolean().default(false),
+  required: yesNo.default(false),
 });
 
 const scalar = z.union([z.string(), z.number(), z.boolean()]).transform((v) => String(v));
@@ -114,21 +188,34 @@ const TestSchema = z.object({
   result: z.string().optional(),
 });
 
+const capabilityList = z.array(z.enum(MODEL_CAPABILITIES, { errorMap: () => ({ message: `must be one of ${MODEL_CAPABILITIES.join(", ")}` }) }));
+
 const InputSchema = z.object({
   name: z.string().regex(/^[a-zA-Z_][a-zA-Z0-9_]*$/, "invalid input name"),
   label: z.string().optional(),
   type: z.enum(["text", "choice", "number", "path", "flag"]).default("text"),
   default: scalar.optional(),
-  required: z.coerce.boolean().default(false),
+  required: yesNo.default(false),
   help: z.string().optional(),
   options: z.array(scalar).optional(),
   min: z.coerce.number().optional(),
   max: z.coerce.number().optional(),
   unit: z.string().optional(),
   adds: z.string().optional(),
-  capabilities: z.array(z.enum(MODEL_CAPABILITIES)).optional(),
+  capabilities: capabilityList.optional(),
+  drops: capabilityList.optional(),
   by_nodes: z.record(z.string(), scalar).optional(),
-}).refine((i) => !i.capabilities?.length || i.type === "flag", { message: "capabilities only go on a flag input" });
+}).superRefine((i, ctx) => {
+  const problem = (message: string) => ctx.addIssue({ code: z.ZodIssueCode.custom, message: `${i.name}: ${message}` });
+  if ((i.capabilities?.length || i.drops?.length) && i.type !== "flag") problem("capabilities and drops only go on a flag input");
+  if (i.type === "flag" && i.adds === undefined) problem("a flag needs adds: the text it puts in the script when it's on");
+  if (i.type === "flag" && i.default !== undefined && !["true", "false"].includes(i.default)) problem("a flag's default must be true or false");
+  if (i.options && i.type !== "choice") problem("options only go on a choice input");
+  if (i.type === "choice") {
+    if (!i.options?.length) problem("a choice needs options");
+    else if (i.default !== undefined && !i.default.includes("{{") && !i.options.includes(i.default)) problem(`the default ${i.default} isn't one of the options (${i.options.join(", ")})`);
+  }
+});
 
 function uniqueNames(what: string) {
   return (items: { name: string }[] | undefined, ctx: z.RefinementCtx) => {
@@ -145,19 +232,20 @@ const HeaderSchema = z
   .object({
     name: z.string().min(1),
     description: z.string().optional(),
-    engine: z.string().min(1),
+    engine: z.string().min(1).transform(normalizeEngine),
     model_type: z.string().min(1),
-    api_model_name: z.string().min(1),
-    port: z.coerce.number().int().positive(),
-    health_path: z.string().optional(),
+    api_model_name: z.string().min(1).regex(MODEL_NAME_RE, `the served name must ${MODEL_NAME_RULE}`),
+    // The base of each replica's port window, not a port the server listens on.
+    port: z.coerce.number().int().min(1).max(65535).default(8000),
+    health_path: z.string().startsWith("/", "must start with /").optional(),
     min_replicas: z.coerce.number().int().positive().optional(),
-    target_replicas: z.coerce.number().int().positive().default(2),
-    max_job_failures: z.coerce.number().int().nonnegative().default(3),
+    target_replicas: z.coerce.number().int().nonnegative().default(1),
+    max_job_failures: z.coerce.number().int().nonnegative().default(2),
     partition: z.string().optional(),
     gres: z.string().optional(),
     cpus_per_task: z.coerce.number().int().positive().optional(),
-    mem: z.string().optional(),
-    time_limit: z.string().optional(),
+    mem: scalar.optional(),
+    time_limit: scalar.optional(),
     nodes: z.coerce.number().int().positive().optional(),
     account: z.string().optional(),
     qos: z.string().optional(),
@@ -171,6 +259,8 @@ const HeaderSchema = z
     model: z.string().optional(),
     weights_gb: z.coerce.number().positive().optional(),
     requires: z.string().optional(),
+    context_window: scalar.optional(),
+    capabilities: capabilityList.optional(),
     node_options: z.array(z.coerce.number().int().positive()).optional(),
     node_notes: z.record(z.string(), z.string()).optional(),
     env: z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/, "invalid environment variable name"), scalar).optional(),
@@ -185,6 +275,47 @@ const HeaderSchema = z
     return { ...h, inputs: [...typed, ...legacy] };
   });
 
+/** Names {{api_model_name}} and the like that obleth fills without an input. */
+const BUILTIN_TOKENS = ["api_model_name"];
+
+/** What's wrong with a parsed recipe's script and token use, as sentences
+ *  (refused), and what is merely odd (warnings). */
+function scriptProblems(h: RecipeHeader, body: string, directives: ParsedDirectives): { errors: string[]; warnings: string[] } {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+  const declared = new Set([...h.inputs.map((i) => i.name), ...BUILTIN_TOKENS]);
+  const texts = [body, h.context_window ?? "", ...h.inputs.map((i) => `${i.default ?? ""} ${Object.values(i.by_nodes ?? {}).join(" ")}`)];
+  for (const name of inputTokens(texts.join("\n"))) {
+    if (!declared.has(name)) errors.push(`The recipe uses {{${name}}}, but no input is called ${name}. Declare it under inputs, or correct the name.`);
+  }
+  for (const t of malformedTokens(texts.join("\n"))) errors.push(`${t} isn't a token obleth can fill. Write {{name}} for an input or {{cluster.cache}}-style names for a cluster default.`);
+  for (const t of clusterTokens(texts.join("\n"))) {
+    if (!knownClusterToken(t.key, t.sub)) errors.push(`{{${t.text}}} isn't a cluster default. Use cluster.cache, cluster.images, cluster.logs, cluster.setup or cluster.image.<engine>.`);
+  }
+  for (const [k, v] of Object.entries(h.env ?? {})) {
+    if (/\{\{/.test(v)) errors.push(`The env value for ${k} uses a {{token}}, but env values are exported exactly as written. Set it in the script instead, e.g. export ${k}="{{...}}".`);
+  }
+  if (h.context_window !== undefined && !/\{\{/.test(h.context_window) && !/^\d+$/.test(h.context_window.trim())) {
+    errors.push(`context_window must be a number of tokens or an input such as {{context}}, not ${h.context_window}.`);
+  }
+  const code = body.split("\n").filter((l) => !/^\s*#/.test(l)).join("\n");
+  if (!/\$\{?OBLETH_SERVING_PORT\b/.test(code)) {
+    errors.push('The script never uses $OBLETH_SERVING_PORT. Start the server on that port, e.g. --port "$OBLETH_SERVING_PORT": obleth picks a free port for each replica and checks only that one.');
+  }
+  const fixed = /(?:^|\s)--port(?:=|\s+)["']?(\d+)/m.exec(code);
+  if (fixed) errors.push(`The script starts a server on the fixed port ${fixed[1]}. Use --port "$OBLETH_SERVING_PORT" so each replica gets its own port.`);
+  for (const flag of directives.unapplied ?? []) errors.push(`#SBATCH ${unappliedAdvice(flag)}`);
+  for (const i of h.inputs) {
+    // A flag that only marks what the model can do needn't appear in the script.
+    if (i.type === "flag" && !i.adds && (i.capabilities?.length || i.drops?.length)) continue;
+    if (!inputTokens(`${body}\n${h.context_window ?? ""}`).includes(i.name)) warnings.push(`The input ${i.name} isn't used in the script, so changing it does nothing.`);
+  }
+  if (!(KNOWN_ENGINES as readonly string[]).includes(h.engine)) {
+    warnings.push(`obleth doesn't know the engine ${h.engine}. The recipe launches as written, but it isn't offered for Hugging Face models.`);
+  }
+  return { errors, warnings };
+}
+
 export function parseRecipe(id: string, text: string): ParsedRecipe {
   const split = splitFrontmatter(text);
   if (!split) {
@@ -196,6 +327,8 @@ export function parseRecipe(id: string, text: string): ParsedRecipe {
   } catch (e) {
     return { id, valid: false, error: `invalid YAML header: ${(e as Error).message}`, warnings: [] };
   }
+  const unknown = unknownKeys(raw);
+  if (unknown.length) return { id, valid: false, error: unknown.join(" "), warnings: [] };
   const parsed = HeaderSchema.safeParse(raw);
   if (!parsed.success) {
     const issue = parsed.error.issues[0];
@@ -208,7 +341,10 @@ export function parseRecipe(id: string, text: string): ParsedRecipe {
     return { id, valid: false, error: "recipe has no script body", warnings: [] };
   }
   const directives = parseSbatchDirectives(body);
-  return { id, valid: true, header: parsed.data, body, directives, warnings: directives.warnings };
+  const header = parsed.data as RecipeHeader;
+  const checked = scriptProblems(header, body, directives);
+  if (checked.errors.length) return { id, valid: false, error: checked.errors.join(" "), header, body, directives, warnings: checked.warnings };
+  return { id, valid: true, header, body, directives, warnings: [...directives.warnings, ...checked.warnings] };
 }
 
 /** Recipes directory: OBLETH_RECIPES_DIR or ./recipes relative to cwd. */
@@ -327,6 +463,9 @@ export async function resolveRecipeById(id: string): Promise<ParsedRecipe | null
 
 export interface DeployOverrides {
   api_model_name?: string;
+  /** What kind of model it is (chat, embedding, …), when the launch knows
+   *  better than the recipe, e.g. an engine recipe serving an embedding model. */
+  model_type?: string;
   target_replicas?: number;
   /** Deploy-time placement tweaks. A provided string wins over the recipe; an
    *  empty/whitespace string clears the field (sends null/""). `undefined` keeps
@@ -362,6 +501,8 @@ export interface DeployPayload {
     upstream_model: string;
     api_base: string;
     model_type: string;
+    /** The context the server is started with, so the gateway's limits match. */
+    context_window?: number;
   } & Partial<Record<`supports_${ModelCapability}`, true>>;
   managedBody: PutManagedModel;
 }
@@ -418,13 +559,20 @@ export function buildManagedFromRecipe(
   const h = recipe.header;
   const d = recipe.directives;
   const modelName = overrides.api_model_name?.trim() || h.api_model_name;
-  const targetReplicas = overrides.target_replicas ?? h.target_replicas ?? 2;
+  // The name goes into the script as the served name, so it must be one word
+  // the engine and the shell read the same way.
+  if (!MODEL_NAME_RE.test(modelName)) throw new Error(`The name ${modelName} can't be used: names ${MODEL_NAME_RULE}.`);
+  const targetReplicas = overrides.target_replicas ?? h.target_replicas ?? 1;
+  const nodes = overrides.nodes ?? placement(h.nodes, d.nodes);
+  const values = overrides.inputs ?? overrides.variables;
+  const rawScript = unixLineEndings(overrides.script_body ?? recipe.body);
+  const rendered = renderScript(rawScript, h.inputs, values, cluster, { strict, nodes, builtins: { api_model_name: modelName } });
 
   const managedBody: PutManagedModel = {
     enabled: true,
     partition: overrideString(overrides.partition, placement(h.partition, d.partition)) ?? "",
     gres: overrideString(overrides.gres, placement(h.gres, d.gres)),
-    nodes: overrides.nodes ?? placement(h.nodes, d.nodes),
+    nodes,
     cpus_per_task: overrides.cpus_per_task !== undefined ? overrides.cpus_per_task : placement(h.cpus_per_task, d.cpus_per_task) ?? null,
     mem: overrideString(overrides.mem, placement(h.mem, d.mem)) ?? null,
     time_limit: overrideString(overrides.time_limit, placement(h.time_limit, d.time_limit)) ?? null,
@@ -439,23 +587,14 @@ export function buildManagedFromRecipe(
     // The #SBATCH lines are already in the fields above, and Slurm doesn't
     // read them from a submitted script, so the stored script leaves them out.
     script_body: applyChdir(
-      applyEnv(
-        stripSbatchDirectives(
-          renderScript(unixLineEndings(overrides.script_body ?? recipe.body), h.inputs, overrides.inputs ?? overrides.variables, cluster, {
-            strict,
-            nodes: overrides.nodes ?? placement(h.nodes, d.nodes),
-            builtins: { api_model_name: modelName },
-          }),
-        ),
-        overrides.env ?? h.env,
-      ),
+      applyEnv(stripSbatchDirectives(rendered), overrides.env ?? h.env),
       d.chdir,
     ),
     serving_port: h.port,
     health_path: overrides.health_path?.trim() || h.health_path?.trim() || defaultHealthPath(h.engine),
     min_replicas: overrides.min_replicas ?? h.min_replicas ?? 1,
     target_replicas: targetReplicas,
-    max_job_failures: overrides.max_job_failures ?? h.max_job_failures ?? 3,
+    max_job_failures: overrides.max_job_failures ?? h.max_job_failures ?? 2,
     launcher_spec: {
       source: "recipe",
       recipe_id: recipe.id,
@@ -464,23 +603,51 @@ export function buildManagedFromRecipe(
       // Kept so "Save as recipe" on the deployment can write the same values back.
       ...(Object.keys(overrides.inputs ?? overrides.variables ?? {}).length ? { inputs: overrides.inputs ?? overrides.variables } : {}),
       ...(overrides.env ? { env: overrides.env } : {}),
+      // A script edited at launch, kept so "Save as recipe" saves that version.
+      ...(overrides.script_body !== undefined && overrides.script_body !== recipe.body ? { script: rawScript } : {}),
     },
   };
+  // Kept to tell, when saving as a recipe, whether the script was changed on
+  // the deployment's page after launch.
+  (managedBody.launcher_spec as Record<string, unknown>).script_digest = scriptDigest(managedBody.script_body ?? "");
 
   // What the flags that are on tell us the model can do, e.g. a tool parser
   // means function calling, so its tool boons work without a second step.
-  const capabilities = inputCapabilities(h.inputs, overrides.inputs ?? overrides.variables, cluster, overrides.nodes ?? placement(h.nodes, d.nodes));
+  const capabilities = inputCapabilities(h.inputs, values, cluster, nodes, { always: h.capabilities, script: rendered });
+  const contextWindow = servedContext(h, values, cluster, nodes);
 
   return {
     createBody: {
       model_name: modelName,
       upstream_model: modelName,
       api_base: "",
-      model_type: h.model_type,
+      model_type: overrides.model_type?.trim() || h.model_type,
+      ...(contextWindow ? { context_window: contextWindow } : {}),
       ...Object.fromEntries(capabilities.map((c) => [`supports_${c}`, true])),
     },
     managedBody,
   };
+}
+
+/** The context window the recipe starts the server with: `context_window:`
+ *  (which may name inputs), else the value of an input called `context`.
+ *  Undefined when neither gives a whole number of tokens. */
+export function servedContext(h: RecipeHeader, values: Record<string, string> | undefined, cluster: ClusterValues, nodes?: number): number | undefined {
+  const source = h.context_window ?? (h.inputs.some((i) => i.name === "context") ? "{{context}}" : undefined);
+  if (source === undefined) return undefined;
+  const text = renderScript(source, h.inputs, values, cluster, { nodes }).trim();
+  return /^\d+$/.test(text) && Number(text) > 0 ? Number(text) : undefined;
+}
+
+/** A short, stable fingerprint of a script (FNV-1a, hex). Not a security
+ *  measure: it only tells whether the text changed. */
+export function scriptDigest(text: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0");
 }
 
 /** Compute the "what will be deployed" preview, reusing the deploy builder so it
@@ -501,8 +668,10 @@ export function buildDeployPreview(recipe: ParsedRecipe): RecipeDeployPreview | 
     engine: recipe.header.engine,
     port: m.serving_port,
     healthPath: m.health_path ?? "/health",
-    targetReplicas: m.target_replicas ?? 2,
-    maxJobFailures: m.max_job_failures ?? 3,
+    targetReplicas: m.target_replicas ?? 1,
+    maxJobFailures: m.max_job_failures ?? 2,
+    contextWindow: payload.createBody.context_window,
+    capabilities: MODEL_CAPABILITIES.filter((c) => (payload.createBody as Record<string, unknown>)[`supports_${c}`] === true),
     partition: m.partition,
     gres: m.gres,
     cpusPerTask: m.cpus_per_task,
@@ -537,13 +706,21 @@ export function buildDeployPreview(recipe: ParsedRecipe): RecipeDeployPreview | 
  *  (source:"db") fetched from the admin API. The DB fetch is wrapped in a
  *  try/catch so file templates always render even when the admin API is down. */
 export async function loadRecipeCards(): Promise<RecipeCard[]> {
-  const docs = listRecipeDocs();
-  const parsed = docs.map((d) => parseRecipe(d.id, d.text));
+  // Every file, readable or not: one that can't be read shows as a card saying
+  // why, instead of the library quietly being short.
+  const docs: { id: string; text: string | null; error?: string }[] = recipeFileIds().map(({ id }) => {
+    try {
+      return { id, text: readRecipeText(id) };
+    } catch (e) {
+      return { id, text: null, error: `the file can't be opened (${(e as Error).message})` };
+    }
+  });
+  const parsed = docs.map((d): ParsedRecipe => (d.text === null ? { id: d.id, valid: false, error: d.error, warnings: [] } : parseRecipe(d.id, d.text)));
   const cards = toRecipeCards(parsed);
   const fileCards = cards.map((c, i) => ({
     ...c,
     preview: buildDeployPreview(parsed[i]),
-    body: docs[i].text, // FULL raw document (---fenced), matching DB cards
+    ...(docs[i].text !== null ? { body: docs[i].text as string } : {}), // FULL raw document (---fenced), matching DB cards
   }));
 
   let dbCards: RecipeCard[] = [];

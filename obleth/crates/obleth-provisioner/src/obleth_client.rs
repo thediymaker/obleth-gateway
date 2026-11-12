@@ -1,8 +1,57 @@
 use crate::config::ProvisionerConfig;
 use crate::domain::ReplicaView;
 use async_trait::async_trait;
-use obleth_config::{ManagedModelSpec, SlurmSettings};
+use obleth_config::{ManagedBackoff, ManagedModelSpec, SlurmSettings};
+use std::collections::HashMap;
 use uuid::Uuid;
+
+/// Provisioner-reported details of a replica (`PATCH /replicas/{id}`).
+/// `None` leaves a field as it is; an empty `state_detail` or `log_path`
+/// clears it.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct ReplicaDetails {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_ends_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replace_requested: Option<bool>,
+}
+
+/// A gateway model's name and the name its server is expected to serve.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelIdentity {
+    pub name: String,
+    /// `upstream_model`; empty when unknown.
+    pub upstream: String,
+}
+
+impl ModelIdentity {
+    /// The names a server for this model may list on `/v1/models`. Empty
+    /// when the upstream name is unknown, so no identity check is made.
+    pub fn served_names(&self) -> Vec<String> {
+        if self.upstream.trim().is_empty() {
+            Vec::new()
+        } else {
+            vec![self.upstream.clone(), self.name.clone()]
+        }
+    }
+
+    /// The name used in messages about what the server should serve.
+    pub fn expected(&self) -> &str {
+        if self.upstream.trim().is_empty() {
+            &self.name
+        } else {
+            &self.upstream
+        }
+    }
+}
 
 #[async_trait]
 pub trait OblethClient: Send + Sync {
@@ -55,6 +104,58 @@ pub trait OblethClient: Send + Sync {
     /// Record (or clear with `None`) the provisioner's last submit error for a
     /// model, so the dashboard can show it.
     async fn set_provision_error(&self, model_id: Uuid, error: Option<&str>) -> anyhow::Result<()>;
+    /// Every model's name and upstream name by id, in one read.
+    async fn model_identities(&self) -> anyhow::Result<HashMap<Uuid, ModelIdentity>> {
+        Ok(HashMap::new())
+    }
+    /// One model's name and upstream name.
+    async fn model_identity(&self, model_id: Uuid) -> anyhow::Result<ModelIdentity> {
+        Ok(ModelIdentity {
+            name: self.model_name(model_id).await?,
+            upstream: String::new(),
+        })
+    }
+    /// Record a new replica and where its job's output goes.
+    async fn create_replica_with_log(
+        &self,
+        model_id: Uuid,
+        slurm_job_id: &str,
+        port_base: i64,
+        _log_path: Option<&str>,
+    ) -> anyhow::Result<Uuid> {
+        self.create_replica(model_id, slurm_job_id, port_base).await
+    }
+    /// Update a replica's Slurm times, plain-sentence detail, log path, port
+    /// or replacement flag.
+    async fn patch_replica_details(
+        &self,
+        _replica_id: Uuid,
+        _details: &ReplicaDetails,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    /// Record a managed model's failure count and pause (backoff) state.
+    async fn set_managed_backoff(
+        &self,
+        _model_id: Uuid,
+        _backoff: &ManagedBackoff,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    /// A state change and the replica's details in one update.
+    async fn patch_replica_with_details(
+        &self,
+        replica_id: Uuid,
+        state: Option<&str>,
+        nodes: Option<&str>,
+        endpoint_id: Option<Uuid>,
+        message: Option<&str>,
+        details: &ReplicaDetails,
+    ) -> anyhow::Result<()> {
+        self.patch_replica(replica_id, state, nodes, endpoint_id, message)
+            .await?;
+        self.patch_replica_details(replica_id, details).await
+    }
 }
 
 /// Map a JSON array of replica rows (`ModelReplica`) into `ReplicaView`s. Rows
@@ -86,11 +187,19 @@ fn replica_views_from_json(rows: &[serde_json::Value]) -> Vec<ReplicaView> {
                 continue;
             }
         };
-        let created: chrono::DateTime<chrono::Utc> = r
-            .get("created_at")
-            .and_then(|x| x.as_str())
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(now);
+        let time = |k: &str| -> Option<chrono::DateTime<chrono::Utc>> {
+            r.get(k)
+                .and_then(|x| x.as_str())
+                .and_then(|s| s.parse().ok())
+        };
+        let text = |k: &str| -> Option<String> {
+            r.get(k)
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        let created = time("created_at").unwrap_or(now);
+        let updated = time("updated_at").unwrap_or(created);
         out.push(ReplicaView {
             id,
             model_id,
@@ -118,9 +227,32 @@ fn replica_views_from_json(rows: &[serde_json::Value]) -> Vec<ReplicaView> {
                 .get("cancel_requested")
                 .and_then(|x| x.as_bool())
                 .unwrap_or(false),
+            replace_requested: r
+                .get("replace_requested")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false),
+            updated_secs: (now - updated).num_seconds(),
+            job_started_at: time("job_started_at"),
+            job_ends_at: time("job_ends_at"),
+            state_detail: text("state_detail"),
+            port: r.get("port").and_then(|x| x.as_i64()),
+            nodes: text("nodes"),
+            log_path: text("log_path"),
         });
     }
     out
+}
+
+/// A model row's name and upstream name.
+fn identity_from_json(m: &serde_json::Value) -> Option<ModelIdentity> {
+    Some(ModelIdentity {
+        name: m.get("model_name")?.as_str()?.to_string(),
+        upstream: m
+            .get("upstream_model")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string(),
+    })
 }
 
 /// Outcome of the previous reconcile tick, reported to the gateway as headers
@@ -135,6 +267,9 @@ pub struct TickReport {
     pub status: &'static str,
     /// Idle reason or error text; empty for `ok`.
     pub detail: String,
+    /// Things an operator should know even when the tick worked, as plain
+    /// sentences ("2 cancels failed: ...", "The Slurm token expires in 2 days.").
+    pub warnings: Vec<String>,
 }
 
 impl TickReport {
@@ -142,20 +277,46 @@ impl TickReport {
         Self {
             status: "ok",
             detail: String::new(),
+            warnings: Vec::new(),
         }
     }
     pub fn idle(reason: &str) -> Self {
         Self {
             status: "idle",
             detail: reason.to_string(),
+            warnings: Vec::new(),
         }
     }
     pub fn error(detail: &str) -> Self {
         Self {
             status: "error",
             detail: detail.to_string(),
+            warnings: Vec::new(),
         }
     }
+    /// The same report carrying `warnings`.
+    pub fn with_warnings(mut self, warnings: Vec<String>) -> Self {
+        self.warnings = warnings;
+        self
+    }
+}
+
+/// Most warnings carried per tick, and the longest each may be.
+const TICK_WARNINGS_MAX: usize = 8;
+const TICK_WARNING_MAX_LEN: usize = 400;
+
+/// The tick warnings as a JSON array that is safe as a header value.
+fn warnings_header(warnings: &[String]) -> Option<String> {
+    let list: Vec<String> = warnings
+        .iter()
+        .map(|w| header_safe(w, TICK_WARNING_MAX_LEN))
+        .filter(|w| !w.is_empty())
+        .take(TICK_WARNINGS_MAX)
+        .collect();
+    if list.is_empty() {
+        return None;
+    }
+    serde_json::to_string(&list).ok()
 }
 
 /// Longest tick detail we put on the wire. Error chains can be long; the
@@ -253,26 +414,15 @@ impl OblethClient for HttpObleth {
         // /managed is per-model; the provisioner needs them all. List models,
         // then GET each /managed. (A bulk /managed route exists and is a fine
         // future optimization; v1 keeps the surface minimal.)
-        let models = self.get_array("/models").await?;
-        let mut out = Vec::new();
-        for m in models {
-            let id = m.get("id").and_then(|x| x.as_str()).unwrap_or_default();
-            if id.is_empty() {
-                continue;
-            }
-            // An unmanaged model answers 200 `null`; an error status must not
-            // read as "unmanaged" (that would drain the model's replicas).
-            let spec: Option<ManagedModelSpec> = self
-                .req(reqwest::Method::GET, &format!("/models/{id}/managed"))
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
-            if let Some(s) = spec {
-                if s.enabled {
-                    out.push(s);
-                }
+        // One read of every spec. An error status fails the whole list (it
+        // must not read as "nothing is managed", which would drain replicas).
+        let rows = self.get_array("/managed").await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let spec: ManagedModelSpec = serde_json::from_value(row)
+                .map_err(|e| anyhow::anyhow!("GET /managed: unreadable spec: {e}"))?;
+            if spec.enabled {
+                out.push(spec);
             }
         }
         Ok(out)
@@ -290,6 +440,9 @@ impl OblethClient for HttpObleth {
             if !detail.is_empty() {
                 req = req.header("X-Obleth-Provisioner-Tick-Detail", detail);
             }
+            if let Some(w) = warnings_header(&t.warnings) {
+                req = req.header("X-Obleth-Provisioner-Tick-Warnings", w);
+            }
         }
         let s: SlurmSettings = req.send().await?.error_for_status()?.json().await?;
         Ok(Some(s))
@@ -300,6 +453,7 @@ impl OblethClient for HttpObleth {
             .req(reqwest::Method::GET, &format!("/models/{model_id}"))
             .send()
             .await?
+            .error_for_status()?
             .json()
             .await?;
         Ok(m.get("model_name")
@@ -369,10 +523,16 @@ impl OblethClient for HttpObleth {
     }
 
     async fn delete_replica(&self, replica_id: Uuid) -> anyhow::Result<()> {
-        self.req(reqwest::Method::DELETE, &format!("/replicas/{replica_id}"))
-            .send()
-            .await?
-            .error_for_status()?;
+        // `force` drops the row outright. Without it the gateway treats a
+        // DELETE of a live replica as "cancel it", which is the operator's
+        // action, not the provisioner's clean-up of a finished row.
+        self.req(
+            reqwest::Method::DELETE,
+            &format!("/replicas/{replica_id}?force=true"),
+        )
+        .send()
+        .await?
+        .error_for_status()?;
         Ok(())
     }
 
@@ -453,13 +613,18 @@ impl OblethClient for HttpObleth {
     }
 
     async fn delete_endpoint(&self, model_id: Uuid, endpoint_id: Uuid) -> anyhow::Result<()> {
-        self.req(
-            reqwest::Method::DELETE,
-            &format!("/models/{model_id}/endpoints/{endpoint_id}"),
-        )
-        .send()
-        .await?
-        .error_for_status()?;
+        let resp = self
+            .req(
+                reqwest::Method::DELETE,
+                &format!("/models/{model_id}/endpoints/{endpoint_id}"),
+            )
+            .send()
+            .await?;
+        // Already gone is what a delete wants.
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        resp.error_for_status()?;
         Ok(())
     }
 
@@ -483,6 +648,121 @@ impl OblethClient for HttpObleth {
             "weight": ep.weight,
             "enabled": ep.enabled,
         }))
+        .send()
+        .await?
+        .error_for_status()?;
+        Ok(())
+    }
+
+    async fn model_identities(&self) -> anyhow::Result<HashMap<Uuid, ModelIdentity>> {
+        let rows = self.get_array("/models").await?;
+        Ok(rows
+            .iter()
+            .filter_map(|m| Some((m.get("id")?.as_str()?.parse().ok()?, identity_from_json(m)?)))
+            .collect())
+    }
+
+    async fn model_identity(&self, model_id: Uuid) -> anyhow::Result<ModelIdentity> {
+        let m: serde_json::Value = self
+            .req(reqwest::Method::GET, &format!("/models/{model_id}"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(identity_from_json(&m).unwrap_or_default())
+    }
+
+    async fn patch_replica_with_details(
+        &self,
+        replica_id: Uuid,
+        state: Option<&str>,
+        nodes: Option<&str>,
+        endpoint_id: Option<Uuid>,
+        message: Option<&str>,
+        details: &ReplicaDetails,
+    ) -> anyhow::Result<()> {
+        let mut body = match serde_json::to_value(details)? {
+            serde_json::Value::Object(m) => m,
+            _ => serde_json::Map::new(),
+        };
+        if let Some(s) = state {
+            body.insert("state".into(), serde_json::json!(s));
+        }
+        if let Some(n) = nodes {
+            body.insert("nodes".into(), serde_json::json!(n));
+        }
+        if let Some(e) = endpoint_id {
+            body.insert("endpoint_id".into(), serde_json::json!(e.to_string()));
+        }
+        if let Some(m) = message {
+            body.insert("message".into(), serde_json::json!(m));
+        }
+        if body.is_empty() {
+            return Ok(());
+        }
+        self.req(reqwest::Method::PATCH, &format!("/replicas/{replica_id}"))
+            .json(&serde_json::Value::Object(body))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    async fn create_replica_with_log(
+        &self,
+        model_id: Uuid,
+        slurm_job_id: &str,
+        port_base: i64,
+        log_path: Option<&str>,
+    ) -> anyhow::Result<Uuid> {
+        let v: serde_json::Value = self
+            .req(
+                reqwest::Method::POST,
+                &format!("/models/{model_id}/replicas"),
+            )
+            .json(&serde_json::json!({
+                "slurm_job_id": slurm_job_id,
+                "port_base": port_base,
+                "log_path": log_path,
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        v.get("id")
+            .and_then(|x| x.as_str())
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| anyhow::anyhow!("create_replica: response missing a valid id: {v}"))
+    }
+
+    async fn patch_replica_details(
+        &self,
+        replica_id: Uuid,
+        details: &ReplicaDetails,
+    ) -> anyhow::Result<()> {
+        if *details == ReplicaDetails::default() {
+            return Ok(());
+        }
+        self.req(reqwest::Method::PATCH, &format!("/replicas/{replica_id}"))
+            .json(details)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    async fn set_managed_backoff(
+        &self,
+        model_id: Uuid,
+        backoff: &ManagedBackoff,
+    ) -> anyhow::Result<()> {
+        self.req(
+            reqwest::Method::PUT,
+            &format!("/models/{model_id}/managed/backoff"),
+        )
+        .json(backoff)
         .send()
         .await?
         .error_for_status()?;
@@ -580,6 +860,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn managed_specs_come_from_one_list_and_disabled_ones_are_skipped() {
+        let c = admin_stub(
+            200,
+            r#"[{"model_id":"00000000-0000-0000-0000-000000000001","enabled":true,"partition":"","gres":"","nodes":1,"image":"","preamble":"","log_output_dir":"","launch_command":"x","serving_port":8000,"health_path":"/health","target_replicas":1,"max_job_failures":0,"paused_until":"2030-01-01T00:00:00Z","paused_reason":"Paused.","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"},
+                {"model_id":"00000000-0000-0000-0000-000000000002","enabled":false,"partition":"","gres":"","nodes":1,"image":"","preamble":"","log_output_dir":"","launch_command":"x","serving_port":8000,"health_path":"/health","target_replicas":1,"max_job_failures":0,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}]"#,
+        )
+        .await;
+        let specs = c.list_managed_models().await.unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].paused_reason.as_deref(), Some("Paused."));
+        assert!(specs[0].paused_until.is_some());
+        // Fields an older gateway does not send take their defaults.
+        assert_eq!(specs[0].startup_timeout_mins, 60);
+        assert_eq!(specs[0].handoff_mins, 15);
+    }
+
+    #[tokio::test]
+    async fn model_names_are_read_in_one_list() {
+        let c = admin_stub(
+            200,
+            r#"[{"id":"00000000-0000-0000-0000-000000000001","model_name":"a","upstream_model":"org/a"},{"id":"bad","model_name":"b"}]"#,
+        )
+        .await;
+        let names = c.model_identities().await.unwrap();
+        assert_eq!(names.len(), 1);
+        let a = names.values().next().unwrap();
+        assert_eq!((a.name.as_str(), a.upstream.as_str()), ("a", "org/a"));
+        assert_eq!(a.served_names(), vec!["org/a".to_string(), "a".to_string()]);
+        let c = admin_stub(500, "[]").await;
+        assert!(c.model_identities().await.is_err());
+        let c = admin_stub(404, r#"{"error":"not found"}"#).await;
+        assert!(c.model_identity(Uuid::nil()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn deleting_an_endpoint_that_is_already_gone_succeeds() {
+        let c = admin_stub(404, r#"{"error":"not found"}"#).await;
+        assert!(c.delete_endpoint(Uuid::nil(), Uuid::nil()).await.is_ok());
+        let c = admin_stub(500, r#"{"error":"db down"}"#).await;
+        assert!(c.delete_endpoint(Uuid::nil(), Uuid::nil()).await.is_err());
+    }
+
+    #[test]
+    fn tick_warnings_travel_as_a_bounded_json_header() {
+        assert_eq!(warnings_header(&[]), None);
+        let w = warnings_header(&["The Slurm token\nexpires in 2 days.".into(), String::new()])
+            .unwrap();
+        assert_eq!(w, r#"["The Slurm token expires in 2 days."]"#);
+        let many: Vec<String> = (0..20).map(|i| format!("w{i}")).collect();
+        let parsed: Vec<String> = serde_json::from_str(&warnings_header(&many).unwrap()).unwrap();
+        assert_eq!(parsed.len(), TICK_WARNINGS_MAX);
+    }
+
+    #[tokio::test]
     async fn list_all_replicas_errors_on_500_and_error_envelope() {
         let c = admin_stub(500, r#"{"error":"db down"}"#).await;
         assert!(c.list_all_replicas().await.is_err(), "500 must be Err");
@@ -645,6 +979,14 @@ pub struct MockObleth {
     #[allow(clippy::type_complexity)]
     pub patches: std::sync::Mutex<Vec<(Uuid, Option<String>, Option<String>, Option<String>)>>,
     pub provision_errors: std::sync::Mutex<Vec<(Uuid, Option<String>)>>,
+    /// Every details patch: (replica_id, details).
+    pub details: std::sync::Mutex<Vec<(Uuid, ReplicaDetails)>>,
+    /// Every backoff write: (model_id, state).
+    pub backoffs: std::sync::Mutex<Vec<(Uuid, ManagedBackoff)>>,
+    /// Endpoints `list_endpoints` reports for every model.
+    pub endpoints: std::sync::Mutex<Vec<crate::domain::EndpointView>>,
+    /// When set, `delete_endpoint` fails.
+    pub fail_delete_endpoint: std::sync::atomic::AtomicBool,
     /// When set, `create_replica` returns an error — drives the compensating
     /// "cancel the orphan job" path in the Submit executor.
     pub fail_create_replica: std::sync::atomic::AtomicBool,
@@ -739,12 +1081,40 @@ impl OblethClient for MockObleth {
         &self,
         _model_id: Uuid,
     ) -> anyhow::Result<Vec<crate::domain::EndpointView>> {
-        // MockObleth doesn't track the returned endpoint ids by name, so report
-        // none exist — each test promote creates exactly one endpoint.
-        Ok(Vec::new())
+        // Canned endpoints (none by default): each test promote then creates
+        // exactly one endpoint.
+        Ok(self.endpoints.lock().unwrap().clone())
     }
     async fn delete_endpoint(&self, _model_id: Uuid, endpoint_id: Uuid) -> anyhow::Result<()> {
+        if self
+            .fail_delete_endpoint
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("simulated delete_endpoint failure");
+        }
         self.deleted_endpoints.lock().unwrap().push(endpoint_id);
+        Ok(())
+    }
+    async fn patch_replica_details(
+        &self,
+        replica_id: Uuid,
+        details: &ReplicaDetails,
+    ) -> anyhow::Result<()> {
+        self.details
+            .lock()
+            .unwrap()
+            .push((replica_id, details.clone()));
+        Ok(())
+    }
+    async fn set_managed_backoff(
+        &self,
+        model_id: Uuid,
+        backoff: &ManagedBackoff,
+    ) -> anyhow::Result<()> {
+        self.backoffs
+            .lock()
+            .unwrap()
+            .push((model_id, backoff.clone()));
         Ok(())
     }
     async fn update_endpoint_api_base(

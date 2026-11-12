@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { baselineForm, setField } from "./deploy-form";
 import { EMPTY_CLUSTER, inputDefaults } from "./recipe-inputs";
-import { savedName, savedRecipeText } from "./recipe-save";
+import { retokenizeName, savedName, savedRecipeText } from "./recipe-save";
 import { buildDeployPreview, parseRecipe } from "./sbatch-recipes";
 
 // A multi-node recipe with comments in its header, kept here as a fixture.
@@ -29,10 +29,23 @@ describe("save as recipe", () => {
   });
 
   it("sets this node count's entry of a per-node default", () => {
-    const src = "---\nname: t\nengine: vllm\nmodel_type: chat\napi_model_name: t\nport: 8000\ninputs:\n  - name: gb\n    type: number\n    default: 270\n    by_nodes: { \"1\": 270, \"4\": 20 }\n---\nrun {{gb}}\n";
+    const src = "---\nname: t\nengine: vllm\nmodel_type: chat\napi_model_name: t\nport: 8000\ninputs:\n  - name: gb\n    type: number\n    default: 270\n    by_nodes: { \"1\": 270, \"4\": 20 }\n---\nrun {{gb}} --port $OBLETH_SERVING_PORT\n";
     const r = parseRecipe("t", src);
     const f = setField(setField(baselineForm("t", buildDeployPreview(r)!, cv), "slurm.nodes", 4), "inputs.gb", "30");
     const saved = parseRecipe("s", savedRecipeText(src, f, { name: "t2", basedOn: "t" }));
     expect(saved.header!.inputs[0]).toMatchObject({ default: "30", by_nodes: { "1": "270", "4": "30" } });
+  });
+
+  it("saves a script edited at launch instead of the source recipe's", () => {
+    const edited = recipe.body!.replace("--served-model-name", "--marker --served-model-name");
+    const text = savedRecipeText(source, form, { name: "edited", basedOn: recipe.id, script: edited });
+    const saved = parseRecipe("saved", text);
+    expect(saved.valid, saved.error).toBe(true);
+    expect(saved.body).toContain("--marker");
+  });
+
+  it("turns a deployment's served name back into {{api_model_name}}, but not inside a repo id", () => {
+    expect(retokenizeName("vllm serve org/gpt-oss-20b --served-model-name gpt-oss-20b --port 1\nX='gpt-oss-20b'", "gpt-oss-20b"))
+      .toBe("vllm serve org/gpt-oss-20b --served-model-name {{api_model_name}} --port 1\nX='{{api_model_name}}'");
   });
 });

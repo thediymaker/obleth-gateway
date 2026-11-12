@@ -9,8 +9,9 @@ requires: "llama.cpp with GLM-5.2 support, built for the node (the official serv
 model_type: chat
 api_model_name: glm-5.2
 port: 8000
+health_path: /health
 target_replicas: 1
-max_job_failures: 3
+max_job_failures: 2
 env:
   # Let GPU allocations overflow into the Grace CPU's coherent memory.
   GGML_CUDA_ENABLE_UNIFIED_MEMORY: "1"
@@ -20,22 +21,13 @@ tested:
     date: 2026-10-03
     result: "With the defaults: ready in 9 minutes. One request ran at about 20 tokens a second; with 4 at once they shared about 28. It thinks before answering, so a short max_tokens can end before the answer starts."
 inputs:
-  - name: cache
-    label: Weight cache
-    type: path
-    default: "{{cluster.cache}}"
-    required: true
-    help: LLAMA_CACHE. Node-local scratch is fastest.
-  - name: image
-    label: Container image
-    type: path
-    default: "{{cluster.image.llamacpp}}"
-    help: Leave empty to run the llama-server on the node's PATH.
   - name: context
     label: Context length
     type: choice
     options: [131072, 262144, 524288, 1048576]
     default: 1048576
+    unit: tokens
+    help: The longest prompt and answer together, shared by the requests running at once.
   - name: parallel
     label: Requests at once
     type: number
@@ -48,25 +40,49 @@ inputs:
     min: 0
     max: 92
     default: 68
+    help: How many layers keep their experts in CPU memory. Lower it if the GPU has room to spare; raise it if loading runs out of GPU memory.
+  - name: extra
+    label: More llama-server flags
+    type: text
+    help: "Anything else to pass to llama-server, written as on its command line, such as --temp 0.8."
+  - name: image
+    label: Container image
+    type: path
+    default: "{{cluster.image.llamacpp}}"
+    help: The image the server runs in. Leave it empty to run llama-server from the node's PATH, for example after the cluster's setup lines load it.
+  - name: cache
+    label: Weight cache
+    type: path
+    default: "{{cluster.cache}}"
+    required: true
+    help: Where the weights are kept between jobs. Use shared storage, so a restart on another node doesn't download them again.
 ---
 #!/bin/bash -l
 #SBATCH --gres=gpu:1                 # one GH200 superchip
 #SBATCH --cpus-per-task=72
 #SBATCH --mem=560G
-set -euo pipefail
+# The cluster's setup lines run before strict mode, since site scripts often
+# read unset variables.
 {{cluster.setup}}
-export LLAMA_CACHE={{cache}}
-IMAGE="{{image}}"
+set -euo pipefail
+export LLAMA_CACHE="{{cache}}"
 # The official image keeps llama-server and its libraries in /app, which
-# neither PATH nor the library path includes under apptainer.
+# neither PATH nor the library path includes when it runs this way.
+# In the image when one is set, with the cluster's container command
+# (OBLETH_CONTAINER_RUN, "apptainer exec --nv" when unset); else from the node's PATH.
+IMAGE="{{image}}"
+RUN=()
 if [ -n "$IMAGE" ]; then
-  RUN=(apptainer exec --nv --bind {{cache}} "$IMAGE" sh -c 'PATH=/app:$PATH LD_LIBRARY_PATH=/app:${LD_LIBRARY_PATH:-} exec "$0" "$@"')
-else RUN=(); fi
-"${RUN[@]}" llama-server -hf unsloth/GLM-5.2-GGUF:UD-IQ2_M \
-  --host 0.0.0.0 --port "$OBLETH_SERVING_PORT" --alias {{api_model_name}} \
-  -ngl 99 --ctx-size {{context}} --parallel {{parallel}} --threads "$(nproc)" \
+  read -r -a RUN <<< "${OBLETH_CONTAINER_RUN:-apptainer exec --nv}"
+  RUN+=(--bind "$LLAMA_CACHE" "$IMAGE" sh -c 'PATH=/app:$PATH LD_LIBRARY_PATH=/app:${LD_LIBRARY_PATH:-} exec "$0" "$@"')
+fi
+exec ${RUN[@]+"${RUN[@]}"} llama-server -hf unsloth/GLM-5.2-GGUF:UD-IQ2_M \
+  --alias {{api_model_name}} \
+  --host 0.0.0.0 --port "$OBLETH_SERVING_PORT" \
+  -ngl 99 --ctx-size {{context}} --parallel {{parallel}} --threads "${SLURM_CPUS_ON_NODE:-$(nproc)}" \
   --n-cpu-moe {{cpu_moe}} \
   --batch-size 2048 --ubatch-size 512 \
   --cache-type-k q8_0 --cache-type-v q8_0 \
   --temp 1.0 --top-p 0.95 --min-p 0.01 \
-  --cont-batching --flash-attn on --jinja
+  --cont-batching --flash-attn on --jinja \
+  {{extra}}
