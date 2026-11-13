@@ -108,7 +108,8 @@ pub async fn tools(
     if segment != TOOLS_SEGMENT {
         return error_json(StatusCode::NOT_FOUND, "not found");
     }
-    let resolved = match authenticate(&state, req.headers()).await {
+    let client = crate::client::ClientInfo::of(req.extensions());
+    let resolved = match authenticate(&state, req.headers(), &client).await {
         Ok((resolved, _)) => resolved,
         Err(resp) => return resp,
     };
@@ -146,12 +147,13 @@ async fn with_request_id(
 async fn authenticate(
     state: &AppState,
     headers: &axum::http::HeaderMap,
+    client: &crate::client::ClientInfo,
 ) -> Result<(Arc<ResolvedKey>, String), Response<Body>> {
     let Some(secret) = proxy::bearer(headers) else {
         return Err(error_json(StatusCode::UNAUTHORIZED, "missing bearer token"));
     };
     let cred = crate::jwt_auth::authenticate_credential(state, &secret).await?;
-    gate_resolved_key(state, &cred.resolved)?;
+    gate_resolved_key(state, &cred.resolved, client)?;
     Ok((cred.resolved, cred.device_id))
 }
 
@@ -164,7 +166,8 @@ async fn handle(
     let started = Instant::now();
     let (parts, body) = req.into_parts();
     let headers = parts.headers;
-    let (resolved, device_id) = match authenticate(state, &headers).await {
+    let client = crate::client::ClientInfo::of(&parts.extensions);
+    let (resolved, device_id) = match authenticate(state, &headers, &client).await {
         Ok(auth) => auth,
         Err(resp) => return resp,
     };
@@ -212,6 +215,7 @@ async fn handle(
         streamed: false,
         failure: None,
         crash_fp: String::new(),
+        client,
     };
 
     // ---- tenant input guardrails ----
@@ -1122,10 +1126,19 @@ mod pipeline_tests {
         }
 
         async fn key(&self, allowed_models: Option<Vec<String>>) -> String {
+            self.key_from(allowed_models, Vec::new()).await
+        }
+
+        async fn key_from(
+            &self,
+            allowed_models: Option<Vec<String>>,
+            allowed_networks: Vec<String>,
+        ) -> String {
             let mut key = crate::boons::test_support::test_key();
             key.key_id = Uuid::new_v4();
             key.tenant_id = Uuid::new_v4();
             key.allowed_models = allowed_models;
+            key.allowed_networks = allowed_networks;
             let secret = format!("sk-search-{}", Uuid::new_v4());
             self.state
                 .key_cache
@@ -1274,6 +1287,62 @@ mod pipeline_tests {
         assert_eq!(query["language"], "en-US");
         assert_eq!(auth.as_deref(), Some("Bearer up-key"));
         assert_eq!(gw.ledger_rows(), rows + 1);
+    }
+
+    /// A key limited to certain networks is refused from anywhere else
+    /// (and from an unknown address) with 403 `ip_not_allowed`, before
+    /// anything is sent upstream or written to the usage ledger; from inside
+    /// its networks it works as usual.
+    #[tokio::test]
+    async fn a_key_limited_to_networks_is_refused_from_elsewhere() {
+        let Some(gw) = gateway().await else { return };
+        let (fake, base) = spawn_searxng().await;
+        gw.register(search_route("web-search", &base)).await;
+        let secret = gw
+            .key_from(None, vec!["192.0.2.0/24".into(), "2001:db8::/32".into()])
+            .await;
+        let rows = gw.ledger_rows();
+        let from = |ip: Option<&str>| {
+            let mut req = post(
+                "/v1/search/web-search",
+                &secret,
+                json!({ "query": "attention", "max_results": 1 }),
+            );
+            if let Some(ip) = ip {
+                req.extensions_mut().insert(crate::client::ClientInfo {
+                    ip: Some(ip.parse().unwrap()),
+                    path: "/v1/search/web-search".into(),
+                    ..Default::default()
+                });
+            }
+            req
+        };
+        let call = |req| search_named(State(gw.state.clone()), Path("web-search".into()), req);
+
+        let outside = call(from(Some("198.51.100.7"))).await;
+        assert_eq!(outside.status(), StatusCode::FORBIDDEN);
+        let body = json_of(outside).await;
+        assert_eq!(body["error"]["code"], "ip_not_allowed");
+        assert_eq!(
+            body["error"]["message"],
+            "This API key can't be used from 198.51.100.7. Its owner limited it to certain networks."
+        );
+
+        let unknown = call(from(None)).await;
+        assert_eq!(unknown.status(), StatusCode::FORBIDDEN);
+        assert_eq!(json_of(unknown).await["error"]["code"], "ip_not_allowed");
+
+        assert!(
+            fake.seen.lock().unwrap().is_empty(),
+            "nothing sent upstream"
+        );
+        assert_eq!(gw.ledger_rows(), rows, "no usage row for a refusal");
+
+        let inside = call(from(Some("192.0.2.44"))).await;
+        assert_eq!(inside.status(), StatusCode::OK);
+        let inside6 = call(from(Some("2001:db8:1::5"))).await;
+        assert_eq!(inside6.status(), StatusCode::OK);
+        assert_eq!(fake.seen.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]

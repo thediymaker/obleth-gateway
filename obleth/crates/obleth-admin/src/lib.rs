@@ -218,6 +218,11 @@ pub fn router(state: AdminState) -> Router {
         .route("/api/v1/usage", get(get_usage))
         .route("/api/v1/usage/keys", get(get_usage_keys))
         .route("/api/v1/usage/keys/summary", get(get_usage_keys_summary))
+        .route("/api/v1/usage/key-sources", get(get_usage_key_sources))
+        .route(
+            "/api/v1/usage/key-rejections",
+            get(get_usage_key_rejections),
+        )
         .route("/api/v1/usage/models", get(get_usage_models))
         .route("/api/v1/usage/series", get(get_usage_series))
         .route(
@@ -662,6 +667,12 @@ pub struct CreateKey {
     /// Per-model in-flight ceiling for this key. `null` clears the cap.
     #[serde(default)]
     pub max_in_flight: Option<i64>,
+    /// Networks the key may be used from: CIDR ranges or single addresses
+    /// (IPv4 or IPv6), at most 64. Empty or absent means any network.
+    /// Entries are stored in canonical form (`203.0.113.7` becomes
+    /// `203.0.113.7/32`).
+    #[serde(default)]
+    pub allowed_networks: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -687,6 +698,12 @@ pub struct UpdateKey {
     /// Per-model in-flight ceiling for this key. `null` clears the cap.
     #[serde(default)]
     pub max_in_flight: Option<i64>,
+    /// Networks the key may be used from (see `CreateKey::allowed_networks`).
+    /// Unlike the fields above, leaving it out (or sending `null`) keeps the
+    /// key's current list, so an edit that does not mention it never opens a
+    /// limited key to every network. Send `[]` to allow any network again.
+    #[serde(default)]
+    pub allowed_networks: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -4764,6 +4781,9 @@ async fn create_key(
         "budget_cost_usd",
         "budget_period",
     )?;
+    let allowed_networks =
+        obleth_config::network::normalize_allowed_networks(&body.allowed_networks)
+            .map_err(AdminError::BadRequest)?;
     let (key, secret) = state
         .store
         .create_api_key(
@@ -4776,6 +4796,7 @@ async fn create_key(
             started_at,
             body.weight,
             body.max_in_flight,
+            &allowed_networks,
         )
         .await?;
     let hash = hash_api_key(&secret);
@@ -4798,6 +4819,7 @@ async fn create_key(
                 "budget_started_at": key.budget_started_at,
                 "weight": key.weight,
                 "max_in_flight": key.max_in_flight,
+                "allowed_networks": key.allowed_networks,
             }),
         )
         .await?;
@@ -4987,6 +5009,12 @@ async fn update_key(
         "budget_cost_usd",
         "budget_period",
     )?;
+    let allowed_networks = body
+        .allowed_networks
+        .as_deref()
+        .map(obleth_config::network::normalize_allowed_networks)
+        .transpose()
+        .map_err(AdminError::BadRequest)?;
     let (hash, key, resolved) = state
         .store
         .update_api_key(
@@ -4999,8 +5027,11 @@ async fn update_key(
             started_at,
             body.weight,
             body.max_in_flight,
+            allowed_networks.as_deref(),
         )
         .await?;
+    // Same path as disabling a key: Redis is rewritten and every replica
+    // drops its local copy, so a narrowed list applies within moments.
     push_key(&state, &hash, &resolved).await?;
     state
         .store
@@ -5018,6 +5049,7 @@ async fn update_key(
                 "budget_started_at": key.budget_started_at,
                 "weight": key.weight,
                 "max_in_flight": key.max_in_flight,
+                "allowed_networks": key.allowed_networks,
             }),
         )
         .await?;
@@ -5358,6 +5390,59 @@ async fn get_key_usage(
 }
 
 /// Bulk per-key activity summary for the dashboard Keys table. Returns the
+/// Where each key was used from in the window: one row per key, network
+/// (IPv4 /24, IPv6 /48) and country, with request and address counts and
+/// when the key was first seen from that country (ever) and that network
+/// (as far back as client addresses are kept). For an account system that
+/// watches its keys for use from somewhere new. Default window: the last 24
+/// hours; at most 31 days. Requests recorded before client addresses were
+/// captured are left out.
+#[utoipa::path(
+    get, path = "/api/v1/usage/key-sources", tag = "usage",
+    params(usage::KeyWatchQuery),
+    responses((status = 200, body = [usage::KeySource]), (status = 400))
+)]
+async fn get_usage_key_sources(
+    State(state): State<AdminState>,
+    Query(q): Query<usage::KeyWatchQuery>,
+) -> Result<Json<Vec<usage::KeySource>>> {
+    let (since, until) = q
+        .window(chrono::Utc::now().timestamp_millis())
+        .map_err(AdminError::BadRequest)?;
+    Ok(Json(
+        usage::query_key_sources(
+            &state.clickhouse,
+            &q,
+            since,
+            until,
+            obleth_telemetry::client_ip_retention_days(),
+        )
+        .await?,
+    ))
+}
+
+/// Refused uses of real keys in the window: a disabled key, or a key used
+/// from outside its allowed networks. One row per key, reason, client
+/// address and country, with the number of refusals, first and last seen,
+/// and the most recent User-Agent. Default window: the last 24 hours; at
+/// most 31 days.
+#[utoipa::path(
+    get, path = "/api/v1/usage/key-rejections", tag = "usage",
+    params(usage::KeyWatchQuery),
+    responses((status = 200, body = [usage::KeyRejectionAgg]), (status = 400))
+)]
+async fn get_usage_key_rejections(
+    State(state): State<AdminState>,
+    Query(q): Query<usage::KeyWatchQuery>,
+) -> Result<Json<Vec<usage::KeyRejectionAgg>>> {
+    let (since, until) = q
+        .window(chrono::Utc::now().timestamp_millis())
+        .map_err(AdminError::BadRequest)?;
+    Ok(Json(
+        usage::query_key_rejections(&state.clickhouse, &q, since, until).await?,
+    ))
+}
+
 /// busiest keys (by token volume) that saw traffic in the window, each with
 /// last-used metadata so the UI can show "last used" without N+1 log fetches.
 #[utoipa::path(
@@ -11666,7 +11751,7 @@ mod tests {
         if let Some(secret) = created["secret"].as_str() {
             let hash = obleth_config::hash_api_key(secret);
             let _: ::redis::RedisResult<()> = ::redis::cmd("DEL")
-                .arg(format!("obleth:key:{hash}"))
+                .arg(format!("obleth:key2:{hash}"))
                 .query_async(&mut conn)
                 .await;
         }
@@ -11965,6 +12050,152 @@ mod tests {
         );
         assert_eq!(off_status, StatusCode::NO_CONTENT);
         assert_eq!(listed_off, Some(false));
+    }
+
+    /// Allowed networks are validated and normalised on create and update,
+    /// reach the gateway's resolved key, and a whole-key PUT that does not
+    /// mention them leaves them alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn allowed_networks_are_normalised_and_survive_a_key_put() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let tenant = t
+            .store
+            .create_tenant(&format!("t-{}", Uuid::new_v4()), 100, 1000, None, None)
+            .await
+            .expect("create tenant");
+        let request = |method: &str, path: String, body: serde_json::Value| {
+            axum::http::Request::builder()
+                .method(method)
+                .uri(path)
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+                .body(axum::body::Body::from(body.to_string()))
+                .expect("build request")
+        };
+        let resolved_networks = |id: String| {
+            let store = t.store.clone();
+            async move {
+                store
+                    .all_resolved_keys()
+                    .await
+                    .expect("resolved keys")
+                    .into_iter()
+                    .find(|(_, k)| k.key_id.to_string() == id)
+                    .map(|(_, k)| k.allowed_networks)
+            }
+        };
+
+        let (bad_status, bad) = send(
+            &t.app,
+            request(
+                "POST",
+                format!("/api/v1/tenants/{}/keys", tenant.id),
+                serde_json::json!({ "name": "lab", "allowed_networks": ["10.0.0.0/33"] }),
+            ),
+        )
+        .await;
+        let (_, created) = send(
+            &t.app,
+            request(
+                "POST",
+                format!("/api/v1/tenants/{}/keys", tenant.id),
+                serde_json::json!({
+                    "name": "lab",
+                    "allowed_networks": [" 203.0.113.7 ", "10.1.2.3/8", "", "2001:DB8::/32"]
+                }),
+            ),
+        )
+        .await;
+        let id = created["key"]["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let secret = created["secret"].as_str().unwrap_or_default().to_string();
+        let resolved_after_create = resolved_networks(id.clone()).await;
+        let (_, after_put) = send(
+            &t.app,
+            request(
+                "PUT",
+                format!("/api/v1/keys/{id}"),
+                serde_json::json!({ "name": "lab", "weight": 300 }),
+            ),
+        )
+        .await;
+        let (narrow_status, narrowed) = send(
+            &t.app,
+            request(
+                "PUT",
+                format!("/api/v1/keys/{id}"),
+                serde_json::json!({ "name": "lab", "allowed_networks": ["192.0.2.0/24"] }),
+            ),
+        )
+        .await;
+        let redis = RedisStore::connect(
+            &std::env::var("OBLETH_TEST_REDIS_URL").expect("checked by test_admin_app"),
+        )
+        .await
+        .expect("connect redis");
+        let cached = redis
+            .get_resolved_key(&obleth_config::hash_api_key(&secret))
+            .await
+            .expect("redis read")
+            .map(|k| k.allowed_networks);
+        let (bad_put_status, _) = send(
+            &t.app,
+            request(
+                "PUT",
+                format!("/api/v1/keys/{id}"),
+                serde_json::json!({ "name": "lab", "allowed_networks": ["nope"] }),
+            ),
+        )
+        .await;
+        let (_, cleared) = send(
+            &t.app,
+            request(
+                "PUT",
+                format!("/api/v1/keys/{id}"),
+                serde_json::json!({ "name": "lab", "allowed_networks": [] }),
+            ),
+        )
+        .await;
+
+        let _ = t.store.delete_tenant(tenant.id).await;
+
+        assert_eq!(bad_status, StatusCode::BAD_REQUEST, "{bad}");
+        assert!(
+            bad.to_string().contains("10.0.0.0/33"),
+            "the error names the entry: {bad}"
+        );
+        let normalised = serde_json::json!(["203.0.113.7/32", "10.0.0.0/8", "2001:db8::/32"]);
+        assert_eq!(created["key"]["allowed_networks"], normalised);
+        assert_eq!(
+            resolved_after_create,
+            Some(vec![
+                "203.0.113.7/32".to_string(),
+                "10.0.0.0/8".to_string(),
+                "2001:db8::/32".to_string()
+            ])
+        );
+        assert_eq!(after_put["weight"], serde_json::json!(300));
+        assert_eq!(
+            after_put["allowed_networks"], normalised,
+            "a whole-key PUT without the field must not open the key to every network"
+        );
+        assert_eq!(narrow_status, StatusCode::OK);
+        assert_eq!(
+            narrowed["allowed_networks"],
+            serde_json::json!(["192.0.2.0/24"])
+        );
+        assert_eq!(
+            cached,
+            Some(vec!["192.0.2.0/24".to_string()]),
+            "the change reaches the gateway's cache at once"
+        );
+        assert_eq!(bad_put_status, StatusCode::BAD_REQUEST);
+        assert_eq!(cleared["allowed_networks"], serde_json::json!([]));
     }
 
     /// Background priority is operator-only, has its own route, and a
@@ -12752,6 +12983,8 @@ mod tests {
             ("/api/v1/keys/{id}/tracing", "put"),
             ("/api/v1/keys/{id}/end-user-fairshare", "put"),
             ("/api/v1/keys/{id}/background", "put"),
+            ("/api/v1/usage/key-sources", "get"),
+            ("/api/v1/usage/key-rejections", "get"),
             ("/api/v1/tenants/{id}/tracing", "put"),
             ("/api/v1/usage/logs/{request_id}/spans", "get"),
             ("/api/v1/models/{id}/managed/provision-error", "patch"),
@@ -12769,6 +13002,8 @@ mod tests {
             "SetKeyTracing",
             "SetKeyEndUserFairshare",
             "SetKeyBackground",
+            "KeySource",
+            "KeyRejectionAgg",
             "ProvisionErrorBody",
             "SpanEntry",
         ] {

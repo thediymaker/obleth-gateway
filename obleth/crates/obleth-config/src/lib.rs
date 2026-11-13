@@ -10,6 +10,7 @@ pub mod failure;
 pub mod jwt;
 pub mod keys;
 pub mod manifest;
+pub mod network;
 pub mod reasoning;
 pub mod routing;
 pub mod slurm;

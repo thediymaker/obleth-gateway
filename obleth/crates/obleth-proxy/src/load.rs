@@ -204,10 +204,17 @@ struct Caller {
 pub async fn load(
     State(state): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
+    client: crate::client::ClientInfo,
     headers: HeaderMap,
 ) -> Response<Body> {
     let request_id = Uuid::new_v4();
-    let mut resp = handle(&state, query.get("model").map(String::as_str), &headers).await;
+    let mut resp = handle(
+        &state,
+        query.get("model").map(String::as_str),
+        &headers,
+        &client,
+    )
+    .await;
     if let Ok(value) = HeaderValue::from_str(&request_id.to_string()) {
         resp.headers_mut()
             .entry("x-obleth-request-id")
@@ -216,7 +223,12 @@ pub async fn load(
     resp
 }
 
-async fn handle(state: &AppState, model: Option<&str>, headers: &HeaderMap) -> Response<Body> {
+async fn handle(
+    state: &AppState,
+    model: Option<&str>,
+    headers: &HeaderMap,
+    client: &crate::client::ClientInfo,
+) -> Response<Body> {
     let Some(reporter) = &state.load else {
         return error_json(StatusCode::NOT_FOUND, "unknown endpoint");
     };
@@ -227,7 +239,7 @@ async fn handle(state: &AppState, model: Option<&str>, headers: &HeaderMap) -> R
         Ok(cred) => cred.resolved,
         Err(resp) => return resp,
     };
-    if let Err(resp) = gate_resolved_key(state, &resolved) {
+    if let Err(resp) = gate_resolved_key(state, &resolved, client) {
         return resp;
     }
     reporter.answer(&resolved, model, headers).await

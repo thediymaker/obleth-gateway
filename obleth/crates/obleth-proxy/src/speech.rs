@@ -49,10 +49,17 @@ const VOICES_BODY_MAX: usize = 1 << 20;
 pub async fn voices(
     State(state): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
+    client: crate::client::ClientInfo,
     headers: HeaderMap,
 ) -> Response<Body> {
     let request_id = Uuid::new_v4();
-    let mut resp = handle(&state, query.get("model").map(String::as_str), &headers).await;
+    let mut resp = handle(
+        &state,
+        query.get("model").map(String::as_str),
+        &headers,
+        &client,
+    )
+    .await;
     if let Ok(value) = HeaderValue::from_str(&request_id.to_string()) {
         resp.headers_mut()
             .entry("x-obleth-request-id")
@@ -61,7 +68,12 @@ pub async fn voices(
     resp
 }
 
-async fn handle(state: &AppState, model: Option<&str>, headers: &HeaderMap) -> Response<Body> {
+async fn handle(
+    state: &AppState,
+    model: Option<&str>,
+    headers: &HeaderMap,
+    client: &crate::client::ClientInfo,
+) -> Response<Body> {
     let Some(secret) = proxy::bearer(headers) else {
         return error_json(StatusCode::UNAUTHORIZED, "missing bearer token");
     };
@@ -69,7 +81,7 @@ async fn handle(state: &AppState, model: Option<&str>, headers: &HeaderMap) -> R
         Ok(cred) => cred.resolved,
         Err(resp) => return resp,
     };
-    if let Err(resp) = gate_resolved_key(state, &resolved) {
+    if let Err(resp) = gate_resolved_key(state, &resolved, client) {
         return resp;
     }
     let Some(name) = model.map(str::trim).filter(|n| !n.is_empty()) else {

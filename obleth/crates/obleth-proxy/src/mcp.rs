@@ -82,6 +82,7 @@ pub const MCP_REQUEST_TYPE: &str = "mcp";
 /// the server's response headers, since an MCP session can stream long after.
 /// No tokens or cost: obleth does not price MCP calls. The client's
 /// `mcp-session-id` groups a session's calls.
+#[allow(clippy::too_many_arguments)]
 fn mcp_usage_record(
     key: &ResolvedKey,
     request_id: Uuid,
@@ -90,6 +91,7 @@ fn mcp_usage_record(
     device_id: &str,
     status_code: u16,
     total_ms: u32,
+    client: &crate::client::ClientInfo,
 ) -> UsageRecord {
     UsageRecord {
         request_id,
@@ -140,6 +142,10 @@ fn mcp_usage_record(
             .map_or("", obleth_config::ErrorClass::as_str)
             .to_string(),
         error_reason: obleth_config::reason_for_status(status_code, "direct").to_string(),
+        client_ip: client.ip_string(),
+        client_network: client.network(),
+        client_country: client.country.clone(),
+        user_agent: client.user_agent.clone(),
     }
 }
 
@@ -174,6 +180,7 @@ async fn handle(
 ) -> (Response<Body>, bool) {
     let (parts, body) = req.into_parts();
     let headers = parts.headers;
+    let client = crate::client::ClientInfo::of(&parts.extensions);
 
     // ---- reject path traversal in the `*rest` segment before any upstream work ----
     if let Some(rest) = params.rest.as_deref() {
@@ -199,7 +206,7 @@ async fn handle(
         Err(resp) => return (resp, false),
     };
     // Same gate as the data plane: disabled key, inactive tenant, schedule.
-    if let Err(resp) = crate::proxy::gate_resolved_key(state, &resolved) {
+    if let Err(resp) = crate::proxy::gate_resolved_key(state, &resolved, &client) {
         return (resp, false);
     }
 
@@ -223,6 +230,7 @@ async fn handle(
             &device_id,
             status.as_u16(),
             started.elapsed().as_millis() as u32,
+            &client,
         ));
     };
 
@@ -533,7 +541,22 @@ mod tests {
         let mut key = crate::boons::test_support::test_key();
         key.key_name = "jlee379-cli".into();
         let id = Uuid::new_v4();
-        let row = mcp_usage_record(&key, id, "github", Some("sess-1"), "", 200, 85);
+        let client = crate::client::ClientInfo {
+            ip: Some("203.0.113.9".parse().unwrap()),
+            country: "DE".into(),
+            user_agent: "mcp-client/1".into(),
+            ..Default::default()
+        };
+        let row = mcp_usage_record(&key, id, "github", Some("sess-1"), "", 200, 85, &client);
+        assert_eq!(
+            (
+                row.client_ip.as_str(),
+                row.client_network.as_str(),
+                row.client_country.as_str(),
+                row.user_agent.as_str()
+            ),
+            ("203.0.113.9", "203.0.113.0/24", "DE", "mcp-client/1")
+        );
         assert_eq!(row.request_id, id);
         assert_eq!(row.request_type, MCP_REQUEST_TYPE);
         assert_eq!(
@@ -552,13 +575,13 @@ mod tests {
         assert_eq!(row.key_name, "jlee379-cli");
         assert!(!row.streamed);
 
-        let row = mcp_usage_record(&key, id, "github", None, "", 502, 3);
+        let row = mcp_usage_record(&key, id, "github", None, "", 502, 3, &client);
         assert_eq!(
             (row.session_id.as_str(), row.session_id_source.as_str()),
             ("", "none")
         );
         key.synthetic = true;
-        let row = mcp_usage_record(&key, id, "github", None, "", 200, 3);
+        let row = mcp_usage_record(&key, id, "github", None, "", 200, 3, &client);
         assert_eq!(row.request_type, obleth_config::BENCHMARK_REQUEST_TYPE);
     }
 
@@ -591,7 +614,7 @@ mod tests {
             .find("authenticate_credential(")
             .expect("the auth call");
         let gate = handler
-            .find("crate::proxy::gate_resolved_key(state, &resolved)")
+            .find("crate::proxy::gate_resolved_key(state, &resolved, &client)")
             .expect("the MCP handler must call gate_resolved_key");
         let upstream = handler
             .find("resolve_mcp(state")

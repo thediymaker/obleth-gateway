@@ -48,7 +48,20 @@ cached_script!(slot_hold_script, scripts::SLOT_HOLD);
 cached_script!(slot_reconcile_script, scripts::SLOT_RECONCILE);
 cached_script!(crash_strike_script, scripts::CRASH_STRIKE);
 
-const KEY_PREFIX: &str = "obleth:key:";
+/// Resolved keys, by key hash. Versioned: an entry is only ever written by a
+/// build that knows every security field of `ResolvedKey`. When a field like
+/// that is added, the namespace moves on, so an older replica still running
+/// in a rollout (which keeps re-warming its own namespace) can never write an
+/// entry a newer one reads with that field missing and defaulted to "off".
+/// `v2` added `allowed_networks`. Each build re-warms its namespace from
+/// Postgres at boot, before it serves, so a rollback reads its own entries
+/// fresh too. Entries left in an older namespace are never read; they can be
+/// removed with `redis-cli --scan --pattern 'obleth:key:*' | xargs redis-cli
+/// del` once no older replica runs.
+const KEY_PREFIX: &str = "obleth:key2:";
+/// The namespace before `KEY_PREFIX`. Only deletes touch it, so a key revoked
+/// while older replicas still run is gone for them too.
+const LEGACY_KEY_PREFIX: &str = "obleth:key:";
 const MODEL_PREFIX: &str = "obleth:model:";
 const MCP_PREFIX: &str = "obleth:mcp:";
 const BUDGET_PREFIX: &str = "obleth:budget:";
@@ -305,7 +318,9 @@ impl RedisStore {
 
     pub async fn delete_resolved_key(&self, hash: &str) -> Result<()> {
         let mut conn = self.conn.clone();
-        let _: () = conn.del(Self::key_cache(hash)).await?;
+        let _: () = conn
+            .del(&[Self::key_cache(hash), format!("{LEGACY_KEY_PREFIX}{hash}")])
+            .await?;
         Ok(())
     }
 
@@ -1038,6 +1053,17 @@ mod tests {
     use super::*;
     use obleth_config::ResolvedKey;
 
+    /// An older replica prunes `obleth:key:*` against its own snapshot. The
+    /// current namespace must not match that pattern, or an older replica
+    /// still running in a rollout would delete every entry a newer one
+    /// wrote.
+    #[test]
+    fn the_key_namespace_is_outside_the_legacy_scan_pattern() {
+        assert!(!KEY_PREFIX.starts_with(LEGACY_KEY_PREFIX));
+        assert_ne!(KEY_PREFIX, LEGACY_KEY_PREFIX);
+        assert!(RedisStore::key_cache("abc").starts_with(KEY_PREFIX));
+    }
+
     /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
     #[tokio::test]
     async fn budget_reserve_and_reconcile() {
@@ -1227,6 +1253,7 @@ mod tests {
             guardrails_policy: None,
             compression_policy: None,
             synthetic: false,
+            allowed_networks: Vec::new(),
         };
         store.put_resolved_key(&hash, &key).await.unwrap();
         let got = store.get_resolved_key(&hash).await.unwrap().unwrap();

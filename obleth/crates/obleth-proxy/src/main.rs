@@ -31,6 +31,7 @@ mod verdicts;
 
 mod boons;
 mod classifier;
+mod client;
 mod diagnostics;
 pub mod tracer;
 
@@ -858,10 +859,15 @@ async fn serve_until_shutdown(
             // TCP_NODELAY: a response goes out as headers then body; with
             // Nagle on, the body waits for the client's delayed ACK of the
             // headers (40 ms on Linux) on every reused keep-alive connection.
-            axum::serve(listener, app)
-                .tcp_nodelay(true)
-                .with_graceful_shutdown(stop)
-                .await
+            // With connect info, so the client-address middleware can see
+            // the TCP peer.
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .tcp_nodelay(true)
+            .with_graceful_shutdown(stop)
+            .await
         }
     }));
     tokio::pin!(running);
@@ -918,6 +924,9 @@ fn proxy_router(state: AppState) -> Router {
         .route("/mcp/:server", axum::routing::any(mcp::mcp_handler))
         .route("/mcp/:server/*rest", axum::routing::any(mcp::mcp_handler))
         .fallback(proxy::proxy_handler)
+        // Records each request's client address, country and User-Agent for
+        // key network limits and the usage ledger (see `client`).
+        .layer(axum::middleware::from_fn(client::capture))
         .with_state(state)
 }
 
@@ -1315,7 +1324,7 @@ fn restore_and_evict(
     (restore, evict)
 }
 
-/// Push a Postgres snapshot into Redis, then delete any `obleth:key:*` entry
+/// Push a Postgres snapshot into Redis, then delete any `obleth:key2:*` entry
 /// Redis holds that the snapshot doesn't list — the same SCAN-based prune
 /// `POST /api/v1/resync` uses (`obleth-redis/src/prune.rs`). A key revoked
 /// before this snapshot was taken has no entry here, so the prune removes it
@@ -1958,7 +1967,7 @@ mod shutdown_tests {
     /// covers in isolation above.
     ///
     /// `push_and_prune_keys` calls `RedisStore::prune_stale_resolved_keys`,
-    /// which SCANs and deletes across the *entire* `obleth:key:*` namespace —
+    /// which SCANs and deletes across the *entire* `obleth:key2:*` namespace —
     /// not just the hashes this test creates. Point `OBLETH_TEST_REDIS_URL`
     /// at an isolated database (e.g. Redis db 15, the project's documented
     /// test database — never db 0 / a shared or live instance): running this
@@ -2070,6 +2079,7 @@ mod shutdown_tests {
             guardrails_policy: None,
             compression_policy: None,
             synthetic: false,
+            allowed_networks: Vec::new(),
         }
     }
 

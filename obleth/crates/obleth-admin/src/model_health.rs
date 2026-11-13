@@ -1467,6 +1467,10 @@ fn build_probe_usage(
             .map_or("", obleth_config::ErrorClass::as_str)
             .to_string(),
         error_reason: obleth_config::reason_for_status(http_status.unwrap_or(0), "").to_string(),
+        client_ip: String::new(),
+        client_network: String::new(),
+        client_country: String::new(),
+        user_agent: String::new(),
     }
 }
 

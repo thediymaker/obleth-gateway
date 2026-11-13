@@ -1359,6 +1359,11 @@ fn helper_usage_record(
         streamed: false,
         error_class: String::new(),
         error_reason: String::new(),
+        // A helper call is the gateway's own: it has no client.
+        client_ip: String::new(),
+        client_network: String::new(),
+        client_country: String::new(),
+        user_agent: String::new(),
     }
 }
 
@@ -1620,6 +1625,7 @@ mod tests {
             guardrails_policy: None,
             compression_policy: None,
             synthetic: false,
+            allowed_networks: Vec::new(),
         };
         k.compression_policy = policy;
         k
@@ -1916,6 +1922,7 @@ mod tests {
                 guardrails_policy: None,
                 compression_policy: None,
                 synthetic: false,
+                allowed_networks: Vec::new(),
             }
         }
 

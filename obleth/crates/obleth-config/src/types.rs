@@ -253,6 +253,11 @@ pub struct ApiKey {
     /// busy. Operator-only, so off by default.
     #[serde(default)]
     pub background: bool,
+    /// Networks the key may be used from, as canonical CIDRs (a single
+    /// address is a /32 or /128). Empty means any network. A request from
+    /// anywhere else is refused with 403 `ip_not_allowed`.
+    #[serde(default)]
+    pub allowed_networks: Vec<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -348,6 +353,12 @@ pub struct ResolvedKey {
     /// field existed still parse.
     #[serde(default)]
     pub background: bool,
+    /// Networks the key may be used from (see `ApiKey::allowed_networks`);
+    /// empty means any. Cached entries live under a key namespace that only
+    /// builds knowing this field write, so an entry written without it is
+    /// never read as "any network".
+    #[serde(default)]
+    pub allowed_networks: Vec<String>,
     /// Optional per-tenant model allowlist. Empty/`None` = all models permitted.
     #[serde(default)]
     pub allowed_models: Option<Vec<String>>,
@@ -1391,6 +1402,65 @@ pub struct UsageRecord {
     /// Never request or answer text. Empty for a success.
     #[serde(default)]
     pub error_reason: String,
+    /// The address the request came from (see `obleth_config::network`):
+    /// the rightmost `X-Forwarded-For` entry when the peer is a trusted
+    /// proxy, else the peer. Empty when unknown (in-process callers, helper
+    /// rows). Expires after the client address retention, while the row
+    /// stays. `#[serde(default)]` keeps older WAL records replayable.
+    #[serde(default)]
+    pub client_ip: String,
+    /// The network `client_ip` is grouped under (IPv4 /24, IPv6 /48), kept
+    /// beside it so reads need no address arithmetic; expires with it.
+    #[serde(default)]
+    pub client_network: String,
+    /// Two-letter country the edge named for the client, only when the peer
+    /// is a trusted proxy; empty otherwise. Kept as long as the row.
+    #[serde(default)]
+    pub client_country: String,
+    /// The client's User-Agent, cut to 256 characters. Expires with
+    /// `client_ip`.
+    #[serde(default)]
+    pub user_agent: String,
+}
+
+/// Why a known key was refused before its request ran, as recorded in the
+/// `key_rejections` ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyRejectionReason {
+    /// The key is disabled.
+    Disabled,
+    /// The request came from outside the key's `allowed_networks`.
+    IpNotAllowed,
+}
+
+impl KeyRejectionReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KeyRejectionReason::Disabled => "disabled",
+            KeyRejectionReason::IpNotAllowed => "ip_not_allowed",
+        }
+    }
+}
+
+/// One refused use of a real key. The ledger keeps at most one row per key,
+/// address and reason in each short window, with `count` saying how many
+/// refusals it stands for.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyRejection {
+    /// Unix epoch milliseconds of the first refusal the row stands for.
+    pub ts_ms: i64,
+    pub key_id: Uuid,
+    pub key_name: String,
+    pub tenant_id: Uuid,
+    pub tenant_name: String,
+    pub reason: KeyRejectionReason,
+    pub client_ip: String,
+    pub client_country: String,
+    pub user_agent: String,
+    /// The request path, without its query string.
+    pub path: String,
+    pub count: u64,
 }
 
 /// Runtime-configurable retention for the raw per-request `usage` ledger.
@@ -3960,6 +4030,10 @@ pub struct ApiKeyBackup {
     /// the column existed.
     #[serde(default)]
     pub background: bool,
+    /// See `ApiKey::allowed_networks`. Defaults to any network for backups
+    /// taken before the column existed.
+    #[serde(default)]
+    pub allowed_networks: Vec<String>,
     pub disabled: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
@@ -4183,6 +4257,43 @@ pub struct RestoreReport {
 
 #[cfg(test)]
 mod tests {
+    /// A key's network list survives the trip through a backup file, and a
+    /// backup taken before the field existed restores as "any network".
+    #[test]
+    fn backups_carry_allowed_networks() {
+        let raw = serde_json::json!({
+            "id": uuid::Uuid::nil(), "tenant_id": uuid::Uuid::nil(), "name": "k",
+            "key_prefix": "obl_0123456789abcd", "key_hash": "h", "disabled": false,
+            "created_at": "2026-01-01T00:00:00Z"
+        });
+        let old: super::ApiKeyBackup = serde_json::from_value(raw.clone()).unwrap();
+        assert!(old.allowed_networks.is_empty());
+        let mut with = raw;
+        with["allowed_networks"] = serde_json::json!(["203.0.113.0/24", "2001:db8::/48"]);
+        let backup: super::ApiKeyBackup = serde_json::from_value(with).unwrap();
+        let again: super::ApiKeyBackup =
+            serde_json::from_str(&serde_json::to_string(&backup).unwrap()).unwrap();
+        assert_eq!(again.allowed_networks, ["203.0.113.0/24", "2001:db8::/48"]);
+    }
+
+    /// The cached hot-path view keeps the list through the JSON Redis holds.
+    /// (An entry written by a build without the field can only exist in the
+    /// older key namespace, which this build never reads; see obleth-redis.)
+    #[test]
+    fn resolved_keys_cache_allowed_networks() {
+        let raw = serde_json::json!({
+            "key_id": uuid::Uuid::nil(), "tenant_id": uuid::Uuid::nil(),
+            "tenant_name": "t", "fairshare_group": "default", "group_weight": 100,
+            "weight": 100, "tokens_per_minute": 1000, "max_in_flight": null,
+            "disabled": false, "allowed_networks": ["192.0.2.0/24"]
+        });
+        let key: super::ResolvedKey = serde_json::from_value(raw).unwrap();
+        assert_eq!(key.allowed_networks, ["192.0.2.0/24"]);
+        let again: super::ResolvedKey =
+            serde_json::from_str(&serde_json::to_string(&key).unwrap()).unwrap();
+        assert_eq!(again, key);
+    }
+
     #[test]
     fn catalog_urls_try_the_canonical_path_then_the_trailing_slash() {
         assert_eq!(
