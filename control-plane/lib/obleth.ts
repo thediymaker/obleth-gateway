@@ -99,6 +99,11 @@ export interface ApiKey {
   end_user_fairshare: boolean;
   /** Background priority: the key's requests take only spare capacity (operators only). */
   background: boolean;
+  /**
+   * Networks the key may be used from, as canonical CIDRs. Empty means any
+   * network. Optional so data from an older gateway still reads.
+   */
+  allowed_networks?: string[];
   created_at: string;
   updated_at: string;
 }
@@ -2519,6 +2524,8 @@ export const obleth = {
       budget_cost_usd?: number | null;
       budget_period?: string | null;
       budget_started_at?: string | null;
+      /** CIDR ranges or addresses; empty for any network. */
+      allowed_networks?: string[];
     },
     options?: AuditOptions,
   ) =>
@@ -2538,6 +2545,8 @@ export const obleth = {
       budget_cost_usd?: number | null;
       budget_period?: string | null;
       budget_started_at?: string | null;
+      /** Left out, the key keeps its list; `[]` allows any network. */
+      allowed_networks?: string[];
     },
     options?: AuditOptions,
   ) =>

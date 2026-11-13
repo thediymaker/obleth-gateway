@@ -7,12 +7,13 @@ import { deleteKeyAction, replaceKeyAction, saveKeySettingsAction, setKeysDisabl
 import { PERIOD_OPTIONS } from "@/components/access/key-dialogs";
 import { SettingsForm } from "@/components/access/settings-form";
 import { BudgetBar, StateDot } from "@/components/access/ui";
-import { SelectField, Setting, Switch, TextField } from "@/components/models/fields";
+import { SelectField, Setting, Switch, TextArea, TextField } from "@/components/models/fields";
 import { Sheet } from "@/components/models/ui";
 import { Pill } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { describeIdentityKey } from "@/lib/key-kind";
+import { NETWORKS_HINT, networksSummary, networksText } from "@/lib/key-networks";
 import { lastUsed, tenantHref, type KeyRow } from "@/lib/access-model";
 import { logsHref } from "@/lib/log-links";
 import { money } from "@/lib/models-model";
@@ -29,7 +30,7 @@ function keyFieldSection(name: string): "key" | "tracing" | "end_user" | "backgr
   if (name === "tracing_enabled") return "tracing";
   if (name === "end_user_fairshare") return "end_user";
   if (name === "background") return "background";
-  if (["name", "description", "weight", "max_in_flight", "budget_tokens", "budget_cost_usd", "budget_period", "budget_started_at"].includes(name)) return "key";
+  if (["name", "description", "weight", "max_in_flight", "budget_tokens", "budget_cost_usd", "budget_period", "budget_started_at", "allowed_networks"].includes(name)) return "key";
   return null;
 }
 
@@ -44,6 +45,7 @@ const KEY_LABELS: Record<string, string> = {
   tracing_enabled: "Trace requests",
   end_user_fairshare: "Per-user fairshare",
   background: "Background priority",
+  allowed_networks: "Allowed networks",
 };
 
 function Use({ row }: { row: KeyRow }) {
@@ -206,6 +208,20 @@ export function KeyPanel({
             </p>
           )}
 
+          <section aria-label="Networks" className="flex flex-col gap-2">
+            <span className="text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">Networks</span>
+            {k.allowed_networks?.length ? (
+              <div className="flex flex-col gap-1.5">
+                <span className="text-[12.5px] text-secondary-foreground">Works only from these networks. Requests from anywhere else are refused.</span>
+                <div className="flex flex-wrap gap-1.5">
+                  {k.allowed_networks.map((n) => <Pill key={n}><span className="font-mono text-[12px]">{n}</span></Pill>)}
+                </div>
+              </div>
+            ) : (
+              <p className="text-[12.5px] text-muted-foreground">{networksSummary(k.allowed_networks)}. Limit it below.</p>
+            )}
+          </section>
+
           <Use row={row} />
 
           <section aria-label="Budget" className="flex flex-col gap-2">
@@ -268,6 +284,9 @@ export function KeyPanel({
           </Setting>
           <Setting label="In flight per model" hint="Blank to use the tenant's cap" fields={["max_in_flight"]} was={{ field: "max_in_flight" }} className="px-6">
             <TextField name="max_in_flight" label="In flight per model" type="number" min={1} step={1} defaultValue={k.max_in_flight ?? ""} placeholder={tenant?.max_in_flight ? `tenant's ${tenant.max_in_flight}` : "No cap"} mono className="w-32" />
+          </Setting>
+          <Setting label="Allowed networks" hint={NETWORKS_HINT} fields={["allowed_networks"]} className="px-6">
+            <TextArea name="allowed_networks" label="Allowed networks" rows={3} defaultValue={networksText(k.allowed_networks)} placeholder={"203.0.113.0/24\n2001:db8::/48"} />
           </Setting>
           <Setting label="Trace requests" hint="Keep each step of its requests" fields={["tracing_enabled"]} was={{ field: "tracing_enabled", checkbox: true }} className="px-6">
             <Switch name="tracing_enabled" label="Trace requests" defaultChecked={k.tracing_enabled} />
