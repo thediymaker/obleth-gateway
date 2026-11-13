@@ -81,6 +81,7 @@ use obleth_config::{
         crate::set_key_disabled,
         crate::set_key_tracing_handler,
         crate::set_key_end_user_fairshare_handler,
+        crate::set_key_background_handler,
         crate::get_key_usage,
         // usage & costs
         crate::get_usage,
@@ -426,6 +427,7 @@ use obleth_config::{
         crate::ResyncReport,
         crate::SetKeyTracing,
         crate::SetKeyEndUserFairshare,
+        crate::SetKeyBackground,
         crate::ProvisionErrorBody,
         crate::ManagedActionResult,
         obleth_config::ManagedBackoff,

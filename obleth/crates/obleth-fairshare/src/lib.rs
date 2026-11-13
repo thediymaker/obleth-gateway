@@ -105,6 +105,9 @@ pub const DEFAULT_MODEL_MAX_IN_FLIGHT: usize = 32;
 /// Display name of the shared pool for requests with no resolved route.
 pub const UNROUTED_POOL: &str = "(unrouted)";
 
+/// What a model's background pool is shown as: the model name and this.
+pub const BACKGROUND_POOL_SUFFIX: &str = " (background)";
+
 /// How long a pool with no permits and no waiters is kept before housekeeping
 /// drops it.
 pub const IDLE_POOL_TTL: Duration = Duration::from_secs(600);
@@ -124,11 +127,11 @@ fn housekeeping_interval(idle_pool_ttl: Duration) -> Duration {
 pub enum PoolKey {
     /// The pool of a resolved model route.
     Model(String),
-    /// Background work (batches) for a model. It has its own queues and
-    /// fairness, and shares the model's slots with [`PoolKey::Model`]: it is
-    /// served only while the model has no interactive request waiting, and
-    /// only up to a share of the model's pool (see
-    /// [`AdmitRequest::background_share`]).
+    /// Background work (batch items, and requests from keys with background
+    /// priority) for a model. It has its own queues and fairness, and shares
+    /// the model's slots with [`PoolKey::Model`]: it is served only while the
+    /// model has no interactive request waiting, and only up to a share of
+    /// the model's pool (see [`AdmitRequest::background_share`]).
     Background(String),
     /// One pool shared by every request that did not resolve to a route, so
     /// arbitrary model strings cannot each mint a pool of their own.
@@ -139,7 +142,7 @@ impl PoolKey {
     fn display_name(&self) -> String {
         match self {
             PoolKey::Model(name) => name.clone(),
-            PoolKey::Background(name) => format!("{name} (batch)"),
+            PoolKey::Background(name) => format!("{name}{BACKGROUND_POOL_SUFFIX}"),
             PoolKey::Unrouted => UNROUTED_POOL.to_string(),
         }
     }

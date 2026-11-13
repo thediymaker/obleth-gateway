@@ -97,8 +97,9 @@ const OWNER_TTL: Duration = Duration::from_secs(30);
 const OWNER_PAUSE_SECS: f64 = 60.0;
 
 /// Most an item may wait for a background slot before its turn is given
-/// back; it is retried at once, so this only bounds a single wait.
-const MAX_ADMISSION_WAIT: Duration = Duration::from_secs(3600);
+/// back; it is retried at once, so this only bounds a single wait. Also the
+/// longest a background key's request waits for a slot.
+pub(crate) const MAX_ADMISSION_WAIT: Duration = Duration::from_secs(3600);
 
 /// Batch settings, from the environment.
 #[derive(Debug, Clone)]
@@ -173,14 +174,30 @@ impl BatchConfig {
             concurrency: env_num("OBLETH_BATCH_RUNNER_CONCURRENCY", 64).max(1),
             retention_days: env_num("OBLETH_BATCH_RETENTION_DAYS", 30).max(1),
             scope,
-            share: env_num(
-                "OBLETH_BATCH_MAX_SHARE",
-                obleth_fairshare::DEFAULT_BACKGROUND_SHARE,
-            )
-            .clamp(0.0, 1.0),
+            share: share_from_env(),
             instance,
         })
     }
+}
+
+/// The share of a model's slots, and of the global ceiling, background work
+/// may fill: `OBLETH_BATCH_MAX_SHARE`, else the scheduler's default.
+fn share_from_env() -> f64 {
+    env_num(
+        "OBLETH_BATCH_MAX_SHARE",
+        obleth_fairshare::DEFAULT_BACKGROUND_SHARE,
+    )
+    .clamp(0.0, 1.0)
+}
+
+/// The share a background key's requests may fill: the batch runner's, so
+/// both kinds of background work stop at the same line. Read from the
+/// environment once when batches are off.
+pub(crate) fn background_share(batches: Option<&Batches>) -> f64 {
+    static SHARE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    batches
+        .map(|b| b.cfg.share)
+        .unwrap_or_else(|| *SHARE.get_or_init(share_from_env))
 }
 
 /// `<n>h` or `<n>d` as a duration.
@@ -1462,7 +1479,10 @@ async fn fill(
     let mut waiting: HashMap<(String, Uuid), usize> = HashMap::new();
     if let Some(snap) = state.fairshare.snapshot().await {
         for pool in snap.pools {
-            if let Some(model) = pool.model.strip_suffix(" (batch)") {
+            if let Some(model) = pool
+                .model
+                .strip_suffix(obleth_fairshare::BACKGROUND_POOL_SUFFIX)
+            {
                 for key in pool.keys {
                     waiting.insert((model.to_string(), key.key_id), key.queued);
                 }

@@ -22,9 +22,13 @@ import { cn, getJson } from "@/lib/utils";
 
 const DAY_MS = 86_400_000;
 
-function keyFieldSection(name: string): "key" | "tracing" | "end_user" | null {
+/** Share of a model's slots background work may fill, unless the gateway sets another. */
+const BACKGROUND_SHARE_PCT = 75;
+
+function keyFieldSection(name: string): "key" | "tracing" | "end_user" | "background" | null {
   if (name === "tracing_enabled") return "tracing";
   if (name === "end_user_fairshare") return "end_user";
+  if (name === "background") return "background";
   if (["name", "description", "weight", "max_in_flight", "budget_tokens", "budget_cost_usd", "budget_period", "budget_started_at"].includes(name)) return "key";
   return null;
 }
@@ -39,6 +43,7 @@ const KEY_LABELS: Record<string, string> = {
   budget_period: "Budget period",
   tracing_enabled: "Trace requests",
   end_user_fairshare: "Per-user fairshare",
+  background: "Background priority",
 };
 
 function Use({ row }: { row: KeyRow }) {
@@ -275,6 +280,15 @@ export function KeyPanel({
             className="px-6"
           >
             <Switch name="end_user_fairshare" label="Per-user fairshare" defaultChecked={k.end_user_fairshare} />
+          </Setting>
+          <Setting
+            label="Background priority"
+            hint={`Uses only spare capacity. Nothing new starts for this key while anyone else is waiting for that model, and it never fills more than ${BACKGROUND_SHARE_PCT}% of a model's slots (or the batch share the gateway sets). Its requests wait for a slot instead of failing when a model is busy.`}
+            fields={["background"]}
+            was={{ field: "background", checkbox: true }}
+            className="px-6"
+          >
+            <Switch name="background" label="Background priority" defaultChecked={k.background} />
           </Setting>
         </SettingsForm>
       </Sheet>

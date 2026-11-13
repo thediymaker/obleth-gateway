@@ -37,7 +37,7 @@ const key: ApiKey = {
   id: "k1", tenant_id: "t1", name: "alice", description: "", key_prefix: "sk-abc", kind: "secret",
   identity_issuer: null, identity_subject: null, identity_claims: null, weight: 250, max_in_flight: 3,
   budget_tokens: null, budget_cost_usd: null, budget_period: null, budget_started_at: null,
-  disabled: false, tracing_enabled: false, end_user_fairshare: false, created_at: "", updated_at: "",
+  disabled: false, tracing_enabled: false, end_user_fairshare: false, background: false, created_at: "", updated_at: "",
 };
 
 let host: HTMLDivElement;
@@ -56,12 +56,12 @@ afterEach(async () => {
   host.remove();
 });
 
-async function render() {
+async function render(keys: ApiKey[] = [key]) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, enabled: false } } });
   await act(async () =>
     root.render(
       <QueryClientProvider client={client}>
-        <KeysList tenants={[tenant("t1", "Research"), tenant("t2", "Teaching")]} keys={[key]} usage={[]} budgets={[]} initial={{}} />
+        <KeysList tenants={[tenant("t1", "Research"), tenant("t2", "Teaching")]} keys={keys} usage={[]} budgets={[]} initial={{}} />
       </QueryClientProvider>,
     ),
   );
@@ -89,6 +89,23 @@ describe("keys", () => {
     await click("Open alice");
     expect(document.querySelector<HTMLInputElement>('input[name="weight"]')!.value).toBe("250");
     expect(document.querySelector<HTMLInputElement>('input[name="max_in_flight"]')!.value).toBe("3");
+  });
+
+  it("marks a background key in the list and shows its switch on", async () => {
+    await render([key, { ...key, id: "k2", name: "runner", background: true }]);
+    const rows = [...document.querySelectorAll<HTMLButtonElement>("button")].filter((b) => b.getAttribute("aria-label")?.startsWith("Open "));
+    expect(rows.find((b) => b.getAttribute("aria-label") === "Open alice")!.textContent).not.toContain("Background");
+    expect(rows.find((b) => b.getAttribute("aria-label") === "Open runner")!.textContent).toContain("Background");
+    await click("Open runner");
+    expect(document.body.textContent).toContain("Background priority");
+    expect(document.body.textContent).toContain("Uses only spare capacity.");
+    expect(document.querySelector<HTMLInputElement>('input[name="background"]')!.checked).toBe(true);
+  });
+
+  it("shows background priority off for an ordinary key", async () => {
+    await render();
+    await click("Open alice");
+    expect(document.querySelector<HTMLInputElement>('input[name="background"]')!.checked).toBe(false);
   });
 
   it("moves a key into a new tenant with its old tenant's settings", async () => {
