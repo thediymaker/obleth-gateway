@@ -114,6 +114,17 @@ obleth:
   modelHealthTimeoutSecs: 30
   modelHealthRetentionDays: 30
   usageRetentionDays: 180
+  # Where each request came from. When the connecting peer is in
+  # `trustedProxies` (comma-separated CIDRs), the rightmost X-Forwarded-For
+  # entry is the client; otherwise the peer is. Empty means the private and
+  # loopback ranges; "none" trusts no proxy. Keys limited to certain networks
+  # are checked against this address. `countryHeader` is read only from a
+  # trusted proxy (empty records no country). Client addresses and
+  # User-Agents are cleared from ledger rows after `ipRetentionDays`.
+  clientAddress:
+    trustedProxies: ""
+    countryHeader: "cf-ipcountry"
+    ipRetentionDays: 90
   # Milliseconds each gateway pod buffers usage rows and trace spans before it
   # inserts them into ClickHouse (100-60000). ClickHouse rewrites every insert
   # in later merges, so fewer, larger inserts cost much less disk I/O; rows

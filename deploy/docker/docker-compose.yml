@@ -194,6 +194,11 @@ services:
       # Days of raw per-request usage history kept before pruning (whole
       # day-partitions are dropped). The permanent daily rollup is never pruned.
       OBLETH_USAGE_RETENTION_DAYS: ${OBLETH_USAGE_RETENTION_DAYS:-180}
+      # Client address capture: see .env.example. Blank trusted proxies means
+      # the private and loopback ranges.
+      OBLETH_TRUSTED_PROXIES: ${OBLETH_TRUSTED_PROXIES:-}
+      OBLETH_CLIENT_COUNTRY_HEADER: ${OBLETH_CLIENT_COUNTRY_HEADER-cf-ipcountry}
+      OBLETH_CLIENT_IP_RETENTION_DAYS: ${OBLETH_CLIENT_IP_RETENTION_DAYS:-90}
       # Milliseconds each gateway buffers usage rows before inserting them into
       # ClickHouse. Each insert is a part ClickHouse later rewrites in merges.
       OBLETH_TELEMETRY_FLUSH_INTERVAL_MS: ${OBLETH_TELEMETRY_FLUSH_INTERVAL_MS:-5000}
