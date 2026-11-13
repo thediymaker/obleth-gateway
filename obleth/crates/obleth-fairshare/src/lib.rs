@@ -233,8 +233,8 @@ pub struct GroupFairshare {
     /// Occupancy above this group's apportioned cap, i.e. slots borrowed from
     /// siblings that were leaving capacity idle.
     pub borrowed: usize,
-    /// Service actually received by the group's tenants, excluding the
-    /// virtual time each tenant was placed at; the scheduler ranks groups by
+    /// Service actually received by the group's tenants, excluding where
+    /// each tenant was placed on joining; the scheduler ranks groups by
     /// this over weight. Not the sum of the tenant rows' `served_tokens`.
     pub served_tokens: f64,
     pub share_score: f64,
@@ -1012,9 +1012,9 @@ struct Pool {
     tenant_cap: HashMap<Uuid, usize>,
     queues: HashMap<Uuid, TenantQueue>,
     served: HashMap<Uuid, f64>,
-    /// The part of each tenant's `served` that is virtual time it was placed
-    /// at (on joining, or when snapped forward after going quiet) rather than
-    /// service it received. `served - served_base` is its actual service.
+    /// The part of each tenant's `served` that is placement (on joining, or
+    /// when raised after going quiet) rather than service it received.
+    /// `served - served_base` is its actual service.
     served_base: HashMap<Uuid, f64>,
     key_in_flight: HashMap<Uuid, usize>,
     key_served: HashMap<Uuid, f64>,
@@ -1024,12 +1024,16 @@ struct Pool {
     key_tenant: HashMap<Uuid, Uuid>,
     /// Which end user a derived key stands for (dashboards only).
     key_end_user: HashMap<Uuid, EndUser>,
+    /// The pool's virtual time among tenants, in `served / weight` (a
+    /// tenant's standing, which is what tenants are ranked on): the lowest
+    /// standing among tenants with requests queued. A tenant that starts
+    /// queueing is placed no lower than it. See [`Pool::join_tenant`].
     virtual_time: f64,
     /// Per tenant, the virtual time of its keys, in `key_served / key_weight`
     /// (a key's standing). A key that comes back with nothing queued is
     /// raised to it, so it rejoins level with the keys it now competes with.
-    /// The pool's `virtual_time` is the wrong place for that: it is a tenant
-    /// total, the service of every key in the tenant together. See
+    /// The pool's `virtual_time` is the wrong place for that: it measures
+    /// tenants, the service of every key in a tenant together. See
     /// [`Pool::advance_key_clock`].
     key_clock: HashMap<Uuid, f64>,
     /// Per tenant, its keys with nothing queued or running that are kept
@@ -1197,6 +1201,7 @@ impl Pool {
         if queue.is_empty() {
             self.queues.remove(&from);
         }
+        self.join_tenant(to);
         for mut waiter in waiters {
             self.retarget_waiter(&mut waiter, to);
             self.queues.entry(to).or_default().reinsert(key, waiter);
@@ -1450,10 +1455,10 @@ impl Pool {
     /// for a new slot; a held slot taken by its session is billed alone,
     /// since it was never given back.
     fn charge(&mut self, tenant: Uuid, key: Uuid, cost: u32) {
-        let vt = self.virtual_time;
+        let start = self.tenant_start(&tenant);
         *self.served.entry(tenant).or_insert_with(|| {
-            self.served_base.insert(tenant, vt);
-            vt
+            self.served_base.insert(tenant, start);
+            start
         }) += cost as f64;
         let owner = self.key_owner(&key, tenant);
         let start = self.key_start(owner, key);
@@ -1626,26 +1631,7 @@ impl Pool {
         enqueued: Instant,
         fast: bool,
     ) {
-        let tenant_queue_empty = self
-            .queues
-            .get(&req.tenant)
-            .is_none_or(TenantQueue::is_empty);
-        if tenant_queue_empty {
-            let vt = self.virtual_time;
-            match self.served.get_mut(&req.tenant) {
-                None => {
-                    self.served.insert(req.tenant, vt);
-                    self.served_base.insert(req.tenant, vt);
-                }
-                Some(served) if *served < vt => {
-                    // The snap forward is placement, not service: move the
-                    // base with it so group scores count only real service.
-                    *self.served_base.entry(req.tenant).or_insert(0.0) += vt - *served;
-                    *served = vt;
-                }
-                Some(_) => {}
-            }
-        }
+        self.join_tenant(req.tenant);
         let key_queue_empty = self
             .queues
             .get(&req.tenant)
@@ -1836,6 +1822,7 @@ impl Pool {
         let owner = self.key_owner(&key, tenant);
         if owner != tenant {
             self.retarget_waiter(&mut waiter, owner);
+            self.join_tenant(owner);
         }
         self.queues.entry(owner).or_default().reinsert(key, waiter);
         self.queued_total += 1;
@@ -1986,7 +1973,7 @@ impl Pool {
     }
 
     /// Actual service per group: the sum over its tenants of `served` minus
-    /// the virtual time each was placed at. Summing raw `served` would count
+    /// the placement each started from. Summing raw `served` would count
     /// that placement once per tenant, so a group with many tenants would
     /// look over-served and lose every tie-break.
     fn group_service(&self) -> HashMap<&str, f64> {
@@ -2029,10 +2016,52 @@ impl Pool {
             .queues
             .iter()
             .filter(|(_, q)| !q.is_empty())
-            .filter_map(|(t, _)| self.served.get(t).copied())
+            .filter_map(|(t, _)| self.tenant_standing(t))
             .fold(f64::INFINITY, f64::min);
         if min_active.is_finite() {
             self.virtual_time = min_active;
+        }
+    }
+
+    fn tenant_weight_of(&self, tenant: &Uuid) -> f64 {
+        self.tenant_weight.get(tenant).copied().unwrap_or(1).max(1) as f64
+    }
+
+    /// A tenant's service per unit of weight, the value tenants are ranked
+    /// on; `None` for a tenant the pool does not track.
+    fn tenant_standing(&self, tenant: &Uuid) -> Option<f64> {
+        self.served
+            .get(tenant)
+            .map(|served| served / self.tenant_weight_of(tenant))
+    }
+
+    /// Where `tenant` starts: the pool's virtual time, at its weight.
+    fn tenant_start(&self, tenant: &Uuid) -> f64 {
+        self.virtual_time * self.tenant_weight_of(tenant)
+    }
+
+    /// Place `tenant` as it starts queueing with nothing queued: a new
+    /// tenant starts at the pool's virtual time, and one below it, from
+    /// going quiet, is raised to it, so it carries no credit for time it
+    /// was away. Called before a request goes into the tenant's queue,
+    /// whether it arrives there or moves there with its key.
+    fn join_tenant(&mut self, tenant: Uuid) {
+        if self.queues.get(&tenant).is_some_and(|q| !q.is_empty()) {
+            return;
+        }
+        let start = self.tenant_start(&tenant);
+        match self.served.get_mut(&tenant) {
+            None => {
+                self.served.insert(tenant, start);
+                self.served_base.insert(tenant, start);
+            }
+            Some(served) if *served < start => {
+                // The raise is placement, not service: move the base with it
+                // so group scores count only real service.
+                *self.served_base.entry(tenant).or_insert(0.0) += start - *served;
+                *served = start;
+            }
+            Some(_) => {}
         }
     }
 
@@ -2116,11 +2145,14 @@ impl Pool {
     }
 
     /// Session affinity: a request of `key` that arrived at `arrived` was
-    /// served, passing every request of the key queued before it.
+    /// served, passing every request of the key queued before it. They are
+    /// queued under the key's owner, which may not be the `tenant` whose
+    /// slot served it.
     fn pass_earlier(&mut self, tenant: Uuid, key: Uuid, arrived: Instant) {
         if !self.affinity.on() {
             return;
         }
+        let tenant = self.key_owner(&key, tenant);
         let Some(deque) = self
             .queues
             .get_mut(&tenant)
@@ -2138,7 +2170,7 @@ impl Pool {
     /// may pass it: no slot is held for the key, nor a held one taken.
     fn key_passed_out(&self, tenant: Uuid, key: Uuid) -> bool {
         self.queues
-            .get(&tenant)
+            .get(&self.key_owner(&key, tenant))
             .and_then(|q| q.keys.get(&key))
             .is_some_and(|d| {
                 d.iter()
@@ -2188,7 +2220,9 @@ impl Pool {
     }
 
     /// Hand held slots to queued requests of their sessions. Each keeps the
-    /// slot it was held in and is billed its cost. Returns how many were
+    /// slot it was held in, and its tenant, and is billed its cost there.
+    /// The requests are looked for under the key's owner, where a key that
+    /// moved since the slot was held is queued. Returns how many were
     /// granted and how many waiters whose caller had gone were dropped.
     fn redeem_queued(&mut self) -> (usize, usize) {
         let (mut granted, mut dropped) = (0, 0);
@@ -2201,9 +2235,10 @@ impl Pool {
             if self.key_passed_out(tenant, key) {
                 continue;
             }
+            let queued = self.key_owner(&key, tenant);
             let find = |pool: &Pool| {
                 pool.queues
-                    .get(&tenant)
+                    .get(&queued)
                     .and_then(|q| q.keys.get(&key))
                     .and_then(|d| {
                         d.iter()
@@ -2211,10 +2246,10 @@ impl Pool {
                     })
             };
             while let Some(at) = find(self) {
-                let queue = self.queues.get_mut(&tenant).expect("waiter just found");
+                let queue = self.queues.get_mut(&queued).expect("waiter just found");
                 let waiter = queue.pop_at(&key, at).expect("waiter just found");
                 if queue.is_empty() {
-                    self.queues.remove(&tenant);
+                    self.queues.remove(&queued);
                 }
                 self.queued_total -= 1;
                 if waiter.respond.is_closed() {
@@ -2226,7 +2261,7 @@ impl Pool {
                     .redeem(Some(&session))
                     .expect("hold just listed");
                 let jumped = at > 0 || self.oldest_eligible().is_some_and(|t| t < waiter.enqueued);
-                self.track_waiter_meta(tenant, key, &waiter);
+                self.track_waiter_meta(queued, key, &waiter);
                 self.charge(tenant, key, waiter.cost);
                 self.advance_virtual_time();
                 let waited = waiter.enqueued.elapsed();
@@ -2257,7 +2292,7 @@ impl Pool {
         let tenant_queued = self.queues.get(&tenant).map(|q| q.len).unwrap_or(0);
         if tenant_queued == 0
             && !self.tenant_in_flight.contains_key(&tenant)
-            && self.served.get(&tenant).copied().unwrap_or(0.0) <= self.virtual_time
+            && self.tenant_standing(&tenant).unwrap_or(0.0) <= self.virtual_time
         {
             self.forget_tenant(&tenant);
         }
@@ -4685,5 +4720,190 @@ mod tests {
         assert_eq!(passed(&pool), 0);
         grant(&mut pool, true);
         assert_eq!(passed(&pool), 1);
+    }
+
+    /// A tenant that starts queueing again is placed at the pool's virtual
+    /// time at its own weight, the scale tenants are ranked on. With a
+    /// weight-300 tenant always backlogged, a weight-100 tenant sending one
+    /// request at a time gets about one grant in four, not one each time the
+    /// busy tenant's service has tripled.
+    #[test]
+    fn rejoining_tenant_is_placed_at_its_weight() {
+        let mut sim = Sim::new(1);
+        let (heavy, light) = (Uuid::new_v4(), Uuid::new_v4());
+        let req = |tenant: Uuid, weight: i64| {
+            AdmitRequest::new(tenant, "m", 100)
+                .weight(weight)
+                .key(tenant, 100)
+        };
+        for _ in 0..3_000 {
+            sim.queue_req(req(heavy, 300));
+        }
+        sim.queue_req(req(light, 100));
+        let mut light_grants = 0;
+        for _ in 0..2_000 {
+            let light_queued = sim.pool.queues.get(&light).is_some_and(|q| !q.is_empty());
+            if sim.grant() == light {
+                light_grants += 1;
+            }
+            if !light_queued && !sim.is_running(light) {
+                sim.queue_req(req(light, 100));
+            }
+        }
+        assert!(
+            light_grants >= 400,
+            "the weight-100 tenant had {light_grants} of 2,000 grants"
+        );
+    }
+
+    /// A key moved into a tenant that has been quiet brings its queued
+    /// requests in at the pool's virtual time, as a request arriving there
+    /// would, so the tenant does not take every grant until its old service
+    /// catches up.
+    #[test]
+    fn moved_key_into_a_quiet_tenant_starts_at_virtual_time() {
+        let mut sim = Sim::new(1);
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let (moved, other) = (Uuid::new_v4(), Uuid::new_v4());
+        sim.queue(b, b, 8_000);
+        sim.grant();
+        for _ in 0..1_500 {
+            sim.queue(a, moved, 100);
+            sim.queue(c, other, 100);
+        }
+        for _ in 0..600 {
+            sim.grant();
+        }
+        assert!(
+            sim.pool.served.contains_key(&b),
+            "b is kept above the clock"
+        );
+        sim.queue(b, moved, 100);
+        let (mut run, mut longest) = (0, 0);
+        for _ in 0..400 {
+            if sim.grant() == other {
+                run = 0;
+            } else {
+                run += 1;
+                longest = longest.max(run);
+            }
+        }
+        assert!(longest <= 3, "c waited {longest} grants in a row");
+    }
+
+    /// Shared mode: a refused claim that goes back in line under the tenant
+    /// its key moved to places that tenant as an arrival there would.
+    #[test]
+    fn refused_claim_moved_into_a_quiet_tenant_starts_at_virtual_time() {
+        let mut sim = Sim::new(2);
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let (moved, other) = (Uuid::new_v4(), Uuid::new_v4());
+        sim.queue(b, b, 8_000);
+        sim.grant();
+        for _ in 0..600 {
+            sim.queue(a, moved, 100);
+            sim.queue(c, other, 100);
+        }
+        for _ in 0..500 {
+            sim.grant();
+        }
+        while let Some((t, k)) = sim.running.pop_front() {
+            sim.pool.release(t, k);
+        }
+        let claim = loop {
+            let (next, _) = sim.pool.take_next(sim.pool.cap);
+            let (tenant, key, waiter) = next.expect("a request can be taken");
+            if key == moved {
+                break PendingClaim {
+                    tenant,
+                    key,
+                    waiter,
+                };
+            }
+            sim.pool.release(tenant, key);
+        };
+        // The key's queued requests drain, then it moves to b with a request
+        // that is granted straight away, so nothing is queued under b.
+        if let Some(q) = sim.pool.queues.get_mut(&a) {
+            if let Some(d) = q.keys.remove(&moved) {
+                q.len -= d.len();
+                sim.pool.queued_total -= d.len();
+            }
+        }
+        sim.pool
+            .track_meta(&AdmitRequest::new(b, "m", 100).key(moved, 100));
+        assert!(!sim.pool.queues.get(&b).is_some_and(|q| !q.is_empty()));
+        sim.pool.requeue(claim);
+        let standing = |t: Uuid| sim.pool.served[&t] / sim.pool.tenant_weight[&t] as f64;
+        assert!(
+            standing(b) >= standing(c) - 1.0,
+            "b went back in line at {}, below c at {}",
+            standing(b),
+            standing(c)
+        );
+    }
+
+    fn affinity_pool(max_jumps: u32) -> Pool {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut pool = Pool::new(
+            PoolKey::Model("m".into()),
+            FairshareAlgorithm::Weighted,
+            8,
+            tx,
+        );
+        pool.affinity.configure(
+            Some(SessionAffinityConfig {
+                warm_ttl: Duration::from_secs(120),
+                hold: Duration::from_secs(3),
+                max_jumps,
+                max_bypass: Duration::from_secs(30),
+                max_held_percent: 25,
+            }),
+            Arc::default(),
+        );
+        pool
+    }
+
+    /// Session affinity finds a moved key's queued requests under its new
+    /// tenant: steps served in a slot of the old tenant still count as
+    /// passing them, so the pass limit still holds.
+    #[test]
+    fn pass_limit_counts_a_moved_keys_queued_requests() {
+        let mut pool = affinity_pool(2);
+        let (a, b, key) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let cold = AdmitRequest::new(a, "m", 10).key(key, 100);
+        pool.track_meta(&cold);
+        let (respond, _cold) = oneshot::channel();
+        pool.enqueue(cold, respond, Instant::now(), false);
+        pool.track_meta(&AdmitRequest::new(b, "m", 10).key(key, 100));
+        assert_eq!(pool.queues[&b].key_len(&key), 1);
+        for _ in 0..2 {
+            let (respond, _admitted) = oneshot::channel();
+            let grant = Grant::new(a, key, Some("loop".into()), true);
+            pool.send(grant, respond, Admission::Fast, Duration::ZERO);
+        }
+        assert_eq!(pool.queues[&b].keys[&key].front().unwrap().passed, 2);
+        assert!(pool.key_passed_out(a, key));
+    }
+
+    /// A slot held for a session under the old tenant goes to that
+    /// session's request queued under the tenant the key moved to.
+    #[test]
+    fn held_slot_reaches_its_sessions_request_after_a_move() {
+        let mut pool = affinity_pool(8);
+        let (a, b, key) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let session = affinity::scoped(key, "loop");
+        pool.track_meta(&AdmitRequest::new(a, "m", 10).key(key, 100));
+        pool.occupy(a, key, 10);
+        pool.affinity.hold(&session, a, key, Instant::now());
+        let mut step = AdmitRequest::new(a, "m", 10).key(key, 100);
+        step.session = Some(session.clone());
+        pool.track_meta(&step);
+        let (respond, mut admitted) = oneshot::channel();
+        pool.enqueue(step, respond, Instant::now(), false);
+        pool.track_meta(&AdmitRequest::new(b, "m", 10).key(key, 100));
+        assert_eq!(pool.redeem_queued(), (1, 0));
+        assert!(admitted.try_recv().is_ok());
+        assert_eq!(pool.affinity.held(), 0);
     }
 }
