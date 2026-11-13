@@ -8,6 +8,7 @@ import { admin, genericOAuth } from "better-auth/plugins";
 import { getDb } from "@/lib/db";
 import { oidcProviders } from "@/lib/auth/providers";
 import { requireActiveAccountForAdminApi } from "@/lib/auth/admin-access";
+import { ensurePersonalTenant } from "@/lib/auth/personal";
 
 export const SELF_ADMIN_REMOVAL_ERROR = "You cannot remove admin access from your own account";
 export const LAST_ADMIN_REMOVAL_ERROR = "Cannot remove the last active admin";
@@ -158,6 +159,15 @@ export function createAuth(
     // holds the address here, including the break-glass admin.
     account: { accountLinking: { enabled: false } },
     hooks: { before: adminApiBeforeHook },
+    databaseHooks: {
+      session: {
+        create: {
+          after: async (session) => {
+            await ensurePersonalTenant(session.userId);
+          },
+        },
+      },
+    },
     user: {
       additionalFields: {
         role: { type: "string", defaultValue: "user", input: false },
