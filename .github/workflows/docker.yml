@@ -7,19 +7,20 @@ name: docker-edge
 # :dev is the moving edge and :main tracks what has been promoted for release.
 on:
   push:
-    branches: [main, dev]
+    branches: [main, dev, tenants-as-projects]
 
 permissions:
   contents: read
 
 env:
-  REGISTRY: ghcr.io/thediymaker/obleth-gateway
+  # The repository's own namespace, so a fork publishes to itself.
+  REGISTRY: ghcr.io/${{ github.repository }}
 
 jobs:
   edge:
     strategy:
       matrix:
-        component: [obleth, obleth-provisioner, control-plane, benchmark-backend, obleth-compressor]
+        component: [obleth, obleth-provisioner, control-plane, benchmark-backend]
         include:
           - component: obleth
             context: .
@@ -29,8 +30,6 @@ jobs:
             context: ./control-plane
           - component: benchmark-backend
             context: ./benchmark-backend
-          - component: obleth-compressor
-            context: .
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -53,7 +52,9 @@ jobs:
           context: ${{ matrix.context }}
           file: deploy/docker/${{ matrix.component }}.Dockerfile
           push: true
-          tags: ${{ env.REGISTRY }}/${{ matrix.component }}:${{ github.ref_name }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ matrix.component }}:${{ github.ref_name }}
+            ${{ env.REGISTRY }}/${{ matrix.component }}:${{ github.sha }}
           build-args: |
             GIT_SHA=${{ github.sha }}
             BUILD_TIMESTAMP=${{ steps.meta.outputs.built_at }}
