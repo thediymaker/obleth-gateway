@@ -1915,15 +1915,22 @@ impl Pool {
                 }
             }
         }
+        // The waiter still carries the weights it was charged at; a weight
+        // changed since rescaled what it was charged, so the refund is
+        // rescaled the same way.
+        let tenant_refund =
+            waiter.cost as f64 * self.tenant_weight_of(&tenant) / waiter.weight.max(1) as f64;
         if let Some(served) = self.served.get_mut(&tenant) {
-            *served -= waiter.cost as f64;
+            *served -= tenant_refund;
         }
         if waiter
             .charged_moves
             .is_none_or(|m| m == self.key_moves_of(&key))
         {
+            let key_refund =
+                waiter.cost as f64 * self.key_weight_of(&key) / waiter.key_weight.max(1) as f64;
             if let Some(served) = self.key_served.get_mut(&key) {
-                *served -= waiter.cost as f64;
+                *served -= key_refund;
             }
         }
         waiter.charged_moves = None;
@@ -5301,6 +5308,45 @@ mod tests {
             standing(moved),
             standing(stays)
         );
+    }
+
+    /// Shared mode: a claim refused after its tenant's or key's weight
+    /// changed is refunded at the new weight's scale, so the standing goes
+    /// back to where it was before the claim was taken.
+    #[test]
+    fn refused_claim_after_a_weight_change_restores_the_standing() {
+        for (from, to) in [(10, 1_000), (1_000, 10)] {
+            let mut sim = Sim::new(2);
+            let (tenant, key) = (Uuid::new_v4(), Uuid::new_v4());
+            let at = |w: i64| AdmitRequest::new(tenant, "m", 100).weight(w).key(key, w);
+            sim.queue_req(at(from));
+            sim.grant();
+            let (t, k) = sim.running.pop_front().unwrap();
+            sim.pool.release(t, k);
+            sim.queue_req(at(from));
+            sim.queue_req(at(from));
+            sim.grant();
+            let before = (
+                sim.pool.tenant_standing(&tenant).unwrap(),
+                sim.pool.key_standing(&key),
+            );
+            let (next, _) = sim.pool.take_next(sim.pool.cap);
+            let (t, k, waiter) = next.expect("a request can be taken");
+            sim.queue_req(at(to));
+            sim.pool.requeue(PendingClaim {
+                tenant: t,
+                key: k,
+                waiter,
+            });
+            let after = (
+                sim.pool.tenant_standing(&tenant).unwrap(),
+                sim.pool.key_standing(&key),
+            );
+            assert!(
+                (after.0 - before.0).abs() < 1e-9 && (after.1 - before.1).abs() < 1e-9,
+                "weight {from} to {to}: standing {before:?} before the claim, {after:?} after its refund"
+            );
+        }
     }
 
     /// A tenant's new weight reaches the requests it already has queued or
