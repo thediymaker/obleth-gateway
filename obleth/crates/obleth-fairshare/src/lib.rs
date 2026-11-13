@@ -882,6 +882,10 @@ struct Waiter {
     /// slot was charged. A refused claim undoes the key's charge only if the
     /// key has not moved since, because a move starts its standing again.
     charged_moves: Option<u64>,
+    /// Shared mode: its tenant's rebase count (`Pool::tenant_rebases`) when
+    /// its local slot was charged. A rebase starts the tenant's standing
+    /// again, so a refused claim then undoes only the service it was billed.
+    charged_rebases: Option<u64>,
     respond: oneshot::Sender<Admitted>,
 }
 
@@ -1046,6 +1050,9 @@ struct Pool {
     key_idle: HashMap<Uuid, HashSet<Uuid>>,
     /// How many times each tracked key has moved to another tenant.
     key_moves: HashMap<Uuid, u64>,
+    /// How many times each tracked tenant has been rebased to another
+    /// group's clock.
+    tenant_rebases: HashMap<Uuid, u64>,
     /// When the pool last became idle (no permits, no waiters); `None` while
     /// it is in use.
     idle_since: Option<Instant>,
@@ -1107,6 +1114,7 @@ impl Pool {
             key_clock: HashMap::new(),
             key_idle: HashMap::new(),
             key_moves: HashMap::new(),
+            tenant_rebases: HashMap::new(),
             idle_since: None,
             pending: HashMap::new(),
             probing: false,
@@ -1270,7 +1278,12 @@ impl Pool {
             // Placement, not service: the base moves with it.
             *self.served_base.entry(tenant).or_insert(0.0) += start - *served;
             *served = start;
+            *self.tenant_rebases.entry(tenant).or_insert(0) += 1;
         }
+    }
+
+    fn tenant_rebases_of(&self, tenant: &Uuid) -> u64 {
+        self.tenant_rebases.get(tenant).copied().unwrap_or(0)
     }
 
     /// A key moved from `from` to `to`: its requests still queued under
@@ -1778,6 +1791,7 @@ impl Pool {
                 enqueued,
                 fast,
                 charged_moves: None,
+                charged_rebases: None,
                 respond,
             },
         );
@@ -1838,6 +1852,7 @@ impl Pool {
             self.track_waiter_meta(tenant, key, &waiter);
             self.occupy(tenant, key, waiter.cost);
             waiter.charged_moves = Some(self.key_moves_of(&key));
+            waiter.charged_rebases = Some(self.tenant_rebases_of(&tenant));
             return (Some((tenant, key, waiter)), dropped);
         }
     }
@@ -1917,11 +1932,23 @@ impl Pool {
         }
         // The waiter still carries the weights it was charged at; a weight
         // changed since rescaled what it was charged, so the refund is
-        // rescaled the same way.
-        let tenant_refund =
-            waiter.cost as f64 * self.tenant_weight_of(&tenant) / waiter.weight.max(1) as f64;
+        // rescaled the same way. The rescaled part is placement, as in
+        // `set_tenant_weight`, so the base moves by it and the tenant's
+        // actual service drops by the cost it was billed. A tenant rebased to
+        // another group since has had the charge replaced by its placement
+        // there, so only its actual service is undone.
+        let cost = waiter.cost as f64;
+        let rebased = waiter
+            .charged_rebases
+            .is_some_and(|r| r != self.tenant_rebases_of(&tenant));
+        let tenant_refund = if rebased {
+            0.0
+        } else {
+            cost * self.tenant_weight_of(&tenant) / waiter.weight.max(1) as f64
+        };
         if let Some(served) = self.served.get_mut(&tenant) {
             *served -= tenant_refund;
+            *self.served_base.entry(tenant).or_insert(0.0) -= tenant_refund - cost;
         }
         if waiter
             .charged_moves
@@ -1934,6 +1961,7 @@ impl Pool {
             }
         }
         waiter.charged_moves = None;
+        waiter.charged_rebases = None;
         waiter.fast = false;
         waiter.jumped = false;
         // A key that moved while its claim was out goes back in line under
@@ -2316,6 +2344,7 @@ impl Pool {
         self.track_waiter_meta(tenant, key, &waiter);
         self.occupy(tenant, key, waiter.cost);
         waiter.charged_moves = Some(self.key_moves_of(&key));
+        waiter.charged_rebases = Some(self.tenant_rebases_of(&tenant));
         Some((tenant, key, waiter))
     }
 
@@ -2549,6 +2578,7 @@ impl Pool {
         }
         self.served.remove(tenant);
         self.served_base.remove(tenant);
+        self.tenant_rebases.remove(tenant);
         self.tenant_weight.remove(tenant);
         self.tenant_group.remove(tenant);
         self.tenant_cap.remove(tenant);
@@ -2591,6 +2621,7 @@ impl Pool {
         self.key_clock.clear();
         self.key_idle.clear();
         self.key_moves.clear();
+        self.tenant_rebases.clear();
     }
 
     /// Per-group in-flight/queued totals, for the history sampler. Cheaper
@@ -5326,6 +5357,8 @@ mod tests {
             sim.queue_req(at(from));
             sim.queue_req(at(from));
             sim.grant();
+            let actual = |pool: &Pool| pool.served[&tenant] - pool.served_base[&tenant];
+            let actual_before = actual(&sim.pool);
             let before = (
                 sim.pool.tenant_standing(&tenant).unwrap(),
                 sim.pool.key_standing(&key),
@@ -5346,7 +5379,60 @@ mod tests {
                 (after.0 - before.0).abs() < 1e-9 && (after.1 - before.1).abs() < 1e-9,
                 "weight {from} to {to}: standing {before:?} before the claim, {after:?} after its refund"
             );
+            let actual_after = actual(&sim.pool);
+            assert!(
+                (actual_after - actual_before).abs() < 1e-9,
+                "weight {from} to {to}: service {actual_before} before the claim, {actual_after} after"
+            );
         }
+    }
+
+    /// Shared mode: a claim refused after its tenant moved to another group
+    /// does not take the tenant below that group's clock, where the move
+    /// placed it, and undoes only the service it was billed.
+    #[test]
+    fn refused_claim_after_a_group_move_stays_at_the_new_clock() {
+        let mut sim = Sim::with(FairshareAlgorithm::Hierarchical, 4);
+        let (moved, stays) = (Uuid::new_v4(), Uuid::new_v4());
+        let req = |tenant: Uuid, group: &str, weight: i64| {
+            AdmitRequest::new(tenant, "m", 100)
+                .weight(weight)
+                .group(group, 100)
+        };
+        for _ in 0..2_000 {
+            sim.queue_req(req(moved, "g1", 10));
+            sim.queue_req(req(stays, "g2", 100));
+        }
+        for _ in 0..1_000 {
+            sim.grant();
+        }
+        let claim = loop {
+            if sim.running.len() >= sim.pool.cap {
+                let (t, k) = sim.running.pop_front().unwrap();
+                sim.pool.release(t, k);
+            }
+            let (next, _) = sim.pool.take_next(sim.pool.cap);
+            let (tenant, key, waiter) = next.expect("a request can be taken");
+            if tenant == moved {
+                break PendingClaim {
+                    tenant,
+                    key,
+                    waiter,
+                };
+            }
+            sim.running.push_back((tenant, key));
+        };
+        let actual = |pool: &Pool| pool.served[&moved] - pool.served_base[&moved];
+        let billed = actual(&sim.pool);
+        sim.queue_req(req(moved, "g2", 10));
+        sim.pool.requeue(claim);
+        let clock = sim.pool.tenant_clock["g2"];
+        let standing = sim.pool.tenant_standing(&moved).unwrap();
+        assert!(
+            standing >= clock - 1e-9,
+            "the moved tenant went back in line at {standing}, below its group's clock {clock}"
+        );
+        assert!((actual(&sim.pool) - (billed - 100.0)).abs() < 1e-9);
     }
 
     /// A tenant's new weight reaches the requests it already has queued or
