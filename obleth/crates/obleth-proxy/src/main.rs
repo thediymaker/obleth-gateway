@@ -690,6 +690,7 @@ async fn main() -> anyhow::Result<()> {
                     >
             }
         })),
+        jwt_issuers: cfg.jwt_issuers.clone(),
     };
     obleth_admin::advice::spawn_output_stats_refresher(
         admin_state.clickhouse.clone(),
