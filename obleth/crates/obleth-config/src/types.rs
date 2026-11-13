@@ -4255,6 +4255,27 @@ pub struct RestoreReport {
     pub warnings: Vec<String>,
 }
 
+/// Settings a new tenant starts with, applied only when JIT creates the tenant.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct TenantDefaults {
+    #[serde(default)]
+    pub fairshare_group: Option<String>,
+    #[serde(default)]
+    pub weight: Option<i64>,
+    #[serde(default)]
+    pub tokens_per_minute: Option<i64>,
+    #[serde(default)]
+    pub max_in_flight: Option<i64>,
+    #[serde(default)]
+    pub budget_tokens: Option<i64>,
+    #[serde(default)]
+    pub budget_cost_usd: Option<f64>,
+    #[serde(default)]
+    pub budget_period: Option<String>,
+    #[serde(default)]
+    pub allowed_models: Option<Vec<String>>,
+}
+
 #[cfg(test)]
 mod tests {
     /// A key's network list survives the trip through a backup file, and a
@@ -4292,6 +4313,14 @@ mod tests {
         let again: super::ResolvedKey =
             serde_json::from_str(&serde_json::to_string(&key).unwrap()).unwrap();
         assert_eq!(again, key);
+    }
+
+    #[test]
+    fn tenant_defaults_default_is_empty() {
+        let d: crate::TenantDefaults = serde_json::from_str("{}").unwrap();
+        assert!(
+            d.fairshare_group.is_none() && d.budget_tokens.is_none() && d.allowed_models.is_none()
+        );
     }
 
     #[test]
