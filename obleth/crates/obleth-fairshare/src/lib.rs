@@ -1058,6 +1058,9 @@ struct Pool {
     idle_since: Option<Instant>,
     /// Shared mode: claims outstanding with the backend, by id.
     pending: HashMap<u64, PendingClaim>,
+    /// Shared mode: the tenant and key of a claim being charged, before it
+    /// goes into `pending`.
+    charging: Option<(Uuid, Uuid)>,
     /// Shared mode: a claim was refused, so send one at a time until one
     /// succeeds.
     probing: bool,
@@ -1117,6 +1120,7 @@ impl Pool {
             tenant_rebases: HashMap::new(),
             idle_since: None,
             pending: HashMap::new(),
+            charging: None,
             probing: false,
             blocked: false,
             blocked_tenants: HashSet::new(),
@@ -1411,6 +1415,15 @@ impl Pool {
         self.key_has_slot(key) && !self.blocked_keys.contains(key)
     }
 
+    /// Shared mode: the tenant and key of every claim still out with the
+    /// backend, including one being charged.
+    fn outstanding(&self) -> impl Iterator<Item = (Uuid, Uuid)> + '_ {
+        self.pending
+            .values()
+            .map(|c| (c.tenant, c.key))
+            .chain(self.charging)
+    }
+
     /// Whether `key` is held at its cap for the key clock: as
     /// [`Pool::key_open`], but not counting slots filled only by its own
     /// claims still out with the shared backend. Those may yet be refused,
@@ -1421,7 +1434,7 @@ impl Pool {
             return true;
         }
         self.key_limit(key).is_some_and(|cap| {
-            let out = self.pending.values().filter(|c| c.key == *key).count();
+            let out = self.outstanding().filter(|(_, k)| k == key).count();
             self.key_in_flight
                 .get(key)
                 .copied()
@@ -1432,18 +1445,16 @@ impl Pool {
     }
 
     /// Whether `tenant` is held for the tenant clock: at its cap or blocked,
-    /// or with every queued key held, not counting its own claims still out
-    /// with the shared backend (see [`Pool::key_held`]).
+    /// or with no waiting key that is not held, not counting its own claims
+    /// still out with the shared backend (see [`Pool::key_held`]). A key
+    /// whose last queued request is out as one of those claims still counts
+    /// as waiting.
     fn tenant_held(&self, tenant: &Uuid) -> bool {
         if self.blocked_tenants.contains(tenant) {
             return true;
         }
         let at_cap = self.tenant_limit(tenant).is_some_and(|cap| {
-            let out = self
-                .pending
-                .values()
-                .filter(|c| c.tenant == *tenant)
-                .count();
+            let out = self.outstanding().filter(|(t, _)| t == tenant).count();
             self.tenant_in_flight
                 .get(tenant)
                 .copied()
@@ -1451,12 +1462,21 @@ impl Pool {
                 .saturating_sub(out)
                 >= cap
         });
-        at_cap
-            || !self.queues.get(tenant).is_some_and(|q| {
-                q.keys
-                    .iter()
-                    .any(|(k, d)| !d.is_empty() && !self.key_held(k))
-            })
+        if at_cap {
+            return true;
+        }
+        let queued = self
+            .queues
+            .get(tenant)
+            .into_iter()
+            .flat_map(|q| q.keys.iter())
+            .filter(|(_, d)| !d.is_empty())
+            .map(|(k, _)| *k);
+        let claimed = self
+            .outstanding()
+            .filter(|(t, _)| t == tenant)
+            .map(|(_, k)| k);
+        !queued.chain(claimed).any(|k| !self.key_held(&k))
     }
 
     /// A tenant can be picked only if it is under its own cap (here and, in
@@ -1865,6 +1885,16 @@ impl Pool {
     /// slot: dequeued, occupied and charged. Waiters whose caller has gone
     /// are dropped on the way; the count comes back with the pick.
     fn take_next(&mut self, effective: usize) -> (Option<(Uuid, Uuid, Waiter)>, usize) {
+        self.take(effective, false)
+    }
+
+    /// Shared mode: [`Pool::take_next`] for a claim on the backend, which
+    /// may yet be refused.
+    fn take_claim(&mut self, effective: usize) -> (Option<(Uuid, Uuid, Waiter)>, usize) {
+        self.take(effective, true)
+    }
+
+    fn take(&mut self, effective: usize, claim: bool) -> (Option<(Uuid, Uuid, Waiter)>, usize) {
         let mut dropped = 0;
         loop {
             if self.in_flight >= effective || self.queued_total == 0 {
@@ -1898,7 +1928,9 @@ impl Pool {
                 continue;
             }
             self.track_waiter_meta(tenant, key, &waiter);
+            self.charging = claim.then_some((tenant, key));
             self.occupy(tenant, key, waiter.cost);
+            self.charging = None;
             waiter.charged_moves = Some(self.key_moves_of(&key));
             waiter.charged_rebases = Some(self.tenant_rebases_of(&tenant));
             return (Some((tenant, key, waiter)), dropped);
@@ -2390,7 +2422,9 @@ impl Pool {
         waiter.probed = true;
         waiter.jumped = oldest.is_some_and(|t| t < waiter.enqueued);
         self.track_waiter_meta(tenant, key, &waiter);
+        self.charging = Some((tenant, key));
         self.occupy(tenant, key, waiter.cost);
+        self.charging = None;
         waiter.charged_moves = Some(self.key_moves_of(&key));
         waiter.charged_rebases = Some(self.tenant_rebases_of(&tenant));
         Some((tenant, key, waiter))
@@ -3742,7 +3776,7 @@ impl Scheduler {
                 if pool.queued_total == 0 || pool.blocked || pool.pending.len() >= limit {
                     continue;
                 }
-                let (next, dropped) = pool.take_next(effective);
+                let (next, dropped) = pool.take_claim(effective);
                 if dropped > 0 {
                     pool.settle_idle();
                 }
@@ -5732,7 +5766,7 @@ mod tests {
                 }
             };
             for id in 0..4 {
-                let (next, _) = sim.pool.take_next(sim.pool.cap);
+                let (next, _) = sim.pool.take_claim(sim.pool.cap);
                 let (tenant, key, waiter) = next.expect("a request can be taken");
                 sim.pool.pending.insert(
                     id,
@@ -5753,5 +5787,108 @@ mod tests {
                 "capped {capped_key}: after the refused round {c} against {o}"
             );
         }
+    }
+
+    /// Admit `req` straight into a free slot and leave it running.
+    fn fast_running(sim: &mut Sim, req: AdmitRequest) {
+        sim.pool.track_meta(&req);
+        assert!(sim.pool.can_grant_immediately(&req, sim.pool.cap));
+        let (tenant, key) = (req.tenant, req.key);
+        let (respond, _admitted) = oneshot::channel();
+        sim.pool.grant_fast(req, respond);
+        sim.running.push_back((tenant, key));
+    }
+
+    /// Take a claim with `take_claim` and refuse it, as the scheduler does.
+    fn refuse_next_claim(sim: &mut Sim) -> (Uuid, Uuid) {
+        let (next, _) = sim.pool.take_claim(sim.pool.cap);
+        let (tenant, key, waiter) = next.expect("a request can be taken");
+        sim.pool.pending.insert(
+            0,
+            PendingClaim {
+                tenant,
+                key,
+                waiter,
+            },
+        );
+        let claim = sim.pool.pending.remove(&0).unwrap();
+        sim.pool.requeue(claim);
+        (tenant, key)
+    }
+
+    /// Shared mode: a single claim that brings its tenant or key to its cap,
+    /// refused, does not leave it raised by the clock move its own charge
+    /// made while another was ahead of it.
+    #[test]
+    fn refused_claim_does_not_raise_its_own_capped_tenant_or_key() {
+        for capped_key in [false, true] {
+            let mut sim = Sim::new(8);
+            let shared = Uuid::new_v4();
+            let (capped, other) = (Uuid::new_v4(), Uuid::new_v4());
+            let req = |id: Uuid, cost: u32| {
+                let r = if capped_key {
+                    AdmitRequest::new(shared, "m", cost).key(id, 100)
+                } else {
+                    AdmitRequest::new(id, "m", cost)
+                };
+                match (id == capped, capped_key) {
+                    (true, true) => r.key_cap(1),
+                    (true, false) => r.tenant_cap(1),
+                    _ => r,
+                }
+            };
+            fast_running(&mut sim, req(other, 100));
+            for _ in 0..3 {
+                sim.queue_req(req(capped, 10));
+                sim.queue_req(req(other, 100));
+            }
+            let standing = |pool: &Pool, id: Uuid| {
+                if capped_key {
+                    pool.key_standing(&id)
+                } else {
+                    pool.tenant_standing(&id).unwrap()
+                }
+            };
+            let before = standing(&sim.pool, capped);
+            assert!(before < standing(&sim.pool, other));
+            let (tenant, key) = refuse_next_claim(&mut sim);
+            assert_eq!(if capped_key { key } else { tenant }, capped);
+            let after = standing(&sim.pool, capped);
+            assert!(
+                (after - before).abs() < 1e-9,
+                "capped key {capped_key}: {before} before the refused claim, {after} after"
+            );
+        }
+    }
+
+    /// Shared mode: a tenant whose claim took the last queued request of its
+    /// only open key, its other key being at its cap, still counts as
+    /// waiting while the claim is out, so a refusal leaves it where it was.
+    #[test]
+    fn refused_claim_that_emptied_an_open_key_does_not_raise_its_tenant() {
+        let mut sim = Sim::new(8);
+        let (tenant, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let (capped, open) = (Uuid::new_v4(), Uuid::new_v4());
+        let at_cap = || {
+            AdmitRequest::new(tenant, "m", 10)
+                .key(capped, 100)
+                .key_cap(1)
+        };
+        fast_running(&mut sim, at_cap());
+        fast_running(&mut sim, AdmitRequest::new(other, "m", 100));
+        for _ in 0..3 {
+            sim.queue_req(at_cap());
+            sim.queue(other, other, 100);
+        }
+        sim.queue_req(AdmitRequest::new(tenant, "m", 10).key(open, 100));
+        let before = sim.pool.tenant_standing(&tenant).unwrap();
+        assert!(before < sim.pool.tenant_standing(&other).unwrap());
+        let (t, k) = refuse_next_claim(&mut sim);
+        assert_eq!((t, k), (tenant, open));
+        let after = sim.pool.tenant_standing(&tenant).unwrap();
+        assert!(
+            (after - before).abs() < 1e-9,
+            "{before} before the refused claim, {after} after"
+        );
     }
 }
