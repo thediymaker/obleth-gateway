@@ -167,7 +167,8 @@ obleth:
   # The OpenAI Files and Batches APIs (/v1/files, /v1/batches). Batch
   # requests run through the gateway at background priority: only while a
   # model has no interactive request waiting, and in at most `maxShare` of
-  # its slots, so interactive callers always find the rest free.
+  # its slots, so interactive callers always find the rest free. Keys with
+  # background priority use the same `maxShare`, even with batches off.
   batches:
     enabled: true
     maxShare: "0.75"

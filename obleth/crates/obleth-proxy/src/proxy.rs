@@ -1046,6 +1046,37 @@ pub(crate) fn serve_as(
     }
 }
 
+/// How a request is admitted as background work: the share of the model's
+/// slots it may fill and the longest it waits for one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct BackgroundAdmission {
+    pub share: f64,
+    pub wait: Duration,
+}
+
+/// Background admission for a batch item (its own share and wait) or for a
+/// routed request from a key with background priority (the batch runner's
+/// share and longest wait, from `key_share`). `None` for everything else,
+/// which is admitted as interactive work.
+pub(crate) fn background_admission(
+    route: Option<&ResolvedModel>,
+    batch: Option<&crate::batches::BatchCaller>,
+    resolved: &ResolvedKey,
+    key_share: impl FnOnce() -> f64,
+) -> Option<BackgroundAdmission> {
+    match batch {
+        Some(b) => Some(BackgroundAdmission {
+            share: b.share,
+            wait: b.admission_wait,
+        }),
+        None if resolved.background && route.is_some() => Some(BackgroundAdmission {
+            share: key_share(),
+            wait: crate::batches::MAX_ADMISSION_WAIT,
+        }),
+        None => None,
+    }
+}
+
 /// The pool a routed request is admitted to: one per model, keyed by the
 /// route's own `model_name`, so a variant queues with its parent.
 pub(crate) fn admission_pool(route: Option<&ResolvedModel>) -> obleth_fairshare::PoolKey {
@@ -2198,16 +2229,16 @@ async fn run_pipeline(
     // strings cannot each mint scheduler state.
     let admission_start = crate::tracer::now_ms();
     let pool = admission_pool(route.as_deref());
-    // A batch item waits in the model's background pool, without the
-    // interactive admission timeout.
-    let pool = match (pool, &batch) {
+    // A batch item, or a request from a background key, waits in the model's
+    // background pool, without the interactive admission timeout.
+    let background = background_admission(route.as_deref(), batch.as_ref(), &resolved, || {
+        crate::batches::background_share(state.batches.as_ref())
+    });
+    let pool = match (pool, &background) {
         (obleth_fairshare::PoolKey::Model(m), Some(_)) => obleth_fairshare::PoolKey::Background(m),
         (pool, _) => pool,
     };
-    let admit_wait = batch
-        .as_ref()
-        .map(|b| b.admission_wait)
-        .unwrap_or_else(admission_timeout);
+    let admit_wait = background.map(|b| b.wait).unwrap_or_else(admission_timeout);
     // Session affinity can only keep a conversation warm on an upstream it
     // keeps going back to.
     let mut admit_req = admit_request_for(
@@ -2218,7 +2249,9 @@ async fn run_pipeline(
         est.total(),
         end_user.as_deref(),
     );
-    if let Some(b) = &batch {
+    // Background work keeps no session slots: a slot held idle for a
+    // session's next step would hold back interactive requests.
+    if let Some(b) = &background {
         admit_req = admit_req.background_share(b.share);
     } else if route_keeps_sessions(route.as_deref()) {
         admit_req = admit_req.session(req_meta.session_id.as_str());
@@ -7593,19 +7626,19 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        admit_request_for, anthropic_error, apply_multipart_text_view,
-        backfill_max_tokens_for_count_tokens, backoff_for, build_targets, build_upstream_url,
-        canonical_path, clamp_max_tokens, compute_modality_cost, context_overflow_response,
-        conversation_seed, effective_request_type, end_user_for, forward_headers,
-        has_input_guardrails, has_path_traversal, input_guardrails_unscannable, is_chat_path,
-        is_forwarded, is_models_collection, is_models_endpoint, is_multipart_endpoint,
-        is_retryable_status, looks_like_context_length_error, messages_input_estimate,
-        multipart_text_view, output_guardrails_unenforceable, parse_multipart,
-        prepare_upstream_body, redress_error, request_type_for_path, requires_registered_model,
-        resolve_conversation, response_cache_name, route_keeps_sessions, session_hash_order,
-        should_translate_as_stream, strip_beta_query, strip_tool_strict, sure_overflow, surface,
-        tenant_active_now, weighted_order, MultipartField, RequestMeta, TooLong, END_USER_HEADER,
-        REGISTERED_MODEL_PATHS, SEED_CAP,
+        admission_pool, admit_request_for, anthropic_error, apply_multipart_text_view,
+        backfill_max_tokens_for_count_tokens, background_admission, backoff_for, build_targets,
+        build_upstream_url, canonical_path, clamp_max_tokens, compute_modality_cost,
+        context_overflow_response, conversation_seed, effective_request_type, end_user_for,
+        forward_headers, has_input_guardrails, has_path_traversal, input_guardrails_unscannable,
+        is_chat_path, is_forwarded, is_models_collection, is_models_endpoint,
+        is_multipart_endpoint, is_retryable_status, looks_like_context_length_error,
+        messages_input_estimate, multipart_text_view, output_guardrails_unenforceable,
+        parse_multipart, prepare_upstream_body, redress_error, request_type_for_path,
+        requires_registered_model, resolve_conversation, response_cache_name, route_keeps_sessions,
+        session_hash_order, should_translate_as_stream, strip_beta_query, strip_tool_strict,
+        sure_overflow, surface, tenant_active_now, weighted_order, MultipartField, RequestMeta,
+        TooLong, END_USER_HEADER, REGISTERED_MODEL_PATHS, SEED_CAP,
     };
     use crate::router::{BoonGrants, Candidate, Intent, RequestFeatures, RouterWeights};
     use axum::body::{Body, Bytes};
@@ -7669,6 +7702,7 @@ mod tests {
             key_weight: 100,
             key_max_in_flight: None,
             end_user_fairshare: false,
+            background: false,
             allowed_models: None,
             internal: false,
             tracing_enabled: false,
@@ -10397,6 +10431,119 @@ mod tests {
     }
 
     #[test]
+    fn a_background_key_is_admitted_as_background_work() {
+        let route = minimal_model("m");
+        let mut resolved = key_with_schedule("UTC", None, None, None);
+
+        // An ordinary key is interactive.
+        assert_eq!(
+            background_admission(Some(&route), None, &resolved, || 0.5),
+            None
+        );
+
+        resolved.background = true;
+        let bg = background_admission(Some(&route), None, &resolved, || 0.5)
+            .expect("a background key's routed request is background work");
+        assert_eq!(bg.share, 0.5, "the batch runner's share");
+        assert_eq!(bg.wait, crate::batches::MAX_ADMISSION_WAIT);
+        assert!(bg.wait > super::admission_timeout());
+
+        // No route: today's unrouted admission, untouched.
+        assert_eq!(background_admission(None, None, &resolved, || 0.5), None);
+        assert_eq!(admission_pool(None), obleth_fairshare::PoolKey::Unrouted);
+
+        // A batch item keeps its own share and wait.
+        let batch = crate::batches::BatchCaller {
+            resolved: std::sync::Arc::new(resolved.clone()),
+            share: 0.25,
+            admission_wait: Duration::from_secs(7),
+        };
+        let item = background_admission(Some(&route), Some(&batch), &resolved, || 0.5)
+            .expect("batch item");
+        assert_eq!(item.share, 0.25);
+        assert_eq!(item.wait, Duration::from_secs(7));
+    }
+
+    /// A background key's request, admitted the way the pipeline admits it,
+    /// fills only its share of the model and yields to interactive callers.
+    #[tokio::test]
+    async fn a_background_keys_requests_take_only_spare_capacity() {
+        use obleth_fairshare::{Admitted, FairShare, PoolKey, StaticCapacity};
+        use tokio::task::JoinHandle;
+
+        let fs = FairShare::start(
+            std::sync::Arc::new(StaticCapacity::new(1024)),
+            obleth_config::FairshareAlgorithm::default(),
+            32,
+        );
+        let mut route = minimal_model("m");
+        route.max_in_flight = Some(4);
+        let mut runner = key_with_schedule("UTC", None, None, None);
+        runner.key_id = Uuid::new_v4();
+        runner.tenant_id = Uuid::new_v4();
+        runner.background = true;
+        let mut person = key_with_schedule("UTC", None, None, None);
+        person.key_id = Uuid::new_v4();
+        person.tenant_id = Uuid::new_v4();
+
+        // What the pipeline does: the pool, then the share on the request.
+        let plan = |key: &ResolvedKey| {
+            let bg = background_admission(Some(&route), None, key, || 0.75);
+            let pool = match (admission_pool(Some(&route)), &bg) {
+                (PoolKey::Model(m), Some(_)) => PoolKey::Background(m),
+                (pool, _) => pool,
+            };
+            let mut req = admit_request_for(key, "m", Some(&route), 100, 1, None);
+            if let Some(b) = bg {
+                req = req.background_share(b.share);
+            }
+            (pool, req)
+        };
+        let admit = |key: &ResolvedKey| -> JoinHandle<Option<Admitted>> {
+            let (pool, req) = plan(key);
+            let fs = fs.clone();
+            tokio::spawn(async move { fs.admit_to(pool, req).await })
+        };
+        async fn still_waiting(h: &JoinHandle<Option<Admitted>>, why: &str) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!h.is_finished(), "{why}");
+        }
+        async fn granted(h: JoinHandle<Option<Admitted>>) -> Admitted {
+            tokio::time::timeout(Duration::from_secs(2), h)
+                .await
+                .expect("admitted in time")
+                .expect("task ran")
+                .expect("scheduler alive")
+        }
+
+        assert_eq!(plan(&runner).0, PoolKey::Background("m".into()));
+        assert_eq!(plan(&person).0, PoolKey::Model("m".into()));
+
+        // The share: 3 of the model's 4 slots, and no more.
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            held.push(granted(admit(&runner)).await);
+        }
+        let fourth = admit(&runner);
+        still_waiting(&fourth, "past the background share").await;
+
+        // The slot left over is the person's, at once.
+        let first_person = granted(admit(&person)).await;
+        // The model is full; a second person waits, and the runner's
+        // waiting request does not go ahead of them when a slot frees.
+        let second_person = admit(&person);
+        still_waiting(&second_person, "past the model's slots").await;
+        held.pop();
+        let second_person = granted(second_person).await;
+        still_waiting(&fourth, "background went ahead of a person").await;
+
+        // People leave: the runner gets its slot back.
+        drop((first_person, second_person));
+        granted(fourth).await;
+        drop(held);
+    }
+
+    #[test]
     fn end_user_is_read_only_for_keys_that_turned_it_on() {
         let mut resolved = key_with_schedule("UTC", None, None, None);
         let mut headers = HeaderMap::new();
@@ -10695,6 +10842,28 @@ mod lifecycle_tests {
         assert!(h[check..ret].contains("finalize("));
         assert!(h[check..ret].contains("Admission::Rejected"));
         assert!(h[check..ret].contains("StatusCode::BAD_REQUEST.as_u16()"));
+    }
+
+    #[test]
+    fn background_work_is_admitted_in_the_background_pool_without_sessions() {
+        let h = squash(handler());
+        let plan = h
+            .find("letbackground=background_admission(route.as_deref(),batch.as_ref(),&resolved,")
+            .expect("background admission is decided");
+        let pool = h
+            .find("(obleth_fairshare::PoolKey::Model(m),Some(_))=>obleth_fairshare::PoolKey::Background(m)")
+            .expect("background work goes to the background pool");
+        let wait = h
+            .find("letadmit_wait=background.map(|b|b.wait).unwrap_or_else(admission_timeout);")
+            .expect("background work waits longer");
+        let share = h
+            .find("ifletSome(b)=&background{admit_req=admit_req.background_share(b.share);}elseifroute_keeps_sessions(")
+            .expect("background work keeps no session");
+        let admit = h
+            .find("state.fairshare.admit_to(pool,admit_req)")
+            .expect("admission");
+        assert!(plan < pool && pool < wait && wait < share && share < admit);
+        assert!(h.contains("crate::batches::background_share(state.batches.as_ref())"));
     }
 
     #[test]

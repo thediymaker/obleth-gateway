@@ -97,6 +97,8 @@ export interface ApiKey {
   tracing_enabled: boolean;
   /** Each end user the key names queues on their own (trusted callers only). */
   end_user_fairshare: boolean;
+  /** Background priority: the key's requests take only spare capacity (operators only). */
+  background: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -2570,6 +2572,12 @@ export const obleth = {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ end_user_fairshare }),
+    }),
+  setKeyBackground: (id: string, background: boolean, options?: AuditOptions) =>
+    api<void>(`/keys/${seg(id)}/background`, {
+      method: "PUT",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify({ background }),
     }),
   setTenantTracing: (
     id: string,

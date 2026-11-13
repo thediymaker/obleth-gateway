@@ -210,6 +210,10 @@ pub fn router(state: AdminState) -> Router {
             "/api/v1/keys/:id/end-user-fairshare",
             put(set_key_end_user_fairshare_handler),
         )
+        .route(
+            "/api/v1/keys/:id/background",
+            put(set_key_background_handler),
+        )
         .route("/api/v1/keys/:id/usage", get(get_key_usage))
         .route("/api/v1/usage", get(get_usage))
         .route("/api/v1/usage/keys", get(get_usage_keys))
@@ -709,6 +713,14 @@ pub struct SetKeyEndUserFairshare {
     /// body's `user`) queues on their own. Only for a trusted caller: see
     /// `ApiKey::end_user_fairshare`.
     pub end_user_fairshare: bool,
+}
+
+/// Body of `PUT /api/v1/keys/{id}/background`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetKeyBackground {
+    /// Whether the key's requests run in each model's background pool, taking
+    /// only spare capacity. See `ApiKey::background`.
+    pub background: bool,
 }
 
 fn normalize_budget_fields(
@@ -5166,6 +5178,41 @@ async fn set_key_end_user_fairshare_handler(
             "api_key",
             &id.to_string(),
             serde_json::json!({ "end_user_fairshare": body.end_user_fairshare }),
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Turn background priority on or off for one key. Its own route, like
+/// per-end-user fairshare, because `PUT /api/v1/keys/{id}` resets any field
+/// it is not sent, and a bulk budget edit must never switch this off by
+/// leaving it out.
+#[utoipa::path(
+    put, path = "/api/v1/keys/{id}/background", tag = "keys",
+    params(("id" = Uuid, Path, description = "API key id")),
+    request_body = SetKeyBackground,
+    responses((status = 204), (status = 404))
+)]
+async fn set_key_background_handler(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<SetKeyBackground>,
+) -> Result<StatusCode> {
+    let (hash, resolved) = state.store.set_key_background(id, body.background).await?;
+    push_key(&state, &hash, &resolved).await?;
+    state
+        .store
+        .record_audit(
+            &audit_actor(&headers),
+            if body.background {
+                "enable_key_background"
+            } else {
+                "disable_key_background"
+            },
+            "api_key",
+            &id.to_string(),
+            serde_json::json!({ "background": body.background }),
         )
         .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -11920,6 +11967,144 @@ mod tests {
         assert_eq!(listed_off, Some(false));
     }
 
+    /// Background priority is operator-only, has its own route, and a
+    /// whole-key PUT that does not mention it leaves it alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn background_has_its_own_route_and_survives_a_key_put() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let tenant = t
+            .store
+            .create_tenant(&format!("t-{}", Uuid::new_v4()), 100, 1000, None, None)
+            .await
+            .expect("create tenant");
+        let request = |method: &str, path: String, body: serde_json::Value| {
+            axum::http::Request::builder()
+                .method(method)
+                .uri(path)
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+                .body(axum::body::Body::from(body.to_string()))
+                .expect("build request")
+        };
+
+        let (_, created) = send(
+            &t.app,
+            request(
+                "POST",
+                format!("/api/v1/tenants/{}/keys", tenant.id),
+                serde_json::json!({ "name": "runner" }),
+            ),
+        )
+        .await;
+        let id = created["key"]["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let flag = |on: bool| {
+            request(
+                "PUT",
+                format!("/api/v1/keys/{id}/background"),
+                serde_json::json!({ "background": on }),
+            )
+        };
+        let (anon_status, _) = send(
+            &t.app,
+            axum::http::Request::builder()
+                .method("PUT")
+                .uri(format!("/api/v1/keys/{id}/background"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({ "background": true }).to_string(),
+                ))
+                .expect("build request"),
+        )
+        .await;
+        let after_anon = t
+            .store
+            .keys_by_ids(&[id.parse().expect("key id")])
+            .await
+            .expect("keys by id")
+            .first()
+            .map(|k| k.background);
+        let (on_status, _) = send(&t.app, flag(true)).await;
+        let (_, after_put) = send(
+            &t.app,
+            request(
+                "PUT",
+                format!("/api/v1/keys/{id}"),
+                serde_json::json!({ "name": "runner", "weight": 300 }),
+            ),
+        )
+        .await;
+        let resolved_on = t
+            .store
+            .all_resolved_keys()
+            .await
+            .expect("resolved keys")
+            .into_iter()
+            .find(|(_, k)| k.key_id.to_string() == id)
+            .map(|(_, k)| k.background);
+        let (_, listed) = send(
+            &t.app,
+            request("GET", "/api/v1/keys".to_string(), serde_json::Value::Null),
+        )
+        .await;
+        let listed_on = listed
+            .as_array()
+            .and_then(|keys| keys.iter().find(|k| k["id"] == serde_json::json!(id)))
+            .map(|k| k["background"].clone());
+        let (off_status, _) = send(&t.app, flag(false)).await;
+        let listed_off = t
+            .store
+            .keys_by_ids(&[id.parse().expect("key id")])
+            .await
+            .expect("keys by id")
+            .first()
+            .map(|k| k.background);
+        let (missing_status, _) = send(
+            &t.app,
+            request(
+                "PUT",
+                format!("/api/v1/keys/{}/background", Uuid::new_v4()),
+                serde_json::json!({ "background": true }),
+            ),
+        )
+        .await;
+
+        let _ = t.store.delete_tenant(tenant.id).await;
+
+        assert_eq!(
+            created["key"]["background"],
+            serde_json::json!(false),
+            "off by default"
+        );
+        assert_eq!(anon_status, StatusCode::UNAUTHORIZED, "operator-only");
+        assert_eq!(after_anon, Some(false), "a refused call changes nothing");
+        assert_eq!(on_status, StatusCode::NO_CONTENT);
+        assert_eq!(after_put["weight"], serde_json::json!(300));
+        assert_eq!(
+            after_put["background"],
+            serde_json::json!(true),
+            "a whole-key PUT without the field must not turn it off"
+        );
+        assert_eq!(
+            resolved_on,
+            Some(true),
+            "the gateway's resolved key carries it"
+        );
+        assert_eq!(
+            listed_on,
+            Some(serde_json::json!(true)),
+            "the key list shows it"
+        );
+        assert_eq!(off_status, StatusCode::NO_CONTENT);
+        assert_eq!(listed_off, Some(false));
+        assert_eq!(missing_status, StatusCode::NOT_FOUND);
+    }
+
     /// Fairshare weight and per-model cap are set on a key at creation and
     /// edited afterwards, so both have to survive the round trip through the
     /// store and come back on the response the dashboard renders.
@@ -12566,6 +12751,7 @@ mod tests {
             ("/api/v1/replicas/{id}/restart", "post"),
             ("/api/v1/keys/{id}/tracing", "put"),
             ("/api/v1/keys/{id}/end-user-fairshare", "put"),
+            ("/api/v1/keys/{id}/background", "put"),
             ("/api/v1/tenants/{id}/tracing", "put"),
             ("/api/v1/usage/logs/{request_id}/spans", "get"),
             ("/api/v1/models/{id}/managed/provision-error", "patch"),
@@ -12582,6 +12768,7 @@ mod tests {
             "ResyncReport",
             "SetKeyTracing",
             "SetKeyEndUserFairshare",
+            "SetKeyBackground",
             "ProvisionErrorBody",
             "SpanEntry",
         ] {

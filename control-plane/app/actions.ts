@@ -709,7 +709,7 @@ export async function saveTenantSettingsAction(formData: FormData): Promise<Sett
   return { ok: true };
 }
 
-export type KeySettingsSection = "key" | "tracing" | "end_user";
+export type KeySettingsSection = "key" | "tracing" | "end_user" | "background";
 
 /** Save a key's panel: its fields (one update) and its tracing switch, each only when changed. */
 export async function saveKeySettingsAction(formData: FormData): Promise<SettingsSaveResult<KeySettingsSection>> {
@@ -738,6 +738,14 @@ export async function saveKeySettingsAction(formData: FormData): Promise<Setting
       return { ok: false, error: `Per-user fairshare: ${actionError(e).error}`, saved };
     }
     saved.push("end_user");
+  }
+  if (wanted.has("background")) {
+    try {
+      await obleth.setKeyBackground(id, formData.get("background") === "on", { auditActor: session.email });
+    } catch (e) {
+      return { ok: false, error: `Background priority: ${actionError(e).error}`, saved };
+    }
+    saved.push("background");
   }
   updateTag(CACHE_TAGS.keys);
   revalidatePath("/keys");
@@ -883,6 +891,7 @@ export async function replaceKeyAction(id: string): Promise<{ ok: true; secret: 
     }, { auditActor: session.email });
     if (old.tracing_enabled) await obleth.setKeyTracing(created.key.id, true, { auditActor: session.email });
     if (old.end_user_fairshare) await obleth.setKeyEndUserFairshare(created.key.id, true, { auditActor: session.email });
+    if (old.background) await obleth.setKeyBackground(created.key.id, true, { auditActor: session.email });
     updateTag(CACHE_TAGS.keys);
     revalidatePath("/keys");
     return { ok: true, secret: created.secret, key: created.key };

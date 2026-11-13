@@ -8,6 +8,7 @@ import { BudgetDialog, MoveDialog, NewKeySheet } from "@/components/access/key-d
 import { KeyPanel } from "@/components/access/key-panel";
 import { BudgetBar, SecretBanner, StateDot } from "@/components/access/ui";
 import { Notice, Tile } from "@/components/models/ui";
+import { Pill } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { Select } from "@/components/ui/select";
@@ -241,7 +242,10 @@ export function KeysList({
                 >
                   <input type="checkbox" aria-label={`Select ${k.name}`} checked={selected.has(k.id)} onChange={() => toggle(k.id)} className="accent-foreground" />
                   <button type="button" aria-label={`Open ${k.name}`} onClick={() => setOpen(k.id)} className="flex min-w-0 flex-col text-left">
-                    <span className={cn("truncate font-medium", !k.disabled && "text-foreground")}>{k.name || k.key_prefix}</span>
+                    <span className="flex min-w-0 items-center gap-1.5">
+                      <span className={cn("truncate font-medium", !k.disabled && "text-foreground")}>{k.name || k.key_prefix}</span>
+                      {k.background && <Pill className="h-[18px] px-1.5 text-[10.5px]">Background</Pill>}
+                    </span>
                     <span className="truncate font-mono text-[11.5px] text-muted-foreground">{k.kind === "identity" ? `identity · ${k.identity_subject ?? ""}` : `${k.key_prefix}…`}</span>
                   </button>
                   <span className="truncate">{r.tenantName}</span>

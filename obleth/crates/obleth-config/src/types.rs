@@ -245,6 +245,14 @@ pub struct ApiKey {
     /// could otherwise split itself into many users to jump the queue.
     #[serde(default)]
     pub end_user_fairshare: bool,
+    /// Background priority: this key's requests run in each model's
+    /// background fairshare pool, the one batch items use. Nothing new starts
+    /// for the key while an interactive request for that model waits, and it
+    /// never holds more than the background share of a model's slots. Its
+    /// requests wait longer for a slot instead of failing when a model is
+    /// busy. Operator-only, so off by default.
+    #[serde(default)]
+    pub background: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -335,6 +343,11 @@ pub struct ResolvedKey {
     /// `ApiKey::end_user_fairshare`).
     #[serde(default)]
     pub end_user_fairshare: bool,
+    /// The key's requests run in each model's background pool (see
+    /// `ApiKey::background`). Defaults to off so entries cached before the
+    /// field existed still parse.
+    #[serde(default)]
+    pub background: bool,
     /// Optional per-tenant model allowlist. Empty/`None` = all models permitted.
     #[serde(default)]
     pub allowed_models: Option<Vec<String>>,
@@ -3943,6 +3956,10 @@ pub struct ApiKeyBackup {
     /// before the column existed.
     #[serde(default)]
     pub end_user_fairshare: bool,
+    /// See `ApiKey::background`. Defaults to off for backups taken before
+    /// the column existed.
+    #[serde(default)]
+    pub background: bool,
     pub disabled: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }

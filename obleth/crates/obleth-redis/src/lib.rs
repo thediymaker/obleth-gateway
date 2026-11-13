@@ -1220,6 +1220,7 @@ mod tests {
             key_weight: 100,
             key_max_in_flight: None,
             end_user_fairshare: false,
+            background: false,
             allowed_models: None,
             internal: false,
             tracing_enabled: false,

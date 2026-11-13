@@ -4,6 +4,10 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
+## Unreleased
+
+- **Background priority for a key.** An operator can mark a key as background work: its requests to a model run in that model's background pool, the one batch items use, so they take only spare capacity. Nothing new starts for the key while an interactive request for the model waits, it fills at most `OBLETH_BATCH_MAX_SHARE` (0.75) of the model's slots and of the global ceiling, and a request waits up to an hour for a slot instead of failing with 503 when the model is busy. It is off by default and has its own route, `PUT /api/v1/keys/{id}/background`, and switch in the key panel, so the whole-key `PUT` never turns it off; backups carry it and replacing a key keeps it. The live fairshare view now labels a model's background pool `<model> (background)` instead of `<model> (batch)`. Postgres migration `0042` adds the column; the gateway applies it when it starts.
+
 ## v2.6.0
 
 Deployments on Slurm work on current Slurm releases and keep a model serving through walltime, preemption, node failure, restarts and setting changes. A launch that keeps failing pauses with a reason instead of resubmitting forever, and Slurm's refusals, token expiry and network faults are reported as sentences with what to do.

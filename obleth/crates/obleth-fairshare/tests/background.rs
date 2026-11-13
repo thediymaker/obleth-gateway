@@ -77,6 +77,20 @@ fn background_pool_ids_round_trip() {
     assert_eq!(obleth_fairshare::background_cap(8, f64::NAN), 6);
 }
 
+/// The live view names a model's background pool after the model, as
+/// background work (batch items and background keys both run there); its id
+/// in the shared backend stays `b:` and the model.
+#[tokio::test]
+async fn the_background_pool_is_shown_as_background() {
+    let fs = local(1024);
+    let held = admit_now(&fs, background(), bg_req(Uuid::new_v4(), 8, 0.75)).await;
+    let snap = fs.snapshot().await.expect("snapshot");
+    let names: Vec<&str> = snap.pools.iter().map(|p| p.model.as_str()).collect();
+    assert_eq!(names, vec!["m (background)"]);
+    assert_eq!(background().slot_id(), "b:m");
+    drop(held);
+}
+
 /// Background work fills at most its share of the pool; the rest stays free
 /// for interactive arrivals, which are admitted at once.
 #[tokio::test]
