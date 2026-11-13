@@ -1446,9 +1446,9 @@ impl Pool {
 
     /// Whether `tenant` is held for the tenant clock: at its cap or blocked,
     /// or with no waiting key that is not held, not counting its own claims
-    /// still out with the shared backend (see [`Pool::key_held`]). A key
-    /// whose last queued request is out as one of those claims still counts
-    /// as waiting.
+    /// still out with the shared backend (see [`Pool::key_held`]). A key it
+    /// owns whose last queued request is out as one of those claims still
+    /// counts as waiting.
     fn tenant_held(&self, tenant: &Uuid) -> bool {
         if self.blocked_tenants.contains(tenant) {
             return true;
@@ -1472,9 +1472,11 @@ impl Pool {
             .flat_map(|q| q.keys.iter())
             .filter(|(_, d)| !d.is_empty())
             .map(|(k, _)| *k);
+        // A refused claim goes back in line under its key's owner, which is
+        // not the tenant it was charged to if the key has moved since.
         let claimed = self
             .outstanding()
-            .filter(|(t, _)| t == tenant)
+            .filter(|(t, k)| self.key_owner(k, *t) == *tenant)
             .map(|(_, k)| k);
         !queued.chain(claimed).any(|k| !self.key_held(&k))
     }
@@ -5890,5 +5892,37 @@ mod tests {
             (after - before).abs() < 1e-9,
             "{before} before the refused claim, {after} after"
         );
+    }
+
+    /// Shared mode: a claim whose key moves to another tenant while it is
+    /// out does not keep counting as a waiting key of the tenant it was
+    /// charged to, so that tenant, its other key at its cap, is held and
+    /// raised by the clock as usual.
+    #[test]
+    fn claim_of_a_moved_key_does_not_keep_its_old_tenant_waiting() {
+        let mut sim = Sim::new(8);
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let (capped, moved) = (Uuid::new_v4(), Uuid::new_v4());
+        let at_cap = || AdmitRequest::new(a, "m", 10).key(capped, 100).key_cap(1);
+        fast_running(&mut sim, at_cap());
+        fast_running(&mut sim, AdmitRequest::new(b, "m", 100));
+        for _ in 0..3 {
+            sim.queue_req(at_cap());
+            sim.queue(b, b, 100);
+        }
+        sim.queue_req(AdmitRequest::new(a, "m", 10).key(moved, 100));
+        let (next, _) = sim.pool.take_claim(sim.pool.cap);
+        let (tenant, key, waiter) = next.expect("a request can be taken");
+        assert_eq!((tenant, key), (a, moved));
+        sim.pool.pending.insert(
+            0,
+            PendingClaim {
+                tenant,
+                key,
+                waiter,
+            },
+        );
+        sim.queue(c, moved, 10);
+        assert!(sim.pool.tenant_held(&a));
     }
 }
