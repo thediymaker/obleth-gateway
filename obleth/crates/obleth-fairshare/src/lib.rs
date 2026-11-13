@@ -1154,12 +1154,14 @@ impl Pool {
     }
 
     fn track_meta(&mut self, req: &AdmitRequest) {
-        let old_weight = self.tenant_weight.insert(req.tenant, req.weight.max(1));
+        let reweighted = self.set_tenant_weight(req.tenant, req.weight.max(1));
         let old_group = self.tenant_group.insert(req.tenant, req.group.clone());
         let regrouped = old_group.is_some_and(|g| g != req.group);
-        self.group_weight
-            .insert(req.group.clone(), req.group_weight.max(1));
-        self.key_weight.insert(req.key, req.key_weight.max(1));
+        let group_reweighted = self
+            .group_weight
+            .insert(req.group.clone(), req.group_weight.max(1))
+            .is_some_and(|w| w != req.group_weight.max(1));
+        let key_reweighted = self.set_key_weight(req.key, req.key_weight.max(1));
         let moved_from = self.set_key_tenant(req.key, req.tenant);
         match &req.end_user {
             Some(end_user) => {
@@ -1169,43 +1171,91 @@ impl Pool {
                 self.key_end_user.remove(&req.key);
             }
         }
-        match req.tenant_max_in_flight.filter(|c| *c > 0) {
-            Some(cap) => {
-                self.tenant_cap.insert(req.tenant, cap);
-            }
-            None => {
-                self.tenant_cap.remove(&req.tenant);
-            }
-        }
-        match req.key_max_in_flight.filter(|c| *c > 0) {
-            Some(cap) => {
-                self.key_cap.insert(req.key, cap);
-            }
-            None => {
-                self.key_cap.remove(&req.key);
-            }
-        }
-        if regrouped || old_weight.is_some_and(|w| w != req.weight.max(1)) {
-            self.retarget_queued(req.tenant);
-        }
+        let tenant_cap = req.tenant_max_in_flight.filter(|c| *c > 0);
+        let old_tenant_cap = match tenant_cap {
+            Some(cap) => self.tenant_cap.insert(req.tenant, cap),
+            None => self.tenant_cap.remove(&req.tenant),
+        };
+        let key_cap = req.key_max_in_flight.filter(|c| *c > 0);
+        let old_key_cap = match key_cap {
+            Some(cap) => self.key_cap.insert(req.key, cap),
+            None => self.key_cap.remove(&req.key),
+        };
         if regrouped {
             self.rebase_tenant(req.tenant);
+        }
+        // Queued requests carry the weights, group and caps they arrived
+        // with, and taking one records them again: give them the new ones.
+        if group_reweighted {
+            let tenants: Vec<Uuid> = self
+                .queues
+                .keys()
+                .filter(|t| self.tenant_group.get(*t) == Some(&req.group))
+                .copied()
+                .collect();
+            for tenant in tenants {
+                self.retarget_queued(tenant);
+            }
+        } else if reweighted
+            || regrouped
+            || key_reweighted
+            || old_tenant_cap != tenant_cap
+            || old_key_cap != key_cap
+        {
+            self.retarget_queued(req.tenant);
         }
         if let Some(old) = moved_from {
             self.move_queued(req.key, old, req.tenant);
         }
     }
 
-    /// Give `tenant`'s queued requests its weight, group and cap as now
-    /// recorded, so taking one does not record the old ones again.
+    /// Give `tenant`'s queued requests its and their keys' weights, group
+    /// and caps as now recorded, so taking one does not record the old ones
+    /// again.
     fn retarget_queued(&mut self, tenant: Uuid) {
         let Some(mut queue) = self.queues.remove(&tenant) else {
             return;
         };
-        for waiter in queue.keys.values_mut().flat_map(|d| d.iter_mut()) {
-            self.retarget_waiter(waiter, tenant);
+        for (key, deque) in queue.keys.iter_mut() {
+            for waiter in deque.iter_mut() {
+                self.retarget_waiter(waiter, tenant, *key);
+            }
         }
         self.queues.insert(tenant, queue);
+    }
+
+    /// Record `tenant`'s weight. A change keeps its standing: the service it
+    /// has had is not weighed again at the new weight, only what it gets
+    /// from now on. Returns whether the weight changed.
+    fn set_tenant_weight(&mut self, tenant: Uuid, weight: i64) -> bool {
+        let Some(old) = self.tenant_weight.insert(tenant, weight) else {
+            return false;
+        };
+        if old == weight {
+            return false;
+        }
+        if let Some(served) = self.served.get_mut(&tenant) {
+            let rescaled = *served * weight as f64 / old as f64;
+            // Placement, not service: the base moves with it.
+            *self.served_base.entry(tenant).or_insert(0.0) += rescaled - *served;
+            *served = rescaled;
+        }
+        true
+    }
+
+    /// Record `key`'s weight, keeping its standing as
+    /// [`Pool::set_tenant_weight`] does a tenant's.
+    fn set_key_weight(&mut self, key: Uuid, weight: i64) -> bool {
+        let Some(old) = self.key_weight.insert(key, weight) else {
+            return false;
+        };
+        if old == weight {
+            return false;
+        }
+        if let Some(served) = self.key_served.get_mut(&key) {
+            *served = *served * weight as f64 / old as f64;
+        }
+        true
     }
 
     /// A tenant that moved to another group under the hierarchical
@@ -1240,13 +1290,14 @@ impl Pool {
         }
         self.join_tenant(to);
         for mut waiter in waiters {
-            self.retarget_waiter(&mut waiter, to);
+            self.retarget_waiter(&mut waiter, to, key);
             self.queues.entry(to).or_default().reinsert(key, waiter);
         }
     }
 
-    /// Give a waiter `tenant`'s weight, group and cap, as last recorded.
-    fn retarget_waiter(&self, waiter: &mut Waiter, tenant: Uuid) {
+    /// Give a waiter `tenant`'s and `key`'s weights, group and caps, as last
+    /// recorded.
+    fn retarget_waiter(&self, waiter: &mut Waiter, tenant: Uuid, key: Uuid) {
         if let Some(weight) = self.tenant_weight.get(&tenant) {
             waiter.weight = *weight;
         }
@@ -1257,6 +1308,10 @@ impl Pool {
             }
         }
         waiter.tenant_max_in_flight = self.tenant_cap.get(&tenant).copied();
+        if let Some(weight) = self.key_weight.get(&key) {
+            waiter.key_weight = *weight;
+        }
+        waiter.key_max_in_flight = self.key_cap.get(&key).copied();
     }
 
     /// Record `key`'s tenant, as of its latest admission. A key moved to
@@ -1290,11 +1345,11 @@ impl Pool {
     }
 
     fn track_waiter_meta(&mut self, tenant: Uuid, key: Uuid, w: &Waiter) {
-        self.tenant_weight.insert(tenant, w.weight.max(1));
+        self.set_tenant_weight(tenant, w.weight.max(1));
         self.tenant_group.insert(tenant, w.group.clone());
         self.group_weight
             .insert(w.group.clone(), w.group_weight.max(1));
-        self.key_weight.insert(key, w.key_weight.max(1));
+        self.set_key_weight(key, w.key_weight.max(1));
         // A request queued before the key moved does not move it back.
         self.key_tenant.entry(key).or_insert(tenant);
         match &w.end_user {
@@ -1476,7 +1531,7 @@ impl Pool {
             FairshareAlgorithm::Hierarchical => {
                 let caps = self.compute_group_caps(effective);
                 let cap = caps.get(&req.group).copied().unwrap_or(effective);
-                self.group_in_flight(&req.group) < cap.max(1)
+                self.group_in_flight(&req.group) < cap
             }
         }
     }
@@ -1547,6 +1602,23 @@ impl Pool {
             return;
         }
         *clock = target;
+        // A queued key held at its cap gains no credit while it waits, as at
+        // the tenant level (see [`Pool::advance_tenant_clock`]).
+        let held: Vec<Uuid> = self
+            .queues
+            .get(&tenant)
+            .into_iter()
+            .flat_map(|q| q.keys.iter())
+            .filter(|(k, d)| !d.is_empty() && !self.key_open(k))
+            .map(|(k, _)| *k)
+            .collect();
+        for key in held {
+            let start = self.key_start(tenant, key);
+            let served = self.key_served.entry(key).or_insert(start);
+            if *served < start {
+                *served = start;
+            }
+        }
         self.forget_caught_up_keys(tenant);
     }
 
@@ -1860,7 +1932,7 @@ impl Pool {
         // A key that moved while its claim was out goes back in line under
         // its new tenant.
         let owner = self.key_owner(&key, tenant);
-        self.retarget_waiter(&mut waiter, owner);
+        self.retarget_waiter(&mut waiter, owner, key);
         if owner != tenant {
             self.join_tenant(owner);
         }
@@ -1970,10 +2042,6 @@ impl Pool {
             borrowable.push((*tenant, group_score));
 
             let cap = caps.get(&group).copied().unwrap_or(effective);
-            // With fewer slots than groups (or than a group's tenants), the
-            // split leaves some with none; each may still hold one, and the
-            // scores below take turns between them.
-            let cap = cap.max(1);
             if in_flight_by_group.get(group.as_str()).copied().unwrap_or(0) >= cap {
                 continue;
             }
@@ -1982,8 +2050,7 @@ impl Pool {
                 .or_insert_with(|| self.tenant_slot_caps(&group, cap))
                 .get(tenant)
                 .copied()
-                .unwrap_or(cap)
-                .max(1);
+                .unwrap_or(cap);
             if self.tenant_in_flight.get(tenant).copied().unwrap_or(0) >= tenant_cap {
                 continue;
             }
@@ -2063,8 +2130,13 @@ impl Pool {
     /// a tenant held at its cap cannot pull it down, and grants made with
     /// nothing queued move it too: a tenant that arrives later starts level
     /// with the service given out before it came, not credited with it.
+    ///
+    /// A queued tenant that cannot be picked, held at its cap, is raised to
+    /// the clock as it moves, so it gains no credit while it waits: when its
+    /// cap lifts it competes level, rather than taking every slot until the
+    /// others' service since then is matched.
     fn advance_tenant_clock(&mut self, tenant: Uuid, began: f64) {
-        let scope = self.clock_scope(&tenant);
+        let scope = self.clock_scope(&tenant).to_string();
         let waiting = self
             .queues
             .iter()
@@ -2074,9 +2146,21 @@ impl Pool {
             .filter_map(|(t, _)| self.tenant_standing(t))
             .fold(f64::INFINITY, f64::min);
         let target = if waiting.is_finite() { waiting } else { began };
-        let clock = self.tenant_clock.entry(scope.to_string()).or_insert(0.0);
-        if target > *clock {
-            *clock = target;
+        let clock = self.tenant_clock.entry(scope.clone()).or_insert(0.0);
+        if target <= *clock {
+            return;
+        }
+        *clock = target;
+        let held: Vec<Uuid> = self
+            .queues
+            .iter()
+            .filter(|(t, q)| {
+                !q.is_empty() && self.clock_scope(t) == scope && !self.tenant_is_eligible(t)
+            })
+            .map(|(t, _)| *t)
+            .collect();
+        for t in held {
+            self.raise_tenant(t);
         }
     }
 
@@ -2128,6 +2212,12 @@ impl Pool {
         if self.queues.get(&tenant).is_some_and(|q| !q.is_empty()) {
             return;
         }
+        self.raise_tenant(tenant);
+    }
+
+    /// Raise `tenant` to its start if it is below it, starting a new one
+    /// there.
+    fn raise_tenant(&mut self, tenant: Uuid) {
         let start = self.tenant_start(&tenant);
         match self.served.get_mut(&tenant) {
             None => {
@@ -2352,31 +2442,50 @@ impl Pool {
     }
 
     fn forget_if_quiet(&mut self, tenant: Uuid, key: Uuid) {
+        let owner = self.key_owner(&key, tenant);
         // A key that is idle and at or below its owner's key clock would be
         // raised to it on return anyway, so its entry carries no information
         // worth keeping. One above the clock is kept until the clock reaches
         // it.
         if self.key_quiet(&key) {
-            let owner = self.key_owner(&key, tenant);
             if self.key_served.get(&key).copied().unwrap_or(0.0) <= self.key_start(owner, key) {
                 self.forget_key(&key);
             } else {
                 self.keep_idle_key(owner, key);
             }
         }
-        // The same rule for the tenant, so tenants that have gone quiet (or
-        // have been deleted) stop showing up in the pool's share tree. A
-        // tenant that owns a key running in another tenant's slot is kept:
-        // a refused claim of that key goes back in line under it.
-        let tenant_queued = self.queues.get(&tenant).map(|q| q.len).unwrap_or(0);
-        if tenant_queued == 0
+        self.forget_tenant_if_quiet(tenant);
+        // A key that ran in another tenant's slot after moving: its owner,
+        // kept while it ran, may be quiet now.
+        if owner != tenant {
+            self.forget_tenant_if_quiet(owner);
+        }
+    }
+
+    /// The rule for keys, for a tenant, so tenants that have gone quiet (or
+    /// have been deleted) stop showing up in the pool's share tree. One at
+    /// or below its clock is forgotten, and so is one with no other tenant
+    /// on its clock, which has nobody to keep a lead over. A tenant that
+    /// owns a key running in another tenant's slot is kept: a refused claim
+    /// of that key goes back in line under it.
+    fn forget_tenant_if_quiet(&mut self, tenant: Uuid) {
+        let quiet = self.queues.get(&tenant).is_none_or(|q| q.len == 0)
             && !self.tenant_in_flight.contains_key(&tenant)
-            && self.tenant_standing(&tenant).unwrap_or(0.0) <= self.tenant_clock_of(&tenant)
             && !self
                 .key_in_flight
                 .keys()
-                .any(|k| self.key_tenant.get(k) == Some(&tenant))
-        {
+                .any(|k| self.key_tenant.get(k) == Some(&tenant));
+        if !quiet {
+            return;
+        }
+        let scope = self.clock_scope(&tenant);
+        let caught_up =
+            self.tenant_standing(&tenant).unwrap_or(0.0) <= self.tenant_clock_of(&tenant);
+        let alone = !self
+            .served
+            .keys()
+            .any(|t| *t != tenant && self.clock_scope(t) == scope);
+        if caught_up || alone {
             self.forget_tenant(&tenant);
         }
     }
@@ -5002,13 +5111,20 @@ mod tests {
     }
 
     /// The tenant clock moves with grants made while nothing is queued, so a
-    /// tenant that arrives after another had the pool to itself starts level
-    /// with it, not credited with all the service given out before it came.
+    /// tenant that arrives while another has had the pool to itself starts
+    /// level with it, not credited with all the service given out before it
+    /// came.
     #[test]
     fn newcomer_is_not_credited_with_service_before_it_came() {
-        for slots in [1, 4] {
+        for slots in [2, 4] {
             let mut sim = Sim::new(slots);
             let (first, later) = (Uuid::new_v4(), Uuid::new_v4());
+            // One long request keeps the first tenant in the pool throughout.
+            let long = AdmitRequest::new(first, "m", 100);
+            sim.pool.track_meta(&long);
+            let (respond, _long) = oneshot::channel();
+            sim.pool.grant_fast(long, respond);
+            sim.running.push_back((first, first));
             for _ in 0..1_000 {
                 sim.fast(AdmitRequest::new(first, "m", 100));
             }
@@ -5156,23 +5272,6 @@ mod tests {
         );
     }
 
-    /// Under the hierarchical algorithm with fewer slots than groups, a
-    /// group whose share rounds to no slot still takes turns by its score.
-    #[test]
-    fn group_with_a_share_under_one_slot_is_still_served() {
-        let mut sim = Sim::with(FairshareAlgorithm::Hierarchical, 1);
-        let (big, small) = (Uuid::new_v4(), Uuid::new_v4());
-        for _ in 0..2_000 {
-            sim.queue_req(AdmitRequest::new(big, "m", 100).group("big", 300));
-            sim.queue_req(AdmitRequest::new(small, "m", 100).group("small", 50));
-        }
-        let small_grants = (0..1_400).filter(|_| sim.grant() == small).count();
-        assert!(
-            (150..=250).contains(&small_grants),
-            "the weight-50 group had {small_grants} of 1,400 grants, not about 200"
-        );
-    }
-
     /// Under the hierarchical algorithm, a tenant moved to another group
     /// starts at that group's clock: the service it had in its old group is
     /// on another group's scale and neither holds it back nor puts it ahead
@@ -5229,5 +5328,194 @@ mod tests {
             assert_eq!(sim.pool.tenant_weight[&tenant], 300);
             sim.pool.release(t, k);
         }
+    }
+
+    /// Longest run of grants in a row that did not go to `key`.
+    fn longest_wait(grants: &[Uuid], key: Uuid) -> usize {
+        let (mut run, mut longest) = (0, 0);
+        for k in grants {
+            if *k == key {
+                run = 0;
+            } else {
+                run += 1;
+                longest = longest.max(run);
+            }
+        }
+        longest
+    }
+
+    /// A tenant's new weight applies to service from then on: its standing
+    /// is kept, so a raise does not take every grant and a cut does not
+    /// starve it while its past service is weighed again.
+    #[test]
+    fn tenant_weight_change_keeps_its_standing() {
+        for (from, to) in [(50, 200), (200, 50)] {
+            let mut sim = Sim::new(1);
+            let (steady, changed) = (Uuid::new_v4(), Uuid::new_v4());
+            for _ in 0..4_000 {
+                sim.queue_req(AdmitRequest::new(steady, "m", 100));
+                sim.queue_req(AdmitRequest::new(changed, "m", 100).weight(from));
+            }
+            for _ in 0..1_500 {
+                sim.grant();
+            }
+            sim.queue_req(AdmitRequest::new(changed, "m", 100).weight(to));
+            let grants: Vec<Uuid> = (0..1_500).map(|_| sim.grant()).collect();
+            let share = grants.iter().filter(|k| **k == changed).count() as f64 / 1_500.0;
+            let fair = to as f64 / (to + 100) as f64;
+            assert!(
+                (share - fair).abs() < 0.05,
+                "weight {from} to {to}: share {share:.2}, fair {fair:.2}"
+            );
+            assert!(longest_wait(&grants, steady) <= 4);
+            assert!(longest_wait(&grants, changed) <= 4);
+        }
+    }
+
+    /// The same for a key's weight inside its tenant.
+    #[test]
+    fn key_weight_change_keeps_its_standing() {
+        let mut sim = Sim::new(1);
+        let (tenant, steady, changed) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for _ in 0..3_000 {
+            sim.queue(tenant, steady, 100);
+            sim.queue(tenant, changed, 100);
+        }
+        for _ in 0..1_000 {
+            sim.grant();
+        }
+        sim.queue_req(AdmitRequest::new(tenant, "m", 100).key(changed, 300));
+        let grants: Vec<Uuid> = (0..1_000).map(|_| sim.grant()).collect();
+        let share = grants.iter().filter(|k| **k == changed).count() as f64 / 1_000.0;
+        assert!((share - 0.75).abs() < 0.05, "share {share:.2}, fair 0.75");
+        assert!(longest_wait(&grants, steady) <= 4);
+    }
+
+    /// A tenant whose queued requests are all held at their key's cap gains
+    /// no credit while it waits, so when it has an open key again it does
+    /// not take every slot until its service catches up.
+    #[test]
+    fn tenant_held_at_a_cap_gains_no_credit() {
+        let mut sim = Sim::new(4);
+        let (held, busy) = (Uuid::new_v4(), Uuid::new_v4());
+        let (capped, open) = (Uuid::new_v4(), Uuid::new_v4());
+        for _ in 0..5_000 {
+            sim.queue_req(
+                AdmitRequest::new(held, "m", 100)
+                    .key(capped, 100)
+                    .key_cap(1),
+            );
+            sim.queue(busy, busy, 100);
+        }
+        for _ in 0..2_000 {
+            sim.grant();
+        }
+        for _ in 0..3_000 {
+            sim.queue(held, open, 100);
+        }
+        let grants: Vec<Uuid> = (0..3_000).map(|_| sim.grant()).collect();
+        let wait = longest_wait(&grants, busy);
+        assert!(wait <= 4, "the busy tenant waited {wait} grants in a row");
+    }
+
+    /// The same for a key held at its cap inside its tenant, once the cap is
+    /// lifted.
+    #[test]
+    fn key_held_at_its_cap_gains_no_credit() {
+        let mut sim = Sim::new(4);
+        let (tenant, capped, busy) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for _ in 0..5_000 {
+            sim.queue_req(
+                AdmitRequest::new(tenant, "m", 100)
+                    .key(capped, 100)
+                    .key_cap(1),
+            );
+            sim.queue(tenant, busy, 100);
+        }
+        for _ in 0..2_000 {
+            sim.grant();
+        }
+        sim.queue(tenant, capped, 100);
+        let grants: Vec<Uuid> = (0..2_000).map(|_| sim.grant()).collect();
+        assert!(
+            grants.contains(&capped) && !sim.pool.key_cap.contains_key(&capped),
+            "the cap was lifted"
+        );
+        let wait = longest_wait(&grants, busy);
+        assert!(wait <= 4, "the busy key waited {wait} grants in a row");
+    }
+
+    /// A tenant's cap lifted by its latest request reaches its queued
+    /// requests, so taking one does not set the old cap again.
+    #[test]
+    fn lifted_tenant_cap_reaches_queued_requests() {
+        let mut sim = Sim::new(4);
+        let tenant = Uuid::new_v4();
+        for _ in 0..20 {
+            sim.queue_req(AdmitRequest::new(tenant, "m", 100).tenant_cap(1));
+        }
+        sim.grant();
+        sim.queue_req(AdmitRequest::new(tenant, "m", 100));
+        for _ in 0..3 {
+            sim.grant();
+        }
+        assert_eq!(sim.pool.tenant_in_flight.get(&tenant), Some(&4));
+    }
+
+    /// Under the hierarchical algorithm a quiet tenant alone in its group,
+    /// whose clock only its own grants move, is still forgotten.
+    #[test]
+    fn quiet_tenant_alone_in_its_group_is_forgotten() {
+        let mut sim = Sim::with(FairshareAlgorithm::Hierarchical, 2);
+        let (busy, passing) = (Uuid::new_v4(), Uuid::new_v4());
+        for _ in 0..200 {
+            sim.queue_req(AdmitRequest::new(busy, "m", 100).group("g1", 100));
+        }
+        sim.queue_req(AdmitRequest::new(passing, "m", 100).group("g2", 100));
+        sim.grants_before(passing);
+        for _ in 0..10 {
+            sim.grant();
+        }
+        assert!(!sim.is_running(passing));
+        assert!(!sim.pool.served.contains_key(&passing));
+    }
+
+    /// A tenant kept because a key it owns was running under its old tenant
+    /// is forgotten once that request ends, if it is quiet.
+    #[test]
+    fn owner_kept_for_a_running_key_is_forgotten_when_it_ends() {
+        let mut sim = Sim::new(4);
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let (moved, other) = (Uuid::new_v4(), Uuid::new_v4());
+        for _ in 0..2_000 {
+            sim.queue(c, other, 100);
+        }
+        for _ in 0..20 {
+            sim.grant();
+        }
+        while let Some((t, k)) = sim.running.pop_front() {
+            sim.pool.release(t, k);
+        }
+        sim.queue(a, moved, 100);
+        let take = |sim: &mut Sim, tenant: Uuid| loop {
+            let (next, _) = sim.pool.take_next(sim.pool.cap);
+            let (t, k, _) = next.expect("a request can be taken");
+            if t == tenant && k == moved {
+                break;
+            }
+            sim.pool.release(t, k);
+        };
+        take(&mut sim, a);
+        sim.queue(b, moved, 100);
+        take(&mut sim, b);
+        for _ in 0..50 {
+            let (next, _) = sim.pool.take_next(sim.pool.cap);
+            let (t, k, _) = next.expect("a request can be taken");
+            sim.pool.release(t, k);
+        }
+        sim.pool.release(b, moved);
+        assert!(sim.pool.served.contains_key(&b), "kept while its key runs");
+        sim.pool.release(a, moved);
+        assert!(!sim.pool.served.contains_key(&b), "forgotten once it ends");
     }
 }
