@@ -240,6 +240,8 @@ export function buildTenantRows(
   tenants: Tenant[],
   keys: Pick<ApiKey, "tenant_id" | "disabled">[],
   users: Pick<AdminUser, "tenantId">[],
+  /** Members by tenant id; tenants without members count home-tenant users. */
+  memberCounts: Record<string, number>,
   usage24h: UsageAgg[],
   budgets: BudgetUsage[],
   fairshare?: FairshareLiveView,
@@ -252,7 +254,7 @@ export function buildTenantRows(
     tenant: t,
     keys: keys.filter((k) => k.tenant_id === t.id).length,
     keysOff: keys.filter((k) => k.tenant_id === t.id && k.disabled).length,
-    users: users.filter((u) => u.tenantId === t.id).length,
+    users: memberCounts[t.id] ?? users.filter((u) => u.tenantId === t.id).length,
     requests24h: Number(use.get(t.id)?.requests ?? 0),
     cost24h: Number(use.get(t.id)?.cost_usd ?? 0),
     budget: budgetView(budget.get(t.id), now),

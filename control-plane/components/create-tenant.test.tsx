@@ -17,7 +17,7 @@ beforeEach(async () => {
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
   vi.mocked(createTenantAction).mockReset();
   host = document.createElement("div"); document.body.append(host); root = createRoot(host);
-  await act(async () => root.render(<TooltipProvider><CreateTenant models={["alpha"]} tenantWeights={[100]} /></TooltipProvider>));
+  await act(async () => root.render(<TooltipProvider><CreateTenant models={["alpha"]} groups={["default", "projects"]} tenantWeights={[100]} /></TooltipProvider>));
 });
 afterEach(async () => { await act(async () => root.unmount()); host.remove(); });
 it("retains fields through section changes and submits the complete draft from Models", async () => {
@@ -36,6 +36,7 @@ it("retains fields through section changes and submits the complete draft from M
   expect(data.get("budget_cost_usd")).toBe("12.50");
   expect(data.get("timezone")).toBe("UTC");
   expect(data.get("budget_period")).toBe("lifetime");
+  expect(data.get("fairshare_group")).toBe("projects");
   expect(input("name").value).toBe("Research");
   expect(host.querySelector('[role="alert"]')?.textContent).toBe("Try again");
 });

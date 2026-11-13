@@ -146,7 +146,7 @@ describe("tenants", () => {
 describe("what a person can reach", () => {
   it("needs a tenant for the portal, and approval for anything", () => {
     expect(reachLabel(reachOf({ role: "admin", status: "active", tenantId: null }))).toBe("Dashboard");
-    expect(reachLabel(reachOf({ role: "admin", status: "active", tenantId: "t" }), "rcusers")).toBe("Dashboard and portal · rcusers");
+    expect(reachLabel(reachOf({ role: "admin", status: "active", tenantId: "t" }))).toBe("Dashboard and portal");
     expect(reachLabel(reachOf({ role: "user", status: "active", tenantId: null }))).toBe("Nothing yet: no tenant");
     expect(reachOf({ role: "user", status: "pending", tenantId: "t" })).toBe("waiting");
   });
