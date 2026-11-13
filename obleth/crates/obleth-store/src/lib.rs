@@ -22,11 +22,26 @@ pub mod batches;
 mod crypto;
 mod jobs;
 pub mod knowledge;
+mod members;
 mod models_io;
+mod owned_keys;
 pub use backup::BACKUP_KEY_SENTINEL;
 pub use crypto::{Cipher, CryptoError};
 pub use jobs::{JobOwner, JobRecord};
+pub use members::*;
 pub use models_io::{ModelImportOutcome, ModelImportWrite};
+pub use owned_keys::*;
+
+/// Options for [`Store::provision_identity_key_with`].
+#[derive(Clone, Copy, Default)]
+pub struct ProvisionOptions<'a> {
+    /// Applied only when the tenant is created.
+    pub defaults: Option<&'a obleth_config::TenantDefaults>,
+    /// Create the tenant as `personal` and add the identity as its owner.
+    pub personal: bool,
+    /// Move an existing identity key into `tenant_name`.
+    pub rehome: bool,
+}
 
 /// Process-wide cipher for upstream secret columns, initialized once from the
 /// environment. Kept global so the row-mapping helpers can transparently
@@ -114,6 +129,9 @@ const SCHEMA_V39: &str = include_str!("../../../../schema/postgres/0039_batches.
 const SCHEMA_V40: &str = include_str!("../../../../schema/postgres/0040_mcp_server_tenants.sql");
 const SCHEMA_V41: &str = include_str!("../../../../schema/postgres/0041_slurm_connector.sql");
 const SCHEMA_V42: &str = include_str!("../../../../schema/postgres/0042_api_key_background.sql");
+const SCHEMA_V43: &str = include_str!("../../../../schema/postgres/0043_accounts.sql");
+const SCHEMA_V44: &str =
+    include_str!("../../../../schema/postgres/0044_projects_fairshare_group.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -292,6 +310,8 @@ impl Store {
             sqlx::raw_sql(SCHEMA_V40).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V41).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V42).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V43).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V44).execute(&mut *conn).await?;
             Ok(())
         }
         .await;
@@ -735,6 +755,19 @@ impl Store {
         &self,
         p: IdentityProvision<'_>,
     ) -> Result<ProvisionedIdentity> {
+        self.provision_identity_key_with(p, ProvisionOptions::default())
+            .await
+    }
+
+    /// [`Store::provision_identity_key`] with tenant defaults (applied only
+    /// when the tenant is created), a `personal` flag (kind `personal` plus an
+    /// owner membership) and optional `rehome` of an existing identity key
+    /// into `p.tenant_name`.
+    pub async fn provision_identity_key_with(
+        &self,
+        p: IdentityProvision<'_>,
+        opts: ProvisionOptions<'_>,
+    ) -> Result<ProvisionedIdentity> {
         // `tenant_name` comes straight from `OBLETH_JWT_ISSUERS` config, not
         // from anything validated at boot against reserved names. Without
         // this check, a config value equal to the reserved control-plane
@@ -756,16 +789,18 @@ impl Store {
 
         // Fast path: already provisioned.
         if let Some(resolved) = self.resolved_key_by_hash(&hash).await? {
-            return Ok(ProvisionedIdentity {
-                hash,
-                resolved,
-                tenant_created: false,
-                key_created: false,
-            });
+            if !opts.rehome || resolved.tenant_name == p.tenant_name {
+                return Ok(ProvisionedIdentity {
+                    hash,
+                    resolved,
+                    tenant_created: false,
+                    key_created: false,
+                });
+            }
         }
 
         let mut tx = self.pool.begin().await?;
-        // Serialise tenant lookup-or-create per name so racing first requests
+        // Serialise tenant lookup-or-create (and rehome) per name so racing first requests
         // cannot both insert (tenants.name is unique; this avoids surfacing
         // that as an error to one of them).
         sqlx::query("select pg_advisory_xact_lock(hashtext($1))")
@@ -790,16 +825,75 @@ impl Store {
                             .into(),
                     ));
                 }
+                if opts.personal {
+                    let kind: String = sqlx::query_scalar("select kind from tenants where id = $1")
+                        .bind(id)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                    let already_here: bool = sqlx::query_scalar(
+                        "select exists (select 1 from api_keys where key_hash = $1
+                                        and kind = 'identity' and tenant_id = $2)",
+                    )
+                    .bind(&hash)
+                    .bind(id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if kind != "personal" && !already_here {
+                        return Err(StoreError::Protected(
+                            "personal tenant name collides with an existing non-personal tenant"
+                                .into(),
+                        ));
+                    }
+                    let other_owner: bool = sqlx::query_scalar(
+                        "select exists (select 1 from tenant_members where tenant_id = $1
+                                        and role = 'owner' and (issuer, subject) <> ($2, $3))",
+                    )
+                    .bind(id)
+                    .bind(p.issuer)
+                    .bind(p.subject)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if other_owner {
+                        return Err(StoreError::Protected(
+                            "personal tenant already belongs to another identity".into(),
+                        ));
+                    }
+                }
                 (id, false)
             }
             None => {
                 let id = Uuid::new_v4();
+                let d = opts.defaults.cloned().unwrap_or_default();
+                let has_budget = d.budget_tokens.is_some() || d.budget_cost_usd.is_some();
+                let allowed = d
+                    .allowed_models
+                    .filter(|m| !m.is_empty())
+                    .map(sqlx::types::Json);
+                let email = p.claims.get("email").and_then(|v| v.as_str()).unwrap_or("");
                 sqlx::query(
-                    "insert into tenants (id, name, fairshare_group, weight, tokens_per_minute)
-                     values ($1, $2, 'default', 100, 0)",
+                    "insert into tenants (id, name, fairshare_group, weight, tokens_per_minute,
+                            max_in_flight, budget_tokens, budget_cost_usd, budget_period,
+                            budget_started_at, allowed_models, contact_email, kind)
+                     values ($1, $2, $3, $4, $5, $6, $7, $8, $9,
+                             case when $10 then now() end, $11, $12, $13)",
                 )
                 .bind(id)
                 .bind(p.tenant_name)
+                .bind(d.fairshare_group.as_deref().unwrap_or("default"))
+                .bind(d.weight.unwrap_or(100))
+                .bind(d.tokens_per_minute.unwrap_or(0))
+                .bind(d.max_in_flight)
+                .bind(d.budget_tokens)
+                .bind(d.budget_cost_usd)
+                .bind(d.budget_period.as_deref())
+                .bind(has_budget)
+                .bind(allowed)
+                .bind(email)
+                .bind(if opts.personal {
+                    "personal"
+                } else {
+                    "standard"
+                })
                 .execute(&mut *tx)
                 .await?;
                 Self::record_audit_tx(
@@ -818,6 +912,50 @@ impl Store {
                 (id, true)
             }
         };
+        if opts.personal {
+            sqlx::query(
+                "insert into tenant_members (tenant_id, issuer, subject, email, role)
+                 select id, $2, $3, nullif($4, ''), 'owner' from tenants
+                 where id = $1 and kind = 'personal'
+                 on conflict do nothing",
+            )
+            .bind(tenant_id)
+            .bind(p.issuer)
+            .bind(p.subject)
+            .bind(p.claims.get("email").and_then(|v| v.as_str()).unwrap_or(""))
+            .execute(&mut *tx)
+            .await?;
+        }
+        if opts.rehome {
+            let moved = sqlx::query(
+                "update api_keys set tenant_id = $1, updated_at = now()
+                 where key_hash = $2 and kind = 'identity' and tenant_id <> $1
+                   and tenant_id <> $3
+                 returning id, tenant_id",
+            )
+            .bind(tenant_id)
+            .bind(&hash)
+            .bind(Self::CONTROL_PLANE_TENANT_ID)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(r) = moved {
+                let kid: Uuid = r.try_get("id")?;
+                Self::record_audit_tx(
+                    &mut tx,
+                    "identity-provisioning",
+                    "rehome_identity_key",
+                    "api_key",
+                    &kid.to_string(),
+                    serde_json::json!({
+                        "tenant_id": tenant_id,
+                        "tenant_name": p.tenant_name,
+                        "issuer": p.issuer,
+                        "subject": p.subject,
+                    }),
+                )
+                .await?;
+            }
+        }
         let prefix = truncate_chars(&format!("jwt:{}", p.subject), 64);
         let name = format!("{}-cli", p.subject);
         let claims = match p.claims {
@@ -9579,5 +9717,134 @@ mod tests {
             matches!(err, StoreError::Protected(_)),
             "expected Protected, got {err:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provision_personal_with_defaults_and_rehome() {
+        let Some(url) = crate::test_support::test_db_url() else {
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.unwrap();
+        store.migrate().await.unwrap();
+        let mut guard = FixtureGuard::new(&store);
+        let sub = format!("s-{}", Uuid::new_v4());
+        let shared = format!("t-shared-{}", Uuid::new_v4());
+        let legacy = store
+            .provision_identity_key(IdentityProvision {
+                issuer: "iss",
+                subject: &sub,
+                tenant_name: &shared,
+                claims: serde_json::json!({"email": "a@x"}),
+            })
+            .await
+            .unwrap();
+        guard.track_tenant(legacy.resolved.tenant_id);
+        let d = obleth_config::TenantDefaults {
+            fairshare_group: Some("default".into()),
+            budget_tokens: Some(1000),
+            budget_period: Some("monthly".into()),
+            allowed_models: Some(vec!["m".into()]),
+            ..Default::default()
+        };
+        let name = format!("u-{sub}");
+        let opts = ProvisionOptions {
+            defaults: Some(&d),
+            personal: true,
+            rehome: false,
+        };
+        let kept = store
+            .provision_identity_key_with(
+                IdentityProvision {
+                    issuer: "iss",
+                    subject: &sub,
+                    tenant_name: &name,
+                    claims: serde_json::json!({"email": "a@x"}),
+                },
+                opts,
+            )
+            .await
+            .unwrap();
+        assert_eq!(kept.resolved.tenant_id, legacy.resolved.tenant_id);
+        let moved = store
+            .provision_identity_key_with(
+                IdentityProvision {
+                    issuer: "iss",
+                    subject: &sub,
+                    tenant_name: &name,
+                    claims: serde_json::json!({"email": "a@x"}),
+                },
+                ProvisionOptions {
+                    rehome: true,
+                    ..opts
+                },
+            )
+            .await
+            .unwrap();
+        guard.track_tenant(moved.resolved.tenant_id);
+        assert!(moved.tenant_created && !moved.key_created);
+        assert_eq!(moved.resolved.tenant_name, name);
+        assert_eq!(moved.resolved.budget_tokens, Some(1000));
+        assert_eq!(
+            moved.resolved.allowed_models.as_deref(),
+            Some(&["m".to_string()][..])
+        );
+        let t = store.get_tenant(moved.resolved.tenant_id).await.unwrap();
+        assert_eq!(t.contact_email, "a@x");
+        let again = store
+            .provision_identity_key_with(
+                IdentityProvision {
+                    issuer: "iss",
+                    subject: &sub,
+                    tenant_name: &name,
+                    claims: serde_json::json!({}),
+                },
+                ProvisionOptions {
+                    rehome: true,
+                    ..opts
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!again.tenant_created && !again.key_created);
+        let (kind, owners): (String, i64) = sqlx::query_as("select t.kind, (select count(*) from tenant_members m where m.tenant_id=t.id and m.role='owner') from tenants t where t.id=$1")
+            .bind(moved.resolved.tenant_id).fetch_one(&store.pool).await.unwrap();
+        assert_eq!((kind.as_str(), owners), ("personal", 1));
+
+        // A hand-made non-personal tenant with the personal name must not capture the identity.
+        let sub2 = format!("s-{}", Uuid::new_v4());
+        let clash = format!("u-{sub2}");
+        let ct = store
+            .create_tenant(&clash, 100, 0, None, None)
+            .await
+            .unwrap();
+        guard.track_tenant(ct.id);
+        let err = store
+            .provision_identity_key_with(
+                IdentityProvision {
+                    issuer: "iss",
+                    subject: &sub2,
+                    tenant_name: &clash,
+                    claims: serde_json::json!({}),
+                },
+                opts,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Protected(_)), "got {err:?}");
+        // A second identity cannot become co-owner of an existing personal tenant.
+        let err = store
+            .provision_identity_key_with(
+                IdentityProvision {
+                    issuer: "iss",
+                    subject: &format!("{sub}-b"),
+                    tenant_name: &name,
+                    claims: serde_json::json!({}),
+                },
+                opts,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Protected(_)), "got {err:?}");
     }
 }
