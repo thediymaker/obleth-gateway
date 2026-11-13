@@ -36,7 +36,8 @@ const LEEWAY_SECS: u64 = 60;
 const MAX_TOKEN_LEN: usize = 8 * 1024;
 
 /// Cheap syntactic check: compact JWS is three base64url segments and every
-/// JSON header starts with `{"` which encodes to `eyJ`. Secret keys are `sk_…`.
+/// JSON header starts with `{"` which encodes to `eyJ`. Secret keys are
+/// `obl_…` (or `sk_…` for keys minted before that format).
 pub fn looks_like_jwt(credential: &str) -> bool {
     credential.starts_with("eyJ")
         && credential.len() <= MAX_TOKEN_LEN
@@ -443,6 +444,15 @@ pub(crate) async fn authenticate_credential(
             }
         }
         Route::Key => {
+            // A credential in the current key format carries a checksum: one
+            // that fails it is a typo or a truncation, refused here without
+            // hashing it or asking Redis.
+            if obleth_config::is_malformed_key(secret) {
+                return Err(crate::proxy::error_json(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid api key",
+                ));
+            }
             let hash = obleth_config::hash_api_key(secret);
             match crate::proxy::try_resolve_key(state, &hash).await {
                 Ok(Some(r)) => Ok(Credential {
@@ -1161,5 +1171,27 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    /// A credential that claims the `obl_` format but fails its checksum is
+    /// refused as an unknown key before it is hashed or looked up, so a
+    /// mistyped key never costs a Redis round trip. Pinned at the source
+    /// level, like the test above, since there is no AppState harness here.
+    #[test]
+    fn a_malformed_obl_key_is_refused_before_the_lookup() {
+        let full = include_str!("jwt_auth.rs");
+        let src = &full[..full.find("\nmod tests {").expect("the test module")];
+        let flat: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+        let key_route = &flat[flat.find("Route::Key=>").expect("the key route")..];
+        let check = key_route
+            .find("ifobleth_config::is_malformed_key(secret){returnErr(crate::proxy::error_json(StatusCode::UNAUTHORIZED,\"invalidapikey\",));}")
+            .expect("the format check answers 401 invalid api key");
+        let hash = key_route
+            .find("obleth_config::hash_api_key(secret)")
+            .expect("the hash");
+        let lookup = key_route
+            .find("crate::proxy::try_resolve_key(")
+            .expect("the lookup");
+        assert!(check < hash && hash < lookup);
     }
 }

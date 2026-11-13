@@ -197,7 +197,7 @@ pub struct ApiKey {
     /// Operator note shown in dashboards; useful for ownership and intent.
     #[serde(default)]
     pub description: String,
-    /// Display-only prefix, e.g. `sk_a1b2...` for dashboards.
+    /// Display-only prefix, e.g. `obl_a1b2...` for dashboards.
     pub key_prefix: String,
     /// `secret` (minted, hashed secret) or `identity` (stands for a verified
     /// external identity; no secret exists).

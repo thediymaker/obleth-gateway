@@ -415,7 +415,8 @@ Use your cluster Ingress or an internal Service URL instead if you already expos
 
 ### 2. Create a tenant and mint a key
 
-There is no shared proxy key. Each client needs a tenant-scoped `sk_...` secret:
+There is no shared proxy key. Each client needs a tenant-scoped `obl_...` secret
+(keys minted by older releases start with `sk_` and keep working):
 
 ```bash
 TOKEN=<your-OBLETH_ADMIN_TOKEN>
