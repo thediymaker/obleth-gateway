@@ -23,14 +23,17 @@ const SECTIONS = [
   { id: "lifecycle", label: "Status", detail: "Initial access state" },
 ];
 const STATUS_OPTIONS = ["active", "suspended", "archived"] as const;
+const DEFAULT_GROUP = "projects";
 
 export function CreateTenant({
   models,
+  groups,
   tenantWeights,
   onCreated,
   className,
 }: {
   models: string[];
+  groups: string[];
   tenantWeights: number[];
   onCreated?: () => void;
   className?: string;
@@ -148,6 +151,13 @@ export function CreateTenant({
                 type="email"
                 placeholder="owner@example.com"
               />
+              <Field
+                label="Manager email (optional)"
+                id="tenant-manager-email"
+                name="manager_email"
+                type="email"
+                placeholder="Signed-in user who manages members"
+              />
             </div>
           </PanelCard>
         </TabsContent>
@@ -155,7 +165,20 @@ export function CreateTenant({
         <TabsContent value="controls" data-section="controls" forceMount className="mt-0 min-h-0 overflow-y-auto pr-1 data-[state=inactive]:hidden">
           <PanelCard title="Traffic controls" description="Optional tuning knobs. Leave caps blank for unlimited.">
             <div className="grid gap-x-4 gap-y-3 p-4 md:grid-cols-2">
-              <Field label="Fairshare group" id="tenant-group" name="fairshare_group" placeholder="default" />
+              <div className="space-y-1.5">
+                <div className="flex h-4 items-center">
+                  <Label htmlFor="tenant-group">Fairshare group</Label>
+                </div>
+                {/* Wrapped: Select renders a hidden native select that space-y would also space. */}
+                <div>
+                  <Select
+                    id="tenant-group"
+                    name="fairshare_group"
+                    defaultValue={groups.includes(DEFAULT_GROUP) ? DEFAULT_GROUP : "default"}
+                    options={(groups.length ? groups : ["default"]).map((g) => ({ value: g, label: g }))}
+                  />
+                </div>
+              </div>
               <div className="space-y-1.5">
                 <div className="flex items-center gap-1.5">
                   <Label htmlFor="tenant-weight">Fairshare weight</Label>
