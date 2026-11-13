@@ -38,6 +38,8 @@ import type {
   SlurmHealthView,
 } from "@/lib/obleth";
 import { requireAdmin } from "@/lib/auth/roles";
+import { resolveIdentityByEmail } from "@/lib/identity-lookup";
+import { accounts } from "@/lib/obleth-accounts";
 import { specFormValues, validateManagedModelForm } from "@/lib/managed-model-schema";
 import { parseUpstreamHeaders } from "@/lib/upstream-headers";
 import { resolveRecipeById, resolveRecipeText, buildManagedFromRecipe, parseRecipe, scriptDigest, type DeployOverrides } from "@/lib/sbatch-recipes";
@@ -323,6 +325,16 @@ export async function createTenantAction(formData: FormData): Promise<ActionResu
     return { ok: false, error: "Active-until must be after active-from." };
   }
 
+  // Resolved before anything is created, so an unknown email creates nothing.
+  const managerEmail = trimmed(formData.get("manager_email")).toLowerCase();
+  let manager: { issuer: string; subject: string } | null = null;
+  if (managerEmail) {
+    if (!z.string().email().safeParse(managerEmail).success) return { ok: false, error: "Manager email is not a valid email." };
+    const found = await resolveIdentityByEmail(managerEmail);
+    if (!found.ok) return { ok: false, error: `Manager ${managerEmail}: ${found.error}` };
+    manager = found.identity;
+  }
+
   try {
     const tenant = await obleth.createTenant({
       name: data.name,
@@ -331,6 +343,21 @@ export async function createTenantAction(formData: FormData): Promise<ActionResu
       max_in_flight: data.max_in_flight,
       fairshare_group: data.fairshare_group || undefined,
     }, { auditActor: session.email });
+
+    if (manager) {
+      try {
+        await accounts.upsertMember(
+          tenant.id,
+          { issuer: manager.issuer, subject: manager.subject, email: managerEmail, role: "manager" },
+          { auditActor: session.email },
+        );
+      } catch (e) {
+        await obleth.deleteTenant(tenant.id, { auditActor: session.email }).catch((err) => {
+          console.error(`createTenantAction: rollback of ${tenant.id} failed`, err);
+        });
+        throw e;
+      }
+    }
 
     if (data.description || data.organization || data.contact_email) {
       await obleth.updateTenant(tenant.id, {

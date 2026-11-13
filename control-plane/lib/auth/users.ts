@@ -66,15 +66,12 @@ async function guardedUserWrite(
   }
 }
 
-export async function assignUser(
-  id: string,
-  role: "admin" | "user",
-  tenantId: string | null,
-): Promise<UserChangeResult> {
+/** Role and approval. Tenants are memberships (tenant_members), not "tenantId", which stays the personal tenant. */
+export async function assignUser(id: string, role: "admin" | "user"): Promise<UserChangeResult> {
   return guardedUserWrite(id, role !== "admin", (client) =>
     client.query(
-      `update "user" set role = $1, "tenantId" = $2, status = 'active', "updatedAt" = now() where id = $3`,
-      [role, tenantId, id],
+      `update "user" set role = $1, status = 'active', "updatedAt" = now() where id = $2`,
+      [role, id],
     ),
   );
 }

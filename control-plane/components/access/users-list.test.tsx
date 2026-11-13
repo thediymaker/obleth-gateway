@@ -19,6 +19,14 @@ const users: AdminUser[] = [
   { id: "u4", email: "kchen18@asu.edu", role: "user", status: "pending", tenantId: null },
 ];
 
+const access = {
+  me: { member: false, tenants: [] },
+  u2: { member: true, tenants: [{ id: "t1", name: "rcusers", role: "manager" as const }] },
+  u3: { member: false, tenants: [] },
+  u4: { member: true, tenants: [] },
+};
+const tenants = [{ id: "t1", name: "rcusers" }, { id: "t2", name: "lab" }];
+
 let root: Root;
 let host: HTMLDivElement;
 beforeEach(() => {
@@ -34,22 +42,23 @@ afterEach(async () => {
 
 describe("users", () => {
   it("puts approvals first and says what each person can reach", async () => {
-    await act(async () => root.render(<UsersList users={users} tenants={[{ id: "t1", name: "rcusers" }]} me="me" />));
+    await act(async () => root.render(<UsersList users={users} tenants={tenants} access={access} me="me" />));
     const approvals = host.querySelector('[aria-label="Waiting for approval"]')!;
     expect(approvals.textContent).toContain("kchen18@asu.edu");
     const people = host.querySelector('[aria-label="People"]')!;
-    expect(people.textContent).toContain("Portal · rcusers");
+    expect(people.textContent).toContain("rcusers · manager");
+    expect(people.textContent).toContain("Portal");
     expect(people.textContent).toContain("Nothing yet: no tenant");
     expect(people.textContent).not.toContain("kchen18@asu.edu");
     expect(host.textContent).toContain("1 can't reach anything yet");
   });
 
   it("approves with the chosen role, and Not now leaves them waiting", async () => {
-    await act(async () => root.render(<UsersList users={users} tenants={[{ id: "t1", name: "rcusers" }]} me="me" />));
+    await act(async () => root.render(<UsersList users={users} tenants={tenants} access={access} me="me" />));
     const approve = [...host.querySelectorAll("button")].find((b) => b.textContent === "Approve")!;
     await act(async () => approve.click());
     const fd = vi.mocked(assignUserAction).mock.calls[0][0];
-    expect([fd.get("id"), fd.get("role"), fd.get("tenantId")]).toEqual(["u4", "user", ""]);
+    expect([fd.get("id"), fd.get("role"), fd.get("syncTenants"), fd.getAll("tenantIds")]).toEqual(["u4", "user", null, []]);
     await act(async () => [...host.querySelectorAll("button")].find((b) => b.textContent === "Not now")!.click());
     expect(host.querySelector('[aria-label="Waiting for approval"]')!.textContent).not.toContain("kchen18@asu.edu");
   });

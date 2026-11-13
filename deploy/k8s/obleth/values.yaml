@@ -77,7 +77,10 @@ obleth:
   apiKeyPepper: ""
   # Trusted JWT issuers for data-plane bearer auth: a JSON array string.
   # Empty disables the JWT path. Treated as secret-valued (it names trust
-  # anchors). See the "Identity Tokens" guide.
+  # anchors). Each entry's `tenant` is the tenant an identity is provisioned
+  # into: `{sub}` names it from the token's subject, and any `{claim}`
+  # (e.g. `{email}`) from a claim, so a personal tenant can be named by its
+  # owner's email. See the "Identity Tokens" guide.
   jwtIssuers: ""
   # PRODUCTION: reference a pre-created Secret instead of letting the chart
   # build one from the values above (so real secrets never touch values files or
@@ -554,6 +557,8 @@ controlPlane:
   #                        default body credentials.
   # See deploy/k8s/README.md for the full explanation of each.
   oidcProviders: ""   # e.g. '[{"providerId":"dex","displayName":"Dev SSO (Dex)","discoveryUrl":"...","clientId":"...","clientSecret":"...","scopes":["openid","email","profile"]}]'
+  # true: OIDC sign-ins become active users at once (no admin approval step).
+  oidcAutoApprove: false
   resources:
     requests: { cpu: "100m", memory: "256Mi" }
     limits: { cpu: "1", memory: "512Mi" }

@@ -6,6 +6,7 @@ import { useRouter } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
 import { ChevronDown, MoreHorizontal, Search } from "lucide-react";
 import { deleteTenantAction, setTenantStatusAction } from "@/app/actions";
+import { TenantMembers } from "@/components/access/tenant-members";
 import { TenantSettings } from "@/components/access/tenant-settings";
 import { BudgetBar, StateDot, TENANT_STATUS_LABEL, tenantState } from "@/components/access/ui";
 import { useFairshareLive } from "@/components/fairshare/hooks";
@@ -25,10 +26,10 @@ import {
   type TenantDay,
   type TenantOverviewData,
 } from "@/lib/access-model";
-import type { AdminUser } from "@/lib/auth/users";
 import { logsHref } from "@/lib/log-links";
 import { money } from "@/lib/models-model";
 import type { ApiKey, BudgetUsage, Tenant } from "@/lib/obleth";
+import type { Member } from "@/lib/obleth-accounts";
 import { compact } from "@/lib/overview-model";
 import { cn, getJson } from "@/lib/utils";
 
@@ -236,14 +237,16 @@ export function TenantPage({
   tenant,
   tenants,
   keys,
-  people,
+  members,
+  users,
   budgets,
   models,
 }: {
   tenant: Tenant;
   tenants: Tenant[];
   keys: ApiKey[];
-  people: AdminUser[];
+  members: Member[];
+  users: string[];
   budgets: BudgetUsage[];
   models: string[];
 }) {
@@ -338,7 +341,7 @@ export function TenantPage({
     { id: "compression", count: tenant.compression_policy ? (tenant.compression_policy.enabled ? "on" : "off") : undefined },
     { id: "advanced" },
     { id: "keys", count: keys.length },
-    { id: "people", count: people.length },
+    { id: "people", count: members.length },
   ];
 
   const failShare = data && data.requests24h ? data.failed24h / data.requests24h : 0;
@@ -532,17 +535,11 @@ export function TenantPage({
 
             <section id="people" aria-label="People" className="scroll-mt-24 rounded-xl border border-border bg-card">
               <header className="flex items-center justify-between px-[18px] pb-2 pt-4">
-                <h2 className="text-sm font-semibold">People <span className="font-normal text-muted-foreground">· {people.length ? `${people.length} can use the portal` : "none linked"}</span></h2>
-                <Link href="/users" className="text-[12.5px] text-secondary-foreground hover:text-foreground">Link a user ›</Link>
+                <h2 className="text-sm font-semibold">People <span className="font-normal text-muted-foreground">· {members.length ? `${members.length} member${members.length === 1 ? "" : "s"}` : "none yet"}</span></h2>
               </header>
               <div className="px-[18px] pb-2">
-                {people.map((p) => (
-                  <div key={p.id} className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-t border-border py-2 text-[13px] first:border-t-0">
-                    <span className="truncate">{p.email}</span>
-                    <Pill>{p.role}</Pill>
-                  </div>
-                ))}
-                <p className="border-t border-border py-2.5 text-xs text-muted-foreground">People linked here make and manage their own keys in the portal.</p>
+                <TenantMembers tenantId={tenant.id} tenantName={tenant.name} members={members} users={users} />
+                <p className="border-t border-border py-2.5 text-xs text-muted-foreground">Members make and manage their own keys in the portal.</p>
               </div>
             </section>
           </div>
