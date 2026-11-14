@@ -375,10 +375,19 @@ async fn the_background_pool_reports_the_slots_it_may_fill() {
         admit_now(&fs, interactive(), req(Uuid::new_v4(), 256)).await,
     ];
     let snap = fs.snapshot().await.expect("snapshot");
-    let pool = |name: &str| snap.pools.iter().find(|p| p.model == name).expect("pool listed");
+    let pool = |name: &str| {
+        snap.pools
+            .iter()
+            .find(|p| p.model == name)
+            .expect("pool listed")
+    };
     let bg = pool("m (background)");
     assert_eq!((bg.cap, bg.configured_cap), (192, 192));
-    let mut shares: Vec<f64> = bg.tenants.iter().map(|t| t.weight_share * bg.cap as f64).collect();
+    let mut shares: Vec<f64> = bg
+        .tenants
+        .iter()
+        .map(|t| t.weight_share * bg.cap as f64)
+        .collect();
     shares.sort_by(f64::total_cmp);
     assert_eq!(shares, vec![96.0, 96.0]);
     // The model's interactive pool keeps its whole size.
@@ -403,10 +412,17 @@ async fn the_cluster_view_reports_the_background_pool_by_its_share() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let pool = loop {
         let snap = gws[0].cluster_snapshot().await.expect("backend answers");
-        if let Some(p) = snap.pools.into_iter().find(|p| p.model == "m (background)" && p.tenants.len() == 2) {
+        if let Some(p) = snap
+            .pools
+            .into_iter()
+            .find(|p| p.model == "m (background)" && p.tenants.len() == 2)
+        {
             break p;
         }
-        assert!(tokio::time::Instant::now() < deadline, "both gateways' tenants in the view");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "both gateways' tenants in the view"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
     assert_eq!((pool.cap, pool.configured_cap), (6, 6));

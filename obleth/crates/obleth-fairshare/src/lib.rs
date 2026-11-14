@@ -1558,15 +1558,16 @@ impl Pool {
             .collect()
     }
 
-    /// The number of slots this pool can actually fill right now: its own cap,
-    /// or fewer when the global ceiling leaves less headroom than that. Group
+    /// The number of slots this pool can actually fill right now: `cap` (the
+    /// pool's cap as [`Pool::reported_caps`] gives it), or fewer when the
+    /// global ceiling leaves less headroom than that. Group
     /// and tenant splits are taken from this figure, not from the pool cap,
     /// so a ceiling that binds below the pool still reserves every group's
     /// share of what is really available. Splitting the nominal cap instead
     /// hands the largest group a cap it can never reach, and it then never
     /// has to yield a freed slot to a smaller group.
-    fn effective_cap(&self, headroom: usize) -> usize {
-        self.cap.min(self.in_flight.saturating_add(headroom)).max(1)
+    fn effective_cap(&self, cap: usize, headroom: usize) -> usize {
+        cap.min(self.in_flight.saturating_add(headroom)).max(1)
     }
 
     /// The pool's size as views report it, `(cap, configured_cap)`. A
@@ -2916,8 +2917,7 @@ impl Pool {
             .collect();
         let shares = self.shares(&ids, &key_ids);
         let (cap, configured_cap) = self.reported_caps();
-        let group_caps =
-            self.compute_group_caps(cap.min(self.in_flight.saturating_add(headroom)).max(1));
+        let group_caps = self.compute_group_caps(self.effective_cap(cap, headroom));
         let group_service = self.group_service();
 
         let mut names: HashSet<String> = shares.groups.keys().cloned().collect();
