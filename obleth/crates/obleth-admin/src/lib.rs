@@ -5961,6 +5961,11 @@ pub struct ClientAddressView {
     /// True when `OBLETH_TRUSTED_PROXIES` is unset, so every private and
     /// loopback range is trusted.
     pub trusted_proxies_default: bool,
+    /// True when `X-Forwarded-For` is read from the right past the trusted
+    /// proxies in it, which the gateway does only when
+    /// `OBLETH_TRUSTED_PROXIES` is set. Otherwise its rightmost entry is the
+    /// client.
+    pub walks_past_proxies: bool,
     /// Entries of `OBLETH_TRUSTED_PROXIES` that are not ranges, ignored.
     pub invalid_trusted_proxies: Vec<String>,
     /// `OBLETH_CLIENT_ADDRESS_HEADER`, or `null` when the client is found
@@ -5985,14 +5990,12 @@ pub struct UpdateNamedNetworks {
 
 fn network_settings_view(networks: Vec<NamedNetwork>) -> NetworkSettingsView {
     let env = obleth_config::network::ClientAddressSettings::from_env();
-    let unset = std::env::var("OBLETH_TRUSTED_PROXIES")
-        .map(|v| v.trim().is_empty())
-        .unwrap_or(true);
     NetworkSettingsView {
         networks,
         client_address: ClientAddressView {
             trusted_proxies: env.trusted.iter().map(|n| n.to_string()).collect(),
-            trusted_proxies_default: unset,
+            trusted_proxies_default: !env.explicit,
+            walks_past_proxies: env.explicit,
             invalid_trusted_proxies: env.invalid,
             address_header: env.address_header,
             country_header: env.country_header,

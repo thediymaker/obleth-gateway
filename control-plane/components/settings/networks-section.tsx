@@ -64,8 +64,10 @@ export function NetworksSection({ settings }: { settings: NetworkSettingsView })
         <Line label="Client address">
           {ca.address_header ? (
             <>The <span className="font-mono">{ca.address_header}</span> header from a trusted proxy, else <span className="font-mono">X-Forwarded-For</span>.</>
-          ) : (
+          ) : ca.walks_past_proxies ? (
             <><span className="font-mono">X-Forwarded-For</span> from a trusted proxy, read from the right past the trusted proxies in it.</>
+          ) : (
+            <>The last entry of <span className="font-mono">X-Forwarded-For</span> from a trusted proxy.</>
           )}{" "}
           From anyone else, the address that connected.
         </Line>
@@ -74,7 +76,7 @@ export function NetworksSection({ settings }: { settings: NetworkSettingsView })
         </Line>
         {ca.trusted_proxies_default && (
           <p className="text-xs text-muted-foreground">
-            If clients can reach the gateway directly from a private network, list only your proxies, or such a client can claim any address and pass a key&apos;s network limit.
+            List your proxies to trust only them. Then a client behind two proxies, such as a tunnel and a load balancer, is found past both, and a client on a private network can&apos;t claim another address.
           </p>
         )}
       </Setting>

@@ -4,9 +4,10 @@
 //!
 //! When the TCP peer is a trusted proxy (`OBLETH_TRUSTED_PROXIES`, default
 //! the private and loopback ranges; `none` trusts no proxy), the address is
-//! the one in `OBLETH_CLIENT_ADDRESS_HEADER` if set, else the first entry
-//! in `X-Forwarded-For`, read from the right, that is not itself a trusted
-//! proxy. From anyone else it is the peer. The country comes from
+//! the one in `OBLETH_CLIENT_ADDRESS_HEADER` if set, else from
+//! `X-Forwarded-For`: when the trusted list is set, the first entry read
+//! from the right that is not itself a trusted proxy; with the default, the
+//! rightmost entry. From anyone else it is the peer. The country comes from
 //! `OBLETH_CLIENT_COUNTRY_HEADER` (default `cf-ipcountry`; empty turns it
 //! off), and only from a trusted proxy, since anyone can send the header.
 
@@ -26,6 +27,9 @@ use obleth_config::network;
 /// the environment once.
 pub(crate) struct ClientAddressConfig {
     trusted: Vec<IpNet>,
+    /// Read `X-Forwarded-For` past the trusted proxies in it: only when the
+    /// trusted list was set, see [`network::client_ip`].
+    walk: bool,
     address_header: Option<HeaderName>,
     country_header: Option<HeaderName>,
 }
@@ -70,6 +74,7 @@ impl ClientAddressConfig {
         let ip = network::client_ip(
             peer,
             &self.trusted,
+            self.walk,
             address,
             headers
                 .get_all("x-forwarded-for")
@@ -119,6 +124,7 @@ impl From<network::ClientAddressSettings> for ClientAddressConfig {
         };
         ClientAddressConfig {
             trusted: s.trusted,
+            walk: s.explicit,
             address_header: header(s.address_header, "OBLETH_CLIENT_ADDRESS_HEADER"),
             country_header: header(s.country_header, "OBLETH_CLIENT_COUNTRY_HEADER"),
         }
@@ -281,8 +287,15 @@ mod tests {
             ("x-forwarded-for", "203.0.113.9, 10.42.1.90"),
             ("cf-connecting-ip", "203.0.113.9"),
         ]);
-        let walk = ClientAddressConfig::from_settings(None, None, None);
+        // With the proxies listed, the walk passes the tunnel.
+        let walk = ClientAddressConfig::from_settings(Some("10.42.0.0/16"), None, None);
         assert_eq!(walk.resolve(ip("10.42.3.4"), &h, "/").ip, ip("203.0.113.9"));
+        // With the default list, the rightmost entry stands.
+        let default = ClientAddressConfig::from_settings(None, None, None);
+        assert_eq!(
+            default.resolve(ip("10.42.3.4"), &h, "/").ip,
+            ip("10.42.1.90")
+        );
         let named = ClientAddressConfig::from_settings(None, Some("CF-Connecting-IP"), None);
         let only_header = headers(&[
             ("x-forwarded-for", "10.42.1.90"),

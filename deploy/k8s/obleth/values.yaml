@@ -119,10 +119,12 @@ obleth:
   modelHealthRetentionDays: 30
   usageRetentionDays: 180
   # Where each request came from. When the connecting peer is in
-  # `trustedProxies` (comma-separated CIDRs), X-Forwarded-For is read from
-  # the right, skipping entries that are trusted proxies themselves, and the
-  # first other address is the client; otherwise the peer is. Empty means
-  # the private and loopback ranges; "none" trusts no proxy. `addressHeader`
+  # `trustedProxies` (comma-separated CIDRs), the client comes from
+  # X-Forwarded-For; otherwise the peer is the client. When `trustedProxies`
+  # is set, the header is read from the right past entries that are these
+  # proxies too (a tunnel, a second load balancer), and the first other
+  # address is the client. Empty means the private and loopback ranges, and
+  # then the rightmost entry is the client; "none" trusts no proxy. `addressHeader`
   # (for example CF-Connecting-IP) names a header a trusted proxy sets to
   # exactly the client's address; it wins over X-Forwarded-For when present.
   # Keys limited to certain networks are checked against this address.

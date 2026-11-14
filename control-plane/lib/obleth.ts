@@ -1143,6 +1143,8 @@ export interface ClientAddressView {
   trusted_proxies: string[];
   /** OBLETH_TRUSTED_PROXIES is unset: every private and loopback range. */
   trusted_proxies_default: boolean;
+  /** X-Forwarded-For is read past the trusted proxies in it: only when OBLETH_TRUSTED_PROXIES is set. */
+  walks_past_proxies?: boolean;
   invalid_trusted_proxies: string[];
   address_header: string | null;
   country_header: string | null;

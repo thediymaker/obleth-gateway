@@ -31,6 +31,10 @@ pub const DEFAULT_COUNTRY_HEADER: &str = "cf-ipcountry";
 #[derive(Debug, Clone, Default)]
 pub struct ClientAddressSettings {
     pub trusted: Vec<IpNet>,
+    /// The trusted list was set (not the default). Only then does the
+    /// gateway read `X-Forwarded-For` past the proxies in it; see
+    /// [`client_ip`].
+    pub explicit: bool,
     /// Entries of the trusted list that are not CIDR ranges, skipped.
     pub invalid: Vec<String>,
     /// A header a trusted proxy sets to exactly the client's address. Unset
@@ -52,18 +56,19 @@ impl ClientAddressSettings {
         address_header: Option<&str>,
         country_header: Option<&str>,
     ) -> Self {
-        let trusted = match trusted.map(str::trim) {
-            None | Some("") => DEFAULT_TRUSTED_PROXIES,
-            Some(t) if t.eq_ignore_ascii_case("none") => "",
-            Some(t) => t,
+        let (list, explicit) = match trusted.map(str::trim) {
+            None | Some("") => (DEFAULT_TRUSTED_PROXIES, false),
+            Some(t) if t.eq_ignore_ascii_case("none") => ("", true),
+            Some(t) => (t, true),
         };
-        let (trusted, invalid) = parse_network_list(trusted);
+        let (trusted, invalid) = parse_network_list(list);
         let header = |raw: &str| {
             let raw = raw.trim().to_ascii_lowercase();
             (!raw.is_empty()).then_some(raw)
         };
         ClientAddressSettings {
             trusted,
+            explicit,
             invalid,
             address_header: address_header.and_then(header),
             country_header: header(country_header.unwrap_or(DEFAULT_COUNTRY_HEADER)),
@@ -243,12 +248,20 @@ pub fn parse_address_header(raw: &str) -> Option<IpAddr> {
 
 /// The client address for a request. From a trusted proxy: the address in
 /// `address_header` when given and it holds one, else the client found in
-/// `X-Forwarded-For` (see [`forwarded_client`]), else the peer. From anyone
-/// else, the peer itself. `None` only when the peer is unknown (a request
-/// built in process).
+/// `X-Forwarded-For`, else the peer. From anyone else, the peer itself.
+/// `None` only when the peer is unknown (a request built in process).
+///
+/// With `walk`, `X-Forwarded-For` is read from the right past the trusted
+/// proxies in it (see [`forwarded_client`]); without, its rightmost entry is
+/// the client. Walking is safe only when `trusted` lists the proxies alone:
+/// a client inside a trusted range could otherwise put any address in the
+/// header and have its own skipped as a proxy. So the gateway walks only
+/// when `OBLETH_TRUSTED_PROXIES` is set, never with the default of every
+/// private range.
 pub fn client_ip<'a>(
     peer: Option<IpAddr>,
     trusted: &[IpNet],
+    walk: bool,
     address_header: Option<&str>,
     forwarded_for: impl IntoIterator<Item = &'a str>,
 ) -> Option<IpAddr> {
@@ -256,7 +269,7 @@ pub fn client_ip<'a>(
     match peer {
         Some(p) if trusted.iter().any(|n| n.contains(&p)) => address_header
             .and_then(parse_address_header)
-            .or_else(|| forwarded_client(forwarded_for, trusted))
+            .or_else(|| forwarded_client(forwarded_for, if walk { trusted } else { &[] }))
             .or(Some(p)),
         other => other,
     }
@@ -476,35 +489,41 @@ mod tests {
         let peer = Some(ip("10.42.0.7"));
         // A proxy that sets the header to exactly the client.
         assert_eq!(
-            client_ip(peer, &trusted, None, ["203.0.113.9"]),
+            client_ip(peer, &trusted, false, None, ["203.0.113.9"]),
             Some(ip("203.0.113.9"))
         );
         // A proxy that appends: the client-supplied entries on the left are
         // ignored.
         assert_eq!(
-            client_ip(peer, &trusted, None, ["1.1.1.1, 8.8.8.8 ,203.0.113.9"]),
+            client_ip(
+                peer,
+                &trusted,
+                false,
+                None,
+                ["1.1.1.1, 8.8.8.8 ,203.0.113.9"]
+            ),
             Some(ip("203.0.113.9"))
         );
         // Several header lines read as one list, in order.
         assert_eq!(
-            client_ip(peer, &trusted, None, ["1.1.1.1", "198.51.100.4"]),
+            client_ip(peer, &trusted, false, None, ["1.1.1.1", "198.51.100.4"]),
             Some(ip("198.51.100.4"))
         );
         // Ports, brackets and IPv6.
         assert_eq!(
-            client_ip(peer, &trusted, None, ["203.0.113.9:51234"]),
+            client_ip(peer, &trusted, false, None, ["203.0.113.9:51234"]),
             Some(ip("203.0.113.9"))
         );
         assert_eq!(
-            client_ip(peer, &trusted, None, ["[2001:db8::5]:443"]),
+            client_ip(peer, &trusted, false, None, ["[2001:db8::5]:443"]),
             Some(ip("2001:db8::5"))
         );
         assert_eq!(
-            client_ip(peer, &trusted, None, ["2001:db8::5"]),
+            client_ip(peer, &trusted, false, None, ["2001:db8::5"]),
             Some(ip("2001:db8::5"))
         );
         assert_eq!(
-            client_ip(peer, &trusted, None, ["::ffff:203.0.113.9"]),
+            client_ip(peer, &trusted, false, None, ["::ffff:203.0.113.9"]),
             Some(ip("203.0.113.9"))
         );
     }
@@ -513,17 +532,17 @@ mod tests {
     fn junk_or_missing_forwarded_for_falls_back_to_the_peer() {
         let trusted = default_trusted();
         let peer = Some(ip("10.42.0.7"));
-        assert_eq!(client_ip(peer, &trusted, None, []), peer);
-        assert_eq!(client_ip(peer, &trusted, None, [""]), peer);
-        assert_eq!(client_ip(peer, &trusted, None, [" , "]), peer);
+        assert_eq!(client_ip(peer, &trusted, false, None, []), peer);
+        assert_eq!(client_ip(peer, &trusted, false, None, [""]), peer);
+        assert_eq!(client_ip(peer, &trusted, false, None, [" , "]), peer);
         // A junk rightmost entry does not hand the decision to the
         // client-supplied entries to its left.
         assert_eq!(
-            client_ip(peer, &trusted, None, ["203.0.113.9, unknown"]),
+            client_ip(peer, &trusted, false, None, ["203.0.113.9, unknown"]),
             peer
         );
         assert_eq!(
-            client_ip(peer, &trusted, None, ["203.0.113.9, 999.1.1.1"]),
+            client_ip(peer, &trusted, false, None, ["203.0.113.9, 999.1.1.1"]),
             peer
         );
     }
@@ -532,22 +551,37 @@ mod tests {
     fn forwarded_for_is_ignored_from_an_untrusted_peer() {
         let trusted = default_trusted();
         let peer = Some(ip("198.51.100.77"));
-        assert_eq!(client_ip(peer, &trusted, None, ["203.0.113.9"]), peer);
+        assert_eq!(
+            client_ip(peer, &trusted, false, None, ["203.0.113.9"]),
+            peer
+        );
         // An IPv6 peer outside fc00::/7.
         let peer6 = Some(ip("2001:db8::77"));
-        assert_eq!(client_ip(peer6, &trusted, None, ["203.0.113.9"]), peer6);
+        assert_eq!(
+            client_ip(peer6, &trusted, false, None, ["203.0.113.9"]),
+            peer6
+        );
         // A mapped private peer is the private IPv4 address, so trusted.
         assert_eq!(
-            client_ip(Some(ip("::ffff:10.0.0.1")), &trusted, None, ["203.0.113.9"]),
+            client_ip(
+                Some(ip("::ffff:10.0.0.1")),
+                &trusted,
+                false,
+                None,
+                ["203.0.113.9"]
+            ),
             Some(ip("203.0.113.9"))
         );
         // Trusting nobody.
         assert_eq!(
-            client_ip(Some(ip("10.0.0.1")), &[], None, ["203.0.113.9"]),
+            client_ip(Some(ip("10.0.0.1")), &[], false, None, ["203.0.113.9"]),
             Some(ip("10.0.0.1"))
         );
         // No peer at all (an in-process request).
-        assert_eq!(client_ip(None, &trusted, None, ["203.0.113.9"]), None);
+        assert_eq!(
+            client_ip(None, &trusted, false, None, ["203.0.113.9"]),
+            None
+        );
     }
 
     #[test]
@@ -600,7 +634,7 @@ mod tests {
         // tunnel it came through: the tunnel is a trusted proxy, so the
         // client to its left is the answer.
         assert_eq!(
-            client_ip(peer, &trusted, None, ["203.0.113.9, 10.42.1.90"]),
+            client_ip(peer, &trusted, true, None, ["203.0.113.9, 10.42.1.90"]),
             Some(ip("203.0.113.9"))
         );
         // The walk stops at the first untrusted address; what the client
@@ -609,6 +643,7 @@ mod tests {
             client_ip(
                 peer,
                 &trusted,
+                true,
                 None,
                 ["198.51.100.1, 203.0.113.9, 10.42.1.90, 10.0.0.2"]
             ),
@@ -616,19 +651,26 @@ mod tests {
         );
         // Only private hops: the leftmost is the client.
         assert_eq!(
-            client_ip(peer, &trusted, None, ["10.139.4.5, 10.42.1.90"]),
+            client_ip(peer, &trusted, true, None, ["10.139.4.5, 10.42.1.90"]),
             Some(ip("10.139.4.5"))
         );
         // Junk behind a trusted hop: the last address read.
         assert_eq!(
-            client_ip(peer, &trusted, None, ["unknown, 10.42.1.90"]),
+            client_ip(peer, &trusted, true, None, ["unknown, 10.42.1.90"]),
             Some(ip("10.42.1.90"))
+        );
+        // Without walking (the default trusted list), a client on a private
+        // network can't hide behind an address it wrote itself: the proxy's
+        // entry for it is the answer.
+        assert_eq!(
+            client_ip(peer, &trusted, false, None, ["203.0.113.5, 10.139.121.5"]),
+            Some(ip("10.139.121.5"))
         );
         // Trusting only the tunnel's network keeps a private client
         // address as the client.
         let narrow = parse_network_list("10.42.0.0/16").0;
         assert_eq!(
-            client_ip(peer, &narrow, None, ["10.139.4.5, 10.42.1.90"]),
+            client_ip(peer, &narrow, true, None, ["10.139.4.5, 10.42.1.90"]),
             Some(ip("10.139.4.5"))
         );
     }
@@ -638,18 +680,18 @@ mod tests {
         let trusted = default_trusted();
         let peer = Some(ip("10.42.0.7"));
         assert_eq!(
-            client_ip(peer, &trusted, Some("203.0.113.9"), ["10.42.1.90"]),
+            client_ip(peer, &trusted, false, Some("203.0.113.9"), ["10.42.1.90"]),
             Some(ip("203.0.113.9"))
         );
         // Junk in the header falls back to X-Forwarded-For.
         assert_eq!(
-            client_ip(peer, &trusted, Some("nope"), ["198.51.100.4"]),
+            client_ip(peer, &trusted, false, Some("nope"), ["198.51.100.4"]),
             Some(ip("198.51.100.4"))
         );
         // From an untrusted peer the header is ignored.
         let outside = Some(ip("198.51.100.77"));
         assert_eq!(
-            client_ip(outside, &trusted, Some("203.0.113.9"), []),
+            client_ip(outside, &trusted, false, Some("203.0.113.9"), []),
             outside
         );
     }
