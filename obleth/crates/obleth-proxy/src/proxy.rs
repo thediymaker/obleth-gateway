@@ -15,7 +15,10 @@ use axum::extract::State;
 use axum::http::{header, HeaderMap, Method, Request, Response, StatusCode};
 use axum::response::IntoResponse;
 use futures_util::StreamExt;
-use obleth_config::{Admission, ResolvedEndpoint, ResolvedKey, ResolvedModel, UsageRecord};
+use obleth_config::{
+    Admission, KeyRejection, KeyRejectionReason, ResolvedEndpoint, ResolvedKey, ResolvedModel,
+    UsageRecord,
+};
 use obleth_tokenizer::{CostEstimate, Tokenizer};
 use tokio::time::timeout;
 use tracing::Instrument;
@@ -196,7 +199,8 @@ async fn responses_shim(
     };
     match crate::jwt_auth::authenticate_credential(&state, &secret).await {
         Ok(cred) => {
-            if let Err(resp) = gate_resolved_key(&state, &cred.resolved) {
+            let client = crate::client::ClientInfo::of(&parts.extensions);
+            if let Err(resp) = gate_resolved_key(&state, &cred.resolved, &client) {
                 return resp;
             }
         }
@@ -565,7 +569,8 @@ async fn messages_front(
     };
     match crate::jwt_auth::authenticate_credential(state, &secret).await {
         Ok(cred) => {
-            if let Err(resp) = gate_resolved_key(state, &cred.resolved) {
+            let client = crate::client::ClientInfo::of(&parts.extensions);
+            if let Err(resp) = gate_resolved_key(state, &cred.resolved, &client) {
                 return Err(redress_error(resp).await);
             }
         }
@@ -1143,7 +1148,13 @@ async fn run_pipeline(
         }
     };
     let auth_duration = (crate::tracer::now_ms() - auth_start) as u32;
-    if let Err(resp) = gate_resolved_key(&state, &resolved) {
+    // A batch item runs for an owner checked when the batch was submitted.
+    let client = if batch.is_some() {
+        crate::client::ClientInfo::in_process()
+    } else {
+        crate::client::ClientInfo::of(&parts.extensions)
+    };
+    if let Err(resp) = gate_resolved_key(&state, &resolved, &client) {
         return resp;
     }
 
@@ -1371,6 +1382,7 @@ async fn run_pipeline(
         // Set where a failure's status is chosen.
         failure: None,
         crash_fp: String::new(),
+        client: client.clone(),
     };
     // Surface the conversation id on the OTLP/Jaeger root span for cross-request
     // grouping (the field is declared Empty on the #[instrument] below).
@@ -7076,6 +7088,9 @@ pub(crate) struct RequestMeta {
     /// The crash guard's fingerprint of the request body, or empty when the
     /// guard does not watch it; see [`crate::crash_guard`].
     pub(crate) crash_fp: String,
+    /// Where the request came from, for the ledger's client columns. Unknown
+    /// (empty) for work the gateway runs itself.
+    pub(crate) client: crate::client::ClientInfo,
 }
 
 /// The name a response cache entry is keyed by.
@@ -7523,6 +7538,10 @@ pub(crate) fn finalize(
         streamed: meta.streamed,
         error_class: error_class.to_string(),
         error_reason,
+        client_ip: meta.client.ip_string(),
+        client_network: meta.client.network(),
+        client_country: meta.client.country.clone(),
+        user_agent: meta.client.user_agent.clone(),
     });
 }
 
@@ -7547,9 +7566,14 @@ fn cached_response(cached: obleth_config::CachedResponse, request_id: Uuid) -> R
 }
 
 /// Post-auth key/tenant gates shared by the passthrough pipeline and native
-/// endpoints (e.g. `/v1/verdicts`): key disabled, tenant lifecycle status,
-/// the activation/expiry/weekly schedule window, and the near-expiry operator
-/// alert. Internal probe keys bypass tenant lifecycle gating.
+/// endpoints (e.g. `/v1/verdicts`): key disabled, the key's allowed networks,
+/// tenant lifecycle status, the activation/expiry/weekly schedule window, and
+/// the near-expiry operator alert. Internal probe keys bypass tenant lifecycle
+/// gating. Every data-plane surface that authenticates a credential calls
+/// this right after `authenticate_credential`, with the client the request
+/// came from; a refusal of a real key for being disabled or used from outside
+/// its networks is recorded in the `key_rejections` ledger (folded per key,
+/// address and reason, so a hammering client costs nothing extra).
 // The error is the finished response every caller returns as-is
 // (`return resp`); boxing it would push a deref into each call site for a
 // rejection path that is cold anyway.
@@ -7557,9 +7581,15 @@ fn cached_response(cached: obleth_config::CachedResponse, request_id: Uuid) -> R
 pub(crate) fn gate_resolved_key(
     state: &AppState,
     resolved: &ResolvedKey,
+    client: &crate::client::ClientInfo,
 ) -> Result<(), Response<Body>> {
     if resolved.disabled {
+        record_key_rejection(state, resolved, client, KeyRejectionReason::Disabled);
         return Err(error_json(StatusCode::FORBIDDEN, "api key disabled"));
+    }
+    if !client_network_allowed(resolved, client) {
+        record_key_rejection(state, resolved, client, KeyRejectionReason::IpNotAllowed);
+        return Err(ip_not_allowed_response(client));
     }
     if !resolved.internal && resolved.status != "active" {
         return Err(error_json(StatusCode::FORBIDDEN, "tenant is not active"));
@@ -7591,6 +7621,60 @@ pub(crate) fn gate_resolved_key(
         }
     }
     Ok(())
+}
+
+/// Whether the key's network limits admit this client. Work the gateway runs
+/// for an owner it already checked (a batch item) is not checked again.
+pub(crate) fn client_network_allowed(
+    resolved: &ResolvedKey,
+    client: &crate::client::ClientInfo,
+) -> bool {
+    client.in_process || obleth_config::network::ip_allowed(&resolved.allowed_networks, client.ip)
+}
+
+/// `403 ip_not_allowed`, in OpenAI's error shape, naming the address the
+/// request came from so its owner can see why.
+pub(crate) fn ip_not_allowed_response(client: &crate::client::ClientInfo) -> Response<Body> {
+    let from = client
+        .ip
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "an unknown address".to_string());
+    let body = serde_json::json!({ "error": {
+        "message": format!(
+            "This API key can't be used from {from}. Its owner limited it to certain networks."
+        ),
+        "type": GATEWAY_ERROR_TYPE,
+        "param": null,
+        "code": "ip_not_allowed",
+    } });
+    (StatusCode::FORBIDDEN, axum::Json(body)).into_response()
+}
+
+/// Note a refused use of a real key in the `key_rejections` ledger. Never
+/// waits: the sink folds it into the current window in memory. Gateway-owned
+/// probe keys and work the gateway runs itself are not client uses.
+fn record_key_rejection(
+    state: &AppState,
+    resolved: &ResolvedKey,
+    client: &crate::client::ClientInfo,
+    reason: KeyRejectionReason,
+) {
+    if resolved.internal || client.in_process {
+        return;
+    }
+    state.telemetry.record_rejection(KeyRejection {
+        ts_ms: now_ms(),
+        key_id: resolved.key_id,
+        key_name: resolved.key_name.clone(),
+        tenant_id: resolved.tenant_id,
+        tenant_name: resolved.tenant_name.clone(),
+        reason,
+        client_ip: client.ip_string(),
+        client_country: client.country.clone(),
+        user_agent: client.user_agent.clone(),
+        path: client.path.clone(),
+        count: 1,
+    });
 }
 
 /// The `type` of an error the gateway itself reports, in OpenAI's error shape.
@@ -7709,6 +7793,7 @@ mod tests {
             guardrails_policy: None,
             compression_policy: None,
             synthetic: false,
+            allowed_networks: Vec::new(),
         }
     }
 
@@ -10262,6 +10347,7 @@ mod tests {
             streamed: false,
             failure: None,
             crash_fp: String::new(),
+            client: crate::client::ClientInfo::default(),
         };
         assert_eq!(meta.device_id, "dev-1");
     }
@@ -10774,6 +10860,7 @@ mod lifecycle_tests {
             streamed: false,
             failure: None,
             crash_fp: String::new(),
+            client: crate::client::ClientInfo::default(),
         };
         super::record_called_name(&mut meta, Some("acme"), Some("acme"));
         assert_eq!(meta.model_family, "acme");

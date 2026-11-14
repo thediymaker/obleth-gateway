@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clickhouse::{Client, Row};
-use obleth_config::UsageRecord;
+use obleth_config::{KeyRejection, KeyRejectionReason, UsageRecord};
 use serde::{Deserialize, Serialize};
 mod wal;
 use tokio::sync::{mpsc, oneshot};
@@ -48,6 +48,19 @@ const SCHEMA_WARN_INTERVAL: Duration = Duration::from_secs(60);
 /// `error!`. Failing this persistently is much more likely a configuration
 /// problem (bad grants, DDL the user can't run) than a transient outage.
 const SCHEMA_FAILURE_ALERT_THRESHOLD: u64 = 10;
+/// Days a client address and User-Agent are kept on a ledger row, unless
+/// `OBLETH_CLIENT_IP_RETENTION_DAYS` says otherwise. The rest of the row,
+/// country included, stays as long as the row does.
+pub const DEFAULT_CLIENT_IP_RETENTION_DAYS: u32 = 90;
+/// `usage_meta` key recording the client address retention the column TTLs
+/// were last set to, so a changed setting is applied once, not on every boot.
+const CLIENT_IP_TTL_META: &str = "client_ip_ttl_days";
+/// Refused uses of one key from one address for one reason are folded into
+/// one `key_rejections` row per window of this length.
+pub const REJECTION_WINDOW: Duration = Duration::from_secs(10);
+/// Distinct (key, address, reason) rows held per window. A flood from more
+/// addresses than this within one window is counted, not stored.
+const REJECTION_WINDOW_MAX_ROWS: usize = 10_000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TelemetryError {
@@ -105,6 +118,10 @@ struct UsageRow<'a> {
     streamed: bool,
     error_class: &'a str,
     error_reason: &'a str,
+    client_ip: &'a str,
+    client_network: &'a str,
+    client_country: &'a str,
+    user_agent: &'a str,
 }
 
 impl<'a> From<&'a UsageRecord> for UsageRow<'a> {
@@ -145,6 +162,10 @@ impl<'a> From<&'a UsageRecord> for UsageRow<'a> {
             streamed: r.streamed,
             error_class: &r.error_class,
             error_reason: &r.error_reason,
+            client_ip: &r.client_ip,
+            client_network: &r.client_network,
+            client_country: &r.client_country,
+            user_agent: &r.user_agent,
         }
     }
 }
@@ -238,6 +259,8 @@ pub struct TelemetrySink {
     /// "connected, schema applied" from "up in spill mode" right after boot,
     /// without reaching into the flusher task.
     schema_ready: Arc<AtomicBool>,
+    /// Refused uses of real keys, folded per window (see [`RejectionWindow`]).
+    rejections: Arc<RejectionFlusher>,
 }
 
 impl TelemetrySink {
@@ -309,10 +332,17 @@ impl TelemetrySink {
             flush_interval,
             stats: stats.clone(),
         };
+        let rejections = Arc::new(RejectionFlusher {
+            client: spans_flusher.client.clone(),
+            schema_ready: schema_ready.clone(),
+            window: std::sync::Mutex::new(RejectionWindow::default()),
+            stats: stats.clone(),
+        });
         let (drain, drain_rx) = mpsc::channel(4);
         let (drain_spans, drain_spans_rx) = mpsc::channel(4);
         tokio::spawn(flusher.run(rx, drain_rx));
         tokio::spawn(spans_flusher.run(rx_spans, drain_spans_rx));
+        tokio::spawn(rejections.clone().run());
         Ok(TelemetrySink {
             tx,
             tx_spans,
@@ -320,6 +350,7 @@ impl TelemetrySink {
             drain_spans,
             stats,
             schema_ready,
+            rejections,
         })
     }
 
@@ -353,6 +384,13 @@ impl TelemetrySink {
         let _ = self.tx_spans.try_send(span);
     }
 
+    /// Record a refused use of a real key. Never waits on ClickHouse: the
+    /// refusal is folded into the current window in memory (one row per key,
+    /// address and reason, with a count) and written when the window closes.
+    pub fn record_rejection(&self, rejection: KeyRejection) {
+        self.rejections.add(rejection);
+    }
+
     /// Write everything recorded so far before the process exits, bounded so a
     /// wedged ledger can't hold exit. Each flusher drains its queue and runs a
     /// final flush (ClickHouse, or the WAL if the insert fails) before acking.
@@ -369,6 +407,7 @@ impl TelemetrySink {
             for done in acks {
                 let _ = done.await;
             }
+            self.rejections.flush().await;
         })
         .await;
         if drained.is_err() {
@@ -629,6 +668,183 @@ impl Backoff {
     }
 }
 
+/// Refusals of real keys gathered over one [`REJECTION_WINDOW`]: at most
+/// one row per (key, client address, reason), whose `count` grows with each
+/// repeat. A client hammering a disabled key therefore costs one map update
+/// per request and one ledger row per window, never a row per request.
+#[derive(Default)]
+struct RejectionWindow {
+    rows: std::collections::HashMap<(Uuid, String, KeyRejectionReason), KeyRejection>,
+    /// Refusals not stored because the window was already full.
+    overflow: u64,
+}
+
+impl RejectionWindow {
+    fn add(&mut self, rejection: KeyRejection) {
+        let id = (
+            rejection.key_id,
+            rejection.client_ip.clone(),
+            rejection.reason,
+        );
+        if let Some(row) = self.rows.get_mut(&id) {
+            row.count = row.count.saturating_add(rejection.count.max(1));
+            return;
+        }
+        if self.rows.len() >= REJECTION_WINDOW_MAX_ROWS {
+            self.overflow = self.overflow.saturating_add(rejection.count.max(1));
+            return;
+        }
+        let mut rejection = rejection;
+        rejection.count = rejection.count.max(1);
+        self.rows.insert(id, rejection);
+    }
+
+    /// The window's rows, oldest first, leaving it empty.
+    fn take(&mut self) -> (Vec<KeyRejection>, u64) {
+        let mut rows: Vec<KeyRejection> = self.rows.drain().map(|(_, r)| r).collect();
+        rows.sort_by_key(|r| r.ts_ms);
+        (rows, std::mem::take(&mut self.overflow))
+    }
+}
+
+/// Borrowed ClickHouse row mirror of [`KeyRejection`].
+#[derive(Debug, Row, Serialize)]
+struct KeyRejectionRow<'a> {
+    ts_ms: i64,
+    #[serde(with = "clickhouse::serde::uuid")]
+    key_id: Uuid,
+    key_name: &'a str,
+    #[serde(with = "clickhouse::serde::uuid")]
+    tenant_id: Uuid,
+    tenant_name: &'a str,
+    reason: &'a str,
+    client_ip: &'a str,
+    client_country: &'a str,
+    user_agent: &'a str,
+    path: &'a str,
+    count: u64,
+}
+
+impl<'a> From<&'a KeyRejection> for KeyRejectionRow<'a> {
+    fn from(r: &'a KeyRejection) -> Self {
+        KeyRejectionRow {
+            ts_ms: r.ts_ms,
+            key_id: r.key_id,
+            key_name: &r.key_name,
+            tenant_id: r.tenant_id,
+            tenant_name: &r.tenant_name,
+            reason: r.reason.as_str(),
+            client_ip: &r.client_ip,
+            client_country: &r.client_country,
+            user_agent: &r.user_agent,
+            path: &r.path,
+            count: r.count,
+        }
+    }
+}
+
+/// Writes each closed [`RejectionWindow`] to `key_rejections`. Like spans,
+/// these rows are best effort: a failed insert is logged and dropped, never
+/// retried in the request path.
+struct RejectionFlusher {
+    client: Client,
+    schema_ready: Arc<AtomicBool>,
+    window: std::sync::Mutex<RejectionWindow>,
+    stats: Arc<TelemetryStats>,
+}
+
+impl RejectionFlusher {
+    fn add(&self, rejection: KeyRejection) {
+        // Never held across an await; a poisoned lock still holds a usable map.
+        let mut window = self
+            .window
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        window.add(rejection);
+    }
+
+    async fn run(self: Arc<Self>) {
+        let mut ticker = tokio::time::interval_at(
+            tokio::time::Instant::now() + REJECTION_WINDOW,
+            REJECTION_WINDOW,
+        );
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            self.flush().await;
+        }
+    }
+
+    async fn flush(&self) {
+        let (rows, overflow) = {
+            let mut window = self
+                .window
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            window.take()
+        };
+        if overflow > 0 {
+            tracing::warn!(
+                overflow,
+                "refused key uses from too many addresses in one window; some were counted but not recorded"
+            );
+        }
+        if rows.is_empty() {
+            return;
+        }
+        if !self.schema_ready.load(Ordering::Acquire) {
+            self.stats
+                .dropped
+                .fetch_add(rows.len() as u64, Ordering::Relaxed);
+            tracing::debug!(
+                count = rows.len(),
+                "key rejections dropped; clickhouse schema not ready"
+            );
+            return;
+        }
+        let insert = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut ins = self.client.insert("key_rejections")?;
+            for row in &rows {
+                ins.write(&KeyRejectionRow::from(row)).await?;
+            }
+            ins.end().await?;
+            Ok::<(), clickhouse::error::Error>(())
+        })
+        .await;
+        match insert {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, count = rows.len(), "key rejections insert failed")
+            }
+            Err(_) => tracing::warn!(count = rows.len(), "key rejections insert timed out"),
+        }
+    }
+}
+
+/// Days client addresses and User-Agents are kept on ledger rows:
+/// `OBLETH_CLIENT_IP_RETENTION_DAYS`, else [`DEFAULT_CLIENT_IP_RETENTION_DAYS`].
+/// Clamped to 1..=3650 days.
+pub fn client_ip_retention_days() -> u32 {
+    parse_retention_days(
+        std::env::var("OBLETH_CLIENT_IP_RETENTION_DAYS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn parse_retention_days(raw: Option<&str>) -> u32 {
+    raw.and_then(|v| v.trim().parse::<u32>().ok())
+        .map(|d| d.clamp(1, 3650))
+        .unwrap_or(DEFAULT_CLIENT_IP_RETENTION_DAYS)
+}
+
+/// The column TTL clause that expires a client-identifying column `days`
+/// after its row was written. Only the column is cleared (to its default,
+/// `''`); the row stays.
+fn client_ip_ttl(days: u32) -> String {
+    format!("TTL toDate(fromUnixTimestamp64Milli(ts_ms)) + INTERVAL {days} DAY")
+}
+
 struct SpansFlusher {
     client: Client,
     schema_ready: Arc<AtomicBool>,
@@ -744,6 +960,8 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
         .query(&format!("CREATE DATABASE IF NOT EXISTS {database}"))
         .execute()
         .await?;
+    let ip_days = client_ip_retention_days();
+    let ip_ttl = client_ip_ttl(ip_days);
     let ddl = format!(
         "CREATE TABLE IF NOT EXISTS {database}.usage (
             request_id UUID,
@@ -781,6 +999,10 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
             streamed Bool DEFAULT false,
             error_class LowCardinality(String) DEFAULT '',
             error_reason String DEFAULT '',
+            client_ip String DEFAULT '' {ip_ttl},
+            client_network String DEFAULT '' {ip_ttl},
+            client_country LowCardinality(String) DEFAULT '',
+            user_agent String DEFAULT '' {ip_ttl},
             ts DateTime64(3) MATERIALIZED fromUnixTimestamp64Milli(ts_ms),
             INDEX idx_ts_ms ts_ms TYPE minmax GRANULARITY 4
         ) ENGINE = MergeTree()
@@ -924,6 +1146,23 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
             .execute()
             .await?;
     }
+    // Where each request came from. The address, its network and the
+    // User-Agent identify a person more than the rest of the row does, so
+    // they expire after the client address retention (column TTL: cleared
+    // to '', the row stays); the country is kept as long as the row.
+    for column in [
+        format!("client_ip String DEFAULT '' {ip_ttl}"),
+        format!("client_network String DEFAULT '' {ip_ttl}"),
+        "client_country LowCardinality(String) DEFAULT ''".to_string(),
+        format!("user_agent String DEFAULT '' {ip_ttl}"),
+    ] {
+        client
+            .query(&format!(
+                "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS {column}"
+            ))
+            .execute()
+            .await?;
+    }
     // Required for `insert_deduplication_token` on a non-replicated table: an
     // insert that timed out after committing is replayed from the WAL with the
     // same token, and ClickHouse discards the duplicate.
@@ -946,6 +1185,7 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
         .execute()
         .await?;
     ensure_daily_rollup(client, database).await?;
+    ensure_key_watch(client, database, ip_days).await?;
     client
         .query(&format!(
             "CREATE TABLE IF NOT EXISTS {database}.spans (
@@ -1243,6 +1483,122 @@ async fn view_matches(
     Ok(matches == Some(1))
 }
 
+/// Tables that let an account system watch where its keys are used from.
+///
+/// - `key_rejections`: refused uses of real keys (disabled, or outside the
+///   key's allowed networks), one row per key, address and reason per
+///   [`REJECTION_WINDOW`], with a count.
+/// - `key_country_seen`: the first and last time each key was seen from each
+///   country, kept forever (the raw ledger is pruned, this is not), fed by a
+///   materialized view on `usage`. Rows written before countries were
+///   recorded have none, so it starts empty.
+///
+/// Then, when the client address retention changed since the column TTLs
+/// were last set, moves every client-identifying column to the new TTL once.
+async fn ensure_key_watch(
+    client: &Client,
+    database: &str,
+    ip_days: u32,
+) -> Result<(), TelemetryError> {
+    let ip_ttl = client_ip_ttl(ip_days);
+    client
+        .query(&format!(
+            "CREATE TABLE IF NOT EXISTS {database}.key_rejections (
+                ts_ms Int64,
+                key_id UUID,
+                key_name String DEFAULT '',
+                tenant_id UUID,
+                tenant_name String DEFAULT '',
+                reason LowCardinality(String),
+                client_ip String DEFAULT '' {ip_ttl},
+                client_country LowCardinality(String) DEFAULT '',
+                user_agent String DEFAULT '' {ip_ttl},
+                path String DEFAULT '',
+                count UInt64 DEFAULT 1,
+                ts DateTime64(3) MATERIALIZED fromUnixTimestamp64Milli(ts_ms)
+            ) ENGINE = MergeTree()
+            PARTITION BY toYYYYMM(ts)
+            ORDER BY (key_id, ts_ms)"
+        ))
+        .execute()
+        .await?;
+    client
+        .query(&format!(
+            "CREATE TABLE IF NOT EXISTS {database}.key_country_seen (
+                key_id UUID,
+                client_country LowCardinality(String),
+                first_seen_ms SimpleAggregateFunction(min, Int64),
+                last_seen_ms SimpleAggregateFunction(max, Int64)
+            ) ENGINE = AggregatingMergeTree()
+            ORDER BY (key_id, client_country)"
+        ))
+        .execute()
+        .await?;
+    client
+        .query(&format!(
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS {database}.key_country_seen_mv
+            TO {database}.key_country_seen AS
+            SELECT key_id, client_country,
+                   min(ts_ms) AS first_seen_ms, max(ts_ms) AS last_seen_ms
+            FROM {database}.usage
+            WHERE client_country != ''
+            GROUP BY key_id, client_country"
+        ))
+        .execute()
+        .await?;
+
+    // The TTL a column was created with is the retention in force when it
+    // was added, recorded here the first time. A later change is applied with
+    // one MODIFY per column; ClickHouse then re-evaluates the TTL on existing
+    // parts in the background.
+    let applied = meta_latest(client, database, CLIENT_IP_TTL_META).await?;
+    let wanted = ip_days.to_string();
+    match applied {
+        Some(days) if days == wanted => {}
+        None => meta_put(client, database, CLIENT_IP_TTL_META, &wanted).await?,
+        Some(previous) => {
+            for (table, column) in [
+                ("usage", "client_ip"),
+                ("usage", "client_network"),
+                ("usage", "user_agent"),
+                ("key_rejections", "client_ip"),
+                ("key_rejections", "user_agent"),
+            ] {
+                client
+                    .query(&format!(
+                        "ALTER TABLE {database}.{table} MODIFY COLUMN {column} String DEFAULT '' {ip_ttl}"
+                    ))
+                    .execute()
+                    .await?;
+            }
+            meta_put(client, database, CLIENT_IP_TTL_META, &wanted).await?;
+            tracing::info!(
+                from_days = %previous,
+                to_days = ip_days,
+                "client address retention changed; column TTLs updated"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The most recently written value under `key` in `usage_meta`, if any.
+async fn meta_latest(
+    client: &Client,
+    database: &str,
+    key: &str,
+) -> Result<Option<String>, TelemetryError> {
+    let rows = client
+        .query(&format!(
+            "SELECT value FROM {database}.usage_meta WHERE key = ? \
+             ORDER BY updated_at DESC LIMIT 1"
+        ))
+        .bind(key)
+        .fetch_all::<String>()
+        .await?;
+    Ok(rows.into_iter().next())
+}
+
 async fn meta_count(client: &Client, database: &str, key: &str) -> Result<u64, TelemetryError> {
     Ok(client
         .query(&format!(
@@ -1344,6 +1700,10 @@ mod conv_tests {
             streamed: false,
             error_class: String::new(),
             error_reason: String::new(),
+            client_ip: String::new(),
+            client_network: String::new(),
+            client_country: String::new(),
+            user_agent: String::new(),
         }
     }
 
@@ -1574,6 +1934,10 @@ mod conv_tests {
             streamed: false,
             error_class: String::new(),
             error_reason: String::new(),
+            client_ip: String::new(),
+            client_network: String::new(),
+            client_country: String::new(),
+            user_agent: String::new(),
         };
         let row = UsageRow::from(&rec);
         assert_eq!(row.session_id_source, "derived");
@@ -1618,6 +1982,10 @@ mod conv_tests {
             streamed: false,
             error_class: String::new(),
             error_reason: String::new(),
+            client_ip: String::new(),
+            client_network: String::new(),
+            client_country: String::new(),
+            user_agent: String::new(),
         };
         rec.energy_wh = 1.5;
         rec.energy_cost_usd = 0.0002;
@@ -1674,6 +2042,138 @@ mod conv_tests {
         assert_eq!(
             (row.key_name, row.tenant_name),
             ("alice-notebook-1700000000000", "research")
+        );
+    }
+
+    #[test]
+    fn usage_row_carries_the_client() {
+        let mut rec = record();
+        rec.client_ip = "203.0.113.9".into();
+        rec.client_network = "203.0.113.0/24".into();
+        rec.client_country = "DE".into();
+        rec.user_agent = "curl/8.0".into();
+        let row = UsageRow::from(&rec);
+        assert_eq!(
+            (
+                row.client_ip,
+                row.client_network,
+                row.client_country,
+                row.user_agent
+            ),
+            ("203.0.113.9", "203.0.113.0/24", "DE", "curl/8.0")
+        );
+        // A WAL record written before the columns existed replays as unknown.
+        let mut old = serde_json::to_value(record()).unwrap();
+        for field in [
+            "client_ip",
+            "client_network",
+            "client_country",
+            "user_agent",
+        ] {
+            old.as_object_mut().unwrap().remove(field);
+        }
+        let old: UsageRecord = serde_json::from_value(old).unwrap();
+        assert_eq!(old.client_ip, "");
+        assert_eq!(old.client_country, "");
+    }
+
+    fn rejection(key: u128, ip: &str, reason: KeyRejectionReason, ts_ms: i64) -> KeyRejection {
+        KeyRejection {
+            ts_ms,
+            key_id: Uuid::from_u128(key),
+            key_name: "k".into(),
+            tenant_id: Uuid::nil(),
+            tenant_name: "t".into(),
+            reason,
+            client_ip: ip.into(),
+            client_country: String::new(),
+            user_agent: "ua".into(),
+            path: "/v1/chat/completions".into(),
+            count: 1,
+        }
+    }
+
+    #[test]
+    fn rejections_fold_to_one_row_per_key_address_and_reason() {
+        let mut window = RejectionWindow::default();
+        for i in 0..1000 {
+            window.add(rejection(
+                1,
+                "203.0.113.9",
+                KeyRejectionReason::Disabled,
+                100 + i,
+            ));
+        }
+        window.add(rejection(
+            1,
+            "203.0.113.9",
+            KeyRejectionReason::IpNotAllowed,
+            50,
+        ));
+        window.add(rejection(
+            1,
+            "198.51.100.1",
+            KeyRejectionReason::Disabled,
+            60,
+        ));
+        window.add(rejection(
+            2,
+            "203.0.113.9",
+            KeyRejectionReason::Disabled,
+            70,
+        ));
+        let (rows, overflow) = window.take();
+        assert_eq!(overflow, 0);
+        assert_eq!(rows.len(), 4);
+        // Oldest first; a folded row keeps its first refusal's time.
+        assert_eq!(
+            rows.iter().map(|r| r.ts_ms).collect::<Vec<_>>(),
+            [50, 60, 70, 100]
+        );
+        let hammered = rows.iter().find(|r| r.ts_ms == 100).unwrap();
+        assert_eq!(hammered.count, 1000);
+        assert!(rows.iter().filter(|r| r.ts_ms != 100).all(|r| r.count == 1));
+        // The window starts over empty.
+        assert_eq!(window.take().0.len(), 0);
+    }
+
+    #[test]
+    fn a_full_rejection_window_counts_instead_of_growing() {
+        let mut window = RejectionWindow::default();
+        for i in 0..(REJECTION_WINDOW_MAX_ROWS as u32 + 5) {
+            let ip = std::net::Ipv4Addr::from(i).to_string();
+            window.add(rejection(1, &ip, KeyRejectionReason::IpNotAllowed, 1));
+        }
+        // An address already in the window still folds.
+        window.add(rejection(1, "0.0.0.0", KeyRejectionReason::IpNotAllowed, 1));
+        let (rows, overflow) = window.take();
+        assert_eq!(rows.len(), REJECTION_WINDOW_MAX_ROWS);
+        assert_eq!(overflow, 5);
+        assert_eq!(
+            rows.iter().map(|r| r.count).sum::<u64>(),
+            REJECTION_WINDOW_MAX_ROWS as u64 + 1
+        );
+    }
+
+    #[test]
+    fn rejection_rows_name_the_reason() {
+        let r = rejection(1, "203.0.113.9", KeyRejectionReason::IpNotAllowed, 1);
+        assert_eq!(KeyRejectionRow::from(&r).reason, "ip_not_allowed");
+        let r = rejection(1, "203.0.113.9", KeyRejectionReason::Disabled, 1);
+        assert_eq!(KeyRejectionRow::from(&r).reason, "disabled");
+    }
+
+    #[test]
+    fn client_address_retention_defaults_to_90_days_and_is_clamped() {
+        assert_eq!(parse_retention_days(None), 90);
+        assert_eq!(parse_retention_days(Some("30")), 30);
+        assert_eq!(parse_retention_days(Some(" 7 ")), 7);
+        assert_eq!(parse_retention_days(Some("0")), 1);
+        assert_eq!(parse_retention_days(Some("999999")), 3650);
+        assert_eq!(parse_retention_days(Some("soon")), 90);
+        assert_eq!(
+            client_ip_ttl(90),
+            "TTL toDate(fromUnixTimestamp64Milli(ts_ms)) + INTERVAL 90 DAY"
         );
     }
 
@@ -1798,6 +2298,85 @@ mod clickhouse_tests {
             .execute()
             .await
             .unwrap();
+    }
+
+    /// Client columns, their TTLs, the rejections ledger and the per-country
+    /// first-seen table come up on a fresh database and on a second boot,
+    /// and a changed retention moves the TTLs once.
+    #[tokio::test]
+    async fn client_columns_and_key_watch_tables_are_applied_idempotently() {
+        let Some((client, database)) = fixture() else {
+            return;
+        };
+        ensure_schema(&client, &database).await.unwrap();
+        ensure_schema(&client, &database).await.unwrap();
+        let flusher = flusher(&client, &database);
+        let mut rec = record(1);
+        rec.key_id = Uuid::from_u128(7);
+        rec.client_ip = "203.0.113.9".into();
+        rec.client_network = "203.0.113.0/24".into();
+        rec.client_country = "DE".into();
+        rec.user_agent = "curl/8.0".into();
+        flusher.insert(&[rec]).await.unwrap();
+        let ip: String = client
+            .query(&format!("SELECT client_ip FROM {database}.usage"))
+            .fetch_one()
+            .await
+            .unwrap();
+        assert_eq!(ip, "203.0.113.9");
+        let seen =
+            format!("SELECT count() FROM {database}.key_country_seen WHERE client_country = 'DE'");
+        assert_eq!(scalar(&client, &seen).await, 1);
+        let create: String = client
+            .query("SELECT create_table_query FROM system.tables WHERE database = ? AND name = 'usage'")
+            .bind(&database)
+            .fetch_one()
+            .await
+            .unwrap();
+        assert!(create.contains("INTERVAL 90 DAY"), "{create}");
+
+        let rejections = RejectionFlusher {
+            client: client.clone().with_database(&database),
+            schema_ready: Arc::new(AtomicBool::new(true)),
+            window: std::sync::Mutex::new(RejectionWindow::default()),
+            stats: Arc::default(),
+        };
+        let mut r = KeyRejection {
+            ts_ms: 1_750_000_000_000,
+            key_id: Uuid::from_u128(7),
+            key_name: "k".into(),
+            tenant_id: Uuid::nil(),
+            tenant_name: "t".into(),
+            reason: KeyRejectionReason::IpNotAllowed,
+            client_ip: "198.51.100.1".into(),
+            client_country: "US".into(),
+            user_agent: "ua".into(),
+            path: "/v1/models".into(),
+            count: 1,
+        };
+        rejections.add(r.clone());
+        r.ts_ms += 5;
+        rejections.add(r);
+        rejections.flush().await;
+        let rows = format!("SELECT count() FROM {database}.key_rejections");
+        let total = format!("SELECT sum(count) FROM {database}.key_rejections");
+        assert_eq!(scalar(&client, &rows).await, 1);
+        assert_eq!(scalar(&client, &total).await, 2);
+
+        // A changed retention is applied to the columns once.
+        meta_put(&client, &database, CLIENT_IP_TTL_META, "30")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        ensure_key_watch(&client, &database, 90).await.unwrap();
+        assert_eq!(
+            meta_latest(&client, &database, CLIENT_IP_TTL_META)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("90")
+        );
+        drop_database(&client, &database).await;
     }
 
     #[tokio::test]

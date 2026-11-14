@@ -89,6 +89,9 @@ spec:
             - { name: OBLETH_MODEL_HEALTH_TIMEOUT_SECS, value: {{ .Values.obleth.modelHealthTimeoutSecs | quote }} }
             - { name: OBLETH_MODEL_HEALTH_RETENTION_DAYS, value: {{ .Values.obleth.modelHealthRetentionDays | quote }} }
             - { name: OBLETH_USAGE_RETENTION_DAYS, value: {{ .Values.obleth.usageRetentionDays | quote }} }
+            - { name: OBLETH_TRUSTED_PROXIES, value: {{ .Values.obleth.clientAddress.trustedProxies | default "" | quote }} }
+            - { name: OBLETH_CLIENT_COUNTRY_HEADER, value: {{ .Values.obleth.clientAddress.countryHeader | quote }} }
+            - { name: OBLETH_CLIENT_IP_RETENTION_DAYS, value: {{ .Values.obleth.clientAddress.ipRetentionDays | default 90 | quote }} }
             - { name: OBLETH_TELEMETRY_FLUSH_INTERVAL_MS, value: {{ .Values.obleth.telemetryFlushIntervalMs | default 5000 | quote }} }
             - { name: OBLETH_OTEL_ENDPOINT, value: {{ .Values.obleth.otelEndpoint | quote }} }
             - { name: OBLETH_SLACK_ALERT_MIN_INTERVAL_SECS, value: {{ .Values.obleth.slackAlertMinIntervalSecs | quote }} }

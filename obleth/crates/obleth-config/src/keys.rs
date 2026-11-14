@@ -43,18 +43,82 @@ pub struct GeneratedKey {
     pub hash: String,
 }
 
-/// Generate a new API key: `sk_<48 hex chars>`.
+/// Marker every key minted today starts with. Keys minted before it (`sk_…`)
+/// and any other format an instance imported keep authenticating: only
+/// minting changed.
+pub const KEY_PREFIX: &str = "obl_";
+
+/// Hex characters of random secret after [`KEY_PREFIX`] (24 bytes).
+const KEY_RANDOM_HEX: usize = 48;
+
+/// Hex characters of the CRC-32 checksum that ends a key.
+const KEY_CHECKSUM_HEX: usize = 8;
+
+/// Total length of a well-formed `obl_` key.
+pub const KEY_LEN: usize = KEY_PREFIX.len() + KEY_RANDOM_HEX + KEY_CHECKSUM_HEX;
+
+/// Characters of a key kept for display (`ApiKey::key_prefix`).
+const DISPLAY_PREFIX_CHARS: usize = 18;
+
+/// CRC-32 (IEEE 802.3, the zlib/PNG polynomial) of `data`. Bitwise rather
+/// than table-driven: it runs once per minted key and once per `obl_`
+/// credential presented, on under 60 bytes.
+pub fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+/// Generate a new API key: `obl_` + 48 lowercase hex characters of random
+/// secret + 8 lowercase hex characters of CRC-32 over everything before them.
+/// The checksum lets the gateway refuse a mistyped or truncated key without
+/// a lookup, and lets secret scanners recognise a real key with few false
+/// positives.
 pub fn generate_api_key() -> GeneratedKey {
-    let mut bytes = [0u8; 24];
+    let mut bytes = [0u8; KEY_RANDOM_HEX / 2];
     rand::thread_rng().fill_bytes(&mut bytes);
-    let secret = format!("sk_{}", hex::encode(bytes));
-    let prefix = secret.chars().take(18).collect::<String>();
+    let body = format!("{KEY_PREFIX}{}", hex::encode(bytes));
+    let secret = format!("{body}{:08x}", crc32(body.as_bytes()));
+    let prefix = secret
+        .chars()
+        .take(DISPLAY_PREFIX_CHARS)
+        .collect::<String>();
     let hash = hash_api_key(&secret);
     GeneratedKey {
         secret,
         prefix,
         hash,
     }
+}
+
+/// True when `secret` is a well-formed `obl_` key: the prefix, 56 lowercase
+/// hex characters, and a checksum that matches. Says nothing about whether
+/// the key exists.
+pub fn is_well_formed_key(secret: &str) -> bool {
+    let Some(rest) = secret.strip_prefix(KEY_PREFIX) else {
+        return false;
+    };
+    if rest.len() != KEY_RANDOM_HEX + KEY_CHECKSUM_HEX
+        || !rest.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return false;
+    }
+    let (body, checksum) = secret.split_at(KEY_PREFIX.len() + KEY_RANDOM_HEX);
+    u32::from_str_radix(checksum, 16).is_ok_and(|c| c == crc32(body.as_bytes()))
+}
+
+/// True when a presented credential claims the `obl_` format but is not a
+/// well-formed key, so it can be refused before it is hashed or looked up.
+/// Any credential in another format (`sk_…` and the rest) is never refused
+/// here.
+pub fn is_malformed_key(secret: &str) -> bool {
+    secret.starts_with(KEY_PREFIX) && !is_well_formed_key(secret)
 }
 
 /// SHA-256 hex digest of a raw key, used as the lookup handle in Postgres + Redis.
@@ -133,10 +197,66 @@ mod tests {
     #[test]
     fn generated_key_is_well_formed() {
         let k = generate_api_key();
-        assert!(k.secret.starts_with("sk_"));
-        assert_eq!(k.prefix.len(), 18);
+        assert!(k.secret.starts_with("obl_"));
+        assert_eq!(k.secret.len(), KEY_LEN);
+        assert_eq!(KEY_LEN, 60);
+        assert!(k.secret[4..]
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+        assert!(is_well_formed_key(&k.secret));
+        assert!(!is_malformed_key(&k.secret));
+        assert_eq!(k.prefix, k.secret[..18]);
         assert_eq!(k.hash.len(), 64);
         assert_eq!(hash_api_key(&k.secret), k.hash);
+        assert_ne!(generate_api_key().secret, k.secret);
+    }
+
+    #[test]
+    fn crc32_matches_the_standard_check_value() {
+        // The CRC-32/ISO-HDLC check value every implementation agrees on.
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+        assert_eq!(crc32(b""), 0);
+    }
+
+    #[test]
+    fn checksum_covers_the_prefix_and_the_random_part() {
+        let body = format!("obl_{}", "0".repeat(48));
+        let good = format!("{body}{:08x}", crc32(body.as_bytes()));
+        assert!(is_well_formed_key(&good));
+
+        // One flipped hex digit anywhere fails the checksum.
+        let mut flipped = good.clone().into_bytes();
+        flipped[10] = b'1';
+        let flipped = String::from_utf8(flipped).unwrap();
+        assert!(is_malformed_key(&flipped));
+
+        let mut bad_sum = good.clone();
+        bad_sum.replace_range(56.., "00000000");
+        assert!(is_malformed_key(&bad_sum));
+
+        // Wrong length, upper case, non-hex: all malformed.
+        assert!(is_malformed_key(&good[..59]));
+        assert!(is_malformed_key(&format!("{good}0")));
+        assert!(is_malformed_key(
+            &good.to_uppercase().replace("OBL_", "obl_")
+        ));
+        assert!(is_malformed_key(&good.replace('0', "g")));
+        assert!(is_malformed_key("obl_"));
+    }
+
+    #[test]
+    fn other_formats_are_never_called_malformed() {
+        // Keys minted before `obl_` keep authenticating exactly as before.
+        assert!(!is_malformed_key(
+            "sk_0123456789abcdef0123456789abcdef0123456789abcdef"
+        ));
+        assert!(!is_malformed_key("sk_short"));
+        assert!(!is_malformed_key(
+            "eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJhIn0.sig"
+        ));
+        assert!(!is_malformed_key("OBL_upper-case-is-another-format"));
+        assert!(!is_malformed_key(""));
+        assert!(!is_well_formed_key("sk_0123"));
     }
 
     #[test]

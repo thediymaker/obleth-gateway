@@ -92,7 +92,7 @@ impl Store {
                     budget_tokens, budget_cost_usd, budget_period, budget_started_at,
                     disabled, created_at,
                     kind, identity_issuer, identity_subject, identity_claims,
-                    weight, max_in_flight, end_user_fairshare, background
+                    weight, max_in_flight, end_user_fairshare, background, allowed_networks
              from api_keys order by created_at",
         )
         .fetch_all(&self.pool)
@@ -122,6 +122,7 @@ impl Store {
                 max_in_flight: row.try_get("max_in_flight").unwrap_or(None),
                 end_user_fairshare: row.try_get("end_user_fairshare").unwrap_or(false),
                 background: row.try_get("background").unwrap_or(false),
+                allowed_networks: row.try_get("allowed_networks")?,
                 disabled: row.try_get("disabled")?,
                 created_at: row.try_get("created_at")?,
             })
@@ -369,9 +370,9 @@ impl Store {
                         budget_tokens, budget_cost_usd, budget_period, budget_started_at,
                         disabled, created_at, kind, identity_issuer, identity_subject,
                         identity_claims, weight, max_in_flight, end_user_fairshare,
-                        background)
+                        background, allowed_networks)
                  values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                         $17, $18, $19, $20)
+                         $17, $18, $19, $20, $21)
                  on conflict (id) do update set
                         tenant_id = excluded.tenant_id,
                         name = excluded.name,
@@ -391,6 +392,7 @@ impl Store {
                         max_in_flight = excluded.max_in_flight,
                         end_user_fairshare = excluded.end_user_fairshare,
                         background = excluded.background,
+                        allowed_networks = excluded.allowed_networks,
                         updated_at = now()
                  returning (xmax = 0) as inserted",
             )
@@ -414,6 +416,7 @@ impl Store {
             .bind(k.max_in_flight)
             .bind(k.end_user_fairshare)
             .bind(k.background)
+            .bind(&k.allowed_networks)
             .fetch_one(&mut *tx)
             .await
             .map_err(restore_db_error)?;
@@ -1045,6 +1048,7 @@ mod tests {
                 None,
                 100,
                 None,
+                &["203.0.113.0/24".to_string(), "2001:db8::/48".to_string()],
             )
             .await
             .expect("create key");
@@ -1266,6 +1270,11 @@ mod tests {
             "export carries end_user_fairshare"
         );
         assert!(exported_key.background, "export carries background");
+        assert_eq!(
+            exported_key.allowed_networks,
+            vec!["203.0.113.0/24".to_string(), "2001:db8::/48".to_string()],
+            "export carries allowed_networks"
+        );
         let exported_tenant = data
             .tenants
             .iter()
@@ -1319,7 +1328,8 @@ mod tests {
             .await
             .expect("drift endpoint concurrency");
         sqlx::query(
-            "update api_keys set end_user_fairshare = false, background = false where id = $1",
+            "update api_keys set end_user_fairshare = false, background = false, \
+             allowed_networks = '{}' where id = $1",
         )
         .bind(key.id)
         .execute(&store.pool)
@@ -1335,6 +1345,14 @@ mod tests {
         assert!(
             restored_key.first().is_some_and(|k| k.background),
             "restore puts background back"
+        );
+        assert_eq!(
+            restored_key.first().map(|k| k.allowed_networks.clone()),
+            Some(vec![
+                "203.0.113.0/24".to_string(),
+                "2001:db8::/48".to_string()
+            ]),
+            "restore puts allowed_networks back"
         );
         let restored_model = store.get_model(model.id).await.expect("get model");
         assert_eq!(

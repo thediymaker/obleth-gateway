@@ -1,6 +1,6 @@
 //! Reconciling the resolver caches against Postgres.
 //!
-//! Resolver entries (`obleth:key:*`, `obleth:model:*`, `obleth:mcp:*`) carry no
+//! Resolver entries (`obleth:key2:*`, `obleth:model:*`, `obleth:mcp:*`) carry no
 //! TTL, so an entry whose eviction was missed (a Redis blip during a delete)
 //! would keep resolving forever. These helpers SCAN a namespace and delete every
 //! entry the caller's authoritative set does not list.

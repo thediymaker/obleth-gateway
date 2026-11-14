@@ -3,7 +3,8 @@
 import { useState, useTransition } from "react";
 import Link from "next/link";
 import { createKeyAction, moveKeysAction, setKeysBudgetAction, type BulkKeyResult } from "@/app/actions";
-import { Field, SelectField } from "@/components/models/fields";
+import { Field, SelectField, TextArea } from "@/components/models/fields";
+import { NETWORKS_HINT } from "@/lib/key-networks";
 import { Sheet } from "@/components/models/ui";
 import { Segmented } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
@@ -235,6 +236,11 @@ export function NewKeySheet({
         <div className="space-y-1.5">
           <span className="text-[12.5px] font-medium text-secondary-foreground">Budget period</span>
           <SelectField name="budget_period" label="Budget period" value={period} onChange={setPeriod} options={PERIOD_OPTIONS} />
+        </div>
+        <div className="space-y-1.5">
+          <span className="text-[12.5px] font-medium text-secondary-foreground">Allowed networks</span>
+          <TextArea name="allowed_networks" label="Allowed networks" rows={3} placeholder={"203.0.113.0/24\n2001:db8::/48"} />
+          <p className="text-[11.5px] leading-snug text-muted-foreground">{NETWORKS_HINT}</p>
         </div>
       </form>
     </Sheet>

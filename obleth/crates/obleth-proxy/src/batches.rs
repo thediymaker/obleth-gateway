@@ -1600,7 +1600,9 @@ async fn run_item(
             return;
         }
     };
-    if crate::proxy::gate_resolved_key(state, &resolved).is_err() {
+    if crate::proxy::gate_resolved_key(state, &resolved, &crate::client::ClientInfo::in_process())
+        .is_err()
+    {
         let _ = store
             .retry_batch_item(
                 &batch.id,

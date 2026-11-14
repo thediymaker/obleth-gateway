@@ -10,6 +10,7 @@ pub mod failure;
 pub mod jwt;
 pub mod keys;
 pub mod manifest;
+pub mod network;
 pub mod reasoning;
 pub mod routing;
 pub mod slurm;
@@ -25,8 +26,9 @@ pub use jwt::{
     JwtIssuerConfig, ALLOWED_JWT_ALGORITHMS, DEVICE_ID_MAX_LEN,
 };
 pub use keys::{
-    cache_key, content_hash, end_user_key_id, generate_api_key, hash_api_key, normalize_end_user,
-    pepper_is_set, GeneratedKey, END_USER_MAX_CHARS,
+    cache_key, content_hash, crc32, end_user_key_id, generate_api_key, hash_api_key,
+    is_malformed_key, is_well_formed_key, normalize_end_user, pepper_is_set, GeneratedKey,
+    END_USER_MAX_CHARS, KEY_LEN, KEY_PREFIX,
 };
 pub use manifest::{
     endpoint_to_manifest_entry, model_to_manifest_entry, resolve_endpoint, resolve_model,

@@ -11,12 +11,12 @@ use crate::model_health::{
     ValidateModelResult,
 };
 use crate::usage::{
-    CacheStats, CostAgg, KeyUsageSummary, KeyUsageSummaryQuery, ModelSpeedPoint,
-    ModelUsageTimePoint, TenantUsageTimePoint, UsageAgg, UsageBreakdownQuery, UsageDailyQuery,
-    UsageDailyRow, UsageFailureGroup, UsageFailureGroups, UsageKeyAgg, UsageKeyModelBreakdown,
-    UsageLogBucket, UsageLogFacet, UsageLogFacets, UsageLogFailure, UsageLogHistogram,
-    UsageLogQuery, UsageLogRow, UsageModelAgg, UsageQuery, UsageSeriesQuery, UsageSpeedQuery,
-    UsageTimePoint,
+    CacheStats, CostAgg, KeyRejectionAgg, KeySource, KeyUsageSummary, KeyUsageSummaryQuery,
+    KeyWatchQuery, ModelSpeedPoint, ModelUsageTimePoint, TenantUsageTimePoint, UsageAgg,
+    UsageBreakdownQuery, UsageDailyQuery, UsageDailyRow, UsageFailureGroup, UsageFailureGroups,
+    UsageKeyAgg, UsageKeyModelBreakdown, UsageLogBucket, UsageLogFacet, UsageLogFacets,
+    UsageLogFailure, UsageLogHistogram, UsageLogQuery, UsageLogRow, UsageModelAgg, UsageQuery,
+    UsageSeriesQuery, UsageSpeedQuery, UsageTimePoint,
 };
 use crate::{
     AlertSettingsView, ApplyAutotuneCapacity, AuditEntryView, AuditQuery, AutoRouterSettingsView,
@@ -87,6 +87,8 @@ use obleth_config::{
         crate::get_usage,
         crate::get_usage_keys,
         crate::get_usage_keys_summary,
+        crate::get_usage_key_sources,
+        crate::get_usage_key_rejections,
         crate::get_usage_models,
         crate::get_usage_series,
         crate::get_usage_series_tenants,
@@ -278,6 +280,9 @@ use obleth_config::{
         UsageDailyQuery,
         UsageLogQuery,
         KeyUsageSummaryQuery,
+        KeyWatchQuery,
+        KeySource,
+        KeyRejectionAgg,
         UsageAgg,
         UsageKeyAgg,
         UsageModelAgg,
@@ -503,7 +508,13 @@ mod tests {
             );
         }
         // The request log documents the new columns.
-        for field in ["parent_request_id", "model_variant"] {
+        for field in [
+            "parent_request_id",
+            "model_variant",
+            "client_ip",
+            "client_country",
+            "user_agent",
+        ] {
             assert!(
                 schemas["UsageLogRow"]["properties"][field].is_object(),
                 "UsageLogRow.{field} is not documented"

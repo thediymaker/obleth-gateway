@@ -25,6 +25,7 @@ import {
 } from "@/lib/access-model";
 import { logsHref } from "@/lib/log-links";
 import { money } from "@/lib/models-model";
+import { networksSummary } from "@/lib/key-networks";
 import type { ApiKey, BudgetUsage, KeyUsageSummary, Tenant } from "@/lib/obleth";
 import { compact } from "@/lib/overview-model";
 import { cn } from "@/lib/utils";
@@ -245,6 +246,7 @@ export function KeysList({
                     <span className="flex min-w-0 items-center gap-1.5">
                       <span className={cn("truncate font-medium", !k.disabled && "text-foreground")}>{k.name || k.key_prefix}</span>
                       {k.background && <Pill className="h-[18px] px-1.5 text-[10.5px]">Background</Pill>}
+                      {k.allowed_networks?.length ? <Pill className="h-[18px] px-1.5 text-[10.5px]">{networksSummary(k.allowed_networks)}</Pill> : null}
                     </span>
                     <span className="truncate font-mono text-[11.5px] text-muted-foreground">{k.kind === "identity" ? `identity · ${k.identity_subject ?? ""}` : `${k.key_prefix}…`}</span>
                   </button>

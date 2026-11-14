@@ -332,6 +332,13 @@ pub struct UsageLogRow {
     /// empty for a success. Rows written before failures were classified are
     /// filed by their status code.
     pub error_class: String,
+    /// The address the request came from; empty when unknown, on older rows,
+    /// and once the client address retention has passed.
+    pub client_ip: String,
+    /// Two-letter country the edge named for the client, or empty.
+    pub client_country: String,
+    /// The client's User-Agent; empty when unknown or past retention.
+    pub user_agent: String,
 }
 
 /// A bind value for the request-log filters, in placeholder order.
@@ -451,7 +458,7 @@ fn usage_log_select() -> String {
          energy_wh, energy_cost_usd, co2_g, parent_request_id, model_variant, \
          reasoning_effort, reasoning_effort_requested, model_family, \
          key_name as recorded_key_name, tenant_name as recorded_tenant_name, streamed, \
-         error_reason, {} as filed_class \
+         error_reason, {} as filed_class, client_ip, client_country, user_agent \
          from usage",
         obleth_config::EFFECTIVE_CLASS_SQL
     )
@@ -1307,6 +1314,293 @@ pub async fn query_keys_usage_summary(
     Ok(rows.into_iter().map(KeyUsageSummary::from).collect())
 }
 
+/// Longest window `key-sources` and `key-rejections` read, in milliseconds.
+pub const KEY_WATCH_MAX_WINDOW_MS: i64 = 31 * 86_400_000;
+
+/// Most rows `key-sources` and `key-rejections` return.
+const KEY_WATCH_MAX_ROWS: u64 = 10_000;
+
+/// Filters for the endpoints an account system polls to watch where its keys
+/// are used from (`/usage/key-sources`, `/usage/key-rejections`).
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
+pub struct KeyWatchQuery {
+    /// Window start, unix epoch millis. Defaults to 24 hours before
+    /// `until_ms`.
+    pub since_ms: Option<i64>,
+    /// Window end (exclusive), unix epoch millis. Defaults to now. The window
+    /// may be at most 31 days long.
+    pub until_ms: Option<i64>,
+    /// Only this tenant's keys.
+    #[schema(value_type = Option<String>)]
+    pub tenant_id: Option<Uuid>,
+    /// Only this key.
+    #[schema(value_type = Option<String>)]
+    pub key_id: Option<Uuid>,
+}
+
+impl KeyWatchQuery {
+    /// The window as `(since, until)`, or why it is not one.
+    pub fn window(&self, now: i64) -> Result<(i64, i64), String> {
+        let until = self.until_ms.unwrap_or(now);
+        let since = self.since_ms.unwrap_or(until - 86_400_000);
+        if since >= until {
+            return Err("since_ms must be before until_ms".into());
+        }
+        if until - since > KEY_WATCH_MAX_WINDOW_MS {
+            return Err("the window can be at most 31 days (since_ms to until_ms)".into());
+        }
+        Ok((since, until))
+    }
+
+    /// SQL predicates for the tenant and key filters on `table`, and the
+    /// values to bind for them, in order.
+    fn filters(&self, table: &str) -> (String, Vec<String>) {
+        let mut sql = String::new();
+        let mut binds = Vec::new();
+        if let Some(t) = self.tenant_id {
+            // Qualified so a SELECT alias can never shadow the column.
+            sql.push_str(&format!(" and {table}.tenant_id = toUUID(?)"));
+            binds.push(t.to_string());
+        }
+        if let Some(k) = self.key_id {
+            sql.push_str(&format!(" and {table}.key_id = toUUID(?)"));
+            binds.push(k.to_string());
+        }
+        (sql, binds)
+    }
+}
+
+/// One key's traffic from one network and country in the window.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct KeySource {
+    #[schema(value_type = String)]
+    pub key_id: Uuid,
+    pub key_name: String,
+    #[schema(value_type = String)]
+    pub tenant_id: Uuid,
+    pub tenant_name: String,
+    /// The client addresses' network: an IPv4 /24 or IPv6 /48, as CIDR text.
+    pub network: String,
+    /// Two-letter country the edge named, or empty when none was given.
+    pub client_country: String,
+    /// Requests from this network and country in the window.
+    pub requests: u64,
+    /// Distinct client addresses among them.
+    pub distinct_ips: u64,
+    /// The most recent of them, unix epoch millis.
+    pub last_seen_ms: i64,
+    /// The first time this key was ever seen from this country, across all
+    /// history the gateway kept since it began recording countries. `null`
+    /// when the country is empty.
+    pub first_seen_ms: Option<i64>,
+    /// The first time this key was seen from this network, as far back as
+    /// client addresses are kept (`OBLETH_CLIENT_IP_RETENTION_DAYS`).
+    pub network_first_seen_ms: Option<i64>,
+}
+
+#[derive(Debug, Row, Deserialize)]
+struct KeySourceRow {
+    #[serde(with = "clickhouse::serde::uuid")]
+    key_id: Uuid,
+    key_name: String,
+    #[serde(with = "clickhouse::serde::uuid")]
+    tenant_id: Uuid,
+    tenant_name: String,
+    network: String,
+    client_country: String,
+    requests: u64,
+    distinct_ips: u64,
+    last_seen_ms: i64,
+    country_first_ms: i64,
+    network_first_ms: i64,
+}
+
+impl From<KeySourceRow> for KeySource {
+    fn from(r: KeySourceRow) -> Self {
+        let seen = |ms: i64| (ms > 0).then_some(ms);
+        KeySource {
+            first_seen_ms: if r.client_country.is_empty() {
+                None
+            } else {
+                seen(r.country_first_ms)
+            },
+            network_first_seen_ms: seen(r.network_first_ms),
+            key_id: r.key_id,
+            key_name: r.key_name,
+            tenant_id: r.tenant_id,
+            tenant_name: r.tenant_name,
+            network: r.network,
+            client_country: r.client_country,
+            requests: r.requests,
+            distinct_ips: r.distinct_ips,
+            last_seen_ms: r.last_seen_ms,
+        }
+    }
+}
+
+/// The `key-sources` query, with the values to bind for the window's
+/// tenant/key filters (bound twice: once for the window, once for the
+/// first-seen scan) and for the country table's key filter. Bind order:
+/// since, until, filters, scan start, filters, country filters.
+fn key_sources_sql(q: &KeyWatchQuery) -> (String, Vec<String>, Vec<String>) {
+    let (usage_filters, usage_binds) = q.filters("usage");
+    // `key_country_seen` has no tenant column; its rows only join to the
+    // window's keys, which are already filtered by tenant.
+    let (seen_filters, seen_binds) = match q.key_id {
+        Some(k) => (
+            " and key_country_seen.key_id = toUUID(?)".to_string(),
+            vec![k.to_string()],
+        ),
+        None => (String::new(), Vec::new()),
+    };
+    let sql = format!(
+        "select w.key_id as key_id, w.kname as key_name, w.tid as tenant_id, \
+         w.tname as tenant_name, w.net as network, w.country as client_country, \
+         w.reqs as requests, w.ips as distinct_ips, w.last_ms as last_seen_ms, \
+         c.first_ms as country_first_ms, n.first_ms as network_first_ms \
+         from ( \
+           select key_id, any(usage.tenant_id) as tid, \
+                  argMax(key_name, ts_ms) as kname, argMax(tenant_name, ts_ms) as tname, \
+                  client_network as net, client_country as country, \
+                  count() as reqs, uniqExact(client_ip) as ips, max(ts_ms) as last_ms \
+           from usage \
+           where ts_ms >= ? and ts_ms < ? and client_ip != '' and client_network != ''{usage_filters} \
+           group by key_id, net, country \
+         ) as w \
+         left join ( \
+           select key_id, client_network as net, min(ts_ms) as first_ms \
+           from usage \
+           where ts_ms >= ? and client_network != ''{usage_filters} \
+           group by key_id, net \
+         ) as n on w.key_id = n.key_id and w.net = n.net \
+         left join ( \
+           select key_id, client_country as country, min(first_seen_ms) as first_ms \
+           from key_country_seen \
+           where client_country != ''{seen_filters} \
+           group by key_id, country \
+         ) as c on w.key_id = c.key_id and w.country = c.country \
+         order by key_id, requests desc \
+         limit {KEY_WATCH_MAX_ROWS}"
+    );
+    (sql, usage_binds, seen_binds)
+}
+
+/// Each key with traffic in the window, one row per network and country it
+/// came from, with when the key was first seen from each. Rows written
+/// before client addresses were recorded (or whose address has expired) are
+/// left out.
+pub async fn query_key_sources(
+    client: &clickhouse::Client,
+    q: &KeyWatchQuery,
+    since: i64,
+    until: i64,
+    ip_retention_days: u32,
+) -> Result<Vec<KeySource>, clickhouse::error::Error> {
+    let (sql, usage_binds, seen_binds) = key_sources_sql(q);
+    // Addresses older than their retention are blank, so the first-seen scan
+    // stops there instead of reading the whole ledger.
+    let scan_from = (until - i64::from(ip_retention_days + 1) * 86_400_000).min(since);
+    let mut query = client.query(&sql).bind(since).bind(until);
+    for b in &usage_binds {
+        query = query.bind(b.as_str());
+    }
+    query = query.bind(scan_from);
+    for b in usage_binds.iter().chain(&seen_binds) {
+        query = query.bind(b.as_str());
+    }
+    let rows = query.fetch_all::<KeySourceRow>().await?;
+    Ok(rows.into_iter().map(KeySource::from).collect())
+}
+
+/// Refused uses of one key for one reason from one address and country in
+/// the window.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct KeyRejectionAgg {
+    #[schema(value_type = String)]
+    pub key_id: Uuid,
+    pub key_name: String,
+    #[schema(value_type = String)]
+    pub tenant_id: Uuid,
+    pub tenant_name: String,
+    /// `disabled` or `ip_not_allowed`.
+    pub reason: String,
+    /// Empty once the address's retention has passed.
+    pub client_ip: String,
+    pub client_country: String,
+    /// How many requests were refused.
+    pub count: u64,
+    pub first_seen_ms: i64,
+    pub last_seen_ms: i64,
+    /// The User-Agent of the most recent of them.
+    pub sample_user_agent: String,
+}
+
+#[derive(Debug, Row, Deserialize)]
+struct KeyRejectionAggRow {
+    #[serde(with = "clickhouse::serde::uuid")]
+    key_id: Uuid,
+    key_name: String,
+    #[serde(with = "clickhouse::serde::uuid")]
+    tenant_id: Uuid,
+    tenant_name: String,
+    reason: String,
+    client_ip: String,
+    client_country: String,
+    total: u64,
+    first_ms: i64,
+    last_ms: i64,
+    sample_ua: String,
+}
+
+fn key_rejections_sql(q: &KeyWatchQuery) -> (String, Vec<String>) {
+    let (filters, binds) = q.filters("key_rejections");
+    let sql = format!(
+        "select key_id as kid, argMax(key_name, ts_ms) as kname, \
+         any(key_rejections.tenant_id) as tid, argMax(tenant_name, ts_ms) as tname, \
+         reason as why, client_ip as ip, client_country as cc, \
+         sum(count) as total, min(ts_ms) as first_ms, max(ts_ms) as last_ms, \
+         argMax(user_agent, ts_ms) as sample_ua \
+         from key_rejections \
+         where ts_ms >= ? and ts_ms < ?{filters} \
+         group by key_id, reason, client_ip, client_country \
+         order by last_ms desc \
+         limit {KEY_WATCH_MAX_ROWS}"
+    );
+    (sql, binds)
+}
+
+/// Refused uses of real keys in the window (disabled, or used from outside
+/// their allowed networks), per key, reason, address and country.
+pub async fn query_key_rejections(
+    client: &clickhouse::Client,
+    q: &KeyWatchQuery,
+    since: i64,
+    until: i64,
+) -> Result<Vec<KeyRejectionAgg>, clickhouse::error::Error> {
+    let (sql, binds) = key_rejections_sql(q);
+    let mut query = client.query(&sql).bind(since).bind(until);
+    for b in binds {
+        query = query.bind(b);
+    }
+    let rows = query.fetch_all::<KeyRejectionAggRow>().await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| KeyRejectionAgg {
+            key_id: r.key_id,
+            key_name: r.key_name,
+            tenant_id: r.tenant_id,
+            tenant_name: r.tenant_name,
+            reason: r.reason,
+            client_ip: r.client_ip,
+            client_country: r.client_country,
+            count: r.total,
+            first_seen_ms: r.first_ms,
+            last_seen_ms: r.last_ms,
+            sample_user_agent: r.sample_ua,
+        })
+        .collect())
+}
+
 pub async fn query_usage_by_model(
     client: &clickhouse::Client,
     q: UsageQuery,
@@ -2119,6 +2413,94 @@ mod alias_tests {
         }
     }
 
+    fn watch_query(tenant: bool, key: bool) -> KeyWatchQuery {
+        KeyWatchQuery {
+            since_ms: None,
+            until_ms: None,
+            tenant_id: tenant.then(Uuid::new_v4),
+            key_id: key.then(Uuid::new_v4),
+        }
+    }
+
+    #[test]
+    fn key_watch_reads_bind_one_value_per_placeholder() {
+        for (tenant, key) in [(false, false), (true, false), (false, true), (true, true)] {
+            let q = watch_query(tenant, key);
+            let (sql, usage, seen) = key_sources_sql(&q);
+            let filters = usize::from(tenant) + usize::from(key);
+            assert_eq!(usage.len(), filters);
+            assert_eq!(seen.len(), usize::from(key));
+            // since, until, filters, scan start, filters, country filters.
+            assert_eq!(
+                sql.matches('?').count(),
+                3 + 2 * filters + seen.len(),
+                "{sql}"
+            );
+            assert!(
+                sql.contains("client_ip != ''"),
+                "old rows without an address are skipped"
+            );
+
+            let (sql, binds) = key_rejections_sql(&q);
+            assert_eq!(binds.len(), filters);
+            assert_eq!(sql.matches('?').count(), 2 + filters, "{sql}");
+            assert_no_shadowing(&sql);
+            assert_eq!(select_items(&sql).len(), 11);
+        }
+        let (sql, _, _) = key_sources_sql(&watch_query(true, true));
+        assert_no_shadowing(&sql);
+        assert_eq!(select_items(&sql).len(), 11);
+        assert!(sql.contains("usage.tenant_id = toUUID(?)"));
+        assert!(sql.contains("key_country_seen.key_id = toUUID(?)"));
+        assert!(!sql.contains("key_country_seen.tenant_id"));
+    }
+
+    #[test]
+    fn key_watch_window_defaults_to_a_day_and_caps_at_31_days() {
+        let now = 1_750_000_000_000;
+        let mut q = watch_query(false, false);
+        assert_eq!(q.window(now), Ok((now - 86_400_000, now)));
+        q.until_ms = Some(now - 1000);
+        assert_eq!(q.window(now), Ok((now - 1000 - 86_400_000, now - 1000)));
+        q.since_ms = Some(now - 1000 - KEY_WATCH_MAX_WINDOW_MS);
+        assert!(q.window(now).is_ok());
+        q.since_ms = Some(now - 1001 - KEY_WATCH_MAX_WINDOW_MS);
+        assert!(q.window(now).unwrap_err().contains("31 days"));
+        q.since_ms = Some(now);
+        assert!(q.window(now).unwrap_err().contains("before"));
+    }
+
+    #[test]
+    fn key_sources_report_first_seen_only_when_known() {
+        let row = |country: &str, country_first: i64, network_first: i64| KeySourceRow {
+            key_id: Uuid::nil(),
+            key_name: "k".into(),
+            tenant_id: Uuid::nil(),
+            tenant_name: "t".into(),
+            network: "203.0.113.0/24".into(),
+            client_country: country.into(),
+            requests: 3,
+            distinct_ips: 2,
+            last_seen_ms: 9,
+            country_first_ms: country_first,
+            network_first_ms: network_first,
+        };
+        let seen = KeySource::from(row("DE", 5, 4));
+        assert_eq!(
+            (seen.first_seen_ms, seen.network_first_seen_ms),
+            (Some(5), Some(4))
+        );
+        // No country: no country first-seen, whatever the join gave.
+        let no_country = KeySource::from(row("", 5, 4));
+        assert_eq!(no_country.first_seen_ms, None);
+        // A missing join row reads as 0 in ClickHouse: unknown.
+        let unknown = KeySource::from(row("DE", 0, 0));
+        assert_eq!(
+            (unknown.first_seen_ms, unknown.network_first_seen_ms),
+            (None, None)
+        );
+    }
+
     #[test]
     fn totals_aliases_do_not_shadow_columns() {
         assert_no_shadowing(&usage_totals_sql(""));
@@ -2322,6 +2704,9 @@ mod alias_tests {
                 "streamed",
                 "error_reason",
                 "filed_class",
+                "client_ip",
+                "client_country",
+                "user_agent",
             ]
         );
     }
@@ -2396,5 +2781,143 @@ mod alias_tests {
         let bad = "select sum(input_tokens) + sum(output_tokens) as total_tokens, \
                    sum(input_tokens) as input_tokens from usage";
         assert!(std::panic::catch_unwind(|| assert_no_shadowing(bad)).is_err());
+    }
+}
+
+/// Run against a real ClickHouse by setting `OBLETH_TEST_CLICKHOUSE_URL`
+/// (e.g. `http://127.0.0.1:18123`); without it this returns early. Works in
+/// its own uniquely named database and drops only that database.
+#[cfg(test)]
+mod key_watch_clickhouse_tests {
+    use super::*;
+    use obleth_config::{KeyRejection, KeyRejectionReason, UsageRecord};
+
+    fn usage(key: Uuid, ts_ms: i64, ip: &str, network: &str, country: &str) -> UsageRecord {
+        let mut rec: UsageRecord = serde_json::from_value(serde_json::json!({
+            "request_id": Uuid::new_v4(), "tenant_id": Uuid::nil(), "key_id": key,
+            "model": "m", "admission": "fast", "weight": 1, "input_tokens": 1,
+            "output_tokens": 1, "estimated_tokens": 2, "queue_wait_ms": 0, "ttft_ms": 0,
+            "total_ms": 1, "status_code": 200, "cache_status": "off",
+            "ts_ms": ts_ms, "request_type": "chat", "key_name": "alice"
+        }))
+        .unwrap();
+        rec.client_ip = ip.into();
+        rec.client_network = network.into();
+        rec.client_country = country.into();
+        rec.user_agent = "curl/8.0".into();
+        rec
+    }
+
+    #[tokio::test]
+    async fn key_sources_and_rejections_read_what_the_gateway_wrote() {
+        let Ok(url) = std::env::var("OBLETH_TEST_CLICKHOUSE_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_CLICKHOUSE_URL to run");
+            return;
+        };
+        let database = format!("obleth_test_{}", Uuid::new_v4().simple());
+        let dir = std::env::temp_dir().join(format!("obleth-keywatch-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sink = obleth_telemetry::TelemetrySink::start(
+            &url,
+            &database,
+            "default",
+            "",
+            dir.join("usage.wal").to_str().unwrap(),
+            std::time::Duration::from_millis(50),
+            true,
+        )
+        .await
+        .expect("sink");
+        let key = Uuid::new_v4();
+        let now = now_ms();
+        let day = 86_400_000;
+        // Seen from DE ten days ago (before the window), and from a new
+        // network in NL inside it.
+        sink.record(usage(
+            key,
+            now - 10 * day,
+            "203.0.113.9",
+            "203.0.113.0/24",
+            "DE",
+        ));
+        sink.record(usage(
+            key,
+            now - 1000,
+            "203.0.113.10",
+            "203.0.113.0/24",
+            "DE",
+        ));
+        sink.record(usage(
+            key,
+            now - 900,
+            "198.51.100.4",
+            "198.51.100.0/24",
+            "NL",
+        ));
+        sink.record(usage(
+            key,
+            now - 800,
+            "198.51.100.5",
+            "198.51.100.0/24",
+            "NL",
+        ));
+        // An old row with no address is skipped.
+        sink.record(usage(key, now - 700, "", "", ""));
+        for _ in 0..3 {
+            sink.record_rejection(KeyRejection {
+                ts_ms: now - 500,
+                key_id: key,
+                key_name: "alice".into(),
+                tenant_id: Uuid::nil(),
+                tenant_name: "t".into(),
+                reason: KeyRejectionReason::IpNotAllowed,
+                client_ip: "192.0.2.1".into(),
+                client_country: "US".into(),
+                user_agent: "bot/1".into(),
+                path: "/v1/chat/completions".into(),
+                count: 1,
+            });
+        }
+        sink.shutdown().await;
+
+        let client = clickhouse::Client::default()
+            .with_url(&url)
+            .with_database(&database);
+        let q = KeyWatchQuery {
+            since_ms: None,
+            until_ms: None,
+            tenant_id: Some(Uuid::nil()),
+            key_id: Some(key),
+        };
+        let (since, until) = q.window(now + 1000).unwrap();
+        let sources = query_key_sources(&client, &q, since, until, 90)
+            .await
+            .expect("key sources");
+        assert_eq!(sources.len(), 2, "{sources:?}");
+        let de = sources.iter().find(|s| s.client_country == "DE").unwrap();
+        assert_eq!((de.requests, de.distinct_ips), (1, 1));
+        assert_eq!(de.first_seen_ms, Some(now - 10 * day), "first seen ever");
+        assert_eq!(de.network_first_seen_ms, Some(now - 10 * day));
+        let nl = sources.iter().find(|s| s.client_country == "NL").unwrap();
+        assert_eq!((nl.requests, nl.distinct_ips), (2, 2));
+        assert_eq!(nl.network, "198.51.100.0/24");
+        assert_eq!(nl.first_seen_ms, Some(now - 900));
+        assert_eq!(nl.last_seen_ms, now - 800);
+        assert_eq!(nl.key_name, "alice");
+
+        let rejections = query_key_rejections(&client, &q, since, until)
+            .await
+            .expect("key rejections");
+        assert_eq!(rejections.len(), 1, "{rejections:?}");
+        assert_eq!(rejections[0].count, 3);
+        assert_eq!(rejections[0].reason, "ip_not_allowed");
+        assert_eq!(rejections[0].sample_user_agent, "bot/1");
+
+        client
+            .query(&format!("DROP DATABASE IF EXISTS {database}"))
+            .execute()
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

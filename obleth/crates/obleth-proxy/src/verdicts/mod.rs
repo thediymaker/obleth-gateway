@@ -598,6 +598,7 @@ async fn handler_inner(
     let proxy_start_ms = crate::tracer::now_ms();
     let (parts, body) = req.into_parts();
     let headers = parts.headers;
+    let client = crate::client::ClientInfo::of(&parts.extensions);
 
     // ---- auth (same gates as the passthrough pipeline) ----
     let Some(secret) = proxy::bearer(&headers) else {
@@ -610,7 +611,7 @@ async fn handler_inner(
             Err(resp) => return resp,
         };
     let auth_duration = (crate::tracer::now_ms() - auth_start) as u32;
-    if let Err(resp) = gate_resolved_key(&state, &resolved) {
+    if let Err(resp) = gate_resolved_key(&state, &resolved, &client) {
         return resp;
     }
 
@@ -699,6 +700,7 @@ async fn handler_inner(
         streamed: false,
         failure: None,
         crash_fp: String::new(),
+        client: client.clone(),
     };
     if let Some(t) = tracer.as_mut() {
         t.set_conversation(&req_meta.session_id, req_meta.session_id_source);
