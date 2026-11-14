@@ -75,6 +75,10 @@ obleth:
   # Optional server-side pepper mixed into API-key hashes. Keep secret/stable;
   # changing it invalidates issued keys. Supply via an external Secret.
   apiKeyPepper: ""
+  # What new API keys start with before the `_` until a prefix is saved in
+  # Settings › Keys: 1 to 3 lowercase letters or digits, starting with a
+  # letter. Empty means `obl`. Keys already made keep working.
+  keyPrefix: ""
   # Trusted JWT issuers for data-plane bearer auth: a JSON array string.
   # Empty disables the JWT path. Treated as secret-valued (it names trust
   # anchors). See the "Identity Tokens" guide.

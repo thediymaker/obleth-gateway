@@ -6,7 +6,7 @@
 
 use chrono::{DateTime, Utc};
 use obleth_config::{
-    generate_api_key, ApiKey, DeploymentLaunch, FairshareGroup, IdentityProvision,
+    generate_api_key_with_prefix, ApiKey, DeploymentLaunch, FairshareGroup, IdentityProvision,
     ManagedModelSpec, McpServer, ModelEndpoint, ModelHealthCheck, ModelHealthDetail,
     ModelHealthSummary, ModelReplica, ModelRoute, ProvisionedIdentity, ResolvedEndpoint,
     ResolvedKey, ResolvedMcpServer, ResolvedModel, Tenant, WeeklyWindow,
@@ -701,7 +701,7 @@ impl Store {
         max_in_flight: Option<i64>,
         allowed_networks: &[String],
     ) -> Result<(ApiKey, String)> {
-        let gen = generate_api_key();
+        let gen = generate_api_key_with_prefix(&self.key_prefix().await?);
         let row = sqlx::query(
             "insert into api_keys (id, tenant_id, name, description, key_prefix, key_hash,
                     budget_tokens, budget_cost_usd, budget_period, budget_started_at,
@@ -4111,6 +4111,46 @@ impl Store {
         Ok(())
     }
 
+    /// The saved key prefix (`app_settings.key_prefix`), or `None` when none
+    /// is saved. A saved value that is no longer a valid prefix reads as none.
+    pub async fn get_key_prefix_setting(&self) -> Result<Option<String>> {
+        let row = sqlx::query("select value from app_settings where key = 'key_prefix'")
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let value: sqlx::types::Json<serde_json::Value> = row.try_get("value")?;
+        Ok(value
+            .0
+            .get("prefix")
+            .and_then(|p| p.as_str())
+            .filter(|p| obleth_config::is_valid_key_prefix(p))
+            .map(str::to_string))
+    }
+
+    /// Save the prefix new keys start with. The caller validates it.
+    pub async fn put_key_prefix_setting(&self, prefix: &str) -> Result<()> {
+        sqlx::query(
+            "insert into app_settings (key, value, updated_at)
+             values ('key_prefix', $1, now())
+             on conflict (key) do update set value = excluded.value, updated_at = now()",
+        )
+        .bind(sqlx::types::Json(serde_json::json!({ "prefix": prefix })))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The prefix new keys start with: the saved setting, else
+    /// `OBLETH_KEY_PREFIX`, else `obl`.
+    pub async fn key_prefix(&self) -> Result<String> {
+        Ok(self
+            .get_key_prefix_setting()
+            .await?
+            .unwrap_or_else(|| obleth_config::default_key_prefix().to_string()))
+    }
+
     /// Load the persisted raw-usage retention setting, or `None` if unset.
     pub async fn get_usage_retention_settings(
         &self,
@@ -5982,6 +6022,67 @@ mod tests {
             ..base
         };
         assert_eq!(store.list_audit_filtered(&byid).await.unwrap().len(), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn new_keys_start_with_the_saved_prefix() {
+        let Some(url) = crate::test_support::test_db_url() else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        let mut fixtures = FixtureGuard::new(&store);
+        let before = sqlx::query("select value from app_settings where key = 'key_prefix'")
+            .fetch_optional(&store.pool)
+            .await
+            .expect("read setting")
+            .map(|r| r.get::<sqlx::types::Json<serde_json::Value>, _>("value").0);
+
+        let tenant = store
+            .create_tenant(&format!("t-{}", Uuid::new_v4()), 100, 1000, None, None)
+            .await
+            .expect("create tenant");
+        fixtures.track_tenant(tenant.id);
+
+        store
+            .put_key_prefix_setting("rc")
+            .await
+            .expect("save prefix");
+        assert_eq!(store.key_prefix().await.unwrap(), "rc");
+        let (key, secret) = store
+            .create_api_key(tenant.id, "k", "", None, None, None, None, 100, None, &[])
+            .await
+            .expect("create key");
+        assert!(secret.starts_with("rc_"), "{secret}");
+        assert!(obleth_config::is_well_formed_key(&secret));
+        assert!(key.key_prefix.starts_with("rc_"));
+
+        // An invalid saved value reads as none, so minting falls back.
+        sqlx::query(
+            "update app_settings set value = '{\"prefix\": \"Bad!\"}' where key = 'key_prefix'",
+        )
+        .execute(&store.pool)
+        .await
+        .expect("corrupt");
+        assert_eq!(store.get_key_prefix_setting().await.unwrap(), None);
+
+        match before {
+            Some(v) => {
+                sqlx::query("update app_settings set value = $1 where key = 'key_prefix'")
+                    .bind(sqlx::types::Json(v))
+                    .execute(&store.pool)
+                    .await
+                    .expect("restore");
+            }
+            None => {
+                sqlx::query("delete from app_settings where key = 'key_prefix'")
+                    .execute(&store.pool)
+                    .await
+                    .expect("restore");
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

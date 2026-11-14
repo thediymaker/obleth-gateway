@@ -18,7 +18,7 @@ import { boonsWaitingOnFunctionCalling } from "@/lib/boon-availability";
  */
 
 /** Sections that save, in the order the save runs them. */
-export const SAVE_SECTIONS = ["alerts", "routing", "boons", "energy", "assistant", "retention"] as const;
+export const SAVE_SECTIONS = ["alerts", "routing", "boons", "energy", "assistant", "keys", "retention"] as const;
 export type SaveSection = (typeof SAVE_SECTIONS)[number];
 
 export const SECTION_LABEL: Record<SaveSection, string> = {
@@ -27,6 +27,7 @@ export const SECTION_LABEL: Record<SaveSection, string> = {
   boons: "Boons",
   energy: "Energy",
   assistant: "Assistant",
+  keys: "Keys",
   retention: "Data",
 };
 
@@ -43,6 +44,7 @@ export const TAB_ANCHOR: Record<string, string> = {
   boons: "boons",
   compression: "boon-compression",
   energy: "energy",
+  keys: "keys",
   data: "data",
   assistant: "assistant",
   about: "about",

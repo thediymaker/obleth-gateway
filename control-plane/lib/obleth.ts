@@ -1073,6 +1073,15 @@ export interface UsageRetentionView {
   configured: boolean;
 }
 
+/** The prefix new API keys start with. */
+export interface KeyPrefixView {
+  prefix: string;
+  /** True when saved, not the default. */
+  configured: boolean;
+  /** Used when none is saved: OBLETH_KEY_PREFIX, else `obl`. */
+  default_prefix: string;
+}
+
 export interface CompactUsageResult {
   retention_days: number;
   partitions_dropped: number;
@@ -3080,6 +3089,13 @@ export const obleth = {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ days }),
+    }),
+  getKeyPrefix: reactCache(() => api<KeyPrefixView>("/settings/key-prefix")),
+  setKeyPrefix: (prefix: string, options?: AuditOptions) =>
+    api<KeyPrefixView>("/settings/key-prefix", {
+      method: "PUT",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify({ prefix }),
     }),
   compactUsage: (options?: AuditOptions) =>
     api<CompactUsageResult>("/usage/compact", {

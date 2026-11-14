@@ -4,6 +4,10 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
+## Unreleased
+
+- **Choose the key prefix.** Settings › Keys sets what new keys start with before the `_`: 1 to 3 lowercase letters or digits, starting with a letter, `obl` by default (`OBLETH_KEY_PREFIX`, Helm `obleth.keyPrefix`, sets the starting value). `GET` and `PUT /api/v1/settings/key-prefix` read and change it, the change is in the audit log, and backups carry it with the other settings. Keys already made keep working whatever their prefix: the checksum is checked for any prefix, so a key of the full shape (a prefix, `_` and 56 lowercase hex characters) whose checksum fails is refused with `401` before any lookup, as is any malformed `obl_` key. A reverse proxy that picks a backend by the shape of the key must accept the new prefix before you change it, or match any prefix with `[a-z][a-z0-9]{0,2}_[0-9a-f]{56}`.
+
 ## v2.7.0
 
 Keys have a new format with a checksum and can be limited to the networks they are used from, and every request records where it came from, so a key used from somewhere unexpected shows up. A key can also be marked as background work that takes only spare capacity.

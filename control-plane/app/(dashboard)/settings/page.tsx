@@ -14,7 +14,7 @@ export default async function Page({ searchParams }: { searchParams: Promise<{ t
   // Old links: Slurm moved to Deployments, retrieval to Knowledge.
   if (tab === "slurm") redirect("/deployments?slurm=1");
   if (tab === "knowledge") redirect("/knowledge?tab=retrieval");
-  const [advice, alerts, router, boons, compressor, charo, energy, knowledge, models, retention, slurm, readiness, gateway, latest] =
+  const [advice, alerts, router, boons, compressor, charo, energy, knowledge, models, retention, keyPrefix, slurm, readiness, gateway, latest] =
     await Promise.all([
       safe(obleth.getAdvice(), null),
       safe(obleth.getAlertSettings(), null),
@@ -26,6 +26,7 @@ export default async function Page({ searchParams }: { searchParams: Promise<{ t
       safe(obleth.getKnowledgeSettings(), null),
       safe(obleth.listModels(), []),
       safe(obleth.getUsageRetention(), null),
+      safe(obleth.getKeyPrefix(), null),
       safe(obleth.getSlurmSettings(), null),
       safe(obleth.getRouterReadiness(), null),
       safe(obleth.gatewayVersion(), null),
@@ -36,7 +37,7 @@ export default async function Page({ searchParams }: { searchParams: Promise<{ t
     <SettingsPage
       anchor={tab ? TAB_ANCHOR[tab] : undefined}
       data={{
-        advice, alerts, router, readiness, boons, compressor, knowledge, energy, charo, retention, slurm, models,
+        advice, alerts, router, readiness, boons, compressor, knowledge, energy, charo, retention, keyPrefix, slurm, models,
         version: {
           gateway,
           controlPlane: { version: CONTROL_PLANE_VERSION, sha: CONTROL_PLANE_SHA },

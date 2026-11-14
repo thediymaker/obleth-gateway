@@ -473,6 +473,10 @@ pub fn router(state: AdminState) -> Router {
             get(get_usage_retention).put(put_usage_retention),
         )
         .route(
+            "/api/v1/settings/key-prefix",
+            get(get_key_prefix).put(put_key_prefix),
+        )
+        .route(
             "/api/v1/settings/slurm",
             get(slurm_settings::get_slurm_settings).put(slurm_settings::put_slurm_settings),
         )
@@ -5860,6 +5864,75 @@ async fn get_usage_daily(
     Ok(Json(
         usage::query_usage_daily(&state.clickhouse, q, &key_ids).await?,
     ))
+}
+
+/// The prefix new API keys start with.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct KeyPrefixView {
+    /// What new keys start with, before the `_`.
+    pub prefix: String,
+    /// True when this is a saved setting rather than the default.
+    pub configured: bool,
+    /// The prefix used when none is saved: `OBLETH_KEY_PREFIX`, else `obl`.
+    pub default_prefix: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateKeyPrefix {
+    /// 1 to 3 lowercase letters or digits, the first a letter.
+    pub prefix: String,
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/settings/key-prefix", tag = "settings",
+    responses((status = 200, body = KeyPrefixView))
+)]
+async fn get_key_prefix(State(state): State<AdminState>) -> Result<Json<KeyPrefixView>> {
+    let saved = state.store.get_key_prefix_setting().await?;
+    let default_prefix = obleth_config::default_key_prefix().to_string();
+    Ok(Json(KeyPrefixView {
+        configured: saved.is_some(),
+        prefix: saved.unwrap_or_else(|| default_prefix.clone()),
+        default_prefix,
+    }))
+}
+
+/// Set the prefix new keys start with. Keys already made keep working: any
+/// prefix authenticates, only minting reads this.
+#[utoipa::path(
+    put, path = "/api/v1/settings/key-prefix", tag = "settings",
+    request_body = UpdateKeyPrefix,
+    responses((status = 200, body = KeyPrefixView), (status = 400, description = "Not a valid prefix"))
+)]
+async fn put_key_prefix(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Json(body): Json<UpdateKeyPrefix>,
+) -> Result<Json<KeyPrefixView>> {
+    let prefix = body.prefix.trim();
+    if !obleth_config::is_valid_key_prefix(prefix) {
+        return Err(AdminError::BadRequest(format!(
+            "a key prefix is 1 to {} lowercase letters or digits, starting with a letter",
+            obleth_config::KEY_PREFIX_MAX_CHARS
+        )));
+    }
+    let previous = state.store.key_prefix().await?;
+    state.store.put_key_prefix_setting(prefix).await?;
+    state
+        .store
+        .record_audit(
+            &audit_actor(&headers),
+            "set_key_prefix",
+            "settings",
+            "key_prefix",
+            serde_json::json!({ "prefix": prefix, "previous": previous }),
+        )
+        .await?;
+    Ok(Json(KeyPrefixView {
+        prefix: prefix.to_string(),
+        configured: true,
+        default_prefix: obleth_config::default_key_prefix().to_string(),
+    }))
 }
 
 /// View of the persisted raw-usage retention window.
