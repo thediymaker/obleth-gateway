@@ -808,6 +808,52 @@ export interface BudgetUsage {
   resets_at: string | null;
 }
 
+/** One key's use from one network and country in a window (`GET /usage/key-sources`). */
+export interface KeySource {
+  key_id: string;
+  key_name: string;
+  tenant_id: string;
+  tenant_name: string;
+  /** An IPv4 /24 or IPv6 /48, as CIDR text. */
+  network: string;
+  /** Two-letter country, or empty when no proxy named one. */
+  client_country: string;
+  requests: number;
+  distinct_ips: number;
+  last_seen_ms: number;
+  /** First time the key was ever seen from this country. */
+  first_seen_ms: number | null;
+  /** First time the key was seen from this network, as far back as addresses are kept. */
+  network_first_seen_ms: number | null;
+}
+
+/** Refused uses of one key for one reason from one address (`GET /usage/key-rejections`). */
+export interface KeyRejectionAgg {
+  key_id: string;
+  key_name: string;
+  tenant_id: string;
+  tenant_name: string;
+  /** `disabled` or `ip_not_allowed`. */
+  reason: string;
+  client_ip: string;
+  client_country: string;
+  count: number;
+  first_seen_ms: number;
+  last_seen_ms: number;
+  sample_user_agent: string;
+}
+
+/** Window and filters of the key-watching reads. At most 31 days. */
+export interface KeyWatchParams {
+  sinceMs?: number;
+  untilMs?: number;
+  tenantId?: string;
+  keyId?: string;
+}
+
+const keyWatchQuery = (p: KeyWatchParams) =>
+  qs({ since_ms: p.sinceMs, until_ms: p.untilMs, tenant_id: p.tenantId, key_id: p.keyId });
+
 export interface KeyUsageSummary {
   key_id: string;
   tenant_id: string;
@@ -3075,6 +3121,10 @@ export const obleth = {
   usageLogFacets: (params: UsageLogParams = {}) =>
     api<UsageLogFacets>(`/usage/logs/facets${qs(logFilterQuery(params))}`),
   /** The failures among the requests matching the log's filters, grouped into repeats; the last 24 hours by default. */
+  /** Where each key was used from in a window: one row per key, network and country. */
+  keySources: (params: KeyWatchParams = {}) => api<KeySource[]>(`/usage/key-sources${keyWatchQuery(params)}`),
+  /** Refused uses of real keys in a window: turned off, or outside the key's networks. */
+  keyRejections: (params: KeyWatchParams = {}) => api<KeyRejectionAgg[]>(`/usage/key-rejections${keyWatchQuery(params)}`),
   usageFailures: (params: UsageLogParams = {}) =>
     api<UsageFailureGroups>(`/usage/failures${qs(logFilterQuery(params))}`),
   getRequestSpans: (requestId: string) =>

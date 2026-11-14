@@ -4,6 +4,16 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
+## Unreleased
+
+## v2.9.0
+
+A page that shows where each API key is used from. No migrations and nothing to check before upgrading.
+
+**Control plane**
+
+- **Key access page.** Access › Key Access shows where each API key was used from in the last 24 hours, 7 days or 30 days: one row per key with its requests, networks and countries, a tag when a key was seen from a country or network for the first time, and the refused requests (turned-off keys and keys used from outside their allowed networks) with address, country and User-Agent. Filter by tenant, search by key, tenant, network or country, and open a key to see each network with links to its requests and the key. It reads `GET /api/v1/usage/key-sources` and `GET /api/v1/usage/key-rejections`.
+
 ## v2.8.0
 
 Each instance chooses what its new keys start with. The built-in prefix is `sk`, the familiar one, and an instance that already made `obl_` keys keeps making them.

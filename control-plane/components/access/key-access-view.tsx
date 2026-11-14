@@ -1,0 +1,362 @@
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import { ChevronDown, ChevronRight, RefreshCw, Search } from "lucide-react";
+import { Kpi, Panel, PanelLink, Segmented } from "@/components/overview/ui";
+import { Input } from "@/components/ui/input";
+import { Select } from "@/components/ui/select";
+import {
+  countryLabel,
+  filterKeyAccess,
+  KEY_ACCESS_RANGES,
+  keyAccessRange,
+  keyAccessRows,
+  keyAccessSummary,
+  REFUSAL_REASON,
+  refusalRows,
+  type KeyAccessRange,
+  type KeyAccessRow,
+  type KeyAccessSort,
+} from "@/lib/key-access-model";
+import { logsHref } from "@/lib/log-links";
+import { compact } from "@/lib/overview-model";
+import type { KeyRejectionAgg, KeySource } from "@/lib/obleth";
+import { cn, getJson } from "@/lib/utils";
+
+interface KeyAccessData {
+  sinceMs: number;
+  sources: KeySource[];
+  rejections: KeyRejectionAgg[];
+}
+
+/** Rows shown before "Show more". */
+const PAGE = 100;
+
+const SORTS: { value: KeyAccessSort; label: string }[] = [
+  { value: "requests", label: "Busiest" },
+  { value: "networks", label: "Most networks" },
+  { value: "recent", label: "Latest" },
+  { value: "new", label: "New first" },
+];
+
+const LOG_WINDOW: Record<KeyAccessRange, "24h" | "7d" | "30d"> = { "24h": "24h", "7d": "7d", "30d": "30d" };
+
+function ago(ms: number, now: number): string {
+  if (!ms) return "—";
+  const s = Math.max(0, (now - ms) / 1000);
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.round(s / 60)}m ago`;
+  if (s < 86_400) return `${Math.round(s / 3600)}h ago`;
+  return `${Math.round(s / 86_400)}d ago`;
+}
+
+const stamp = (ms: number) => (ms ? new Date(ms).toLocaleString() : "");
+
+function NewTag({ children = "New" }: { children?: string }) {
+  return (
+    <span className="rounded-full border border-[hsl(38_65%_62%/0.5)] px-1.5 py-px text-[10.5px] font-medium text-[hsl(38_65%_62%)]">
+      {children}
+    </span>
+  );
+}
+
+function Countries({ row }: { row: KeyAccessRow }) {
+  if (row.countries.length === 0) return <span className="text-muted-foreground">Unknown</span>;
+  return (
+    <span className="flex flex-wrap gap-1">
+      {row.countries.slice(0, 6).map((c) => (
+        <span
+          key={c}
+          title={`${countryLabel(c)}${row.newCountries.includes(c) ? ": first seen in this window" : ""}`}
+          className={cn(
+            "rounded border px-1.5 py-px font-mono text-[11px]",
+            row.newCountries.includes(c) ? "border-[hsl(38_65%_62%/0.5)] text-[hsl(38_65%_62%)]" : "border-border text-secondary-foreground",
+          )}
+        >
+          {c}
+        </span>
+      ))}
+      {row.countries.length > 6 && <span className="text-xs text-muted-foreground">+{row.countries.length - 6}</span>}
+    </span>
+  );
+}
+
+const GRID = "grid grid-cols-[1.25rem_minmax(0,1.6fr)_4.5rem_4.5rem_minmax(0,1fr)_5.5rem] items-center gap-3";
+
+function KeyRow({ row, range, now, open, onToggle }: { row: KeyAccessRow; range: KeyAccessRange; now: number; open: boolean; onToggle: () => void }) {
+  return (
+    <li className="border-t border-border">
+      <button
+        type="button"
+        onClick={onToggle}
+        aria-expanded={open}
+        className={cn(GRID, "w-full px-[18px] py-[9px] text-left text-[13px] hover:bg-muted/30")}
+      >
+        {open ? <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" /> : <ChevronRight className="h-3.5 w-3.5 text-muted-foreground" />}
+        <span className="flex min-w-0 flex-col">
+          <span className="flex min-w-0 items-center gap-2">
+            <span className="truncate font-medium" title={row.keyName}>{row.keyName || `${row.keyId.slice(0, 8)}…`}</span>
+            {(row.newCountries.length > 0 || row.newNetworks > 0) && <NewTag>{row.newCountries.length > 0 ? "New country" : "New network"}</NewTag>}
+            {row.refused > 0 && (
+              <span className="rounded-full border border-[hsl(350_55%_64%/0.5)] px-1.5 py-px text-[10.5px] font-medium text-[hsl(350_55%_64%)]">
+                {compact(row.refused)} refused
+              </span>
+            )}
+          </span>
+          <span className="truncate text-xs text-muted-foreground">{row.tenantName}</span>
+        </span>
+        <span className="text-right font-mono text-xs tabular-nums">{compact(row.requests)}</span>
+        <span className="text-right font-mono text-xs tabular-nums" title={`${row.distinctIps} distinct addresses`}>
+          {row.places.length}
+        </span>
+        <Countries row={row} />
+        <span className="text-right text-xs text-muted-foreground" title={stamp(row.lastSeenMs)}>{ago(row.lastSeenMs, now)}</span>
+      </button>
+      {open && (
+        <div className="bg-muted/15 px-[18px] pb-3 pt-1">
+          <table className="w-full text-left text-xs">
+            <thead className="text-muted-foreground">
+              <tr>
+                <th className="py-1.5 pr-3 font-medium">Network</th>
+                <th className="py-1.5 pr-3 font-medium">Country</th>
+                <th className="py-1.5 pr-3 text-right font-medium">Requests</th>
+                <th className="py-1.5 pr-3 text-right font-medium">Addresses</th>
+                <th className="py-1.5 text-right font-medium">Last seen</th>
+              </tr>
+            </thead>
+            <tbody>
+              {row.places.map((p) => (
+                <tr key={`${p.network}:${p.country}`} className="border-t border-border/60">
+                  <td className="py-1.5 pr-3 font-mono">
+                    <span className="inline-flex items-center gap-2">
+                      {p.network}
+                      {p.newNetwork && <NewTag />}
+                    </span>
+                  </td>
+                  <td className="py-1.5 pr-3">
+                    <span className="inline-flex items-center gap-2">
+                      {countryLabel(p.country)}
+                      {p.newCountry && <NewTag />}
+                    </span>
+                  </td>
+                  <td className="py-1.5 pr-3 text-right font-mono tabular-nums">{p.requests.toLocaleString()}</td>
+                  <td className="py-1.5 pr-3 text-right font-mono tabular-nums">{p.distinctIps.toLocaleString()}</td>
+                  <td className="py-1.5 text-right text-muted-foreground" title={stamp(p.lastSeenMs)}>{ago(p.lastSeenMs, now)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div className="mt-2 flex flex-wrap gap-4 text-[12.5px]">
+            <PanelLink href={logsHref({ key: row.keyId, window: LOG_WINDOW[range] })}>Its requests, with each address</PanelLink>
+            <PanelLink href={`/keys?key=${row.keyId}`}>Open the key</PanelLink>
+          </div>
+        </div>
+      )}
+    </li>
+  );
+}
+
+/**
+ * Where each API key was used from in a window, one row per key with its
+ * networks and countries, what was new, and the requests that were refused.
+ */
+export function KeyAccessView({
+  tenants,
+  initialRange,
+  initialTenant,
+  initialSearch,
+  initial,
+}: {
+  tenants: { id: string; name: string }[];
+  initialRange: KeyAccessRange;
+  initialTenant: string;
+  initialSearch: string;
+  initial: KeyAccessData | null;
+}) {
+  const router = useRouter();
+  const [range, setRange] = useState<KeyAccessRange>(initialRange);
+  const [tenant, setTenant] = useState(initialTenant);
+  const [search, setSearch] = useState(initialSearch);
+  const [sort, setSort] = useState<KeyAccessSort>("requests");
+  const [onlyNew, setOnlyNew] = useState(false);
+  const [openKey, setOpenKey] = useState<string | null>(null);
+  const [shown, setShown] = useState(PAGE);
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 30_000);
+    return () => clearInterval(t);
+  }, []);
+
+  // Keep the URL in step so a filtered view can be shared.
+  useEffect(() => {
+    const p = new URLSearchParams();
+    if (range !== "24h") p.set("range", range);
+    if (tenant) p.set("tenant", tenant);
+    if (search.trim()) p.set("q", search.trim());
+    const qs = p.toString();
+    router.replace(qs ? `/key-access?${qs}` : "/key-access", { scroll: false });
+  }, [range, tenant, search, router]);
+
+  const query = useQuery({
+    queryKey: ["key-access", range, tenant],
+    queryFn: () => {
+      const since = Date.now() - keyAccessRange(range).ms;
+      return getJson<KeyAccessData>(`/api/live/usage/key-access?since_ms=${since}${tenant ? `&tenant_id=${tenant}` : ""}`);
+    },
+    initialData: range === initialRange && tenant === initialTenant && initial ? initial : undefined,
+    placeholderData: keepPreviousData,
+    refetchInterval: range === "24h" ? 60_000 : 300_000,
+  });
+  const data = query.data;
+  const rows = useMemo(() => (data ? keyAccessRows(data.sources, data.rejections, data.sinceMs) : []), [data]);
+  const summary = useMemo(() => (data ? keyAccessSummary(rows, data.rejections) : null), [rows, data]);
+  const visible = useMemo(() => filterKeyAccess(rows, search, sort, onlyNew), [rows, search, sort, onlyNew]);
+  const refusals = useMemo(() => (data ? refusalRows(data.rejections) : []), [data]);
+  const words = keyAccessRange(range).words;
+
+  return (
+    <div className="mx-auto flex max-w-[1600px] flex-col gap-4">
+      <div className="flex flex-wrap items-end justify-between gap-4">
+        <div className="min-w-0">
+          <h1 className="text-[26px] font-semibold tracking-tight">Key access</h1>
+          <p className="mt-1 text-[13px] text-muted-foreground" role="status">
+            {summary
+              ? `${summary.keys.toLocaleString()} keys were used from ${summary.networks.toLocaleString()} networks in ${words}.`
+              : query.isLoading
+                ? "Reading…"
+                : "Where keys were used from could not be read."}
+          </p>
+        </div>
+        <div className="flex flex-wrap items-center gap-2.5">
+          <Select
+            aria-label="Tenant"
+            className="h-[34px] w-56"
+            value={tenant}
+            onValueChange={(v) => { setTenant(v); setShown(PAGE); }}
+            options={[{ value: "", label: "All tenants" }, ...tenants.map((t) => ({ value: t.id, label: t.name }))]}
+          />
+          <Segmented label="Time range" value={range} onChange={(v) => { setRange(v); setShown(PAGE); }} options={KEY_ACCESS_RANGES.map((r) => ({ value: r.id, label: r.label }))} />
+          <button type="button" onClick={() => void query.refetch()} aria-label="Refresh" title="Refresh" className="flex h-[34px] w-[34px] items-center justify-center rounded-lg border border-border text-muted-foreground hover:bg-accent hover:text-foreground">
+            <RefreshCw className={cn("h-3.5 w-3.5", query.isFetching && "animate-spin")} />
+          </button>
+        </div>
+      </div>
+
+      {summary && (
+        <div className={cn("grid grid-cols-2 gap-3 md:grid-cols-4", query.isPlaceholderData && "opacity-60")}>
+          <Kpi label={`Keys used · ${range}`} value={summary.keys.toLocaleString()} detail={`from ${summary.countries} ${summary.countries === 1 ? "country" : "countries"}`} trend={[]} />
+          <Kpi label={`Networks · ${range}`} value={summary.networks.toLocaleString()} detail="IPv4 /24 or IPv6 /48" trend={[]} />
+          <Kpi
+            label="From a new country"
+            value={summary.keysInNewCountry.toLocaleString()}
+            detail={summary.keysInNewCountry ? "keys seen from a country for the first time" : "no key was seen anywhere new"}
+            trend={[]}
+            emphasis={summary.keysInNewCountry > 0}
+          />
+          <Kpi
+            label={`Refused · ${range}`}
+            value={compact(summary.refused)}
+            detail={summary.refusedKeys ? `requests with ${summary.refusedKeys} ${summary.refusedKeys === 1 ? "key" : "keys"}` : "no refused requests"}
+            trend={[]}
+            emphasis={summary.refused > 0}
+          />
+        </div>
+      )}
+
+      <Panel
+        title="Where keys are used"
+        subtitle="Each key's networks and countries. New means first seen in this window. Select a key to see its networks"
+        className={cn(query.isPlaceholderData && "opacity-60")}
+      >
+        <div className="mt-3 flex flex-wrap items-center gap-2.5 px-[18px] pb-3">
+          <div className="relative w-full max-w-xs">
+            <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              value={search}
+              onChange={(e) => { setSearch(e.target.value); setShown(PAGE); }}
+              placeholder="Key, tenant, network or country"
+              aria-label="Search keys"
+              className="h-[34px] pl-8"
+            />
+          </div>
+          <Segmented label="Sort" value={sort} onChange={setSort} options={SORTS} />
+          <label className="inline-flex cursor-pointer items-center gap-2 text-[12.5px] text-secondary-foreground">
+            <input type="checkbox" checked={onlyNew} onChange={(e) => setOnlyNew(e.target.checked)} className="h-3.5 w-3.5 accent-current" />
+            Only keys with something new
+          </label>
+        </div>
+        {visible.length === 0 ? (
+          <p className="border-t border-border px-[18px] py-6 text-center text-sm text-muted-foreground">
+            {query.isLoading ? <span className="skeleton mx-auto block h-4 w-40 rounded" /> : data ? (rows.length ? "No key matches." : `No key was used in ${words}.`) : "Where keys were used from could not be read."}
+          </p>
+        ) : (
+          <div className="overflow-x-auto pb-2">
+            <div className="min-w-[760px]">
+              <div className={cn(GRID, "border-t border-border px-[18px] py-2 text-[11.5px] text-muted-foreground")}>
+                <span />
+                <span>Key</span>
+                <span className="text-right">Requests</span>
+                <span className="text-right">Networks</span>
+                <span>Countries</span>
+                <span className="text-right">Last used</span>
+              </div>
+              <ul>
+                {visible.slice(0, shown).map((row) => (
+                  <KeyRow key={row.keyId} row={row} range={range} now={now} open={openKey === row.keyId} onToggle={() => setOpenKey(openKey === row.keyId ? null : row.keyId)} />
+                ))}
+              </ul>
+              {visible.length > shown && (
+                <button type="button" onClick={() => setShown(shown + PAGE)} className="block w-full border-t border-border px-[18px] py-[9px] text-left text-[13px] text-muted-foreground hover:text-foreground">
+                  Show {Math.min(PAGE, visible.length - shown)} more of {visible.length - shown}
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+      </Panel>
+
+      <Panel title="Refused" subtitle="Requests with a turned-off key, or from outside a key's allowed networks" className={cn(query.isPlaceholderData && "opacity-60")}>
+        {refusals.length === 0 ? (
+          <p className="mt-3 border-t border-border px-[18px] py-6 text-center text-sm text-muted-foreground">
+            {data ? `No request was refused in ${words}.` : query.isLoading ? <span className="skeleton mx-auto block h-4 w-40 rounded" /> : "Refusals could not be read."}
+          </p>
+        ) : (
+          <div className="mt-3 overflow-x-auto pb-2">
+            <table className="w-full min-w-[860px] text-left text-[13px]">
+              <thead className="text-[11.5px] text-muted-foreground">
+                <tr className="border-t border-border">
+                  <th className="px-[18px] py-2 font-medium">Key</th>
+                  <th className="py-2 pr-3 font-medium">Why</th>
+                  <th className="py-2 pr-3 font-medium">Address</th>
+                  <th className="py-2 pr-3 font-medium">Country</th>
+                  <th className="py-2 pr-3 text-right font-medium">Refused</th>
+                  <th className="py-2 pr-3 text-right font-medium">Last</th>
+                  <th className="py-2 pr-[18px] font-medium">User agent</th>
+                </tr>
+              </thead>
+              <tbody>
+                {refusals.slice(0, 200).map((r) => (
+                  <tr key={`${r.key_id}:${r.reason}:${r.client_ip}:${r.client_country}`} className="border-t border-border">
+                    <td className="px-[18px] py-[9px]">
+                      <Link href={`/keys?key=${r.key_id}`} className="font-medium underline-offset-2 hover:underline">{r.key_name || `${r.key_id.slice(0, 8)}…`}</Link>
+                      <span className="block text-xs text-muted-foreground">{r.tenant_name}</span>
+                    </td>
+                    <td className="py-[9px] pr-3">{REFUSAL_REASON[r.reason] ?? r.reason}</td>
+                    <td className="py-[9px] pr-3 font-mono text-xs">{r.client_ip || "—"}</td>
+                    <td className="py-[9px] pr-3">{countryLabel(r.client_country)}</td>
+                    <td className="py-[9px] pr-3 text-right font-mono text-xs tabular-nums">{r.count.toLocaleString()}</td>
+                    <td className="py-[9px] pr-3 text-right text-xs text-muted-foreground" title={`First ${stamp(r.first_seen_ms)}, last ${stamp(r.last_seen_ms)}`}>{ago(r.last_seen_ms, now)}</td>
+                    <td className="max-w-[18rem] truncate py-[9px] pr-[18px] text-xs text-muted-foreground" title={r.sample_user_agent}>{r.sample_user_agent || "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Panel>
+    </div>
+  );
+}
