@@ -36,6 +36,7 @@ import type {
   UpdateKnowledgeSettings,
   UpdateSlurmSettings,
   SlurmHealthView,
+  NamedNetwork,
 } from "@/lib/obleth";
 import { requireAdmin } from "@/lib/auth/roles";
 import { specFormValues, validateManagedModelForm } from "@/lib/managed-model-schema";
@@ -51,6 +52,7 @@ import { blockedHostReason } from "@/lib/ssrf";
 import { familyWrite, MAX_FAMILY_DESCRIPTION_CHARS, reasoningProblem } from "@/lib/models-model";
 import { networkLines } from "@/lib/key-networks";
 import { keyPrefixProblem } from "@/lib/key-prefix";
+import { cleanNamedNetworks, namedNetworksProblem, parseNamedNetworksField } from "@/lib/named-networks";
 import { tagsInclude } from "@/lib/utils";
 
 export type ActionResult =
@@ -2015,9 +2017,9 @@ export async function deleteMcpServerAction(id: string): Promise<ActionResult> {
 // fixed order; a refusal says which sections were already saved.
 // ----------------------------------------------------------------------------
 
-type SettingsPageSection = "alerts" | "routing" | "boons" | "energy" | "assistant" | "keys" | "retention";
-const SETTINGS_PAGE_ORDER: SettingsPageSection[] = ["alerts", "routing", "boons", "energy", "assistant", "keys", "retention"];
-const SETTINGS_PAGE_LABEL: Record<SettingsPageSection, string> = { alerts: "Alerts", routing: "Routing", boons: "Boons", energy: "Energy", assistant: "Assistant", keys: "Keys", retention: "Data" };
+type SettingsPageSection = "alerts" | "routing" | "boons" | "energy" | "assistant" | "keys" | "networks" | "retention";
+const SETTINGS_PAGE_ORDER: SettingsPageSection[] = ["alerts", "routing", "boons", "energy", "assistant", "keys", "networks", "retention"];
+const SETTINGS_PAGE_LABEL: Record<SettingsPageSection, string> = { alerts: "Alerts", routing: "Routing", boons: "Boons", energy: "Energy", assistant: "Assistant", keys: "Keys", networks: "Networks", retention: "Data" };
 
 const BOON_BOOLS = [
   "vision_enabled", "structured_output_enabled", "tool_loop_enabled", "image_generation_enabled", "web_search_enabled", "speculation_enabled",
@@ -2176,6 +2178,10 @@ export async function saveSettingsAction(formData: FormData): Promise<SettingsSa
       });
     } else if (section === "keys") {
       res = await setKeyPrefixAction(trimmed(g("keys", "prefix")));
+    } else if (section === "networks") {
+      const rows = parseNamedNetworksField(g("networks", "list"));
+      if (!rows) return fail(section, "The list could not be read. Reload the page and try again.");
+      res = await setNamedNetworksAction(rows);
     } else {
       res = await setUsageRetentionAction(num("retention", "days") ?? 0);
     }
@@ -2386,6 +2392,20 @@ export async function testSlurmConnectionAction(): Promise<
   } catch (e) {
     return actionError(e);
   }
+}
+
+export async function setNamedNetworksAction(rows: NamedNetwork[]): Promise<ActionResult> {
+  const session = await requireAdmin();
+  const problem = namedNetworksProblem(rows);
+  if (problem) return { ok: false, error: problem };
+  try {
+    await obleth.setNamedNetworks(cleanNamedNetworks(rows), { auditActor: session.email });
+  } catch (e) {
+    return actionError(e);
+  }
+  revalidatePath("/settings");
+  revalidatePath("/reports");
+  return { ok: true };
 }
 
 export async function setKeyPrefixAction(prefix: string): Promise<ActionResult> {

@@ -26,6 +26,8 @@ const initial = {
     source(),
     source({ network: "198.51.100.0/24", client_country: "BR", requests: 3, distinct_ips: 1, first_seen_ms: now - 3_600_000, network_first_seen_ms: now - 3_600_000 }),
     source({ key_id: "k-3", key_name: "ci", tenant_name: "cs-teaching", network: "10.30.0.0/24", requests: 90 }),
+    source({ key_id: "k-4", key_name: "lab-box", tenant_name: "cs-teaching", network: "10.139.121.0/24", client_country: "", network_name: "Research computing", requests: 7 }),
+    source({ key_id: "k-5", key_name: "vpn-box", tenant_name: "cs-teaching", network: "172.31.20.0/24", client_country: "", requests: 5 }),
   ],
   rejections: [rejection],
 };
@@ -61,7 +63,7 @@ describe("Key access", () => {
   it("lists each key with its networks and countries, and flags a new country", async () => {
     await render();
     const text = host.textContent ?? "";
-    expect(text).toContain("2 keys were used from 3 networks in the last 24 hours.");
+    expect(text).toContain("4 keys were used from 5 networks in the last 24 hours.");
     expect(text).toContain("nightly-eval");
     expect(text).toContain("New country");
     expect(text.indexOf("nightly-eval")).toBeLessThan(text.indexOf("ci"));
@@ -98,5 +100,22 @@ describe("Key access", () => {
     const rows = [...host.querySelectorAll("button[aria-expanded]")].map((b) => b.textContent);
     expect(rows.some((t) => t?.includes("nightly-eval"))).toBe(true);
     expect(rows.some((t) => t?.includes("cs-teaching"))).toBe(false);
+  });
+
+  it("names a network from Settings › Networks, and calls an unnamed private one a private address", async () => {
+    await render();
+    const text = host.textContent ?? "";
+    expect(text).toContain("Research computing");
+    expect(text).toContain("Private address");
+    const hrefs = [...host.querySelectorAll("a")].map((a) => a.getAttribute("href"));
+    expect(hrefs).toContain("/settings#networks");
+  });
+
+  it("is a tab of Reports and keeps its filters in the Reports address", async () => {
+    await render();
+    expect(host.querySelector("h1")?.textContent).toBe("Reports");
+    const tab = host.querySelector('nav[aria-label="Reports"] a[aria-current="page"]');
+    expect(tab?.textContent).toBe("Key access");
+    expect(replace).toHaveBeenLastCalledWith("/reports?tab=key-access", { scroll: false });
   });
 });

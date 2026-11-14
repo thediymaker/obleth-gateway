@@ -2,9 +2,12 @@
 //! its User-Agent. Captured once per request by [`capture`], a middleware on
 //! the data-plane router, and read back by handlers as a [`ClientInfo`].
 //!
-//! The address is the rightmost `X-Forwarded-For` entry when the TCP peer is
-//! a trusted proxy (`OBLETH_TRUSTED_PROXIES`, default the private and
-//! loopback ranges; `none` trusts no proxy), else the peer. The country comes from
+//! When the TCP peer is a trusted proxy (`OBLETH_TRUSTED_PROXIES`, default
+//! the private and loopback ranges; `none` trusts no proxy), the address is
+//! the one in `OBLETH_CLIENT_ADDRESS_HEADER` if set, else from
+//! `X-Forwarded-For`: when the trusted list is set, the first entry read
+//! from the right that is not itself a trusted proxy; with the default, the
+//! rightmost entry. From anyone else it is the peer. The country comes from
 //! `OBLETH_CLIENT_COUNTRY_HEADER` (default `cf-ipcountry`; empty turns it
 //! off), and only from a trusted proxy, since anyone can send the header.
 
@@ -20,63 +23,38 @@ use axum::response::Response;
 use ipnet::IpNet;
 use obleth_config::network;
 
-/// The trusted-proxy list and country header, read from the environment once.
+/// The trusted-proxy list and the address and country headers, read from
+/// the environment once.
 pub(crate) struct ClientAddressConfig {
     trusted: Vec<IpNet>,
+    /// Read `X-Forwarded-For` past the trusted proxies in it: only when the
+    /// trusted list was set, see [`network::client_ip`].
+    walk: bool,
+    address_header: Option<HeaderName>,
     country_header: Option<HeaderName>,
 }
 
 impl ClientAddressConfig {
-    /// Build from the two settings as the environment holds them (`None` =
-    /// unset). Bad entries are logged and skipped, never fatal: a typo in the
-    /// trusted list must not stop the gateway, and an entry left out only
-    /// means its proxy's `X-Forwarded-For` is not believed.
-    ///
-    /// An unset or blank trusted list means the default private ranges (so a
-    /// deployment template can pass the variable through empty); `none`
-    /// trusts no proxy at all.
-    pub(crate) fn from_settings(trusted: Option<&str>, country_header: Option<&str>) -> Self {
-        let trusted = match trusted.map(str::trim) {
-            None | Some("") => network::DEFAULT_TRUSTED_PROXIES,
-            Some(t) if t.eq_ignore_ascii_case("none") => "",
-            Some(t) => t,
-        };
-        let (trusted, invalid) = network::parse_network_list(trusted);
-        if !invalid.is_empty() {
-            tracing::warn!(
-                entries = ?invalid,
-                "OBLETH_TRUSTED_PROXIES has entries that are not CIDR ranges; ignoring them"
-            );
-        }
-        let country_header = match country_header
-            .unwrap_or(network::DEFAULT_COUNTRY_HEADER)
-            .trim()
-        {
-            "" => None,
-            name => match HeaderName::from_bytes(name.to_ascii_lowercase().as_bytes()) {
-                Ok(h) => Some(h),
-                Err(_) => {
-                    tracing::warn!(
-                        header = name,
-                        "OBLETH_CLIENT_COUNTRY_HEADER is not a valid header name; not recording countries"
-                    );
-                    None
-                }
-            },
-        };
-        ClientAddressConfig {
+    /// Build from the settings as the environment holds them (`None` =
+    /// unset); see [`network::ClientAddressSettings::from_settings`]. Bad
+    /// entries are logged and skipped, never fatal: a typo in the trusted
+    /// list must not stop the gateway, and an entry left out only means its
+    /// proxy's `X-Forwarded-For` is not believed.
+    #[cfg(test)]
+    pub(crate) fn from_settings(
+        trusted: Option<&str>,
+        address_header: Option<&str>,
+        country_header: Option<&str>,
+    ) -> Self {
+        Self::from(network::ClientAddressSettings::from_settings(
             trusted,
+            address_header,
             country_header,
-        }
+        ))
     }
 
     fn from_env() -> Self {
-        Self::from_settings(
-            std::env::var("OBLETH_TRUSTED_PROXIES").ok().as_deref(),
-            std::env::var("OBLETH_CLIENT_COUNTRY_HEADER")
-                .ok()
-                .as_deref(),
-        )
+        Self::from(network::ClientAddressSettings::from_env())
     }
 
     /// What the request's headers and peer say about its client.
@@ -88,9 +66,16 @@ impl ClientAddressConfig {
     ) -> ClientInfo {
         let peer = peer.map(network::canonical_ip);
         let from_proxy = peer.is_some_and(|p| self.trusted.iter().any(|n| n.contains(&p)));
+        let address = self
+            .address_header
+            .as_ref()
+            .and_then(|h| headers.get(h))
+            .and_then(|v| v.to_str().ok());
         let ip = network::client_ip(
             peer,
             &self.trusted,
+            self.walk,
+            address,
             headers
                 .get_all("x-forwarded-for")
                 .iter()
@@ -115,6 +100,33 @@ impl ClientAddressConfig {
             user_agent,
             path: path.chars().take(PATH_MAX_CHARS).collect(),
             in_process: false,
+        }
+    }
+}
+
+impl From<network::ClientAddressSettings> for ClientAddressConfig {
+    fn from(s: network::ClientAddressSettings) -> Self {
+        if !s.invalid.is_empty() {
+            tracing::warn!(
+                entries = ?s.invalid,
+                "OBLETH_TRUSTED_PROXIES has entries that are not CIDR ranges; ignoring them"
+            );
+        }
+        let header = |name: Option<String>, var: &str| {
+            let name = name?;
+            match HeaderName::from_bytes(name.as_bytes()) {
+                Ok(h) => Some(h),
+                Err(_) => {
+                    tracing::warn!(header = %name, "{var} is not a valid header name; ignoring it");
+                    None
+                }
+            }
+        };
+        ClientAddressConfig {
+            trusted: s.trusted,
+            walk: s.explicit,
+            address_header: header(s.address_header, "OBLETH_CLIENT_ADDRESS_HEADER"),
+            country_header: header(s.country_header, "OBLETH_CLIENT_COUNTRY_HEADER"),
         }
     }
 }
@@ -214,7 +226,7 @@ mod tests {
 
     #[test]
     fn a_trusted_proxy_supplies_address_and_country() {
-        let cfg = ClientAddressConfig::from_settings(None, None);
+        let cfg = ClientAddressConfig::from_settings(None, None, None);
         let h = headers(&[
             ("x-forwarded-for", "6.6.6.6, 203.0.113.9"),
             ("cf-ipcountry", "de"),
@@ -231,7 +243,7 @@ mod tests {
 
     #[test]
     fn an_untrusted_peer_cannot_claim_an_address_or_country() {
-        let cfg = ClientAddressConfig::from_settings(None, None);
+        let cfg = ClientAddressConfig::from_settings(None, None, None);
         let h = headers(&[("x-forwarded-for", "203.0.113.9"), ("cf-ipcountry", "DE")]);
         let info = cfg.resolve(ip("198.51.100.20"), &h, "/v1/models");
         assert_eq!(info.ip, ip("198.51.100.20"));
@@ -241,12 +253,12 @@ mod tests {
     #[test]
     fn country_is_configurable_and_can_be_turned_off() {
         let h = headers(&[("cf-ipcountry", "DE"), ("x-country", "fr")]);
-        let custom = ClientAddressConfig::from_settings(None, Some("X-Country"));
+        let custom = ClientAddressConfig::from_settings(None, None, Some("X-Country"));
         assert_eq!(custom.resolve(ip("10.0.0.1"), &h, "/").country, "FR");
-        let off = ClientAddressConfig::from_settings(None, Some(""));
+        let off = ClientAddressConfig::from_settings(None, None, Some(""));
         assert_eq!(off.resolve(ip("10.0.0.1"), &h, "/").country, "");
         // Placeholders for unknown and Tor are not countries.
-        let cfg = ClientAddressConfig::from_settings(None, None);
+        let cfg = ClientAddressConfig::from_settings(None, None, None);
         for junk in ["XX", "T1", "", "Germany"] {
             let h = headers(&[("cf-ipcountry", junk)]);
             assert_eq!(cfg.resolve(ip("10.0.0.1"), &h, "/").country, "", "{junk}");
@@ -256,21 +268,54 @@ mod tests {
     #[test]
     fn the_trusted_list_is_configurable() {
         // Trust only one proxy address; private peers are no longer trusted.
-        let cfg = ClientAddressConfig::from_settings(Some("192.0.2.10/32, junk"), None);
+        let cfg = ClientAddressConfig::from_settings(Some("192.0.2.10/32, junk"), None, None);
         let h = headers(&[("x-forwarded-for", "203.0.113.9")]);
         assert_eq!(cfg.resolve(ip("192.0.2.10"), &h, "/").ip, ip("203.0.113.9"));
         assert_eq!(cfg.resolve(ip("10.0.0.1"), &h, "/").ip, ip("10.0.0.1"));
         // `none` trusts nobody.
-        let none = ClientAddressConfig::from_settings(Some("none"), None);
+        let none = ClientAddressConfig::from_settings(Some("none"), None, None);
         assert_eq!(none.resolve(ip("10.0.0.1"), &h, "/").ip, ip("10.0.0.1"));
         // Blank is the default, as unset is.
-        let blank = ClientAddressConfig::from_settings(Some(" "), None);
+        let blank = ClientAddressConfig::from_settings(Some(" "), None, None);
         assert_eq!(blank.resolve(ip("10.0.0.1"), &h, "/").ip, ip("203.0.113.9"));
     }
 
     #[test]
+    fn a_client_address_header_names_the_client_behind_a_tunnel() {
+        // A tunnel relays to a proxy that appends the tunnel's address.
+        let h = headers(&[
+            ("x-forwarded-for", "203.0.113.9, 10.42.1.90"),
+            ("cf-connecting-ip", "203.0.113.9"),
+        ]);
+        // With the proxies listed, the walk passes the tunnel.
+        let walk = ClientAddressConfig::from_settings(Some("10.42.0.0/16"), None, None);
+        assert_eq!(walk.resolve(ip("10.42.3.4"), &h, "/").ip, ip("203.0.113.9"));
+        // With the default list, the rightmost entry stands.
+        let default = ClientAddressConfig::from_settings(None, None, None);
+        assert_eq!(
+            default.resolve(ip("10.42.3.4"), &h, "/").ip,
+            ip("10.42.1.90")
+        );
+        let named = ClientAddressConfig::from_settings(None, Some("CF-Connecting-IP"), None);
+        let only_header = headers(&[
+            ("x-forwarded-for", "10.42.1.90"),
+            ("cf-connecting-ip", "198.51.100.8"),
+        ]);
+        assert_eq!(
+            named.resolve(ip("10.42.3.4"), &only_header, "/").ip,
+            ip("198.51.100.8")
+        );
+        // A bad header name is ignored, not fatal.
+        let bad = ClientAddressConfig::from_settings(None, Some("bad header"), None);
+        assert_eq!(
+            bad.resolve(ip("10.42.3.4"), &only_header, "/").ip,
+            ip("10.42.1.90")
+        );
+    }
+
+    #[test]
     fn a_request_without_a_peer_has_no_address() {
-        let cfg = ClientAddressConfig::from_settings(None, None);
+        let cfg = ClientAddressConfig::from_settings(None, None, None);
         let h = headers(&[("x-forwarded-for", "203.0.113.9")]);
         let info = cfg.resolve(None, &h, "/");
         assert_eq!(info.ip, None);
@@ -282,7 +327,7 @@ mod tests {
 
     #[test]
     fn long_user_agents_are_cut() {
-        let cfg = ClientAddressConfig::from_settings(None, None);
+        let cfg = ClientAddressConfig::from_settings(None, None, None);
         let long = "a".repeat(600);
         let h = headers(&[("user-agent", long.as_str())]);
         assert_eq!(cfg.resolve(None, &h, "/").user_agent.len(), 256);

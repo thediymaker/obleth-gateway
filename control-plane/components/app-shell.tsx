@@ -25,7 +25,6 @@ import {
   Settings,
   UserCog,
   Users,
-  Globe,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -59,7 +58,6 @@ const navGroups = [
   { label: "Access", items: [
     { href: "/tenants", label: "Tenants", icon: Users },
     { href: "/keys", label: "API Keys", icon: KeyRound },
-    { href: "/key-access", label: "Key Access", icon: Globe },
     { href: "/users", label: "Users", icon: UserCog },
   ] },
   { label: "Configuration", items: [

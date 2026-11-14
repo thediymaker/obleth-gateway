@@ -25,6 +25,66 @@ pub const DEFAULT_TRUSTED_PROXIES: &str =
 /// `OBLETH_CLIENT_COUNTRY_HEADER` says otherwise.
 pub const DEFAULT_COUNTRY_HEADER: &str = "cf-ipcountry";
 
+/// How the gateway works out a request's client, as the environment sets
+/// it: `OBLETH_TRUSTED_PROXIES`, `OBLETH_CLIENT_ADDRESS_HEADER` and
+/// `OBLETH_CLIENT_COUNTRY_HEADER`. Header names are lower-cased.
+#[derive(Debug, Clone, Default)]
+pub struct ClientAddressSettings {
+    pub trusted: Vec<IpNet>,
+    /// The trusted list was set (not the default). Only then does the
+    /// gateway read `X-Forwarded-For` past the proxies in it; see
+    /// [`client_ip`].
+    pub explicit: bool,
+    /// Entries of the trusted list that are not CIDR ranges, skipped.
+    pub invalid: Vec<String>,
+    /// A header a trusted proxy sets to exactly the client's address. Unset
+    /// by default: the client is found in `X-Forwarded-For`.
+    pub address_header: Option<String>,
+    /// The header a trusted proxy names the client's country in. `None`
+    /// when turned off.
+    pub country_header: Option<String>,
+}
+
+impl ClientAddressSettings {
+    /// From the three settings as the environment holds them (`None` =
+    /// unset). An unset or blank trusted list means the default private
+    /// ranges (so a deployment template can pass the variable through
+    /// empty); `none` trusts no proxy. An unset country header means
+    /// [`DEFAULT_COUNTRY_HEADER`]; blank turns it off.
+    pub fn from_settings(
+        trusted: Option<&str>,
+        address_header: Option<&str>,
+        country_header: Option<&str>,
+    ) -> Self {
+        let (list, explicit) = match trusted.map(str::trim) {
+            None | Some("") => (DEFAULT_TRUSTED_PROXIES, false),
+            Some(t) if t.eq_ignore_ascii_case("none") => ("", true),
+            Some(t) => (t, true),
+        };
+        let (trusted, invalid) = parse_network_list(list);
+        let header = |raw: &str| {
+            let raw = raw.trim().to_ascii_lowercase();
+            (!raw.is_empty()).then_some(raw)
+        };
+        ClientAddressSettings {
+            trusted,
+            explicit,
+            invalid,
+            address_header: address_header.and_then(header),
+            country_header: header(country_header.unwrap_or(DEFAULT_COUNTRY_HEADER)),
+        }
+    }
+
+    pub fn from_env() -> Self {
+        let var = |k: &str| std::env::var(k).ok();
+        Self::from_settings(
+            var("OBLETH_TRUSTED_PROXIES").as_deref(),
+            var("OBLETH_CLIENT_ADDRESS_HEADER").as_deref(),
+            var("OBLETH_CLIENT_COUNTRY_HEADER").as_deref(),
+        )
+    }
+}
+
 /// An IPv4 address carried in IPv6 (`::ffff:192.0.2.1`) is that IPv4 address:
 /// a dual-stack listener reports IPv4 peers this way, and a CIDR list written
 /// in IPv4 must still match them.
@@ -146,36 +206,71 @@ fn parse_forwarded_entry(entry: &str) -> Option<IpAddr> {
         .and_then(|e| e.parse::<IpAddr>().ok())
 }
 
-/// The address the nearest proxy put in `X-Forwarded-For`: the rightmost
-/// entry across every header line, in order. A proxy appends the address it
-/// saw, so that entry is the one it vouches for; anything to its left came
-/// from the client and is not trusted. When that rightmost entry is not an
-/// address, nothing further left is used either: `None` lets the caller fall
-/// back to the peer.
-pub fn rightmost_forwarded<'a>(values: impl IntoIterator<Item = &'a str>) -> Option<IpAddr> {
-    let last = values
+/// The client address in `X-Forwarded-For`, read from the right: each
+/// proxy appends the address it saw, so the rightmost entry is the one the
+/// nearest proxy vouches for. While that entry is itself a trusted proxy,
+/// the entry to its left is the address that proxy saw, so the walk goes on;
+/// the first address that is not a trusted proxy is the client. Entries
+/// further left came from the client and are never used.
+///
+/// When every entry is a trusted proxy, the leftmost is the client (a
+/// request from inside the proxies' own networks). An entry that is not an
+/// address stops the walk: the last address read is used, and when that is
+/// the rightmost entry itself, `None` lets the caller fall back to the peer.
+pub fn forwarded_client<'a>(
+    values: impl IntoIterator<Item = &'a str>,
+    trusted: &[IpNet],
+) -> Option<IpAddr> {
+    let entries: Vec<&str> = values
         .into_iter()
         .flat_map(|v| v.split(','))
         .map(str::trim)
         .filter(|e| !e.is_empty())
-        .last()?;
-    parse_forwarded_entry(last).map(canonical_ip)
+        .collect();
+    let mut found = None;
+    for entry in entries.iter().rev() {
+        let Some(ip) = parse_forwarded_entry(entry).map(canonical_ip) else {
+            break;
+        };
+        found = Some(ip);
+        if !trusted.iter().any(|n| n.contains(&ip)) {
+            break;
+        }
+    }
+    found
 }
 
-/// The client address for a request: the rightmost `X-Forwarded-For` entry
-/// when the peer is a trusted proxy and that entry is an address, else the
-/// peer itself. `None` only when the peer is unknown (a request built in
-/// process).
+/// One address in a header that holds only the client's address (such as
+/// `CF-Connecting-IP` or `X-Real-IP`), or `None` when it is not one.
+pub fn parse_address_header(raw: &str) -> Option<IpAddr> {
+    parse_forwarded_entry(raw).map(canonical_ip)
+}
+
+/// The client address for a request. From a trusted proxy: the address in
+/// `address_header` when given and it holds one, else the client found in
+/// `X-Forwarded-For`, else the peer. From anyone else, the peer itself.
+/// `None` only when the peer is unknown (a request built in process).
+///
+/// With `walk`, `X-Forwarded-For` is read from the right past the trusted
+/// proxies in it (see [`forwarded_client`]); without, its rightmost entry is
+/// the client. Walking is safe only when `trusted` lists the proxies alone:
+/// a client inside a trusted range could otherwise put any address in the
+/// header and have its own skipped as a proxy. So the gateway walks only
+/// when `OBLETH_TRUSTED_PROXIES` is set, never with the default of every
+/// private range.
 pub fn client_ip<'a>(
     peer: Option<IpAddr>,
     trusted: &[IpNet],
+    walk: bool,
+    address_header: Option<&str>,
     forwarded_for: impl IntoIterator<Item = &'a str>,
 ) -> Option<IpAddr> {
     let peer = peer.map(canonical_ip);
     match peer {
-        Some(p) if trusted.iter().any(|n| n.contains(&p)) => {
-            rightmost_forwarded(forwarded_for).or(Some(p))
-        }
+        Some(p) if trusted.iter().any(|n| n.contains(&p)) => address_header
+            .and_then(parse_address_header)
+            .or_else(|| forwarded_client(forwarded_for, if walk { trusted } else { &[] }))
+            .or(Some(p)),
         other => other,
     }
 }
@@ -200,6 +295,105 @@ pub fn clean_user_agent(raw: &str) -> String {
         .filter(|c| !c.is_control())
         .take(USER_AGENT_MAX_CHARS)
         .collect()
+}
+
+/// Most named networks one instance keeps.
+pub const MAX_NAMED_NETWORKS: usize = 500;
+
+/// Longest name for a network, in characters.
+pub const NETWORK_NAME_MAX_CHARS: usize = 64;
+
+/// A range of addresses an operator gave a name, such as a campus, a VPN or
+/// a cluster's pod network, so reports can say whose network a client
+/// address is in. Purely descriptive: it changes no check.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct NamedNetwork {
+    /// CIDR range, normalised (`10.139.0.0/16`).
+    pub network: String,
+    /// What to call it, for example `Campus VPN`.
+    pub name: String,
+}
+
+/// Validate and normalise named networks as an operator sent them: blank
+/// rows are dropped, each range becomes its canonical CIDR, names are
+/// trimmed, and a range listed twice is refused. The error names the row
+/// that is wrong.
+pub fn normalize_named_networks(entries: &[NamedNetwork]) -> Result<Vec<NamedNetwork>, String> {
+    let mut out: Vec<NamedNetwork> = Vec::new();
+    for entry in entries {
+        let raw = entry.network.trim();
+        let name: String = entry
+            .name
+            .trim()
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect();
+        if raw.is_empty() && name.is_empty() {
+            continue;
+        }
+        let Some(net) = parse_network(raw) else {
+            return Err(format!(
+                "\"{raw}\" is not an IP address or CIDR range \
+                 (examples: 10.0.0.0/8, 203.0.113.0/24, 2001:db8::/48)"
+            ));
+        };
+        if name.is_empty() {
+            return Err(format!("{net} needs a name"));
+        }
+        if name.chars().count() > NETWORK_NAME_MAX_CHARS {
+            return Err(format!(
+                "the name for {net} is longer than {NETWORK_NAME_MAX_CHARS} characters"
+            ));
+        }
+        let network = net.to_string();
+        if out.iter().any(|n| n.network == network) {
+            return Err(format!("{network} is listed twice"));
+        }
+        out.push(NamedNetwork { network, name });
+    }
+    if out.len() > MAX_NAMED_NETWORKS {
+        return Err(format!(
+            "at most {MAX_NAMED_NETWORKS} named networks ({} given)",
+            out.len()
+        ));
+    }
+    Ok(out)
+}
+
+/// Named networks parsed once, for naming many addresses.
+#[derive(Debug, Clone, Default)]
+pub struct NetworkNames {
+    /// Most specific first, so the first match is the narrowest.
+    nets: Vec<(IpNet, String)>,
+}
+
+impl NetworkNames {
+    /// Entries that do not parse (none should, as the admin API normalises
+    /// them) are skipped.
+    pub fn new(named: &[NamedNetwork]) -> Self {
+        let mut nets: Vec<(IpNet, String)> = named
+            .iter()
+            .filter_map(|n| parse_network(&n.network).map(|net| (net, n.name.clone())))
+            .collect();
+        nets.sort_by_key(|n| std::cmp::Reverse(n.0.prefix_len()));
+        NetworkNames { nets }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.nets.is_empty()
+    }
+
+    /// The name of the narrowest named network that holds all of `raw`, an
+    /// address or a CIDR range (a usage row's /24 or /48). A named range
+    /// narrower than `raw` does not name it, since only part of `raw` is in
+    /// it.
+    pub fn name_of(&self, raw: &str) -> Option<&str> {
+        let target = parse_network(raw)?;
+        self.nets
+            .iter()
+            .find(|(net, _)| net.contains(&target))
+            .map(|(_, name)| name.as_str())
+    }
 }
 
 #[cfg(test)]
@@ -295,35 +489,41 @@ mod tests {
         let peer = Some(ip("10.42.0.7"));
         // A proxy that sets the header to exactly the client.
         assert_eq!(
-            client_ip(peer, &trusted, ["203.0.113.9"]),
+            client_ip(peer, &trusted, false, None, ["203.0.113.9"]),
             Some(ip("203.0.113.9"))
         );
         // A proxy that appends: the client-supplied entries on the left are
         // ignored.
         assert_eq!(
-            client_ip(peer, &trusted, ["1.1.1.1, 8.8.8.8 ,203.0.113.9"]),
+            client_ip(
+                peer,
+                &trusted,
+                false,
+                None,
+                ["1.1.1.1, 8.8.8.8 ,203.0.113.9"]
+            ),
             Some(ip("203.0.113.9"))
         );
         // Several header lines read as one list, in order.
         assert_eq!(
-            client_ip(peer, &trusted, ["1.1.1.1", "198.51.100.4"]),
+            client_ip(peer, &trusted, false, None, ["1.1.1.1", "198.51.100.4"]),
             Some(ip("198.51.100.4"))
         );
         // Ports, brackets and IPv6.
         assert_eq!(
-            client_ip(peer, &trusted, ["203.0.113.9:51234"]),
+            client_ip(peer, &trusted, false, None, ["203.0.113.9:51234"]),
             Some(ip("203.0.113.9"))
         );
         assert_eq!(
-            client_ip(peer, &trusted, ["[2001:db8::5]:443"]),
+            client_ip(peer, &trusted, false, None, ["[2001:db8::5]:443"]),
             Some(ip("2001:db8::5"))
         );
         assert_eq!(
-            client_ip(peer, &trusted, ["2001:db8::5"]),
+            client_ip(peer, &trusted, false, None, ["2001:db8::5"]),
             Some(ip("2001:db8::5"))
         );
         assert_eq!(
-            client_ip(peer, &trusted, ["::ffff:203.0.113.9"]),
+            client_ip(peer, &trusted, false, None, ["::ffff:203.0.113.9"]),
             Some(ip("203.0.113.9"))
         );
     }
@@ -332,35 +532,56 @@ mod tests {
     fn junk_or_missing_forwarded_for_falls_back_to_the_peer() {
         let trusted = default_trusted();
         let peer = Some(ip("10.42.0.7"));
-        assert_eq!(client_ip(peer, &trusted, []), peer);
-        assert_eq!(client_ip(peer, &trusted, [""]), peer);
-        assert_eq!(client_ip(peer, &trusted, [" , "]), peer);
+        assert_eq!(client_ip(peer, &trusted, false, None, []), peer);
+        assert_eq!(client_ip(peer, &trusted, false, None, [""]), peer);
+        assert_eq!(client_ip(peer, &trusted, false, None, [" , "]), peer);
         // A junk rightmost entry does not hand the decision to the
         // client-supplied entries to its left.
-        assert_eq!(client_ip(peer, &trusted, ["203.0.113.9, unknown"]), peer);
-        assert_eq!(client_ip(peer, &trusted, ["203.0.113.9, 999.1.1.1"]), peer);
+        assert_eq!(
+            client_ip(peer, &trusted, false, None, ["203.0.113.9, unknown"]),
+            peer
+        );
+        assert_eq!(
+            client_ip(peer, &trusted, false, None, ["203.0.113.9, 999.1.1.1"]),
+            peer
+        );
     }
 
     #[test]
     fn forwarded_for_is_ignored_from_an_untrusted_peer() {
         let trusted = default_trusted();
         let peer = Some(ip("198.51.100.77"));
-        assert_eq!(client_ip(peer, &trusted, ["203.0.113.9"]), peer);
+        assert_eq!(
+            client_ip(peer, &trusted, false, None, ["203.0.113.9"]),
+            peer
+        );
         // An IPv6 peer outside fc00::/7.
         let peer6 = Some(ip("2001:db8::77"));
-        assert_eq!(client_ip(peer6, &trusted, ["203.0.113.9"]), peer6);
+        assert_eq!(
+            client_ip(peer6, &trusted, false, None, ["203.0.113.9"]),
+            peer6
+        );
         // A mapped private peer is the private IPv4 address, so trusted.
         assert_eq!(
-            client_ip(Some(ip("::ffff:10.0.0.1")), &trusted, ["203.0.113.9"]),
+            client_ip(
+                Some(ip("::ffff:10.0.0.1")),
+                &trusted,
+                false,
+                None,
+                ["203.0.113.9"]
+            ),
             Some(ip("203.0.113.9"))
         );
         // Trusting nobody.
         assert_eq!(
-            client_ip(Some(ip("10.0.0.1")), &[], ["203.0.113.9"]),
+            client_ip(Some(ip("10.0.0.1")), &[], false, None, ["203.0.113.9"]),
             Some(ip("10.0.0.1"))
         );
         // No peer at all (an in-process request).
-        assert_eq!(client_ip(None, &trusted, ["203.0.113.9"]), None);
+        assert_eq!(
+            client_ip(None, &trusted, false, None, ["203.0.113.9"]),
+            None
+        );
     }
 
     #[test]
@@ -403,5 +624,147 @@ mod tests {
             clean_user_agent(&long).chars().count(),
             USER_AGENT_MAX_CHARS
         );
+    }
+
+    #[test]
+    fn the_walk_skips_trusted_proxies_to_the_client() {
+        let trusted = default_trusted();
+        let peer = Some(ip("10.42.0.7"));
+        // An edge proxy set the client, then the next proxy appended the
+        // tunnel it came through: the tunnel is a trusted proxy, so the
+        // client to its left is the answer.
+        assert_eq!(
+            client_ip(peer, &trusted, true, None, ["203.0.113.9, 10.42.1.90"]),
+            Some(ip("203.0.113.9"))
+        );
+        // The walk stops at the first untrusted address; what the client
+        // wrote further left is never used.
+        assert_eq!(
+            client_ip(
+                peer,
+                &trusted,
+                true,
+                None,
+                ["198.51.100.1, 203.0.113.9, 10.42.1.90, 10.0.0.2"]
+            ),
+            Some(ip("203.0.113.9"))
+        );
+        // Only private hops: the leftmost is the client.
+        assert_eq!(
+            client_ip(peer, &trusted, true, None, ["10.139.4.5, 10.42.1.90"]),
+            Some(ip("10.139.4.5"))
+        );
+        // Junk behind a trusted hop: the last address read.
+        assert_eq!(
+            client_ip(peer, &trusted, true, None, ["unknown, 10.42.1.90"]),
+            Some(ip("10.42.1.90"))
+        );
+        // Without walking (the default trusted list), a client on a private
+        // network can't hide behind an address it wrote itself: the proxy's
+        // entry for it is the answer.
+        assert_eq!(
+            client_ip(peer, &trusted, false, None, ["203.0.113.5, 10.139.121.5"]),
+            Some(ip("10.139.121.5"))
+        );
+        // Trusting only the tunnel's network keeps a private client
+        // address as the client.
+        let narrow = parse_network_list("10.42.0.0/16").0;
+        assert_eq!(
+            client_ip(peer, &narrow, true, None, ["10.139.4.5, 10.42.1.90"]),
+            Some(ip("10.139.4.5"))
+        );
+    }
+
+    #[test]
+    fn an_address_header_from_a_trusted_proxy_wins() {
+        let trusted = default_trusted();
+        let peer = Some(ip("10.42.0.7"));
+        assert_eq!(
+            client_ip(peer, &trusted, false, Some("203.0.113.9"), ["10.42.1.90"]),
+            Some(ip("203.0.113.9"))
+        );
+        // Junk in the header falls back to X-Forwarded-For.
+        assert_eq!(
+            client_ip(peer, &trusted, false, Some("nope"), ["198.51.100.4"]),
+            Some(ip("198.51.100.4"))
+        );
+        // From an untrusted peer the header is ignored.
+        let outside = Some(ip("198.51.100.77"));
+        assert_eq!(
+            client_ip(outside, &trusted, false, Some("203.0.113.9"), []),
+            outside
+        );
+    }
+
+    #[test]
+    fn named_networks_normalise_and_name_the_narrowest_match() {
+        let named = normalize_named_networks(&[
+            NamedNetwork {
+                network: " 10.0.0.0/8 ".into(),
+                name: " Campus ".into(),
+            },
+            NamedNetwork {
+                network: "10.139.5.9/16".into(),
+                name: "Research computing".into(),
+            },
+            NamedNetwork {
+                network: "".into(),
+                name: "".into(),
+            },
+            NamedNetwork {
+                network: "2001:db8::/32".into(),
+                name: "Lab v6".into(),
+            },
+        ])
+        .unwrap();
+        assert_eq!(
+            named[0],
+            NamedNetwork {
+                network: "10.0.0.0/8".into(),
+                name: "Campus".into()
+            }
+        );
+        assert_eq!(named[1].network, "10.139.0.0/16");
+        assert_eq!(named.len(), 3);
+        let names = NetworkNames::new(&named);
+        assert_eq!(names.name_of("10.139.121.0/24"), Some("Research computing"));
+        assert_eq!(names.name_of("10.4.58.0/24"), Some("Campus"));
+        assert_eq!(names.name_of("10.4.58.7"), Some("Campus"));
+        assert_eq!(names.name_of("2001:db8:1::/48"), Some("Lab v6"));
+        assert_eq!(names.name_of("203.0.113.0/24"), None);
+        assert_eq!(names.name_of(""), None);
+        // A named range narrower than the row names none of it.
+        let narrow = NetworkNames::new(&[NamedNetwork {
+            network: "192.0.2.0/28".into(),
+            name: "x".into(),
+        }]);
+        assert_eq!(narrow.name_of("192.0.2.0/24"), None);
+        assert_eq!(narrow.name_of("192.0.2.3"), Some("x"));
+    }
+
+    #[test]
+    fn bad_named_networks_are_refused_with_the_row_named() {
+        let one = |network: &str, name: &str| {
+            normalize_named_networks(&[NamedNetwork {
+                network: network.into(),
+                name: name.into(),
+            }])
+        };
+        assert!(one("nope", "x").unwrap_err().contains("\"nope\""));
+        assert!(one("10.0.0.0/8", " ").unwrap_err().contains("needs a name"));
+        assert!(one("10.0.0.0/8", &"n".repeat(65))
+            .unwrap_err()
+            .contains("longer than"));
+        let twice = normalize_named_networks(&[
+            NamedNetwork {
+                network: "10.0.0.0/8".into(),
+                name: "a".into(),
+            },
+            NamedNetwork {
+                network: "10.1.0.0/8".into(),
+                name: "b".into(),
+            },
+        ]);
+        assert!(twice.unwrap_err().contains("listed twice"));
     }
 }

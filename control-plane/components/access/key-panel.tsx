@@ -7,7 +7,8 @@ import { deleteKeyAction, replaceKeyAction, saveKeySettingsAction, setKeysDisabl
 import { PERIOD_OPTIONS } from "@/components/access/key-dialogs";
 import { SettingsForm } from "@/components/access/settings-form";
 import { BudgetBar, StateDot } from "@/components/access/ui";
-import { SelectField, Setting, Switch, TextArea, TextField } from "@/components/models/fields";
+import { SelectField, Setting, Switch, TextField } from "@/components/models/fields";
+import { AllowedNetworksField } from "@/components/access/allowed-networks-field";
 import { Sheet } from "@/components/models/ui";
 import { Pill } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
@@ -17,7 +18,7 @@ import { NETWORKS_HINT, networksSummary, networksText } from "@/lib/key-networks
 import { lastUsed, tenantHref, type KeyRow } from "@/lib/access-model";
 import { logsHref } from "@/lib/log-links";
 import { money } from "@/lib/models-model";
-import type { ApiKey, Tenant, UsageDailyRow } from "@/lib/obleth";
+import type { ApiKey, NamedNetwork, Tenant, UsageDailyRow } from "@/lib/obleth";
 import { compact } from "@/lib/overview-model";
 import { cn, getJson } from "@/lib/utils";
 
@@ -115,9 +116,12 @@ export function KeyPanel({
   onReplaced,
   onNotice,
   onChanged,
+  named = [],
 }: {
   row: KeyRow | null;
   tenants: Tenant[];
+  /** Settings › Networks, offered by name. */
+  named?: NamedNetwork[];
   /** The other keys in its tenant, for the weight's meaning. */
   siblings: ApiKey[];
   onClose: () => void;
@@ -286,7 +290,7 @@ export function KeyPanel({
             <TextField name="max_in_flight" label="In flight per model" type="number" min={1} step={1} defaultValue={k.max_in_flight ?? ""} placeholder={tenant?.max_in_flight ? `tenant's ${tenant.max_in_flight}` : "No cap"} mono className="w-32" />
           </Setting>
           <Setting label="Allowed networks" hint={NETWORKS_HINT} fields={["allowed_networks"]} className="px-6">
-            <TextArea name="allowed_networks" label="Allowed networks" rows={3} defaultValue={networksText(k.allowed_networks)} placeholder={"203.0.113.0/24\n2001:db8::/48"} />
+            <AllowedNetworksField defaultValue={networksText(k.allowed_networks)} named={named} />
           </Setting>
           <Setting label="Trace requests" hint="Keep each step of its requests" fields={["tracing_enabled"]} was={{ field: "tracing_enabled", checkbox: true }} className="px-6">
             <Switch name="tracing_enabled" label="Trace requests" defaultChecked={k.tracing_enabled} />

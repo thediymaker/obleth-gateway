@@ -3,7 +3,8 @@
 import { useState, useTransition } from "react";
 import Link from "next/link";
 import { createKeyAction, moveKeysAction, setKeysBudgetAction, type BulkKeyResult } from "@/app/actions";
-import { Field, SelectField, TextArea } from "@/components/models/fields";
+import { Field, SelectField } from "@/components/models/fields";
+import { AllowedNetworksField } from "@/components/access/allowed-networks-field";
 import { NETWORKS_HINT } from "@/lib/key-networks";
 import { Sheet } from "@/components/models/ui";
 import { Segmented } from "@/components/overview/ui";
@@ -11,7 +12,7 @@ import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Select } from "@/components/ui/select";
 import { tenantHref } from "@/lib/access-model";
-import type { ApiKey, Tenant } from "@/lib/obleth";
+import type { ApiKey, NamedNetwork, Tenant } from "@/lib/obleth";
 
 export const PERIOD_OPTIONS = [
   { value: "monthly", label: "each month" },
@@ -163,12 +164,15 @@ export function NewKeySheet({
   onClose,
   tenants,
   tenantId,
+  named = [],
   onCreated,
 }: {
   open: boolean;
   onClose: () => void;
   tenants: Tenant[];
   tenantId: string;
+  /** Settings › Networks, offered by name. */
+  named?: NamedNetwork[];
   onCreated: (created: { secret: string; name: string; tenantName: string; detail: string }) => void;
 }) {
   const [tenant, setTenant] = useState(tenantId);
@@ -239,7 +243,7 @@ export function NewKeySheet({
         </div>
         <div className="space-y-1.5">
           <span className="text-[12.5px] font-medium text-secondary-foreground">Allowed networks</span>
-          <TextArea name="allowed_networks" label="Allowed networks" rows={3} placeholder={"203.0.113.0/24\n2001:db8::/48"} />
+          <AllowedNetworksField named={named} />
           <p className="text-[11.5px] leading-snug text-muted-foreground">{NETWORKS_HINT}</p>
         </div>
       </form>

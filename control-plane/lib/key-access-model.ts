@@ -20,6 +20,10 @@ export const keyAccessRange = (id: KeyAccessRange) => KEY_ACCESS_RANGES.find((r)
 /** One network and country a key was used from. */
 export interface KeyPlace {
   network: string;
+  /** Its name from Settings › Networks, or null. */
+  name: string | null;
+  /** A private, loopback or link-local range: never has a country. */
+  private: boolean;
   country: string;
   requests: number;
   distinctIps: number;
@@ -43,6 +47,10 @@ export interface KeyAccessRow {
   /** Busiest first. */
   places: KeyPlace[];
   countries: string[];
+  /** Names of the named networks it was used from, A to Z. */
+  names: string[];
+  /** Used from a private network that has no name. */
+  unnamedPrivate: boolean;
   newCountries: string[];
   newNetworks: number;
   refused: number;
@@ -74,6 +82,8 @@ export function keyAccessRows(sources: KeySource[], rejections: KeyRejectionAgg[
         lastSeenMs: 0,
         places: [],
         countries: [],
+        names: [],
+        unnamedPrivate: false,
         newCountries: [],
         newNetworks: 0,
         refused: 0,
@@ -81,8 +91,12 @@ export function keyAccessRows(sources: KeySource[], rejections: KeyRejectionAgg[
     const country = s.client_country.toUpperCase();
     const newCountry = !!country && s.first_seen_ms !== null && s.first_seen_ms >= sinceMs;
     const newNetwork = s.network_first_seen_ms !== null && s.network_first_seen_ms >= sinceMs;
+    const name = s.network_name || null;
+    const priv = isPrivateNetwork(s.network);
     row.places.push({
       network: s.network,
+      name,
+      private: priv,
       country,
       requests: s.requests,
       distinctIps: s.distinct_ips,
@@ -94,6 +108,8 @@ export function keyAccessRows(sources: KeySource[], rejections: KeyRejectionAgg[
     row.distinctIps += s.distinct_ips;
     row.lastSeenMs = Math.max(row.lastSeenMs, s.last_seen_ms);
     if (country && !row.countries.includes(country)) row.countries.push(country);
+    if (name && !row.names.includes(name)) row.names.push(name);
+    if (!name && priv) row.unnamedPrivate = true;
     if (newCountry && !row.newCountries.includes(country)) row.newCountries.push(country);
     byKey.set(s.key_id, row);
   }
@@ -101,6 +117,7 @@ export function keyAccessRows(sources: KeySource[], rejections: KeyRejectionAgg[
     row.places.sort((a, b) => b.requests - a.requests || b.lastSeenMs - a.lastSeenMs);
     row.newNetworks = new Set(row.places.filter((p) => p.newNetwork).map((p) => p.network)).size;
     row.countries.sort();
+    row.names.sort((a, b) => a.localeCompare(b));
   }
   for (const r of rejections) {
     const row = byKey.get(r.key_id);
@@ -131,6 +148,7 @@ export function filterKeyAccess(rows: KeyAccessRow[], search: string, sort: KeyA
     r.tenantName.toLowerCase().includes(q) ||
     r.keyId.startsWith(q) ||
     r.countries.some((c) => c.toLowerCase() === q) ||
+    r.names.some((n) => n.toLowerCase().includes(q)) ||
     r.places.some((p) => p.network.startsWith(q));
   const out = rows.filter((r) => hit(r) && (!onlyNew || r.newCountries.length > 0 || r.newNetworks > 0));
   const by: Record<KeyAccessSort, (a: KeyAccessRow, b: KeyAccessRow) => number> = {
@@ -151,6 +169,31 @@ export const REFUSAL_REASON: Record<string, string> = {
   disabled: "Key turned off",
   ip_not_allowed: "Outside allowed networks",
 };
+
+/**
+ * Whether a network or address (CIDR text) is private: RFC 1918, shared
+ * (100.64/10), loopback, link-local, or IPv6 unique-local, loopback or
+ * link-local. Such an address has no country.
+ */
+export function isPrivateNetwork(cidr: string): boolean {
+  const addr = cidr.split("/")[0]!.trim().toLowerCase();
+  if (!addr) return false;
+  if (addr.includes(":")) {
+    const v4 = addr.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+    if (v4) return isPrivateNetwork(v4[1]!);
+    return addr === "::1" || /^f[cd][0-9a-f]{0,2}:/.test(addr) || /^fe[89ab][0-9a-f]?:/.test(addr);
+  }
+  const p = addr.split(".").map(Number);
+  if (p.length !== 4 || p.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return false;
+  const [a, b] = p as [number, number, number, number];
+  return a === 10 || a === 127 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254) || (a === 100 && b >= 64 && b <= 127);
+}
+
+/** What to call where a place is: its country, else "Private address" for a private range, else "Unknown". */
+export function placeLabel(country: string, network: string): string {
+  if (country) return countryLabel(country);
+  return isPrivateNetwork(network) ? "Private address" : "Unknown";
+}
 
 /** "US" -> "United States", falling back to the code; empty -> "Unknown". */
 export function countryLabel(code: string): string {
