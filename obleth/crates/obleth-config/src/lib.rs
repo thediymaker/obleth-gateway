@@ -26,9 +26,10 @@ pub use jwt::{
     JwtIssuerConfig, ALLOWED_JWT_ALGORITHMS, DEVICE_ID_MAX_LEN,
 };
 pub use keys::{
-    cache_key, content_hash, crc32, end_user_key_id, generate_api_key, hash_api_key,
-    is_malformed_key, is_well_formed_key, normalize_end_user, pepper_is_set, GeneratedKey,
-    END_USER_MAX_CHARS, KEY_LEN, KEY_PREFIX,
+    cache_key, content_hash, crc32, default_key_prefix, end_user_key_id, env_key_prefix,
+    generate_api_key, generate_api_key_with_prefix, hash_api_key, is_malformed_key,
+    is_valid_key_prefix, is_well_formed_key, normalize_end_user, pepper_is_set, GeneratedKey,
+    DEFAULT_KEY_PREFIX, END_USER_MAX_CHARS, KEY_LEN, KEY_PREFIX_MAX_CHARS,
 };
 pub use manifest::{
     endpoint_to_manifest_entry, model_to_manifest_entry, resolve_endpoint, resolve_model,

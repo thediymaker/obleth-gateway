@@ -9,7 +9,7 @@ import { SettingsForm } from "@/components/access/settings-form";
 import { SettingsCard } from "@/components/access/ui";
 import { AlertsSection } from "@/components/settings/alerts-section";
 import { BoonsSection } from "@/components/settings/boons-section";
-import { AboutSection, AssistantSection, DataSection, EnergySection, type VersionInfo } from "@/components/settings/other-sections";
+import { AboutSection, AssistantSection, DataSection, EnergySection, KeysSection, type VersionInfo } from "@/components/settings/other-sections";
 import { NeedsYouSection, needsYouCount } from "@/components/settings/needs-you";
 import { RoutingSection } from "@/components/settings/routing-section";
 import { useConfirm } from "@/components/ui/confirm-dialog";
@@ -21,6 +21,7 @@ import type {
   CharoSettingsView,
   CompressorStatusView,
   EnergySettingsView,
+  KeyPrefixView,
   KnowledgeSettingsView,
   ModelRoute,
   RouterReadinessView,
@@ -42,6 +43,8 @@ export interface SettingsData {
   energy: EnergySettingsView | null;
   charo: CharoSettingsView | null;
   retention: UsageRetentionView | null;
+  /** The prefix new API keys start with; null when it could not be read. */
+  keyPrefix: KeyPrefixView | null;
   slurm: SlurmSettingsView | null;
   models: ModelRoute[];
   version: VersionInfo;
@@ -66,6 +69,7 @@ const SEARCH: { id: string; label: string; words: string }[] = [
   { id: "boon-compression", label: "Compression", words: "dedup lossy compact boon" },
   { id: "set-energy", label: "Energy", words: "power prometheus watts carbon co2 pue kwh" },
   { id: "set-assistant", label: "Assistant", words: "charo playground agent benchmark" },
+  { id: "set-key-prefix", label: "Key prefix", words: "api key prefix obl sk format" },
   { id: "set-retention", label: "History retention", words: "retention days usage logs keep" },
   { id: "data", label: "Backup and restore", words: "backup export restore cache reconcile" },
   { id: "about", label: "Versions", words: "version about provisioner compressor" },
@@ -190,6 +194,7 @@ export function SettingsPage({ data, anchor }: { data: SettingsData; anchor?: st
     { id: "boons", label: "Boons", count: boonsOn !== null ? `${boonsOn} of ${BOONS.length} on` : undefined },
     { id: "energy", label: "Energy", count: data.energy ? (data.energy.enabled ? "on" : "off") : undefined },
     { id: "assistant", label: "Assistant", count: data.charo ? (data.charo.enabled ? "on" : "off") : undefined },
+    { id: "keys", label: "Keys", count: data.keyPrefix ? `${data.keyPrefix.prefix}_` : undefined },
     { id: "data", label: "Data and backups", count: data.retention ? `${data.retention.days} days` : undefined },
     { id: "about", label: "About", count: data.version.gateway?.version },
   ];
@@ -232,6 +237,7 @@ export function SettingsPage({ data, anchor }: { data: SettingsData; anchor?: st
             {data.boons ? <BoonsSection settings={data.boons} models={data.models} knowledge={data.knowledge} compressor={data.compressor} /> : <Unreadable id="boons" title="Boons" />}
             {data.energy ? <EnergySection settings={data.energy} /> : <Unreadable id="energy" title="Energy" />}
             {data.charo ? <AssistantSection settings={data.charo} models={data.models} /> : <Unreadable id="assistant" title="Assistant" />}
+            {data.keyPrefix ? <KeysSection settings={data.keyPrefix} /> : <Unreadable id="keys" title="Keys" />}
             <DataSection retention={data.retention} />
           </SettingsForm>
 

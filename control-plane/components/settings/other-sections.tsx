@@ -10,7 +10,8 @@ import { Notice } from "@/components/models/ui";
 import { Pill } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm-dialog";
-import type { CharoSettingsView, CompressorStatusView, EnergySettingsView, ModelRoute, SlurmSettingsView, UsageRetentionView } from "@/lib/obleth";
+import type { CharoSettingsView, CompressorStatusView, EnergySettingsView, KeyPrefixView, ModelRoute, SlurmSettingsView, UsageRetentionView } from "@/lib/obleth";
+import { KEY_PREFIX_MAX, keyPrefixExample, keyPrefixProblem } from "@/lib/key-prefix";
 import { describeEnergyTest, describeResync } from "@/lib/settings-model";
 import { cn } from "@/lib/utils";
 
@@ -133,6 +134,28 @@ export function AssistantSection({ settings, models }: { settings: CharoSettings
           <span className="inline-flex items-center gap-1.5"><TextField name="assistant.bench_max_duration_s" label="Longest run" inputMode="numeric" defaultValue={settings.bench_max_duration_s} mono className="w-20" /><span className="text-xs text-muted-foreground">s</span></span>
           <span className="inline-flex items-center gap-1.5"><TextField name="assistant.bench_max_requests" label="Most requests" inputMode="numeric" defaultValue={settings.bench_max_requests} mono className="w-20" /><span className="text-xs text-muted-foreground">requests</span></span>
         </div>
+      </Setting>
+    </SettingsCard>
+  );
+}
+
+/** What new API keys start with. */
+export function KeysSection({ settings }: { settings: KeyPrefixView }) {
+  const [prefix, setPrefix] = useState(settings.prefix);
+  const problem = keyPrefixProblem(prefix);
+  return (
+    <SettingsCard id="keys" title="Keys" description="How new API keys look.">
+      <Setting id="set-key-prefix" label="Key prefix" hint={`New keys start with this and an underscore. 1 to ${KEY_PREFIX_MAX} lowercase letters or digits, starting with a letter. Keys already made keep working whatever their prefix.`} fields={["keys.prefix"]} was={{ field: "keys.prefix" }}>
+        <div className="flex flex-wrap items-center gap-3">
+          <TextField name="keys.prefix" label="Key prefix" value={prefix} onChange={(e) => setPrefix(e.target.value.trim().toLowerCase())} maxLength={KEY_PREFIX_MAX} mono className="w-20" aria-invalid={problem ? true : undefined} />
+          <span className="font-mono text-[12.5px] text-muted-foreground">{problem ? "" : keyPrefixExample(prefix)}</span>
+        </div>
+        {problem ? (
+          <span className="text-xs font-medium">{problem}</span>
+        ) : (
+          prefix !== settings.prefix && <span className="text-xs text-muted-foreground">A proxy that sends keys to the gateway by their shape must also accept <span className="font-mono">{prefix}_</span> keys.</span>
+        )}
+        {!settings.configured && <span className="text-xs text-muted-foreground">The default, <span className="font-mono">{settings.default_prefix}</span>, until you save one.</span>}
       </Setting>
     </SettingsCard>
   );

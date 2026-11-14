@@ -43,26 +43,69 @@ pub struct GeneratedKey {
     pub hash: String,
 }
 
-/// Marker every key minted today starts with. Keys minted before it (`sk_…`)
-/// and any other format an instance imported keep authenticating: only
-/// minting changed.
-pub const KEY_PREFIX: &str = "obl_";
+/// Prefix new keys start with unless an operator chose another (see
+/// [`is_valid_key_prefix`]). Keys minted before checksummed keys existed
+/// (`sk_` and 48 hex characters) and any other format an instance imported
+/// keep authenticating: only minting depends on the prefix.
+pub const DEFAULT_KEY_PREFIX: &str = "sk";
 
-/// Hex characters of random secret after [`KEY_PREFIX`] (24 bytes).
+/// The prefix v2.7.0 minted every key with. No key in another format ever
+/// started with it, so a credential starting `obl_` that fails its checksum
+/// is refused before the lookup whatever prefix is configured now.
+const CHECKSUM_ONLY_PREFIX: &str = "obl_";
+
+/// Most characters a key prefix may have.
+pub const KEY_PREFIX_MAX_CHARS: usize = 3;
+
+/// Hex characters of random secret after the prefix and `_` (24 bytes).
 const KEY_RANDOM_HEX: usize = 48;
 
 /// Hex characters of the CRC-32 checksum that ends a key.
 const KEY_CHECKSUM_HEX: usize = 8;
 
-/// Total length of a well-formed `obl_` key.
-pub const KEY_LEN: usize = KEY_PREFIX.len() + KEY_RANDOM_HEX + KEY_CHECKSUM_HEX;
+/// Hex characters after the prefix and `_`.
+const KEY_TAIL_HEX: usize = KEY_RANDOM_HEX + KEY_CHECKSUM_HEX;
+
+/// Length of a well-formed key with the default prefix.
+pub const KEY_LEN: usize = DEFAULT_KEY_PREFIX.len() + 1 + KEY_TAIL_HEX;
+
+/// True when `prefix` may start new keys: 1 to [`KEY_PREFIX_MAX_CHARS`]
+/// lowercase letters or digits, the first a letter. Kept short and plain so
+/// a key stays one token in a URL, a shell and a secret scanner's pattern.
+pub fn is_valid_key_prefix(prefix: &str) -> bool {
+    let bytes = prefix.as_bytes();
+    (1..=KEY_PREFIX_MAX_CHARS).contains(&bytes.len())
+        && bytes[0].is_ascii_lowercase()
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+/// The prefix `OBLETH_KEY_PREFIX` names, when it is a valid one. The saved
+/// setting wins over it; it only sets the starting value.
+pub fn env_key_prefix() -> Option<&'static str> {
+    static PREFIX: OnceLock<Option<String>> = OnceLock::new();
+    PREFIX
+        .get_or_init(|| {
+            std::env::var("OBLETH_KEY_PREFIX")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| is_valid_key_prefix(v))
+        })
+        .as_deref()
+}
+
+/// The prefix to mint with when no setting is saved.
+pub fn default_key_prefix() -> &'static str {
+    env_key_prefix().unwrap_or(DEFAULT_KEY_PREFIX)
+}
 
 /// Characters of a key kept for display (`ApiKey::key_prefix`).
 const DISPLAY_PREFIX_CHARS: usize = 18;
 
 /// CRC-32 (IEEE 802.3, the zlib/PNG polynomial) of `data`. Bitwise rather
-/// than table-driven: it runs once per minted key and once per `obl_`
-/// credential presented, on under 60 bytes.
+/// than table-driven: it runs once per minted key and once per credential of
+/// the checksummed shape presented, on under 60 bytes.
 pub fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for &byte in data {
@@ -75,15 +118,26 @@ pub fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
-/// Generate a new API key: `obl_` + 48 lowercase hex characters of random
-/// secret + 8 lowercase hex characters of CRC-32 over everything before them.
-/// The checksum lets the gateway refuse a mistyped or truncated key without
-/// a lookup, and lets secret scanners recognise a real key with few false
-/// positives.
+/// Generate a new API key with the default prefix. See
+/// [`generate_api_key_with_prefix`].
 pub fn generate_api_key() -> GeneratedKey {
+    generate_api_key_with_prefix(DEFAULT_KEY_PREFIX)
+}
+
+/// Generate a new API key: `prefix`, `_`, 48 lowercase hex characters of
+/// random secret, then 8 lowercase hex characters of CRC-32 over everything
+/// before them. The checksum lets the gateway refuse a mistyped or truncated
+/// key without a lookup, and lets secret scanners recognise a real key with
+/// few false positives. An invalid `prefix` falls back to the default.
+pub fn generate_api_key_with_prefix(prefix: &str) -> GeneratedKey {
+    let prefix = if is_valid_key_prefix(prefix) {
+        prefix
+    } else {
+        DEFAULT_KEY_PREFIX
+    };
     let mut bytes = [0u8; KEY_RANDOM_HEX / 2];
     rand::thread_rng().fill_bytes(&mut bytes);
-    let body = format!("{KEY_PREFIX}{}", hex::encode(bytes));
+    let body = format!("{prefix}_{}", hex::encode(bytes));
     let secret = format!("{body}{:08x}", crc32(body.as_bytes()));
     let prefix = secret
         .chars()
@@ -97,28 +151,40 @@ pub fn generate_api_key() -> GeneratedKey {
     }
 }
 
-/// True when `secret` is a well-formed `obl_` key: the prefix, 56 lowercase
-/// hex characters, and a checksum that matches. Says nothing about whether
-/// the key exists.
-pub fn is_well_formed_key(secret: &str) -> bool {
-    let Some(rest) = secret.strip_prefix(KEY_PREFIX) else {
-        return false;
-    };
-    if rest.len() != KEY_RANDOM_HEX + KEY_CHECKSUM_HEX
-        || !rest.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+/// The key's checksummed body and checksum when `secret` has the shape of a
+/// checksummed key: a valid prefix, `_`, and 56 lowercase hex characters.
+fn checksummed_parts(secret: &str) -> Option<(&str, &str)> {
+    let (prefix, tail) = secret.split_once('_')?;
+    if !is_valid_key_prefix(prefix)
+        || tail.len() != KEY_TAIL_HEX
+        || !tail.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
     {
-        return false;
+        return None;
     }
-    let (body, checksum) = secret.split_at(KEY_PREFIX.len() + KEY_RANDOM_HEX);
-    u32::from_str_radix(checksum, 16).is_ok_and(|c| c == crc32(body.as_bytes()))
+    Some(secret.split_at(secret.len() - KEY_CHECKSUM_HEX))
 }
 
-/// True when a presented credential claims the `obl_` format but is not a
-/// well-formed key, so it can be refused before it is hashed or looked up.
-/// Any credential in another format (`sk_…` and the rest) is never refused
-/// here.
+/// True when `secret` is a well-formed checksummed key, with any valid
+/// prefix: the prefix, `_`, 56 lowercase hex characters, and a checksum that
+/// matches. Says nothing about whether the key exists.
+pub fn is_well_formed_key(secret: &str) -> bool {
+    checksummed_parts(secret).is_some_and(|(body, checksum)| {
+        u32::from_str_radix(checksum, 16).is_ok_and(|c| c == crc32(body.as_bytes()))
+    })
+}
+
+/// True when a presented credential claims to be a checksummed key but is
+/// not a well-formed one, so it can be refused before it is hashed or looked
+/// up: anything starting with `obl_`, or a key of the full shape with any
+/// prefix whose checksum fails. A key in another format (the older `sk_` and
+/// 48 hex characters, and the rest) is never refused here, and neither is a
+/// cut-off key with another prefix: those go to the lookup and are refused
+/// there.
 pub fn is_malformed_key(secret: &str) -> bool {
-    secret.starts_with(KEY_PREFIX) && !is_well_formed_key(secret)
+    if is_well_formed_key(secret) {
+        return false;
+    }
+    secret.starts_with(CHECKSUM_ONLY_PREFIX) || checksummed_parts(secret).is_some()
 }
 
 /// SHA-256 hex digest of a raw key, used as the lookup handle in Postgres + Redis.
@@ -197,10 +263,10 @@ mod tests {
     #[test]
     fn generated_key_is_well_formed() {
         let k = generate_api_key();
-        assert!(k.secret.starts_with("obl_"));
+        assert!(k.secret.starts_with("sk_"));
         assert_eq!(k.secret.len(), KEY_LEN);
-        assert_eq!(KEY_LEN, 60);
-        assert!(k.secret[4..]
+        assert_eq!(KEY_LEN, 59);
+        assert!(k.secret[3..]
             .bytes()
             .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
         assert!(is_well_formed_key(&k.secret));
@@ -246,7 +312,8 @@ mod tests {
 
     #[test]
     fn other_formats_are_never_called_malformed() {
-        // Keys minted before `obl_` keep authenticating exactly as before.
+        // Keys minted before checksummed keys keep authenticating exactly as
+        // before, though new keys start `sk_` again by default.
         assert!(!is_malformed_key(
             "sk_0123456789abcdef0123456789abcdef0123456789abcdef"
         ));
@@ -257,6 +324,69 @@ mod tests {
         assert!(!is_malformed_key("OBL_upper-case-is-another-format"));
         assert!(!is_malformed_key(""));
         assert!(!is_well_formed_key("sk_0123"));
+    }
+
+    #[test]
+    fn a_prefix_is_one_to_three_lowercase_letters_or_digits() {
+        for ok in ["obl", "sk", "rc", "air", "a", "x9", "ab1"] {
+            assert!(is_valid_key_prefix(ok), "{ok}");
+        }
+        for bad in ["", "abcd", "Obl", "9ab", "a_b", "a-b", "é", " rc", "rc "] {
+            assert!(!is_valid_key_prefix(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn keys_mint_with_the_prefix_they_are_given() {
+        for prefix in ["rc", "air", "sk", "a"] {
+            let k = generate_api_key_with_prefix(prefix);
+            assert!(k.secret.starts_with(&format!("{prefix}_")));
+            assert_eq!(k.secret.len(), prefix.len() + 1 + 56);
+            assert!(is_well_formed_key(&k.secret));
+            assert!(!is_malformed_key(&k.secret));
+            assert_eq!(k.prefix, k.secret[..18]);
+        }
+        // An invalid prefix never reaches a key.
+        assert!(generate_api_key_with_prefix("toolong")
+            .secret
+            .starts_with("sk_"));
+        assert!(generate_api_key_with_prefix("").secret.starts_with("sk_"));
+    }
+
+    #[test]
+    fn sk_keys_of_both_formats_live_side_by_side() {
+        // A new `sk_` key has the checksummed shape; an older one is 48 hex
+        // characters with no checksum and still goes to the lookup.
+        let new = generate_api_key_with_prefix("sk").secret;
+        assert_eq!(new.len(), 59);
+        assert!(is_well_formed_key(&new));
+        let mut flipped = new.clone().into_bytes();
+        flipped[5] = if flipped[5] == b'0' { b'1' } else { b'0' };
+        assert!(is_malformed_key(&String::from_utf8(flipped).unwrap()));
+        let old = format!("sk_{}", "ab".repeat(24));
+        assert!(!is_well_formed_key(&old));
+        assert!(!is_malformed_key(&old));
+        // `obl_` keys stay checked strictly, cut off or not.
+        let obl = generate_api_key_with_prefix("obl").secret;
+        assert!(!is_malformed_key(&obl));
+        assert!(is_malformed_key(&obl[..40]));
+    }
+
+    #[test]
+    fn a_checksum_failure_is_caught_whatever_the_prefix() {
+        let k = generate_api_key_with_prefix("rc").secret;
+        let mut flipped = k.clone().into_bytes();
+        flipped[5] = if flipped[5] == b'0' { b'1' } else { b'0' };
+        assert!(is_malformed_key(&String::from_utf8(flipped).unwrap()));
+        // A cut-off key with another prefix goes to the lookup instead.
+        assert!(!is_malformed_key(&k[..40]));
+        assert!(!is_well_formed_key(&k[..40]));
+        // A new-format `sk_` key is told apart from a 48-hex legacy one by length.
+        let sk = generate_api_key_with_prefix("sk").secret;
+        assert!(is_well_formed_key(&sk));
+        assert!(!is_malformed_key(
+            "sk_0123456789abcdef0123456789abcdef0123456789abcdef"
+        ));
     }
 
     #[test]
