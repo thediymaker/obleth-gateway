@@ -361,3 +361,57 @@ async fn a_waited_on_interactive_pool_refuses_background_claims() {
     let (outcome, _) = a.acquire(bg).await.unwrap();
     assert_eq!(outcome, AcquireOutcome::Granted);
 }
+
+/// Views size a background pool by the share it may fill, which is what
+/// admission enforces, so fair shares come out of those slots and not the
+/// whole model's.
+#[tokio::test]
+async fn the_background_pool_reports_the_slots_it_may_fill() {
+    let fs = local(1024);
+    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+    let held = vec![
+        admit_now(&fs, background(), bg_req(a, 256, 0.75)).await,
+        admit_now(&fs, background(), bg_req(b, 256, 0.75)).await,
+        admit_now(&fs, interactive(), req(Uuid::new_v4(), 256)).await,
+    ];
+    let snap = fs.snapshot().await.expect("snapshot");
+    let pool = |name: &str| snap.pools.iter().find(|p| p.model == name).expect("pool listed");
+    let bg = pool("m (background)");
+    assert_eq!((bg.cap, bg.configured_cap), (192, 192));
+    let mut shares: Vec<f64> = bg.tenants.iter().map(|t| t.weight_share * bg.cap as f64).collect();
+    shares.sort_by(f64::total_cmp);
+    assert_eq!(shares, vec![96.0, 96.0]);
+    // The model's interactive pool keeps its whole size.
+    let fg = pool("m");
+    assert_eq!((fg.cap, fg.configured_cap), (256, 256));
+    drop(held);
+}
+
+/// The cluster-wide view, merged from every gateway's, sizes the background
+/// pool the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_cluster_view_reports_the_background_pool_by_its_share() {
+    let cluster = InMemoryCluster::new();
+    let gws = gateways(&cluster, 2, 4096);
+    for fs in &gws {
+        wait_for_shared(fs).await;
+    }
+    let held = vec![
+        admit_now(&gws[0], background(), bg_req(Uuid::new_v4(), 8, 0.75)).await,
+        admit_now(&gws[1], background(), bg_req(Uuid::new_v4(), 8, 0.75)).await,
+    ];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let pool = loop {
+        let snap = gws[0].cluster_snapshot().await.expect("backend answers");
+        if let Some(p) = snap.pools.into_iter().find(|p| p.model == "m (background)" && p.tenants.len() == 2) {
+            break p;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "both gateways' tenants in the view");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!((pool.cap, pool.configured_cap), (6, 6));
+    for t in &pool.tenants {
+        assert_eq!(t.weight_share * pool.cap as f64, 3.0);
+    }
+    drop(held);
+}

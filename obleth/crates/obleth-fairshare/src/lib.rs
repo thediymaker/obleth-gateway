@@ -1569,6 +1569,22 @@ impl Pool {
         self.cap.min(self.in_flight.saturating_add(headroom)).max(1)
     }
 
+    /// The pool's size as views report it, `(cap, configured_cap)`. A
+    /// background pool reports the share of the model's pool it may fill,
+    /// which is what admission enforces (see [`Pool::claim`]), so its fair
+    /// shares and bars are drawn against the slots background work can use
+    /// rather than the whole model.
+    fn reported_caps(&self) -> (usize, usize) {
+        if self.key.is_background() {
+            (
+                background_cap(self.cap, self.share).max(1),
+                background_cap(self.configured_cap, self.share).max(1),
+            )
+        } else {
+            (self.cap, self.configured_cap)
+        }
+    }
+
     /// The slots this pool may fill now, given what the same model's other
     /// pool holds (`sibling_in_flight`) and has waiting (`sibling_queued`),
     /// and the replica's in-flight total against its ceiling.
@@ -2869,7 +2885,7 @@ impl Pool {
 
         ReplicaPoolView {
             pool: self.key.slot_id(),
-            configured_cap: self.configured_cap,
+            configured_cap: self.reported_caps().1,
             in_flight: self.in_flight,
             queued: self.queued_total,
             groups,
@@ -2899,7 +2915,9 @@ impl Pool {
             .chain(self.queues.values().flat_map(|q| q.keys.keys().copied()))
             .collect();
         let shares = self.shares(&ids, &key_ids);
-        let group_caps = self.compute_group_caps(self.effective_cap(headroom));
+        let (cap, configured_cap) = self.reported_caps();
+        let group_caps =
+            self.compute_group_caps(cap.min(self.in_flight.saturating_add(headroom)).max(1));
         let group_service = self.group_service();
 
         let mut names: HashSet<String> = shares.groups.keys().cloned().collect();
@@ -3007,8 +3025,8 @@ impl Pool {
 
         ModelPoolFairshare {
             model: self.model.clone(),
-            cap: self.cap,
-            configured_cap: self.configured_cap,
+            cap,
+            configured_cap,
             in_flight: self.in_flight,
             cluster_in_flight: self.cluster_in_flight,
             queued: self.queued_total,
@@ -3335,7 +3353,7 @@ impl Scheduler {
                     pools: self
                         .pools
                         .values()
-                        .map(|p| (p.model.clone(), p.configured_cap))
+                        .map(|p| (p.model.clone(), p.reported_caps().1))
                         .collect(),
                     algorithm: self.algorithm,
                     ceiling: self.capacity.max_in_flight(),
@@ -4320,7 +4338,7 @@ impl Scheduler {
             .filter(|pool| !pool.is_idle())
             .map(|pool| PoolSample {
                 model: pool.model.clone(),
-                cap: pool.cap,
+                cap: pool.reported_caps().0,
                 in_flight: pool.in_flight,
                 queued: pool.queued_total,
                 groups: pool.group_totals(),

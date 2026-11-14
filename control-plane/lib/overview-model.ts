@@ -283,7 +283,9 @@ export function buildAttention(fleet: FleetTile[], fairshare: FairshareLiveView 
       actions: [{ label: "Open Fairshare", href: "/fairshare", primary: true }],
     });
   }
-  for (const { model, tenant: t } of belowShareInPools(fairshare)) {
+  // Background work waits whenever its share of a model is full, by design:
+  // the pool page shows it, Needs attention does not.
+  for (const { model, tenant: t } of belowShareInPools(fairshare, { background: false })) {
     items.push({
       key: model === null ? `share:${t.tenant_id}` : `share:${model}:${t.tenant_id}`,
       badge: "Below share",
