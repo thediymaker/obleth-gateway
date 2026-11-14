@@ -47,7 +47,7 @@ function liveCapacity(view?: FairshareLiveView, stats?: LiveStats): LiveCapacity
     shared,
     queuesHere: view ? countsScope(view) === "gateway" : replicas > 1,
     activeTenants: view?.tenants.filter((t) => t.in_flight > 0 || t.queued > 0).length ?? 0,
-    belowShare: tenantsBelowShare(view).size,
+    belowShare: tenantsBelowShare(view, { background: false }).size,
   };
 }
 

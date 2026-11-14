@@ -43,6 +43,29 @@ export function countsScope(view: FairshareLiveView | undefined): CountsScope {
   return Math.max(view?.replicas ?? 1, 1) > 1 ? "gateway" : "single";
 }
 
+/** The live view names a model's background pool after the model with this suffix. */
+export const BACKGROUND_POOL_SUFFIX = " (background)";
+
+export function isBackgroundPool(model: string | null | undefined): boolean {
+  return !!model && model.endsWith(BACKGROUND_POOL_SUFFIX);
+}
+
+/**
+ * How much of its model a background pool may fill: its own size (what the
+ * gateway reports for it, already the background share) against the model's
+ * whole pool, taken from the interactive pool of the same model when the
+ * view lists it.
+ */
+export function backgroundRoom(view: FairshareLiveView | undefined, model: string): { cap: number; modelCap: number | null } | null {
+  if (!isBackgroundPool(model)) return null;
+  const sizeOf = (p: { cap: number; configured_cap?: number }) => (view?.mode === "shared" ? p.configured_cap ?? p.cap : p.cap);
+  const pool = view?.pools?.find((p) => p.model === model);
+  if (!pool) return null;
+  const base = model.slice(0, -BACKGROUND_POOL_SUFFIX.length);
+  const sibling = view?.pools?.find((p) => p.model === base);
+  return { cap: sizeOf(pool), modelCap: sibling ? sizeOf(sibling) : null };
+}
+
 /** A tenant waiting below its fair share in one pool. */
 export interface BelowShare {
   /** The pool's model, or null when the view has no per-pool detail. */
@@ -57,15 +80,21 @@ export interface BelowShare {
  * without per-pool detail (an older gateway) falls back to the tenants
  * aggregated across pools.
  */
-export function belowShareInPools(view: FairshareLiveView | undefined): BelowShare[] {
+export function belowShareInPools(view: FairshareLiveView | undefined, options: { background?: boolean } = {}): BelowShare[] {
   if (!view) return [];
   if (!view.pools) return view.tenants.filter((t) => isWaitingBelowShare(t, view.tenants)).map((tenant) => ({ model: null, tenant }));
-  return view.pools.flatMap((p) => p.tenants.filter((t) => isWaitingBelowShare(t, p.tenants)).map((tenant) => ({ model: p.model, tenant })));
+  const pools = options.background === false ? view.pools.filter((p) => !isBackgroundPool(p.model)) : view.pools;
+  return pools.flatMap((p) => p.tenants.filter((t) => isWaitingBelowShare(t, p.tenants)).map((tenant) => ({ model: p.model, tenant })));
 }
 
-/** Tenants waiting below their fair share in at least one pool. */
-export function tenantsBelowShare(view: FairshareLiveView | undefined): Set<string> {
-  return new Set(belowShareInPools(view).map((b) => b.tenant.tenant_id));
+/**
+ * Tenants waiting below their fair share in at least one pool. With
+ * `background: false`, background pools are left out: background work waits
+ * whenever its share of a model is full, by design, so it is not a problem
+ * to flag.
+ */
+export function tenantsBelowShare(view: FairshareLiveView | undefined, options: { background?: boolean } = {}): Set<string> {
+  return new Set(belowShareInPools(view, options).map((b) => b.tenant.tenant_id));
 }
 
 /** Tenants holding at least one slot above their fair share in some pool. */

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { FairshareLiveView, ModelPoolView, TenantFairshareView } from "@/lib/obleth";
-import { belowShareInPools, countsScope, isWaitingBelowShare, tenantsAboveShare, tenantsBelowShare } from "./fairshare";
+import { backgroundRoom, belowShareInPools, countsScope, isBackgroundPool, isWaitingBelowShare, tenantsAboveShare, tenantsBelowShare } from "./fairshare";
 
 const tenant = (id: string, o: Partial<TenantFairshareView> = {}): TenantFairshareView => ({
   tenant_id: id, name: id, fairshare_group: "default", weight: 100, in_flight: 0, queued: 0,
@@ -70,6 +70,29 @@ describe("below share, judged per pool", () => {
   it("is empty without a view", () => {
     expect(belowShareInPools(undefined)).toEqual([]);
     expect(tenantsBelowShare(undefined).size).toBe(0);
+  });
+
+  it("leaves background pools out on request: waiting there is by design", () => {
+    const bg = pool("m (background)", 192, [tenant("batch", { in_flight: 187, expected_slots: 96 }), tenant("bench", { in_flight: 4, queued: 2, expected_slots: 96 })]);
+    const v = view([bg]);
+    expect(belowShareInPools(v).map((b) => b.tenant.tenant_id)).toEqual(["bench"]);
+    expect(belowShareInPools(v, { background: false })).toEqual([]);
+    expect(tenantsBelowShare(v, { background: false }).size).toBe(0);
+  });
+});
+
+describe("background pools", () => {
+  it("are told apart by name", () => {
+    expect(isBackgroundPool("m (background)")).toBe(true);
+    expect(isBackgroundPool("m")).toBe(false);
+    expect(isBackgroundPool(null)).toBe(false);
+  });
+
+  it("report their room against the model's whole pool", () => {
+    const v = view([pool("m", 256, []), pool("m (background)", 192, [])], { mode: "shared" });
+    expect(backgroundRoom(v, "m (background)")).toEqual({ cap: 192, modelCap: 256 });
+    expect(backgroundRoom(view([pool("m (background)", 192, [])]), "m (background)")).toEqual({ cap: 192, modelCap: null });
+    expect(backgroundRoom(v, "m")).toBeNull();
   });
 });
 

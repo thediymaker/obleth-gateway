@@ -7,7 +7,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { ChevronDown, RefreshCw } from "lucide-react";
 import { Select } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
-import { countsScope, isWaitingBelowShare, tenantsAboveShare, tenantsBelowShare } from "@/lib/fairshare";
+import { backgroundRoom, countsScope, isWaitingBelowShare, tenantsAboveShare, tenantsBelowShare } from "@/lib/fairshare";
 import {
   buildPoolRows,
   groupShares,
@@ -404,6 +404,7 @@ function PoolView({ view, raw, poolRow, shared, onOpen }: { view: FairshareLiveV
         <p className="px-[18px] pb-4 pt-1 text-xs text-muted-foreground">
           Bars are drawn against the pool&apos;s {formatNumber(cap)} slots.{groupWeights ? ` Fair shares split the pool by group weight (${groupWeights}), then by tenant weight inside each group.` : ""}
           {poolScopeNote(raw, shared)}
+          {backgroundNote(raw, poolRow?.model)}
         </p>
       </Panel>
 
@@ -431,6 +432,20 @@ function PoolView({ view, raw, poolRow, shared, onOpen }: { view: FairshareLiveV
 }
 
 /** Whose rows the pool view shows, when that is not obvious. */
+/**
+ * A background pool is the part of a model background work may fill; the
+ * rest of the model's slots stay free for interactive requests, since a
+ * running request is never cut short to make room.
+ */
+function backgroundNote(raw: FairshareLiveView, model: string | undefined): string {
+  const room = model ? backgroundRoom(raw, model) : null;
+  if (!room) return "";
+  if (room.modelCap && room.modelCap > room.cap) {
+    return ` Background work may fill ${formatNumber(room.cap)} of the model's ${formatNumber(room.modelCap)} slots; the other ${formatNumber(room.modelCap - room.cap)} stay free for interactive requests, since a running request is never cut short to make room.`;
+  }
+  return " Background work may fill only part of the model's slots; the rest stay free for interactive requests, since a running request is never cut short to make room.";
+}
+
 function poolScopeNote(raw: FairshareLiveView, shared: boolean): string {
   const n = raw.replicas ?? 1;
   if (n <= 1) return "";
