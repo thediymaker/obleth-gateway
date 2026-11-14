@@ -4153,6 +4153,48 @@ impl Store {
             .unwrap_or_else(|| obleth_config::default_key_prefix().to_string()))
     }
 
+    /// The named networks (`app_settings.named_networks`), or none. Rows
+    /// that no longer validate are dropped as they are read.
+    pub async fn named_networks(&self) -> Result<Vec<obleth_config::network::NamedNetwork>> {
+        let row = sqlx::query("select value from app_settings where key = 'named_networks'")
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some(row) = row else {
+            return Ok(Vec::new());
+        };
+        let value: sqlx::types::Json<serde_json::Value> = row.try_get("value")?;
+        let saved: Vec<obleth_config::network::NamedNetwork> = value
+            .0
+            .get("networks")
+            .cloned()
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
+        Ok(saved
+            .into_iter()
+            .filter(|n| {
+                obleth_config::network::normalize_named_networks(std::slice::from_ref(n)).is_ok()
+            })
+            .collect())
+    }
+
+    /// Save the named networks. The caller validates them.
+    pub async fn put_named_networks(
+        &self,
+        networks: &[obleth_config::network::NamedNetwork],
+    ) -> Result<()> {
+        sqlx::query(
+            "insert into app_settings (key, value, updated_at)
+             values ('named_networks', $1, now())
+             on conflict (key) do update set value = excluded.value, updated_at = now()",
+        )
+        .bind(sqlx::types::Json(
+            serde_json::json!({ "networks": networks }),
+        ))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Load the persisted raw-usage retention setting, or `None` if unset.
     pub async fn get_usage_retention_settings(
         &self,
@@ -6106,6 +6148,42 @@ mod tests {
                     .expect("restore");
             }
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn named_networks_round_trip_and_skip_bad_rows() {
+        let Some(url) = crate::test_support::test_db_url() else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        let before = store.named_networks().await.expect("read");
+        use obleth_config::network::NamedNetwork;
+        let nets = vec![
+            NamedNetwork {
+                network: "10.0.0.0/8".into(),
+                name: "Campus".into(),
+            },
+            NamedNetwork {
+                network: "10.42.0.0/16".into(),
+                name: "Cluster pods".into(),
+            },
+        ];
+        store.put_named_networks(&nets).await.expect("save");
+        assert_eq!(store.named_networks().await.unwrap(), nets);
+        // A row edited by hand into junk is skipped, not an error.
+        sqlx::query("update app_settings set value = $1 where key = 'named_networks'")
+            .bind(sqlx::types::Json(serde_json::json!({ "networks": [
+                { "network": "nope", "name": "x" },
+                { "network": "10.0.0.0/8", "name": "Campus" }
+            ] })))
+            .execute(&store.pool)
+            .await
+            .expect("junk");
+        assert_eq!(store.named_networks().await.unwrap(), nets[..1].to_vec());
+        store.put_named_networks(&before).await.expect("restore");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

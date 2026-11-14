@@ -135,6 +135,30 @@ describe("the Settings page", () => {
     expect(saved().get("retention.days")).toBe("90");
   });
 
+  it("names a network and saves the list, and shows how the client address is found", async () => {
+    await render(<SettingsPage data={settingsData()} />);
+    const section = host.querySelector("#networks")!;
+    expect(section.textContent).toContain("X-Forwarded-For from a trusted proxy");
+    expect(section.textContent).toContain("cf-ipcountry");
+    await act(async () => button("Add a network").click());
+    await type(section.querySelector<HTMLInputElement>('input[aria-label="Range 2"]')!, "10.42.0.0/16");
+    await type(section.querySelector<HTMLInputElement>('input[aria-label="Name 2"]')!, "Cluster pods");
+    await frame();
+    await act(async () => button("Save changes").click());
+    expect(saved().get("sections")).toBe("networks");
+    expect(JSON.parse(String(saved().get("networks.list")))).toEqual([
+      { network: "10.0.0.0/8", name: "Campus" },
+      { network: "10.42.0.0/16", name: "Cluster pods" },
+    ]);
+  });
+
+  it("says when a named network has no name", async () => {
+    await render(<SettingsPage data={settingsData()} />);
+    const section = host.querySelector("#networks")!;
+    await type(section.querySelector<HTMLInputElement>('input[aria-label="Name 1"]')!, "");
+    expect(section.textContent).toContain("10.0.0.0/8 needs a name.");
+  });
+
   it("doesn't offer a section it couldn't read", async () => {
     await render(<SettingsPage data={settingsData({ router: null })} />);
     expect(host.querySelector("#routing")!.textContent).toContain("couldn't be read");

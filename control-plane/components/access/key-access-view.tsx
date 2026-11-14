@@ -15,12 +15,14 @@ import {
   keyAccessRange,
   keyAccessRows,
   keyAccessSummary,
+  placeLabel,
   REFUSAL_REASON,
   refusalRows,
   type KeyAccessRange,
   type KeyAccessRow,
   type KeyAccessSort,
 } from "@/lib/key-access-model";
+import { ReportsTabs } from "@/components/reports/reports-tabs";
 import { logsHref } from "@/lib/log-links";
 import { compact } from "@/lib/overview-model";
 import type { KeyRejectionAgg, KeySource } from "@/lib/obleth";
@@ -63,10 +65,19 @@ function NewTag({ children = "New" }: { children?: string }) {
   );
 }
 
-function Countries({ row }: { row: KeyAccessRow }) {
-  if (row.countries.length === 0) return <span className="text-muted-foreground">Unknown</span>;
+function NetworkName({ name }: { name: string }) {
+  return <span className="rounded border border-border bg-muted/40 px-1.5 py-px text-[11px] text-secondary-foreground">{name}</span>;
+}
+
+/** The named networks and countries a key was used from. */
+function Where({ row }: { row: KeyAccessRow }) {
+  if (row.countries.length === 0 && row.names.length === 0) {
+    return <span className="text-muted-foreground">{row.unnamedPrivate ? "Private address" : "Unknown"}</span>;
+  }
   return (
     <span className="flex flex-wrap gap-1">
+      {row.names.slice(0, 3).map((n) => <NetworkName key={n} name={n} />)}
+      {row.names.length > 3 && <span className="text-xs text-muted-foreground">+{row.names.length - 3}</span>}
       {row.countries.slice(0, 6).map((c) => (
         <span
           key={c}
@@ -112,7 +123,7 @@ function KeyRow({ row, range, now, open, onToggle }: { row: KeyAccessRow; range:
         <span className="text-right font-mono text-xs tabular-nums" title={`${row.distinctIps} distinct addresses`}>
           {row.places.length}
         </span>
-        <Countries row={row} />
+        <Where row={row} />
         <span className="text-right text-xs text-muted-foreground" title={stamp(row.lastSeenMs)}>{ago(row.lastSeenMs, now)}</span>
       </button>
       {open && (
@@ -130,15 +141,16 @@ function KeyRow({ row, range, now, open, onToggle }: { row: KeyAccessRow; range:
             <tbody>
               {row.places.map((p) => (
                 <tr key={`${p.network}:${p.country}`} className="border-t border-border/60">
-                  <td className="py-1.5 pr-3 font-mono">
+                  <td className="py-1.5 pr-3">
                     <span className="inline-flex items-center gap-2">
-                      {p.network}
+                      <span className="font-mono">{p.network}</span>
+                      {p.name && <NetworkName name={p.name} />}
                       {p.newNetwork && <NewTag />}
                     </span>
                   </td>
                   <td className="py-1.5 pr-3">
-                    <span className="inline-flex items-center gap-2">
-                      {countryLabel(p.country)}
+                    <span className={cn("inline-flex items-center gap-2", !p.country && "text-muted-foreground")}>
+                      {placeLabel(p.country, p.network)}
                       {p.newCountry && <NewTag />}
                     </span>
                   </td>
@@ -197,7 +209,7 @@ export function KeyAccessView({
     if (tenant) p.set("tenant", tenant);
     if (search.trim()) p.set("q", search.trim());
     const qs = p.toString();
-    router.replace(qs ? `/key-access?${qs}` : "/key-access", { scroll: false });
+    router.replace(`/reports?tab=key-access${qs ? `&${qs}` : ""}`, { scroll: false });
   }, [range, tenant, search, router]);
 
   const query = useQuery({
@@ -221,7 +233,7 @@ export function KeyAccessView({
     <div className="mx-auto flex max-w-[1600px] flex-col gap-4">
       <div className="flex flex-wrap items-end justify-between gap-4">
         <div className="min-w-0">
-          <h1 className="text-[26px] font-semibold tracking-tight">Key access</h1>
+          <h1 className="text-[26px] font-semibold tracking-tight">Reports</h1>
           <p className="mt-1 text-[13px] text-muted-foreground" role="status">
             {summary
               ? `${summary.keys.toLocaleString()} keys were used from ${summary.networks.toLocaleString()} networks in ${words}.`
@@ -244,6 +256,8 @@ export function KeyAccessView({
           </button>
         </div>
       </div>
+
+      <ReportsTabs active="key-access" />
 
       {summary && (
         <div className={cn("grid grid-cols-2 gap-3 md:grid-cols-4", query.isPlaceholderData && "opacity-60")}>
@@ -268,7 +282,7 @@ export function KeyAccessView({
 
       <Panel
         title="Where keys are used"
-        subtitle="Each key's networks and countries. New means first seen in this window. Select a key to see its networks"
+        subtitle="Each key's networks, by name and country. New means first seen in this window. Select a key to see its networks"
         className={cn(query.isPlaceholderData && "opacity-60")}
       >
         <div className="mt-3 flex flex-wrap items-center gap-2.5 px-[18px] pb-3">
@@ -277,7 +291,7 @@ export function KeyAccessView({
             <Input
               value={search}
               onChange={(e) => { setSearch(e.target.value); setShown(PAGE); }}
-              placeholder="Key, tenant, network or country"
+              placeholder="Key, tenant, network, name or country"
               aria-label="Search keys"
               className="h-[34px] pl-8"
             />
@@ -288,6 +302,13 @@ export function KeyAccessView({
             Only keys with something new
           </label>
         </div>
+        {rows.some((r) => r.unnamedPrivate) && (
+          <p className="px-[18px] pb-3 text-[12.5px] text-muted-foreground">
+            Private addresses have no country. Name your own networks, such as a campus, VPN or cluster, under{" "}
+            <Link href="/settings#networks" className="text-foreground underline-offset-2 hover:underline">Settings › Networks</Link>{" "}
+            and they show here by name.
+          </p>
+        )}
         {visible.length === 0 ? (
           <p className="border-t border-border px-[18px] py-6 text-center text-sm text-muted-foreground">
             {query.isLoading ? <span className="skeleton mx-auto block h-4 w-40 rounded" /> : data ? (rows.length ? "No key matches." : `No key was used in ${words}.`) : "Where keys were used from could not be read."}
@@ -300,7 +321,7 @@ export function KeyAccessView({
                 <span>Key</span>
                 <span className="text-right">Requests</span>
                 <span className="text-right">Networks</span>
-                <span>Countries</span>
+                <span>Where</span>
                 <span className="text-right">Last used</span>
               </div>
               <ul>
@@ -345,8 +366,11 @@ export function KeyAccessView({
                       <span className="block text-xs text-muted-foreground">{r.tenant_name}</span>
                     </td>
                     <td className="py-[9px] pr-3">{REFUSAL_REASON[r.reason] ?? r.reason}</td>
-                    <td className="py-[9px] pr-3 font-mono text-xs">{r.client_ip || "—"}</td>
-                    <td className="py-[9px] pr-3">{countryLabel(r.client_country)}</td>
+                    <td className="py-[9px] pr-3">
+                      <span className="block font-mono text-xs">{r.client_ip || "—"}</span>
+                      {r.network_name && <span className="mt-0.5 block text-xs text-muted-foreground">{r.network_name}</span>}
+                    </td>
+                    <td className={cn("py-[9px] pr-3", !r.client_country && "text-muted-foreground")}>{placeLabel(r.client_country, r.client_ip)}</td>
                     <td className="py-[9px] pr-3 text-right font-mono text-xs tabular-nums">{r.count.toLocaleString()}</td>
                     <td className="py-[9px] pr-3 text-right text-xs text-muted-foreground" title={`First ${stamp(r.first_seen_ms)}, last ${stamp(r.last_seen_ms)}`}>{ago(r.last_seen_ms, now)}</td>
                     <td className="max-w-[18rem] truncate py-[9px] pr-[18px] text-xs text-muted-foreground" title={r.sample_user_agent}>{r.sample_user_agent || "—"}</td>

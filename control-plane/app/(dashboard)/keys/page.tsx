@@ -12,11 +12,12 @@ const KEY_USAGE_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 export default async function KeysPage({ searchParams }: { searchParams: Promise<{ tenant?: string; key?: string; new?: string }> }) {
   await requireAdmin();
   const params = await searchParams;
-  const [tenants, keys, usage, budgets] = await Promise.all([
+  const [tenants, keys, usage, budgets, networks] = await Promise.all([
     safe(obleth.listTenants(), [] as Tenant[]),
     safe(obleth.listKeys(), [] as ApiKey[]),
     safe(obleth.keyUsageForDashboard({ sinceMs: Date.now() - KEY_USAGE_WINDOW_MS, limit: 5000 }), []),
     safe(obleth.budgetUsage(), [] as BudgetUsage[]),
+    safe(obleth.getNetworkSettings(), null),
   ]);
 
   return (
@@ -26,6 +27,7 @@ export default async function KeysPage({ searchParams }: { searchParams: Promise
       usage={usage}
       budgets={budgets}
       initial={{ tenant: params.tenant, key: params.key, newFor: params.new }}
+      named={networks?.networks ?? []}
     />
   );
 }

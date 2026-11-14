@@ -26,7 +26,7 @@ import {
 import { logsHref } from "@/lib/log-links";
 import { money } from "@/lib/models-model";
 import { networksSummary } from "@/lib/key-networks";
-import type { ApiKey, BudgetUsage, KeyUsageSummary, Tenant } from "@/lib/obleth";
+import type { ApiKey, BudgetUsage, KeyUsageSummary, NamedNetwork, Tenant } from "@/lib/obleth";
 import { compact } from "@/lib/overview-model";
 import { cn } from "@/lib/utils";
 
@@ -60,8 +60,11 @@ export function KeysList({
   usage,
   budgets,
   initial,
+  named = [],
 }: {
   tenants: Tenant[];
+  /** Settings › Networks, offered by name in a key's allowed networks. */
+  named?: NamedNetwork[];
   keys: ApiKey[];
   /** The last 30 days, per key. */
   usage: KeyUsageSummary[];
@@ -288,6 +291,7 @@ export function KeysList({
         onReplaced={(created) => { setSecret(created); setOpen(null); }}
         onNotice={setNotice}
         onChanged={refresh}
+        named={named}
       />
       {adding && (
         <NewKeySheet
@@ -295,6 +299,7 @@ export function KeysList({
           onClose={() => setAdding(false)}
           tenants={tenants}
           tenantId={initial.newFor ?? filters.tenantId}
+          named={named}
           onCreated={(c) => { setSecret({ secret: c.secret, name: c.name, detail: `for ${c.tenantName} · ${c.detail}` }); setAdding(false); refresh(); }}
         />
       )}

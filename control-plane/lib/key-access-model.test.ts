@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { countryLabel, filterKeyAccess, keyAccessRows, keyAccessSummary, refusalRows } from "@/lib/key-access-model";
+import { countryLabel, filterKeyAccess, isPrivateNetwork, keyAccessRows, keyAccessSummary, placeLabel, refusalRows } from "@/lib/key-access-model";
 import type { KeyRejectionAgg, KeySource } from "@/lib/obleth";
 
 const SINCE = 1_000_000;
@@ -105,5 +105,37 @@ describe("refusals and countries", () => {
   it("names countries, and says Unknown for none", () => {
     expect(countryLabel("US")).toBe("United States");
     expect(countryLabel("")).toBe("Unknown");
+  });
+});
+
+describe("named and private networks", () => {
+  it("carries each network's name, and notes private networks with none", () => {
+    const [row] = keyAccessRows(
+      [
+        src({ network: "10.139.121.0/24", client_country: "", network_name: "Research computing" }),
+        src({ network: "10.4.58.0/24", client_country: "", network_name: "Campus" }),
+        src({ network: "172.31.20.0/24", client_country: "" }),
+        src({ network: "203.0.113.0/24", client_country: "JP" }),
+      ],
+      [],
+      SINCE,
+    );
+    expect(row.names).toEqual(["Campus", "Research computing"]);
+    expect(row.unnamedPrivate).toBe(true);
+    expect(row.places.find((p) => p.network === "10.139.121.0/24")).toMatchObject({ name: "Research computing", private: true });
+    expect(row.places.find((p) => p.network === "203.0.113.0/24")).toMatchObject({ name: null, private: false });
+    expect(filterKeyAccess([row], "research", "requests", false)).toHaveLength(1);
+  });
+
+  it("knows private ranges, v4 and v6", () => {
+    for (const p of ["10.42.1.0/24", "172.16.0.0/24", "172.31.255.0/24", "192.168.1.0/24", "127.0.0.1", "169.254.0.0/16", "100.64.0.0/24", "fd12:3456::/48", "fc00::/48", "fe80::/48", "::1", "::ffff:10.1.2.3"])
+      expect(isPrivateNetwork(p), p).toBe(true);
+    for (const p of ["172.32.0.0/24", "203.0.113.0/24", "100.128.0.0/24", "2001:db8::/48", "", "nope"]) expect(isPrivateNetwork(p), p).toBe(false);
+  });
+
+  it("calls a private place a private address, not an unknown country", () => {
+    expect(placeLabel("", "10.139.120.0/24")).toBe("Private address");
+    expect(placeLabel("", "203.0.113.0/24")).toBe("Unknown");
+    expect(placeLabel("JP", "10.42.1.0/24")).toBe("Japan");
   });
 });

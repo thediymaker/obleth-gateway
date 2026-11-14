@@ -35,6 +35,7 @@ use axum::middleware::Next;
 use axum::response::Response;
 use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
+use obleth_config::network::{NamedNetwork, NetworkNames};
 use obleth_config::routing::route_explain::RouteExplain;
 use obleth_config::routing::{
     classifier_prompts, classify_turns, difficulty_from_header, explain_selection,
@@ -475,6 +476,10 @@ pub fn router(state: AdminState) -> Router {
         .route(
             "/api/v1/settings/key-prefix",
             get(get_key_prefix).put(put_key_prefix),
+        )
+        .route(
+            "/api/v1/settings/networks",
+            get(get_network_settings).put(put_network_settings),
         )
         .route(
             "/api/v1/settings/slurm",
@@ -5393,11 +5398,11 @@ async fn get_key_usage(
     Ok(Json(summary))
 }
 
-/// Bulk per-key activity summary for the dashboard Keys table. Returns the
 /// Where each key was used from in the window: one row per key, network
-/// (IPv4 /24, IPv6 /48) and country, with request and address counts and
-/// when the key was first seen from that country (ever) and that network
-/// (as far back as client addresses are kept). For an account system that
+/// (IPv4 /24, IPv6 /48) and country, with request and address counts, when
+/// the key was first seen from that country (ever) and that network (as far
+/// back as client addresses are kept), and the network's name when one of
+/// the named networks holds it. For an account system that
 /// watches its keys for use from somewhere new. Default window: the last 24
 /// hours; at most 31 days. Requests recorded before client addresses were
 /// captured are left out.
@@ -5413,16 +5418,21 @@ async fn get_usage_key_sources(
     let (since, until) = q
         .window(chrono::Utc::now().timestamp_millis())
         .map_err(AdminError::BadRequest)?;
-    Ok(Json(
-        usage::query_key_sources(
-            &state.clickhouse,
-            &q,
-            since,
-            until,
-            obleth_telemetry::client_ip_retention_days(),
-        )
-        .await?,
-    ))
+    let mut rows = usage::query_key_sources(
+        &state.clickhouse,
+        &q,
+        since,
+        until,
+        obleth_telemetry::client_ip_retention_days(),
+    )
+    .await?;
+    let names = NetworkNames::new(&state.store.named_networks().await?);
+    if !names.is_empty() {
+        for r in &mut rows {
+            r.network_name = names.name_of(&r.network).map(str::to_string);
+        }
+    }
+    Ok(Json(rows))
 }
 
 /// Refused uses of real keys in the window: a disabled key, or a key used
@@ -5442,11 +5452,17 @@ async fn get_usage_key_rejections(
     let (since, until) = q
         .window(chrono::Utc::now().timestamp_millis())
         .map_err(AdminError::BadRequest)?;
-    Ok(Json(
-        usage::query_key_rejections(&state.clickhouse, &q, since, until).await?,
-    ))
+    let mut rows = usage::query_key_rejections(&state.clickhouse, &q, since, until).await?;
+    let names = NetworkNames::new(&state.store.named_networks().await?);
+    if !names.is_empty() {
+        for r in &mut rows {
+            r.network_name = names.name_of(&r.client_ip).map(str::to_string);
+        }
+    }
+    Ok(Json(rows))
 }
 
+/// Bulk per-key activity summary for the dashboard Keys table. Returns the
 /// busiest keys (by token volume) that saw traffic in the window, each with
 /// last-used metadata so the UI can show "last used" without N+1 log fetches.
 #[utoipa::path(
@@ -5873,7 +5889,7 @@ pub struct KeyPrefixView {
     pub prefix: String,
     /// True when this is a saved setting rather than the default.
     pub configured: bool,
-    /// The prefix used when none is saved: `OBLETH_KEY_PREFIX`, else `obl`.
+    /// The prefix used when none is saved: `OBLETH_KEY_PREFIX`, else `sk`.
     pub default_prefix: String,
 }
 
@@ -5933,6 +5949,96 @@ async fn put_key_prefix(
         configured: true,
         default_prefix: obleth_config::default_key_prefix().to_string(),
     }))
+}
+
+/// How the gateway works out a request's client, from its environment.
+/// Read-only: these are set where the gateway is deployed.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ClientAddressView {
+    /// The proxies whose `X-Forwarded-For` and headers are believed
+    /// (`OBLETH_TRUSTED_PROXIES`).
+    pub trusted_proxies: Vec<String>,
+    /// True when `OBLETH_TRUSTED_PROXIES` is unset, so every private and
+    /// loopback range is trusted.
+    pub trusted_proxies_default: bool,
+    /// Entries of `OBLETH_TRUSTED_PROXIES` that are not ranges, ignored.
+    pub invalid_trusted_proxies: Vec<String>,
+    /// `OBLETH_CLIENT_ADDRESS_HEADER`, or `null` when the client is found
+    /// in `X-Forwarded-For`.
+    pub address_header: Option<String>,
+    /// `OBLETH_CLIENT_COUNTRY_HEADER`, or `null` when countries are off.
+    pub country_header: Option<String>,
+}
+
+/// Named networks, and how the client address is found.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct NetworkSettingsView {
+    pub networks: Vec<NamedNetwork>,
+    pub client_address: ClientAddressView,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateNamedNetworks {
+    /// Every named network; this replaces the list.
+    pub networks: Vec<NamedNetwork>,
+}
+
+fn network_settings_view(networks: Vec<NamedNetwork>) -> NetworkSettingsView {
+    let env = obleth_config::network::ClientAddressSettings::from_env();
+    let unset = std::env::var("OBLETH_TRUSTED_PROXIES")
+        .map(|v| v.trim().is_empty())
+        .unwrap_or(true);
+    NetworkSettingsView {
+        networks,
+        client_address: ClientAddressView {
+            trusted_proxies: env.trusted.iter().map(|n| n.to_string()).collect(),
+            trusted_proxies_default: unset,
+            invalid_trusted_proxies: env.invalid,
+            address_header: env.address_header,
+            country_header: env.country_header,
+        },
+    }
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/settings/networks", tag = "settings",
+    responses((status = 200, body = NetworkSettingsView))
+)]
+async fn get_network_settings(
+    State(state): State<AdminState>,
+) -> Result<Json<NetworkSettingsView>> {
+    Ok(Json(network_settings_view(
+        state.store.named_networks().await?,
+    )))
+}
+
+/// Replace the named networks: ranges of addresses with a name, so reports
+/// can say whose network a client is in. They change no check.
+#[utoipa::path(
+    put, path = "/api/v1/settings/networks", tag = "settings",
+    request_body = UpdateNamedNetworks,
+    responses((status = 200, body = NetworkSettingsView), (status = 400, description = "A range or name is not valid"))
+)]
+async fn put_network_settings(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Json(body): Json<UpdateNamedNetworks>,
+) -> Result<Json<NetworkSettingsView>> {
+    let networks = obleth_config::network::normalize_named_networks(&body.networks)
+        .map_err(AdminError::BadRequest)?;
+    let previous = state.store.named_networks().await?;
+    state.store.put_named_networks(&networks).await?;
+    state
+        .store
+        .record_audit(
+            &audit_actor(&headers),
+            "set_named_networks",
+            "settings",
+            "named_networks",
+            serde_json::json!({ "networks": networks, "previous": previous }),
+        )
+        .await?;
+    Ok(Json(network_settings_view(networks)))
 }
 
 /// View of the persisted raw-usage retention window.
@@ -13058,6 +13164,8 @@ mod tests {
             ("/api/v1/keys/{id}/background", "put"),
             ("/api/v1/usage/key-sources", "get"),
             ("/api/v1/usage/key-rejections", "get"),
+            ("/api/v1/settings/networks", "get"),
+            ("/api/v1/settings/networks", "put"),
             ("/api/v1/tenants/{id}/tracing", "put"),
             ("/api/v1/usage/logs/{request_id}/spans", "get"),
             ("/api/v1/models/{id}/managed/provision-error", "patch"),

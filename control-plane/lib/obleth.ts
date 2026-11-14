@@ -825,6 +825,8 @@ export interface KeySource {
   first_seen_ms: number | null;
   /** First time the key was seen from this network, as far back as addresses are kept. */
   network_first_seen_ms: number | null;
+  /** The narrowest named network (Settings › Networks) holding this network. */
+  network_name?: string | null;
 }
 
 /** Refused uses of one key for one reason from one address (`GET /usage/key-rejections`). */
@@ -841,6 +843,8 @@ export interface KeyRejectionAgg {
   first_seen_ms: number;
   last_seen_ms: number;
   sample_user_agent: string;
+  /** The narrowest named network (Settings › Networks) holding the address. */
+  network_name?: string | null;
 }
 
 /** Window and filters of the key-watching reads. At most 31 days. */
@@ -1124,8 +1128,29 @@ export interface KeyPrefixView {
   prefix: string;
   /** True when saved, not the default. */
   configured: boolean;
-  /** Used when none is saved: OBLETH_KEY_PREFIX, else `obl`. */
+  /** Used when none is saved: OBLETH_KEY_PREFIX, else `sk`. */
   default_prefix: string;
+}
+
+/** A range of addresses with a name, so reports can say whose network a client is in. */
+export interface NamedNetwork {
+  network: string;
+  name: string;
+}
+
+/** How the gateway works out a request's client; set where it is deployed. */
+export interface ClientAddressView {
+  trusted_proxies: string[];
+  /** OBLETH_TRUSTED_PROXIES is unset: every private and loopback range. */
+  trusted_proxies_default: boolean;
+  invalid_trusted_proxies: string[];
+  address_header: string | null;
+  country_header: string | null;
+}
+
+export interface NetworkSettingsView {
+  networks: NamedNetwork[];
+  client_address: ClientAddressView;
 }
 
 export interface CompactUsageResult {
@@ -3141,6 +3166,13 @@ export const obleth = {
       body: JSON.stringify({ days }),
     }),
   getKeyPrefix: reactCache(() => api<KeyPrefixView>("/settings/key-prefix")),
+  getNetworkSettings: reactCache(() => api<NetworkSettingsView>("/settings/networks")),
+  setNamedNetworks: (networks: NamedNetwork[], options?: AuditOptions) =>
+    api<NetworkSettingsView>("/settings/networks", {
+      method: "PUT",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify({ networks }),
+    }),
   setKeyPrefix: (prefix: string, options?: AuditOptions) =>
     api<KeyPrefixView>("/settings/key-prefix", {
       method: "PUT",

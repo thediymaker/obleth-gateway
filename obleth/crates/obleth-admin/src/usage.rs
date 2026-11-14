@@ -1396,6 +1396,10 @@ pub struct KeySource {
     /// The first time this key was seen from this network, as far back as
     /// client addresses are kept (`OBLETH_CLIENT_IP_RETENTION_DAYS`).
     pub network_first_seen_ms: Option<i64>,
+    /// The name of the narrowest named network (Settings › Networks) that
+    /// holds this network, or `null`.
+    #[serde(default)]
+    pub network_name: Option<String>,
 }
 
 #[derive(Debug, Row, Deserialize)]
@@ -1434,6 +1438,7 @@ impl From<KeySourceRow> for KeySource {
             requests: r.requests,
             distinct_ips: r.distinct_ips,
             last_seen_ms: r.last_seen_ms,
+            network_name: None,
         }
     }
 }
@@ -1533,6 +1538,10 @@ pub struct KeyRejectionAgg {
     pub last_seen_ms: i64,
     /// The User-Agent of the most recent of them.
     pub sample_user_agent: String,
+    /// The name of the narrowest named network (Settings › Networks) that
+    /// holds the address, or `null`.
+    #[serde(default)]
+    pub network_name: Option<String>,
 }
 
 #[derive(Debug, Row, Deserialize)]
@@ -1597,6 +1606,7 @@ pub async fn query_key_rejections(
             first_seen_ms: r.first_ms,
             last_seen_ms: r.last_ms,
             sample_user_agent: r.sample_ua,
+            network_name: None,
         })
         .collect())
 }

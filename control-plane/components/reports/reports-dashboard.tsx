@@ -10,6 +10,7 @@ import { ArrowDown, ArrowUp, Download, Search } from "lucide-react";
 import { axisTick, chartGrid, compactAxis } from "@/components/chart-tooltip";
 import { ExportSheet } from "@/components/reports/export-sheet";
 import { ModelSpeed } from "@/components/reports/model-speed";
+import { ReportsTabs } from "@/components/reports/reports-tabs";
 import { Meter, Panel, Segmented } from "@/components/overview/ui";
 import { Tile } from "@/components/models/ui";
 import { Button } from "@/components/ui/button";
@@ -209,6 +210,8 @@ export function ReportsDashboard({ tenants, keys, models, retentionDays = null, 
           <Button type="button" size="sm" className="h-9" disabled={!range} onClick={() => setExporting(true)}><Download className="h-3.5 w-3.5" />Export</Button>
         </div>
       </div>
+
+      <ReportsTabs active="usage" />
 
       <Dialog open={picker} onOpenChange={setPicker}>
         <DialogContent className="max-w-fit">

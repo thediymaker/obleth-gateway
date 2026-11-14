@@ -199,6 +199,7 @@ services:
       # Client address capture: see .env.example. Blank trusted proxies means
       # the private and loopback ranges.
       OBLETH_TRUSTED_PROXIES: ${OBLETH_TRUSTED_PROXIES:-}
+      OBLETH_CLIENT_ADDRESS_HEADER: ${OBLETH_CLIENT_ADDRESS_HEADER:-}
       OBLETH_CLIENT_COUNTRY_HEADER: ${OBLETH_CLIENT_COUNTRY_HEADER-cf-ipcountry}
       OBLETH_CLIENT_IP_RETENTION_DAYS: ${OBLETH_CLIENT_IP_RETENTION_DAYS:-90}
       # Milliseconds each gateway buffers usage rows before inserting them into

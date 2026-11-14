@@ -12,6 +12,7 @@ import { BoonsSection } from "@/components/settings/boons-section";
 import { AboutSection, AssistantSection, DataSection, EnergySection, KeysSection, type VersionInfo } from "@/components/settings/other-sections";
 import { NeedsYouSection, needsYouCount } from "@/components/settings/needs-you";
 import { RoutingSection } from "@/components/settings/routing-section";
+import { NetworksSection } from "@/components/settings/networks-section";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import type {
   AdviceReportView,
@@ -22,6 +23,7 @@ import type {
   CompressorStatusView,
   EnergySettingsView,
   KeyPrefixView,
+  NetworkSettingsView,
   KnowledgeSettingsView,
   ModelRoute,
   RouterReadinessView,
@@ -45,6 +47,7 @@ export interface SettingsData {
   retention: UsageRetentionView | null;
   /** The prefix new API keys start with; null when it could not be read. */
   keyPrefix: KeyPrefixView | null;
+  networks: NetworkSettingsView | null;
   slurm: SlurmSettingsView | null;
   models: ModelRoute[];
   version: VersionInfo;
@@ -70,6 +73,8 @@ const SEARCH: { id: string; label: string; words: string }[] = [
   { id: "set-energy", label: "Energy", words: "power prometheus watts carbon co2 pue kwh" },
   { id: "set-assistant", label: "Assistant", words: "charo playground agent benchmark" },
   { id: "set-key-prefix", label: "Key prefix", words: "api key prefix obl sk format" },
+  { id: "set-named-networks", label: "Named networks", words: "network name cidr range campus vpn cluster private address subnet" },
+  { id: "set-client-address", label: "Where a request came from", words: "client ip address trusted proxies x-forwarded-for cf-connecting-ip country header" },
   { id: "set-retention", label: "History retention", words: "retention days usage logs keep" },
   { id: "data", label: "Backup and restore", words: "backup export restore cache reconcile" },
   { id: "about", label: "Versions", words: "version about provisioner compressor" },
@@ -195,6 +200,7 @@ export function SettingsPage({ data, anchor }: { data: SettingsData; anchor?: st
     { id: "energy", label: "Energy", count: data.energy ? (data.energy.enabled ? "on" : "off") : undefined },
     { id: "assistant", label: "Assistant", count: data.charo ? (data.charo.enabled ? "on" : "off") : undefined },
     { id: "keys", label: "Keys", count: data.keyPrefix ? `${data.keyPrefix.prefix}_` : undefined },
+    { id: "networks", label: "Networks", count: data.networks ? (data.networks.networks.length ? `${data.networks.networks.length} named` : "none named") : undefined },
     { id: "data", label: "Data and backups", count: data.retention ? `${data.retention.days} days` : undefined },
     { id: "about", label: "About", count: data.version.gateway?.version },
   ];
@@ -238,6 +244,7 @@ export function SettingsPage({ data, anchor }: { data: SettingsData; anchor?: st
             {data.energy ? <EnergySection settings={data.energy} /> : <Unreadable id="energy" title="Energy" />}
             {data.charo ? <AssistantSection settings={data.charo} models={data.models} /> : <Unreadable id="assistant" title="Assistant" />}
             {data.keyPrefix ? <KeysSection settings={data.keyPrefix} /> : <Unreadable id="keys" title="Keys" />}
+            {data.networks ? <NetworksSection settings={data.networks} /> : <Unreadable id="networks" title="Networks" />}
             <DataSection retention={data.retention} />
           </SettingsForm>
 
