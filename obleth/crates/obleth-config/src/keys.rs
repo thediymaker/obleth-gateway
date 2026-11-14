@@ -45,9 +45,14 @@ pub struct GeneratedKey {
 
 /// Prefix new keys start with unless an operator chose another (see
 /// [`is_valid_key_prefix`]). Keys minted before checksummed keys existed
-/// (`sk_…`) and any other format an instance imported keep authenticating:
-/// only minting depends on the prefix.
-pub const DEFAULT_KEY_PREFIX: &str = "obl";
+/// (`sk_` and 48 hex characters) and any other format an instance imported
+/// keep authenticating: only minting depends on the prefix.
+pub const DEFAULT_KEY_PREFIX: &str = "sk";
+
+/// The prefix v2.7.0 minted every key with. No key in another format ever
+/// started with it, so a credential starting `obl_` that fails its checksum
+/// is refused before the lookup whatever prefix is configured now.
+const CHECKSUM_ONLY_PREFIX: &str = "obl_";
 
 /// Most characters a key prefix may have.
 pub const KEY_PREFIX_MAX_CHARS: usize = 3;
@@ -99,8 +104,8 @@ pub fn default_key_prefix() -> &'static str {
 const DISPLAY_PREFIX_CHARS: usize = 18;
 
 /// CRC-32 (IEEE 802.3, the zlib/PNG polynomial) of `data`. Bitwise rather
-/// than table-driven: it runs once per minted key and once per `obl_`
-/// credential presented, on under 60 bytes.
+/// than table-driven: it runs once per minted key and once per credential of
+/// the checksummed shape presented, on under 60 bytes.
 pub fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for &byte in data {
@@ -170,18 +175,16 @@ pub fn is_well_formed_key(secret: &str) -> bool {
 
 /// True when a presented credential claims to be a checksummed key but is
 /// not a well-formed one, so it can be refused before it is hashed or looked
-/// up: anything starting with the default prefix, or a key of the full shape
-/// with any prefix whose checksum fails. A key in another format (`sk_…` and
-/// the rest) is never refused here, and neither is a cut-off key with
-/// another prefix: those go to the lookup and are refused there.
+/// up: anything starting with `obl_`, or a key of the full shape with any
+/// prefix whose checksum fails. A key in another format (the older `sk_` and
+/// 48 hex characters, and the rest) is never refused here, and neither is a
+/// cut-off key with another prefix: those go to the lookup and are refused
+/// there.
 pub fn is_malformed_key(secret: &str) -> bool {
     if is_well_formed_key(secret) {
         return false;
     }
-    secret
-        .strip_prefix(DEFAULT_KEY_PREFIX)
-        .is_some_and(|rest| rest.starts_with('_'))
-        || checksummed_parts(secret).is_some()
+    secret.starts_with(CHECKSUM_ONLY_PREFIX) || checksummed_parts(secret).is_some()
 }
 
 /// SHA-256 hex digest of a raw key, used as the lookup handle in Postgres + Redis.
@@ -260,10 +263,10 @@ mod tests {
     #[test]
     fn generated_key_is_well_formed() {
         let k = generate_api_key();
-        assert!(k.secret.starts_with("obl_"));
+        assert!(k.secret.starts_with("sk_"));
         assert_eq!(k.secret.len(), KEY_LEN);
-        assert_eq!(KEY_LEN, 60);
-        assert!(k.secret[4..]
+        assert_eq!(KEY_LEN, 59);
+        assert!(k.secret[3..]
             .bytes()
             .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
         assert!(is_well_formed_key(&k.secret));
@@ -309,7 +312,8 @@ mod tests {
 
     #[test]
     fn other_formats_are_never_called_malformed() {
-        // Keys minted before `obl_` keep authenticating exactly as before.
+        // Keys minted before checksummed keys keep authenticating exactly as
+        // before, though new keys start `sk_` again by default.
         assert!(!is_malformed_key(
             "sk_0123456789abcdef0123456789abcdef0123456789abcdef"
         ));
@@ -345,8 +349,27 @@ mod tests {
         // An invalid prefix never reaches a key.
         assert!(generate_api_key_with_prefix("toolong")
             .secret
-            .starts_with("obl_"));
-        assert!(generate_api_key_with_prefix("").secret.starts_with("obl_"));
+            .starts_with("sk_"));
+        assert!(generate_api_key_with_prefix("").secret.starts_with("sk_"));
+    }
+
+    #[test]
+    fn sk_keys_of_both_formats_live_side_by_side() {
+        // A new `sk_` key has the checksummed shape; an older one is 48 hex
+        // characters with no checksum and still goes to the lookup.
+        let new = generate_api_key_with_prefix("sk").secret;
+        assert_eq!(new.len(), 59);
+        assert!(is_well_formed_key(&new));
+        let mut flipped = new.clone().into_bytes();
+        flipped[5] = if flipped[5] == b'0' { b'1' } else { b'0' };
+        assert!(is_malformed_key(&String::from_utf8(flipped).unwrap()));
+        let old = format!("sk_{}", "ab".repeat(24));
+        assert!(!is_well_formed_key(&old));
+        assert!(!is_malformed_key(&old));
+        // `obl_` keys stay checked strictly, cut off or not.
+        let obl = generate_api_key_with_prefix("obl").secret;
+        assert!(!is_malformed_key(&obl));
+        assert!(is_malformed_key(&obl[..40]));
     }
 
     #[test]

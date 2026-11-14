@@ -116,6 +116,7 @@ const SCHEMA_V41: &str = include_str!("../../../../schema/postgres/0041_slurm_co
 const SCHEMA_V42: &str = include_str!("../../../../schema/postgres/0042_api_key_background.sql");
 const SCHEMA_V43: &str =
     include_str!("../../../../schema/postgres/0043_api_key_allowed_networks.sql");
+const SCHEMA_V44: &str = include_str!("../../../../schema/postgres/0044_key_prefix_keeps_obl.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -295,6 +296,7 @@ impl Store {
             sqlx::raw_sql(SCHEMA_V41).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V42).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V43).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V44).execute(&mut *conn).await?;
             Ok(())
         }
         .await;
@@ -6067,6 +6069,27 @@ mod tests {
         .await
         .expect("corrupt");
         assert_eq!(store.get_key_prefix_setting().await.unwrap(), None);
+
+        // An instance that already made `obl_` keys keeps `obl` on upgrade,
+        // and a prefix saved later is never overwritten.
+        store.put_key_prefix_setting("obl").await.expect("save obl");
+        let (_, obl) = store
+            .create_api_key(tenant.id, "k2", "", None, None, None, None, 100, None, &[])
+            .await
+            .expect("create obl key");
+        assert!(obl.starts_with("obl_"), "{obl}");
+        sqlx::query("delete from app_settings where key = 'key_prefix'")
+            .execute(&store.pool)
+            .await
+            .expect("clear setting");
+        store.migrate().await.expect("migrate again");
+        assert_eq!(
+            store.get_key_prefix_setting().await.unwrap().as_deref(),
+            Some("obl")
+        );
+        store.put_key_prefix_setting("rc").await.expect("save rc");
+        store.migrate().await.expect("migrate again");
+        assert_eq!(store.key_prefix().await.unwrap(), "rc");
 
         match before {
             Some(v) => {

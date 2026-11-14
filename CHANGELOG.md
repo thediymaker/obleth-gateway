@@ -4,9 +4,15 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
-## Unreleased
+## v2.8.0
 
-- **Choose the key prefix.** Settings › Keys sets what new keys start with before the `_`: 1 to 3 lowercase letters or digits, starting with a letter, `obl` by default (`OBLETH_KEY_PREFIX`, Helm `obleth.keyPrefix`, sets the starting value). `GET` and `PUT /api/v1/settings/key-prefix` read and change it, the change is in the audit log, and backups carry it with the other settings. Keys already made keep working whatever their prefix: the checksum is checked for any prefix, so a key of the full shape (a prefix, `_` and 56 lowercase hex characters) whose checksum fails is refused with `401` before any lookup, as is any malformed `obl_` key. A reverse proxy that picks a backend by the shape of the key must accept the new prefix before you change it, or match any prefix with `[a-z][a-z0-9]{0,2}_[0-9a-f]{56}`.
+Each instance chooses what its new keys start with. The built-in prefix is `sk`, the familiar one, and an instance that already made `obl_` keys keeps making them.
+
+> **Upgrade notes.** Postgres migration `0044` saves `obl` as the key prefix when the instance already has `obl_` keys and no prefix is saved, so an upgrade from v2.7.0 keeps minting `obl_` keys. Every other instance mints `sk_` keys from now on: `sk_` followed by 56 lowercase hex characters, with a checksum. A reverse proxy that picks a backend by the shape of the key must accept that shape too (older `sk_` keys have 48 hex characters), or match any prefix with `[a-z][a-z0-9]{0,2}_[0-9a-f]{48}([0-9a-f]{8})?`.
+
+**Keys**
+
+- **Choose the key prefix.** Settings › Keys sets what new keys start with before the `_`: 1 to 3 lowercase letters or digits, starting with a letter, `sk` by default (`OBLETH_KEY_PREFIX`, Helm `obleth.keyPrefix`, sets the starting value; a saved prefix wins). `GET` and `PUT /api/v1/settings/key-prefix` read and change it, the change is in the audit log, and backups carry it with the other settings. Keys already made keep working whatever their prefix: the checksum is checked for any prefix, so a key of the full shape (a prefix, `_` and 56 lowercase hex characters) whose checksum fails is refused with `401` before any lookup, as is any malformed `obl_` key. Older `sk_` keys without a checksum still go to the lookup. A reverse proxy that picks a backend by the shape of the key must accept the new prefix before you change it.
 
 ## v2.7.0
 
