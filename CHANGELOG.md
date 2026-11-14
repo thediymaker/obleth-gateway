@@ -6,6 +6,12 @@ workflow falls back to auto-generated notes.
 
 ## Unreleased
 
+## v2.9.0
+
+A page that shows where each API key is used from. No migrations and nothing to check before upgrading.
+
+**Control plane**
+
 - **Key access page.** Access › Key Access shows where each API key was used from in the last 24 hours, 7 days or 30 days: one row per key with its requests, networks and countries, a tag when a key was seen from a country or network for the first time, and the refused requests (turned-off keys and keys used from outside their allowed networks) with address, country and User-Agent. Filter by tenant, search by key, tenant, network or country, and open a key to see each network with links to its requests and the key. It reads `GET /api/v1/usage/key-sources` and `GET /api/v1/usage/key-rejections`.
 
 ## v2.8.0
