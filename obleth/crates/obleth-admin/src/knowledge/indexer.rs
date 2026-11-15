@@ -35,17 +35,8 @@ use obleth_store::knowledge::{ChunkInsert, KnowledgeDocument};
 use obleth_store::Store;
 use obleth_tokenizer::HeuristicTokenizer;
 
-use super::chunk::{chunk_text, Chunk};
-use super::embed::{embed_batch, EmbedTarget};
-
-/// Group chunk texts into upstream-sized batches, preserving order.
-pub fn plan_batches(chunks: &[Chunk], batch_size: usize) -> Vec<Vec<String>> {
-    let size = batch_size.max(1);
-    chunks
-        .chunks(size)
-        .map(|g| g.iter().map(|c| c.text.clone()).collect())
-        .collect()
-}
+use super::chunk::chunk_text;
+use super::embed::{embed_in_batches, resolve_target};
 
 /// Refuse a document that would push the collection past its chunk cap.
 pub fn check_chunk_cap(existing: i64, incoming: usize, cap: i64) -> Result<()> {
@@ -114,18 +105,18 @@ pub async fn index_document(
         .await?;
     check_chunk_cap(existing, chunks.len(), settings.max_chunks_per_collection)?;
 
-    let target = EmbedTarget {
-        api_base: model.api_base.clone(),
-        api_key: model.api_key.clone(),
-        headers: crate::upstream_header_map(&model.upstream_headers),
-        upstream_model: model.upstream_model.clone(),
-    };
+    let target = resolve_target(store, &model).await?;
     let timeout = Duration::from_millis(settings.index_timeout_ms.max(1_000));
 
-    let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
-    for batch in plan_batches(&chunks, settings.index_batch_size.max(1) as usize) {
-        vectors.extend(embed_batch(client, &target, &batch, timeout).await?);
-    }
+    let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
+    let vectors = embed_in_batches(
+        client,
+        &target,
+        &texts,
+        settings.index_batch_size as usize,
+        timeout,
+    )
+    .await?;
     if vectors.len() != chunks.len() {
         return Err(anyhow!(
             "embedder returned {} vectors for {} chunks",
@@ -218,38 +209,6 @@ pub fn spawn_indexer(store: Store, client: reqwest::Client) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knowledge::chunk::Chunk;
-
-    fn chunks(n: usize) -> Vec<Chunk> {
-        (0..n)
-            .map(|i| Chunk {
-                text: format!("chunk {i}"),
-                token_count: 2,
-            })
-            .collect()
-    }
-
-    #[test]
-    fn batches_respect_the_batch_size() {
-        let batches = plan_batches(&chunks(10), 4);
-        assert_eq!(batches.len(), 3);
-        assert_eq!(batches[0].len(), 4);
-        assert_eq!(batches[2].len(), 2);
-    }
-
-    #[test]
-    fn batching_preserves_order_across_batches() {
-        // Vectors are matched back to chunks positionally, so any reordering
-        // attaches the wrong vector to the wrong text.
-        let flat: Vec<String> = plan_batches(&chunks(7), 3).into_iter().flatten().collect();
-        assert_eq!(flat[0], "chunk 0");
-        assert_eq!(flat[6], "chunk 6");
-    }
-
-    #[test]
-    fn empty_input_yields_no_batches() {
-        assert!(plan_batches(&[], 4).is_empty());
-    }
 
     #[test]
     fn cap_rejects_a_document_that_would_exceed_the_limit() {
