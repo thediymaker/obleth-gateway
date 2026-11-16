@@ -60,19 +60,24 @@ export function TenantsList({
   tenants,
   keys,
   users,
+  memberCounts,
   usage24h,
   budgets,
   monthSpend,
   models,
+  fairshareGroups,
 }: {
   tenants: Tenant[];
   keys: ApiKey[];
   users: AdminUser[];
+  memberCounts: Record<string, number>;
   usage24h: UsageAgg[];
   budgets: BudgetUsage[];
   /** Spend this calendar month, by tenant id. */
   monthSpend: Record<string, number>;
   models: string[];
+  /** Fairshare group names, for the create form. */
+  fairshareGroups: string[];
 }) {
   const router = useRouter();
   const fairshare = useFairshareLive();
@@ -83,7 +88,7 @@ export function TenantsList({
   const [sort, setSort] = useState<TenantSort>("requests");
   const [adding, setAdding] = useState(false);
 
-  const rows = useMemo(() => buildTenantRows(tenants, keys, users, usage24h, budgets, fairshare.data), [tenants, keys, users, usage24h, budgets, fairshare.data]);
+  const rows = useMemo(() => buildTenantRows(tenants, keys, users, memberCounts, usage24h, budgets, fairshare.data), [tenants, keys, users, memberCounts, usage24h, budgets, fairshare.data]);
   const shown = useMemo(() => sortTenants(filterTenants(rows, { query, status, group, has }), sort), [rows, query, status, group, has, sort]);
   const groups = [...new Set(tenants.map((t) => t.fairshare_group))].sort();
   const count = (s: string) => tenants.filter((t) => t.status === s).length;
@@ -222,7 +227,7 @@ export function TenantsList({
             <DialogTitle>Add a tenant</DialogTitle>
             <DialogDescription>A team or project that gets its own keys, share of the gateway, and optional limits.</DialogDescription>
           </DialogHeader>
-          <CreateTenant models={models} tenantWeights={tenants.map((t) => t.weight)} onCreated={() => { setAdding(false); router.refresh(); }} />
+          <CreateTenant models={models} groups={fairshareGroups} tenantWeights={tenants.map((t) => t.weight)} onCreated={() => { setAdding(false); router.refresh(); }} />
         </DialogContent>
       </Dialog>
     </div>

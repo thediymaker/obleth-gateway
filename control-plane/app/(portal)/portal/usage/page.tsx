@@ -1,12 +1,12 @@
 import { PortalUsage } from "@/components/portal/portal-usage";
-import { requireTenant } from "@/lib/auth/roles";
+import { currentPortalContext } from "@/lib/portal-context";
 import { obleth, type KeyUsageSummary, type UsageAgg, type UsageLogEntry } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
 
 export const dynamic = "force-dynamic";
 
 export default async function PortalUsagePage() {
-  const tenantId = await requireTenant();
+  const tenantId = (await currentPortalContext()).current.id;
   const sinceMs = Date.now() - 24 * 60 * 60_000;
   const [allUsage, keyUsage, recent] = await Promise.all([
     safe(obleth.usage(), [] as UsageAgg[]),

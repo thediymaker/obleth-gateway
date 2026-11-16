@@ -1,6 +1,6 @@
 import { PortalModels } from "@/components/portal/portal-models";
 import { toPortalModelSummary } from "@/components/portal/portal-model-summary";
-import { requireUser } from "@/lib/auth/roles";
+import { currentPortalContext } from "@/lib/portal-context";
 import { lifecycleStatus } from "@/lib/models-model";
 import { obleth, type ModelRoute, type Tenant } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
@@ -8,12 +8,12 @@ import { safe } from "@/lib/safe";
 export const dynamic = "force-dynamic";
 
 export default async function PortalModelsPage() {
-  const session = await requireUser();
+  const ctx = await currentPortalContext();
   const [models, tenants] = await Promise.all([
     safe(obleth.listModels(), [] as ModelRoute[]),
     safe(obleth.listTenants(), [] as Tenant[]),
   ]);
-  const tenant = tenants.find((row) => row.id === session.tenantId) ?? null;
+  const tenant = tenants.find((row) => row.id === ctx.current.id) ?? null;
   const allowed = tenant?.allowed_models?.filter(Boolean) ?? [];
   const visible = models
     .filter((model) => model.enabled)

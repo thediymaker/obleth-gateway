@@ -17,6 +17,7 @@ stringData:
   TRUSTED_ORIGINS: {{ .Values.controlPlane.trustedOrigins | default "" | quote }}
   DASHBOARD_ADMIN_EMAIL: {{ .Values.controlPlane.dashboardAdminEmail | default "admin@example.com" | quote }}
   OIDC_PROVIDERS: {{ .Values.controlPlane.oidcProviders | default "" | quote }}
+  OIDC_AUTO_APPROVE: {{ .Values.controlPlane.oidcAutoApprove | default false | quote }}
 ---
 {{- end }}
 apiVersion: apps/v1

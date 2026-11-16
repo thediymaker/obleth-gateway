@@ -22,8 +22,9 @@ pub use failure::{
     ErrorClass, Failure, EFFECTIVE_CLASS_SQL, ERROR_REASON_MAX_CHARS, PLATFORM_CLASSES_SQL,
 };
 pub use jwt::{
-    identity_key_hash, jwt_issuers_from_env, parse_jwt_issuers, sanitize_device_id, JwtConfigError,
-    JwtIssuerConfig, ALLOWED_JWT_ALGORITHMS, DEVICE_ID_MAX_LEN,
+    identity_key_hash, is_personal_template, jwt_issuers_from_env, parse_jwt_issuers,
+    render_identity_tenant, sanitize_device_id, JwtConfigError, JwtIssuerConfig,
+    TenantTemplateError, ALLOWED_JWT_ALGORITHMS, DEVICE_ID_MAX_LEN,
 };
 pub use keys::{
     cache_key, content_hash, crc32, default_key_prefix, end_user_key_id, env_key_prefix,

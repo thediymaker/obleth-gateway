@@ -41,6 +41,9 @@ pub struct JwtIssuerConfig {
     pub identity_claims: Vec<String>,
     /// Name of the tenant identity keys are created under.
     pub tenant: String,
+    /// Settings applied only when JIT creates the tenant.
+    #[serde(default)]
+    pub tenant_defaults: Option<crate::TenantDefaults>,
     /// When false, an unknown identity is a 401 rather than being provisioned.
     #[serde(default = "default_true")]
     pub jit_provision: bool,
@@ -66,6 +69,18 @@ pub enum JwtConfigError {
     Algorithm(String),
     #[error("OBLETH_JWT_ISSUERS: issuer {0:?} is listed more than once")]
     DuplicateIssuer(String),
+}
+
+/// A tenant template references a claim the token does not carry (or carries
+/// as a non-string). Rendering fails rather than falling back to a name two
+/// users could share: a personal tenant named from a missing claim would
+/// merge distinct identities into one tenant.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum TenantTemplateError {
+    #[error(
+        "tenant template references claim {0:?}, which is absent from the token or not a string"
+    )]
+    MissingClaim(String),
 }
 
 /// Parse and validate the issuer list. Blank input means no issuers (feature off).
@@ -104,6 +119,19 @@ pub fn parse_jwt_issuers(raw: &str) -> Result<Vec<JwtIssuerConfig>, JwtConfigErr
                 i.issuer
             )));
         }
+        validate_tenant_template(&i.tenant, &i.issuer)?;
+        if let Some(p) = i
+            .tenant_defaults
+            .as_ref()
+            .and_then(|d| d.budget_period.as_ref())
+        {
+            if !matches!(p.as_str(), "monthly" | "term" | "lifetime") {
+                return Err(JwtConfigError::Field(format!(
+                    "tenant_defaults.budget_period {p:?} must be monthly, term or lifetime for issuer {:?}",
+                    i.issuer
+                )));
+            }
+        }
         if i.subject_claim.trim().is_empty() {
             return Err(JwtConfigError::Field(format!(
                 "subject_claim must not be blank for issuer {:?}",
@@ -130,6 +158,141 @@ pub fn parse_jwt_issuers(raw: &str) -> Result<Vec<JwtIssuerConfig>, JwtConfigErr
 
 fn is_http_url(s: &str) -> bool {
     s.starts_with("https://") || s.starts_with("http://")
+}
+
+/// Placeholder names a tenant template may use: 1..=32 chars from
+/// `[A-Za-z0-9._-]` — enough for `sub` and any reasonable claim name,
+/// nothing that could collide with template syntax.
+fn is_placeholder_name(name: &str) -> bool {
+    (1..=32).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Walk a template's `{placeholder}` occurrences, calling `f` for each name in
+/// order. A `{` without a closing `}` is not a placeholder: `f` is not called
+/// and the scan stops there.
+fn for_each_placeholder(template: &str, mut f: impl FnMut(&str)) {
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        let tail = &rest[open + 1..];
+        let Some(close) = tail.find('}') else {
+            return;
+        };
+        f(&tail[..close]);
+        rest = &tail[close + 1..];
+    }
+}
+
+/// Boot-time validation of a tenant template: every `{placeholder}` must have
+/// a name from [`is_placeholder_name`] and may appear at most once. A
+/// malformed placeholder would render into a tenant name at request time;
+/// catch it at boot instead.
+fn validate_tenant_template(tenant: &str, issuer: &str) -> Result<(), JwtConfigError> {
+    let mut seen = HashSet::new();
+    let mut rest = tenant;
+    while let Some(open) = rest.find('{') {
+        let tail = &rest[open + 1..];
+        let Some(close) = tail.find('}') else {
+            return Err(JwtConfigError::Field(format!(
+                "tenant {tenant:?} has an unterminated placeholder for issuer {issuer:?}",
+            )));
+        };
+        let name = &tail[..close];
+        if !is_placeholder_name(name) {
+            return Err(JwtConfigError::Field(format!(
+                "tenant placeholder {{{name}}} in {tenant:?} must be 1..=32 chars from [A-Za-z0-9._-] for issuer {issuer:?}",
+            )));
+        }
+        if !seen.insert(name.to_string()) {
+            return Err(JwtConfigError::Field(format!(
+                "tenant may contain placeholder {{{name}}} at most once for issuer {issuer:?}",
+            )));
+        }
+        rest = &tail[close + 1..];
+    }
+    Ok(())
+}
+
+/// A template is personal when it names a per-identity tenant, i.e. it
+/// carries any `{placeholder}` (`{sub}`, `{email}`, ...).
+pub fn is_personal_template(template: &str) -> bool {
+    let mut personal = false;
+    for_each_placeholder(template, |_| personal = true);
+    personal
+}
+
+/// Hash fallback for a placeholder value that cannot be used verbatim:
+/// `h` + 32 hex chars of its SHA-256.
+fn hash_part(s: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(s.as_bytes());
+    format!("h{}", &hex::encode(h.finalize())[..32])
+}
+
+/// Tenant name for a JIT identity.
+///
+/// `{sub}` in `template` becomes the subject when it is 1..=64 ASCII
+/// alphanumerics or `-`, else `h` + 32 hex chars of its SHA-256.
+///
+/// Any other `{claim}` placeholder becomes the value of that claim from
+/// `claims` (a JSON object, e.g. `{"email": "a.b@example.com"}`) when the
+/// value is a string of 1..=64 chars from `[A-Za-z0-9._@+-]` — the set an
+/// email address needs and no more — else the same hash fallback. A
+/// placeholder whose claim is absent from `claims` (or not a string) is an
+/// error: every such token would land in the same tenant, so the call is
+/// rejected instead of guessing a shared name.
+pub fn render_identity_tenant(
+    template: &str,
+    subject: &str,
+    claims: &serde_json::Value,
+) -> Result<String, TenantTemplateError> {
+    let subject_part = if (1..=64).contains(&subject.len())
+        && subject
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        subject.to_string()
+    } else {
+        hash_part(subject)
+    };
+    let mut out = String::with_capacity(template.len() + subject_part.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let tail = &rest[open + 1..];
+        let Some(close) = tail.find('}') else {
+            // A `{` that is not a placeholder: keep it verbatim.
+            out.push_str(tail);
+            return Ok(out);
+        };
+        let name = &tail[..close];
+        let value = if name == "sub" {
+            subject_part.clone()
+        } else {
+            match claims.get(name) {
+                Some(serde_json::Value::String(s)) if !s.trim().is_empty() => {
+                    let s = s.trim();
+                    if (1..=64).contains(&s.len())
+                        && s.bytes().all(|b| {
+                            b.is_ascii_alphanumeric()
+                                || matches!(b, b'.' | b'@' | b'_' | b'+' | b'-')
+                        })
+                    {
+                        s.to_string()
+                    } else {
+                        hash_part(s)
+                    }
+                }
+                _ => return Err(TenantTemplateError::MissingClaim(name.to_string())),
+            }
+        };
+        out.push_str(&value);
+        rest = &tail[close + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
 }
 
 /// Read `OBLETH_JWT_ISSUERS`. A trust anchor that fails to parse must not
@@ -314,5 +477,152 @@ mod tests {
         assert_ne!(a, identity_key_hash("https://idp.example.com", "bob"));
         // The NUL separator prevents (iss="a", sub="bc") colliding with (iss="ab", sub="c").
         assert_ne!(identity_key_hash("a", "bc"), identity_key_hash("ab", "c"));
+    }
+
+    #[test]
+    fn renders_identity_tenant() {
+        let empty = serde_json::json!({});
+        assert_eq!(
+            render_identity_tenant("u-{sub}", "3f2a-9c", &empty).unwrap(),
+            "u-3f2a-9c"
+        );
+        assert_eq!(
+            render_identity_tenant("open-webui", "x", &empty).unwrap(),
+            "open-webui"
+        );
+        let h = render_identity_tenant("u-{sub}", "a@b", &empty).unwrap();
+        assert!(h.starts_with("u-h") && h.len() == 2 + 1 + 32);
+        assert_eq!(h, render_identity_tenant("u-{sub}", "a@b", &empty).unwrap());
+        assert_ne!(h, render_identity_tenant("u-{sub}", "a_b", &empty).unwrap());
+        assert!(render_identity_tenant("u-{sub}", &"x".repeat(65), &empty)
+            .unwrap()
+            .starts_with("u-h"));
+    }
+
+    #[test]
+    fn renders_identity_tenant_from_claim() {
+        let claims = serde_json::json!({"email": "test.user@example.org"});
+        // A clean email renders verbatim, the TDDEV-5289 personal-tenant format.
+        assert_eq!(
+            render_identity_tenant("{email}", "u-02dd4a0b", &claims).unwrap(),
+            "test.user@example.org"
+        );
+        // Email character set: dots, plus-signs, underscores, dashes.
+        let claims = serde_json::json!({"email": "first.last+tag_1-2@sub.example.co"});
+        assert_eq!(
+            render_identity_tenant("t-{email}", "s", &claims).unwrap(),
+            "t-first.last+tag_1-2@sub.example.co"
+        );
+        // `{sub}` and `{claim}` can combine.
+        let claims = serde_json::json!({"email": "test.user@example.org"});
+        assert_eq!(
+            render_identity_tenant("{sub}/{email}", "abc", &claims).unwrap(),
+            "abc/test.user@example.org"
+        );
+        // Out-of-set characters (space, unicode, path) fall back to the hash,
+        // keeping one stable name per distinct value.
+        let a =
+            render_identity_tenant("{email}", "s", &serde_json::json!({"email": "x y@z"})).unwrap();
+        let b =
+            render_identity_tenant("{email}", "s", &serde_json::json!({"email": "x y@z"})).unwrap();
+        let c =
+            render_identity_tenant("{email}", "s", &serde_json::json!({"email": "x.z@z"})).unwrap();
+        assert!(a.starts_with('h') && a.len() == 33);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        // A value longer than 64 chars is hashed, not truncated into a shared prefix.
+        let long = render_identity_tenant(
+            "{email}",
+            "s",
+            &serde_json::json!({"email": "a".repeat(65) + "@x.y"}),
+        )
+        .unwrap();
+        assert!(long.starts_with('h') && long.len() == 33);
+        // Whitespace-trimmed emails are usable.
+        let claims = serde_json::json!({"email": " test.user@example.org "});
+        assert_eq!(
+            render_identity_tenant("{email}", "s", &claims).unwrap(),
+            "test.user@example.org"
+        );
+    }
+
+    #[test]
+    fn renders_identity_tenant_missing_claim_is_an_error() {
+        // Absent claim, non-string claim and empty claim all fail closed:
+        // a fallback name would be shared by every such token.
+        assert_eq!(
+            render_identity_tenant("{email}", "s", &serde_json::json!({})).unwrap_err(),
+            TenantTemplateError::MissingClaim("email".into())
+        );
+        assert_eq!(
+            render_identity_tenant("{email}", "s", &serde_json::json!({"email": 42})).unwrap_err(),
+            TenantTemplateError::MissingClaim("email".into())
+        );
+        assert_eq!(
+            render_identity_tenant("{email}", "s", &serde_json::json!({"email": "  "}))
+                .unwrap_err(),
+            TenantTemplateError::MissingClaim("email".into())
+        );
+        // `{sub}` alone never fails, even with an empty claims object.
+        assert!(render_identity_tenant("u-{sub}", "s", &serde_json::Value::Null).is_ok());
+    }
+
+    #[test]
+    fn personal_template_detection() {
+        assert!(is_personal_template("u-{sub}"));
+        assert!(is_personal_template("{email}"));
+        assert!(is_personal_template("team-{sub}-x-{email}"));
+        assert!(!is_personal_template("open-webui"));
+        assert!(!is_personal_template("cli-users"));
+    }
+
+    #[test]
+    fn rejects_malformed_and_duplicate_placeholders() {
+        let one = |tenant: &str| {
+            parse_jwt_issuers(&format!(
+                r#"[{{"issuer":"https://idp.example.com","audience":"a","tenant":{tenant}}}]"#
+            ))
+        };
+        // Duplicate placeholder (covers the old `u-{sub}-{sub}` rejection).
+        assert!(matches!(
+            one(r#""u-{sub}-{sub}""#).unwrap_err(),
+            JwtConfigError::Field(_)
+        ));
+        assert!(matches!(
+            one(r#""{email}-{email}""#).unwrap_err(),
+            JwtConfigError::Field(_)
+        ));
+        // Empty, too-long and bad-character placeholder names.
+        assert!(matches!(
+            one(r#""u-{}""#).unwrap_err(),
+            JwtConfigError::Field(_)
+        ));
+        assert!(matches!(
+            one(&format!(r#""u-{{{}}}""#, "a".repeat(33))).unwrap_err(),
+            JwtConfigError::Field(_)
+        ));
+        assert!(matches!(
+            one(r#""u-{bad name}""#).unwrap_err(),
+            JwtConfigError::Field(_)
+        ));
+        // Valid placeholders (including literal text around them) pass.
+        assert!(one(r#""u-{sub}""#).is_ok());
+        assert!(one(r#""{email}""#).is_ok());
+        assert!(one(r#""u-{sub}-{email}""#).is_ok());
+    }
+
+    #[test]
+    fn tenant_defaults_parse_and_validate() {
+        let ok = r#"[{"issuer":"https://idp.example.com","audience":"a","tenant":"u-{sub}","tenant_defaults":{"fairshare_group":"personal","budget_tokens":1000,"budget_period":"monthly","allowed_models":["m"]}}]"#;
+        let i = &parse_jwt_issuers(ok).unwrap()[0];
+        assert_eq!(
+            i.tenant_defaults.as_ref().unwrap().budget_tokens,
+            Some(1000)
+        );
+        assert!(parse_jwt_issuers(
+            r#"[{"issuer":"https://idp.example.com","audience":"a","tenant":"u-{sub}-{sub}"}]"#
+        )
+        .is_err());
+        assert!(parse_jwt_issuers(r#"[{"issuer":"https://idp.example.com","audience":"a","tenant":"u","tenant_defaults":{"budget_period":"weekly"}}]"#).is_err());
     }
 }

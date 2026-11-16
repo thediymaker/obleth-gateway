@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   BarChart3,
   Boxes,
@@ -12,10 +12,13 @@ import {
   LogOut,
   PanelLeftClose,
   PanelLeftOpen,
+  Users,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { authClient } from "@/lib/auth/client";
 import { cn } from "@/lib/utils";
+import { selectPortalTenant } from "@/app/(portal)/portal-actions";
+import type { PortalTenant } from "@/lib/portal-context";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -31,11 +34,60 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 
 const SIDEBAR_STORAGE_KEY = "obleth-portal-sidebar-collapsed";
 
-const nav = [
+const baseNav = [
   { href: "/portal/models", label: "Models", icon: Boxes },
   { href: "/portal/keys", label: "Keys", icon: KeyRound },
   { href: "/portal/usage", label: "Usage", icon: BarChart3 },
 ];
+
+const membersNav = { href: "/portal/members", label: "Members", icon: Users };
+
+export function TenantSwitcher({ tenants, current }: { tenants: PortalTenant[]; current: PortalTenant }) {
+  // Controlled select: an uncontrolled defaultValue sticks on the previous
+  // tenant after the RSC re-render that follows selectPortalTenant.
+  const [value, setValue] = useState(current.id);
+  useEffect(() => {
+    if (!tenants.some((t) => t.id === value)) setValue(current.id);
+  }, [tenants, value, current.id]);
+  // TDDEV-5338: React 19 calls form.reset() in the commit phase after a
+  // server action completes (react-dom commitMutationEffects, flag 1024),
+  // which bounces a controlled <select> back to its first option. The
+  // committed `value` prop is unchanged across that commit, so React's diff
+  // never rewrites the DOM and the select stays desynced on the previous
+  // tenant until the next full navigation. Passive effects run after the
+  // mutation phase, so this re-syncs the DOM to the committed value in the
+  // very commit where the RSC payload flips `current`.
+  const selectRef = useRef<HTMLSelectElement>(null);
+  useEffect(() => {
+    const el = selectRef.current;
+    if (el && el.value !== value) el.value = value;
+  }, [value, current.id]);
+
+  return (
+    <form action={selectPortalTenant} className="flex items-center gap-2">
+      <select
+        ref={selectRef}
+        name="tenantId"
+        value={value}
+        aria-label="Tenant"
+        onChange={(e) => {
+          setValue(e.target.value);
+          e.currentTarget.form?.requestSubmit();
+        }}
+        className="h-8 min-w-0 max-w-full flex-1 rounded-md border border-input bg-background px-2 text-sm"
+      >
+        {tenants.map((t) => (
+          <option key={t.id} value={t.id}>
+            {t.name} ({t.kind})
+          </option>
+        ))}
+      </select>
+      <span className="shrink-0 rounded bg-secondary px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-muted-foreground">
+        {current.kind}
+      </span>
+    </form>
+  );
+}
 
 function userInitials(name: string) {
   const parts = name.trim().split(/[\s._-]+/).filter(Boolean);
@@ -85,16 +137,20 @@ function NavItem({
 export function PortalShell({
   children,
   username,
-  tenantName,
+  tenants,
+  current,
   role,
   version,
 }: {
   children: React.ReactNode;
   username: string;
-  tenantName: string;
+  tenants: PortalTenant[];
+  current: PortalTenant;
   role: "admin" | "user";
   version: string;
 }) {
+  const tenantName = current.name;
+  const nav = current.role === "manager" ? [...baseNav, membersNav] : baseNav;
   const pathname = usePathname();
   const router = useRouter();
   const [collapsed, setCollapsed] = useState(false);
@@ -174,9 +230,9 @@ export function PortalShell({
               <p className="truncate text-[10px] uppercase tracking-wider text-muted-foreground">
                 Tenant
               </p>
-              <p className="mt-1 truncate text-sm font-medium" title={tenantName}>
-                {tenantName}
-              </p>
+              <div className="mt-1">
+                <TenantSwitcher tenants={tenants} current={current} />
+              </div>
             </div>
           )}
         </aside>
@@ -249,7 +305,7 @@ export function PortalShell({
             </DropdownMenu>
           </header>
 
-          <nav className="grid grid-cols-3 gap-1 border-b border-border bg-card/35 p-2 sm:hidden">
+          <nav className="grid grid-flow-col auto-cols-fr gap-1 border-b border-border bg-card/35 p-2 sm:hidden">
             {nav.map(({ href, label, icon: Icon }) => {
               const active = pathname.startsWith(href);
               return (

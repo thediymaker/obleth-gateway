@@ -1,4 +1,5 @@
-import { requireTenant } from "@/lib/auth/roles";
+import { currentPortalContext } from "@/lib/portal-context";
+import { accounts } from "@/lib/obleth-accounts";
 import { obleth, type ApiKey, type KeyUsageSummary, type ModelRoute, type Tenant } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
 import { PortalKeys } from "@/components/portal/portal-keys";
@@ -6,10 +7,14 @@ import { PortalKeys } from "@/components/portal/portal-keys";
 export const dynamic = "force-dynamic";
 
 export default async function PortalKeysPage() {
-  const tenantId = await requireTenant();
+  const ctx = await currentPortalContext();
+  const tenantId = ctx.current.id;
   const sinceMs = Date.now() - 24 * 60 * 60_000;
   const [keys, keyUsage, models, tenants] = await Promise.all([
-    safe(obleth.listKeys(tenantId), [] as ApiKey[]),
+    safe(
+      accounts.listOwnedKeys(tenantId, ctx.current.role === "manager" ? undefined : ctx.identity),
+      [] as ApiKey[],
+    ),
     safe(obleth.usageKeysSummary({ tenantId, sinceMs, limit: 500 }), [] as KeyUsageSummary[]),
     safe(obleth.listModels(), [] as ModelRoute[]),
     safe(obleth.listTenants(), [] as Tenant[]),
