@@ -232,6 +232,10 @@ pub struct UsageLogQuery {
     pub error_class: Vec<String>,
     /// Case-insensitive prefix match on the request id, for the search box.
     pub request_id: Option<String>,
+    /// Where the request came from: one address (`203.0.113.7`) or a CIDR
+    /// range (`10.0.0.0/8`). Something that is neither matches no rows.
+    /// Requests whose address has passed its retention never match.
+    pub client_ip: Option<String>,
     /// Only the helper calls a boon made for this client request (a
     /// speculation draft, an image description, ...): the rows whose
     /// `parent_request_id` is this id. Combine with `since_ms`/`until_ms`
@@ -399,6 +403,9 @@ fn log_filter_sql(q: &UsageLogQuery, since: i64) -> (String, Vec<LogBind>) {
         sql.push_str(" and startsWith(lower(toString(request_id)), lower(?))");
         binds.push(LogBind::Text(rid.clone()));
     }
+    if let Some(raw) = q.client_ip.as_deref() {
+        client_ip_filter(&mut sql, &mut binds, raw);
+    }
     if let Some(parent) = q.parent_request_id {
         sql.push_str(" and parent_request_id = toUUID(?)");
         binds.push(LogBind::Text(parent.to_string()));
@@ -407,6 +414,32 @@ fn log_filter_sql(q: &UsageLogQuery, since: i64) -> (String, Vec<LogBind>) {
         sql.push_str(&traced_only_filter(since, q.until_ms));
     }
     (sql, binds)
+}
+
+/// `client_ip` matching one address or a range. Addresses are stored in
+/// canonical text, so one address is an exact match; a range compares the
+/// parsed address against the range's ends with the `OrNull` parsers, which
+/// never throw on a row whose address is empty.
+fn client_ip_filter(sql: &mut String, binds: &mut Vec<LogBind>, raw: &str) {
+    use ipnet::IpNet;
+    let Some(net) = obleth_config::network::parse_network(raw) else {
+        sql.push_str(" and 0");
+        return;
+    };
+    if net.prefix_len() == net.max_prefix_len() {
+        sql.push_str(" and client_ip = ?");
+        binds.push(LogBind::Text(net.addr().to_string()));
+        return;
+    }
+    let parse = match net {
+        IpNet::V4(_) => "toIPv4OrNull",
+        IpNet::V6(_) => "toIPv6OrNull",
+    };
+    sql.push_str(&format!(
+        " and {parse}(client_ip) between {parse}(?) and {parse}(?)"
+    ));
+    binds.push(LogBind::Text(net.network().to_string()));
+    binds.push(LogBind::Text(net.broadcast().to_string()));
 }
 
 /// `and {column} = …` for one value, `and {column} in (…)` for several,
@@ -2588,6 +2621,7 @@ mod alias_tests {
             fault: None,
             error_class: Vec::new(),
             request_id: None,
+            client_ip: None,
             parent_request_id: None,
             since_ms: None,
             until_ms: None,
@@ -2625,6 +2659,45 @@ mod alias_tests {
         assert!(sql.contains("status_code >= 400"));
         assert!(sql.contains("status_code = 502"));
         assert!(sql.contains("FROM spans"));
+    }
+
+    #[test]
+    fn log_filters_match_an_address_or_a_range() {
+        let with = |ip: &str| {
+            log_filter_sql(
+                &UsageLogQuery {
+                    client_ip: Some(ip.into()),
+                    ..log_query()
+                },
+                0,
+            )
+        };
+        let bound = |binds: &[LogBind]| -> Vec<String> {
+            binds
+                .iter()
+                .filter_map(|b| match b {
+                    LogBind::Text(t) => Some(t.clone()),
+                    LogBind::Int(_) => None,
+                })
+                .collect()
+        };
+
+        let (sql, binds) = with(" 203.0.113.7 ");
+        assert!(sql.contains(" and client_ip = ?"));
+        assert_eq!(bound(&binds), vec!["203.0.113.7"]);
+
+        let (sql, binds) = with("10.1.2.3/8");
+        assert!(sql.contains("toIPv4OrNull(client_ip) between toIPv4OrNull(?) and toIPv4OrNull(?)"));
+        assert_eq!(bound(&binds), vec!["10.0.0.0", "10.255.255.255"]);
+        assert_eq!(sql.matches('?').count(), binds.len());
+
+        let (sql, binds) = with("2001:db8::/48");
+        assert!(sql.contains("toIPv6OrNull(client_ip) between"));
+        assert_eq!(sql.matches('?').count(), binds.len());
+
+        let (sql, binds) = with("not an address");
+        assert!(sql.ends_with(" and 0"));
+        assert_eq!(sql.matches('?').count(), binds.len());
     }
 
     #[test]

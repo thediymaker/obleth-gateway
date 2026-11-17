@@ -5734,6 +5734,10 @@ pub struct UsageLogEntry {
     /// `true` when at least one span for this request exists in ClickHouse.
     #[serde(default)]
     pub has_trace: bool,
+    /// The narrowest named network (Settings › Networks) that holds the
+    /// client address, when one does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_name: Option<String>,
 }
 
 /// Newest-first feed of individual requests for the live log view. ClickHouse
@@ -5776,6 +5780,7 @@ async fn get_usage_logs(
 
     let request_ids: Vec<Uuid> = rows.iter().map(|r| r.request_id).collect();
     let traced = usage::batch_has_trace(&state.clickhouse, &request_ids).await;
+    let names = NetworkNames::new(&state.store.named_networks().await?);
 
     let entries = rows
         .into_iter()
@@ -5791,12 +5796,16 @@ async fn get_usage_logs(
                 .cloned()
                 .unwrap_or_else(|| (row.recorded_key_name.clone(), String::new()));
             let has_trace = traced.contains(&row.request_id);
+            let network_name = (!row.client_ip.is_empty())
+                .then(|| names.name_of(&row.client_ip).map(str::to_string))
+                .flatten();
             UsageLogEntry {
                 row,
                 tenant_name,
                 key_name,
                 key_prefix,
                 has_trace,
+                network_name,
             }
         })
         .collect();
