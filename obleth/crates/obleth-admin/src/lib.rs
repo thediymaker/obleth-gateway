@@ -5599,28 +5599,47 @@ async fn get_usage_key_sources(
 /// Refused uses of real keys in the window: a disabled key, or a key used
 /// from outside its allowed networks. One row per key, reason, client
 /// address and country, with the number of refusals, first and last seen,
-/// and the most recent User-Agent. Default window: the last 24 hours; at
-/// most 31 days.
+/// and the most recent User-Agent, newest first. Default window: the last 24
+/// hours; at most 31 days. `key_id` takes one key or up to 200 joined by
+/// commas, so one call covers every key a person holds (`key_id=` with no
+/// key is refused); `limit` (default and most 10,000) caps the rows and
+/// `per_key` caps any one key's rows. When rows were left out the response
+/// carries `x-obleth-truncated: true`. The read gives up after 10 seconds.
 #[utoipa::path(
     get, path = "/api/v1/usage/key-rejections", tag = "usage",
     params(usage::KeyWatchQuery),
-    responses((status = 200, body = [usage::KeyRejectionAgg]), (status = 400))
+    responses(
+        (status = 200, body = [usage::KeyRejectionAgg], headers(
+            ("x-obleth-truncated" = String, description = "`true` when more rows matched than `limit` or the 10,000-row cap let through")
+        )),
+        (status = 400)
+    )
 )]
 async fn get_usage_key_rejections(
     State(state): State<AdminState>,
     Query(q): Query<usage::KeyWatchQuery>,
-) -> Result<Json<Vec<usage::KeyRejectionAgg>>> {
+) -> Result<(HeaderMap, Json<Vec<usage::KeyRejectionAgg>>)> {
     let (since, until) = q
         .window(chrono::Utc::now().timestamp_millis())
         .map_err(AdminError::BadRequest)?;
-    let mut rows = usage::query_key_rejections(&state.clickhouse, &q, since, until).await?;
+    let usage::KeyRejections {
+        mut rows,
+        truncated,
+    } = usage::query_key_rejections(&state.clickhouse, &q, since, until).await?;
+    let mut headers = HeaderMap::new();
+    if truncated {
+        headers.insert(
+            "x-obleth-truncated",
+            axum::http::HeaderValue::from_static("true"),
+        );
+    }
     let names = NetworkNames::new(&state.store.named_networks().await?);
     if !names.is_empty() {
         for r in &mut rows {
             r.network_name = names.name_of(&r.client_ip).map(str::to_string);
         }
     }
-    Ok(Json(rows))
+    Ok((headers, Json(rows)))
 }
 
 /// Bulk per-key activity summary for the dashboard Keys table. Returns the

@@ -718,6 +718,7 @@ mod tests {
             upstream_base: "http://127.0.0.1:1/v1".into(),
             upstream_timeout: Duration::from_secs(30),
             key_cache: moka::future::Cache::builder().build(),
+            key_misses: Default::default(),
             model_cache: moka::future::Cache::builder().build(),
             mcp_cache: moka::future::Cache::builder().build(),
             model_registry: sources.1.clone(),

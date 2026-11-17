@@ -5093,15 +5093,25 @@ async fn settle_inner(
 /// Distinguishes a Redis error from a miss so callers can fail closed on the
 /// former (503, backend unavailable) rather than reading it as an unknown
 /// credential (401) -- see `jwt_auth::authenticate_credential`.
+///
+/// With `remember_miss`, a hash Redis does not know is remembered on this pod
+/// for a minute and answered as unknown without asking Redis again (see
+/// `key_miss`). Callers pass it only for credentials without a checksum,
+/// never for identity handles, whose miss means "provision".
 #[tracing::instrument(skip_all, name = "auth_resolve")]
 pub(crate) async fn try_resolve_key(
     state: &AppState,
     hash: &str,
+    remember_miss: bool,
 ) -> Result<Option<Arc<ResolvedKey>>, ()> {
     if let Some(r) = state.key_cache.get(hash).await {
         return Ok(Some(r));
     }
-    match state.redis.get_resolved_key(hash).await {
+    let found = state
+        .key_misses
+        .lookup(hash, remember_miss, || state.redis.get_resolved_key(hash))
+        .await;
+    match found {
         Ok(Some(r)) => {
             let r = Arc::new(r);
             state.key_cache.insert(hash.to_string(), r.clone()).await;

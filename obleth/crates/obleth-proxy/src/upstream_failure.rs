@@ -1325,6 +1325,7 @@ mod pipeline {
             upstream_base: "http://127.0.0.1:1/v1".into(),
             upstream_timeout: Duration::from_secs(30),
             key_cache: Cache::builder().build(),
+            key_misses: Default::default(),
             model_cache: Cache::builder().build(),
             mcp_cache: Cache::builder().build(),
             model_registry: crate::router::ModelRegistry::new(),

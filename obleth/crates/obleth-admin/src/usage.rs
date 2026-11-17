@@ -163,6 +163,25 @@ pub fn parse_key_ids(raw: Option<&str>) -> Result<Vec<Uuid>, uuid::Error> {
 /// Most values one request-log filter takes as a comma-separated list.
 pub const MAX_LOG_FILTER_VALUES: usize = 200;
 
+/// `key_id` of the key-watching reads: like [`comma_list`], except a value
+/// that is present but names no key (`key_id=`, `key_id=,`) is an error. An
+/// empty list would otherwise drop the key filter and return every key's rows.
+fn key_id_list<'de, D>(de: D) -> Result<Vec<Uuid>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(raw) = Option::<String>::deserialize(de)? else {
+        return Ok(Vec::new());
+    };
+    let keys: Vec<Uuid> = parse_comma_list(&raw)?;
+    if keys.is_empty() {
+        return Err(serde::de::Error::custom(
+            "key_id names no key; leave it out to read every key",
+        ));
+    }
+    Ok(keys)
+}
+
 /// A request-log filter given as one value or several joined by commas
 /// (`a,b,c`); a row matches any of them. Empty entries are ignored, so a
 /// trailing comma is harmless. A bad entry, or more than
@@ -173,17 +192,28 @@ where
     T: std::str::FromStr,
     T::Err: std::fmt::Display,
 {
-    let Some(raw) = Option::<String>::deserialize(de)? else {
-        return Ok(Vec::new());
-    };
+    match Option::<String>::deserialize(de)? {
+        Some(raw) => parse_comma_list(&raw),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Split `raw` on commas, skip empty items and parse the rest, at most
+/// [`MAX_LOG_FILTER_VALUES`] of them.
+fn parse_comma_list<T, E>(raw: &str) -> Result<Vec<T>, E>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+    E: serde::de::Error,
+{
     let values = raw
         .split(',')
         .map(str::trim)
         .filter(|v| !v.is_empty())
-        .map(|v| v.parse::<T>().map_err(serde::de::Error::custom))
+        .map(|v| v.parse::<T>().map_err(E::custom))
         .collect::<Result<Vec<T>, _>>()?;
     if values.len() > MAX_LOG_FILTER_VALUES {
-        return Err(serde::de::Error::custom(format!(
+        return Err(E::custom(format!(
             "at most {MAX_LOG_FILTER_VALUES} values per filter"
         )));
     }
@@ -1350,8 +1380,18 @@ pub async fn query_keys_usage_summary(
 /// Longest window `key-sources` and `key-rejections` read, in milliseconds.
 pub const KEY_WATCH_MAX_WINDOW_MS: i64 = 31 * 86_400_000;
 
-/// Most rows `key-sources` and `key-rejections` return.
+/// Most rows `key-sources` returns.
 const KEY_WATCH_MAX_ROWS: u64 = 10_000;
+
+/// Most rows `key-rejections` returns, and its default when no `limit` is
+/// given. A caller that names neither `limit` nor `per_key` gets the same
+/// rows it always did; when rows are cut the response says so (see
+/// [`KeyRejections::truncated`]).
+const KEY_REJECTIONS_MAX_ROWS: u32 = 10_000;
+
+/// Seconds ClickHouse may spend on one `key-rejections` read before it gives
+/// up, so a wide window cannot tie up the server.
+const KEY_REJECTIONS_MAX_EXECUTION_SECS: u32 = 10;
 
 /// Filters for the endpoints an account system polls to watch where its keys
 /// are used from (`/usage/key-sources`, `/usage/key-rejections`).
@@ -1366,9 +1406,19 @@ pub struct KeyWatchQuery {
     /// Only this tenant's keys.
     #[schema(value_type = Option<String>)]
     pub tenant_id: Option<Uuid>,
-    /// Only this key.
+    /// Only this key, or these keys: one UUID or up to 200 joined by commas
+    /// (`a,b,c`). Present but empty (`key_id=`) is refused rather than read
+    /// as "every key".
+    #[serde(default, deserialize_with = "key_id_list")]
     #[schema(value_type = Option<String>)]
-    pub key_id: Option<Uuid>,
+    #[param(value_type = Option<String>)]
+    pub key_id: Vec<Uuid>,
+    /// `key-rejections` only: most rows to return, newest `last_seen_ms`
+    /// first. Default and most: 10,000.
+    pub limit: Option<u32>,
+    /// `key-rejections` only: most rows to return for any one key, so one
+    /// noisy key cannot crowd out the rest. Default: no per-key cap.
+    pub per_key: Option<u32>,
 }
 
 impl KeyWatchQuery {
@@ -1395,11 +1445,34 @@ impl KeyWatchQuery {
             sql.push_str(&format!(" and {table}.tenant_id = toUUID(?)"));
             binds.push(t.to_string());
         }
-        if let Some(k) = self.key_id {
-            sql.push_str(&format!(" and {table}.key_id = toUUID(?)"));
-            binds.push(k.to_string());
+        match self.key_id.as_slice() {
+            [] => {}
+            [k] => {
+                sql.push_str(&format!(" and {table}.key_id = toUUID(?)"));
+                binds.push(k.to_string());
+            }
+            keys => {
+                // `key_id` leads the sort key of both tables, so an IN list
+                // still reads only those keys' granules.
+                let marks = vec!["toUUID(?)"; keys.len()].join(", ");
+                sql.push_str(&format!(" and {table}.key_id in ({marks})"));
+                binds.extend(keys.iter().map(Uuid::to_string));
+            }
         }
         (sql, binds)
+    }
+
+    /// Rows `key-rejections` returns: `limit` clamped to 1..=10,000,
+    /// default 10,000.
+    fn rejection_limit(&self) -> u32 {
+        self.limit
+            .unwrap_or(KEY_REJECTIONS_MAX_ROWS)
+            .clamp(1, KEY_REJECTIONS_MAX_ROWS)
+    }
+
+    /// Per-key row cap for `key-rejections`, clamped to 1..=10,000.
+    fn rejection_per_key(&self) -> Option<u32> {
+        self.per_key.map(|n| n.clamp(1, KEY_REJECTIONS_MAX_ROWS))
     }
 }
 
@@ -1484,12 +1557,19 @@ fn key_sources_sql(q: &KeyWatchQuery) -> (String, Vec<String>, Vec<String>) {
     let (usage_filters, usage_binds) = q.filters("usage");
     // `key_country_seen` has no tenant column; its rows only join to the
     // window's keys, which are already filtered by tenant.
-    let (seen_filters, seen_binds) = match q.key_id {
-        Some(k) => (
+    let (seen_filters, seen_binds) = match q.key_id.as_slice() {
+        [] => (String::new(), Vec::new()),
+        [k] => (
             " and key_country_seen.key_id = toUUID(?)".to_string(),
             vec![k.to_string()],
         ),
-        None => (String::new(), Vec::new()),
+        keys => (
+            format!(
+                " and key_country_seen.key_id in ({})",
+                vec!["toUUID(?)"; keys.len()].join(", ")
+            ),
+            keys.iter().map(Uuid::to_string).collect(),
+        ),
     };
     let sql = format!(
         "select w.key_id as key_id, w.kname as key_name, w.tid as tenant_id, \
@@ -1596,6 +1676,13 @@ struct KeyRejectionAggRow {
 
 fn key_rejections_sql(q: &KeyWatchQuery) -> (String, Vec<String>) {
     let (filters, binds) = q.filters("key_rejections");
+    let per_key = q
+        .rejection_per_key()
+        .map(|n| format!(" limit {n} by key_id"))
+        .unwrap_or_default();
+    // One row past the limit, so the caller can tell a cut list from a
+    // complete one.
+    let fetch = q.rejection_limit() + 1;
     let sql = format!(
         "select key_id as kid, argMax(key_name, ts_ms) as kname, \
          any(key_rejections.tenant_id) as tid, argMax(tenant_name, ts_ms) as tname, \
@@ -1605,10 +1692,20 @@ fn key_rejections_sql(q: &KeyWatchQuery) -> (String, Vec<String>) {
          from key_rejections \
          where ts_ms >= ? and ts_ms < ?{filters} \
          group by key_id, reason, client_ip, client_country \
-         order by last_ms desc \
-         limit {KEY_WATCH_MAX_ROWS}"
+         order by last_ms desc{per_key} \
+         limit {fetch} \
+         settings max_execution_time = {KEY_REJECTIONS_MAX_EXECUTION_SECS}"
     );
     (sql, binds)
+}
+
+/// What `key-rejections` read: the rows, and whether more matched than
+/// the limit let through.
+pub struct KeyRejections {
+    pub rows: Vec<KeyRejectionAgg>,
+    /// True when rows past the limit were left out, so a caller summing
+    /// counts knows it saw only part of the window.
+    pub truncated: bool,
 }
 
 /// Refused uses of real keys in the window (disabled, or used from outside
@@ -1618,14 +1715,17 @@ pub async fn query_key_rejections(
     q: &KeyWatchQuery,
     since: i64,
     until: i64,
-) -> Result<Vec<KeyRejectionAgg>, clickhouse::error::Error> {
+) -> Result<KeyRejections, clickhouse::error::Error> {
     let (sql, binds) = key_rejections_sql(q);
     let mut query = client.query(&sql).bind(since).bind(until);
     for b in binds {
         query = query.bind(b);
     }
-    let rows = query.fetch_all::<KeyRejectionAggRow>().await?;
-    Ok(rows
+    let mut rows = query.fetch_all::<KeyRejectionAggRow>().await?;
+    let limit = q.rejection_limit() as usize;
+    let truncated = rows.len() > limit;
+    rows.truncate(limit);
+    let rows = rows
         .into_iter()
         .map(|r| KeyRejectionAgg {
             key_id: r.key_id,
@@ -1641,7 +1741,8 @@ pub async fn query_key_rejections(
             sample_user_agent: r.sample_ua,
             network_name: None,
         })
-        .collect())
+        .collect();
+    Ok(KeyRejections { rows, truncated })
 }
 
 pub async fn query_usage_by_model(
@@ -2461,7 +2562,9 @@ mod alias_tests {
             since_ms: None,
             until_ms: None,
             tenant_id: tenant.then(Uuid::new_v4),
-            key_id: key.then(Uuid::new_v4),
+            key_id: key.then(Uuid::new_v4).into_iter().collect(),
+            limit: None,
+            per_key: None,
         }
     }
 
@@ -2496,6 +2599,91 @@ mod alias_tests {
         assert!(sql.contains("usage.tenant_id = toUUID(?)"));
         assert!(sql.contains("key_country_seen.key_id = toUUID(?)"));
         assert!(!sql.contains("key_country_seen.tenant_id"));
+    }
+
+    #[test]
+    fn key_rejections_take_a_key_list_and_limits() {
+        let keys: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+        let raw = keys
+            .iter()
+            .map(Uuid::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let q: KeyWatchQuery = serde_json::from_value(serde_json::json!({
+            "tenant_id": Uuid::new_v4().to_string(),
+            "key_id": format!("{raw},"),
+            "limit": 50,
+            "per_key": 5,
+        }))
+        .expect("parses");
+        assert_eq!(q.key_id, keys);
+        let (sql, binds) = key_rejections_sql(&q);
+        assert!(
+            sql.contains(" and key_rejections.key_id in (toUUID(?), toUUID(?), toUUID(?))"),
+            "{sql}"
+        );
+        assert!(sql.contains("where ts_ms >= ? and ts_ms < ?"));
+        assert_eq!(binds.len(), 4);
+        assert_eq!(
+            binds[1..],
+            keys.iter().map(Uuid::to_string).collect::<Vec<_>>()[..]
+        );
+        assert_eq!(sql.matches('?').count(), 2 + binds.len());
+        assert!(
+            sql.contains("order by last_ms desc limit 5 by key_id limit 51 settings"),
+            "{sql}"
+        );
+        assert!(sql.ends_with("settings max_execution_time = 10"), "{sql}");
+        assert_no_shadowing(&sql);
+
+        // key-sources reads the same list from both of its tables.
+        let (sql, usage, seen) = key_sources_sql(&q);
+        assert_eq!((usage.len(), seen.len()), (4, 3));
+        assert!(sql.contains("key_country_seen.key_id in (toUUID(?), toUUID(?), toUUID(?))"));
+        assert_eq!(sql.matches('?').count(), 3 + 2 * usage.len() + seen.len());
+
+        // A single key reads exactly as before; limits default and clamp.
+        let one = watch_query(false, true);
+        let (sql, binds) = key_rejections_sql(&one);
+        assert!(sql.contains(" and key_rejections.key_id = toUUID(?)"));
+        assert_eq!(binds.len(), 1);
+        assert!(
+            sql.contains("order by last_ms desc limit 10001 settings"),
+            "{sql}"
+        );
+        let mut big = watch_query(false, false);
+        big.limit = Some(50_000);
+        big.per_key = Some(0);
+        let (sql, _) = key_rejections_sql(&big);
+        assert!(sql.contains("limit 1 by key_id limit 10001 "), "{sql}");
+        big.limit = Some(0);
+        assert!(key_rejections_sql(&big)
+            .0
+            .contains("limit 1 by key_id limit 2 "));
+
+        // A key_id that is present but names no key is refused, never read
+        // as "every key".
+        for empty in ["", ",", " , "] {
+            let q = serde_json::json!({ "tenant_id": Uuid::new_v4().to_string(), "key_id": empty });
+            assert!(
+                serde_json::from_value::<KeyWatchQuery>(q).is_err(),
+                "{empty:?}"
+            );
+        }
+        let absent: KeyWatchQuery = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(absent.key_id.is_empty());
+
+        // A bad id, or more than 200, is refused.
+        let bad = serde_json::json!({ "key_id": format!("{},nope", keys[0]) });
+        assert!(serde_json::from_value::<KeyWatchQuery>(bad).is_err());
+        let many = vec![keys[0].to_string(); MAX_LOG_FILTER_VALUES + 1].join(",");
+        assert!(
+            serde_json::from_value::<KeyWatchQuery>(serde_json::json!({ "key_id": many })).is_err()
+        );
+        let max = vec![keys[0].to_string(); MAX_LOG_FILTER_VALUES].join(",");
+        assert!(
+            serde_json::from_value::<KeyWatchQuery>(serde_json::json!({ "key_id": max })).is_ok()
+        );
     }
 
     #[test]
@@ -2970,7 +3158,9 @@ mod key_watch_clickhouse_tests {
             since_ms: None,
             until_ms: None,
             tenant_id: Some(Uuid::nil()),
-            key_id: Some(key),
+            key_id: vec![key],
+            limit: None,
+            per_key: None,
         };
         let (since, until) = q.window(now + 1000).unwrap();
         let sources = query_key_sources(&client, &q, since, until, 90)
@@ -2991,6 +3181,8 @@ mod key_watch_clickhouse_tests {
         let rejections = query_key_rejections(&client, &q, since, until)
             .await
             .expect("key rejections");
+        assert!(!rejections.truncated);
+        let rejections = rejections.rows;
         assert_eq!(rejections.len(), 1, "{rejections:?}");
         assert_eq!(rejections[0].count, 3);
         assert_eq!(rejections[0].reason, "ip_not_allowed");

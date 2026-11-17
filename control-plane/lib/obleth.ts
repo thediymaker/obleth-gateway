@@ -853,16 +853,31 @@ export interface KeyRejectionAgg {
   network_name?: string | null;
 }
 
+/** Rows the Key access page asks for: the most the gateway returns. */
+export const KEY_REJECTION_ROWS = 10_000;
+
 /** Window and filters of the key-watching reads. At most 31 days. */
 export interface KeyWatchParams {
   sinceMs?: number;
   untilMs?: number;
   tenantId?: string;
+  /** One key id, or several joined by commas (at most 200). */
   keyId?: string;
+  /** Key rejections only: most rows (default and most 10,000), newest first. */
+  limit?: number;
+  /** Key rejections only: most rows for any one key. */
+  perKey?: number;
 }
 
 const keyWatchQuery = (p: KeyWatchParams) =>
-  qs({ since_ms: p.sinceMs, until_ms: p.untilMs, tenant_id: p.tenantId, key_id: p.keyId });
+  qs({
+    since_ms: p.sinceMs,
+    until_ms: p.untilMs,
+    tenant_id: p.tenantId,
+    key_id: p.keyId,
+    limit: p.limit,
+    per_key: p.perKey,
+  });
 
 export interface KeyUsageSummary {
   key_id: string;
