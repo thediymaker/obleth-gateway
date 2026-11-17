@@ -4,8 +4,9 @@ import { useState, useTransition } from "react";
 import Link from "next/link";
 import { createKeyAction, moveKeysAction, setKeysBudgetAction, type BulkKeyResult } from "@/app/actions";
 import { Field, SelectField } from "@/components/models/fields";
+import { AllowedCountriesField } from "@/components/access/allowed-countries-field";
 import { AllowedNetworksField } from "@/components/access/allowed-networks-field";
-import { NETWORKS_HINT } from "@/lib/key-networks";
+import { COUNTRIES_HINT, NETWORKS_HINT } from "@/lib/key-networks";
 import { Sheet } from "@/components/models/ui";
 import { Segmented } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
@@ -245,6 +246,11 @@ export function NewKeySheet({
           <span className="text-[12.5px] font-medium text-secondary-foreground">Allowed networks</span>
           <AllowedNetworksField named={named} />
           <p className="text-[11.5px] leading-snug text-muted-foreground">{NETWORKS_HINT}</p>
+        </div>
+        <div className="space-y-1.5">
+          <span className="text-[12.5px] font-medium text-secondary-foreground">Allowed countries</span>
+          <AllowedCountriesField />
+          <p className="text-[11.5px] leading-snug text-muted-foreground">{COUNTRIES_HINT}</p>
         </div>
       </form>
     </Sheet>

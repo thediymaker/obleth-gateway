@@ -104,6 +104,12 @@ export interface ApiKey {
    * network. Optional so data from an older gateway still reads.
    */
   allowed_networks?: string[];
+  /**
+   * Countries the key may be used from, as two-letter codes. A request from
+   * a listed country is allowed even outside `allowed_networks`. Optional so
+   * data from an older gateway still reads.
+   */
+  allowed_countries?: string[];
   created_at: string;
   updated_at: string;
 }
@@ -1156,6 +1162,8 @@ export interface ClientAddressView {
   invalid_trusted_proxies: string[];
   address_header: string | null;
   country_header: string | null;
+  /** A country can let a request use a key limited to countries: a country header and OBLETH_TRUSTED_PROXIES are both set. Older gateways leave it out. */
+  countries_admit?: boolean;
 }
 
 export interface NetworkSettingsView {
@@ -2616,6 +2624,8 @@ export const obleth = {
       budget_started_at?: string | null;
       /** CIDR ranges or addresses; empty for any network. */
       allowed_networks?: string[];
+      /** Two-letter country codes; empty for none. */
+      allowed_countries?: string[];
     },
     options?: AuditOptions,
   ) =>
@@ -2637,6 +2647,8 @@ export const obleth = {
       budget_started_at?: string | null;
       /** Left out, the key keeps its list; `[]` allows any network. */
       allowed_networks?: string[];
+      /** Left out, the key keeps its list; `[]` clears it. */
+      allowed_countries?: string[];
     },
     options?: AuditOptions,
   ) =>

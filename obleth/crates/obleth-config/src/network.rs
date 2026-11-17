@@ -1,5 +1,6 @@
 //! Client network helpers: which address a request came from, which country
-//! the edge says it came from, and whether a key's allowed networks admit it.
+//! the edge says it came from, and whether a key's allowed networks and
+//! countries admit it.
 //!
 //! Everything here is pure so it can be tested without a listener. The proxy
 //! reads the trusted-proxy list and the country header name from the
@@ -11,6 +12,9 @@ use ipnet::IpNet;
 
 /// Most networks one key may list in `allowed_networks`.
 pub const MAX_ALLOWED_NETWORKS: usize = 64;
+
+/// Most countries one key may list in `allowed_countries`.
+pub const MAX_ALLOWED_COUNTRIES: usize = 50;
 
 /// Longest User-Agent kept on a usage or rejection row, in characters.
 pub const USER_AGENT_MAX_CHARS: usize = 256;
@@ -177,6 +181,88 @@ pub fn ip_allowed(networks: &[String], ip: Option<IpAddr>) -> bool {
         .iter()
         .filter_map(|n| parse_network(n))
         .any(|net| net.contains(&ip))
+}
+
+/// Validate and normalise a key's `allowed_countries` as an operator sent
+/// it: blank entries are dropped, each entry is trimmed and upper-cased and
+/// must be two ASCII letters (an ISO 3166-1 alpha-2 code such as `US`), and
+/// repeats are removed, keeping the first. `XX`, the code edges send for
+/// "unknown", is refused. The error names the entry that is wrong.
+pub fn normalize_allowed_countries(entries: &[String]) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for entry in entries.iter().map(|e| e.trim()).filter(|e| !e.is_empty()) {
+        let Some(code) = parse_country(entry) else {
+            return Err(format!(
+                "allowed_countries: \"{entry}\" is not a two-letter country code \
+                 (examples: US, CA, GB)"
+            ));
+        };
+        if !out.contains(&code) {
+            out.push(code);
+        }
+    }
+    if out.len() > MAX_ALLOWED_COUNTRIES {
+        return Err(format!(
+            "allowed_countries: at most {MAX_ALLOWED_COUNTRIES} countries per key ({} given)",
+            out.len()
+        ));
+    }
+    Ok(out)
+}
+
+/// Whether a key that lists `networks` and `countries` may be used by a
+/// client at `ip` in `country` (two upper-case letters, or empty when the
+/// edge named none). Both lists empty allows anyone. Otherwise the client is
+/// allowed when its address is inside one of the networks (see
+/// [`ip_allowed`]) or its country is listed. An unknown address is inside no
+/// network and an unknown country matches no country, so a limited key fails
+/// closed; a known country alone is enough, whatever the address.
+pub fn client_allowed(
+    networks: &[String],
+    countries: &[String],
+    ip: Option<IpAddr>,
+    country: &str,
+) -> bool {
+    if networks.is_empty() && countries.is_empty() {
+        return true;
+    }
+    if !networks.is_empty() && ip_allowed(networks, ip) {
+        return true;
+    }
+    !country.is_empty() && countries.iter().any(|c| c.eq_ignore_ascii_case(country))
+}
+
+/// Whether `ip` is a public internet address: not unspecified, loopback,
+/// private (RFC 1918), shared/CGNAT (`100.64.0.0/10`), link-local, unique
+/// local (`fc00::/7`), multicast, broadcast or otherwise reserved. An
+/// IPv4-mapped IPv6 address is judged as its IPv4 address. Documentation
+/// ranges count as public so examples read naturally.
+pub fn is_public_ip(ip: IpAddr) -> bool {
+    match canonical_ip(ip) {
+        IpAddr::V4(v4) => {
+            let [a, b, c, _] = v4.octets();
+            !(v4.is_unspecified()
+                || v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_multicast()
+                || v4.is_broadcast()
+                || a == 0
+                || (a == 100 && (64..128).contains(&b))
+                || (a == 192 && b == 0 && c == 0)
+                || (a == 198 && (18..20).contains(&b))
+                || a >= 240)
+        }
+        IpAddr::V6(v6) => {
+            let first = v6.segments()[0];
+            !(v6.is_unspecified()
+                || v6.is_loopback()
+                || v6.is_multicast()
+                || (first & 0xfe00) == 0xfc00
+                || (first & 0xffc0) == 0xfe80
+                || (first & 0xffc0) == 0xfec0)
+        }
+    }
 }
 
 /// The network a client address is grouped under when watching where a key
@@ -1006,5 +1092,116 @@ mod tests {
                 group("Pods", &["10.42.0.0/16"], true),
             ]
         );
+    }
+
+    #[test]
+    fn countries_normalise_to_unique_upper_case_codes() {
+        let got = normalize_allowed_countries(&[
+            " us ".into(),
+            "Ca".into(),
+            "".into(),
+            "US".into(),
+            "gb".into(),
+        ])
+        .unwrap();
+        assert_eq!(got, ["US", "CA", "GB"]);
+        assert_eq!(
+            normalize_allowed_countries(&[]).unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn bad_countries_are_refused_with_the_entry_named() {
+        for bad in ["XX", "xx", "USA", "U", "U1", "12", "Ü S", "united states"] {
+            let err = normalize_allowed_countries(&[bad.into()]).unwrap_err();
+            assert!(err.contains(&format!("\"{bad}\"")), "{bad}: {err}");
+        }
+        // Fifty is the most; repeats count once.
+        let codes: Vec<String> = (0..26u8)
+            .flat_map(|a| {
+                (0..26u8).map(move |b| format!("{}{}", (b'A' + a) as char, (b'A' + b) as char))
+            })
+            .filter(|c| c != "XX")
+            .collect();
+        assert_eq!(normalize_allowed_countries(&codes[..50]).unwrap().len(), 50);
+        let err = normalize_allowed_countries(&codes[..51]).unwrap_err();
+        assert!(err.contains("at most 50"), "{err}");
+        let repeated = vec!["us".to_string(); 80];
+        assert_eq!(normalize_allowed_countries(&repeated).unwrap(), ["US"]);
+    }
+
+    #[test]
+    fn the_allow_rule_takes_a_network_or_a_country() {
+        let none: Vec<String> = Vec::new();
+        let nets = vec!["192.0.2.0/24".to_string()];
+        let us = vec!["US".to_string()];
+        let inside = Some(ip("192.0.2.9"));
+        let outside = Some(ip("198.51.100.7"));
+        // Both empty: anyone, unknown address and country included.
+        assert!(client_allowed(&none, &none, None, ""));
+        assert!(client_allowed(&none, &none, outside, "DE"));
+        // Networks only.
+        assert!(client_allowed(&nets, &none, inside, ""));
+        assert!(!client_allowed(&nets, &none, outside, "US"));
+        assert!(!client_allowed(&nets, &none, None, "US"));
+        // Countries only.
+        assert!(client_allowed(&none, &us, outside, "US"));
+        assert!(!client_allowed(&none, &us, outside, "DE"));
+        assert!(!client_allowed(&none, &us, outside, ""));
+        assert!(!client_allowed(&none, &us, inside, ""));
+        // Both: either one matching is enough.
+        assert!(client_allowed(&nets, &us, inside, ""));
+        assert!(client_allowed(&nets, &us, inside, "DE"));
+        assert!(client_allowed(&nets, &us, outside, "US"));
+        assert!(!client_allowed(&nets, &us, outside, "DE"));
+        // An unknown country never matches.
+        assert!(!client_allowed(&nets, &us, outside, ""));
+        // An unknown address with a listed country is allowed.
+        assert!(client_allowed(&nets, &us, None, "US"));
+        assert!(client_allowed(&none, &us, None, "US"));
+        assert!(!client_allowed(&nets, &us, None, ""));
+    }
+
+    #[test]
+    fn only_public_addresses_are_public() {
+        for public in [
+            "8.8.8.8",
+            "203.0.113.9",
+            "198.51.100.7",
+            "100.63.255.255",
+            "100.128.0.1",
+            "172.32.0.1",
+            "2606:4700::1",
+            "2001:db8::1",
+            "::ffff:8.8.8.8",
+        ] {
+            assert!(is_public_ip(ip(public)), "{public}");
+        }
+        for private in [
+            "0.0.0.0",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "127.0.0.1",
+            "169.254.1.1",
+            "100.64.0.1",
+            "100.127.255.254",
+            "224.0.0.1",
+            "255.255.255.255",
+            "192.0.0.8",
+            "198.18.0.1",
+            "240.0.0.1",
+            "::",
+            "::1",
+            "fc00::1",
+            "fd12:3456::1",
+            "fe80::1",
+            "ff02::1",
+            "::ffff:10.0.0.1",
+            "::ffff:100.64.0.1",
+        ] {
+            assert!(!is_public_ip(ip(private)), "{private}");
+        }
     }
 }

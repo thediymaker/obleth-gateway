@@ -160,6 +160,15 @@ describe("the Settings page", () => {
     ]);
   });
 
+  it("warns when a country can't admit a request", async () => {
+    await render(<SettingsPage data={settingsData()} />);
+    expect(host.querySelector("#networks")!.textContent).not.toContain("Recorded only.");
+    const base = settingsData();
+    const networks = { ...base.networks!, client_address: { ...base.networks!.client_address, trusted_proxies_default: true, walks_past_proxies: false, countries_admit: false } };
+    await render(<SettingsPage data={settingsData({ networks })} />);
+    expect(host.querySelector("#networks")!.textContent).toContain("Recorded only. A key limited to certain countries won't accept a request by its country");
+  });
+
   it("says when a named network has no name", async () => {
     await render(<SettingsPage data={settingsData()} />);
     const section = host.querySelector("#networks")!;

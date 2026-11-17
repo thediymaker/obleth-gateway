@@ -117,6 +117,8 @@ const SCHEMA_V42: &str = include_str!("../../../../schema/postgres/0042_api_key_
 const SCHEMA_V43: &str =
     include_str!("../../../../schema/postgres/0043_api_key_allowed_networks.sql");
 const SCHEMA_V44: &str = include_str!("../../../../schema/postgres/0044_key_prefix_keeps_obl.sql");
+const SCHEMA_V45: &str =
+    include_str!("../../../../schema/postgres/0045_api_key_allowed_countries.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -297,6 +299,7 @@ impl Store {
             sqlx::raw_sql(SCHEMA_V42).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V43).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V44).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V45).execute(&mut *conn).await?;
             Ok(())
         }
         .await;
@@ -702,16 +705,17 @@ impl Store {
         weight: i64,
         max_in_flight: Option<i64>,
         allowed_networks: &[String],
+        allowed_countries: &[String],
     ) -> Result<(ApiKey, String)> {
         let gen = generate_api_key_with_prefix(&self.key_prefix().await?);
         let row = sqlx::query(
             "insert into api_keys (id, tenant_id, name, description, key_prefix, key_hash,
                     budget_tokens, budget_cost_usd, budget_period, budget_started_at,
-                    weight, max_in_flight, allowed_networks)
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                    weight, max_in_flight, allowed_networks, allowed_countries)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
              returning id, tenant_id, name, description, key_prefix,
                     budget_tokens, budget_cost_usd, budget_period, budget_started_at,
-                    disabled, tracing_enabled, end_user_fairshare, background, allowed_networks,
+                    disabled, tracing_enabled, end_user_fairshare, background, allowed_networks, allowed_countries,
                     created_at, updated_at,
                     kind, identity_issuer, identity_subject, identity_claims,
                     weight, max_in_flight",
@@ -729,6 +733,7 @@ impl Store {
         .bind(weight.max(1))
         .bind(max_in_flight)
         .bind(allowed_networks)
+        .bind(allowed_countries)
         .fetch_one(&self.pool)
         .await?;
         Ok((api_key_from_row(&row)?, gen.secret))
@@ -974,6 +979,7 @@ impl Store {
                     100,
                     None,
                     &[],
+                    &[],
                 )
                 .await?;
             let enc = cipher().encrypt(&secret);
@@ -1046,7 +1052,7 @@ impl Store {
                 sqlx::query(
                     "select id, tenant_id, name, description, key_prefix,
                             budget_tokens, budget_cost_usd, budget_period, budget_started_at,
-                            disabled, tracing_enabled, end_user_fairshare, background, allowed_networks,
+                            disabled, tracing_enabled, end_user_fairshare, background, allowed_networks, allowed_countries,
                     created_at, updated_at,
                             kind, identity_issuer, identity_subject, identity_claims,
                             weight, max_in_flight
@@ -1060,7 +1066,7 @@ impl Store {
                 sqlx::query(
                     "select id, tenant_id, name, description, key_prefix,
                             budget_tokens, budget_cost_usd, budget_period, budget_started_at,
-                            disabled, tracing_enabled, end_user_fairshare, background, allowed_networks,
+                            disabled, tracing_enabled, end_user_fairshare, background, allowed_networks, allowed_countries,
                     created_at, updated_at,
                             kind, identity_issuer, identity_subject, identity_claims,
                             weight, max_in_flight
@@ -1083,7 +1089,7 @@ impl Store {
         let rows = sqlx::query(
             "select id, tenant_id, name, description, key_prefix,
                     budget_tokens, budget_cost_usd, budget_period, budget_started_at,
-                    disabled, tracing_enabled, end_user_fairshare, background, allowed_networks,
+                    disabled, tracing_enabled, end_user_fairshare, background, allowed_networks, allowed_countries,
                     created_at, updated_at,
                     kind, identity_issuer, identity_subject, identity_claims,
                     weight, max_in_flight
@@ -1108,10 +1114,11 @@ impl Store {
         weight: i64,
         max_in_flight: Option<i64>,
         allowed_networks: Option<&[String]>,
+        allowed_countries: Option<&[String]>,
     ) -> Result<(String, ApiKey, ResolvedKey)> {
         self.guard_reserved_key(id).await?;
-        // `allowed_networks` is the one field a whole-key update leaves as it
-        // is when it is not sent (`None`): an edit that never mentions it,
+        // `allowed_networks` and `allowed_countries` are the fields a
+        // whole-key update leaves as they are when not sent (`None`): an edit that never mentions it,
         // such as a bulk budget change, must not open a limited key to every
         // network.
         let row = sqlx::query(
@@ -1125,11 +1132,12 @@ impl Store {
                  weight = $8,
                  max_in_flight = $9,
                  allowed_networks = coalesce($10, allowed_networks),
+                 allowed_countries = coalesce($11, allowed_countries),
                  updated_at = now()
              where id = $1
              returning key_hash, id, tenant_id, name, description, key_prefix,
                     budget_tokens, budget_cost_usd, budget_period, budget_started_at,
-                    disabled, tracing_enabled, end_user_fairshare, background, allowed_networks,
+                    disabled, tracing_enabled, end_user_fairshare, background, allowed_networks, allowed_countries,
                     created_at, updated_at,
                     kind, identity_issuer, identity_subject, identity_claims,
                     weight, max_in_flight",
@@ -1144,6 +1152,7 @@ impl Store {
         .bind(weight.max(1))
         .bind(max_in_flight)
         .bind(allowed_networks)
+        .bind(allowed_countries)
         .fetch_optional(&self.pool)
         .await?
         .ok_or(StoreError::NotFound)?;
@@ -1188,7 +1197,7 @@ impl Store {
              where id = $1
              returning key_hash, id, tenant_id, name, description, key_prefix,
                     budget_tokens, budget_cost_usd, budget_period, budget_started_at,
-                    disabled, tracing_enabled, end_user_fairshare, background, allowed_networks,
+                    disabled, tracing_enabled, end_user_fairshare, background, allowed_networks, allowed_countries,
                     created_at, updated_at,
                     kind, identity_issuer, identity_subject, identity_claims,
                     weight, max_in_flight",
@@ -1356,7 +1365,7 @@ impl Store {
                     k.budget_period as key_budget_period,
                     k.budget_started_at as key_budget_started_at,
                     k.weight as key_weight, k.max_in_flight as key_max_in_flight,
-                    k.end_user_fairshare, k.background, k.allowed_networks,
+                    k.end_user_fairshare, k.background, k.allowed_networks, k.allowed_countries,
                     t.allowed_models,
                     (k.tracing_enabled OR t.tracing_enabled) AS tracing_enabled,
                     t.guardrails_policy,
@@ -1387,7 +1396,7 @@ impl Store {
                     k.budget_period as key_budget_period,
                     k.budget_started_at as key_budget_started_at,
                     k.weight as key_weight, k.max_in_flight as key_max_in_flight,
-                    k.end_user_fairshare, k.background, k.allowed_networks,
+                    k.end_user_fairshare, k.background, k.allowed_networks, k.allowed_countries,
                     t.allowed_models,
                     (k.tracing_enabled OR t.tracing_enabled) AS tracing_enabled,
                     t.guardrails_policy,
@@ -1417,7 +1426,7 @@ impl Store {
                     k.budget_period as key_budget_period,
                     k.budget_started_at as key_budget_started_at,
                     k.weight as key_weight, k.max_in_flight as key_max_in_flight,
-                    k.end_user_fairshare, k.background, k.allowed_networks,
+                    k.end_user_fairshare, k.background, k.allowed_networks, k.allowed_countries,
                     t.allowed_models,
                     (k.tracing_enabled OR t.tracing_enabled) AS tracing_enabled,
                     t.guardrails_policy,
@@ -1451,7 +1460,7 @@ impl Store {
                     k.budget_period as key_budget_period,
                     k.budget_started_at as key_budget_started_at,
                     k.weight as key_weight, k.max_in_flight as key_max_in_flight,
-                    k.end_user_fairshare, k.background, k.allowed_networks,
+                    k.end_user_fairshare, k.background, k.allowed_networks, k.allowed_countries,
                     t.allowed_models,
                     (k.tracing_enabled OR t.tracing_enabled) AS tracing_enabled,
                     t.guardrails_policy,
@@ -4485,6 +4494,7 @@ fn api_key_from_row(row: &PgRow) -> Result<ApiKey> {
         // Strict, unlike the older columns above: a read that loses this
         // must fail, never resolve as "any network".
         allowed_networks: row.try_get::<Vec<String>, _>("allowed_networks")?,
+        allowed_countries: row.try_get::<Vec<String>, _>("allowed_countries")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -4522,6 +4532,7 @@ fn resolved_from_row(row: &PgRow) -> Result<ResolvedKey> {
         // Strict, unlike the older columns above: a read that loses this
         // must fail, never resolve as "any network".
         allowed_networks: row.try_get::<Vec<String>, _>("allowed_networks")?,
+        allowed_countries: row.try_get::<Vec<String>, _>("allowed_countries")?,
         allowed_models: allowed_models_from_row(row)?,
         internal: false,
         tracing_enabled: row.try_get::<bool, _>("tracing_enabled").unwrap_or(false),
@@ -6097,7 +6108,19 @@ mod tests {
             .expect("save prefix");
         assert_eq!(store.key_prefix().await.unwrap(), "rc");
         let (key, secret) = store
-            .create_api_key(tenant.id, "k", "", None, None, None, None, 100, None, &[])
+            .create_api_key(
+                tenant.id,
+                "k",
+                "",
+                None,
+                None,
+                None,
+                None,
+                100,
+                None,
+                &[],
+                &[],
+            )
             .await
             .expect("create key");
         assert!(secret.starts_with("rc_"), "{secret}");
@@ -6117,7 +6140,19 @@ mod tests {
         // and a prefix saved later is never overwritten.
         store.put_key_prefix_setting("obl").await.expect("save obl");
         let (_, obl) = store
-            .create_api_key(tenant.id, "k2", "", None, None, None, None, 100, None, &[])
+            .create_api_key(
+                tenant.id,
+                "k2",
+                "",
+                None,
+                None,
+                None,
+                None,
+                100,
+                None,
+                &[],
+                &[],
+            )
             .await
             .expect("create obl key");
         assert!(obl.starts_with("obl_"), "{obl}");
@@ -6218,7 +6253,19 @@ mod tests {
         assert_eq!(tenant.weight, 250);
 
         let (key, secret) = store
-            .create_api_key(tenant.id, "k", "", None, None, None, None, 100, None, &[])
+            .create_api_key(
+                tenant.id,
+                "k",
+                "",
+                None,
+                None,
+                None,
+                None,
+                100,
+                None,
+                &[],
+                &[],
+            )
             .await
             .expect("create key");
         let hash = hash_api_key(&secret);
@@ -6515,7 +6562,19 @@ mod tests {
         );
 
         let (_key, secret) = store
-            .create_api_key(tenant.id, "k", "", None, None, None, None, 100, None, &[])
+            .create_api_key(
+                tenant.id,
+                "k",
+                "",
+                None,
+                None,
+                None,
+                None,
+                100,
+                None,
+                &[],
+                &[],
+            )
             .await
             .expect("create key");
         let hash = hash_api_key(&secret);
@@ -6560,6 +6619,7 @@ mod tests {
                 250,
                 Some(3),
                 &[],
+                &[],
             )
             .await
             .unwrap();
@@ -6571,7 +6631,9 @@ mod tests {
         assert_eq!(resolved.key_max_in_flight, Some(3));
 
         let (_, updated, resolved) = store
-            .update_api_key(key.id, "alice", "", None, None, None, None, 100, None, None)
+            .update_api_key(
+                key.id, "alice", "", None, None, None, None, 100, None, None, None,
+            )
             .await
             .unwrap();
         assert_eq!(updated.weight, 100);
@@ -6966,7 +7028,19 @@ mod tests {
             .expect("create tenant");
         fixtures.track_tenant(tenant.id);
         store
-            .create_api_key(tenant.id, "k", "", None, None, None, None, 100, None, &[])
+            .create_api_key(
+                tenant.id,
+                "k",
+                "",
+                None,
+                None,
+                None,
+                None,
+                100,
+                None,
+                &[],
+                &[],
+            )
             .await
             .expect("create key");
 
@@ -8772,6 +8846,7 @@ mod tests {
                 None,
                 150,
                 Some(3),
+                &[],
                 &[],
             )
             .await

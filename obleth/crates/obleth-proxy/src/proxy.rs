@@ -7466,7 +7466,7 @@ pub(crate) fn gate_resolved_key(
     }
     if !client_network_allowed(resolved, client) {
         record_key_rejection(state, resolved, client, KeyRejectionReason::IpNotAllowed);
-        return Err(ip_not_allowed_response(client));
+        return Err(ip_not_allowed_response(resolved, client));
     }
     if !resolved.internal && resolved.status != "active" {
         return Err(error_json(StatusCode::FORBIDDEN, "tenant is not active"));
@@ -7500,26 +7500,51 @@ pub(crate) fn gate_resolved_key(
     Ok(())
 }
 
-/// Whether the key's network limits admit this client. Work the gateway runs
-/// for an owner it already checked (a batch item) is not checked again.
+/// Whether the key's network and country limits admit this client (see
+/// [`obleth_config::network::client_allowed`]). Work the gateway runs for an
+/// owner it already checked (a batch item) is not checked again.
 pub(crate) fn client_network_allowed(
     resolved: &ResolvedKey,
     client: &crate::client::ClientInfo,
 ) -> bool {
-    client.in_process || obleth_config::network::ip_allowed(&resolved.allowed_networks, client.ip)
+    client.in_process
+        || obleth_config::network::client_allowed(
+            &resolved.allowed_networks,
+            &resolved.allowed_countries,
+            client.ip,
+            client.admitting_country(),
+        )
 }
 
 /// `403 ip_not_allowed`, in OpenAI's error shape, naming the address the
-/// request came from so its owner can see why.
-pub(crate) fn ip_not_allowed_response(client: &crate::client::ClientInfo) -> Response<Body> {
+/// request came from (and, for a key limited by country, its country) so its
+/// owner can see why.
+pub(crate) fn ip_not_allowed_response(
+    resolved: &ResolvedKey,
+    client: &crate::client::ClientInfo,
+) -> Response<Body> {
     let from = client
         .ip
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| "an unknown address".to_string());
+    let message = if resolved.allowed_countries.is_empty() {
+        format!("This API key can't be used from {from}. Its owner limited it to certain networks.")
+    } else {
+        let country = if client.country.is_empty() {
+            " (country unknown)".to_string()
+        } else if client.country_admits {
+            format!(" in {}", client.country)
+        } else {
+            // Found behind the default trusted proxies: recorded, not believed.
+            format!(" in {}, which this gateway can't confirm", client.country)
+        };
+        format!(
+            "This API key can't be used from {from}{country}. \
+             Its owner limited the network or country it can be used from."
+        )
+    };
     let body = serde_json::json!({ "error": {
-        "message": format!(
-            "This API key can't be used from {from}. Its owner limited it to certain networks."
-        ),
+        "message": message,
         "type": GATEWAY_ERROR_TYPE,
         "param": null,
         "code": "ip_not_allowed",
@@ -7672,6 +7697,7 @@ mod tests {
             compression_policy: None,
             synthetic: false,
             allowed_networks: Vec::new(),
+            allowed_countries: Vec::new(),
         }
     }
 

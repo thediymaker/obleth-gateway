@@ -254,10 +254,17 @@ pub struct ApiKey {
     #[serde(default)]
     pub background: bool,
     /// Networks the key may be used from, as canonical CIDRs (a single
-    /// address is a /32 or /128). Empty means any network. A request from
-    /// anywhere else is refused with 403 `ip_not_allowed`.
+    /// address is a /32 or /128). When this and `allowed_countries` are both
+    /// empty the key works from any network; otherwise a request from
+    /// outside both is refused with 403 `ip_not_allowed`.
     #[serde(default)]
     pub allowed_networks: Vec<String>,
+    /// Countries the key may be used from, as upper-case ISO 3166-1 alpha-2
+    /// codes. A request whose client country (set by the edge, and only for
+    /// public client addresses) is listed is allowed even from outside
+    /// `allowed_networks`. An unknown country never matches.
+    #[serde(default)]
+    pub allowed_countries: Vec<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -359,6 +366,10 @@ pub struct ResolvedKey {
     /// never read as "any network".
     #[serde(default)]
     pub allowed_networks: Vec<String>,
+    /// Countries the key may be used from (see `ApiKey::allowed_countries`).
+    /// Cached under the same versioned namespace as `allowed_networks`.
+    #[serde(default)]
+    pub allowed_countries: Vec<String>,
     /// Optional per-tenant model allowlist. Empty/`None` = all models permitted.
     #[serde(default)]
     pub allowed_models: Option<Vec<String>>,
@@ -1414,7 +1425,8 @@ pub struct UsageRecord {
     #[serde(default)]
     pub client_network: String,
     /// Two-letter country the edge named for the client, only when the peer
-    /// is a trusted proxy; empty otherwise. Kept as long as the row.
+    /// is a trusted proxy and the client address is public; empty otherwise.
+    /// Kept as long as the row.
     #[serde(default)]
     pub client_country: String,
     /// The client's User-Agent, cut to 256 characters. Expires with
@@ -1430,7 +1442,8 @@ pub struct UsageRecord {
 pub enum KeyRejectionReason {
     /// The key is disabled.
     Disabled,
-    /// The request came from outside the key's `allowed_networks`.
+    /// The request came from outside the key's `allowed_networks` and
+    /// `allowed_countries`.
     IpNotAllowed,
 }
 
@@ -4034,6 +4047,10 @@ pub struct ApiKeyBackup {
     /// taken before the column existed.
     #[serde(default)]
     pub allowed_networks: Vec<String>,
+    /// See `ApiKey::allowed_countries`. Defaults to none for backups taken
+    /// before the column existed.
+    #[serde(default)]
+    pub allowed_countries: Vec<String>,
     pub disabled: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
@@ -4268,12 +4285,15 @@ mod tests {
         });
         let old: super::ApiKeyBackup = serde_json::from_value(raw.clone()).unwrap();
         assert!(old.allowed_networks.is_empty());
+        assert!(old.allowed_countries.is_empty());
         let mut with = raw;
         with["allowed_networks"] = serde_json::json!(["203.0.113.0/24", "2001:db8::/48"]);
+        with["allowed_countries"] = serde_json::json!(["US", "CA"]);
         let backup: super::ApiKeyBackup = serde_json::from_value(with).unwrap();
         let again: super::ApiKeyBackup =
             serde_json::from_str(&serde_json::to_string(&backup).unwrap()).unwrap();
         assert_eq!(again.allowed_networks, ["203.0.113.0/24", "2001:db8::/48"]);
+        assert_eq!(again.allowed_countries, ["US", "CA"]);
     }
 
     /// The cached hot-path view keeps the list through the JSON Redis holds.
@@ -4285,10 +4305,12 @@ mod tests {
             "key_id": uuid::Uuid::nil(), "tenant_id": uuid::Uuid::nil(),
             "tenant_name": "t", "fairshare_group": "default", "group_weight": 100,
             "weight": 100, "tokens_per_minute": 1000, "max_in_flight": null,
-            "disabled": false, "allowed_networks": ["192.0.2.0/24"]
+            "disabled": false, "allowed_networks": ["192.0.2.0/24"],
+            "allowed_countries": ["US"]
         });
         let key: super::ResolvedKey = serde_json::from_value(raw).unwrap();
         assert_eq!(key.allowed_networks, ["192.0.2.0/24"]);
+        assert_eq!(key.allowed_countries, ["US"]);
         let again: super::ResolvedKey =
             serde_json::from_str(&serde_json::to_string(&key).unwrap()).unwrap();
         assert_eq!(again, key);

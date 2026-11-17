@@ -1324,7 +1324,7 @@ fn restore_and_evict(
     (restore, evict)
 }
 
-/// Push a Postgres snapshot into Redis, then delete any `obleth:key2:*` entry
+/// Push a Postgres snapshot into Redis, then delete any `obleth:key3:*` entry
 /// Redis holds that the snapshot doesn't list — the same SCAN-based prune
 /// `POST /api/v1/resync` uses (`obleth-redis/src/prune.rs`). A key revoked
 /// before this snapshot was taken has no entry here, so the prune removes it
@@ -1967,7 +1967,7 @@ mod shutdown_tests {
     /// covers in isolation above.
     ///
     /// `push_and_prune_keys` calls `RedisStore::prune_stale_resolved_keys`,
-    /// which SCANs and deletes across the *entire* `obleth:key2:*` namespace —
+    /// which SCANs and deletes across the *entire* `obleth:key3:*` namespace —
     /// not just the hashes this test creates. Point `OBLETH_TEST_REDIS_URL`
     /// at an isolated database (e.g. Redis db 15, the project's documented
     /// test database — never db 0 / a shared or live instance): running this
@@ -2080,6 +2080,7 @@ mod shutdown_tests {
             compression_policy: None,
             synthetic: false,
             allowed_networks: Vec::new(),
+            allowed_countries: Vec::new(),
         }
     }
 

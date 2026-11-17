@@ -109,7 +109,12 @@ export function NetworksSection({ settings }: { settings: NetworkSettingsView })
           From anyone else, the address that connected.
         </Line>
         <Line label="Country">
-          {ca.country_header ? <>The <span className="font-mono">{ca.country_header}</span> header from a trusted proxy.</> : "Not recorded."}
+          {ca.country_header ? <>The <span className="font-mono">{ca.country_header}</span> header from a trusted proxy, for a client with a public address.</> : "Not recorded."}
+          {ca.countries_admit === false && (
+            <span className="block font-medium">
+              Recorded only. A key limited to certain countries won&apos;t accept a request by its country until your proxies are listed in <span className="font-mono">OBLETH_TRUSTED_PROXIES</span>, and those proxies must remove a <span className="font-mono">{ca.country_header ?? "CF-IPCountry"}</span> header sent by the client.
+            </span>
+          )}
         </Line>
         {ca.trusted_proxies_default && (
           <p className="text-xs text-muted-foreground">

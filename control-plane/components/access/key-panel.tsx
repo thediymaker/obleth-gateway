@@ -8,13 +8,14 @@ import { PERIOD_OPTIONS } from "@/components/access/key-dialogs";
 import { SettingsForm } from "@/components/access/settings-form";
 import { BudgetBar, StateDot } from "@/components/access/ui";
 import { SelectField, Setting, Switch, TextField } from "@/components/models/fields";
+import { AllowedCountriesField } from "@/components/access/allowed-countries-field";
 import { AllowedNetworksField } from "@/components/access/allowed-networks-field";
 import { Sheet } from "@/components/models/ui";
 import { Pill } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { describeIdentityKey } from "@/lib/key-kind";
-import { NETWORKS_HINT, networksSummary, networksText } from "@/lib/key-networks";
+import { COUNTRIES_HINT, countriesText, countryName, NETWORKS_HINT, networksSummary, networksText } from "@/lib/key-networks";
 import { lastUsed, tenantHref, type KeyRow } from "@/lib/access-model";
 import { logsHref } from "@/lib/log-links";
 import { money } from "@/lib/models-model";
@@ -31,7 +32,7 @@ function keyFieldSection(name: string): "key" | "tracing" | "end_user" | "backgr
   if (name === "tracing_enabled") return "tracing";
   if (name === "end_user_fairshare") return "end_user";
   if (name === "background") return "background";
-  if (["name", "description", "weight", "max_in_flight", "budget_tokens", "budget_cost_usd", "budget_period", "budget_started_at", "allowed_networks"].includes(name)) return "key";
+  if (["name", "description", "weight", "max_in_flight", "budget_tokens", "budget_cost_usd", "budget_period", "budget_started_at", "allowed_networks", "allowed_countries"].includes(name)) return "key";
   return null;
 }
 
@@ -47,6 +48,7 @@ const KEY_LABELS: Record<string, string> = {
   end_user_fairshare: "Per-user fairshare",
   background: "Background priority",
   allowed_networks: "Allowed networks",
+  allowed_countries: "Allowed countries",
 };
 
 function Use({ row }: { row: KeyRow }) {
@@ -214,15 +216,20 @@ export function KeyPanel({
 
           <section aria-label="Networks" className="flex flex-col gap-2">
             <span className="text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">Networks</span>
-            {k.allowed_networks?.length ? (
+            {k.allowed_networks?.length || k.allowed_countries?.length ? (
               <div className="flex flex-col gap-1.5">
-                <span className="text-[12.5px] text-secondary-foreground">Works only from these networks. Requests from anywhere else are refused.</span>
+                <span className="text-[12.5px] text-secondary-foreground">
+                  Works only from {k.allowed_networks?.length && k.allowed_countries?.length ? "these networks or countries" : k.allowed_countries?.length ? "these countries" : "these networks"}. Requests from anywhere else are refused.
+                </span>
                 <div className="flex flex-wrap gap-1.5">
-                  {k.allowed_networks.map((n) => <Pill key={n}><span className="font-mono text-[12px]">{n}</span></Pill>)}
+                  {(k.allowed_networks ?? []).map((n) => <Pill key={n}><span className="font-mono text-[12px]">{n}</span></Pill>)}
+                  {(k.allowed_countries ?? []).map((c) => (
+                    <Pill key={c}><span className="font-mono text-[12px]">{c}</span>{countryName(c)}</Pill>
+                  ))}
                 </div>
               </div>
             ) : (
-              <p className="text-[12.5px] text-muted-foreground">{networksSummary(k.allowed_networks)}. Limit it below.</p>
+              <p className="text-[12.5px] text-muted-foreground">{networksSummary(k.allowed_networks, k.allowed_countries)}. Limit it below.</p>
             )}
           </section>
 
@@ -291,6 +298,9 @@ export function KeyPanel({
           </Setting>
           <Setting label="Allowed networks" hint={NETWORKS_HINT} fields={["allowed_networks"]} className="px-6">
             <AllowedNetworksField defaultValue={networksText(k.allowed_networks)} named={named} />
+          </Setting>
+          <Setting label="Allowed countries" hint={COUNTRIES_HINT} fields={["allowed_countries"]} className="px-6">
+            <AllowedCountriesField defaultValue={countriesText(k.allowed_countries)} />
           </Setting>
           <Setting label="Trace requests" hint="Keep each step of its requests" fields={["tracing_enabled"]} was={{ field: "tracing_enabled", checkbox: true }} className="px-6">
             <Switch name="tracing_enabled" label="Trace requests" defaultChecked={k.tracing_enabled} />

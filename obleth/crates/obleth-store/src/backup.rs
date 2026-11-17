@@ -92,7 +92,8 @@ impl Store {
                     budget_tokens, budget_cost_usd, budget_period, budget_started_at,
                     disabled, created_at,
                     kind, identity_issuer, identity_subject, identity_claims,
-                    weight, max_in_flight, end_user_fairshare, background, allowed_networks
+                    weight, max_in_flight, end_user_fairshare, background, allowed_networks,
+                    allowed_countries
              from api_keys order by created_at",
         )
         .fetch_all(&self.pool)
@@ -123,6 +124,7 @@ impl Store {
                 end_user_fairshare: row.try_get("end_user_fairshare").unwrap_or(false),
                 background: row.try_get("background").unwrap_or(false),
                 allowed_networks: row.try_get("allowed_networks")?,
+                allowed_countries: row.try_get("allowed_countries")?,
                 disabled: row.try_get("disabled")?,
                 created_at: row.try_get("created_at")?,
             })
@@ -370,9 +372,9 @@ impl Store {
                         budget_tokens, budget_cost_usd, budget_period, budget_started_at,
                         disabled, created_at, kind, identity_issuer, identity_subject,
                         identity_claims, weight, max_in_flight, end_user_fairshare,
-                        background, allowed_networks)
+                        background, allowed_networks, allowed_countries)
                  values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                         $17, $18, $19, $20, $21)
+                         $17, $18, $19, $20, $21, $22)
                  on conflict (id) do update set
                         tenant_id = excluded.tenant_id,
                         name = excluded.name,
@@ -393,6 +395,7 @@ impl Store {
                         end_user_fairshare = excluded.end_user_fairshare,
                         background = excluded.background,
                         allowed_networks = excluded.allowed_networks,
+                        allowed_countries = excluded.allowed_countries,
                         updated_at = now()
                  returning (xmax = 0) as inserted",
             )
@@ -417,6 +420,7 @@ impl Store {
             .bind(k.end_user_fairshare)
             .bind(k.background)
             .bind(&k.allowed_networks)
+            .bind(&k.allowed_countries)
             .fetch_one(&mut *tx)
             .await
             .map_err(restore_db_error)?;
@@ -1049,6 +1053,7 @@ mod tests {
                 100,
                 None,
                 &["203.0.113.0/24".to_string(), "2001:db8::/48".to_string()],
+                &["US".to_string()],
             )
             .await
             .expect("create key");
@@ -1275,6 +1280,11 @@ mod tests {
             vec!["203.0.113.0/24".to_string(), "2001:db8::/48".to_string()],
             "export carries allowed_networks"
         );
+        assert_eq!(
+            exported_key.allowed_countries,
+            vec!["US".to_string()],
+            "export carries allowed_countries"
+        );
         let exported_tenant = data
             .tenants
             .iter()
@@ -1329,7 +1339,7 @@ mod tests {
             .expect("drift endpoint concurrency");
         sqlx::query(
             "update api_keys set end_user_fairshare = false, background = false, \
-             allowed_networks = '{}' where id = $1",
+             allowed_networks = '{}', allowed_countries = '{}' where id = $1",
         )
         .bind(key.id)
         .execute(&store.pool)
@@ -1353,6 +1363,11 @@ mod tests {
                 "2001:db8::/48".to_string()
             ]),
             "restore puts allowed_networks back"
+        );
+        assert_eq!(
+            restored_key.first().map(|k| k.allowed_countries.clone()),
+            Some(vec!["US".to_string()]),
+            "restore puts allowed_countries back"
         );
         let restored_model = store.get_model(model.id).await.expect("get model");
         assert_eq!(
