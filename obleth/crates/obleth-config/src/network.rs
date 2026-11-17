@@ -297,66 +297,179 @@ pub fn clean_user_agent(raw: &str) -> String {
         .collect()
 }
 
-/// Most named networks one instance keeps.
+/// Most named ranges one instance keeps, across all named networks.
 pub const MAX_NAMED_NETWORKS: usize = 500;
+
+/// Most named networks (groups of ranges) one instance keeps.
+pub const MAX_NAMED_NETWORK_GROUPS: usize = 200;
 
 /// Longest name for a network, in characters.
 pub const NETWORK_NAME_MAX_CHARS: usize = 64;
 
-/// A range of addresses an operator gave a name, such as a campus, a VPN or
-/// a cluster's pod network, so reports can say whose network a client
-/// address is in. Purely descriptive: it changes no check.
+/// A network an operator gave a name, such as a campus, a VPN or a
+/// cluster's pod network: one or more ranges of addresses under one name, so
+/// reports can say whose network a client address is in. Purely
+/// descriptive: it changes no check.
+///
+/// Reading also accepts the older one-range shape
+/// `{"network": "10.0.0.0/8", "name": "Campus"}`, which becomes a group with
+/// that one range. Pieces that share a name are merged by
+/// [`normalize_named_networks`].
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[serde(from = "NamedNetworkInput")]
 pub struct NamedNetwork {
-    /// CIDR range, normalised (`10.139.0.0/16`).
-    pub network: String,
     /// What to call it, for example `Campus VPN`.
     pub name: String,
+    /// CIDR ranges, normalised (`10.139.0.0/16`), in the order given.
+    pub ranges: Vec<String>,
+    /// The network belongs to the organisation running this gateway. The
+    /// gateway changes no check because of it; it tells operators, and apps
+    /// built on the gateway, that use from here is expected.
+    #[serde(default)]
+    pub ours: bool,
+}
+
+/// The shapes a named network is read from: the group, or the older single
+/// range row.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum NamedNetworkInput {
+    // First: an object with `network` is the older row, never a group.
+    Legacy {
+        network: String,
+        #[serde(default)]
+        name: String,
+    },
+    Group {
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        ranges: Vec<String>,
+        #[serde(default)]
+        ours: bool,
+    },
+}
+
+impl From<NamedNetworkInput> for NamedNetwork {
+    fn from(input: NamedNetworkInput) -> Self {
+        match input {
+            NamedNetworkInput::Group { name, ranges, ours } => NamedNetwork { name, ranges, ours },
+            NamedNetworkInput::Legacy { network, name } => NamedNetwork {
+                name,
+                ranges: vec![network],
+                ours: false,
+            },
+        }
+    }
 }
 
 /// Validate and normalise named networks as an operator sent them: blank
-/// rows are dropped, each range becomes its canonical CIDR, names are
-/// trimmed, and a range listed twice is refused. The error names the row
-/// that is wrong.
+/// groups are dropped, names are trimmed, each range becomes its canonical
+/// CIDR, and groups that share a name (ignoring case) are merged into the
+/// first, keeping its spelling. A range may belong to one network only. The
+/// error names the network or range that is wrong.
 pub fn normalize_named_networks(entries: &[NamedNetwork]) -> Result<Vec<NamedNetwork>, String> {
+    build_named_networks(entries, true)
+}
+
+/// Named networks as saved, read leniently: anything that would be refused
+/// by [`normalize_named_networks`] (a range that does not parse, a range
+/// already in an earlier network, a group with no name) is skipped instead,
+/// so one bad row never hides the others.
+pub fn read_named_networks(entries: &[NamedNetwork]) -> Vec<NamedNetwork> {
+    build_named_networks(entries, false).unwrap_or_default()
+}
+
+fn build_named_networks(
+    entries: &[NamedNetwork],
+    strict: bool,
+) -> Result<Vec<NamedNetwork>, String> {
+    macro_rules! refuse {
+        ($($arg:tt)*) => {
+            if strict {
+                return Err(format!($($arg)*));
+            } else {
+                continue;
+            }
+        };
+    }
     let mut out: Vec<NamedNetwork> = Vec::new();
+    // Canonical range -> index of the network that holds it.
+    let mut owner: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut total = 0usize;
     for entry in entries {
-        let raw = entry.network.trim();
         let name: String = entry
             .name
             .trim()
             .chars()
             .filter(|c| !c.is_control())
             .collect();
-        if raw.is_empty() && name.is_empty() {
+        let raws: Vec<&str> = entry
+            .ranges
+            .iter()
+            .map(|r| r.trim())
+            .filter(|r| !r.is_empty())
+            .collect();
+        if name.is_empty() && raws.is_empty() {
             continue;
         }
-        let Some(net) = parse_network(raw) else {
-            return Err(format!(
-                "\"{raw}\" is not an IP address or CIDR range \
-                 (examples: 10.0.0.0/8, 203.0.113.0/24, 2001:db8::/48)"
-            ));
-        };
         if name.is_empty() {
-            return Err(format!("{net} needs a name"));
+            refuse!("{} needs a name", raws[0]);
         }
         if name.chars().count() > NETWORK_NAME_MAX_CHARS {
-            return Err(format!(
-                "the name for {net} is longer than {NETWORK_NAME_MAX_CHARS} characters"
-            ));
+            refuse!(
+                "the name \"{}...\" is longer than {NETWORK_NAME_MAX_CHARS} characters",
+                name.chars().take(24).collect::<String>()
+            );
         }
-        let network = net.to_string();
-        if out.iter().any(|n| n.network == network) {
-            return Err(format!("{network} is listed twice"));
+        if raws.is_empty() {
+            refuse!("{name} needs at least one address or range");
         }
-        out.push(NamedNetwork { network, name });
+        let key = name.to_lowercase();
+        let idx = match out.iter().position(|n| n.name.to_lowercase() == key) {
+            Some(i) => i,
+            None => {
+                if out.len() >= MAX_NAMED_NETWORK_GROUPS {
+                    refuse!("at most {MAX_NAMED_NETWORK_GROUPS} named networks");
+                }
+                out.push(NamedNetwork {
+                    name,
+                    ranges: Vec::new(),
+                    ours: false,
+                });
+                out.len() - 1
+            }
+        };
+        out[idx].ours |= entry.ours;
+        for raw in raws {
+            let Some(net) = parse_network(raw) else {
+                refuse!(
+                    "{}: \"{raw}\" is not an IP address or CIDR range \
+                     (examples: 10.0.0.0/8, 203.0.113.0/24, 2001:db8::/48)",
+                    out[idx].name
+                );
+            };
+            let range = net.to_string();
+            match owner.get(&range) {
+                // Listed twice in one network: keep the first.
+                Some(&i) if i == idx => continue,
+                Some(&i) => refuse!(
+                    "{range} is in both {} and {}; a range can belong to one network only",
+                    out[i].name,
+                    out[idx].name
+                ),
+                None => {}
+            }
+            if total >= MAX_NAMED_NETWORKS {
+                refuse!("at most {MAX_NAMED_NETWORKS} named ranges in all");
+            }
+            total += 1;
+            owner.insert(range.clone(), idx);
+            out[idx].ranges.push(range);
+        }
     }
-    if out.len() > MAX_NAMED_NETWORKS {
-        return Err(format!(
-            "at most {MAX_NAMED_NETWORKS} named networks ({} given)",
-            out.len()
-        ));
-    }
+    // Only a leniently read group can end up with every range skipped.
+    out.retain(|n| !n.ranges.is_empty());
     Ok(out)
 }
 
@@ -368,12 +481,18 @@ pub struct NetworkNames {
 }
 
 impl NetworkNames {
-    /// Entries that do not parse (none should, as the admin API normalises
-    /// them) are skipped.
+    /// Ranges that do not parse (none should, as the admin API normalises
+    /// them) are skipped. Ranges from every network are considered
+    /// together, so an address takes the name of the narrowest range that
+    /// holds it, whichever network that range belongs to.
     pub fn new(named: &[NamedNetwork]) -> Self {
         let mut nets: Vec<(IpNet, String)> = named
             .iter()
-            .filter_map(|n| parse_network(&n.network).map(|net| (net, n.name.clone())))
+            .flat_map(|n| {
+                n.ranges
+                    .iter()
+                    .filter_map(|r| parse_network(r).map(|net| (net, n.name.clone())))
+            })
             .collect();
         nets.sort_by_key(|n| std::cmp::Reverse(n.0.prefix_len()));
         NetworkNames { nets }
@@ -696,75 +815,196 @@ mod tests {
         );
     }
 
+    fn group(name: &str, ranges: &[&str], ours: bool) -> NamedNetwork {
+        NamedNetwork {
+            name: name.into(),
+            ranges: ranges.iter().map(|r| r.to_string()).collect(),
+            ours,
+        }
+    }
+
     #[test]
     fn named_networks_normalise_and_name_the_narrowest_match() {
         let named = normalize_named_networks(&[
-            NamedNetwork {
-                network: " 10.0.0.0/8 ".into(),
-                name: " Campus ".into(),
-            },
-            NamedNetwork {
-                network: "10.139.5.9/16".into(),
-                name: "Research computing".into(),
-            },
-            NamedNetwork {
-                network: "".into(),
-                name: "".into(),
-            },
-            NamedNetwork {
-                network: "2001:db8::/32".into(),
-                name: "Lab v6".into(),
-            },
+            group(" Campus ", &[" 10.0.0.0/8 ", "203.0.113.7"], true),
+            group("Research computing", &["10.139.5.9/16"], false),
+            group("", &["", " "], false),
+            group("Lab v6", &["2001:db8::/32"], false),
         ])
         .unwrap();
         assert_eq!(
             named[0],
-            NamedNetwork {
-                network: "10.0.0.0/8".into(),
-                name: "Campus".into()
-            }
+            group("Campus", &["10.0.0.0/8", "203.0.113.7/32"], true)
         );
-        assert_eq!(named[1].network, "10.139.0.0/16");
+        assert_eq!(named[1].ranges, vec!["10.139.0.0/16"]);
         assert_eq!(named.len(), 3);
         let names = NetworkNames::new(&named);
         assert_eq!(names.name_of("10.139.121.0/24"), Some("Research computing"));
         assert_eq!(names.name_of("10.4.58.0/24"), Some("Campus"));
         assert_eq!(names.name_of("10.4.58.7"), Some("Campus"));
+        assert_eq!(names.name_of("203.0.113.7"), Some("Campus"));
         assert_eq!(names.name_of("2001:db8:1::/48"), Some("Lab v6"));
         assert_eq!(names.name_of("203.0.113.0/24"), None);
         assert_eq!(names.name_of(""), None);
         // A named range narrower than the row names none of it.
-        let narrow = NetworkNames::new(&[NamedNetwork {
-            network: "192.0.2.0/28".into(),
-            name: "x".into(),
-        }]);
+        let narrow = NetworkNames::new(&[group("x", &["192.0.2.0/28"], false)]);
         assert_eq!(narrow.name_of("192.0.2.0/24"), None);
         assert_eq!(narrow.name_of("192.0.2.3"), Some("x"));
     }
 
     #[test]
+    fn the_narrowest_range_across_networks_names_an_address() {
+        let named = normalize_named_networks(&[
+            group("ASU campus", &["10.0.0.0/8", "129.219.0.0/16"], true),
+            group("Research Computing", &["10.139.0.0/16"], true),
+            group(
+                "Sol",
+                &["10.139.120.0/24", "10.139.121.0/24", "10.139.126.0/24"],
+                true,
+            ),
+        ])
+        .unwrap();
+        let names = NetworkNames::new(&named);
+        assert_eq!(names.name_of("10.139.121.5"), Some("Sol"));
+        assert_eq!(names.name_of("10.139.121.0/24"), Some("Sol"));
+        assert_eq!(names.name_of("10.139.127.0/24"), Some("Research Computing"));
+        assert_eq!(names.name_of("10.4.58.0/24"), Some("ASU campus"));
+        assert_eq!(names.name_of("129.219.10.1"), Some("ASU campus"));
+    }
+
+    #[test]
+    fn legacy_rows_merge_by_name() {
+        let rows: Vec<NamedNetwork> = serde_json::from_value(serde_json::json!([
+            { "network": "10.218.105.0/24", "name": "SCAI" },
+            { "network": "10.0.0.0/8", "name": "Campus" },
+            { "network": "10.218.107.0/24", "name": " scai " },
+            { "network": "10.121.120.0/21", "name": "CreateAI Builder" },
+            { "network": "10.121.128.0/22", "name": "CreateAI Builder" }
+        ]))
+        .unwrap();
+        let named = normalize_named_networks(&rows).unwrap();
+        assert_eq!(
+            named,
+            vec![
+                group("SCAI", &["10.218.105.0/24", "10.218.107.0/24"], false),
+                group("Campus", &["10.0.0.0/8"], false),
+                group(
+                    "CreateAI Builder",
+                    &["10.121.120.0/21", "10.121.128.0/22"],
+                    false
+                ),
+            ]
+        );
+        // Lenient reading merges the same way.
+        assert_eq!(read_named_networks(&rows), named);
+    }
+
+    #[test]
+    fn legacy_rows_and_groups_mix_and_ours_carries_over() {
+        let body: Vec<NamedNetwork> = serde_json::from_value(serde_json::json!([
+            { "network": "10.139.120.0/24", "name": "Sol" },
+            { "name": "sol", "ranges": ["10.139.121.0/24"], "ours": true },
+            { "name": "Lab", "ranges": ["198.51.100.0/24"] }
+        ]))
+        .unwrap();
+        let named = normalize_named_networks(&body).unwrap();
+        assert_eq!(
+            named,
+            vec![
+                group("Sol", &["10.139.120.0/24", "10.139.121.0/24"], true),
+                group("Lab", &["198.51.100.0/24"], false),
+            ]
+        );
+        // Names are unique ignoring case once merged.
+        let twice = normalize_named_networks(&[
+            group("VPN", &["10.1.0.0/16"], false),
+            group("vpn", &["10.2.0.0/16"], false),
+        ])
+        .unwrap();
+        assert_eq!(twice.len(), 1);
+        assert_eq!(twice[0].name, "VPN");
+        // The same range twice in one network is kept once.
+        let repeat =
+            normalize_named_networks(&[group("A", &["10.1.0.0/16", "10.1.2.3/16"], false)])
+                .unwrap();
+        assert_eq!(repeat[0].ranges, vec!["10.1.0.0/16"]);
+    }
+
+    #[test]
+    fn named_networks_serialise_in_the_group_shape_and_round_trip() {
+        let named = vec![group("Campus VPN", &["203.0.113.0/24"], true)];
+        let json = serde_json::to_value(&named).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!([
+                { "name": "Campus VPN", "ranges": ["203.0.113.0/24"], "ours": true }
+            ])
+        );
+        let back: Vec<NamedNetwork> = serde_json::from_value(json).unwrap();
+        assert_eq!(back, named);
+        // `ours` defaults to false when left out.
+        let plain: NamedNetwork =
+            serde_json::from_value(serde_json::json!({ "name": "x", "ranges": ["192.0.2.0/24"] }))
+                .unwrap();
+        assert!(!plain.ours);
+    }
+
+    #[test]
     fn bad_named_networks_are_refused_with_the_row_named() {
-        let one = |network: &str, name: &str| {
-            normalize_named_networks(&[NamedNetwork {
-                network: network.into(),
-                name: name.into(),
-            }])
-        };
+        let one =
+            |range: &str, name: &str| normalize_named_networks(&[group(name, &[range], false)]);
         assert!(one("nope", "x").unwrap_err().contains("\"nope\""));
         assert!(one("10.0.0.0/8", " ").unwrap_err().contains("needs a name"));
         assert!(one("10.0.0.0/8", &"n".repeat(65))
             .unwrap_err()
             .contains("longer than"));
+        let empty = normalize_named_networks(&[group("Lab", &[" "], false)]);
+        assert!(empty.unwrap_err().contains("Lab needs at least one"));
         let twice = normalize_named_networks(&[
-            NamedNetwork {
-                network: "10.0.0.0/8".into(),
-                name: "a".into(),
-            },
-            NamedNetwork {
-                network: "10.1.0.0/8".into(),
-                name: "b".into(),
-            },
-        ]);
-        assert!(twice.unwrap_err().contains("listed twice"));
+            group("a", &["10.0.0.0/8"], false),
+            group("b", &["10.1.0.0/8"], false),
+        ])
+        .unwrap_err();
+        assert!(twice.contains("10.0.0.0/8"), "{twice}");
+        assert!(twice.contains("both a and b"), "{twice}");
+        let many: Vec<NamedNetwork> = (0..=MAX_NAMED_NETWORK_GROUPS)
+            .map(|i| {
+                group(
+                    &format!("n{i}"),
+                    &[&format!("10.{}.{}.0/24", i / 256, i % 256)],
+                    false,
+                )
+            })
+            .collect();
+        assert!(normalize_named_networks(&many)
+            .unwrap_err()
+            .contains("at most"));
+        let ranges: Vec<String> = (0..=MAX_NAMED_NETWORKS)
+            .map(|i| format!("10.{}.{}.0/24", i / 256, i % 256))
+            .collect();
+        let big = NamedNetwork {
+            name: "big".into(),
+            ranges,
+            ours: false,
+        };
+        assert!(normalize_named_networks(&[big])
+            .unwrap_err()
+            .contains("at most"));
+    }
+
+    #[test]
+    fn reading_saved_networks_skips_what_no_longer_validates() {
+        let saved = vec![
+            group("Campus", &["10.0.0.0/8", "nope"], false),
+            group("", &["192.0.2.0/24"], false),
+            group("Pods", &["10.0.0.0/8", "10.42.0.0/16"], true),
+        ];
+        assert_eq!(
+            read_named_networks(&saved),
+            vec![
+                group("Campus", &["10.0.0.0/8"], false),
+                group("Pods", &["10.42.0.0/16"], true),
+            ]
+        );
     }
 }

@@ -4154,7 +4154,9 @@ impl Store {
     }
 
     /// The named networks (`app_settings.named_networks`), or none. Rows
-    /// that no longer validate are dropped as they are read.
+    /// may be groups or the older one-range rows (merged by name); anything
+    /// that no longer validates is skipped as it is read, without hiding the
+    /// rest.
     pub async fn named_networks(&self) -> Result<Vec<obleth_config::network::NamedNetwork>> {
         let row = sqlx::query("select value from app_settings where key = 'named_networks'")
             .fetch_optional(&self.pool)
@@ -4166,15 +4168,14 @@ impl Store {
         let saved: Vec<obleth_config::network::NamedNetwork> = value
             .0
             .get("networks")
-            .cloned()
-            .and_then(|v| serde_json::from_value(v).ok())
-            .unwrap_or_default();
-        Ok(saved
-            .into_iter()
-            .filter(|n| {
-                obleth_config::network::normalize_named_networks(std::slice::from_ref(n)).is_ok()
+            .and_then(|v| v.as_array())
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|r| serde_json::from_value(r.clone()).ok())
+                    .collect()
             })
-            .collect())
+            .unwrap_or_default();
+        Ok(obleth_config::network::read_named_networks(&saved))
     }
 
     /// Save the named networks. The caller validates them.
@@ -6163,26 +6164,37 @@ mod tests {
         use obleth_config::network::NamedNetwork;
         let nets = vec![
             NamedNetwork {
-                network: "10.0.0.0/8".into(),
                 name: "Campus".into(),
+                ranges: vec!["10.0.0.0/8".into(), "203.0.113.0/24".into()],
+                ours: true,
             },
             NamedNetwork {
-                network: "10.42.0.0/16".into(),
                 name: "Cluster pods".into(),
+                ranges: vec!["10.42.0.0/16".into()],
+                ours: false,
             },
         ];
         store.put_named_networks(&nets).await.expect("save");
         assert_eq!(store.named_networks().await.unwrap(), nets);
-        // A row edited by hand into junk is skipped, not an error.
+        // Older one-range rows merge by name; a row edited by hand into
+        // junk is skipped, not an error, and hides none of the others.
         sqlx::query("update app_settings set value = $1 where key = 'named_networks'")
             .bind(sqlx::types::Json(serde_json::json!({ "networks": [
                 { "network": "nope", "name": "x" },
-                { "network": "10.0.0.0/8", "name": "Campus" }
+                42,
+                { "network": "10.0.0.0/8", "name": "Campus" },
+                { "network": "203.0.113.0/24", "name": "campus" }
             ] })))
             .execute(&store.pool)
             .await
             .expect("junk");
-        assert_eq!(store.named_networks().await.unwrap(), nets[..1].to_vec());
+        assert_eq!(
+            store.named_networks().await.unwrap(),
+            vec![NamedNetwork {
+                ours: false,
+                ..nets[0].clone()
+            }]
+        );
         store.put_named_networks(&before).await.expect("restore");
     }
 

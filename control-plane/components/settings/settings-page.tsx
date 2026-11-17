@@ -73,7 +73,7 @@ const SEARCH: { id: string; label: string; words: string }[] = [
   { id: "set-energy", label: "Energy", words: "power prometheus watts carbon co2 pue kwh" },
   { id: "set-assistant", label: "Assistant", words: "charo playground agent benchmark" },
   { id: "set-key-prefix", label: "Key prefix", words: "api key prefix obl sk format" },
-  { id: "set-named-networks", label: "Named networks", words: "network name cidr range campus vpn cluster private address subnet" },
+  { id: "set-named-networks", label: "Named networks", words: "network name cidr range campus vpn cluster private address subnet ours own" },
   { id: "set-client-address", label: "Where a request came from", words: "client ip address trusted proxies x-forwarded-for cf-connecting-ip country header" },
   { id: "set-retention", label: "History retention", words: "retention days usage logs keep" },
   { id: "data", label: "Backup and restore", words: "backup export restore cache reconcile" },

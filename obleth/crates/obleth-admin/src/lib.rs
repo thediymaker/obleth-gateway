@@ -6128,7 +6128,9 @@ pub struct NetworkSettingsView {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateNamedNetworks {
-    /// Every named network; this replaces the list.
+    /// Every named network; this replaces the list. The older one-range
+    /// rows (`{"network", "name"}`) are still accepted, and pieces that
+    /// share a name are merged into one network.
     pub networks: Vec<NamedNetwork>,
 }
 
@@ -6159,8 +6161,10 @@ async fn get_network_settings(
     )))
 }
 
-/// Replace the named networks: ranges of addresses with a name, so reports
-/// can say whose network a client is in. They change no check.
+/// Replace the named networks: groups of address ranges with a name (and
+/// whether the network is the organisation's own), so reports can say whose
+/// network a client is in. An address takes the name of the narrowest range
+/// that holds it. They change no check.
 #[utoipa::path(
     put, path = "/api/v1/settings/networks", tag = "settings",
     request_body = UpdateNamedNetworks,
@@ -13583,6 +13587,34 @@ mod tests {
                 "{name} is not registered in components(...)"
             );
         }
+    }
+
+    #[test]
+    fn network_settings_take_legacy_rows_and_answer_in_groups() {
+        use utoipa::OpenApi;
+        let body: UpdateNamedNetworks = serde_json::from_value(serde_json::json!({
+            "networks": [
+                { "network": "198.51.100.0/24", "name": "HPC cluster" },
+                { "name": "hpc cluster", "ranges": ["198.51.101.0/24"], "ours": true },
+                { "name": "Campus", "ranges": ["203.0.113.0/24"] }
+            ]
+        }))
+        .expect("legacy and group rows parse");
+        let networks =
+            obleth_config::network::normalize_named_networks(&body.networks).expect("valid");
+        let view = serde_json::to_value(network_settings_view(networks)).expect("serialize");
+        assert_eq!(
+            view["networks"],
+            serde_json::json!([
+                { "name": "HPC cluster", "ranges": ["198.51.100.0/24", "198.51.101.0/24"], "ours": true },
+                { "name": "Campus", "ranges": ["203.0.113.0/24"], "ours": false }
+            ])
+        );
+        assert!(view["client_address"].is_object());
+        let doc = serde_json::to_value(ApiDoc::openapi()).expect("serialize the openapi doc");
+        let schema = &doc["components"]["schemas"]["NamedNetwork"]["properties"];
+        assert!(schema["ranges"].is_object(), "{schema}");
+        assert!(schema["ours"].is_object(), "{schema}");
     }
 
     #[test]

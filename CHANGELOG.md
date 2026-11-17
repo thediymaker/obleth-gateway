@@ -7,6 +7,7 @@ workflow falls back to auto-generated notes.
 ## Unreleased
 
 - **Queue wait on every response.** Responses to admitted requests carry `x-obleth-queue-wait-ms`: the milliseconds the request waited in the fairshare queue before it was sent to the model (0 when it went straight through). A client can now tell time spent queued from time the model took, for example to leave queue time out of an agent's time limit. The same figure is the request log's queue wait.
+- **Named networks hold several ranges.** A named network is now a name, one or more ranges, and an `ours` flag: `{ "name": "HPC cluster", "ranges": ["198.51.100.0/24", "198.51.101.0/24"], "ours": true }`. Settings › Networks edits one card per network, with the ranges one per line. An address takes the name of the narrowest range that holds it, whichever network that range is in. A range may belong to one network only; up to 500 ranges across up to 200 networks. `ours` marks your organization's own networks: the gateway changes no check because of it, and apps built on obleth can treat use from them as expected; a key's allowed networks offer them first, and choosing one adds all of its ranges. `PUT /api/v1/settings/networks` still accepts the older one-range rows (`{ "network", "name" }`), and rows or networks that share a name (ignoring case) are merged into one; saved lists in the older shape are read the same way, so nothing needs migrating. Responses always use the new shape.
 
 ## v2.10.0
 

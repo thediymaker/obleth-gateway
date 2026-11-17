@@ -47,7 +47,7 @@ export function settingsData(over: Partial<SettingsData> = {}): SettingsData {
     retention: { days: 180, configured: false },
     keyPrefix: { prefix: "obl", configured: true, default_prefix: "sk" },
     networks: {
-      networks: [{ network: "10.0.0.0/8", name: "Campus" }],
+      networks: [{ name: "Campus", ranges: ["10.0.0.0/8"], ours: true }],
       client_address: { trusted_proxies: ["10.0.0.0/8"], trusted_proxies_default: false, walks_past_proxies: true, invalid_trusted_proxies: [], address_header: null, country_header: "cf-ipcountry" },
     },
     slurm: { enabled: false, provisioner_running: true } as SlurmSettingsView,

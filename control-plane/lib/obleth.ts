@@ -1132,10 +1132,18 @@ export interface KeyPrefixView {
   default_prefix: string;
 }
 
-/** A range of addresses with a name, so reports can say whose network a client is in. */
+/**
+ * A named network: one or more address ranges under one name, so reports can
+ * say whose network a client is in. An address takes the name of the
+ * narrowest range that holds it. The gateway still accepts the older
+ * one-range rows (`{ network, name }`) and merges rows that share a name.
+ */
 export interface NamedNetwork {
-  network: string;
   name: string;
+  /** Canonical ranges (`10.139.0.0/16`), in the order given. */
+  ranges: string[];
+  /** The organisation's own network. Changes no check; apps can treat use from here as expected. */
+  ours: boolean;
 }
 
 /** How the gateway works out a request's client; set where it is deployed. */
