@@ -980,6 +980,9 @@ async fn count_tokens_shim(
 /// Response header naming the variant a request was served through (see
 /// [`obleth_config::ModelVariant`]), on every response after the name resolved.
 pub(crate) const MODEL_VARIANT_HEADER: &str = "x-obleth-model-variant";
+/// Milliseconds the request waited in the fairshare queue before admission. Sent on every
+/// admitted response, so a client can tell time spent queued from time the model took.
+pub(crate) const QUEUE_WAIT_HEADER: &str = "x-obleth-queue-wait-ms";
 
 /// The pipeline every proxied request runs ([`run_pipeline`]), plus the
 /// response headers that describe how it was served, whichever exit the
@@ -2706,6 +2709,7 @@ async fn run_pipeline(
                         .status(StatusCode::OK)
                         .header(header::CONTENT_TYPE, "application/json")
                         .header("x-obleth-request-id", request_id.to_string())
+                        .header(QUEUE_WAIT_HEADER, queue_wait_ms.to_string())
                         .header(crate::boons::speculation::DRAFTED_BY_HEADER, drafted_by)
                         .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
                     if !boons_applied.is_empty() {
@@ -2781,6 +2785,7 @@ async fn run_pipeline(
                         .status(StatusCode::OK)
                         .header(header::CONTENT_TYPE, "text/event-stream")
                         .header("x-obleth-request-id", request_id.to_string())
+                        .header(QUEUE_WAIT_HEADER, queue_wait_ms.to_string())
                         .header(crate::boons::speculation::DRAFTED_BY_HEADER, drafted_by)
                         .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
                     if !boons_applied.is_empty() {
@@ -3227,6 +3232,7 @@ async fn run_pipeline(
             .status(status_code)
             .header(header::CONTENT_TYPE, content_type)
             .header("x-obleth-request-id", request_id.to_string())
+            .header(QUEUE_WAIT_HEADER, queue_wait_ms.to_string())
             .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
         if !boons_applied.is_empty() {
             builder = builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
@@ -3448,6 +3454,7 @@ async fn run_pipeline(
                     .status(status_code)
                     .header(header::CONTENT_TYPE, "text/event-stream")
                     .header("x-obleth-request-id", request_id.to_string())
+                    .header(QUEUE_WAIT_HEADER, queue_wait_ms.to_string())
                     .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
                 if !boons_applied.is_empty() {
                     builder = builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
@@ -3592,6 +3599,7 @@ async fn run_pipeline(
                 .status(failure.status)
                 .header(header::CONTENT_TYPE, content_type)
                 .header("x-obleth-request-id", request_id.to_string())
+                .header(QUEUE_WAIT_HEADER, queue_wait_ms.to_string())
                 .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
             if !boons_applied.is_empty() {
                 builder = builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
@@ -3761,6 +3769,7 @@ async fn run_pipeline(
             .status(status_code)
             .header(header::CONTENT_TYPE, final_content_type)
             .header("x-obleth-request-id", request_id.to_string())
+            .header(QUEUE_WAIT_HEADER, queue_wait_ms.to_string())
             .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
         if !boons_applied.is_empty() {
             builder = builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
@@ -4054,6 +4063,7 @@ async fn run_pipeline(
     builder = builder
         .header(header::CONTENT_TYPE, content_type)
         .header("x-obleth-request-id", request_id.to_string())
+        .header(QUEUE_WAIT_HEADER, queue_wait_ms.to_string())
         .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
     if !boons_applied.is_empty() {
         builder = builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
@@ -10872,6 +10882,26 @@ mod lifecycle_tests {
         );
         // Nothing after the cascade abstained claims a drafter.
         assert!(!h[dispatch..].contains("DRAFTED_BY_HEADER"));
+    }
+
+    #[test]
+    fn every_admitted_response_says_how_long_it_queued() {
+        let h = squash(handler());
+        let admitted = h
+            .find("letqueue_wait_ms=admitted.waited.as_millis()asu32;")
+            .expect("admission wait");
+        let after = &h[admitted..];
+        let builders = after
+            .matches(".header(\"x-obleth-request-id\",request_id.to_string())")
+            .count();
+        assert!(builders >= 7, "found {builders} response builders");
+        assert_eq!(
+            after
+                .matches(".header(\"x-obleth-request-id\",request_id.to_string()).header(QUEUE_WAIT_HEADER,queue_wait_ms.to_string())")
+                .count(),
+            builders,
+            "every response built after admission carries the queue wait"
+        );
     }
 
     #[test]

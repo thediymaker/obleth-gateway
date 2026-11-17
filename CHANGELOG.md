@@ -6,6 +6,8 @@ workflow falls back to auto-generated notes.
 
 ## Unreleased
 
+- **Queue wait on every response.** Responses to admitted requests carry `x-obleth-queue-wait-ms`: the milliseconds the request waited in the fairshare queue before it was sent to the model (0 when it went straight through). A client can now tell time spent queued from time the model took, for example to leave queue time out of an agent's time limit. The same figure is the request log's queue wait.
+
 ## v2.10.0
 
 The client address found past a chain of proxies, named networks, and Key access as a tab of Reports. No migrations. To have requests through a tunnel recorded at the client's address, list your proxies in `OBLETH_TRUSTED_PROXIES`.
