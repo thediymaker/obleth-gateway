@@ -16,7 +16,13 @@ export default async function KnowledgeCollectionPage({ params }: { params: Prom
   if (!collection) notFound();
   if (collection.name !== name) redirect(collectionHref(collection.name));
   const docIds = new Set((data.documents[collection.id] ?? []).map((d) => d.id));
-  const changes = await safe(obleth.auditQuery({ limit: 200 }), [] as AuditEntry[]);
+  // The collection's own changes by id, and its documents' from the type's
+  // newest 200: both answered from the audit log's entity index.
+  const [collectionChanges, documentChanges] = await Promise.all([
+    safe(obleth.auditQuery({ entityType: "knowledge_collection", entityId: collection.id, limit: 12 }), [] as AuditEntry[]),
+    safe(obleth.auditQuery({ entityType: "knowledge_document", limit: 200 }), [] as AuditEntry[]),
+  ]);
+  const changes = [...collectionChanges, ...documentChanges.filter((e) => docIds.has(e.entity_id))].sort((a, b) => b.id - a.id).slice(0, 12);
   return (
     <CollectionPage
       key={collection.id}
@@ -26,7 +32,7 @@ export default async function KnowledgeCollectionPage({ params }: { params: Prom
       models={data.models}
       usedBy={data.usedBy[collection.id] ?? []}
       stats={data.stats}
-      changes={changes.filter((e) => (e.entity_type === "knowledge_collection" && e.entity_id === collection.id) || (e.entity_type === "knowledge_document" && docIds.has(e.entity_id))).slice(0, 12)}
+      changes={changes}
     />
   );
 }

@@ -1500,6 +1500,17 @@ export interface UsageBreakdownEntry {
   key_prefix: string;
 }
 
+/** Narrow a usage aggregate to one tenant or model; the gateway filters before it groups. */
+export interface UsageFilter {
+  sinceMs?: number;
+  tenantId?: string;
+  model?: string;
+}
+
+function usageQs(filter: UsageFilter) {
+  return qs({ since_ms: filter.sinceMs, tenant_id: filter.tenantId, model: filter.model });
+}
+
 export interface AuditParams {
   limit?: number;
   actor?: string;
@@ -3072,8 +3083,8 @@ export const obleth = {
       method: "DELETE",
       headers: auditActorHeaders(options),
     }),
-  usage: (sinceMs?: number) =>
-    api<UsageAgg[]>(`/usage${qs({ since_ms: sinceMs })}`),
+  usage: (filter: UsageFilter = {}) =>
+    api<UsageAgg[]>(`/usage${usageQs(filter)}`),
   usageByKey: (sinceMs?: number, limit?: number) =>
     api<UsageKeyAgg[]>(`/usage/keys${qs({ since_ms: sinceMs, limit })}`),
   keyUsage: (id: string, sinceMs?: number) =>
@@ -3117,8 +3128,8 @@ export const obleth = {
       }));
     }
   },
-  usageByModel: (sinceMs?: number) =>
-    api<UsageModelAgg[]>(`/usage/models${qs({ since_ms: sinceMs })}`),
+  usageByModel: (filter: UsageFilter = {}) =>
+    api<UsageModelAgg[]>(`/usage/models${usageQs(filter)}`),
   usageSeries: (bucketMs = 300_000, sinceMs?: number) =>
     api<UsageTimePoint[]>(
       `/usage/series${qs({ bucket_ms: bucketMs, since_ms: sinceMs })}`,

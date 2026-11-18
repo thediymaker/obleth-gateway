@@ -16,7 +16,7 @@ export default async function TenantsPage() {
     safe(obleth.listTenants(), [] as Tenant[]),
     safe(obleth.listKeys(), [] as ApiKey[]),
     safe(listUsers(), [] as AdminUser[]),
-    safe(obleth.usage(now.getTime() - DAY_MS), [] as UsageAgg[]),
+    safe(obleth.usage({ sinceMs: now.getTime() - DAY_MS }), [] as UsageAgg[]),
     safe(obleth.budgetUsage(), [] as BudgetUsage[]),
     safe(obleth.usageDaily({ startDay: monthStart, endDay: now.toISOString().slice(0, 10), groupBy: "tenant" }), [] as UsageDailyRow[]),
     safe(obleth.listModels(), [] as ModelRoute[]),

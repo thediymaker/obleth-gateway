@@ -27,7 +27,7 @@ export async function loadDeployments(now = Date.now()): Promise<DeploymentsData
     safe(note("specs", obleth.listManagedModels()), [] as ManagedModelSpec[]),
     safe(note("replicas", obleth.listAllReplicas()), [] as ModelReplica[]),
     safe<CapacityDiscoveryView | null>(obleth.capacityDiscovery(), null),
-    safe(obleth.usageByModel(now - 86_400_000), []),
+    safe(obleth.usageByModel({ sinceMs: now - 86_400_000 }), []),
     safe<SlurmSettingsView | null>(note("slurm", obleth.getSlurmSettings()), null),
   ]);
   return {
