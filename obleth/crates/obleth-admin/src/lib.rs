@@ -7545,6 +7545,27 @@ async fn resync_all_keys(state: &AdminState) -> Result<(usize, usize)> {
     Ok((fresh.len(), gone.len()))
 }
 
+/// Evict every resolver name among `seen` that no enabled model answers to
+/// any more (`fresh`), and say so to the data plane. Returns how many.
+async fn evict_model_names_gone_since<'a>(
+    redis: &RedisStore,
+    seen: impl Iterator<Item = &'a String>,
+    fresh: &std::collections::HashSet<String>,
+) -> Result<usize> {
+    let gone: std::collections::BTreeSet<&str> = seen
+        .map(String::as_str)
+        .filter(|n| !fresh.contains(*n))
+        .collect();
+    for name in &gone {
+        redis
+            .delete_resolved_model(name)
+            .await
+            .map_err(|e| cache_removal_failed("a model removed during the resync", e))?;
+        redis.publish_invalidation(&format!("model:{name}")).await?;
+    }
+    Ok(gone.len())
+}
+
 /// Republish every model and MCP server from Postgres and evict resolver
 /// entries no enabled row answers to. Returns (models, pruned names, mcp
 /// servers, pruned servers).
@@ -7570,11 +7591,14 @@ async fn resync_models_and_mcp(state: &AdminState) -> Result<(usize, usize, usiz
     for model in &models {
         sync_model(state, model).await?;
     }
+    let listed_names = model_names(&models);
     let pruned_models = state
         .redis
-        .prune_stale_resolved_models(&model_names(&models))
+        .prune_stale_resolved_models(&listed_names)
         .await?;
-    // Same re-read as `resync_all_keys`: restore anything created mid-prune.
+    // Same re-read as `resync_all_keys`: restore anything created mid-prune,
+    // and evict a model deleted or disabled after the list, which was just
+    // republished from its old row and so escaped the prune.
     let fresh_models = state.store.list_models().await?;
     let fresh_names = model_names(&fresh_models);
     for model in &fresh_models {
@@ -7586,12 +7610,12 @@ async fn resync_models_and_mcp(state: &AdminState) -> Result<(usize, usize, usiz
             sync_model(state, model).await?;
         }
     }
-    for name in pruned_models.iter().filter(|n| !fresh_names.contains(*n)) {
-        state
-            .redis
-            .publish_invalidation(&format!("model:{name}"))
-            .await?;
-    }
+    let gone = evict_model_names_gone_since(
+        &state.redis,
+        listed_names.iter().chain(pruned_models.iter()),
+        &fresh_names,
+    )
+    .await?;
 
     let servers = state.store.list_mcp_servers().await?;
     for server in &servers {
@@ -7621,7 +7645,7 @@ async fn resync_models_and_mcp(state: &AdminState) -> Result<(usize, usize, usiz
 
     Ok((
         fresh_models.len(),
-        pruned_models.len(),
+        gone,
         fresh_servers.len(),
         pruned_servers.len(),
     ))
@@ -10476,17 +10500,12 @@ async fn sync_model_from(
     previous: Option<&ModelRoute>,
 ) -> Result<()> {
     // Endpoints carry the per-cluster wire targets and health; the data plane
-    // prefers them over the legacy single api_base/api_key when present.
-    let endpoints = state
-        .store
-        .resolved_endpoints_for(model.id)
-        .await
-        .unwrap_or_default();
-    let knowledge_collections = state
-        .store
-        .model_collection_ids(model.id)
-        .await
-        .unwrap_or_default();
+    // prefers them over the legacy single api_base/api_key when present. A
+    // lookup that fails fails the write: publishing the model with no
+    // endpoints or collections would route it wrongly, with no TTL and no
+    // error, until the next re-warm.
+    let endpoints = state.store.resolved_endpoints_for(model.id).await?;
+    let knowledge_collections = state.store.model_collection_ids(model.id).await?;
     let resolved = resolved_model_of(model, endpoints, knowledge_collections);
     // Aliases and variants the write removed: their keys would otherwise keep
     // resolving to this model forever. Done before the publish so a name moved
@@ -14379,6 +14398,36 @@ mod tests {
         let mut b = status_body(obleth_config::ModelStatus::Deprecated);
         b.note = Some("x".repeat(obleth_config::MAX_LIFECYCLE_NOTE_CHARS + 1));
         assert!(refused(b, None));
+    }
+
+    /// Integration test; runs only with `OBLETH_TEST_REDIS_URL`. A model that
+    /// was listed when the resync began but is gone (or disabled) on the
+    /// re-read is evicted, not left resolving from its old row.
+    #[tokio::test]
+    async fn a_model_gone_during_a_resync_is_evicted() {
+        let Ok(url) = std::env::var("OBLETH_TEST_REDIS_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let redis = RedisStore::connect(&url).await.expect("connect redis");
+        let name = format!("gone-{}", Uuid::new_v4().simple());
+        let kept = format!("kept-{}", Uuid::new_v4().simple());
+        for n in [&name, &kept] {
+            let m = fixture_model_route(n);
+            redis
+                .put_resolved_model(n, &resolved_model_of(&m, Vec::new(), Vec::new()))
+                .await
+                .unwrap();
+        }
+        let seen = [name.clone(), kept.clone()];
+        let fresh: std::collections::HashSet<String> = [kept.clone()].into_iter().collect();
+        let evicted = evict_model_names_gone_since(&redis, seen.iter(), &fresh)
+            .await
+            .unwrap();
+        assert_eq!(evicted, 1);
+        assert!(redis.get_resolved_model(&name).await.unwrap().is_none());
+        assert!(redis.get_resolved_model(&kept).await.unwrap().is_some());
+        redis.delete_resolved_model(&kept).await.unwrap();
     }
 
     #[test]
