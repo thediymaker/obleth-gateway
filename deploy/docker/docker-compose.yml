@@ -40,7 +40,10 @@ services:
     restart: unless-stopped
     # AUTH is always on: the request path reads API keys from Redis, so an
     # unauthenticated instance would let anyone who reaches it mint keys.
-    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?set REDIS_PASSWORD in deploy/docker/.env (copy from .env.example)}"]
+    # Same ceiling and eviction as the chart: TTL entries (response cache,
+    # compression originals, rate-limit windows) are evicted at the ceiling;
+    # keys and routes have no TTL and never are.
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?set REDIS_PASSWORD in deploy/docker/.env (copy from .env.example)}", "--maxmemory", "${REDIS_MAXMEMORY:-400mb}", "--maxmemory-policy", "volatile-lru"]
     environment:
       REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in deploy/docker/.env}
     ports: ["127.0.0.1:6379:6379"]
@@ -235,13 +238,9 @@ services:
   # absent or unreachable, so obleth must NOT depend on this service.
   compressor:
     profiles: ["compressor"]
-    # Tagged separately from the other first-party images: the edge build
-    # (docker.yml) skips this component because baking the ONNX model is slow,
-    # so an edge tag like :dev exists for every image EXCEPT this one. Pinning
-    # it independently lets OBLETH_VERSION track edge without breaking the pull
-    # here. Release tags (vX.Y.Z, latest) cover all five components, so set
-    # OBLETH_COMPRESSOR_VERSION to match OBLETH_VERSION for release deploys.
-    image: ghcr.io/thediymaker/obleth-gateway/obleth-compressor:${OBLETH_COMPRESSOR_VERSION:-latest}
+    # Follows OBLETH_VERSION like every other first-party image (release and
+    # edge builds publish all five); OBLETH_COMPRESSOR_VERSION pins it apart.
+    image: ghcr.io/thediymaker/obleth-gateway/obleth-compressor:${OBLETH_COMPRESSOR_VERSION:-${OBLETH_VERSION:-latest}}
     build:
       context: ../..
       dockerfile: deploy/docker/obleth-compressor.Dockerfile

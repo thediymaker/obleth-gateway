@@ -1,21 +1,33 @@
 # Releasing obleth-gateway
 
 Releases are **lockstep**: one `vX.Y.Z` git tag publishes everything together —
-the `obleth`, `control-plane`, and `benchmark-backend` Docker images
-(multi-arch, to `ghcr.io/thediymaker/obleth-gateway/*`), the Helm chart (OCI, to
-`ghcr.io/thediymaker/charts/obleth`), and a GitHub Release with auto-generated
-notes. There are no separate frontend/backend versions.
+the five Docker images (`obleth`, `obleth-provisioner`, `control-plane`,
+`benchmark-backend`, `obleth-compressor`; multi-arch, to
+`ghcr.io/thediymaker/obleth-gateway/*`), the Helm chart (OCI, to
+`ghcr.io/thediymaker/charts/obleth`), and a GitHub Release whose notes are the
+version's `## vX.Y.Z` section of `CHANGELOG.md`. There are no separate
+frontend/backend versions.
 
 ## Cutting a release
 
+Work is integrated on `dev` (see Edge builds) and a release is cut from
+`main`, so a release starts by promoting `dev`.
+
 ```bash
-# 1. Bump the version everywhere it is declared (Cargo.toml x2, package.json,
+# 1. On dev: write the release's notes as a `## vX.Y.Z` section at the top of
+#    CHANGELOG.md (the release job publishes that section as the GitHub
+#    Release notes; without one it falls back to generated notes), then bump
+#    the version everywhere it is declared (Cargo.toml x2, package.json,
 #    Chart.yaml) and refresh the lockfiles. This is the only sanctioned way.
 bash scripts/bump-version.sh 0.3.0
-
-# 2. Commit and tag.
-git add -A
+git add CHANGELOG.md obleth/Cargo.toml obleth/Cargo.lock \
+  benchmark-backend/Cargo.toml benchmark-backend/Cargo.lock \
+  control-plane/package.json deploy/k8s/obleth/Chart.yaml
 git commit -m "release: v0.3.0"
+git push origin dev
+
+# 2. Promote dev to main (fast-forward) and tag the release there.
+git checkout main && git merge --ff-only dev
 git tag v0.3.0
 git push origin main v0.3.0
 ```
@@ -41,7 +53,9 @@ Pushing the tag triggers `.github/workflows/release.yml`, which:
 3. **manifest** — merges them into multi-arch `:vX.Y.Z` and `:latest` tags.
 4. **helm** — packages and pushes the chart to
    `oci://ghcr.io/thediymaker/charts/obleth`.
-5. **release** — creates the GitHub Release with generated notes.
+5. **release** — creates the GitHub Release, with the version's
+   `CHANGELOG.md` section as its notes (generated notes only when there is
+   no such section).
 
 ## Release candidates
 
@@ -70,9 +84,11 @@ toward a release.
 
 - [ ] After the first publish, set each GHCR package to **public** (GitHub →
       profile → Packages → package → Package settings → Change visibility):
-      `obleth-gateway/obleth`, `obleth-gateway/control-plane`,
-      `obleth-gateway/benchmark-backend`, and `charts/obleth`. They default to
-      private and unauthenticated pulls 403 until flipped.
+      `obleth-gateway/obleth`, `obleth-gateway/obleth-provisioner`,
+      `obleth-gateway/control-plane`, `obleth-gateway/benchmark-backend`,
+      `obleth-gateway/obleth-compressor`, and `charts/obleth`. They default to
+      private and unauthenticated pulls 403 until flipped; an install with
+      `provisioner.enabled` or `compressor.enabled` cannot pull a private one.
 - [ ] Verify `docker pull ghcr.io/thediymaker/obleth-gateway/obleth:latest`
       works logged out.
 - [ ] Verify the dashboard Settings → About shows the gateway as "Latest".

@@ -1,9 +1,10 @@
 name: release
 
 # Pushing a vX.Y.Z tag publishes everything in lockstep: multi-arch images for
-# the three components to GHCR, the Helm chart as an OCI artifact, and a
-# GitHub Release. Prerelease tags (vX.Y.Z-rc.N) publish images + chart but
-# skip the :latest tag and mark the release as a prerelease.
+# the five components to GHCR, the Helm chart as an OCI artifact, and a
+# GitHub Release whose notes are the version's CHANGELOG.md section (generated
+# notes when there is none). Prerelease tags (vX.Y.Z-rc.N) publish images +
+# chart but skip the :latest tag and mark the release as a prerelease.
 on:
   push:
     tags: ["v*.*.*"]
