@@ -5,12 +5,24 @@ import { useQuery } from "@tanstack/react-query";
 import type { CapacityDiscoveryView, FairshareHistoryPoint, FairshareLiveView, ModelRoute } from "@/lib/obleth";
 import { appendHistoryTail, buildHistoryChart, fetchHistory } from "@/lib/fairshare-model";
 
+/** How often the Fairshare pages poll the scheduler: the gateway samples every 2 s. */
 export const FAIRSHARE_POLL_MS = 2000;
+/** How often every other page polls it, for a load column or one tenant's row:
+ * each poll reads every tenant, key, model and endpoint from Postgres. */
+export const FAIRSHARE_LIST_POLL_MS = 15_000;
 const ROUTES_POLL_MS = 30_000;
 const DISCOVERY_POLL_MS = 5_000;
 const THROUGHPUT_POLL_MS = 15_000;
 
-export function useFairshareLive() {
+/** The scheduler's live view. Every page shares the one query, and react-query
+ * polls at the shortest interval among the pages that are open, so the Fairshare
+ * pages (which ask for FAIRSHARE_POLL_MS) keep their 2 s and a list page on its
+ * own polls slowly. `select` narrows the result so a page that needs one row
+ * does not re-render when the rest of the view changes. */
+export function useFairshareLive<T = FairshareLiveView>({
+  intervalMs = FAIRSHARE_LIST_POLL_MS,
+  select,
+}: { intervalMs?: number; select?: (view: FairshareLiveView) => T } = {}) {
   return useQuery({
     queryKey: ["fairshare-live"],
     queryFn: async () => {
@@ -18,7 +30,8 @@ export function useFairshareLive() {
       if (!res.ok) throw new Error("fairshare unavailable");
       return (await res.json()) as FairshareLiveView;
     },
-    refetchInterval: FAIRSHARE_POLL_MS,
+    refetchInterval: intervalMs,
+    select,
   });
 }
 

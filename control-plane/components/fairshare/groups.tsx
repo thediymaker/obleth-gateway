@@ -10,7 +10,7 @@ import type { FairshareGroup, Tenant } from "@/lib/obleth";
 import { GROUP_TONES, OTHER_TONE, groupShares } from "@/lib/fairshare-model";
 import { Meter, Panel, Pill } from "@/components/overview/ui";
 import { cn } from "@/lib/utils";
-import { useFairshareLive } from "./hooks";
+import { FAIRSHARE_POLL_MS, useFairshareLive } from "./hooks";
 
 const pct = (n: number) => `${Math.round(n * 100)}%`;
 
@@ -22,7 +22,7 @@ const pct = (n: number) => `${Math.round(n * 100)}%`;
 export function FairshareGroups({ groups, tenants }: { groups: FairshareGroup[]; tenants: Tenant[] }) {
   const queryClient = useQueryClient();
   const router = useRouter();
-  const live = useFairshareLive();
+  const live = useFairshareLive({ intervalMs: FAIRSHARE_POLL_MS });
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [open, setOpen] = useState<string | null>(null);
   const [errors, setErrors] = useState<string[]>([]);

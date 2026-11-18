@@ -253,7 +253,8 @@ export function TenantPage({
   const [notice, setNotice] = useState<{ text: string; strong?: boolean } | null>(null);
   const [active, setActive] = useState<NavId>("overview");
   const [dirty, setDirty] = useState<string[]>([]);
-  const fairshare = useFairshareLive();
+  // Only this tenant's row: the rest of the view changing does not re-render the page.
+  const fairshare = useFairshareLive({ select: (view) => view.tenants.find((t) => t.tenant_id === tenant.id) ?? null });
   const overview = useQuery({
     queryKey: ["tenant-overview", tenant.id],
     queryFn: () => getJson<TenantOverviewData>(`/api/live/tenants/${tenant.id}/overview`),
@@ -263,7 +264,7 @@ export function TenantPage({
 
   const usage = budgets.find((b) => b.scope === "tenant" && b.id === tenant.id);
   const budget = budgetView(usage);
-  const live = fairshare.data?.tenants.find((t) => t.tenant_id === tenant.id);
+  const live = fairshare.data;
   const share = groupShare(tenants, tenant.id, tenant.fairshare_group, tenant.weight);
   const groupWeight = tenants.filter((t) => t.fairshare_group === tenant.fairshare_group && t.status === "active").reduce((n, t) => n + t.weight, 0);
   const usageByKey = new Map((data?.keys ?? []).map((k) => [k.key_id, k]));
