@@ -1187,30 +1187,39 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_large_argument_streamed_byte_by_byte_joins_in_linear_time() {
+    /// Joins `n` one-byte argument fragments and returns the time it took and
+    /// the joined length.
+    fn join_fragments(n: usize) -> (std::time::Duration, usize) {
         let mut t = StreamTranslator::new("req1", "m");
         t.on_chunk(&json!({ "choices": [{ "delta": { "tool_calls": [
             { "index": 0, "id": "c1", "function": { "name": "write", "arguments": "" } }] } }] }));
+        let fragment = json!({ "choices": [{ "delta": { "tool_calls": [
+            { "index": 0, "function": { "arguments": "x" } }] } }] });
         let started = std::time::Instant::now();
-        for _ in 0..200_000 {
-            t.on_chunk(&json!({ "choices": [{ "delta": { "tool_calls": [
-                { "index": 0, "function": { "arguments": "x" } }] } }] }));
+        for _ in 0..n {
+            t.on_chunk(&fragment);
         }
         let frames = t.finish();
-        // Quadratic joining took seconds here; linear is well under one.
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(3),
-            "{:?}",
-            started.elapsed()
-        );
+        let took = started.elapsed();
         let (_, done) = parse(&frames)
             .into_iter()
             .find(|(e, _)| e == "response.output_item.done")
             .expect("item");
-        assert_eq!(
-            done["item"]["arguments"].as_str().map(str::len),
-            Some(200_000)
+        (took, done["item"]["arguments"].as_str().map_or(0, str::len))
+    }
+
+    #[test]
+    fn a_large_argument_streamed_byte_by_byte_joins_in_linear_time() {
+        let (small, len) = join_fragments(20_000);
+        assert_eq!(len, 20_000);
+        let (large, len) = join_fragments(200_000);
+        assert_eq!(len, 200_000);
+        // Ten times the fragments: about ten times the work when the join is
+        // linear, a hundred times when each fragment re-copies the whole
+        // argument. The margin absorbs a slow or busy runner.
+        assert!(
+            large < small * 30 + std::time::Duration::from_millis(500),
+            "20k: {small:?}, 200k: {large:?}"
         );
     }
 

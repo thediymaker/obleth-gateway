@@ -19,7 +19,7 @@ const client = vi.mocked(obleth);
 
 beforeEach(() => {
   vi.clearAllMocks();
-  client.usage.mockImplementation(async ({ sinceMs }) => [{ tenant_id: "t1", requests: sinceMs === NOW - DAY_MS ? 10 : 25 }] as never);
+  client.usage.mockImplementation(async (filter) => [{ tenant_id: "t1", requests: filter?.sinceMs === NOW - DAY_MS ? 10 : 25 }] as never);
   client.usageLogHistogram.mockResolvedValue({ buckets: [{ errors: 2 }] } as never);
   client.usageLogFacets.mockResolvedValue({ failures: [] } as never);
   client.usageDaily.mockResolvedValue([] as never);
