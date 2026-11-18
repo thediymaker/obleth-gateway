@@ -54,11 +54,11 @@
     },
     {
       "type": "stat",
-      "title": "Telemetry dropped",
+      "title": "Telemetry rows lost (5m)",
       "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
       "gridPos": { "h": 4, "w": 4, "x": 20, "y": 0 },
       "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] } } },
-      "targets": [{ "refId": "A", "expr": "obleth_telemetry_dropped" }]
+      "targets": [{ "refId": "A", "expr": "sum by (stream, outcome) (increase(obleth_telemetry_rows_lost_total[5m]))", "legendFormat": "{{stream}} {{outcome}}" }]
     },
     {
       "type": "timeseries",

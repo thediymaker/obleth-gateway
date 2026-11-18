@@ -966,8 +966,8 @@ async fn metrics_handler(
     state.metrics.set_gauges(
         state.fs.in_flight.load(Ordering::Relaxed) as i64,
         state.fs.queued.load(Ordering::Relaxed),
-        state.tele.dropped.load(Ordering::Relaxed),
     );
+    state.metrics.record_telemetry_losses(&state.tele);
     state
         .metrics
         .set_fairshare_replicas(state.fs.replicas.load(Ordering::Relaxed) as i64);

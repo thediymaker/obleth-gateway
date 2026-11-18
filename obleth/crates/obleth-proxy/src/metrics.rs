@@ -24,7 +24,7 @@ pub struct Metrics {
     fairshare_held: IntGauge,
     fairshare_affinity: IntCounterVec,
     capacity_discovery_models: IntGaugeVec,
-    telemetry_dropped: IntGauge,
+    telemetry_rows_lost: IntCounterVec,
     cache_lookups: IntCounterVec,
     tokens_saved: IntCounter,
     pub(crate) compression_tokens_saved: IntCounter,
@@ -57,14 +57,20 @@ impl Metrics {
         ))
         .unwrap();
         let ttft_ms = Histogram::with_opts(
+            // Up to two minutes: a reasoning model or a cold backend takes
+            // seconds to tens of seconds to the first token, and a quantile
+            // past the last finite bucket reads as that bucket's bound.
             HistogramOpts::new("obleth_ttft_ms", "Time to first token (ms)").buckets(vec![
-                5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0,
+                25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0, 30000.0, 60000.0,
+                120000.0,
             ]),
         )
         .unwrap();
         let total_ms = Histogram::with_opts(
+            // Up to ten minutes, where generations and the request timeout live.
             HistogramOpts::new("obleth_total_ms", "Total request duration (ms)").buckets(vec![
-                10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0, 30000.0,
+                50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0, 30000.0, 60000.0,
+                120000.0, 300000.0, 600000.0,
             ]),
         )
         .unwrap();
@@ -127,10 +133,13 @@ impl Metrics {
             &["state"],
         )
         .unwrap();
-        let telemetry_dropped = IntGauge::with_opts(Opts::new(
-            "obleth_telemetry_dropped",
-            "Telemetry records dropped due to buffer pressure",
-        ))
+        let telemetry_rows_lost = IntCounterVec::new(
+            Opts::new(
+                "obleth_telemetry_rows_lost_total",
+                "Accounting rows that did not reach ClickHouse: dropped (lost) or spilled (written to the WAL, replayed later)",
+            ),
+            &["stream", "outcome"],
+        )
         .unwrap();
         let cache_lookups = IntCounterVec::new(
             Opts::new(
@@ -223,7 +232,7 @@ impl Metrics {
             .register(Box::new(capacity_discovery_models.clone()))
             .unwrap();
         registry
-            .register(Box::new(telemetry_dropped.clone()))
+            .register(Box::new(telemetry_rows_lost.clone()))
             .unwrap();
         registry.register(Box::new(cache_lookups.clone())).unwrap();
         registry.register(Box::new(tokens_saved.clone())).unwrap();
@@ -256,7 +265,7 @@ impl Metrics {
             fairshare_held,
             fairshare_affinity,
             capacity_discovery_models,
-            telemetry_dropped,
+            telemetry_rows_lost,
             cache_lookups,
             tokens_saved,
             compression_tokens_saved,
@@ -307,10 +316,23 @@ impl Metrics {
         self.compression_tokens_saved.inc_by(saved as u64);
     }
 
-    pub fn set_gauges(&self, in_flight: i64, queue_depth: i64, telemetry_dropped: u64) {
+    pub fn set_gauges(&self, in_flight: i64, queue_depth: i64) {
         self.in_flight.set(in_flight);
         self.queue_depth.set(queue_depth);
-        self.telemetry_dropped.set(telemetry_dropped as i64);
+    }
+
+    /// Bring the exported loss counters up to the sink's running totals. The
+    /// ledger only grows, so each scrape adds the difference since the last.
+    pub fn record_telemetry_losses(&self, stats: &obleth_telemetry::TelemetryStats) {
+        for (stream, outcome, total) in stats.losses() {
+            let counter = self
+                .telemetry_rows_lost
+                .with_label_values(&[stream.name(), outcome.name()]);
+            let exported = counter.get();
+            if total > exported {
+                counter.inc_by(total - exported);
+            }
+        }
     }
 
     pub fn set_fairshare_replicas(&self, replicas: i64) {
@@ -406,6 +428,60 @@ mod tests {
         m.record_compression_saved(30);
         // Exposed via the gather/encode path; assert the counter value directly.
         assert_eq!(m.compression_tokens_saved.get(), 150);
+    }
+
+    #[test]
+    fn long_requests_land_in_finite_buckets() {
+        let m = Metrics::new();
+        m.ttft_ms.observe(12_000.0);
+        m.total_ms.observe(45_000.0);
+        let text = m.encode();
+        assert!(
+            text.contains("obleth_ttft_ms_bucket{le=\"30000\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("obleth_total_ms_bucket{le=\"60000\"} 1"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn telemetry_losses_render_as_counters_that_only_grow() {
+        use obleth_telemetry::{Outcome, Stream, TelemetryStats};
+        let m = Metrics::new();
+        let stats = TelemetryStats::default();
+        stats.lose(Stream::Usage, Outcome::Spilled, 3);
+        stats.lose(Stream::Spans, Outcome::Dropped, 2);
+        m.record_telemetry_losses(&stats);
+        // A second scrape with unchanged totals adds nothing.
+        m.record_telemetry_losses(&stats);
+        let text = m.encode();
+        assert!(
+            text.contains("# TYPE obleth_telemetry_rows_lost_total counter"),
+            "{text}"
+        );
+        let value = |stream: &str, outcome: &str| {
+            text.lines()
+                .find(|l| {
+                    l.starts_with("obleth_telemetry_rows_lost_total{")
+                        && l.contains(stream)
+                        && l.contains(outcome)
+                })
+                .map(|l| l.rsplit(' ').next().unwrap().to_string())
+        };
+        assert_eq!(
+            value("stream=\"usage\"", "outcome=\"spilled\"").as_deref(),
+            Some("3")
+        );
+        assert_eq!(
+            value("stream=\"spans\"", "outcome=\"dropped\"").as_deref(),
+            Some("2")
+        );
+        assert_eq!(
+            value("stream=\"usage\"", "outcome=\"dropped\"").as_deref(),
+            Some("0")
+        );
     }
 
     #[test]
