@@ -106,7 +106,11 @@ async fn handle(
         crate::lifecycle::Gate::Redirect(next, _) => next,
         crate::lifecycle::Gate::Refuse(resp, _) => return resp,
     };
-    if !permitted(&resolved, &route, name) {
+    if !crate::proxy::model_permitted(
+        &resolved,
+        &route,
+        crate::proxy::variant_called(&route, name),
+    ) {
         return error_json(StatusCode::FORBIDDEN, "model not permitted for tenant");
     }
     let Some(target) = build_targets(Some(&route), &state.upstream_base, "failover", "")
@@ -133,17 +137,6 @@ fn speech_model_usable(route: &ResolvedModel) -> Result<(), (StatusCode, String)
         return Err((StatusCode::FORBIDDEN, "model is disabled".into()));
     }
     Ok(())
-}
-
-/// The tenant allowlist, which names a model by its own name or the name the
-/// caller used (an alias or variant given on its own).
-fn permitted(resolved: &ResolvedKey, route: &ResolvedModel, requested: &str) -> bool {
-    resolved.internal
-        || resolved.allowed_models.as_deref().is_none_or(|allowed| {
-            allowed
-                .iter()
-                .any(|m| m == &route.model_name || m == requested)
-        })
 }
 
 /// Ask the model's server for its voices and pass its answer through: status,
@@ -256,23 +249,40 @@ mod tests {
         );
     }
 
+    /// The voices call applies the same allowlist rule as the pipeline (see
+    /// `proxy::model_permitted`): the model's name covers its aliases and
+    /// variants, a variant's own name covers that variant, an alias grants
+    /// nothing.
     #[test]
-    fn the_allowlist_takes_the_model_or_the_name_called() {
-        let route = speech_route();
+    fn the_allowlist_rule_is_the_pipelines() {
+        use crate::proxy::{model_permitted, variant_called};
+        let mut route = speech_route();
+        route.aliases = vec!["reader-alias".into()];
+        route.variants = vec![obleth_config::ModelVariant {
+            name: "reader-fast".into(),
+            description: String::new(),
+            boons: vec![],
+        }];
+        let permitted = |key: &ResolvedKey, requested: &str| {
+            model_permitted(key, &route, variant_called(&route, requested))
+        };
         let mut key = crate::boons::test_support::test_key();
         key.internal = false;
         key.allowed_models = None;
-        assert!(permitted(&key, &route, "reader"));
-
+        assert!(permitted(&key, "reader"));
         key.allowed_models = Some(vec!["reader".into()]);
-        assert!(permitted(&key, &route, "reader-alias"));
+        assert!(permitted(&key, "reader-alias") && permitted(&key, "reader-fast"));
+        key.allowed_models = Some(vec!["reader-fast".into()]);
+        assert!(permitted(&key, "reader-fast") && !permitted(&key, "reader"));
         key.allowed_models = Some(vec!["reader-alias".into()]);
-        assert!(permitted(&key, &route, "reader-alias"));
+        assert!(
+            !permitted(&key, "reader-alias"),
+            "an alias on the list grants nothing"
+        );
         key.allowed_models = Some(vec!["other".into()]);
-        assert!(!permitted(&key, &route, "reader"));
-
+        assert!(!permitted(&key, "reader"));
         key.internal = true;
-        assert!(permitted(&key, &route, "reader"));
+        assert!(permitted(&key, "reader"));
     }
 
     #[test]

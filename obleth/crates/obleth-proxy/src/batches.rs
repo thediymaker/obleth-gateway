@@ -1163,14 +1163,18 @@ async fn create(
     if let Err(errors) = checked {
         return fail_batch(batches, &new, errors).await;
     }
-    // The model must exist and be open to the caller now; each request is
-    // checked again by the pipeline when it runs.
-    let known = crate::proxy::resolve_model(state, &model_name)
-        .await
-        .is_some();
-    let allowed =
-        crate::proxy::model_visible(crate::proxy::allowed_models_for(resolved), &model_name);
-    if !known || !allowed {
+    // The model must exist and be open to the caller now, by the pipeline's
+    // own rule (an alias or a variant resolves like a request would); each
+    // request is checked again by the pipeline when it runs.
+    let route = crate::proxy::resolve_model(state, &model_name).await;
+    let allowed = route.as_deref().is_some_and(|route| {
+        crate::proxy::model_permitted(
+            resolved,
+            route,
+            crate::proxy::variant_called(route, &model_name),
+        )
+    });
+    if !allowed {
         return fail_batch(batches, &new, vec![serde_json::json!({
             "code": "model_not_found",
             "message": format!("model {model_name:?} does not exist or is not available to this key"),

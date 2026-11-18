@@ -113,10 +113,13 @@ pub async fn tools(
         Ok((resolved, _)) => resolved,
         Err(resp) => return resp,
     };
-    let data: Vec<Value> = tool_names(&state.model_registry.load(), allowed_for(&resolved))
-        .into_iter()
-        .map(|name| json!({ "search_tool_name": name, "search_provider": "searxng" }))
-        .collect();
+    let data: Vec<Value> = tool_names(
+        &state.model_registry.load(),
+        crate::proxy::allowed_models_for(&resolved),
+    )
+    .into_iter()
+    .map(|name| json!({ "search_tool_name": name, "search_provider": "searxng" }))
+    .collect();
     (
         StatusCode::OK,
         axum::Json(json!({ "object": "list", "data": data })),
@@ -344,16 +347,6 @@ async fn handle(
     resp
 }
 
-/// The model allowlist that bounds what a caller may search with, or `None`
-/// when it may use everything (internal callers, tenants without a list).
-fn allowed_for(resolved: &ResolvedKey) -> Option<&[String]> {
-    if resolved.internal {
-        None
-    } else {
-        resolved.allowed_models.as_deref()
-    }
-}
-
 /// The enabled search tools a caller may use, sorted. A retired tool is not
 /// one: it would only answer 410. A staged tool is not listed either, and so
 /// is never the default; it answers only when named.
@@ -382,7 +375,10 @@ async fn pick_tool(
     let name = match name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()) {
         Some(name) => name,
         None => {
-            let names = tool_names(&state.model_registry.load(), allowed_for(resolved));
+            let names = tool_names(
+                &state.model_registry.load(),
+                crate::proxy::allowed_models_for(resolved),
+            );
             match <[String; 1]>::try_from(names) {
                 Ok([only]) => only,
                 Err(names) if names.is_empty() => {
@@ -425,13 +421,15 @@ async fn pick_tool(
         crate::lifecycle::Gate::Redirect(next, _) => next,
         crate::lifecycle::Gate::Refuse(resp, _) => return Err(resp),
     };
-    if let Some(allowed) = allowed_for(resolved) {
-        if !allowed.iter().any(|m| m == &route.model_name) {
-            return Err(error_json(
-                StatusCode::FORBIDDEN,
-                "model not permitted for tenant",
-            ));
-        }
+    if !crate::proxy::model_permitted(
+        resolved,
+        &route,
+        crate::proxy::variant_called(&route, &name),
+    ) {
+        return Err(error_json(
+            StatusCode::FORBIDDEN,
+            "model not permitted for tenant",
+        ));
     }
     Ok(route)
 }

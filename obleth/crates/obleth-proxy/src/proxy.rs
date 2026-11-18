@@ -1820,17 +1820,12 @@ async fn run_pipeline(
         return error_json(StatusCode::NOT_FOUND, "unknown endpoint");
     }
     // ---- per-tenant model allowlist (Phase 4) ----
-    // A variant is allowed by its parent's name, as an alias is, or by its
-    // own name, so a tenant can be given the variant alone.
-    if !resolved.internal {
-        if let Some(allowed) = &resolved.allowed_models {
-            if !allowed
-                .iter()
-                .any(|m| m == &model || variant.as_deref() == Some(m.as_str()))
-            {
-                return error_json(StatusCode::FORBIDDEN, "model not permitted for tenant");
-            }
-        }
+    let permitted = match route.as_deref() {
+        Some(route) => model_permitted(&resolved, route, variant.as_deref()),
+        None => model_visible(allowed_models_for(&resolved), &model),
+    };
+    if !permitted {
+        return error_json(StatusCode::FORBIDDEN, "model not permitted for tenant");
     }
 
     // ---- request fields the model refuses ----
@@ -5757,6 +5752,34 @@ pub(crate) fn model_visible(allowed: Option<&[String]>, model_name: &str) -> boo
     allowed.is_none_or(|list| list.iter().any(|m| m == model_name))
 }
 
+/// `requested`, when it names one of `route`'s variants rather than the
+/// model itself or an alias.
+pub(crate) fn variant_called<'a>(route: &ResolvedModel, requested: &'a str) -> Option<&'a str> {
+    route
+        .variants
+        .iter()
+        .any(|v| v.name == requested)
+        .then_some(requested)
+}
+
+/// Whether the caller may use `route`, served as `variant` when one was
+/// named. A tenant's allowlist names a model by its own name, which covers
+/// its aliases and variants, or a variant by the variant's name, so a tenant
+/// can be given the variant alone; an alias on the list grants nothing.
+/// Internal callers and tenants without a list may use everything. The one
+/// rule for the pipeline, search, speech and batches.
+pub(crate) fn model_permitted(
+    resolved: &ResolvedKey,
+    route: &ResolvedModel,
+    variant: Option<&str>,
+) -> bool {
+    allowed_models_for(resolved).is_none_or(|allowed| {
+        allowed
+            .iter()
+            .any(|m| m == &route.model_name || variant == Some(m.as_str()))
+    })
+}
+
 /// The OpenAI `{object:"list", data:[…]}` listing for a registry snapshot,
 /// sorted by id and limited to `allowed` when set. Pure, so the shape is
 /// unit-testable without a registry.
@@ -7672,6 +7695,7 @@ mod tests {
         tenant_active_now, MultipartField, RequestMeta, TooLong, END_USER_HEADER,
         REGISTERED_MODEL_PATHS, SEED_CAP,
     };
+    use super::{model_permitted, variant_called};
     use crate::router::{BoonGrants, Candidate, Intent, RequestFeatures, RouterWeights};
     use axum::body::{Body, Bytes};
     use axum::http::{header, HeaderMap, Method, Response, StatusCode};
@@ -8820,6 +8844,43 @@ mod tests {
             boons: vec!["speculation".into()],
         }];
         c
+    }
+
+    #[test]
+    fn model_permitted_by_its_name_or_a_variants_own_name() {
+        let mut route = crate::boons::test_support::test_route();
+        route.model_name = "glm-5-3".into();
+        route.aliases = vec!["glm".into()];
+        route.variants = vec![obleth_config::ModelVariant {
+            name: "glm-5-3-spec".into(),
+            description: String::new(),
+            boons: vec![],
+        }];
+        let mut key = crate::boons::test_support::test_key();
+        key.internal = false;
+        let check = |list: Option<Vec<&str>>, requested: &str| {
+            let mut key = key.clone();
+            key.allowed_models = list.map(|l| l.into_iter().map(String::from).collect());
+            model_permitted(&key, &route, variant_called(&route, requested))
+        };
+        // No list: everything.
+        assert!(check(None, "glm-5-3"));
+        // The model's name covers the model, its alias and its variant.
+        assert!(check(Some(vec!["glm-5-3"]), "glm-5-3"));
+        assert!(check(Some(vec!["glm-5-3"]), "glm"));
+        assert!(check(Some(vec!["glm-5-3"]), "glm-5-3-spec"));
+        // A variant's name covers only that variant.
+        assert!(check(Some(vec!["glm-5-3-spec"]), "glm-5-3-spec"));
+        assert!(!check(Some(vec!["glm-5-3-spec"]), "glm-5-3"));
+        // An alias, a family name or an unlisted model grant nothing.
+        assert!(!check(Some(vec!["glm"]), "glm"));
+        assert!(!check(Some(vec!["glm-family"]), "glm-5-3"));
+        assert!(!check(Some(vec!["other"]), "glm-5-3"));
+        // Internal callers see everything.
+        let mut internal = key.clone();
+        internal.internal = true;
+        internal.allowed_models = Some(vec!["other".into()]);
+        assert!(model_permitted(&internal, &route, None));
     }
 
     #[test]
