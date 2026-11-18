@@ -427,7 +427,7 @@ services:
     depends_on:
       redis: { condition: service_healthy }
 
-  # OTLP trace collector + UI. Set OBLETH_OTEL_ENDPOINT=http://jaeger:4317 (see
+  # OTLP trace collector + UI. Set OBLETH_OTEL_ENDPOINT=http://jaeger:4318 (see
   # .env.example) so obleth exports spans here. UI on http://localhost:16686.
   jaeger:
     profiles: ["observability"]

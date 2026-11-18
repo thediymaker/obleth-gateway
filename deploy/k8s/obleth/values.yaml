@@ -107,7 +107,10 @@ obleth:
   # blockPrivateNetworks is true — then list trusted ranges, e.g. "10.0.0.0/8".
   allowedPrivateCidrs: ""
   upstreamBaseUrl: ""   # empty -> defaults to the in-chart benchmark fixture backend
-  # OTLP/HTTP trace export endpoint (e.g. http://my-collector:4318). Empty disables.
+  # OTLP/HTTP trace export endpoint (e.g. http://my-collector:4318, the HTTP
+  # port, not gRPC 4317). http:// only: the exporter is built without TLS, so
+  # put a collector beside the gateway and let it forward over TLS. Empty
+  # disables.
   otelEndpoint: ""
   # Slack incoming-webhook alerts. Keep the webhook URL in an external Secret
   # for production chart values.
@@ -461,7 +464,9 @@ clickhouse:
     storageClass: ""
     accessMode: ReadWriteOnce
   external:
-    # e.g. http://my-clickhouse-host:8123
+    # e.g. http://my-clickhouse-host:8123, or https://my-clickhouse-host:8443
+    # when the server's certificate chains to a public root (the Mozilla
+    # bundle built into the gateway); a private CA is not trusted.
     url: ""
 
 benchmarkBackend:
