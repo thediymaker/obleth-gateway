@@ -72,6 +72,29 @@ describe("allowed networks", () => {
     expect(hidden()).toBe("192.0.2.7");
   });
 
+  it("unpresses a network whose ranges were typed on one line with commas", async () => {
+    await act(async () => root.render(<AllowedNetworksField named={named} />));
+    await act(async () => type(area(), "192.0.2.7, 10.0.0.0/8, 203.0.113.0/24, 2001:db8::/48"));
+    expect(chip("Campus").getAttribute("aria-pressed")).toBe("true");
+    await act(async () => chip("Campus").click());
+    expect(chip("Campus").getAttribute("aria-pressed")).toBe("false");
+    expect(area().value).toBe("192.0.2.7");
+    expect(hidden()).toBe("192.0.2.7");
+  });
+
+  it("keeps a chosen network's ranges when it is renamed while the form is open", async () => {
+    const sol = [{ name: "Sol", ranges: ["10.139.120.0/24", "10.139.121.0/24"], ours: true }];
+    await act(async () => root.render(<AllowedNetworksField defaultValue="192.0.2.7" named={sol} />));
+    await act(async () => chip("Sol").click());
+    const renamed = [{ name: "Sol cluster", ranges: sol[0].ranges, ours: true }];
+    await act(async () => root.render(<AllowedNetworksField defaultValue="192.0.2.7" named={renamed} />));
+    expect(chip("Sol cluster").getAttribute("aria-pressed")).toBe("true");
+    expect(hidden()).toBe("10.139.120.0/24\n10.139.121.0/24\n192.0.2.7");
+    await act(async () => root.render(<AllowedNetworksField defaultValue="192.0.2.7" named={[]} />));
+    expect(area().value).toBe("10.139.120.0/24\n10.139.121.0/24\n192.0.2.7");
+    expect(hidden()).toBe("10.139.120.0/24\n10.139.121.0/24\n192.0.2.7");
+  });
+
   it("offers our own networks first", async () => {
     await act(async () => root.render(<AllowedNetworksField named={named} />));
     expect([...host.querySelectorAll("button[aria-pressed]")].map((b) => b.textContent)).toEqual(["Campus", "Cluster pods", "Partner lab"]);

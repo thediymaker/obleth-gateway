@@ -14,34 +14,34 @@ const SHOWN = 24;
 /** Ranges listed in a chip's tooltip. */
 const TIP_RANGES = 12;
 
-type Field = { selected: string[]; other: string };
+/** The chosen networks keep the ranges they had when chosen, so a renamed or removed network drops nothing. */
+type Field = { selected: NamedNetwork[]; other: string };
 
 /** A stored list read as the named networks it holds whole, and the other lines. */
 function splitField(text: string, groups: NamedNetwork[]): Field {
   const { names, rest } = splitAllowedNetworks(networkLines(text), groups);
-  return { selected: names, other: rest.join("\n") };
+  return { selected: groups.filter((g) => names.includes(g.name)), other: rest.join("\n") };
 }
 
-/** Lines of `other` that are not one of these ranges, as typed. */
+/** Lines of `other` that are not one of these ranges, split the way networkLines reads the box. */
 function withoutRanges(other: string, ranges: string[]): string {
   const drop = new Set(ranges.map(rangeKey));
-  return other
-    .split("\n")
+  return networkLines(other)
     .filter((line) => !drop.has(rangeKey(line)))
     .join("\n");
 }
 
 /** What the form submits: each chosen network's ranges, then the other lines as typed (once each). */
-function joinField(field: Field, groups: NamedNetwork[]): string {
-  const ranges = groups.filter((g) => field.selected.includes(g.name)).flatMap((g) => g.ranges);
-  const seen = new Set(ranges.map(rangeKey));
-  const other = networkLines(field.other).filter((line) => {
-    const k = rangeKey(line);
-    if (seen.has(k)) return false;
-    seen.add(k);
-    return true;
-  });
-  return [...ranges, ...other].join("\n");
+function joinField(field: Field): string {
+  const seen = new Set<string>();
+  return [...field.selected.flatMap((g) => g.ranges), ...networkLines(field.other)]
+    .filter((line) => {
+      const k = rangeKey(line);
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    })
+    .join("\n");
 }
 
 /**
@@ -54,13 +54,20 @@ function joinField(field: Field, groups: NamedNetwork[]): string {
 export function AllowedNetworksField({ defaultValue = "", named = [] }: { defaultValue?: string; named?: NamedNetwork[] }) {
   const groups = useMemo(() => oursFirst(named.filter((n) => n.ranges.length > 0)), [named]);
   const [field, setField] = useState<Field>(() => splitField(defaultValue, groups));
+  // When the named networks change under an open form, read the same list
+  // again against the new names, so nothing chosen goes missing.
+  const [readWith, setReadWith] = useState(groups);
+  if (readWith !== groups) {
+    setReadWith(groups);
+    setField((f) => splitField(joinField(f), groups));
+  }
   const [showAll, setShowAll] = useState(false);
 
   const typed = new Set(networkLines(field.other).map(rangeKey));
-  const isOn = (g: NamedNetwork) => field.selected.includes(g.name) || g.ranges.every((r) => typed.has(rangeKey(r)));
+  const isOn = (g: NamedNetwork) => field.selected.some((s) => s.name === g.name) || g.ranges.every((r) => typed.has(rangeKey(r)));
   const toggle = (g: NamedNetwork) =>
     setField((f) => ({
-      selected: isOn(g) ? f.selected.filter((n) => n !== g.name) : [...f.selected, g.name],
+      selected: isOn(g) ? f.selected.filter((s) => s.name !== g.name) : [...f.selected, g],
       other: withoutRanges(f.other, g.ranges),
     }));
 
@@ -70,7 +77,7 @@ export function AllowedNetworksField({ defaultValue = "", named = [] }: { defaul
 
   return (
     <>
-      <input type="hidden" name="allowed_networks" value={joinField(field, groups)} />
+      <input type="hidden" name="allowed_networks" value={joinField(field)} />
       {chips && (
         <TooltipProvider delayDuration={300}>
           <div role="group" aria-label="Named networks" className="flex flex-wrap items-center gap-1.5">
