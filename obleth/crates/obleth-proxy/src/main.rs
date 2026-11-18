@@ -27,6 +27,7 @@ mod search;
 mod speech;
 mod state;
 mod sticky;
+mod tool_slots;
 mod upstream_failure;
 mod verdicts;
 

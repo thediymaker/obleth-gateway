@@ -482,10 +482,7 @@ pub(crate) struct AnthropicStreamTranslator {
     /// until its `name` is known, so fragments that arrive before the name
     /// does are buffered in `pending_args` rather than opening a block with
     /// an empty name Anthropic has no way to amend later.
-    tools: Vec<ToolSlot>,
-    /// Maps an upstream `tool_calls[].index` to its slot, for upstreams that
-    /// send one.
-    tool_index_slots: std::collections::HashMap<u64, usize>,
+    tools: crate::tool_slots::ToolSlots<ToolSlot>,
     /// The slot currently open (started, not yet stopped), if any. At most
     /// one at a time: opening a new tool key closes it first.
     open_tool_slot: Option<usize>,
@@ -521,6 +518,12 @@ struct ToolSlot {
     closed: bool,
 }
 
+impl crate::tool_slots::Slot for ToolSlot {
+    fn id(&self) -> Option<&str> {
+        self.id.as_deref()
+    }
+}
+
 impl AnthropicStreamTranslator {
     pub(crate) fn new(ctx: ResponseContext) -> Self {
         Self {
@@ -529,8 +532,7 @@ impl AnthropicStreamTranslator {
             done: false,
             next_index: 0,
             open: None,
-            tools: Vec::new(),
-            tool_index_slots: Default::default(),
+            tools: Default::default(),
             open_tool_slot: None,
             input_tokens: None,
             cached_input_tokens: 0,
@@ -623,45 +625,6 @@ impl AnthropicStreamTranslator {
         index
     }
 
-    /// Match a `tool_calls[]` fragment to its slot, returning the slot and
-    /// whether it was just created. Most upstreams send `index`; ones that
-    /// omit it (older Ollama, some llama.cpp builds) send each call whole
-    /// with only `id`, so a fragment with a new, non-empty `id` starts a new
-    /// slot, and one with neither `index` nor `id` continues whatever was
-    /// most recently opened.
-    fn resolve_tool_slot(&mut self, call: &Value) -> (usize, bool) {
-        if let Some(idx) = call.get("index").and_then(Value::as_u64) {
-            if let Some(&slot) = self.tool_index_slots.get(&idx) {
-                return (slot, false);
-            }
-            let slot = self.tools.len();
-            self.tools.push(ToolSlot::default());
-            self.tool_index_slots.insert(idx, slot);
-            return (slot, true);
-        }
-        if let Some(id) = call
-            .get("id")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-        {
-            if self
-                .tools
-                .last()
-                .is_some_and(|t| t.id.as_deref() == Some(id))
-            {
-                return (self.tools.len() - 1, false);
-            }
-            let slot = self.tools.len();
-            self.tools.push(ToolSlot::default());
-            return (slot, true);
-        }
-        if self.tools.is_empty() {
-            self.tools.push(ToolSlot::default());
-            return (0, true);
-        }
-        (self.tools.len() - 1, false)
-    }
-
     /// Feed one parsed `chat.completion.chunk`. Never logs its content.
     pub(crate) fn on_chunk(&mut self, chunk: &Value) -> Vec<String> {
         if self.done {
@@ -736,7 +699,7 @@ impl AnthropicStreamTranslator {
     /// buffer its arguments while the name is still unknown, or forward the
     /// delta directly once the block is open.
     fn absorb_tool_call(&mut self, call: &Value, out: &mut Vec<String>) {
-        let (slot, is_new) = self.resolve_tool_slot(call);
+        let (slot, is_new) = self.tools.resolve(call);
         if is_new {
             // A new tool call begins: text/thinking and any prior tool
             // block are done.

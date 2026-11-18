@@ -286,7 +286,7 @@ async fn responses_shim(
     if !resp.status().is_success() {
         return resp;
     }
-    if streaming {
+    if should_translate_as_stream(streaming, resp.headers()) {
         translate_response_stream(resp, request_id, model)
     } else {
         translate_response_body(resp, request_id).await
@@ -295,25 +295,12 @@ async fn responses_shim(
 
 /// Buffer a translated chat reply and hand back the Responses object.
 async fn translate_response_body(resp: Response<Body>, request_id: Uuid) -> Response<Body> {
-    let (parts, body) = resp.into_parts();
-    let Ok(bytes) = axum::body::to_bytes(body, RESPONSES_BODY_MAX).await else {
-        return error_json(StatusCode::BAD_GATEWAY, "upstream response too large");
-    };
-    let Ok(chat) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        // Not JSON: hand it back untouched rather than inventing a shape.
-        return Response::from_parts(parts, Body::from(bytes));
-    };
-    let translated = crate::responses::from_chat_response(&chat, &request_id.to_string());
-    let mut builder = Response::builder().status(parts.status);
-    for (name, value) in parts.headers.iter() {
-        if name != header::CONTENT_LENGTH {
-            builder = builder.header(name, value);
-        }
-    }
-    builder
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(translated.to_string()))
-        .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
+    translate_body(
+        resp,
+        || error_json(StatusCode::BAD_GATEWAY, "upstream response too large"),
+        |chat| crate::responses::from_chat_response(chat, &request_id.to_string()),
+    )
+    .await
 }
 
 /// Re-emit a chat SSE stream as Responses events, frame by frame.
@@ -322,18 +309,96 @@ fn translate_response_stream(
     request_id: Uuid,
     model: String,
 ) -> Response<Body> {
+    translate_stream(
+        resp,
+        crate::responses::StreamTranslator::new(&request_id.to_string(), &model),
+    )
+}
+
+/// A shim's stream translator as the shared driver sees it: chat chunks in,
+/// frames of the shim's own event format out.
+trait StreamShim: Send + 'static {
+    fn on_chunk(&mut self, chunk: &serde_json::Value) -> Vec<String>;
+    /// A heartbeat while the upstream is silent.
+    fn ping(&mut self) -> Vec<String>;
+    /// Close a stream whose upstream broke off; `finish` is a no-op after it.
+    fn fail(&mut self, message: &str) -> Vec<String>;
+    fn finish(&mut self) -> Vec<String>;
+}
+
+impl StreamShim for crate::responses::StreamTranslator {
+    fn on_chunk(&mut self, chunk: &serde_json::Value) -> Vec<String> {
+        self.on_chunk(chunk)
+    }
+    fn ping(&mut self) -> Vec<String> {
+        self.ping()
+    }
+    fn fail(&mut self, message: &str) -> Vec<String> {
+        self.fail(message)
+    }
+    fn finish(&mut self) -> Vec<String> {
+        self.finish()
+    }
+}
+
+impl StreamShim for crate::messages::AnthropicStreamTranslator {
+    fn on_chunk(&mut self, chunk: &serde_json::Value) -> Vec<String> {
+        self.on_chunk(chunk)
+    }
+    fn ping(&mut self) -> Vec<String> {
+        self.ping()
+    }
+    fn fail(&mut self, message: &str) -> Vec<String> {
+        self.fail("api_error", message)
+    }
+    fn finish(&mut self) -> Vec<String> {
+        self.finish()
+    }
+}
+
+/// Interval on which an idle translated stream gets a heartbeat. The driver
+/// below exists only once `proxy_handler_inner` has already returned a
+/// streaming response, so it covers gaps between upstream chunks (e.g. a slow
+/// decode) — it starts nothing early and cannot cover an admission queue wait
+/// or buffered-boon work, which both happen before this function is even called.
+const STREAM_PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Re-emit a chat SSE stream through `translator`, frame by frame, with a
+/// heartbeat while the upstream is silent. Shared by the Responses and
+/// Messages shims so a fix on one surface is a fix on both.
+fn translate_stream<T: StreamShim>(resp: Response<Body>, translator: T) -> Response<Body> {
+    translate_stream_with(resp, translator, STREAM_PING_INTERVAL)
+}
+
+fn translate_stream_with<T: StreamShim>(
+    resp: Response<Body>,
+    mut translator: T,
+    ping_interval: std::time::Duration,
+) -> Response<Body> {
     let (parts, body) = resp.into_parts();
-    let id = request_id.to_string();
     let stream = async_stream::stream! {
-        let mut translator = crate::responses::StreamTranslator::new(&id, &model);
         let mut upstream = body.into_data_stream();
         // Bytes in, complete lines out — see `drain_sse_data_lines` for why
         // the split happens on bytes rather than decoded text.
         let mut buffer: Vec<u8> = Vec::new();
-        while let Some(item) = upstream.next().await {
+        loop {
+            let item = match tokio::time::timeout(ping_interval, upstream.next()).await {
+                Ok(item) => item,
+                Err(_) => {
+                    // Silence, not failure: a gap between upstream chunks (a
+                    // slow decode step) is not itself an error. The heartbeat
+                    // keeps the client's own idle timeout from firing while
+                    // the upstream is still working.
+                    for frame in translator.ping() {
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+                    }
+                    continue;
+                }
+            };
+            let Some(item) = item else { break };
             let Ok(chunk) = item else {
                 // The pipeline aborts its body when the upstream stream
-                // breaks; say so instead of closing with `completed`.
+                // breaks; say so instead of closing as complete.
                 for frame in translator.fail("upstream stream ended before the response finished") {
                     yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
                 }
@@ -350,20 +415,53 @@ fn translate_response_stream(
                 }
             }
         }
+        // `fail` followed by `finish` is safe: `finish` is a no-op once `fail`
+        // has closed the translator.
         for frame in translator.finish() {
             yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
         }
     };
-    let mut builder = Response::builder().status(parts.status);
-    for (name, value) in parts.headers.iter() {
-        if name != header::CONTENT_LENGTH && name != header::CONTENT_TYPE {
-            builder = builder.header(name, value);
-        }
-    }
-    builder
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .body(Body::from_stream(stream))
-        .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
+    translated_response(parts, "text/event-stream", Body::from_stream(stream))
+}
+
+/// Buffer a chat reply and hand back `translate` of it. A body that is not JSON
+/// goes back untouched rather than dressed in an invented shape.
+async fn translate_body(
+    resp: Response<Body>,
+    too_large: impl FnOnce() -> Response<Body>,
+    translate: impl FnOnce(&serde_json::Value) -> serde_json::Value,
+) -> Response<Body> {
+    let (parts, body) = resp.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, RESPONSES_BODY_MAX).await else {
+        return too_large();
+    };
+    let Ok(chat) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Response::from_parts(parts, Body::from(bytes));
+    };
+    let translated = translate(&chat);
+    translated_response(
+        parts,
+        "application/json",
+        Body::from(translated.to_string()),
+    )
+}
+
+/// The pipeline's response with its body replaced: the status and headers
+/// stay (request id, rate limits), the length no longer applies, and there
+/// is exactly one Content-Type.
+fn translated_response(
+    parts: http::response::Parts,
+    content_type: &'static str,
+    body: Body,
+) -> Response<Body> {
+    let mut resp = Response::from_parts(parts, body);
+    let headers = resp.headers_mut();
+    headers.remove(header::CONTENT_LENGTH);
+    headers.insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static(content_type),
+    );
+    resp
 }
 
 /// Anthropic-shaped error response. Status and `Retry-After` are the
@@ -869,33 +967,13 @@ async fn translate_messages_body(
     resp: Response<Body>,
     ctx: crate::messages::ResponseContext,
 ) -> Response<Body> {
-    let (parts, body) = resp.into_parts();
-    let Ok(bytes) = axum::body::to_bytes(body, RESPONSES_BODY_MAX).await else {
-        return anthropic_error(StatusCode::BAD_GATEWAY, "upstream response too large", None);
-    };
-    let Ok(chat) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        // Not JSON: hand it back untouched rather than inventing a shape.
-        return Response::from_parts(parts, Body::from(bytes));
-    };
-    let translated = crate::messages::from_chat_response(&chat, &ctx);
-    let mut builder = Response::builder().status(parts.status);
-    for (name, value) in parts.headers.iter() {
-        if name != header::CONTENT_LENGTH && name != header::CONTENT_TYPE {
-            builder = builder.header(name, value);
-        }
-    }
-    builder
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(translated.to_string()))
-        .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
+    translate_body(
+        resp,
+        || anthropic_error(StatusCode::BAD_GATEWAY, "upstream response too large", None),
+        |chat| crate::messages::from_chat_response(chat, &ctx),
+    )
+    .await
 }
-
-/// Interval on which an idle Messages stream gets a `ping` frame. This loop
-/// exists only once `proxy_handler_inner` has already returned a streaming
-/// response, so it covers gaps between upstream chunks (e.g. a slow decode)
-/// — it starts nothing early and cannot cover an admission queue wait or
-/// buffered-boon work, which both happen before this function is even called.
-const MESSAGES_PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Re-emit a chat SSE stream as Anthropic Messages events, frame by frame,
 /// with a `ping` heartbeat while the upstream is silent.
@@ -903,58 +981,7 @@ fn translate_messages_stream(
     resp: Response<Body>,
     ctx: crate::messages::ResponseContext,
 ) -> Response<Body> {
-    let (parts, body) = resp.into_parts();
-    let stream = async_stream::stream! {
-        let mut translator = crate::messages::AnthropicStreamTranslator::new(ctx);
-        let mut upstream = body.into_data_stream();
-        let mut buffer: Vec<u8> = Vec::new();
-        loop {
-            let item = match tokio::time::timeout(MESSAGES_PING_INTERVAL, upstream.next()).await {
-                Ok(item) => item,
-                Err(_) => {
-                    // Silence, not failure: a gap between upstream chunks (a
-                    // slow decode step) is not itself an error. Sending a
-                    // `ping` is what keeps the client's own idle timeout from
-                    // firing while the upstream is still working.
-                    for frame in translator.ping() {
-                        yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
-                    }
-                    continue;
-                }
-            };
-            let Some(item) = item else { break };
-            let Ok(chunk) = item else {
-                for frame in translator.fail("api_error", "upstream stream ended before the response finished") {
-                    yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
-                }
-                break;
-            };
-            buffer.extend_from_slice(&chunk);
-            for payload in crate::responses::drain_sse_data_lines(&mut buffer) {
-                if payload == "[DONE]" { continue; }
-                let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload) else { continue };
-                for frame in translator.on_chunk(&value) {
-                    yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
-                }
-            }
-        }
-        // `fail` followed by `finish` is safe on both paths: `finish` is a
-        // no-op once `fail` has set the translator's `done` flag.
-        for frame in translator.finish() {
-            yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
-        }
-    };
-    // Same header handling as `translate_response_stream`.
-    let mut builder = Response::builder().status(parts.status);
-    for (name, value) in parts.headers.iter() {
-        if name != header::CONTENT_LENGTH && name != header::CONTENT_TYPE {
-            builder = builder.header(name, value);
-        }
-    }
-    builder
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .body(Body::from_stream(stream))
-        .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
+    translate_stream(resp, crate::messages::AnthropicStreamTranslator::new(ctx))
 }
 
 /// `POST /v1/messages/count_tokens`: the gateway's own estimate of the prompt
@@ -9599,6 +9626,96 @@ mod tests {
         assert!(!should_translate_as_stream(true, &json));
 
         assert!(!should_translate_as_stream(true, &HeaderMap::new()));
+    }
+
+    fn chat_reply(content_type: &str) -> Response<Body> {
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, content_type)
+            .header(header::CONTENT_LENGTH, "999")
+            .header("x-obleth-request-id", "r1")
+            .body(Body::from(
+                r#"{"id":"c","object":"chat.completion","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}"#,
+            ))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_translated_responses_body_carries_exactly_one_content_type() {
+        let out = super::translate_response_body(chat_reply("application/json"), Uuid::nil()).await;
+        let types: Vec<_> = out.headers().get_all(header::CONTENT_TYPE).iter().collect();
+        assert_eq!(types, vec!["application/json"]);
+        assert!(out.headers().get(header::CONTENT_LENGTH).is_none());
+        assert_eq!(out.headers().get("x-obleth-request-id").unwrap(), "r1");
+        let bytes = axum::body::to_bytes(out.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["object"], "response");
+    }
+
+    #[tokio::test]
+    async fn a_stream_request_answered_with_plain_json_gets_a_translated_body() {
+        // The upstream ignored `stream`: the reply is a JSON object, so it is
+        // translated as a body, not fed to the SSE translator as an empty stream.
+        let reply = chat_reply("application/json");
+        assert!(!should_translate_as_stream(true, reply.headers()));
+        let out = super::translate_response_body(reply, Uuid::nil()).await;
+        let bytes = axum::body::to_bytes(out.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["output"][0]["content"][0]["text"], "hi");
+    }
+
+    #[tokio::test]
+    async fn an_idle_upstream_gets_a_heartbeat_on_every_shim() {
+        use futures_util::StreamExt;
+        let interval = std::time::Duration::from_millis(50);
+        for shim in ["responses", "messages"] {
+            let silent = Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from_stream(futures_util::stream::pending::<
+                    Result<Bytes, std::io::Error>,
+                >()))
+                .unwrap();
+            let out = if shim == "responses" {
+                super::translate_stream_with(
+                    silent,
+                    crate::responses::StreamTranslator::new("r", "m"),
+                    interval,
+                )
+            } else {
+                super::translate_stream_with(
+                    silent,
+                    crate::messages::AnthropicStreamTranslator::new(
+                        crate::messages::ResponseContext {
+                            request_id: "r".into(),
+                            model: "m".into(),
+                        },
+                    ),
+                    interval,
+                )
+            };
+            let types: Vec<_> = out.headers().get_all(header::CONTENT_TYPE).iter().collect();
+            assert_eq!(types, vec!["text/event-stream"], "{shim}");
+            let mut body = out.into_body().into_data_stream();
+            // Nothing arrives for 15 s of (paused) time, then the heartbeat.
+            let mut seen = String::new();
+            while !seen.contains(if shim == "responses" {
+                ": keep-alive"
+            } else {
+                "\"type\":\"ping\""
+            }) {
+                let chunk = tokio::time::timeout(std::time::Duration::from_secs(16), body.next())
+                    .await
+                    .expect("a frame within the ping interval")
+                    .expect("stream open")
+                    .unwrap();
+                seen.push_str(std::str::from_utf8(&chunk).unwrap());
+            }
+        }
     }
 
     #[test]
