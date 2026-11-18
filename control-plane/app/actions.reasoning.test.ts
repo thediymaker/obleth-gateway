@@ -14,17 +14,15 @@ class OblethApiError extends Error {
 
 function setup(obleth: Record<string, unknown>) {
   const revalidatePath = vi.fn();
-  const updateTag = vi.fn();
   vi.doMock("@/lib/auth/roles", () => ({
     requireAdmin: async () => ({ id: "admin-1", email: "admin@example.com", role: "admin", status: "active", tenantId: null }),
   }));
-  vi.doMock("next/cache", () => ({ revalidatePath, updateTag }));
+  vi.doMock("next/cache", () => ({ revalidatePath }));
   vi.doMock("@/lib/obleth", () => ({
     obleth,
-    CACHE_TAGS: new Proxy({}, { get: (_t, prop) => String(prop) }),
     OblethApiError,
   }));
-  return { revalidatePath, updateTag };
+  return { revalidatePath };
 }
 
 const members = { none: "acme-7b-instruct", low: "acme-7b-think", medium: "acme-7b-think", high: "acme-7b-think" };
@@ -32,12 +30,11 @@ const members = { none: "acme-7b-instruct", low: "acme-7b-think", medium: "acme-
 describe("setModelReasoningAction", () => {
   it("writes the map whole and refreshes the model lists", async () => {
     const setModelReasoning = vi.fn().mockResolvedValue({});
-    const { revalidatePath, updateTag } = setup({ setModelReasoning });
+    const { revalidatePath } = setup({ setModelReasoning });
     const { setModelReasoningAction } = await import("./actions");
     const body = { mode: "unsupported" as const };
     expect(await setModelReasoningAction("m1", body)).toEqual({ ok: true });
     expect(setModelReasoning).toHaveBeenCalledWith("m1", body, { auditActor: "admin@example.com" });
-    expect(updateTag).toHaveBeenCalledWith("models");
     expect(revalidatePath).toHaveBeenCalledWith("/models");
   });
 

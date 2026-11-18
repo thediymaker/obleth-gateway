@@ -20,10 +20,9 @@ function mockDeps(resync: ReturnType<typeof vi.fn>, requireAdmin = vi.fn()) {
     tenantId: null,
   });
   vi.doMock("@/lib/auth/roles", () => ({ requireAdmin }));
-  vi.doMock("next/cache", () => ({ revalidatePath: vi.fn(), updateTag: vi.fn() }));
+  vi.doMock("next/cache", () => ({ revalidatePath: vi.fn() }));
   vi.doMock("@/lib/obleth", () => ({
     obleth: { resync },
-    CACHE_TAGS: new Proxy({}, { get: () => "tag" }),
     OblethApiError: class OblethApiError extends Error {},
   }));
   return requireAdmin;

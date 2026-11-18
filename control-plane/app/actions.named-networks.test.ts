@@ -6,11 +6,10 @@ function mockObleth() {
   vi.doMock("@/lib/auth/roles", () => ({
     requireAdmin: async () => ({ id: "admin-1", email: "admin@example.com", role: "admin", status: "active", tenantId: null }),
   }));
-  vi.doMock("next/cache", () => ({ revalidatePath: vi.fn(), updateTag: vi.fn() }));
+  vi.doMock("next/cache", () => ({ revalidatePath: vi.fn() }));
   const obleth = { setNamedNetworks: vi.fn().mockResolvedValue({}) };
   vi.doMock("@/lib/obleth", () => ({
     obleth,
-    CACHE_TAGS: new Proxy({}, { get: () => "tag" }),
     OblethApiError: class OblethApiError extends Error {},
   }));
   return obleth;

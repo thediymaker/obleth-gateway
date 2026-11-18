@@ -1,6 +1,5 @@
-import { revalidateTag } from "next/cache";
 import { NextRequest, NextResponse } from "next/server";
-import { CACHE_TAGS, obleth } from "@/lib/obleth";
+import { obleth } from "@/lib/obleth";
 import { guardAdmin, guardAdminSession } from "@/lib/auth/guard";
 
 // Wraps GET/POST /api/v1/knowledge/collections.
@@ -21,7 +20,6 @@ export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
     const created = await obleth.createCollection(body, { auditActor: session.email });
-    revalidateTag(CACHE_TAGS.knowledgeCollections, "max");
     return NextResponse.json(created);
   } catch (e) {
     return NextResponse.json({ error: String(e) }, { status: 502 });

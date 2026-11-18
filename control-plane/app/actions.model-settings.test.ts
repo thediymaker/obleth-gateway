@@ -8,7 +8,7 @@ function mockAdmin() {
   vi.doMock("@/lib/auth/roles", () => ({
     requireAdmin: async () => ({ id: "admin-1", email: "admin@example.com", role: "admin", status: "active", tenantId: null }),
   }));
-  vi.doMock("next/cache", () => ({ revalidatePath: vi.fn(), updateTag: vi.fn() }));
+  vi.doMock("next/cache", () => ({ revalidatePath: vi.fn() }));
 }
 
 const model = (over: Record<string, unknown> = {}) => ({
@@ -29,6 +29,7 @@ class OblethApiError extends Error {}
 function gateway(current = model(), over: Record<string, unknown> = {}) {
   const obleth = {
     listModels: vi.fn().mockResolvedValue([current]),
+    getModel: vi.fn().mockResolvedValue(current),
     updateModel: vi.fn().mockResolvedValue({}),
     validateModel: vi.fn().mockResolvedValue({ warnings: [] }),
     setModelCache: vi.fn().mockResolvedValue({}),
@@ -44,7 +45,7 @@ function gateway(current = model(), over: Record<string, unknown> = {}) {
     deleteModel: vi.fn().mockResolvedValue(undefined),
     ...over,
   };
-  vi.doMock("@/lib/obleth", () => ({ obleth, CACHE_TAGS: new Proxy({}, { get: () => "tag" }), OblethApiError }));
+  vi.doMock("@/lib/obleth", () => ({ obleth, OblethApiError }));
   return obleth;
 }
 
@@ -102,7 +103,7 @@ describe("saving a model's settings", () => {
     expect("session_affinity" in obleth.updateModel.mock.calls[3][1]).toBe(false);
   });
 
-  it("keeps the route switch, the stored key, and every group the form leaves out", async () => {
+  it("keeps the route switch and the stored key, and leaves out every group the form leaves out", async () => {
     mockAdmin();
     const obleth = gateway();
     const { saveModelSettingsAction } = await import("./actions");
@@ -111,11 +112,9 @@ describe("saving a model's settings", () => {
     expect(body.description).toBe("new");
     expect(body.enabled).toBe(false);
     expect("api_key" in body).toBe(false);
-    // No has_tags / has_capabilities / has_routing: the stored values carry through.
-    expect(body.tags).toEqual(["coding:3"]);
-    expect(body.boons).toEqual(["compression"]);
-    expect(body.tool_servers).toEqual(["docs"]);
-    expect(body.supports_function_calling).toBe(true);
+    // No has_tags / has_capabilities / has_routing: those groups are not sent,
+    // so the gateway keeps what it has rather than a copy from an earlier read.
+    for (const group of ["tags", "boons", "tool_servers", "supports_function_calling"]) expect(group in body).toBe(false);
     expect(body.auto_eligible).toBe(true);
   });
 
@@ -211,16 +210,13 @@ describe("saving a model's settings", () => {
 });
 
 describe("the serving switch", () => {
-  it("sends the whole model with only the switch changed", async () => {
+  it("sends only the switch, with the two fields the gateway requires", async () => {
     mockAdmin();
     const obleth = gateway(model({ enabled: true }));
     const { setModelEnabledAction } = await import("./actions");
     expect(await setModelEnabledAction("m-1", false)).toEqual({ ok: true });
-    const body = obleth.updateModel.mock.calls[0][1];
-    expect(body.enabled).toBe(false);
-    expect(body.tags).toEqual(["coding:3"]);
-    expect(body.max_in_flight).toBe(16);
-    expect("variants" in body).toBe(false);
+    expect(obleth.getModel).toHaveBeenCalledWith("m-1");
+    expect(obleth.updateModel.mock.calls[0][1]).toEqual({ upstream_model: "up", api_base: "http://a", enabled: false });
   });
 });
 

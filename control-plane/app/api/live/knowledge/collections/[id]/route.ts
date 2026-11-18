@@ -1,6 +1,5 @@
-import { revalidateTag } from "next/cache";
 import { NextRequest, NextResponse } from "next/server";
-import { CACHE_TAGS, obleth } from "@/lib/obleth";
+import { obleth } from "@/lib/obleth";
 import { guardAdmin, guardAdminSession } from "@/lib/auth/guard";
 
 // Wraps GET/PUT/DELETE /api/v1/knowledge/collections/:id.
@@ -29,7 +28,6 @@ export async function PUT(
     const { id } = await params;
     const body = await req.json();
     const updated = await obleth.updateCollection(id, body, { auditActor: session.email });
-    revalidateTag(CACHE_TAGS.knowledgeCollections, "max");
     return NextResponse.json(updated);
   } catch (e) {
     return NextResponse.json({ error: String(e) }, { status: 502 });
@@ -45,7 +43,6 @@ export async function DELETE(
   try {
     const { id } = await params;
     await obleth.deleteCollection(id, { auditActor: session.email });
-    revalidateTag(CACHE_TAGS.knowledgeCollections, "max");
     return NextResponse.json({ deleted: true });
   } catch (e) {
     return NextResponse.json({ error: String(e) }, { status: 502 });

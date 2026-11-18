@@ -2,8 +2,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 afterEach(() => vi.resetModules());
 
 // actions.ts imports from:
-//   "next/cache"       -> revalidatePath, updateTag
-//   "@/lib/obleth"      -> CACHE_TAGS, obleth, OblethApiError
+//   "next/cache"       -> revalidatePath
+//   "@/lib/obleth"      -> obleth, OblethApiError
 //   "@/lib/auth/roles"  -> requireAdmin
 
 function mockAdmin() {
@@ -18,7 +18,6 @@ function mockAdmin() {
   }));
   vi.doMock("next/cache", () => ({
     revalidatePath: vi.fn(),
-    updateTag: vi.fn(),
   }));
 }
 
@@ -70,7 +69,6 @@ describe("model tag strength levels round-trip through the model settings save",
     const updateModel = vi.fn().mockResolvedValue({});
     vi.doMock("@/lib/obleth", () => ({
       obleth: { listModels: vi.fn().mockResolvedValue([model()]), updateModel },
-      CACHE_TAGS: new Proxy({}, { get: () => "tag" }),
       OblethApiError: class OblethApiError extends Error {},
     }));
     const { saveModelSettingsAction } = await import("./actions");
@@ -103,7 +101,6 @@ describe("model tag strength levels round-trip through the model settings save",
     const updateModel = vi.fn().mockResolvedValue({});
     vi.doMock("@/lib/obleth", () => ({
       obleth: { listModels: vi.fn().mockResolvedValue([model()]), updateModel },
-      CACHE_TAGS: new Proxy({}, { get: () => "tag" }),
       OblethApiError: class OblethApiError extends Error {},
     }));
     const { saveModelSettingsAction } = await import("./actions");
@@ -124,7 +121,6 @@ describe("model tag strength levels round-trip through the model settings save",
     const updateModel = vi.fn().mockResolvedValue({});
     vi.doMock("@/lib/obleth", () => ({
       obleth: { listModels: vi.fn().mockResolvedValue([model({ tags: ["coding:3", "math"] })]), updateModel },
-      CACHE_TAGS: new Proxy({}, { get: () => "tag" }),
       OblethApiError: class OblethApiError extends Error {},
     }));
     const { saveModelSettingsAction } = await import("./actions");
@@ -153,7 +149,6 @@ describe("model tag strength levels round-trip through the model settings save",
     const updateModel = vi.fn().mockResolvedValue({});
     vi.doMock("@/lib/obleth", () => ({
       obleth: { listModels: vi.fn().mockResolvedValue([model()]), updateModel },
-      CACHE_TAGS: new Proxy({}, { get: () => "tag" }),
       OblethApiError: class OblethApiError extends Error {},
     }));
     const { saveModelSettingsAction } = await import("./actions");

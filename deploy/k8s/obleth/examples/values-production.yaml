@@ -134,6 +134,8 @@ serviceMonitor:
 
 controlPlane:
   enabled: true
+  # Replicas are interchangeable: the dashboard keeps no cross-request cache
+  # of gateway data, so a save on one is seen on the next load of any other.
   replicas: 2
   existingSecret: obleth-control-plane
   resources:

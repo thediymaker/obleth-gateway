@@ -1,11 +1,9 @@
 "use server";
 
-// `updateTag` (Next 16) expires tagged Data Cache entries from a server action
-// with read-your-own-writes semantics, so the post-action render refetches.
-import { revalidatePath, updateTag } from "next/cache";
+import { revalidatePath } from "next/cache";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
-import { CACHE_TAGS, obleth, OblethApiError } from "@/lib/obleth";
+import { obleth, OblethApiError } from "@/lib/obleth";
 import type {
   ApiKey,
   ManagedModelSpec,
@@ -382,7 +380,6 @@ export async function createTenantAction(formData: FormData): Promise<ActionResu
     return actionError(e);
   }
 
-  updateTag(CACHE_TAGS.tenants);
   revalidatePath("/tenants");
   revalidatePath("/fairshare");
   revalidatePath("/");
@@ -398,8 +395,6 @@ export async function setTenantStatusAction(id: string, status: string): Promise
   } catch (e) {
     return actionError(e);
   }
-  updateTag(CACHE_TAGS.tenants);
-  updateTag(CACHE_TAGS.keys);
   revalidatePath("/tenants");
   revalidatePath("/fairshare");
   revalidatePath("/");
@@ -412,8 +407,6 @@ export async function deleteTenantAction(id: string): Promise<ActionResult> {
   return deleteAndRevalidate(
     () => obleth.deleteTenant(id, { auditActor: session.email }),
     () => {
-      updateTag(CACHE_TAGS.tenants);
-      updateTag(CACHE_TAGS.keys);
       revalidatePath("/tenants");
       revalidatePath("/keys");
       revalidatePath("/fairshare");
@@ -425,7 +418,6 @@ export async function deleteTenantAction(id: string): Promise<ActionResult> {
 export async function setWeightAction(id: string, weight: number) {
   const session = await requireAdmin();
   await obleth.setWeight(id, weight, { auditActor: session.email });
-  updateTag(CACHE_TAGS.tenants);
   revalidatePath("/tenants");
   revalidatePath("/fairshare");
   revalidatePath("/");
@@ -454,13 +446,11 @@ export async function setTenantMaxInFlightAction(id: string, maxInFlight: number
   const session = await requireAdmin();
   if (maxInFlight !== null && (!Number.isInteger(maxInFlight) || maxInFlight < 1)) return { ok: false, error: "The cap must be a whole number of at least 1, or empty for no limit." };
   try {
-    const tenant = (await obleth.listTenants()).find((t) => t.id === id);
-    if (!tenant) return { ok: false, error: "Tenant not found." };
+    const tenant = await obleth.getTenant(id);
     await obleth.setQuota(id, tenant.tokens_per_minute, maxInFlight, { auditActor: session.email });
   } catch (e) {
     return actionError(e);
   }
-  updateTag(CACHE_TAGS.tenants);
   revalidatePath("/fairshare");
   revalidatePath("/tenants");
   return { ok: true };
@@ -502,7 +492,6 @@ export async function createKeyAction(
       },
       { auditActor: session.email },
     );
-    updateTag(CACHE_TAGS.keys);
     revalidatePath("/keys");
     return { ok: true, secret: created.secret };
   } catch (e) {
@@ -550,7 +539,6 @@ export async function updateKeyAction(
   } catch (e) {
     return actionError(e);
   }
-  updateTag(CACHE_TAGS.keys);
   revalidatePath("/keys");
   revalidatePath("/");
   return { ok: true };
@@ -623,8 +611,6 @@ export async function saveTenantSettingsAction(formData: FormData): Promise<Sett
   if (!id) return { ok: false, error: "Missing tenant id.", saved };
 
   const refresh = () => {
-    updateTag(CACHE_TAGS.tenants);
-    updateTag(CACHE_TAGS.keys);
     revalidatePath("/tenants");
     revalidatePath("/fairshare");
     revalidatePath("/");
@@ -756,7 +742,6 @@ export async function saveKeySettingsAction(formData: FormData): Promise<Setting
     }
     saved.push("background");
   }
-  updateTag(CACHE_TAGS.keys);
   revalidatePath("/keys");
   revalidatePath("/tenants");
   return { ok: true };
@@ -785,7 +770,6 @@ async function eachKey(ids: string[], task: (key: ApiKey) => Promise<void>): Pro
       }),
     );
   }
-  updateTag(CACHE_TAGS.keys);
   revalidatePath("/keys");
   revalidatePath("/tenants");
   revalidatePath("/");
@@ -868,7 +852,6 @@ export async function moveKeysAction(ids: string[], target: MoveTarget): Promise
     } catch (e) {
       return { done: 0, failed: [], error: actionError(e).error };
     }
-    updateTag(CACHE_TAGS.tenants);
   }
   const result = await eachKey(ids, async (key) => {
     if (key.tenant_id === tenantId) return;
@@ -903,7 +886,6 @@ export async function replaceKeyAction(id: string): Promise<{ ok: true; secret: 
     if (old.tracing_enabled) await obleth.setKeyTracing(created.key.id, true, { auditActor: session.email });
     if (old.end_user_fairshare) await obleth.setKeyEndUserFairshare(created.key.id, true, { auditActor: session.email });
     if (old.background) await obleth.setKeyBackground(created.key.id, true, { auditActor: session.email });
-    updateTag(CACHE_TAGS.keys);
     revalidatePath("/keys");
     return { ok: true, secret: created.secret, key: created.key };
   } catch (e) {
@@ -916,7 +898,6 @@ export async function deleteKeyAction(id: string): Promise<ActionResult> {
   return deleteAndRevalidate(
     () => obleth.deleteKey(id, { auditActor: session.email }),
     () => {
-      updateTag(CACHE_TAGS.keys);
       revalidatePath("/keys");
       revalidatePath("/");
     },
@@ -929,7 +910,6 @@ export async function deleteKeysAction(
   const session = await requireAdmin();
   const uniqueIds = [...new Set(ids.map((id) => String(id)).filter(Boolean))];
   const result = await deleteKeys(uniqueIds, session.email);
-  updateTag(CACHE_TAGS.keys);
   revalidatePath("/keys");
   revalidatePath("/");
   return result;
@@ -1070,7 +1050,6 @@ export async function createModelAction(
       check = `The first health check could not run: ${actionError(e).error}`;
     }
   }
-  updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
   const warnings = isSlurm
     ? undefined
@@ -1150,7 +1129,6 @@ export async function applyAutotuneCapacityAction(
 ) {
   const session = await requireAdmin();
   await obleth.applyAutotuneCapacity(id, max_in_flight, { auditActor: session.email });
-  updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
   revalidatePath("/fairshare");
 }
@@ -1160,7 +1138,6 @@ export async function deleteModelAction(id: string): Promise<ActionResult> {
   return deleteAndRevalidate(
     () => obleth.deleteModel(id, { auditActor: session.email }),
     () => {
-      updateTag(CACHE_TAGS.models);
       revalidatePath("/models");
     },
   );
@@ -1244,47 +1221,20 @@ async function modelRegistrationWarnings(body: {
 // on purpose: it is a write-only secret not returned by listModels, and sending
 // null would clear it. `variants` is left out too: omitted, the gateway keeps
 // them. Callers spread this and override only their own fields.
-function toModelUpdateBody(model: ModelRoute) {
-  return {
-    upstream_model: model.upstream_model,
-    api_base: model.api_base,
-    model_type: model.model_type,
-    quantization: model.quantization,
-    aliases: model.aliases ?? [],
-    description: model.description,
-    input_cost_per_token: model.input_cost_per_token,
-    output_cost_per_token: model.output_cost_per_token,
-    cost_per_image: model.cost_per_image,
-    cost_per_audio_second: model.cost_per_audio_second,
-    cost_per_character: model.cost_per_character,
-    cost_per_video: model.cost_per_video,
-    energy_slots_per_node: model.energy_slots_per_node,
-    route_bias: model.route_bias,
-    auto_eligible: model.auto_eligible,
-    draft_model: model.draft_model,
-    verify_api_base: model.verify_api_base,
-    verify_upstream_model: model.verify_upstream_model,
-    context_window: model.context_window,
-    admission_weight: model.admission_weight,
-    max_in_flight: model.max_in_flight,
-    supports_function_calling: model.supports_function_calling,
-    supports_system_messages: model.supports_system_messages,
-    supports_response_schema: model.supports_response_schema,
-    supports_tool_choice: model.supports_tool_choice,
-    supports_vision: model.supports_vision,
-    enabled: model.enabled,
-    cache_enabled: model.cache_enabled,
-    cache_ttl_secs: model.cache_ttl_secs,
-    tags: model.tags ?? [],
-    boons: model.boons ?? [],
-    tool_servers: model.tool_servers ?? [],
-  };
+/** The two fields `updateModel` requires. Every other field left out keeps
+ * its stored value, so a write carries only what it changes and never a copy
+ * of the rest taken from an earlier read. */
+function modelUpdateKeys(model: ModelRoute) {
+  return { upstream_model: model.upstream_model, api_base: model.api_base };
 }
-
-// Loads the current model so a granular update can preserve untouched fields.
+/** The model as the gateway has it now, or undefined when it is gone. */
 async function loadModel(id: string): Promise<ModelRoute | undefined> {
-  const models = await obleth.listModels();
-  return models.find((m) => m.id === id);
+  try {
+    return await obleth.getModel(id);
+  } catch (e) {
+    if (e instanceof OblethApiError && e.status === 404) return undefined;
+    throw e;
+  }
 }
 
 // ----------------------------------------------------------------------------
@@ -1330,7 +1280,7 @@ function modelSettingsBody(formData: FormData, current: ModelRoute) {
   const tags = has("has_tags") ? tagsFromForm(formData) : null;
   const capabilities = has("has_capabilities");
   return {
-    ...toModelUpdateBody(current),
+    ...modelUpdateKeys(current),
     description: text("description", current.description),
     model_type: text("model_type", current.model_type),
     quantization: text("quantization", current.quantization),
@@ -1391,7 +1341,6 @@ export async function saveModelSettingsAction(formData: FormData): Promise<Model
 
   let warnings: string[] | undefined;
   const refresh = () => {
-    updateTag(CACHE_TAGS.models);
     revalidatePath("/models");
     revalidatePath("/fairshare");
   };
@@ -1490,11 +1439,10 @@ export async function setModelEnabledAction(id: string, enabled: boolean): Promi
   const current = await loadModel(id);
   if (!current) return { ok: false, error: "Model not found." };
   try {
-    await obleth.updateModel(id, { ...toModelUpdateBody(current), enabled }, { auditActor: session.email });
+    await obleth.updateModel(id, { ...modelUpdateKeys(current), enabled }, { auditActor: session.email });
   } catch (e) {
     return actionError(e);
   }
-  updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
   revalidatePath("/");
   return { ok: true };
@@ -1519,7 +1467,6 @@ export async function setModelStatusAction(id: string, body: SetModelStatus): Pr
   } catch (e) {
     return actionError(e);
   }
-  updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
   revalidatePath("/");
   return { ok: true };
@@ -1540,7 +1487,6 @@ export async function setModelReasoningAction(id: string, body: ModelReasoning):
   } catch (e) {
     return actionError(e);
   }
-  updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
   return { ok: true };
 }
@@ -1585,7 +1531,6 @@ export async function activateModelAction(id: string): Promise<ActivateModelResu
   const session = await requireAdmin();
   try {
     const result = await obleth.activateModel(id, { auditActor: session.email });
-    updateTag(CACHE_TAGS.models);
     revalidatePath("/models");
     return {
       ok: true,
@@ -1625,7 +1570,6 @@ async function eachModel(
       }),
     );
   }
-  updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
   revalidatePath("/");
   return { done, failed };
@@ -1635,7 +1579,7 @@ export async function setModelsEnabledAction(ids: string[], enabled: boolean): P
   const session = await requireAdmin();
   return eachModel(ids, async (model) => {
     if (model.enabled === enabled) return;
-    await obleth.updateModel(model.id, { ...toModelUpdateBody(model), enabled }, { auditActor: session.email });
+    await obleth.updateModel(model.id, { ...modelUpdateKeys(model), enabled }, { auditActor: session.email });
   });
 }
 
@@ -1662,7 +1606,6 @@ export async function activateModelsAction(names: string[]): Promise<{ on: strin
       }),
     );
   }
-  updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
   return { on, off };
 }
@@ -1790,9 +1733,6 @@ export async function restoreBackupAction(
 
   try {
     const report = await obleth.restoreBackup(parsed, { auditActor: session.email });
-    updateTag(CACHE_TAGS.tenants);
-    updateTag(CACHE_TAGS.keys);
-    updateTag(CACHE_TAGS.models);
     revalidatePath("/");
     revalidatePath("/tenants");
     revalidatePath("/keys");
@@ -1897,7 +1837,6 @@ export async function applyModelManifestAction(
     });
     // A dry run writes nothing, so there is nothing to revalidate.
     if (!dryRun) {
-      updateTag(CACHE_TAGS.models);
       revalidatePath("/models");
       revalidatePath("/");
     }
@@ -1994,11 +1933,10 @@ export async function setModelToolServerAction(modelId: string, server: string, 
     const current = model.tool_servers ?? [];
     const next = on ? [...new Set([...current, server])] : current.filter((s) => s !== server);
     if (next.length === current.length && next.every((s, i) => s === current[i])) return { ok: true };
-    await obleth.updateModel(modelId, { ...toModelUpdateBody(model), tool_servers: next }, { auditActor: session.email });
+    await obleth.updateModel(modelId, { ...modelUpdateKeys(model), tool_servers: next }, { auditActor: session.email });
   } catch (e) {
     return actionError(e);
   }
-  updateTag(CACHE_TAGS.models);
   revalidatePath("/mcp");
   revalidatePath("/models");
   return { ok: true };
@@ -2301,12 +2239,11 @@ export async function attachCollectionAction(modelId: string, collectionId: stri
     const next = attach ? [...new Set([...collection_ids, collectionId])] : collection_ids.filter((c) => c !== collectionId);
     await obleth.setModelCollections(modelId, next, { auditActor: session.email });
     if (attach && !(model.boons ?? []).includes("knowledge")) {
-      await obleth.updateModel(modelId, { ...toModelUpdateBody(model), boons: [...(model.boons ?? []), "knowledge"] }, { auditActor: session.email });
+      await obleth.updateModel(modelId, { ...modelUpdateKeys(model), boons: [...(model.boons ?? []), "knowledge"] }, { auditActor: session.email });
     }
   } catch (e) {
     return actionError(e);
   }
-  updateTag(CACHE_TAGS.models);
   revalidatePath("/knowledge");
   revalidatePath("/models");
   return { ok: true };
@@ -2741,7 +2678,6 @@ export async function deleteTemplateAction(id: string): Promise<ActionResult> {
 // ----------------------------------------------------------------------------
 
 function refreshDeployments() {
-  updateTag(CACHE_TAGS.models);
   revalidatePath("/deployments");
   revalidatePath("/models");
   revalidatePath("/fairshare");
@@ -2879,7 +2815,7 @@ export async function launchRecipeAction(recipeId: string, overrides: DeployOver
   if (!recipe.valid) return { ok: false, error: recipe.error ?? "The recipe can't be read." };
   try {
     const { createBody, managedBody } = buildManagedFromRecipe(recipe, overrides, await clusterValues());
-    const models = await obleth.listModelsFresh();
+    const models = await obleth.listModels();
     if (models.some((m) => m.model_name === createBody.model_name || m.aliases?.includes(createBody.model_name) || m.variants?.some((v) => v.name === createBody.model_name))) {
       return { ok: false, error: `A model called ${createBody.model_name} already exists. Pick another name.` };
     }
@@ -2995,7 +2931,6 @@ export async function deployRecipeAction(
   } catch (e) {
     return actionError(e);
   }
-  updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
   return { ok: true };
 }
@@ -3029,7 +2964,6 @@ export async function applyAdviceFixAction(key: string): Promise<ActionResult> {
           failed.push(`${name}: ${e instanceof Error ? e.message : String(e)}`);
         }
       }
-      updateTag(CACHE_TAGS.models);
       revalidatePath("/settings");
       revalidatePath("/models");
       if (failed.length === fix.models.length) return { ok: false, error: failed.join("; ") };
