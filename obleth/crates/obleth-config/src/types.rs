@@ -3989,6 +3989,16 @@ pub struct TenantBackup {
     pub budget_started_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default)]
     pub allowed_models: Option<Vec<String>>,
+    /// Absent in backups taken before 2.12; a restore of one leaves the
+    /// tenant unguarded and untraced, as it was then.
+    #[serde(default)]
+    pub guardrails_policy: Option<GuardrailsPolicy>,
+    #[serde(default)]
+    pub compression_policy: Option<CompressionPolicy>,
+    #[serde(default)]
+    pub tracing_enabled: bool,
+    #[serde(default)]
+    pub synthetic: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 

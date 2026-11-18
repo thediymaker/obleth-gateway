@@ -78,7 +78,8 @@ impl Store {
             "select id, name, fairshare_group, weight, tokens_per_minute, max_in_flight,
                     description, organization, contact_email, status, timezone, active_from,
                     active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period,
-                    budget_started_at, allowed_models, created_at
+                    budget_started_at, allowed_models, guardrails_policy, compression_policy,
+                    tracing_enabled, synthetic, created_at
              from tenants order by created_at",
         )
         .fetch_all(&self.pool)
@@ -290,9 +291,10 @@ impl Store {
                 "insert into tenants (id, name, fairshare_group, weight, tokens_per_minute,
                         max_in_flight, description, organization, contact_email, status, timezone,
                         active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd,
-                        budget_period, budget_started_at, allowed_models, created_at)
+                        budget_period, budget_started_at, allowed_models, guardrails_policy,
+                        compression_policy, tracing_enabled, synthetic, created_at)
                  values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                        $17, $18, $19, $20)
+                        $17, $18, $19, $20, $21, $22, $23, $24)
                  on conflict (id) do update set
                         name = excluded.name,
                         fairshare_group = excluded.fairshare_group,
@@ -312,6 +314,10 @@ impl Store {
                         budget_period = excluded.budget_period,
                         budget_started_at = excluded.budget_started_at,
                         allowed_models = excluded.allowed_models,
+                        guardrails_policy = excluded.guardrails_policy,
+                        compression_policy = excluded.compression_policy,
+                        tracing_enabled = excluded.tracing_enabled,
+                        synthetic = excluded.synthetic,
                         updated_at = now()
                  returning (xmax = 0) as inserted",
             )
@@ -334,6 +340,10 @@ impl Store {
             .bind(&t.budget_period)
             .bind(t.budget_started_at)
             .bind(allowed)
+            .bind(t.guardrails_policy.clone().map(sqlx::types::Json))
+            .bind(t.compression_policy.clone().map(sqlx::types::Json))
+            .bind(t.tracing_enabled)
+            .bind(t.synthetic)
             .bind(t.created_at)
             .fetch_one(&mut *tx)
             .await
@@ -878,6 +888,10 @@ fn tenant_backup_from_row(row: &PgRow) -> Result<TenantBackup> {
         budget_period: row.try_get("budget_period")?,
         budget_started_at: row.try_get("budget_started_at")?,
         allowed_models: crate::allowed_models_from_row(row)?,
+        guardrails_policy: crate::guardrails_policy_from_row(row)?,
+        compression_policy: crate::compression_policy_from_row(row)?,
+        tracing_enabled: row.try_get("tracing_enabled")?,
+        synthetic: row.try_get("synthetic")?,
         created_at: row.try_get("created_at")?,
     })
 }
@@ -1000,6 +1014,19 @@ mod tests {
     /// different key, and reports a missing key when the cipher is disabled.
     /// (Exercises the same logic as `verify_backup_key_check`, which needs the
     /// process-global cipher; the env-independent path is tested here.)
+    /// A backup written before the tenant policies and flags were exported
+    /// still loads; the tenant comes back as it was then: unguarded.
+    #[test]
+    fn a_backup_without_the_tenant_policies_still_loads() {
+        let old = serde_json::json!({
+            "id": uuid::Uuid::nil(), "name": "t", "fairshare_group": "default", "weight": 100,
+            "tokens_per_minute": 0, "max_in_flight": null, "created_at": "2026-01-01T00:00:00Z"
+        });
+        let tenant: TenantBackup = serde_json::from_value(old).expect("old backup loads");
+        assert!(tenant.guardrails_policy.is_none() && tenant.compression_policy.is_none());
+        assert!(!tenant.tracing_enabled && !tenant.synthetic);
+    }
+
     #[test]
     fn key_check_sentinel_semantics() {
         let exporter = enabled_cipher(7);
@@ -1041,6 +1068,31 @@ mod tests {
             .await
             .expect("create tenant");
         fixtures.track_tenant(tenant.id);
+        // The fields a tenant has beyond what create_tenant sets.
+        let guardrails: obleth_config::GuardrailsPolicy =
+            serde_json::from_value(serde_json::json!({
+                "action": "block", "input_scanners": ["pii"], "ban_keywords": ["secret"]
+            }))
+            .expect("guardrails policy");
+        let compression: obleth_config::CompressionPolicy =
+            serde_json::from_value(serde_json::json!({ "enabled": true, "dedup": true }))
+                .expect("compression policy");
+        store
+            .update_tenant_guardrails_policy(tenant.id, Some(guardrails.clone()))
+            .await
+            .expect("set guardrails");
+        store
+            .update_tenant_compression_policy(tenant.id, Some(compression.clone()))
+            .await
+            .expect("set compression");
+        store
+            .set_tenant_tracing(tenant.id, true)
+            .await
+            .expect("set tracing");
+        store
+            .set_tenant_synthetic(tenant.id, true)
+            .await
+            .expect("set synthetic");
         let (key, secret) = store
             .create_api_key(
                 tenant.id,
@@ -1291,6 +1343,15 @@ mod tests {
             .find(|t| t.id == tenant.id)
             .expect("tenant in export");
         assert_eq!(exported_tenant.weight, 250);
+        assert_eq!(
+            exported_tenant.guardrails_policy.as_ref(),
+            Some(&guardrails)
+        );
+        assert_eq!(
+            exported_tenant.compression_policy.as_ref(),
+            Some(&compression)
+        );
+        assert!(exported_tenant.tracing_enabled && exported_tenant.synthetic);
         let exported_model = data
             .models
             .iter()
@@ -1313,6 +1374,22 @@ mod tests {
             .update_tenant_weight(tenant.id, 999)
             .await
             .expect("update weight");
+        store
+            .update_tenant_guardrails_policy(tenant.id, None)
+            .await
+            .expect("drift guardrails");
+        store
+            .update_tenant_compression_policy(tenant.id, None)
+            .await
+            .expect("drift compression");
+        store
+            .set_tenant_tracing(tenant.id, false)
+            .await
+            .expect("drift tracing");
+        store
+            .set_tenant_synthetic(tenant.id, false)
+            .await
+            .expect("drift synthetic");
         // Drift the model's bias the same way, through the same restore.
         sqlx::query(
             "update models set route_bias = 1.0, auto_eligible = true, variants = '[]', lifecycle = '{}' where id = $1",
@@ -1412,6 +1489,10 @@ mod tests {
         assert_eq!(report.tenants.inserted, 0);
         let restored = store.get_tenant(tenant.id).await.expect("get tenant");
         assert_eq!(restored.weight, 250);
+        assert_eq!(restored.guardrails_policy, Some(guardrails));
+        assert_eq!(restored.compression_policy, Some(compression));
+        assert!(restored.tracing_enabled, "restore puts tracing back");
+        assert!(restored.synthetic, "restore puts synthetic back");
 
         // Delete the key, restore again: it comes back as an insert and the
         // original secret's hash resolves like before the deletion.

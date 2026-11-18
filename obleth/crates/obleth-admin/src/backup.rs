@@ -17,9 +17,7 @@ use obleth_config::{
 use obleth_store::CryptoError;
 
 use crate::ssrf::{SsrfPolicy, VERIFY_TEMPLATE_PLACEHOLDERS};
-use crate::{
-    audit_actor, resync_all_keys, sync_mcp_server, sync_model, AdminError, AdminState, Result,
-};
+use crate::{audit_actor, resync_all_keys, AdminError, AdminState, Result};
 
 #[utoipa::path(
     get, path = "/api/v1/backup/export", tag = "backup",
@@ -130,14 +128,10 @@ pub(crate) async fn restore_backup(
     }
 
     // Re-sync the Redis hot caches so the data plane sees the restored config
-    // without waiting for its periodic refresh.
+    // without waiting for its periodic refresh: the same pass as
+    // POST /api/v1/resync, which also prunes entries the backup no longer has.
     resync_all_keys(&state).await?;
-    for model in state.store.list_models().await? {
-        sync_model(&state, &model).await?;
-    }
-    for server in state.store.list_mcp_servers().await? {
-        sync_mcp_server(&state, &server).await?;
-    }
+    crate::resync_models_and_mcp(&state).await?;
     // Alert settings are pushed (not polled); reload them live. Auto-router,
     // boons and retention are picked up by the proxy's poll loop.
     if let Some(settings) = state.store.get_alert_settings().await? {
@@ -170,6 +164,8 @@ pub(crate) async fn restore_backup(
     Ok(Json(report))
 }
 
+/// How many of each thing the backup holds, for the audit row: every
+/// collection in `BackupData`.
 fn entity_counts(data: &BackupData) -> serde_json::Value {
     serde_json::json!({
         "fairshare_groups": data.fairshare_groups.len(),
@@ -179,15 +175,38 @@ fn entity_counts(data: &BackupData) -> serde_json::Value {
         "model_endpoints": data.model_endpoints.len(),
         "mcp_servers": data.mcp_servers.len(),
         "app_settings": data.app_settings.len(),
+        "model_families": data.model_families.len(),
+        "managed_models": data.managed_models.len(),
+        "recipes": data.recipes.len(),
     })
 }
 
-/// True when any secret column in the backup carries `enc:v1:` ciphertext.
+/// True when any secret in the backup carries `enc:v1:` ciphertext: the
+/// secret columns, and the settings rows, whose values hold encrypted
+/// tokens (the Slurm JWT and Hugging Face token) as opaque JSON.
 fn contains_ciphertext(data: &BackupData) -> bool {
-    let enc = |v: &Option<String>| v.as_deref().is_some_and(|s| s.starts_with("enc:v1:"));
+    let enc = |v: &Option<String>| v.as_deref().is_some_and(is_ciphertext);
     data.models.iter().any(|m| enc(&m.api_key))
         || data.model_endpoints.iter().any(|e| enc(&e.api_key))
         || data.mcp_servers.iter().any(|s| enc(&s.auth_header))
+        || data
+            .app_settings
+            .iter()
+            .any(|s| json_has_ciphertext(&s.value))
+}
+
+fn is_ciphertext(value: &str) -> bool {
+    value.starts_with("enc:v1:")
+}
+
+/// Any string anywhere in the value that is ciphertext.
+fn json_has_ciphertext(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(s) => is_ciphertext(s),
+        serde_json::Value::Array(items) => items.iter().any(json_has_ciphertext),
+        serde_json::Value::Object(fields) => fields.values().any(json_has_ciphertext),
+        _ => false,
+    }
 }
 
 /// One outbound URL a restore would register.
@@ -322,6 +341,22 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(msg.contains("endpoint 'bad'"), "{msg}");
+    }
+
+    #[test]
+    fn an_encrypted_slurm_token_in_the_settings_counts_as_ciphertext() {
+        let mut data = BackupData::default();
+        assert!(!contains_ciphertext(&data));
+        data.app_settings.push(setting(
+            "slurm",
+            serde_json::json!({ "host": "sol", "slurm_jwt": "enc:v1:abc", "hf_token": "" }),
+        ));
+        assert!(contains_ciphertext(&data));
+        let counts = entity_counts(&data);
+        assert_eq!(counts["app_settings"], 1);
+        assert_eq!(counts["managed_models"], 0);
+        assert_eq!(counts["recipes"], 0);
+        assert_eq!(counts["model_families"], 0);
     }
 
     fn setting(key: &str, value: serde_json::Value) -> obleth_config::AppSettingBackup {
