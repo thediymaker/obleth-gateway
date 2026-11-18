@@ -25,7 +25,7 @@ use axum::body::Body;
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, Response, StatusCode};
 use bytes::Bytes;
-use obleth_config::{ResolvedKey, ResolvedModel};
+use obleth_config::ResolvedModel;
 use uuid::Uuid;
 
 use crate::proxy::{
@@ -263,7 +263,7 @@ mod tests {
             description: String::new(),
             boons: vec![],
         }];
-        let permitted = |key: &ResolvedKey, requested: &str| {
+        let permitted = |key: &obleth_config::ResolvedKey, requested: &str| {
             model_permitted(key, &route, variant_called(&route, requested))
         };
         let mut key = crate::boons::test_support::test_key();
