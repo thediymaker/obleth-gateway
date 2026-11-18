@@ -68,6 +68,7 @@ async function connectionUpdate(current: Record<string, unknown>, fd: FormData) 
   vi.doMock("@/lib/obleth", () => ({
     obleth: {
       listModels: vi.fn().mockResolvedValue([current]),
+      getModel: vi.fn().mockResolvedValue(current),
       updateModel,
       listUpstreamModels: vi.fn().mockResolvedValue([]),
     },

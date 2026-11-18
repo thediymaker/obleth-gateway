@@ -25,6 +25,7 @@ async function discoveryAction(fd: FormData, reject?: Error) {
       setModelCapacityMode,
       setModelCapacity,
       listModels: vi.fn().mockResolvedValue([{ id: "m-1", model_name: "m", capacity_mode: "static", max_in_flight: null }]),
+      getModel: vi.fn().mockResolvedValue({ id: "m-1", model_name: "m", capacity_mode: "static", max_in_flight: null }),
     },
     OblethApiError,
   }));

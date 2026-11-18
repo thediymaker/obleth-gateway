@@ -68,7 +68,7 @@ describe("model tag strength levels round-trip through the model settings save",
     mockAdmin();
     const updateModel = vi.fn().mockResolvedValue({});
     vi.doMock("@/lib/obleth", () => ({
-      obleth: { listModels: vi.fn().mockResolvedValue([model()]), updateModel },
+      obleth: { listModels: vi.fn().mockResolvedValue([model()]), getModel: vi.fn().mockResolvedValue(model()), updateModel },
       OblethApiError: class OblethApiError extends Error {},
     }));
     const { saveModelSettingsAction } = await import("./actions");
@@ -100,7 +100,7 @@ describe("model tag strength levels round-trip through the model settings save",
     mockAdmin();
     const updateModel = vi.fn().mockResolvedValue({});
     vi.doMock("@/lib/obleth", () => ({
-      obleth: { listModels: vi.fn().mockResolvedValue([model()]), updateModel },
+      obleth: { listModels: vi.fn().mockResolvedValue([model()]), getModel: vi.fn().mockResolvedValue(model()), updateModel },
       OblethApiError: class OblethApiError extends Error {},
     }));
     const { saveModelSettingsAction } = await import("./actions");
@@ -120,7 +120,7 @@ describe("model tag strength levels round-trip through the model settings save",
     mockAdmin();
     const updateModel = vi.fn().mockResolvedValue({});
     vi.doMock("@/lib/obleth", () => ({
-      obleth: { listModels: vi.fn().mockResolvedValue([model({ tags: ["coding:3", "math"] })]), updateModel },
+      obleth: { listModels: vi.fn().mockResolvedValue([model({ tags: ["coding:3", "math"] })]), getModel: vi.fn().mockResolvedValue(model({ tags: ["coding:3", "math"] })), updateModel },
       OblethApiError: class OblethApiError extends Error {},
     }));
     const { saveModelSettingsAction } = await import("./actions");
@@ -148,7 +148,7 @@ describe("model tag strength levels round-trip through the model settings save",
     mockAdmin();
     const updateModel = vi.fn().mockResolvedValue({});
     vi.doMock("@/lib/obleth", () => ({
-      obleth: { listModels: vi.fn().mockResolvedValue([model()]), updateModel },
+      obleth: { listModels: vi.fn().mockResolvedValue([model()]), getModel: vi.fn().mockResolvedValue(model()), updateModel },
       OblethApiError: class OblethApiError extends Error {},
     }));
     const { saveModelSettingsAction } = await import("./actions");

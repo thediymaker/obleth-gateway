@@ -30,6 +30,7 @@ function gateway(current = model(), over: Record<string, unknown> = {}) {
   const obleth = {
     listModels: vi.fn().mockResolvedValue([current]),
     getModel: vi.fn().mockResolvedValue(current),
+    getModel: vi.fn().mockResolvedValue(current),
     updateModel: vi.fn().mockResolvedValue({}),
     validateModel: vi.fn().mockResolvedValue({ warnings: [] }),
     setModelCache: vi.fn().mockResolvedValue({}),
