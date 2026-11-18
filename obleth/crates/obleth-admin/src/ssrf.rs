@@ -211,6 +211,11 @@ pub fn check_template_structure(
     Ok(url)
 }
 
+/// How long one call the admin plane makes on its own behalf (a Slack post,
+/// a Prometheus query, an auto-tune probe) may take before it is given up:
+/// a hung host must never hold an admin request or a spawned task.
+pub const ADMIN_OUTBOUND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Registered upstreams must not redirect requests (or their bodies) to an
 /// unvalidated destination. Configure the final endpoint URL instead.
 pub fn upstream_client_builder() -> reqwest::ClientBuilder {

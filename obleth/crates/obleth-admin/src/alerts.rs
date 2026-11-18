@@ -191,6 +191,7 @@ async fn post_slack(
     let response = http
         .post(webhook_url)
         .json(&serde_json::json!({ "text": text }))
+        .timeout(crate::ssrf::ADMIN_OUTBOUND_TIMEOUT)
         .send()
         .await
         // The webhook URL is the Slack credential; keep it out of logs and test results.
@@ -246,6 +247,35 @@ async fn send_email(email: &EmailSettings, subject: &str, body: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A webhook host that accepts the connection and never answers: the post
+    /// gives up within the admin outbound bound instead of holding the alert
+    /// task for the client's read timeout (minutes), and the error carries no
+    /// URL. The bound is the real constant, so this test takes that long.
+    #[tokio::test]
+    async fn a_silent_webhook_times_out_within_the_bound() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/services/T000/B000/webhook-secret",
+            listener.local_addr().unwrap()
+        );
+        let hold = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(crate::ssrf::ADMIN_OUTBOUND_TIMEOUT * 3).await;
+            drop(socket);
+        });
+        let started = Instant::now();
+        let err = post_slack(&Client::new(), &url, "k", "t", "d")
+            .await
+            .unwrap_err();
+        assert!(
+            started.elapsed() < crate::ssrf::ADMIN_OUTBOUND_TIMEOUT + Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(!err.contains("webhook-secret"), "leaked webhook url: {err}");
+        hold.abort();
+    }
 
     #[tokio::test]
     async fn slack_transport_error_omits_webhook_url() {
