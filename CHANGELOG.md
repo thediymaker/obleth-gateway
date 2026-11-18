@@ -6,6 +6,8 @@ workflow falls back to auto-generated notes.
 
 ## Unreleased
 
+The bundled ClickHouse no longer keeps `system.metric_log`, its own per-second snapshot of about 1,000 internal counters: merging it cost about 4 GiB of memory per merge and got 4 GiB pods OOM-killed, and nothing in Obleth reads it. `clickhouse.metricLog: true` turns it back on, merged column by column so it stays small. The server now caps its own memory at `clickhouse.memoryRatio` (0.75) of the container limit instead of 0.9, so an oversized allocation fails inside ClickHouse instead of killing the pod. The Compose config makes the same two changes. The existing `system.metric_log` table keeps its 7-day expiry and empties on its own; installs upgraded through 2.4.0 may still carry `system.metric_log_0`, `text_log_0` and similar tables from before the retention settings, which nothing expires and `DROP TABLE system.<name>_0` removes.
+
 ## v2.11.0
 
 Keys can be limited to a country as well as to networks, named networks hold several ranges and say which are your own, and refused uses of a key are easier to read for many keys at once. Postgres migration `0045` adds one column; the gateway applies it when it starts.

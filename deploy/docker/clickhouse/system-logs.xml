@@ -6,12 +6,21 @@
   table below is partitioned by day and drops days older than 7; text_log
   keeps warnings and errors. Mounted into the server's config.d so it merges
   with the shipped config. The Helm chart renders the same settings from
-  clickhouse.systemLogRetentionDays and clickhouse.logLevel.
+  clickhouse.systemLogRetentionDays, clickhouse.logLevel, clickhouse.metricLog
+  and clickhouse.memoryRatio.
+
+  metric_log is removed: it snapshots about 1,000 counters once a second, and
+  merging such parts holds a buffer per column, about 4 GiB on this image.
+  Nothing in Obleth reads it. The server also caps its own memory at 0.75 of
+  what the container (or host) has, instead of the image's 0.9, so an
+  oversized merge fails inside ClickHouse rather than getting the container
+  killed.
 -->
 <clickhouse>
     <logger>
         <level>information</level>
     </logger>
+    <max_server_memory_usage_to_ram_ratio>0.75</max_server_memory_usage_to_ram_ratio>
     <query_log>
         <partition_by>event_date</partition_by>
         <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
@@ -43,11 +52,7 @@
         <settings>ttl_only_drop_parts = 1</settings>
         <level>warning</level>
     </text_log>
-    <metric_log>
-        <partition_by>event_date</partition_by>
-        <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
-        <settings>ttl_only_drop_parts = 1</settings>
-    </metric_log>
+    <metric_log remove="remove"/>
     <error_log>
         <partition_by>event_date</partition_by>
         <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>

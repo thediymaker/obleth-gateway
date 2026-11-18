@@ -130,6 +130,15 @@ clickhouse.systemLogRetentionDays; with ttl_only_drop_parts an expired day is
 dropped whole rather than rewritten. text_log keeps warnings and errors only.
 Tables the image already bounds (asynchronous_insert_log, blob_storage_log)
 and opentelemetry_span_log, whose custom engine takes no TTL, are left alone.
+
+metric_log is off unless clickhouse.metricLog is true. It snapshots every
+internal counter once a second into one row of about 1,000 columns, and a
+merge of such a part holds a buffer per column: about 4 GiB on this image,
+which is what got 4 GiB pods OOM-killed. Nothing in Obleth reads it. When it
+is on, its merges run column by column (the vertical algorithm), which keeps
+the peak to tens of MiB. The server's own memory cap is set to
+clickhouse.memoryRatio of the container limit instead of the image's 0.9, so
+a runaway allocation fails inside ClickHouse before the kernel kills the pod.
 */}}
 {{- define "obleth.clickhouseConfig" -}}
 {{- /* An upgrade with --reuse-values from a chart before this setting carries no key: use the default. */ -}}
@@ -140,19 +149,35 @@ and opentelemetry_span_log, whose custom engine takes no TTL, are left alone.
 {{- if lt $days 1 -}}
 {{- fail "clickhouse.systemLogRetentionDays must be at least 1" -}}
 {{- end -}}
+{{- $ratio := 0.75 -}}
+{{- if hasKey .Values.clickhouse "memoryRatio" -}}
+{{- $ratio = .Values.clickhouse.memoryRatio -}}
+{{- end -}}
+{{- if or (le (float64 $ratio) 0.0) (gt (float64 $ratio) 1.0) -}}
+{{- fail "clickhouse.memoryRatio must be above 0 and at most 1" -}}
+{{- end }}
 <clickhouse>
     <logger>
         <level>{{ .Values.clickhouse.logLevel | default "information" }}</level>
     </logger>
+    <max_server_memory_usage_to_ram_ratio>{{ $ratio }}</max_server_memory_usage_to_ram_ratio>
 {{- range list "query_log" "query_thread_log" "query_views_log" "part_log" "trace_log" "text_log" "metric_log" "error_log" "asynchronous_metric_log" "processors_profile_log" "backup_log" }}
+{{- if and (eq . "metric_log") (not $.Values.clickhouse.metricLog) }}
+    <metric_log remove="remove"/>
+{{- else }}
     <{{ . }}>
         <partition_by>event_date</partition_by>
         <ttl>event_date + INTERVAL {{ $days }} DAY DELETE</ttl>
+        {{- if eq . "metric_log" }}
+        <settings>ttl_only_drop_parts = 1, vertical_merge_algorithm_min_rows_to_activate = 1, vertical_merge_algorithm_min_columns_to_activate = 1</settings>
+        {{- else }}
         <settings>ttl_only_drop_parts = 1</settings>
+        {{- end }}
         {{- if eq . "text_log" }}
         <level>warning</level>
         {{- end }}
     </{{ . }}>
+{{- end }}
 {{- end }}
 </clickhouse>
 {{- end -}}

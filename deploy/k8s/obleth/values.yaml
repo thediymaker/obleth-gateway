@@ -434,6 +434,17 @@ clickhouse:
   # gateway they outgrow the usage ledger many times over. Each system log
   # table drops days older than this, and text_log keeps warnings and errors.
   systemLogRetentionDays: 7
+  # ClickHouse's per-second snapshot of its own counters (system.metric_log,
+  # about 1,000 columns). Nothing in Obleth reads it, and merging it costs
+  # about 4 GiB of memory per merge on this image, so it is off. Turn it on
+  # only while diagnosing ClickHouse itself; the chart then merges it column
+  # by column so the cost stays small.
+  metricLog: false
+  # The server caps its own memory at this fraction of the container limit
+  # (the image default is 0.9). The rest is headroom for memory ClickHouse
+  # does not track, so an oversized merge fails inside ClickHouse with
+  # MEMORY_LIMIT_EXCEEDED instead of the kernel killing the pod.
+  memoryRatio: 0.75
   # Server log level (none, fatal, critical, error, warning, notice,
   # information, debug, trace).
   logLevel: information
