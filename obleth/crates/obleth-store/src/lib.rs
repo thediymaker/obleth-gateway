@@ -1600,7 +1600,7 @@ impl Store {
     ) -> Result<ModelRoute> {
         let api_key = cipher().encrypt_opt(api_key);
         let discovery = discovery.normalized();
-        let row = sqlx::query(
+        let row = sqlx::query(&format!(
             "insert into models (
                 id, model_name, description, upstream_model, api_base, api_key, model_type,
                 input_cost_per_token, output_cost_per_token,
@@ -1613,16 +1613,7 @@ impl Store {
                 capacity_service, per_replica_max_in_flight, capacity_source, capacity_headroom,
                 variants
              ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40)
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, rejected_request_fields, session_affinity, quantization,
-                       input_cost_per_token, output_cost_per_token,
-                       cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
-                       admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
-                       supports_response_schema, supports_tool_choice, supports_vision, enabled,
-                       cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_service,
-                       per_replica_max_in_flight, capacity_headroom,
-                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
-                       created_at, updated_at",
+             returning {MODEL_COLUMNS}"),
         )
         .bind(Uuid::new_v4())
         .bind(model_name)
@@ -1672,40 +1663,20 @@ impl Store {
     }
 
     pub async fn list_models(&self) -> Result<Vec<ModelRoute>> {
-        let rows = sqlx::query(
-            "select id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, rejected_request_fields, session_affinity, quantization,
-                    input_cost_per_token, output_cost_per_token,
-                    cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
-                    admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
-                    supports_response_schema, supports_tool_choice, supports_vision, enabled,
-                    cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                    capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_service,
-                       per_replica_max_in_flight, capacity_headroom,
-                    request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
-                    debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
-                    created_at, updated_at
-             from models order by model_name",
-        )
+        let rows = sqlx::query(&format!(
+            "select {MODEL_COLUMNS}
+             from models order by model_name"
+        ))
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(model_from_row).collect()
     }
 
     pub async fn get_model(&self, id: Uuid) -> Result<ModelRoute> {
-        let row = sqlx::query(
-            "select id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, rejected_request_fields, session_affinity, quantization,
-                    input_cost_per_token, output_cost_per_token,
-                    cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
-                    admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
-                    supports_response_schema, supports_tool_choice, supports_vision, enabled,
-                    cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                    capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_service,
-                       per_replica_max_in_flight, capacity_headroom,
-                    request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
-                    debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
-                    created_at, updated_at
-             from models where id = $1",
-        )
+        let row = sqlx::query(&format!(
+            "select {MODEL_COLUMNS}
+             from models where id = $1"
+        ))
         .bind(id)
         .fetch_optional(&self.pool)
         .await?
@@ -1714,20 +1685,10 @@ impl Store {
     }
 
     pub async fn get_model_by_name(&self, model_name: &str) -> Result<ModelRoute> {
-        let row = sqlx::query(
-            "select id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, rejected_request_fields, session_affinity, quantization,
-                    input_cost_per_token, output_cost_per_token,
-                    cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
-                    admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
-                    supports_response_schema, supports_tool_choice, supports_vision, enabled,
-                    cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                    capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_service,
-                       per_replica_max_in_flight, capacity_headroom,
-                    request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
-                    debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
-                    created_at, updated_at
-             from models where model_name = $1",
-        )
+        let row = sqlx::query(&format!(
+            "select {MODEL_COLUMNS}
+             from models where model_name = $1"
+        ))
         .bind(model_name)
         .fetch_optional(&self.pool)
         .await?
@@ -1806,7 +1767,7 @@ impl Store {
     ) -> Result<ModelRoute> {
         let api_key = cipher().encrypt_opt(api_key);
         let discovery = discovery.normalized();
-        let row = sqlx::query(
+        let row = sqlx::query(&format!(
             "update models set
                 description = $2, upstream_model = $3, api_base = $4, api_key = $5,
                 input_cost_per_token = $6, output_cost_per_token = $7,
@@ -1826,17 +1787,8 @@ impl Store {
                 capacity_source = $38, capacity_headroom = $39, variants = $40,
                 updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, rejected_request_fields, session_affinity, quantization,
-                       input_cost_per_token, output_cost_per_token,
-                       cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
-                       admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
-                       supports_response_schema, supports_tool_choice, supports_vision, enabled,
-                       cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_service,
-                       per_replica_max_in_flight, capacity_headroom,
-                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
-                       created_at, updated_at",
-        )
+             returning {MODEL_COLUMNS}"
+        ))
         .bind(id)
         .bind(description)
         .bind(upstream_model)
@@ -1878,7 +1830,9 @@ impl Store {
         .bind(discovery.per_replica_max_in_flight.map(|n| n.max(1)))
         .bind(&discovery.source)
         .bind(discovery.headroom)
-        .bind(sqlx::types::Json(obleth_config::normalize_variants(variants)))
+        .bind(sqlx::types::Json(obleth_config::normalize_variants(
+            variants,
+        )))
         .fetch_optional(&self.pool)
         .await?
         .ok_or(StoreError::NotFound)?;
@@ -1901,20 +1855,11 @@ impl Store {
         id: Uuid,
         max_in_flight: Option<i64>,
     ) -> Result<ModelRoute> {
-        let row = sqlx::query(
+        let row = sqlx::query(&format!(
             "update models set max_in_flight = $2, updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, rejected_request_fields, session_affinity, quantization,
-                       input_cost_per_token, output_cost_per_token,
-                       cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
-                       admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
-                       supports_response_schema, supports_tool_choice, supports_vision, enabled,
-                       cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_service,
-                       per_replica_max_in_flight, capacity_headroom,
-                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
-                       created_at, updated_at",
-        )
+             returning {MODEL_COLUMNS}"
+        ))
         .bind(id)
         .bind(max_in_flight.map(|n| n.max(1)))
         .fetch_optional(&self.pool)
@@ -1931,20 +1876,11 @@ impl Store {
         id: Uuid,
         lifecycle: &obleth_config::ModelLifecycle,
     ) -> Result<ModelRoute> {
-        let row = sqlx::query(
+        let row = sqlx::query(&format!(
             "update models set lifecycle = $2, updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, rejected_request_fields, session_affinity, quantization,
-                       input_cost_per_token, output_cost_per_token,
-                       cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
-                       admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
-                       supports_response_schema, supports_tool_choice, supports_vision, enabled,
-                       cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_service,
-                       per_replica_max_in_flight, capacity_headroom,
-                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
-                       created_at, updated_at",
-        )
+             returning {MODEL_COLUMNS}"
+        ))
         .bind(id)
         .bind(sqlx::types::Json(lifecycle))
         .fetch_optional(&self.pool)
@@ -1960,20 +1896,11 @@ impl Store {
         id: Uuid,
         reasoning: &obleth_config::ModelReasoning,
     ) -> Result<ModelRoute> {
-        let row = sqlx::query(
+        let row = sqlx::query(&format!(
             "update models set reasoning = $2, updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, rejected_request_fields, session_affinity, quantization,
-                       input_cost_per_token, output_cost_per_token,
-                       cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
-                       admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
-                       supports_response_schema, supports_tool_choice, supports_vision, enabled,
-                       cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_service,
-                       per_replica_max_in_flight, capacity_headroom,
-                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
-                       created_at, updated_at",
-        )
+             returning {MODEL_COLUMNS}"
+        ))
         .bind(id)
         .bind(sqlx::types::Json(reasoning))
         .fetch_optional(&self.pool)
@@ -1984,20 +1911,11 @@ impl Store {
 
     /// Set whether the discovery endpoints advertise a model.
     pub async fn set_model_listed(&self, id: Uuid, listed: bool) -> Result<ModelRoute> {
-        let row = sqlx::query(
+        let row = sqlx::query(&format!(
             "update models set listed = $2, updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, rejected_request_fields, session_affinity, quantization,
-                       input_cost_per_token, output_cost_per_token,
-                       cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
-                       admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
-                       supports_response_schema, supports_tool_choice, supports_vision, enabled,
-                       cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_service,
-                       per_replica_max_in_flight, capacity_headroom,
-                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
-                       created_at, updated_at",
-        )
+             returning {MODEL_COLUMNS}"
+        ))
         .bind(id)
         .bind(listed)
         .fetch_optional(&self.pool)
@@ -2013,20 +1931,11 @@ impl Store {
         id: Uuid,
         fields: &[String],
     ) -> Result<ModelRoute> {
-        let row = sqlx::query(
+        let row = sqlx::query(&format!(
             "update models set rejected_request_fields = $2, updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, rejected_request_fields, session_affinity, quantization,
-                       input_cost_per_token, output_cost_per_token,
-                       cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
-                       admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
-                       supports_response_schema, supports_tool_choice, supports_vision, enabled,
-                       cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_service,
-                       per_replica_max_in_flight, capacity_headroom,
-                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
-                       created_at, updated_at",
-        )
+             returning {MODEL_COLUMNS}"
+        ))
         .bind(id)
         .bind(sqlx::types::Json(
             obleth_config::normalize_rejected_request_fields(fields),
@@ -2043,20 +1952,11 @@ impl Store {
         id: Uuid,
         affinity: &obleth_config::ModelSessionAffinity,
     ) -> Result<ModelRoute> {
-        let row = sqlx::query(
+        let row = sqlx::query(&format!(
             "update models set session_affinity = $2, updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, rejected_request_fields, session_affinity, quantization,
-                       input_cost_per_token, output_cost_per_token,
-                       cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
-                       admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
-                       supports_response_schema, supports_tool_choice, supports_vision, enabled,
-                       cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_service,
-                       per_replica_max_in_flight, capacity_headroom,
-                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
-                       created_at, updated_at",
-        )
+             returning {MODEL_COLUMNS}"
+        ))
         .bind(id)
         .bind(sqlx::types::Json(affinity))
         .fetch_optional(&self.pool)
@@ -2189,7 +2089,7 @@ impl Store {
         discovery: Option<&obleth_config::capacity::DiscoveryFields>,
     ) -> Result<ModelRoute> {
         let discovery = discovery.map(|d| d.normalized());
-        let row = sqlx::query(
+        let row = sqlx::query(&format!(
             "update models set capacity_mode = $2,
                     capacity_namespace = case when $3 then $4 else capacity_namespace end,
                     capacity_service = case when $3 then $5 else capacity_service end,
@@ -2199,17 +2099,8 @@ impl Store {
                     capacity_headroom = case when $3 then $8 else capacity_headroom end,
                     updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, rejected_request_fields, session_affinity, quantization,
-                       input_cost_per_token, output_cost_per_token,
-                       cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
-                       admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
-                       supports_response_schema, supports_tool_choice, supports_vision, enabled,
-                       cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_service,
-                       per_replica_max_in_flight, capacity_headroom,
-                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
-                       created_at, updated_at",
-        )
+             returning {MODEL_COLUMNS}"
+        ))
         .bind(id)
         .bind(obleth_config::normalize_capacity_mode(capacity_mode))
         .bind(discovery.is_some())
@@ -2242,21 +2133,12 @@ impl Store {
         id: Uuid,
         max_in_flight: i64,
     ) -> Result<ModelRoute> {
-        let row = sqlx::query(
+        let row = sqlx::query(&format!(
             "update models set max_in_flight = $2, capacity_mode = 'tuned',
                     capacity_tuned_at = now(), updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, rejected_request_fields, session_affinity, quantization,
-                       input_cost_per_token, output_cost_per_token,
-                       cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
-                       admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
-                       supports_response_schema, supports_tool_choice, supports_vision, enabled,
-                       cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_service,
-                       per_replica_max_in_flight, capacity_headroom,
-                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
-                       created_at, updated_at",
-        )
+             returning {MODEL_COLUMNS}"
+        ))
         .bind(id)
         .bind(max_in_flight.max(1))
         .fetch_optional(&self.pool)
@@ -2270,20 +2152,11 @@ impl Store {
         id: Uuid,
         admission_weight: i64,
     ) -> Result<ModelRoute> {
-        let row = sqlx::query(
+        let row = sqlx::query(&format!(
             "update models set admission_weight = $2, updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, rejected_request_fields, session_affinity, quantization,
-                       input_cost_per_token, output_cost_per_token,
-                       cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
-                       admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
-                       supports_response_schema, supports_tool_choice, supports_vision, enabled,
-                       cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_service,
-                       per_replica_max_in_flight, capacity_headroom,
-                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
-                       created_at, updated_at",
-        )
+             returning {MODEL_COLUMNS}"
+        ))
         .bind(id)
         .bind(admission_weight.max(1))
         .fetch_optional(&self.pool)
@@ -2494,20 +2367,11 @@ impl Store {
 
     /// Turn a model's route on or off, leaving every other field alone.
     pub async fn set_model_enabled(&self, id: Uuid, enabled: bool) -> Result<ModelRoute> {
-        let row = sqlx::query(
+        let row = sqlx::query(&format!(
             "update models set enabled = $2, updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, rejected_request_fields, session_affinity, quantization,
-                       input_cost_per_token, output_cost_per_token,
-                       cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
-                       admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
-                       supports_response_schema, supports_tool_choice, supports_vision, enabled,
-                       cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_service,
-                       per_replica_max_in_flight, capacity_headroom,
-                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
-                       created_at, updated_at",
-        )
+             returning {MODEL_COLUMNS}"
+        ))
         .bind(id)
         .bind(enabled)
         .fetch_optional(&self.pool)
@@ -2523,20 +2387,11 @@ impl Store {
         cache_enabled: bool,
         cache_ttl_secs: i64,
     ) -> Result<ModelRoute> {
-        let row = sqlx::query(
+        let row = sqlx::query(&format!(
             "update models set cache_enabled = $2, cache_ttl_secs = $3, updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, rejected_request_fields, session_affinity, quantization,
-                       input_cost_per_token, output_cost_per_token,
-                       cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
-                       admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
-                       supports_response_schema, supports_tool_choice, supports_vision, enabled,
-                       cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_service,
-                       per_replica_max_in_flight, capacity_headroom,
-                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
-                       created_at, updated_at",
-        )
+             returning {MODEL_COLUMNS}"
+        ))
         .bind(id)
         .bind(cache_enabled)
         .bind(cache_ttl_secs.max(0))
@@ -2558,23 +2413,13 @@ impl Store {
         endpoint_selection_mode: &str,
         debug_diagnostics: bool,
     ) -> Result<ModelRoute> {
-        let row = sqlx::query(
+        let row = sqlx::query(&format!(
             "update models set request_timeout_secs = $2, max_retries = $3,
                     retry_backoff_ms = $4, endpoint_selection_mode = $5,
                     debug_diagnostics = $6, updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, rejected_request_fields, session_affinity, quantization,
-                       input_cost_per_token, output_cost_per_token,
-                       cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
-                       admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
-                       supports_response_schema, supports_tool_choice, supports_vision, enabled,
-                       cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_service,
-                       per_replica_max_in_flight, capacity_headroom,
-                       request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
-                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
-                       created_at, updated_at",
-        )
+             returning {MODEL_COLUMNS}"
+        ))
         .bind(id)
         .bind(request_timeout_secs.filter(|n| *n >= 1))
         .bind(max_retries.max(0))
@@ -3855,20 +3700,11 @@ impl Store {
         .fetch_one(&mut *tx)
         .await?;
         let server = mcp_server_from_row(&row)?;
-        let rows = sqlx::query(
+        let rows = sqlx::query(&format!(
             "update models
                 set tool_servers = (tool_servers - $1) || jsonb_build_array($2::text), updated_at = now()
               where tool_servers ? $1
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, rejected_request_fields, session_affinity, quantization,
-                       input_cost_per_token, output_cost_per_token,
-                       cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
-                       admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
-                       supports_response_schema, supports_tool_choice, supports_vision, enabled,
-                       cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_service,
-                       per_replica_max_in_flight, capacity_headroom,
-                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
-                       created_at, updated_at",
+             returning {MODEL_COLUMNS}"),
         )
         .bind(&old)
         .bind(new_name)
@@ -3898,21 +3734,12 @@ impl Store {
     /// server fails tool discovery on every request, and the dashboard can no
     /// longer show (or clear) it once the server's checkbox is gone.
     pub async fn strip_tool_server_grants(&self, server_name: &str) -> Result<Vec<ModelRoute>> {
-        let rows = sqlx::query(
+        let rows = sqlx::query(&format!(
             "update models
                 set tool_servers = tool_servers - $1, updated_at = now()
               where tool_servers ? $1
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, rejected_request_fields, session_affinity, quantization,
-                       input_cost_per_token, output_cost_per_token,
-                       cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
-                       admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
-                       supports_response_schema, supports_tool_choice, supports_vision, enabled,
-                       cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_service,
-                       per_replica_max_in_flight, capacity_headroom,
-                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
-                       created_at, updated_at",
-        )
+             returning {MODEL_COLUMNS}"
+        ))
         .bind(server_name)
         .fetch_all(&self.pool)
         .await?;
@@ -4567,6 +4394,22 @@ fn mcp_server_from_row(row: &PgRow) -> Result<McpServer> {
     })
 }
 
+/// Every column of `models` that [`model_from_row`] reads, for each select and
+/// RETURNING clause that feeds the mapper. One list, so a write cannot hand
+/// back a row that is missing a column: the mapper reads the newer columns
+/// leniently, and a missing one used to come back as its default and go to
+/// the data plane that way.
+pub(crate) const MODEL_COLUMNS: &str = "id, model_name, description, upstream_model, api_base, api_key,
+     upstream_headers, model_type, aliases, variants, lifecycle, reasoning,
+     listed, rejected_request_fields, session_affinity, quantization, input_cost_per_token, output_cost_per_token,
+     cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window, admission_weight,
+     max_in_flight, supports_function_calling, supports_system_messages, supports_response_schema, supports_tool_choice, supports_vision,
+     enabled, cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
+     capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_service, per_replica_max_in_flight,
+     capacity_headroom, request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode, debug_diagnostics,
+     energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
+     created_at, updated_at";
+
 fn model_from_row(row: &PgRow) -> Result<ModelRoute> {
     Ok(ModelRoute {
         id: row.try_get("id")?,
@@ -4576,10 +4419,8 @@ fn model_from_row(row: &PgRow) -> Result<ModelRoute> {
         api_base: row.try_get("api_base")?,
         api_key: cipher().decrypt_opt(row.try_get("api_key")?)?,
         upstream_headers: upstream_headers_from_row(row)?,
-        // Tolerant reads: SQL statements that don't select these newer columns
-        // (e.g. capacity/weight toggles) degrade to defaults rather than
-        // erroring. The full SELECT/RETURNING clauses do include them so the
-        // resolved-cache refresh in `sync_model` sees the real values.
+        // Every statement that feeds this mapper selects MODEL_COLUMNS, so the
+        // lenient reads below only cover rows from older schemas mid-upgrade.
         model_type: row
             .try_get::<String, _>("model_type")
             .unwrap_or_else(|_| obleth_config::DEFAULT_MODEL_TYPE.to_string()),
@@ -5179,6 +5020,29 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    /// Every column the model mapper reads is in MODEL_COLUMNS, and nothing in
+    /// MODEL_COLUMNS is unread, so the list and the mapper cannot drift apart.
+    #[test]
+    fn model_columns_match_the_mapper() {
+        let src = include_str!("lib.rs");
+        let mapper = &src[src.find("\nfn model_from_row(").unwrap()..];
+        let mapper = &mapper[..mapper.find("\n}\n").unwrap()];
+        let mut read: std::collections::BTreeSet<&str> = mapper
+            .match_indices("try_get")
+            .filter_map(|(at, _)| {
+                let rest = &mapper[at..];
+                let open = rest.find("(\"")? + 2;
+                let close = open + rest[open..].find('"')?;
+                Some(&rest[open..close])
+            })
+            .collect();
+        // lifecycle is read through lifecycle_from_row.
+        read.insert("lifecycle");
+        let listed: std::collections::BTreeSet<&str> =
+            super::MODEL_COLUMNS.split(',').map(str::trim).collect();
+        assert_eq!(read, listed);
+    }
+
     use super::*;
     use obleth_config::hash_api_key;
 
