@@ -1932,8 +1932,7 @@ async fn create_tenant(
         )
         .await?;
     if body.synthetic == Some(true) {
-        state.store.set_tenant_synthetic(tenant.id, true).await?;
-        tenant.synthetic = true;
+        tenant = state.store.set_tenant_synthetic(tenant.id, true).await?;
     }
     state
         .store
