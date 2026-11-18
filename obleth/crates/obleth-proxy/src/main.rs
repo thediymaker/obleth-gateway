@@ -294,6 +294,13 @@ async fn main() -> anyhow::Result<()> {
         http_builder =
             http_builder.tcp_keepalive(Duration::from_secs(cfg.upstream_tcp_keepalive_secs));
     }
+    // A host that drops packets would otherwise hold the request, and its
+    // fairshare permit, for the kernel's connect give-up before the next
+    // endpoint is tried.
+    if cfg.upstream_connect_timeout_secs > 0 {
+        http_builder =
+            http_builder.connect_timeout(Duration::from_secs(cfg.upstream_connect_timeout_secs));
+    }
     // A backend that sends headers and then stalls would otherwise hold its
     // fairshare permit forever. reqwest's read timeout also bounds the wait
     // for response headers, so a non-streaming generation slower than this

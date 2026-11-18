@@ -2960,7 +2960,9 @@ async fn run_pipeline(
                     // end here rather than in the arm below. It is the same
                     // timeout: a 504, and never the fresh-connection retry,
                     // which would run the whole generation again.
-                    let read_timed_out = e.is_timeout();
+                    // A connect timeout is also reported as a timeout, but the
+                    // request never left: that one is a connection error.
+                    let read_timed_out = e.is_timeout() && !e.is_connect();
                     timed_out |= read_timed_out;
                     let connection_error = is_connection_error(&e);
                     last_err = Some(e.to_string());
@@ -2969,6 +2971,9 @@ async fn run_pipeline(
                             "no answer from the model server within {}",
                             secs_label(req_timeout)
                         )
+                    } else if e.is_connect() && e.is_timeout() {
+                        "could not reach the model server: no connection within the connect timeout"
+                            .to_string()
                     } else {
                         format!("could not reach the model server: {}", transport_cause(&e))
                     });
@@ -6671,12 +6676,16 @@ fn is_retryable_status(status: u16) -> bool {
 /// well-known signatures.
 fn is_connection_error(e: &reqwest::Error) -> bool {
     use std::error::Error;
+    // A connect timeout is a timeout too, but the request never left.
+    if e.is_connect() {
+        return true;
+    }
     // reqwest reports a read timeout before the headers as a request error;
     // the upstream got the request and was working on it.
     if e.is_timeout() {
         return false;
     }
-    if e.is_connect() || e.is_request() {
+    if e.is_request() {
         return true;
     }
     let mut source: Option<&dyn Error> = Some(e);
@@ -11607,6 +11616,27 @@ mod lifecycle_tests {
         );
     }
 
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set (the
+    /// target address needs no server, but the test needs a routable network).
+    #[tokio::test]
+    async fn a_connect_timeout_is_a_connection_error() {
+        if std::env::var("OBLETH_TEST_REDIS_URL").is_err() {
+            eprintln!("skipping: set OBLETH_TEST_REDIS_URL to run");
+            return;
+        }
+        let err = reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(300))
+            .build()
+            .unwrap()
+            .post("http://10.255.255.1:9/chat/completions")
+            .body("{}")
+            .send()
+            .await
+            .expect_err("a blackholed address never connects");
+        assert!(err.is_connect() && err.is_timeout(), "{err:?}");
+        assert!(is_connection_error(&err), "{err:?}");
+    }
+
     #[tokio::test]
     async fn a_connection_dropped_before_response_headers_is_a_connection_error() {
         use crate::upstream_failure::test_support::{spawn_failing_upstream, Hangup};
@@ -11656,6 +11686,8 @@ mod lifecycle_tests {
         let src = squash(handler());
         let arm = src.find("Ok(Err(e))=>{").expect("the send-error arm");
         let rest = &src[arm..];
-        assert!(rest.contains("letread_timed_out=e.is_timeout();timed_out|=read_timed_out;"));
+        assert!(rest.contains(
+            "letread_timed_out=e.is_timeout()&&!e.is_connect();timed_out|=read_timed_out;"
+        ));
     }
 }

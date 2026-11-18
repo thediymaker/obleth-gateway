@@ -154,6 +154,11 @@ obleth:
   # Seconds between re-pushes of keys/models/MCP servers from Postgres into
   # Redis (also runs after every Redis reconnect). 0 disables the timer.
   redisRewarmSecs: 300
+  # How long (seconds) a new connection to a model server may take. A host
+  # that drops packets would otherwise hold the request, and its fairshare
+  # slot, for the kernel's connect give-up (about two minutes) before the
+  # next endpoint is tried. "0" disables.
+  upstreamConnectTimeoutSecs: "5"
   # Longest wait for an upstream to return response headers before the
   # attempt fails (the body is bounded by upstreamReadTimeoutSecs below).
   upstreamTimeoutSecs: 300

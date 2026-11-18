@@ -32,6 +32,11 @@ pub struct Config {
     /// TCP keep-alive probe interval for upstream connections. Keeps NAT/LB state
     /// warm and surfaces dead peers faster. `0` disables.
     pub upstream_tcp_keepalive_secs: u64,
+    /// How long a new TCP connection to an upstream may take. Without it a
+    /// host that drops packets holds the request, and its fairshare permit,
+    /// for the kernel's connect give-up (about two minutes) before the next
+    /// endpoint is tried. `0` disables.
+    pub upstream_connect_timeout_secs: u64,
     /// Longest silence on an upstream connection (header wait or gap between
     /// body chunks). reqwest applies it to the header wait too, so it defaults
     /// to the upstream request timeout to never undercut it. `0` disables.
@@ -437,6 +442,7 @@ impl Config {
             upstream_timeout: Duration::from_secs(parse_or("OBLETH_UPSTREAM_TIMEOUT_SECS", 300)),
             upstream_pool_idle_secs: parse_or("OBLETH_UPSTREAM_POOL_IDLE_SECS", 15),
             upstream_tcp_keepalive_secs: parse_or("OBLETH_UPSTREAM_TCP_KEEPALIVE_SECS", 30),
+            upstream_connect_timeout_secs: parse_or("OBLETH_UPSTREAM_CONNECT_TIMEOUT_SECS", 5),
             upstream_read_timeout_secs: upstream_read_timeout_secs(
                 env::var("OBLETH_UPSTREAM_READ_TIMEOUT_SECS")
                     .ok()
