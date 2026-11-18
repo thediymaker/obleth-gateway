@@ -360,7 +360,8 @@ async fn main() -> anyhow::Result<()> {
     let knowledge = Arc::new(knowledge::KnowledgeIndex::new());
 
     // Alert settings are persisted in Postgres (app_settings, key='alerts') and
-    // hot-reloadable at runtime. On boot, prefer the saved settings; otherwise
+    // re-read by the 15 s refresh loop, so a save on any replica reaches all of
+    // them. On boot, prefer the saved settings; otherwise
     // seed from the legacy env-configured Slack webhook so existing deployments
     // keep working until an operator saves settings from the control plane.
     let initial_alert_settings = match store.get_alert_settings().await {
@@ -558,9 +559,12 @@ async fn main() -> anyhow::Result<()> {
         store.clone(),
         model_registry.clone(),
         families.clone(),
-        classifier.clone(),
-        boons.clone(),
-        energy.clone(),
+        SavedSettings {
+            classifier: classifier.clone(),
+            boons: boons.clone(),
+            energy: energy.clone(),
+            alerts: alerts.clone(),
+        },
         cfg.upstream_read_timeout_secs,
     );
 
@@ -1020,20 +1024,34 @@ fn overlong_request_timeouts(
     offenders
 }
 
+/// The engines whose settings are saved from the control plane and re-read
+/// by the refresh loop, so a save on any replica reaches all of them.
+struct SavedSettings {
+    classifier: classifier::Classifier,
+    boons: boons::BoonEngine,
+    energy: energy::EnergyEngine,
+    alerts: obleth_admin::AlertDispatcher,
+}
+
 /// Periodically rebuild the `auto`-router candidate list so enable/disable,
 /// metadata edits, and health/maintenance transitions take effect without a
-/// restart. Also refreshes the classifier settings (saved from the control
-/// plane) so they propagate within one interval. Runs every 15s; failures are
-/// logged and retried next tick.
+/// restart. Also refreshes the settings saved from the control plane
+/// (classifier, boons, energy, alerts) so they propagate to every replica
+/// within one interval. Runs every 15s; failures are logged and retried next
+/// tick.
 fn spawn_model_registry_refresh(
     store: Store,
     registry: router::ModelRegistry,
     families: reasoning::FamilyRegistry,
-    classifier: classifier::Classifier,
-    boons: boons::BoonEngine,
-    energy: energy::EnergyEngine,
+    saved: SavedSettings,
     upstream_read_timeout_secs: u64,
 ) {
+    let SavedSettings {
+        classifier,
+        boons,
+        energy,
+        alerts,
+    } = saved;
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(15));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1082,8 +1100,30 @@ fn spawn_model_registry_refresh(
                 Ok(None) => {}
                 Err(e) => tracing::warn!(error = %e, "energy settings refresh failed"),
             }
+            match store.get_alert_settings().await {
+                Ok(Some(settings)) => apply_alert_settings(&alerts, settings),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(error = %e, "alert settings refresh failed"),
+            }
         }
     });
+}
+
+/// Hand freshly read alert settings to the dispatcher, but only when they
+/// differ from what it already holds: a save on another replica must reach
+/// this one, while an unchanged row must not replace the live settings every
+/// tick. The dispatcher keeps its cooldown state across updates either way.
+fn apply_alert_settings(
+    alerts: &obleth_admin::AlertDispatcher,
+    settings: obleth_config::AlertSettings,
+) {
+    if *alerts.current() != settings {
+        tracing::info!(
+            enabled = settings.any_channel_enabled(),
+            "alert settings reloaded"
+        );
+        alerts.update(settings);
+    }
 }
 
 /// Sample the scheduler every `FAIRSHARE_HISTORY_INTERVAL_MS` into the
@@ -1733,6 +1773,27 @@ where
 #[cfg(test)]
 mod registry_refresh_tests {
     use super::*;
+
+    /// A row that differs from the live settings replaces them; an identical
+    /// row leaves the live snapshot untouched, so an unchanged save on another
+    /// replica does not churn the dispatcher every tick.
+    #[test]
+    fn alert_settings_are_replaced_only_when_they_change() {
+        let alerts = obleth_admin::AlertDispatcher::new(
+            reqwest::Client::new(),
+            obleth_config::AlertSettings::default(),
+        );
+        let before = alerts.current();
+        apply_alert_settings(&alerts, obleth_config::AlertSettings::default());
+        assert!(Arc::ptr_eq(&before, &alerts.current()));
+        let changed = obleth_config::AlertSettings {
+            slack_webhook_url: Some("https://hooks.example.test/x".into()),
+            ..obleth_config::AlertSettings::default()
+        };
+        apply_alert_settings(&alerts, changed.clone());
+        assert_eq!(*alerts.current(), changed);
+        assert!(alerts.enabled());
+    }
 
     #[test]
     fn failed_health_query_retains_snapshot_and_success_replaces_it() {
