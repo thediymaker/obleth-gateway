@@ -4920,7 +4920,15 @@ pub(crate) mod test_support {
     /// contain "test" — refuses to run the integration suite against a possibly
     /// real/dev database, which is how fixtures previously leaked.
     pub(crate) fn test_db_url() -> Option<String> {
-        let url = std::env::var("OBLETH_TEST_DATABASE_URL").ok()?;
+        let url = match std::env::var("OBLETH_TEST_DATABASE_URL") {
+            Ok(url) => url,
+            // Locally a missing database skips the test; in CI it must be
+            // there, or the whole integration suite silently stops running.
+            Err(_) if std::env::var_os("CI").is_some() => {
+                panic!("OBLETH_TEST_DATABASE_URL must be set in CI: the integration tests would otherwise be skipped")
+            }
+            Err(_) => return None,
+        };
         let db = url
             .rsplit('/')
             .next()
