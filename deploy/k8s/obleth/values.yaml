@@ -128,8 +128,11 @@ obleth:
   # (for example CF-Connecting-IP) names a header a trusted proxy sets to
   # exactly the client's address; it wins over X-Forwarded-For when present.
   # Keys limited to certain networks are checked against this address.
-  # `countryHeader` is read only from a trusted proxy (empty records no
-  # country). Client addresses and
+  # `countryHeader` is read only from a trusted proxy, for a public client
+  # address (empty records no country). A key limited to certain countries
+  # accepts a request by its country only when `trustedProxies` is set: list
+  # only the proxies' own addresses (not the pod range), and have them remove
+  # a CF-IPCountry header the client sent. Client addresses and
   # User-Agents are cleared from ledger rows after `ipRetentionDays`.
   clientAddress:
     trustedProxies: ""

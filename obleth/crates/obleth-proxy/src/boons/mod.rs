@@ -1626,6 +1626,7 @@ mod tests {
             compression_policy: None,
             synthetic: false,
             allowed_networks: Vec::new(),
+            allowed_countries: Vec::new(),
         };
         k.compression_policy = policy;
         k
@@ -1923,6 +1924,7 @@ mod tests {
                 compression_policy: None,
                 synthetic: false,
                 allowed_networks: Vec::new(),
+                allowed_countries: Vec::new(),
             }
         }
 

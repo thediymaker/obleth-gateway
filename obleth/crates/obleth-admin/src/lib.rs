@@ -682,6 +682,14 @@ pub struct CreateKey {
     /// `203.0.113.7/32`).
     #[serde(default)]
     pub allowed_networks: Vec<String>,
+    /// Countries the key may be used from: two-letter ISO 3166-1 codes such
+    /// as `US`, at most 50, stored upper-case. A request whose client country
+    /// is listed is allowed even from outside `allowed_networks`. The country
+    /// comes from the edge, and only for public client addresses, so a
+    /// request from a private network has none. When both lists are empty
+    /// the key works from anywhere.
+    #[serde(default)]
+    pub allowed_countries: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -713,6 +721,11 @@ pub struct UpdateKey {
     /// limited key to every network. Send `[]` to allow any network again.
     #[serde(default)]
     pub allowed_networks: Option<Vec<String>>,
+    /// Countries the key may be used from (see
+    /// `CreateKey::allowed_countries`). Leaving it out (or sending `null`)
+    /// keeps the key's current list; send `[]` to clear it.
+    #[serde(default)]
+    pub allowed_countries: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -4928,6 +4941,9 @@ async fn create_key(
     let allowed_networks =
         obleth_config::network::normalize_allowed_networks(&body.allowed_networks)
             .map_err(AdminError::BadRequest)?;
+    let allowed_countries =
+        obleth_config::network::normalize_allowed_countries(&body.allowed_countries)
+            .map_err(AdminError::BadRequest)?;
     let (key, secret) = state
         .store
         .create_api_key(
@@ -4941,6 +4957,7 @@ async fn create_key(
             body.weight,
             body.max_in_flight,
             &allowed_networks,
+            &allowed_countries,
         )
         .await?;
     let hash = hash_api_key(&secret);
@@ -4964,6 +4981,7 @@ async fn create_key(
                 "weight": key.weight,
                 "max_in_flight": key.max_in_flight,
                 "allowed_networks": key.allowed_networks,
+                "allowed_countries": key.allowed_countries,
             }),
         )
         .await?;
@@ -5159,6 +5177,12 @@ async fn update_key(
         .map(obleth_config::network::normalize_allowed_networks)
         .transpose()
         .map_err(AdminError::BadRequest)?;
+    let allowed_countries = body
+        .allowed_countries
+        .as_deref()
+        .map(obleth_config::network::normalize_allowed_countries)
+        .transpose()
+        .map_err(AdminError::BadRequest)?;
     let (hash, key, resolved) = state
         .store
         .update_api_key(
@@ -5172,6 +5196,7 @@ async fn update_key(
             body.weight,
             body.max_in_flight,
             allowed_networks.as_deref(),
+            allowed_countries.as_deref(),
         )
         .await?;
     // Same path as disabling a key: Redis is rewritten and every replica
@@ -5194,6 +5219,7 @@ async fn update_key(
                 "weight": key.weight,
                 "max_in_flight": key.max_in_flight,
                 "allowed_networks": key.allowed_networks,
+                "allowed_countries": key.allowed_countries,
             }),
         )
         .await?;
@@ -5573,28 +5599,47 @@ async fn get_usage_key_sources(
 /// Refused uses of real keys in the window: a disabled key, or a key used
 /// from outside its allowed networks. One row per key, reason, client
 /// address and country, with the number of refusals, first and last seen,
-/// and the most recent User-Agent. Default window: the last 24 hours; at
-/// most 31 days.
+/// and the most recent User-Agent, newest first. Default window: the last 24
+/// hours; at most 31 days. `key_id` takes one key or up to 200 joined by
+/// commas, so one call covers every key a person holds (`key_id=` with no
+/// key is refused); `limit` (default and most 10,000) caps the rows and
+/// `per_key` caps any one key's rows. When rows were left out the response
+/// carries `x-obleth-truncated: true`. The read gives up after 10 seconds.
 #[utoipa::path(
     get, path = "/api/v1/usage/key-rejections", tag = "usage",
     params(usage::KeyWatchQuery),
-    responses((status = 200, body = [usage::KeyRejectionAgg]), (status = 400))
+    responses(
+        (status = 200, body = [usage::KeyRejectionAgg], headers(
+            ("x-obleth-truncated" = String, description = "`true` when more rows matched than `limit` or the 10,000-row cap let through")
+        )),
+        (status = 400)
+    )
 )]
 async fn get_usage_key_rejections(
     State(state): State<AdminState>,
     Query(q): Query<usage::KeyWatchQuery>,
-) -> Result<Json<Vec<usage::KeyRejectionAgg>>> {
+) -> Result<(HeaderMap, Json<Vec<usage::KeyRejectionAgg>>)> {
     let (since, until) = q
         .window(chrono::Utc::now().timestamp_millis())
         .map_err(AdminError::BadRequest)?;
-    let mut rows = usage::query_key_rejections(&state.clickhouse, &q, since, until).await?;
+    let usage::KeyRejections {
+        mut rows,
+        truncated,
+    } = usage::query_key_rejections(&state.clickhouse, &q, since, until).await?;
+    let mut headers = HeaderMap::new();
+    if truncated {
+        headers.insert(
+            "x-obleth-truncated",
+            axum::http::HeaderValue::from_static("true"),
+        );
+    }
     let names = NetworkNames::new(&state.store.named_networks().await?);
     if !names.is_empty() {
         for r in &mut rows {
             r.network_name = names.name_of(&r.client_ip).map(str::to_string);
         }
     }
-    Ok(Json(rows))
+    Ok((headers, Json(rows)))
 }
 
 /// Bulk per-key activity summary for the dashboard Keys table. Returns the
@@ -5734,6 +5779,10 @@ pub struct UsageLogEntry {
     /// `true` when at least one span for this request exists in ClickHouse.
     #[serde(default)]
     pub has_trace: bool,
+    /// The narrowest named network (Settings › Networks) that holds the
+    /// client address, when one does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_name: Option<String>,
 }
 
 /// Newest-first feed of individual requests for the live log view. ClickHouse
@@ -5776,6 +5825,7 @@ async fn get_usage_logs(
 
     let request_ids: Vec<Uuid> = rows.iter().map(|r| r.request_id).collect();
     let traced = usage::batch_has_trace(&state.clickhouse, &request_ids).await;
+    let names = NetworkNames::new(&state.store.named_networks().await?);
 
     let entries = rows
         .into_iter()
@@ -5791,12 +5841,16 @@ async fn get_usage_logs(
                 .cloned()
                 .unwrap_or_else(|| (row.recorded_key_name.clone(), String::new()));
             let has_trace = traced.contains(&row.request_id);
+            let network_name = (!row.client_ip.is_empty())
+                .then(|| names.name_of(&row.client_ip).map(str::to_string))
+                .flatten();
             UsageLogEntry {
                 row,
                 tenant_name,
                 key_name,
                 key_prefix,
                 has_trace,
+                network_name,
             }
         })
         .collect();
@@ -6108,6 +6162,11 @@ pub struct ClientAddressView {
     pub address_header: Option<String>,
     /// `OBLETH_CLIENT_COUNTRY_HEADER`, or `null` when countries are off.
     pub country_header: Option<String>,
+    /// True when a country can let a request use a key limited to certain
+    /// countries: a country header is set and so is
+    /// `OBLETH_TRUSTED_PROXIES`. Otherwise countries are only recorded, and
+    /// a key limited to countries alone is refused everywhere.
+    pub countries_admit: bool,
 }
 
 /// Named networks, and how the client address is found.
@@ -6119,7 +6178,9 @@ pub struct NetworkSettingsView {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateNamedNetworks {
-    /// Every named network; this replaces the list.
+    /// Every named network; this replaces the list. The older one-range
+    /// rows (`{"network", "name"}`) are still accepted, and pieces that
+    /// share a name are merged into one network.
     pub networks: Vec<NamedNetwork>,
 }
 
@@ -6132,6 +6193,7 @@ fn network_settings_view(networks: Vec<NamedNetwork>) -> NetworkSettingsView {
             trusted_proxies_default: !env.explicit,
             walks_past_proxies: env.explicit,
             invalid_trusted_proxies: env.invalid,
+            countries_admit: env.explicit && env.country_header.is_some(),
             address_header: env.address_header,
             country_header: env.country_header,
         },
@@ -6150,8 +6212,10 @@ async fn get_network_settings(
     )))
 }
 
-/// Replace the named networks: ranges of addresses with a name, so reports
-/// can say whose network a client is in. They change no check.
+/// Replace the named networks: groups of address ranges with a name (and
+/// whether the network is the organisation's own), so reports can say whose
+/// network a client is in. An address takes the name of the narrowest range
+/// that holds it. They change no check.
 #[utoipa::path(
     put, path = "/api/v1/settings/networks", tag = "settings",
     request_body = UpdateNamedNetworks,
@@ -12274,7 +12338,7 @@ mod tests {
         if let Some(secret) = created["secret"].as_str() {
             let hash = obleth_config::hash_api_key(secret);
             let _: ::redis::RedisResult<()> = ::redis::cmd("DEL")
-                .arg(format!("obleth:key2:{hash}"))
+                .arg(format!("obleth:key3:{hash}"))
                 .query_async(&mut conn)
                 .await;
         }
@@ -12719,6 +12783,155 @@ mod tests {
         );
         assert_eq!(bad_put_status, StatusCode::BAD_REQUEST);
         assert_eq!(cleared["allowed_networks"], serde_json::json!([]));
+    }
+
+    /// Omitting `allowed_countries` from an update keeps the key's list;
+    /// `[]` clears it. On create it defaults to none.
+    #[test]
+    fn allowed_countries_are_optional_on_create_and_update() {
+        let create: CreateKey =
+            serde_json::from_value(serde_json::json!({ "name": "lab" })).unwrap();
+        assert!(create.allowed_countries.is_empty());
+        let keep: UpdateKey = serde_json::from_value(serde_json::json!({ "name": "lab" })).unwrap();
+        assert_eq!(keep.allowed_countries, None);
+        let clear: UpdateKey =
+            serde_json::from_value(serde_json::json!({ "name": "lab", "allowed_countries": [] }))
+                .unwrap();
+        assert_eq!(clear.allowed_countries, Some(Vec::new()));
+    }
+
+    /// Allowed countries are validated and normalised on create and update,
+    /// reach the gateway's resolved key, survive a whole-key PUT that does
+    /// not mention them, and a bad code is a 400 naming it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn allowed_countries_are_normalised_and_survive_a_key_put() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let tenant = t
+            .store
+            .create_tenant(&format!("t-{}", Uuid::new_v4()), 100, 1000, None, None)
+            .await
+            .expect("create tenant");
+        let request = |method: &str, path: String, body: serde_json::Value| {
+            axum::http::Request::builder()
+                .method(method)
+                .uri(path)
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+                .body(axum::body::Body::from(body.to_string()))
+                .expect("build request")
+        };
+        let resolved_countries = |id: String| {
+            let store = t.store.clone();
+            async move {
+                store
+                    .all_resolved_keys()
+                    .await
+                    .expect("resolved keys")
+                    .into_iter()
+                    .find(|(_, k)| k.key_id.to_string() == id)
+                    .map(|(_, k)| k.allowed_countries)
+            }
+        };
+
+        let (bad_status, bad) = send(
+            &t.app,
+            request(
+                "POST",
+                format!("/api/v1/tenants/{}/keys", tenant.id),
+                serde_json::json!({ "name": "lab", "allowed_countries": ["US", "XX"] }),
+            ),
+        )
+        .await;
+        let (_, created) = send(
+            &t.app,
+            request(
+                "POST",
+                format!("/api/v1/tenants/{}/keys", tenant.id),
+                serde_json::json!({
+                    "name": "lab",
+                    "allowed_networks": ["192.0.2.0/24"],
+                    "allowed_countries": [" us ", "ca", "", "US"]
+                }),
+            ),
+        )
+        .await;
+        let id = created["key"]["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let resolved_after_create = resolved_countries(id.clone()).await;
+        let (_, after_put) = send(
+            &t.app,
+            request(
+                "PUT",
+                format!("/api/v1/keys/{id}"),
+                serde_json::json!({ "name": "lab", "weight": 300 }),
+            ),
+        )
+        .await;
+        let (bad_put_status, bad_put) = send(
+            &t.app,
+            request(
+                "PUT",
+                format!("/api/v1/keys/{id}"),
+                serde_json::json!({ "name": "lab", "allowed_countries": ["U1"] }),
+            ),
+        )
+        .await;
+        let (_, narrowed) = send(
+            &t.app,
+            request(
+                "PUT",
+                format!("/api/v1/keys/{id}"),
+                serde_json::json!({ "name": "lab", "allowed_countries": ["us"] }),
+            ),
+        )
+        .await;
+        let (_, cleared) = send(
+            &t.app,
+            request(
+                "PUT",
+                format!("/api/v1/keys/{id}"),
+                serde_json::json!({ "name": "lab", "allowed_countries": [] }),
+            ),
+        )
+        .await;
+
+        let _ = t.store.delete_tenant(tenant.id).await;
+
+        assert_eq!(bad_status, StatusCode::BAD_REQUEST, "{bad}");
+        assert!(
+            bad.to_string().contains("XX"),
+            "the error names the entry: {bad}"
+        );
+        assert_eq!(
+            created["key"]["allowed_countries"],
+            serde_json::json!(["US", "CA"])
+        );
+        assert_eq!(
+            resolved_after_create,
+            Some(vec!["US".to_string(), "CA".to_string()])
+        );
+        assert_eq!(
+            after_put["allowed_countries"],
+            serde_json::json!(["US", "CA"]),
+            "a whole-key PUT without the field keeps the countries"
+        );
+        assert_eq!(bad_put_status, StatusCode::BAD_REQUEST);
+        assert!(bad_put.to_string().contains("U1"), "{bad_put}");
+        assert_eq!(narrowed["allowed_countries"], serde_json::json!(["US"]));
+        assert_eq!(
+            narrowed["allowed_networks"],
+            serde_json::json!(["192.0.2.0/24"])
+        );
+        assert_eq!(cleared["allowed_countries"], serde_json::json!([]));
+        assert_eq!(
+            cleared["allowed_networks"],
+            serde_json::json!(["192.0.2.0/24"])
+        );
     }
 
     /// Background priority is operator-only, has its own route, and a
@@ -13574,6 +13787,34 @@ mod tests {
                 "{name} is not registered in components(...)"
             );
         }
+    }
+
+    #[test]
+    fn network_settings_take_legacy_rows_and_answer_in_groups() {
+        use utoipa::OpenApi;
+        let body: UpdateNamedNetworks = serde_json::from_value(serde_json::json!({
+            "networks": [
+                { "network": "198.51.100.0/24", "name": "HPC cluster" },
+                { "name": "hpc cluster", "ranges": ["198.51.101.0/24"], "ours": true },
+                { "name": "Campus", "ranges": ["203.0.113.0/24"] }
+            ]
+        }))
+        .expect("legacy and group rows parse");
+        let networks =
+            obleth_config::network::normalize_named_networks(&body.networks).expect("valid");
+        let view = serde_json::to_value(network_settings_view(networks)).expect("serialize");
+        assert_eq!(
+            view["networks"],
+            serde_json::json!([
+                { "name": "HPC cluster", "ranges": ["198.51.100.0/24", "198.51.101.0/24"], "ours": true },
+                { "name": "Campus", "ranges": ["203.0.113.0/24"], "ours": false }
+            ])
+        );
+        assert!(view["client_address"].is_object());
+        let doc = serde_json::to_value(ApiDoc::openapi()).expect("serialize the openapi doc");
+        let schema = &doc["components"]["schemas"]["NamedNetwork"]["properties"];
+        assert!(schema["ranges"].is_object(), "{schema}");
+        assert!(schema["ours"].is_object(), "{schema}");
     }
 
     #[test]

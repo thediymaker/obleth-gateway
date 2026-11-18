@@ -10,6 +10,7 @@ mod crash_guard;
 mod energy;
 mod jobs;
 mod jwt_auth;
+mod key_miss;
 mod knowledge;
 mod lifecycle;
 mod load;
@@ -234,6 +235,9 @@ async fn main() -> anyhow::Result<()> {
         .time_to_live(Duration::from_secs(300))
         .max_capacity(100_000)
         .build();
+    // Hashes Redis did not know, so a flood of one made-up key costs one
+    // Redis lookup a minute on this pod (see key_miss.rs).
+    let key_misses = key_miss::KeyMissCache::default();
     let model_cache: Cache<String, Arc<obleth_config::ResolvedModel>> = Cache::builder()
         .time_to_live(Duration::from_secs(300))
         .max_capacity(10_000)
@@ -261,9 +265,11 @@ async fn main() -> anyhow::Result<()> {
 
     let (local_cache_tx, mut local_cache_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let key_cache_direct = key_cache.clone();
+    let key_misses_direct = key_misses.clone();
     tokio::spawn(async move {
         while let Some(hash) = local_cache_rx.recv().await {
             key_cache_direct.invalidate(&hash).await;
+            key_misses_direct.forget(&hash).await;
         }
     });
 
@@ -460,6 +466,7 @@ async fn main() -> anyhow::Result<()> {
         upstream_base: cfg.upstream_base_url.clone(),
         upstream_timeout: cfg.upstream_timeout,
         key_cache: key_cache.clone(),
+        key_misses: key_misses.clone(),
         model_cache: model_cache.clone(),
         mcp_cache: mcp_cache.clone(),
         tool_cache,
@@ -600,6 +607,7 @@ async fn main() -> anyhow::Result<()> {
         redis.clone(),
         InvalidationCaches {
             keys: key_cache.clone(),
+            key_misses: key_misses.clone(),
             models: model_cache.clone(),
             mcp: mcp_cache.clone(),
         },
@@ -611,6 +619,7 @@ async fn main() -> anyhow::Result<()> {
         (cfg.redis_rewarm_secs > 0)
             .then(|| Duration::from_secs(clamped_redis_rewarm_secs(cfg.redis_rewarm_secs))),
         redis_reconnected,
+        key_misses.clone(),
     );
 
     // ---- admin (Management API) ----
@@ -1180,6 +1189,7 @@ fn spawn_tool_cache_prewarm(state: AppState, store: Store) {
 #[derive(Clone)]
 struct InvalidationCaches {
     keys: Cache<String, Arc<obleth_config::ResolvedKey>>,
+    key_misses: key_miss::KeyMissCache,
     models: Cache<String, Arc<obleth_config::ResolvedModel>>,
     mcp: Cache<String, Arc<obleth_config::ResolvedMcpServer>>,
 }
@@ -1187,6 +1197,7 @@ struct InvalidationCaches {
 impl InvalidationCaches {
     fn invalidate_all(&self) {
         self.keys.invalidate_all();
+        self.key_misses.clear();
         self.models.invalidate_all();
         self.mcp.invalidate_all();
     }
@@ -1200,6 +1211,8 @@ impl InvalidationCaches {
             self.mcp.invalidate(name).await;
         } else {
             self.keys.invalidate(target).await;
+            // A key with this hash may have just been created or restored.
+            self.key_misses.forget(target).await;
         }
     }
 }
@@ -1262,6 +1275,7 @@ fn spawn_redis_rewarm(
     redis: RedisStore,
     every: Option<Duration>,
     reconnected: Arc<tokio::sync::Notify>,
+    key_misses: key_miss::KeyMissCache,
 ) {
     tokio::spawn(async move {
         let mut tick = every.map(|period| {
@@ -1282,13 +1296,18 @@ fn spawn_redis_rewarm(
                 _ = periodic => {}
                 _ = reconnected.notified() => {}
             }
-            rewarm_redis(&store, &redis).await;
+            rewarm_redis(&store, &redis, &key_misses).await;
         }
     });
 }
 
-async fn rewarm_redis(store: &Store, redis: &RedisStore) {
+async fn rewarm_redis(store: &Store, redis: &RedisStore, key_misses: &key_miss::KeyMissCache) {
     let keys = rewarm_keys(store, redis).await;
+    // A real key looked up while Redis was missing it (after a restart or
+    // flush, before this pass pushed it back) was remembered as unknown. The
+    // push publishes no per-key invalidation, so forget every miss now that
+    // Redis holds the keys again.
+    key_misses.clear();
     let models = rewarm_models(store, redis).await;
     let mcp = rewarm_mcp_servers(store, redis).await;
     tracing::debug!(?keys, ?models, ?mcp, "redis re-warm pass complete");
@@ -1324,7 +1343,7 @@ fn restore_and_evict(
     (restore, evict)
 }
 
-/// Push a Postgres snapshot into Redis, then delete any `obleth:key2:*` entry
+/// Push a Postgres snapshot into Redis, then delete any `obleth:key3:*` entry
 /// Redis holds that the snapshot doesn't list — the same SCAN-based prune
 /// `POST /api/v1/resync` uses (`obleth-redis/src/prune.rs`). A key revoked
 /// before this snapshot was taken has no entry here, so the prune removes it
@@ -1967,7 +1986,7 @@ mod shutdown_tests {
     /// covers in isolation above.
     ///
     /// `push_and_prune_keys` calls `RedisStore::prune_stale_resolved_keys`,
-    /// which SCANs and deletes across the *entire* `obleth:key2:*` namespace —
+    /// which SCANs and deletes across the *entire* `obleth:key3:*` namespace —
     /// not just the hashes this test creates. Point `OBLETH_TEST_REDIS_URL`
     /// at an isolated database (e.g. Redis db 15, the project's documented
     /// test database — never db 0 / a shared or live instance): running this
@@ -2080,6 +2099,7 @@ mod shutdown_tests {
             compression_policy: None,
             synthetic: false,
             allowed_networks: Vec::new(),
+            allowed_countries: Vec::new(),
         }
     }
 

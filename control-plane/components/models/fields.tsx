@@ -233,7 +233,8 @@ export function Field({
 }
 
 export function TextArea({ name, label, rows = 3, defaultValue, value, onChange, placeholder, className }: {
-  name: string; label: string; rows?: number; defaultValue?: string; placeholder?: string; className?: string;
+  /** Left out for a box another field submits for. */
+  name?: string; label: string; rows?: number; defaultValue?: string; placeholder?: string; className?: string;
   /** Controlled when given. */
   value?: string;
   onChange?: (value: string) => void;

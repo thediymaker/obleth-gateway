@@ -47,8 +47,8 @@ export function settingsData(over: Partial<SettingsData> = {}): SettingsData {
     retention: { days: 180, configured: false },
     keyPrefix: { prefix: "obl", configured: true, default_prefix: "sk" },
     networks: {
-      networks: [{ network: "10.0.0.0/8", name: "Campus" }],
-      client_address: { trusted_proxies: ["10.0.0.0/8"], trusted_proxies_default: false, walks_past_proxies: true, invalid_trusted_proxies: [], address_header: null, country_header: "cf-ipcountry" },
+      networks: [{ name: "Campus", ranges: ["10.0.0.0/8"], ours: true }],
+      client_address: { trusted_proxies: ["10.0.0.0/8"], trusted_proxies_default: false, walks_past_proxies: true, invalid_trusted_proxies: [], address_header: null, country_header: "cf-ipcountry", countries_admit: true },
     },
     slurm: { enabled: false, provisioner_running: true } as SlurmSettingsView,
     models: [model("glm-5-3", { boons: ["vision", "image_generation", "speculation"], supports_function_calling: true }), model("north-mini-code"), model("flux-2", { model_type: "image" } as Partial<ModelRoute>)],

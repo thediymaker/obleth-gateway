@@ -454,7 +454,10 @@ pub(crate) async fn authenticate_credential(
                 ));
             }
             let hash = obleth_config::hash_api_key(secret);
-            match crate::proxy::try_resolve_key(state, &hash).await {
+            // Every API key miss is remembered: the checksum is public
+            // (CRC-32), so a made-up key can be well formed, and a deleted
+            // key left in a busy client looks the same.
+            match crate::proxy::try_resolve_key(state, &hash, true).await {
                 Ok(Some(r)) => Ok(Credential {
                     resolved: r,
                     device_id: String::new(),
@@ -537,7 +540,7 @@ impl JwtAuth {
             .map_err(|_| AuthFailure::Unauthorized)?;
         let handle = obleth_config::identity_key_hash(&identity.issuer, &identity.subject);
 
-        match crate::proxy::try_resolve_key(state, &handle).await {
+        match crate::proxy::try_resolve_key(state, &handle, false).await {
             Ok(Some(resolved)) => {
                 return Ok(Authenticated {
                     resolved,
@@ -585,7 +588,7 @@ impl JwtAuth {
         let _held = gate.lock().await;
         let _entry = entry;
         async {
-            match crate::proxy::try_resolve_key(state, &handle).await {
+            match crate::proxy::try_resolve_key(state, &handle, false).await {
                 Ok(Some(resolved)) => {
                     return Ok(Authenticated {
                         resolved,

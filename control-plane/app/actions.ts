@@ -50,7 +50,7 @@ import { lookupHfModel, type HfModel } from "@/lib/hf-model";
 import { parseUpstreamModelList, normalizeBase, type UpstreamModel } from "@/lib/provider-import";
 import { blockedHostReason } from "@/lib/ssrf";
 import { familyWrite, MAX_FAMILY_DESCRIPTION_CHARS, reasoningProblem } from "@/lib/models-model";
-import { networkLines } from "@/lib/key-networks";
+import { countryCodes, networkLines } from "@/lib/key-networks";
 import { keyPrefixProblem } from "@/lib/key-prefix";
 import { cleanNamedNetworks, namedNetworksProblem, parseNamedNetworksField } from "@/lib/named-networks";
 import { tagsInclude } from "@/lib/utils";
@@ -498,6 +498,7 @@ export async function createKeyAction(
         budget_period: hasBudget ? data.budget_period : null,
         budget_started_at: hasBudget ? data.budget_started_at : null,
         allowed_networks: networkLines(formData.get("allowed_networks")),
+        allowed_countries: countryCodes(formData.get("allowed_countries")),
       },
       { auditActor: session.email },
     );
@@ -542,6 +543,7 @@ export async function updateKeyAction(
         budget_started_at: hasBudget ? data.budget_started_at : null,
         // Only a form that shows the field sends it; left out, the key keeps its list.
         ...(formData.has("allowed_networks") ? { allowed_networks: networkLines(formData.get("allowed_networks")) } : {}),
+        ...(formData.has("allowed_countries") ? { allowed_countries: countryCodes(formData.get("allowed_countries")) } : {}),
       },
       { auditActor: session.email },
     );
@@ -896,6 +898,7 @@ export async function replaceKeyAction(id: string): Promise<{ ok: true; secret: 
       budget_period: old.budget_period,
       budget_started_at: old.budget_started_at,
       allowed_networks: old.allowed_networks ?? [],
+      allowed_countries: old.allowed_countries ?? [],
     }, { auditActor: session.email });
     if (old.tracing_enabled) await obleth.setKeyTracing(created.key.id, true, { auditActor: session.email });
     if (old.end_user_fairshare) await obleth.setKeyEndUserFairshare(created.key.id, true, { auditActor: session.email });

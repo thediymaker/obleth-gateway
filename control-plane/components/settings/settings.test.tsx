@@ -48,6 +48,12 @@ async function type(el: HTMLInputElement, value: string) {
     el.dispatchEvent(new Event("input", { bubbles: true }));
   });
 }
+async function typeArea(el: HTMLTextAreaElement, value: string) {
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(el, value);
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+}
 const saved = () => vi.mocked(saveSettingsAction).mock.calls[0][0] as FormData;
 
 describe("the Settings page", () => {
@@ -140,16 +146,27 @@ describe("the Settings page", () => {
     const section = host.querySelector("#networks")!;
     expect(section.textContent).toContain("X-Forwarded-For from a trusted proxy");
     expect(section.textContent).toContain("cf-ipcountry");
+    expect(section.textContent).toContain("1 network, 1 range");
     await act(async () => button("Add a network").click());
-    await type(section.querySelector<HTMLInputElement>('input[aria-label="Range 2"]')!, "10.42.0.0/16");
     await type(section.querySelector<HTMLInputElement>('input[aria-label="Name 2"]')!, "Cluster pods");
+    await typeArea(section.querySelector<HTMLTextAreaElement>('textarea[aria-label="Ranges 2"]')!, "10.42.0.0/16\n203.0.113.0/24");
     await frame();
+    expect(section.textContent).toContain("2 networks, 3 ranges");
     await act(async () => button("Save changes").click());
     expect(saved().get("sections")).toBe("networks");
     expect(JSON.parse(String(saved().get("networks.list")))).toEqual([
-      { network: "10.0.0.0/8", name: "Campus" },
-      { network: "10.42.0.0/16", name: "Cluster pods" },
+      { name: "Campus", ranges: ["10.0.0.0/8"], ours: true },
+      { name: "Cluster pods", ranges: ["10.42.0.0/16", "203.0.113.0/24"], ours: false },
     ]);
+  });
+
+  it("warns when a country can't admit a request", async () => {
+    await render(<SettingsPage data={settingsData()} />);
+    expect(host.querySelector("#networks")!.textContent).not.toContain("Recorded only.");
+    const base = settingsData();
+    const networks = { ...base.networks!, client_address: { ...base.networks!.client_address, trusted_proxies_default: true, walks_past_proxies: false, countries_admit: false } };
+    await render(<SettingsPage data={settingsData({ networks })} />);
+    expect(host.querySelector("#networks")!.textContent).toContain("Recorded only. A key limited to certain countries won't accept a request by its country");
   });
 
   it("says when a named network has no name", async () => {
@@ -157,6 +174,15 @@ describe("the Settings page", () => {
     const section = host.querySelector("#networks")!;
     await type(section.querySelector<HTMLInputElement>('input[aria-label="Name 1"]')!, "");
     expect(section.textContent).toContain("10.0.0.0/8 needs a name.");
+  });
+
+  it("says when a range is in two named networks", async () => {
+    await render(<SettingsPage data={settingsData()} />);
+    const section = host.querySelector("#networks")!;
+    await act(async () => button("Add a network").click());
+    await type(section.querySelector<HTMLInputElement>('input[aria-label="Name 2"]')!, "Lab");
+    await typeArea(section.querySelector<HTMLTextAreaElement>('textarea[aria-label="Ranges 2"]')!, "10.0.0.0/8");
+    expect(section.textContent).toContain("10.0.0.0/8 is in both Campus and Lab.");
   });
 
   it("doesn't offer a section it couldn't read", async () => {

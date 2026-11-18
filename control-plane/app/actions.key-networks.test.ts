@@ -76,3 +76,46 @@ describe("allowed networks on a key", () => {
     expect(obleth.createKey.mock.calls[0][1].allowed_networks).toEqual(["203.0.113.0/24"]);
   });
 });
+
+describe("allowed countries on a key", () => {
+  it("are sent as upper-case codes when a key is made", async () => {
+    const obleth = mockObleth();
+    const { createKeyAction } = await import("./actions");
+    const fd = new FormData();
+    fd.set("tenant_id", "t1");
+    fd.set("name", "lab");
+    fd.set("allowed_countries", " us, ca US ");
+    expect((await createKeyAction(fd)).ok).toBe(true);
+    expect(obleth.createKey.mock.calls[0][1].allowed_countries).toEqual(["US", "CA"]);
+  });
+
+  it("are saved with the key's fields, and an empty box clears them", async () => {
+    const obleth = mockObleth();
+    const { saveKeySettingsAction } = await import("./actions");
+    const fd = new FormData();
+    fd.set("id", "k1");
+    fd.set("sections", "key");
+    fd.set("name", "lab");
+    fd.set("allowed_countries", "");
+    expect(await saveKeySettingsAction(fd)).toEqual({ ok: true });
+    expect(obleth.updateKey.mock.calls[0][1].allowed_countries).toEqual([]);
+  });
+
+  it("are left alone by an edit that doesn't show them", async () => {
+    const obleth = mockObleth({ listKeys: vi.fn().mockResolvedValue([oldKey]) });
+    const { setKeysBudgetAction, updateKeyAction } = await import("./actions");
+    const fd = new FormData();
+    fd.set("id", "k1");
+    fd.set("name", "lab");
+    await updateKeyAction(fd);
+    await setKeysBudgetAction(["k1"], { budget_tokens: 100, budget_cost_usd: null, budget_period: "monthly" });
+    for (const call of obleth.updateKey.mock.calls) expect(call[1]).not.toHaveProperty("allowed_countries");
+  });
+
+  it("are kept when the key is replaced", async () => {
+    const obleth = mockObleth({ listKeys: vi.fn().mockResolvedValue([{ ...oldKey, allowed_countries: ["US"] }]) });
+    const { replaceKeyAction } = await import("./actions");
+    expect((await replaceKeyAction("k1")).ok).toBe(true);
+    expect(obleth.createKey.mock.calls[0][1].allowed_countries).toEqual(["US"]);
+  });
+});

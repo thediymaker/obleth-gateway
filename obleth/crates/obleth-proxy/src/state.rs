@@ -32,6 +32,9 @@ pub struct AppState {
     /// Values are `Arc`-wrapped so a per-request lookup clones a pointer, not the
     /// whole struct (these are read on every data-plane and MCP request).
     pub key_cache: Cache<String, Arc<ResolvedKey>>,
+    /// API key hashes Redis recently did not know, so a repeated made-up or
+    /// deleted key skips Redis for a minute.
+    pub key_misses: crate::key_miss::KeyMissCache,
     pub model_cache: Cache<String, Arc<ResolvedModel>>,
     pub mcp_cache: Cache<String, Arc<ResolvedMcpServer>>,
     /// Enumerable list of candidate models for `auto` selection. Kept fresh by

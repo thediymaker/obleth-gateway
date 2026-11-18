@@ -249,7 +249,7 @@ export function KeysList({
                     <span className="flex min-w-0 items-center gap-1.5">
                       <span className={cn("truncate font-medium", !k.disabled && "text-foreground")}>{k.name || k.key_prefix}</span>
                       {k.background && <Pill className="h-[18px] px-1.5 text-[10.5px]">Background</Pill>}
-                      {k.allowed_networks?.length ? <Pill className="h-[18px] px-1.5 text-[10.5px]">{networksSummary(k.allowed_networks)}</Pill> : null}
+                      {k.allowed_networks?.length || k.allowed_countries?.length ? <Pill className="h-[18px] px-1.5 text-[10.5px]">{networksSummary(k.allowed_networks, k.allowed_countries, named)}</Pill> : null}
                     </span>
                     <span className="truncate font-mono text-[11.5px] text-muted-foreground">{k.kind === "identity" ? `identity · ${k.identity_subject ?? ""}` : `${k.key_prefix}…`}</span>
                   </button>

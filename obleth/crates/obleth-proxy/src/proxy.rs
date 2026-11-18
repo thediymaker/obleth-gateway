@@ -980,6 +980,9 @@ async fn count_tokens_shim(
 /// Response header naming the variant a request was served through (see
 /// [`obleth_config::ModelVariant`]), on every response after the name resolved.
 pub(crate) const MODEL_VARIANT_HEADER: &str = "x-obleth-model-variant";
+/// Milliseconds the request waited in the fairshare queue before admission. Sent on every
+/// admitted response, so a client can tell time spent queued from time the model took.
+pub(crate) const QUEUE_WAIT_HEADER: &str = "x-obleth-queue-wait-ms";
 
 /// The pipeline every proxied request runs ([`run_pipeline`]), plus the
 /// response headers that describe how it was served, whichever exit the
@@ -2706,6 +2709,7 @@ async fn run_pipeline(
                         .status(StatusCode::OK)
                         .header(header::CONTENT_TYPE, "application/json")
                         .header("x-obleth-request-id", request_id.to_string())
+                        .header(QUEUE_WAIT_HEADER, queue_wait_ms.to_string())
                         .header(crate::boons::speculation::DRAFTED_BY_HEADER, drafted_by)
                         .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
                     if !boons_applied.is_empty() {
@@ -2781,6 +2785,7 @@ async fn run_pipeline(
                         .status(StatusCode::OK)
                         .header(header::CONTENT_TYPE, "text/event-stream")
                         .header("x-obleth-request-id", request_id.to_string())
+                        .header(QUEUE_WAIT_HEADER, queue_wait_ms.to_string())
                         .header(crate::boons::speculation::DRAFTED_BY_HEADER, drafted_by)
                         .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
                     if !boons_applied.is_empty() {
@@ -3227,6 +3232,7 @@ async fn run_pipeline(
             .status(status_code)
             .header(header::CONTENT_TYPE, content_type)
             .header("x-obleth-request-id", request_id.to_string())
+            .header(QUEUE_WAIT_HEADER, queue_wait_ms.to_string())
             .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
         if !boons_applied.is_empty() {
             builder = builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
@@ -3448,6 +3454,7 @@ async fn run_pipeline(
                     .status(status_code)
                     .header(header::CONTENT_TYPE, "text/event-stream")
                     .header("x-obleth-request-id", request_id.to_string())
+                    .header(QUEUE_WAIT_HEADER, queue_wait_ms.to_string())
                     .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
                 if !boons_applied.is_empty() {
                     builder = builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
@@ -3592,6 +3599,7 @@ async fn run_pipeline(
                 .status(failure.status)
                 .header(header::CONTENT_TYPE, content_type)
                 .header("x-obleth-request-id", request_id.to_string())
+                .header(QUEUE_WAIT_HEADER, queue_wait_ms.to_string())
                 .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
             if !boons_applied.is_empty() {
                 builder = builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
@@ -3761,6 +3769,7 @@ async fn run_pipeline(
             .status(status_code)
             .header(header::CONTENT_TYPE, final_content_type)
             .header("x-obleth-request-id", request_id.to_string())
+            .header(QUEUE_WAIT_HEADER, queue_wait_ms.to_string())
             .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
         if !boons_applied.is_empty() {
             builder = builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
@@ -4054,6 +4063,7 @@ async fn run_pipeline(
     builder = builder
         .header(header::CONTENT_TYPE, content_type)
         .header("x-obleth-request-id", request_id.to_string())
+        .header(QUEUE_WAIT_HEADER, queue_wait_ms.to_string())
         .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
     if !boons_applied.is_empty() {
         builder = builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
@@ -5083,15 +5093,25 @@ async fn settle_inner(
 /// Distinguishes a Redis error from a miss so callers can fail closed on the
 /// former (503, backend unavailable) rather than reading it as an unknown
 /// credential (401) -- see `jwt_auth::authenticate_credential`.
+///
+/// With `remember_miss`, a hash Redis does not know is remembered on this pod
+/// for a minute and answered as unknown without asking Redis again (see
+/// `key_miss`). Callers pass it only for credentials without a checksum,
+/// never for identity handles, whose miss means "provision".
 #[tracing::instrument(skip_all, name = "auth_resolve")]
 pub(crate) async fn try_resolve_key(
     state: &AppState,
     hash: &str,
+    remember_miss: bool,
 ) -> Result<Option<Arc<ResolvedKey>>, ()> {
     if let Some(r) = state.key_cache.get(hash).await {
         return Ok(Some(r));
     }
-    match state.redis.get_resolved_key(hash).await {
+    let found = state
+        .key_misses
+        .lookup(hash, remember_miss, || state.redis.get_resolved_key(hash))
+        .await;
+    match found {
         Ok(Some(r)) => {
             let r = Arc::new(r);
             state.key_cache.insert(hash.to_string(), r.clone()).await;
@@ -7456,7 +7476,7 @@ pub(crate) fn gate_resolved_key(
     }
     if !client_network_allowed(resolved, client) {
         record_key_rejection(state, resolved, client, KeyRejectionReason::IpNotAllowed);
-        return Err(ip_not_allowed_response(client));
+        return Err(ip_not_allowed_response(resolved, client));
     }
     if !resolved.internal && resolved.status != "active" {
         return Err(error_json(StatusCode::FORBIDDEN, "tenant is not active"));
@@ -7490,26 +7510,51 @@ pub(crate) fn gate_resolved_key(
     Ok(())
 }
 
-/// Whether the key's network limits admit this client. Work the gateway runs
-/// for an owner it already checked (a batch item) is not checked again.
+/// Whether the key's network and country limits admit this client (see
+/// [`obleth_config::network::client_allowed`]). Work the gateway runs for an
+/// owner it already checked (a batch item) is not checked again.
 pub(crate) fn client_network_allowed(
     resolved: &ResolvedKey,
     client: &crate::client::ClientInfo,
 ) -> bool {
-    client.in_process || obleth_config::network::ip_allowed(&resolved.allowed_networks, client.ip)
+    client.in_process
+        || obleth_config::network::client_allowed(
+            &resolved.allowed_networks,
+            &resolved.allowed_countries,
+            client.ip,
+            client.admitting_country(),
+        )
 }
 
 /// `403 ip_not_allowed`, in OpenAI's error shape, naming the address the
-/// request came from so its owner can see why.
-pub(crate) fn ip_not_allowed_response(client: &crate::client::ClientInfo) -> Response<Body> {
+/// request came from (and, for a key limited by country, its country) so its
+/// owner can see why.
+pub(crate) fn ip_not_allowed_response(
+    resolved: &ResolvedKey,
+    client: &crate::client::ClientInfo,
+) -> Response<Body> {
     let from = client
         .ip
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| "an unknown address".to_string());
+    let message = if resolved.allowed_countries.is_empty() {
+        format!("This API key can't be used from {from}. Its owner limited it to certain networks.")
+    } else {
+        let country = if client.country.is_empty() {
+            " (country unknown)".to_string()
+        } else if client.country_admits {
+            format!(" in {}", client.country)
+        } else {
+            // Found behind the default trusted proxies: recorded, not believed.
+            format!(" in {}, which this gateway can't confirm", client.country)
+        };
+        format!(
+            "This API key can't be used from {from}{country}. \
+             Its owner limited the network or country it can be used from."
+        )
+    };
     let body = serde_json::json!({ "error": {
-        "message": format!(
-            "This API key can't be used from {from}. Its owner limited it to certain networks."
-        ),
+        "message": message,
         "type": GATEWAY_ERROR_TYPE,
         "param": null,
         "code": "ip_not_allowed",
@@ -7662,6 +7707,7 @@ mod tests {
             compression_policy: None,
             synthetic: false,
             allowed_networks: Vec::new(),
+            allowed_countries: Vec::new(),
         }
     }
 
@@ -10872,6 +10918,26 @@ mod lifecycle_tests {
         );
         // Nothing after the cascade abstained claims a drafter.
         assert!(!h[dispatch..].contains("DRAFTED_BY_HEADER"));
+    }
+
+    #[test]
+    fn every_admitted_response_says_how_long_it_queued() {
+        let h = squash(handler());
+        let admitted = h
+            .find("letqueue_wait_ms=admitted.waited.as_millis()asu32;")
+            .expect("admission wait");
+        let after = &h[admitted..];
+        let builders = after
+            .matches(".header(\"x-obleth-request-id\",request_id.to_string())")
+            .count();
+        assert!(builders >= 7, "found {builders} response builders");
+        assert_eq!(
+            after
+                .matches(".header(\"x-obleth-request-id\",request_id.to_string()).header(QUEUE_WAIT_HEADER,queue_wait_ms.to_string())")
+                .count(),
+            builders,
+            "every response built after admission carries the queue wait"
+        );
     }
 
     #[test]

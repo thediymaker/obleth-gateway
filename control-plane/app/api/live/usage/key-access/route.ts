@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { obleth } from "@/lib/obleth";
+import { KEY_REJECTION_ROWS, obleth } from "@/lib/obleth";
 import { guardAdmin } from "@/lib/auth/guard";
 
 // Where keys were used from, and where they were refused, in one window.
@@ -13,7 +13,7 @@ export async function GET(req: NextRequest) {
   try {
     const [sources, rejections] = await Promise.all([
       obleth.keySources({ sinceMs, tenantId, keyId }),
-      obleth.keyRejections({ sinceMs, tenantId, keyId }),
+      obleth.keyRejections({ sinceMs, tenantId, keyId, limit: KEY_REJECTION_ROWS }),
     ]);
     return NextResponse.json({ sinceMs: sinceMs ?? null, sources, rejections });
   } catch (e) {
