@@ -42,4 +42,23 @@ describe("key networks", () => {
     expect(countryName("de")).toBe("Germany");
     for (const bad of ["XX", "USA", "U1", "", "QQ"]) expect(countryName(bad)).toBeNull();
   });
+
+  it("names whole named networks when they are given", () => {
+    const named = [
+      { name: "Sol", ranges: ["10.139.121.0/24"], ours: true },
+      { name: "ASU campus", ranges: ["10.0.0.0/8", "2001:db8::/48"], ours: true },
+      { name: "Partner lab", ranges: ["198.51.100.0/24"], ours: false },
+      { name: "VPN", ranges: ["172.16.0.0/12"], ours: true },
+    ];
+    expect(networksSummary(["10.0.0.0/8", "2001:DB8::/48"], [], named)).toBe("Only ASU campus");
+    expect(networksSummary(["10.0.0.0/8", "2001:db8::/48"], ["US"], named)).toBe("Only ASU campus or the United States");
+    expect(networksSummary(["10.0.0.0/8", "2001:db8::/48", "10.139.121.0/24", "192.0.2.7"], [], named)).toBe("Only Sol, ASU campus or 192.0.2.7");
+    expect(
+      networksSummary(["10.0.0.0/8", "2001:db8::/48", "10.139.121.0/24", "198.51.100.0/24", "172.16.0.0/12"], [], named),
+    ).toBe("Only Sol, ASU campus and 2 more");
+    // Part of a network is not the network.
+    expect(networksSummary(["10.0.0.0/8"], [], named)).toBe("Only 10.0.0.0/8");
+    expect(networksSummary([], [], named)).toBe("Any network");
+    expect(networksSummary(["10.0.0.0/8", "192.0.2.0/24"], [], [])).toBe("Only 2 networks");
+  });
 });

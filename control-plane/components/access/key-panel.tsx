@@ -229,7 +229,7 @@ export function KeyPanel({
                 </div>
               </div>
             ) : (
-              <p className="text-[12.5px] text-muted-foreground">{networksSummary(k.allowed_networks, k.allowed_countries)}. Limit it below.</p>
+              <p className="text-[12.5px] text-muted-foreground">{networksSummary(k.allowed_networks, k.allowed_countries, named)}. Limit it below.</p>
             )}
           </section>
 

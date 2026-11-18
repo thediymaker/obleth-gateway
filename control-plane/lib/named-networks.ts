@@ -118,3 +118,87 @@ export function rangeCount(groups: NamedNetwork[]): number {
 export function oursFirst(groups: NamedNetwork[]): NamedNetwork[] {
   return [...groups.filter((g) => g.ours), ...groups.filter((g) => !g.ours)];
 }
+
+/**
+ * A range as the gateway stores it, near enough to compare: trimmed and
+ * lower-cased (IPv6). Both a key's list and the named networks come back
+ * canonical, so this is all the matching needs.
+ */
+export function rangeKey(range: string): string {
+  return range.trim().toLowerCase();
+}
+
+/**
+ * A key's allowed list read back as named networks: a network counts when
+ * every one of its ranges is listed, and `rest` is whatever no whole network
+ * accounts for, in the order listed.
+ */
+export function splitAllowedNetworks(listed: readonly string[], groups: readonly NamedNetwork[]): { names: string[]; rest: string[] } {
+  const present = new Set(listed.map(rangeKey));
+  const whole = groups.filter((g) => g.ranges.length > 0 && g.ranges.every((r) => present.has(rangeKey(r))));
+  const taken = new Set(whole.flatMap((g) => g.ranges.map(rangeKey)));
+  return { names: whole.map((g) => g.name), rest: listed.filter((n) => !taken.has(rangeKey(n))) };
+}
+
+interface Cidr {
+  v6: boolean;
+  bits: bigint;
+  prefix: number;
+}
+
+function parseV4(text: string): bigint | null {
+  const parts = text.split(".");
+  if (parts.length !== 4 || !parts.every((p) => /^\d{1,3}$/.test(p) && Number(p) <= 255)) return null;
+  return parts.reduce((n, p) => (n << BigInt(8)) | BigInt(Number(p)), BigInt(0));
+}
+
+function parseV6(text: string): bigint | null {
+  let s = text.toLowerCase();
+  const lastColon = s.lastIndexOf(":");
+  if (s.slice(lastColon + 1).includes(".")) {
+    // An IPv4 tail (::ffff:192.0.2.1) is two more words.
+    const v4 = parseV4(s.slice(lastColon + 1));
+    if (v4 === null) return null;
+    s = `${s.slice(0, lastColon + 1)}${(v4 >> BigInt(16)).toString(16)}:${(v4 & BigInt(0xffff)).toString(16)}`;
+  }
+  const halves = s.split("::");
+  if (halves.length > 2) return null;
+  const words = (h: string) => (h === "" ? [] : h.split(":"));
+  const head = words(halves[0]!);
+  const back = halves.length === 2 ? words(halves[1]!) : [];
+  if (![...head, ...back].every((w) => /^[0-9a-f]{1,4}$/.test(w))) return null;
+  const known = head.length + back.length;
+  if (halves.length === 1 ? known !== 8 : known > 7) return null;
+  return [...head, ...Array<string>(8 - known).fill("0"), ...back].reduce((n, w) => (n << BigInt(16)) | BigInt(parseInt(w, 16)), BigInt(0));
+}
+
+function parseCidr(raw: string): Cidr | null {
+  const [addr, prefixText, extra] = raw.trim().split("/");
+  if (!addr || extra !== undefined) return null;
+  const v6 = addr.includes(":");
+  const width = v6 ? 128 : 32;
+  const bits = v6 ? parseV6(addr) : parseV4(addr);
+  if (bits === null) return null;
+  const prefix = prefixText === undefined ? width : /^\d{1,3}$/.test(prefixText) ? Number(prefixText) : NaN;
+  if (!(prefix >= 0 && prefix <= width)) return null;
+  return { v6, bits, prefix };
+}
+
+function cidrContains(outer: Cidr, inner: Cidr): boolean {
+  if (outer.v6 !== inner.v6 || outer.prefix > inner.prefix) return false;
+  const shift = BigInt((outer.v6 ? 128 : 32) - outer.prefix);
+  return outer.bits >> shift === inner.bits >> shift;
+}
+
+/** The other named networks that hold every range of `group` (a cluster inside a campus). */
+export function networksHolding(group: NamedNetwork, groups: readonly NamedNetwork[]): string[] {
+  const inner = group.ranges.map(parseCidr).filter((c): c is Cidr => c !== null);
+  if (!inner.length) return [];
+  return groups
+    .filter((g) => g.name !== group.name)
+    .filter((g) => {
+      const outer = g.ranges.map(parseCidr).filter((c): c is Cidr => c !== null);
+      return inner.every((i) => outer.some((o) => cidrContains(o, i)));
+    })
+    .map((g) => g.name);
+}

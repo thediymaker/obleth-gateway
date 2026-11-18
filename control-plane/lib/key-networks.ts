@@ -1,3 +1,6 @@
+import { oursFirst, splitAllowedNetworks } from "@/lib/named-networks";
+import type { NamedNetwork } from "@/lib/obleth";
+
 /** Helper text under every "Allowed networks" field. */
 export const NETWORKS_HINT =
   "One CIDR range or address per line. Leave empty to allow any network. Requests from anywhere else are refused.";
@@ -64,14 +67,34 @@ export function countryName(code: string): string | null {
   return name && name !== c ? name : null;
 }
 
-/** A few words for where a key may be used from. */
+/** A country as it reads mid-sentence: "the United States", "Mexico", or the code when it has no name. */
+function countryInSentence(code: string): string {
+  const name = countryName(code);
+  if (!name) return code;
+  return /^(United .*|Netherlands|Philippines|Bahamas)$/.test(name) ? `the ${name}` : name;
+}
+
+/**
+ * A few words for where a key may be used from. Given the named networks
+ * (Settings › Networks), a network whose every range is listed is called by
+ * its name: "Only ASU campus, Sol and 2 more", "Only ASU campus or the
+ * United States". Without them, ranges and countries are counted.
+ */
 export function networksSummary(
   networks: readonly string[] | null | undefined,
   countries?: readonly string[] | null,
+  named?: readonly NamedNetwork[] | null,
 ): string {
   const n = networks?.length ?? 0;
   const c = countries?.length ?? 0;
   if (n === 0 && c === 0) return "Any network";
+  if (named?.length) {
+    const { names, rest } = splitAllowedNetworks(networks ?? [], oursFirst([...named]));
+    const parts = [...names, ...rest, ...(countries ?? []).map(countryInSentence)];
+    if (parts.length > 3) return `Only ${parts.slice(0, 2).join(", ")} and ${parts.length - 2} more`;
+    if (parts.length === 1) return `Only ${parts[0]}`;
+    return `Only ${parts.slice(0, -1).join(", ")} or ${parts[parts.length - 1]}`;
+  }
   const parts: string[] = [];
   if (n > 0) parts.push(n === 1 ? networks![0] : `${n} networks`);
   if (c > 0) parts.push(c === 1 ? countries![0] : `${c} countries`);

@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   cleanNamedNetworks,
+  networksHolding,
+  splitAllowedNetworks,
   looksLikeNetwork,
   namedNetworkProblems,
   namedNetworksProblem,
@@ -51,5 +53,32 @@ describe("named networks", () => {
     ]);
     expect(parseNamedNetworksField("nope")).toBeNull();
     expect(parseNamedNetworksField(null)).toBeNull();
+  });
+
+  it("reads a key's list as the networks it holds whole and the rest", () => {
+    const groups = [
+      { name: "Campus", ranges: ["10.0.0.0/8", "2001:db8::/48"], ours: true },
+      { name: "Lab", ranges: ["198.51.100.0/24"], ours: false },
+    ];
+    expect(splitAllowedNetworks(["192.0.2.7", " 2001:DB8::/48", "10.0.0.0/8", "198.51.100.0/25"], groups)).toEqual({
+      names: ["Campus"],
+      rest: ["192.0.2.7", "198.51.100.0/25"],
+    });
+    expect(splitAllowedNetworks([], groups)).toEqual({ names: [], rest: [] });
+  });
+
+  it("names the other networks that hold every range of one", () => {
+    const groups = [
+      { name: "Sol", ranges: ["10.139.121.0/24", "2001:db8:0:1::/64"], ours: true },
+      { name: "Research", ranges: ["10.139.0.0/16", "2001:db8::/48"], ours: true },
+      { name: "Campus", ranges: ["10.0.0.0/8", "2001:db8::/32"], ours: true },
+      { name: "Lab", ranges: ["10.139.121.0/25"], ours: false },
+      { name: "Mapped", ranges: ["::ffff:10.139.121.0/120"], ours: false },
+    ];
+    expect(networksHolding(groups[0]!, groups)).toEqual(["Research", "Campus"]);
+    expect(networksHolding(groups[3]!, groups)).toEqual(["Sol", "Research", "Campus"]);
+    expect(networksHolding(groups[2]!, groups)).toEqual([]);
+    expect(networksHolding(groups[4]!, groups)).toEqual([]);
+    expect(networksHolding({ name: "Bad", ranges: ["nope"], ours: false }, groups)).toEqual([]);
   });
 });
