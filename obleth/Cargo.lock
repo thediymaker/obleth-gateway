@@ -1758,6 +1758,8 @@ dependencies = [
  "form_urlencoded",
  "futures",
  "futures-util",
+ "hex",
+ "hmac",
  "http",
  "ipnet",
  "jsonschema",

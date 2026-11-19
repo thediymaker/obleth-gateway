@@ -108,7 +108,17 @@ spec:
             - { name: OBLETH_VIDEO_JOB_RETENTION_HOURS, value: {{ .Values.obleth.videoJobRetentionHours | quote }} }
             - { name: OBLETH_VIDEO_JOB_SCOPE, value: {{ .Values.obleth.videoJobScope | default "key" | quote }} }
             - { name: OBLETH_LOAD_ENDPOINT, value: {{ .Values.obleth.loadEndpoint | quote }} }
-            - { name: OBLETH_BATCHES, value: {{ .Values.obleth.batches.enabled | quote }} }
+            {{- with .Values.obleth.batches }}
+            {{- if .bucket }}
+            - { name: OBLETH_BATCH_BUCKET, value: {{ .bucket | quote }} }
+            {{- with .endpoint }}
+            - { name: AWS_ENDPOINT_URL, value: {{ . | quote }} }
+            {{- end }}
+            {{- with .region }}
+            - { name: AWS_REGION, value: {{ . | quote }} }
+            {{- end }}
+            {{- end }}
+            {{- end }}
             - { name: OBLETH_BATCH_MAX_SHARE, value: {{ .Values.obleth.batches.maxShare | quote }} }
             - { name: OBLETH_BATCH_MAX_LINES, value: {{ .Values.obleth.batches.maxLines | int64 | quote }} }
             - { name: OBLETH_BATCH_MAX_FILE_BYTES, value: {{ .Values.obleth.batches.maxFileBytes | int64 | quote }} }
@@ -116,7 +126,7 @@ spec:
             - { name: OBLETH_BATCH_WINDOW_MIN, value: {{ .Values.obleth.batches.windowMin | quote }} }
             - { name: OBLETH_BATCH_WINDOW_MAX, value: {{ .Values.obleth.batches.windowMax | quote }} }
             - { name: OBLETH_BATCH_RUNNER_CONCURRENCY, value: {{ .Values.obleth.batches.runnerConcurrency | int64 | quote }} }
-            - { name: OBLETH_BATCH_RETENTION_DAYS, value: {{ .Values.obleth.batches.retentionDays | int64 | quote }} }
+            - { name: OBLETH_BATCH_RETENTION, value: {{ .Values.obleth.batches.retention | default "24h" | quote }} }
             - { name: OBLETH_BATCH_SCOPE, value: {{ .Values.obleth.batches.scope | default "key" | quote }} }
             # Telemetry spill file used while ClickHouse is unreachable. Must be
             # writable by the non-root runtime user; backed by the wal volume.
@@ -128,6 +138,10 @@ spec:
           envFrom:
             - secretRef:
                 name: {{ include "obleth.secretName" . }}
+            {{- with .Values.obleth.batches.credentialsSecret }}
+            - secretRef:
+                name: {{ . }}
+            {{- end }}
           volumeMounts:
             - { name: wal, mountPath: /var/lib/obleth }
           # SIGTERM makes the gateway stop accepting at once, but endpoint

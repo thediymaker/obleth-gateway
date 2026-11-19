@@ -203,7 +203,14 @@ obleth:
   # its slots, so interactive callers always find the rest free. Keys with
   # background priority use the same `maxShare`, even with batches off.
   batches:
-    enabled: true
+    # Batches keep their files and answers in an S3-compatible bucket and
+    # are off without one. `bucket` is s3://<bucket>[/<prefix>].
+    bucket: ""
+    # The store's URL; empty for AWS S3 itself (then `region` picks it).
+    endpoint: ""
+    region: ""
+    # A Secret with AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.
+    credentialsSecret: ""
     maxShare: "0.75"
     maxLines: 50000
     maxFileBytes: 209715200
@@ -214,7 +221,10 @@ obleth:
     # Batch requests each replica keeps in flight (running or waiting for a
     # slot).
     runnerConcurrency: 64
-    retentionDays: 30
+    # How long a batch and its answers are kept after it ends (<n>h or <n>d);
+    # also how long an uploaded file waits for a batch. An input file is
+    # deleted as soon as its batch ends.
+    retention: 24h
     # `key`: files and batches are private to the key that created them;
     # `tenant`: shared by every key of the tenant.
     scope: key

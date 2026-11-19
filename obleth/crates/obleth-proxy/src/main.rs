@@ -504,8 +504,7 @@ async fn main() -> anyhow::Result<()> {
         jobs: jobs::JobStore::new(store.clone(), cfg.job_scope),
         load,
         crash_guard: crate::crash_guard::CrashGuard::new(Some(capacity_discovery.clone())),
-        batches: batches::BatchConfig::from_env()
-            .map(|cfg| batches::Batches::new(store.clone(), cfg)),
+        batches: batches::Batches::from_env(store.clone()),
     };
     tracing::info!(
         scope = cfg.job_scope.as_str(),
@@ -519,10 +518,13 @@ async fn main() -> anyhow::Result<()> {
     let batch_runner = match app_state.batches.clone() {
         Some(b) => {
             tracing::info!(
+                bucket = %b.storage(),
                 max_lines = b.config().max_lines,
                 share = b.config().share,
+                retention_hours = b.config().retention.as_secs() / 3600,
                 "batches on: /v1/files and /v1/batches are served"
             );
+            b.spawn_storage_check();
             batches::spawn_runner(app_state.clone(), b, shutdown_rx.clone())
         }
         None => None,

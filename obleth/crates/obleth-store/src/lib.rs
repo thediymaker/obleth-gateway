@@ -119,6 +119,7 @@ const SCHEMA_V43: &str =
 const SCHEMA_V44: &str = include_str!("../../../../schema/postgres/0044_key_prefix_keeps_obl.sql");
 const SCHEMA_V45: &str =
     include_str!("../../../../schema/postgres/0045_api_key_allowed_countries.sql");
+const SCHEMA_V46: &str = include_str!("../../../../schema/postgres/0046_batch_object_storage.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -300,6 +301,7 @@ impl Store {
             sqlx::raw_sql(SCHEMA_V43).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V44).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V45).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V46).execute(&mut *conn).await?;
             Ok(())
         }
         .await;

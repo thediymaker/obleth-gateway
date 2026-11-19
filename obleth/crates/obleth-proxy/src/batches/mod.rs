@@ -15,14 +15,25 @@
 //! DELETE /v1/batches/{id}           delete a stopped batch (obleth extension)
 //! ```
 //!
+//! Batches need an S3-compatible bucket (`OBLETH_BATCH_BUCKET`, see
+//! [`bucket`]); without one these routes are not served. The bytes live
+//! there: an uploaded file as 4 MiB chunk objects, written as the upload
+//! arrives, and each answer as one object. Postgres keeps only state.
+//!
 //! A batch is checked line by line when it is created; each line becomes an
-//! item in Postgres. The runner, in every gateway replica, claims items with
-//! a lease and sends each one through the ordinary pipeline in process, as
+//! item in Postgres that records where the request is in the input file. The
+//! runner, in every gateway replica, claims items with a lease, reads each
+//! request from the bucket and sends it through the ordinary pipeline in process, as
 //! the batch's owner, admitted to the model's background pool: it runs only
 //! while no interactive request waits for the model, and fills at most
 //! `OBLETH_BATCH_MAX_SHARE` of its slots (see `obleth_fairshare::PoolKey`).
 //! Routing, guardrails, boons, budgets and the usage ledger apply as for any
 //! request; ledger rows carry `request_type = "batch"`.
+//!
+//! An input file is deleted as soon as every batch reading it has ended, and
+//! a batch with its answers once it has been over for
+//! `OBLETH_BATCH_RETENTION` (default 24h); a file no batch reads goes after
+//! the same time.
 //!
 //! Extensions to the OpenAI shape are optional: `completion_window` accepts
 //! any `<n>h` or `<n>d` within the configured bounds, and batch objects carry
@@ -30,6 +41,8 @@
 
 // Handlers answer `Result<Response, Response>`: the error is the response.
 #![allow(clippy::result_large_err)]
+
+mod bucket;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -39,10 +52,11 @@ use axum::body::{Body, Bytes};
 use axum::http::{header, HeaderMap, Method, Request, Response, StatusCode};
 use axum::response::IntoResponse;
 use chrono::{DateTime, Utc};
+use futures_util::{StreamExt, TryStreamExt};
 use obleth_config::{JobScope, ResolvedKey};
 use obleth_store::batches::{
-    BatchDeletion, BatchFile, BatchOutput, BatchRecord, ClaimedItem, NewBatch, NewBatchFile,
-    NewBatchItem, OutputRow, PURPOSE_BATCH, PURPOSE_BATCH_ERROR, PURPOSE_BATCH_OUTPUT,
+    BatchFile, BatchOutput, BatchRecord, ClaimedItem, NewBatch, NewBatchFile, NewBatchItem,
+    OutputRow, PURPOSE_BATCH, PURPOSE_BATCH_ERROR, PURPOSE_BATCH_OUTPUT,
 };
 use obleth_store::JobOwner;
 use uuid::Uuid;
@@ -51,6 +65,7 @@ use crate::proxy::{
     error_json, invalid_request, read_body, BackgroundShare, BodyTooLarge, PipelineInput,
 };
 use crate::state::AppState;
+use bucket::{Bucket, BucketError};
 
 /// Endpoints a batch may target. Each runs down the pipeline unchanged.
 pub(crate) const BATCH_ENDPOINTS: &[&str] =
@@ -64,6 +79,28 @@ const ITEM_RESPONSE_MAX: usize = 32 * 1024 * 1024;
 
 /// Items stored per insert while creating a batch.
 const ITEM_RUN: usize = 1000;
+
+/// Bytes per chunk object of an uploaded file.
+const CHUNK_BYTES: usize = 4 * 1024 * 1024;
+
+/// Object reads at once while streaming an output file.
+const FETCH_CONCURRENCY: usize = 16;
+
+/// Object deletes at once while removing a file or a batch.
+const DELETE_CONCURRENCY: usize = 32;
+
+/// How often a replica deletes files and batches that are due.
+const CLEANUP: Duration = Duration::from_secs(60);
+
+/// Files, and batches, a replica takes per cleanup pass.
+const CLEANUP_RUN: i64 = 20;
+
+/// How long an upload may go unfinished before its objects are deleted.
+const STALE_UPLOAD_SECS: i64 = 3600;
+
+/// How long an item waits before it is tried again while the bucket cannot
+/// be read or written.
+const STORAGE_PAUSE_SECS: f64 = 30.0;
 
 /// Lines per page when streaming an output or error file.
 const OUTPUT_PAGE: i64 = 500;
@@ -114,7 +151,9 @@ pub struct BatchConfig {
     pub max_attempts: i32,
     pub runner: bool,
     pub concurrency: usize,
-    pub retention_days: i64,
+    /// How long a batch and its answers are kept after it ends; also how
+    /// long an uploaded file waits for a batch to read it.
+    pub retention: Duration,
     pub scope: JobScope,
     pub share: f64,
     /// This process's name in item leases, unique per process.
@@ -131,13 +170,6 @@ fn env_num<T: std::str::FromStr>(name: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
-fn falsy(v: &str) -> bool {
-    matches!(
-        v.trim().to_ascii_lowercase().as_str(),
-        "0" | "false" | "no" | "off"
-    )
-}
-
 fn truthy(v: &str) -> bool {
     matches!(
         v.trim().to_ascii_lowercase().as_str(),
@@ -145,12 +177,30 @@ fn truthy(v: &str) -> bool {
     )
 }
 
-impl BatchConfig {
-    /// `None` when `OBLETH_BATCHES` is off (on by default).
-    pub fn from_env() -> Option<Self> {
-        if env("OBLETH_BATCHES").is_some_and(|v| falsy(&v)) {
-            return None;
+/// `OBLETH_BATCH_RETENTION` (`<n>h` or `<n>d`), default 24 hours. The
+/// older `OBLETH_BATCH_RETENTION_DAYS` is read when it is unset.
+fn retention_from_env() -> Duration {
+    const DEFAULT: Duration = Duration::from_secs(24 * 3600);
+    if let Some(raw) = env("OBLETH_BATCH_RETENTION") {
+        return parse_window(&raw).unwrap_or_else(|| {
+            tracing::warn!(value = %raw, "OBLETH_BATCH_RETENTION is not <n>h or <n>d; using 24h");
+            DEFAULT
+        });
+    }
+    match env("OBLETH_BATCH_RETENTION_DAYS").and_then(|v| v.parse::<u64>().ok()) {
+        Some(days) => {
+            tracing::warn!(
+                days,
+                "OBLETH_BATCH_RETENTION_DAYS is deprecated; set OBLETH_BATCH_RETENTION (e.g. 72h) instead"
+            );
+            Duration::from_secs(days.max(1) * 86400)
         }
+        None => DEFAULT,
+    }
+}
+
+impl BatchConfig {
+    pub fn from_env() -> Self {
         let window = |name: &str, default: Duration| {
             env(name).and_then(|v| parse_window(&v)).unwrap_or(default)
         };
@@ -165,7 +215,7 @@ impl BatchConfig {
         // that restarts under the same name must not take over (and keep
         // renewing) the leases of the one before it.
         let instance = crate::replicas::instance_id();
-        Some(BatchConfig {
+        BatchConfig {
             max_file_bytes: env_num("OBLETH_BATCH_MAX_FILE_BYTES", 200 * 1024 * 1024),
             max_lines: env_num("OBLETH_BATCH_MAX_LINES", 50_000),
             max_active_per_key: env_num("OBLETH_BATCH_MAX_ACTIVE_PER_KEY", 10),
@@ -174,11 +224,11 @@ impl BatchConfig {
             max_attempts: env_num("OBLETH_BATCH_MAX_ATTEMPTS", 5).max(1),
             runner: env("OBLETH_BATCH_RUNNER").is_none_or(|v| truthy(&v)),
             concurrency: env_num("OBLETH_BATCH_RUNNER_CONCURRENCY", 64).max(1),
-            retention_days: env_num("OBLETH_BATCH_RETENTION_DAYS", 30).max(1),
+            retention: retention_from_env(),
             scope,
             share: share_from_env(),
             instance,
-        })
+        }
     }
 }
 
@@ -214,19 +264,132 @@ pub(crate) fn parse_window(raw: &str) -> Option<Duration> {
     }
 }
 
-/// The batch store and settings the data plane carries when batches are on.
+/// The batch store, bucket and settings the data plane carries when
+/// batches are on.
 #[derive(Clone)]
 pub struct Batches {
     store: obleth_store::Store,
+    bucket: Bucket,
     cfg: Arc<BatchConfig>,
 }
 
+/// The object holding chunk `seq` of uploaded file `file_id`.
+fn chunk_key(file_id: &str, seq: u64) -> String {
+    format!("files/{file_id}/{seq:05}")
+}
+
+/// Chunk objects a file of `bytes` is stored in.
+fn chunk_count(bytes: i64) -> u64 {
+    (bytes.max(0) as u64).div_ceil(CHUNK_BYTES as u64)
+}
+
+/// The object holding the answer attempt `attempt` of line `line` got. The
+/// attempt is part of the name so a runner whose lease lapsed cannot
+/// overwrite the answer the item was finished with.
+fn result_key(batch_id: &str, line: i32, attempt: i32) -> String {
+    format!("results/{batch_id}/{line}.{attempt}")
+}
+
 impl Batches {
-    pub fn new(store: obleth_store::Store, cfg: BatchConfig) -> Self {
+    /// Batches with their bucket from the environment; `None`, with the
+    /// reason logged, when `OBLETH_BATCH_BUCKET` is unset or unusable.
+    pub fn from_env(store: obleth_store::Store) -> Option<Self> {
+        match Bucket::from_env() {
+            Ok(Some(bucket)) => Some(Batches::new(store, bucket, BatchConfig::from_env())),
+            Ok(None) => {
+                tracing::info!(
+                    "batches off: set OBLETH_BATCH_BUCKET to an S3 bucket to serve /v1/files and /v1/batches"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "batches off: the batch bucket is not usable");
+                None
+            }
+        }
+    }
+
+    fn new(store: obleth_store::Store, bucket: Bucket, cfg: BatchConfig) -> Self {
         Batches {
             store,
+            bucket,
             cfg: Arc::new(cfg),
         }
+    }
+
+    /// Where the bytes go, for logs.
+    pub fn storage(&self) -> String {
+        self.bucket.describe()
+    }
+
+    /// Check the bucket in the background: a write, a read and a delete. A
+    /// failure is logged; the routes stay up and answer 503 while it lasts.
+    pub fn spawn_storage_check(&self) {
+        let bucket = self.bucket.clone();
+        tokio::spawn(async move {
+            match bucket.check().await {
+                Ok(()) => tracing::info!(bucket = %bucket.describe(), "batch bucket reachable"),
+                Err(e) => tracing::error!(
+                    bucket = %bucket.describe(), error = %e,
+                    "batch bucket check failed: uploads, runs and downloads will fail until it works"
+                ),
+            }
+        });
+    }
+
+    /// Delete `keys`, a few at a time. Every key is tried; the first error,
+    /// if any, is returned.
+    async fn delete_objects(&self, keys: Vec<String>) -> Result<(), BucketError> {
+        let errors: Vec<BucketError> = futures_util::stream::iter(keys)
+            .map(|key| {
+                let bucket = self.bucket.clone();
+                async move { bucket.delete(&key).await }
+            })
+            .buffer_unordered(DELETE_CONCURRENCY)
+            .filter_map(|r| async move { r.err() })
+            .collect()
+            .await;
+        match errors.into_iter().next() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// Delete an uploaded file: its chunk objects, then its row. For an
+    /// upload that never finished, one chunk past `bytes` may exist too.
+    async fn delete_input_file(&self, id: &str, bytes: i64, uploading: bool) -> Result<(), String> {
+        let chunks = chunk_count(bytes) + u64::from(uploading);
+        self.delete_objects((0..chunks).map(|seq| chunk_key(id, seq)).collect())
+            .await
+            .map_err(|e| e.to_string())?;
+        self.store
+            .delete_batch_file_row(id)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Delete a batch that has ended: its answers' objects, then its rows
+    /// (items, output and error files). Its input file is separate.
+    async fn delete_batch_data(&self, id: &str) -> Result<(), String> {
+        let answers = self
+            .store
+            .batch_result_objects(id)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.delete_objects(
+            answers
+                .into_iter()
+                .map(|(line, attempt)| result_key(id, line, attempt))
+                .collect(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        self.store
+            .delete_batch_rows(id)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     pub fn config(&self) -> &BatchConfig {
@@ -427,14 +590,111 @@ fn is_size_error(e: &multer::Error) -> bool {
     )
 }
 
+fn storage_error(e: &BucketError) -> Response<Body> {
+    tracing::warn!(error = %e, "batch bucket request failed");
+    error_json(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "batch storage is unavailable; try again shortly",
+    )
+}
+
+/// An upload being stored: a chunk object whenever [`CHUNK_BYTES`] have
+/// arrived, and the row told how far it got, so an upload abandoned by a
+/// crash can still be found and deleted.
+struct Upload<'a> {
+    batches: &'a Batches,
+    id: String,
+    seq: u64,
+    buf: Vec<u8>,
+    stored: i64,
+}
+
+impl Upload<'_> {
+    async fn write(&mut self, mut data: &[u8]) -> Result<(), Response<Body>> {
+        while !data.is_empty() {
+            let take = (CHUNK_BYTES - self.buf.len()).min(data.len());
+            self.buf.extend_from_slice(&data[..take]);
+            data = &data[take..];
+            if self.buf.len() == CHUNK_BYTES {
+                self.flush().await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn flush(&mut self) -> Result<(), Response<Body>> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let chunk = Bytes::from(std::mem::take(&mut self.buf));
+        let len = chunk.len() as i64;
+        self.batches
+            .bucket
+            .put(&chunk_key(&self.id, self.seq), chunk)
+            .await
+            .map_err(|e| storage_error(&e))?;
+        self.seq += 1;
+        self.stored += len;
+        self.batches
+            .store
+            .note_batch_file_progress(&self.id, self.stored)
+            .await
+            .map_err(store_error)?;
+        self.buf = Vec::with_capacity(CHUNK_BYTES.min(1 << 20));
+        Ok(())
+    }
+
+    /// Bytes received so far.
+    fn bytes(&self) -> i64 {
+        self.stored + self.buf.len() as i64
+    }
+
+    async fn finish(mut self) -> Result<BatchFile, Response<Body>> {
+        self.flush().await?;
+        self.batches
+            .store
+            .finish_batch_file(&self.id, self.stored)
+            .await
+            .map_err(store_error)
+    }
+}
+
 /// Upload an input file. Its bytes are stored as they arrive, a chunk at a
 /// time, so memory use does not grow with the file; the file appears only
-/// once the upload is complete and checked.
+/// once the upload is complete and checked. A failed upload's objects and
+/// row are deleted at once.
 async fn upload(
     batches: &Batches,
     resolved: &ResolvedKey,
     headers: &HeaderMap,
     body: Body,
+) -> Handled {
+    let id = new_file_id();
+    let mut started = false;
+    let result = receive(batches, resolved, headers, body, &id, &mut started).await;
+    if result.is_err() && started {
+        let batches = batches.clone();
+        tokio::spawn(async move {
+            let deleted = match batches.store.abandon_batch_file(&id).await {
+                Ok(Some(bytes)) => batches.delete_input_file(&id, bytes, true).await,
+                Ok(None) => Ok(()),
+                Err(e) => Err(e.to_string()),
+            };
+            if let Err(e) = deleted {
+                tracing::warn!(error = %e, file = %id, "could not delete a failed upload; the cleanup retries it");
+            }
+        });
+    }
+    result
+}
+
+async fn receive(
+    batches: &Batches,
+    resolved: &ResolvedKey,
+    headers: &HeaderMap,
+    body: Body,
+    id: &str,
+    started: &mut bool,
 ) -> Handled {
     let ct = headers
         .get(header::CONTENT_TYPE)
@@ -453,9 +713,8 @@ async fn upload(
     let mut form =
         multer::Multipart::with_constraints(body.into_data_stream(), boundary, constraints);
     let mut purpose: Option<String> = None;
-    let mut writer = None;
+    let mut upload = None;
     let mut counter = LineCounter::default();
-    let id = new_file_id();
     loop {
         let mut field = match form.next_field().await {
             Ok(Some(f)) => f,
@@ -472,17 +731,17 @@ async fn upload(
                         .map_err(|_| invalid("unreadable `purpose`"))?,
                 );
             }
-            Some("file") if writer.is_none() => {
+            Some("file") if upload.is_none() => {
                 let filename: String = field
                     .file_name()
                     .unwrap_or("input.jsonl")
                     .chars()
                     .take(255)
                     .collect();
-                let mut w = batches
+                batches
                     .store
                     .begin_batch_file(&NewBatchFile {
-                        id: &id,
+                        id,
                         tenant_id: resolved.tenant_id,
                         key_id: resolved.key_id,
                         purpose: PURPOSE_BATCH,
@@ -492,6 +751,14 @@ async fn upload(
                     })
                     .await
                     .map_err(store_error)?;
+                *started = true;
+                let mut w = Upload {
+                    batches,
+                    id: id.to_string(),
+                    seq: 0,
+                    buf: Vec::with_capacity(CHUNK_BYTES.min(1 << 20)),
+                    stored: 0,
+                };
                 loop {
                     match field.chunk().await {
                         Ok(Some(data)) => {
@@ -502,7 +769,7 @@ async fn upload(
                                     batches.cfg.max_lines
                                 )));
                             }
-                            w.write(&data).await.map_err(store_error)?;
+                            w.write(&data).await?;
                         }
                         Ok(None) => break,
                         Err(e) if is_size_error(&e) => return Err(too_large(max)),
@@ -511,7 +778,7 @@ async fn upload(
                         }
                     }
                 }
-                writer = Some(w);
+                upload = Some(w);
             }
             _ => {}
         }
@@ -525,13 +792,13 @@ async fn upload(
         }
         None => return Err(invalid("missing `purpose`")),
     }
-    let Some(writer) = writer else {
+    let Some(upload) = upload else {
         return Err(invalid("missing `file`"));
     };
-    if writer.bytes() == 0 {
+    if upload.bytes() == 0 {
         return Err(invalid("the file is empty"));
     }
-    let stored = writer.finish().await.map_err(store_error)?;
+    let stored = upload.finish().await?;
     Ok(json(file_object(&stored)))
 }
 
@@ -580,18 +847,52 @@ async fn get_file(batches: &Batches, owner: JobOwner, id: &str) -> Handled {
 }
 
 async fn delete_file(batches: &Batches, owner: JobOwner, id: &str) -> Handled {
-    if batches
+    let Some(file) = batches
         .store
-        .delete_batch_file(id, owner)
+        .get_batch_file(id, owner)
         .await
         .map_err(store_error)?
-    {
-        Ok(json(
-            serde_json::json!({ "id": id, "object": "file", "deleted": true }),
-        ))
+    else {
+        return Err(not_found("file", id));
+    };
+    if file.purpose == PURPOSE_BATCH {
+        if batches
+            .store
+            .batch_file_in_use(id)
+            .await
+            .map_err(store_error)?
+        {
+            return Err(invalid_request(
+                StatusCode::CONFLICT,
+                &format!(
+                    "File '{id}' is the input of a batch that is still running; it is deleted when the batch ends."
+                ),
+                Some("id"),
+                Some("file_in_use"),
+            ));
+        }
+        batches
+            .delete_input_file(id, file.bytes, false)
+            .await
+            .map_err(|e| {
+                tracing::warn!(error = %e, file = %id, "could not delete a batch file");
+                error_json(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "batch storage is unavailable; try again shortly",
+                )
+            })?;
     } else {
-        Err(not_found("file", id))
+        // An output or error file: its content is the batch's, which goes
+        // with the batch.
+        batches
+            .store
+            .delete_batch_file_row(id)
+            .await
+            .map_err(store_error)?;
     }
+    Ok(json(
+        serde_json::json!({ "id": id, "object": "file", "deleted": true }),
+    ))
 }
 
 async fn file_content(batches: &Batches, owner: JobOwner, id: &str) -> Handled {
@@ -607,26 +908,16 @@ async fn file_content(batches: &Batches, owner: JobOwner, id: &str) -> Handled {
         PURPOSE_BATCH_OUTPUT => BatchOutput::Output,
         PURPOSE_BATCH_ERROR => BatchOutput::Error,
         _ => {
-            // An uploaded file: its chunks, in order, as the client reads.
-            let store = batches.store.clone();
+            // An uploaded file: its chunk objects, in order, as the client reads.
+            let bucket = batches.bucket.clone();
             let file_id = file.id.clone();
-            let stream = futures_util::stream::unfold(Some(0i32), move |seq| {
-                let (store, file_id) = (store.clone(), file_id.clone());
+            let stream = futures_util::stream::iter(0..chunk_count(file.bytes)).then(move |seq| {
+                let (bucket, key) = (bucket.clone(), chunk_key(&file_id, seq));
                 async move {
-                    let seq = seq?;
-                    match store.batch_file_chunk(&file_id, seq).await {
-                        Ok(Some(data)) => {
-                            Some((Ok::<_, std::io::Error>(Bytes::from(data)), Some(seq + 1)))
-                        }
-                        Ok(None) => None,
-                        Err(e) => {
-                            tracing::warn!(error = %e, file = %file_id, "reading a batch file failed");
-                            Some((
-                                Err(std::io::Error::other("batch storage unavailable")),
-                                None,
-                            ))
-                        }
-                    }
+                    bucket.get(&key).await.map_err(|e| {
+                        tracing::warn!(error = %e, key = %key, "reading a batch file failed");
+                        std::io::Error::other("batch storage unavailable")
+                    })
                 }
             });
             return Ok(jsonl_response(Body::from_stream(stream), &file.filename));
@@ -642,30 +933,17 @@ async fn file_content(batches: &Batches, owner: JobOwner, id: &str) -> Handled {
 }
 
 /// The lines of a batch's output or error file, read from its requests in
-/// pages as the client reads them.
+/// pages as the client reads them, each answer from its object.
 fn output_body(batches: &Batches, batch_id: String, which: BatchOutput) -> Body {
-    let store = batches.store.clone();
-    // Pages of lines, read as the client reads them.
+    let (store, bucket) = (batches.store.clone(), batches.bucket.clone());
     let stream = futures_util::stream::unfold(Some(-1i32), move |after| {
-        let (store, batch_id) = (store.clone(), batch_id.clone());
+        let (store, bucket, batch_id) = (store.clone(), bucket.clone(), batch_id.clone());
         async move {
             let after = after?;
-            match store
-                .batch_output_rows(&batch_id, which, after, OUTPUT_PAGE)
-                .await
-            {
-                Ok(rows) if rows.is_empty() => None,
-                Ok(rows) => {
-                    let next = (rows.len() as i64 == OUTPUT_PAGE)
-                        .then(|| rows.last().map(|r| r.line))
-                        .flatten();
-                    let mut out = Vec::new();
-                    for row in &rows {
-                        out.extend_from_slice(output_line(&batch_id, row).to_string().as_bytes());
-                        out.push(b'\n');
-                    }
-                    Some((Ok::<_, std::io::Error>(Bytes::from(out)), next))
-                }
+            let page = output_page(&store, &bucket, &batch_id, which, after).await;
+            match page {
+                Ok(None) => None,
+                Ok(Some((bytes, next))) => Some((Ok::<_, std::io::Error>(bytes), next)),
                 Err(e) => {
                     tracing::warn!(error = %e, batch = %batch_id, "reading a batch file failed");
                     Some((
@@ -677,6 +955,64 @@ fn output_body(batches: &Batches, batch_id: String, which: BatchOutput) -> Body 
         }
     });
     Body::from_stream(stream)
+}
+
+/// One page of an output or error file after line `after`, and the line to
+/// continue after; `None` past the end.
+async fn output_page(
+    store: &obleth_store::Store,
+    bucket: &Bucket,
+    batch_id: &str,
+    which: BatchOutput,
+    after: i32,
+) -> Result<Option<(Bytes, Option<i32>)>, String> {
+    let rows = store
+        .batch_output_rows(batch_id, which, after, OUTPUT_PAGE)
+        .await
+        .map_err(|e| e.to_string())?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let keys: Vec<Option<String>> = rows
+        .iter()
+        .map(|r| {
+            r.response_bytes
+                .map(|_| result_key(batch_id, r.line, r.attempts))
+        })
+        .collect();
+    let answers: Vec<Option<Bytes>> = futures_util::stream::iter(keys)
+        .map(|key| {
+            let bucket = bucket.clone();
+            async move {
+                let Some(key) = key else {
+                    return Ok(None);
+                };
+                match bucket.get(&key).await {
+                    Ok(b) => Ok(Some(b)),
+                    Err(BucketError::NotFound) => {
+                        tracing::warn!(key = %key, "a batch answer's object is missing");
+                        Ok(None)
+                    }
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+        })
+        .buffered(FETCH_CONCURRENCY)
+        .try_collect()
+        .await?;
+    let next = (rows.len() as i64 == OUTPUT_PAGE)
+        .then(|| rows.last().map(|r| r.line))
+        .flatten();
+    let mut out = Vec::new();
+    for (row, answer) in rows.iter().zip(&answers) {
+        out.extend_from_slice(
+            output_line(batch_id, row, answer.as_deref())
+                .to_string()
+                .as_bytes(),
+        );
+        out.push(b'\n');
+    }
+    Ok(Some((Bytes::from(out), next)))
 }
 
 /// obleth extension: `GET /v1/batches/{id}/results` streams the lines of the
@@ -723,17 +1059,20 @@ fn jsonl_response(body: Body, filename: &str) -> Response<Body> {
     resp
 }
 
-/// One line of an output or error file, in the OpenAI shape.
-pub(crate) fn output_line(batch_id: &str, row: &OutputRow) -> serde_json::Value {
+/// One line of an output or error file, in the OpenAI shape, with the
+/// item's stored answer when it has one.
+pub(crate) fn output_line(
+    batch_id: &str,
+    row: &OutputRow,
+    answer: Option<&[u8]>,
+) -> serde_json::Value {
     let id = format!(
         "batch_req_{}_{}",
         batch_id.trim_start_matches("batch_"),
         row.line
     );
     let response = row.response_status.map(|status| {
-        let body = row
-            .response
-            .as_deref()
+        let body = answer
             .map(|b| {
                 serde_json::from_slice::<serde_json::Value>(b).unwrap_or_else(|_| {
                     serde_json::Value::String(String::from_utf8_lossy(b).into())
@@ -860,11 +1199,13 @@ impl<'a> InputCheck<'a> {
         }
     }
 
-    /// The next line of the file (without its newline). Returns the item it
-    /// holds, if it is valid.
-    pub(crate) fn line(&mut self, raw: &[u8]) -> Option<NewBatchItem> {
+    /// The next line of the file (without its newline), found at byte
+    /// `offset`. Returns the item it holds, if it is valid: its place in the
+    /// file, from which the runner reads it (see [`request_body`]).
+    pub(crate) fn line(&mut self, offset: i64, raw: &[u8]) -> Option<NewBatchItem> {
         self.line += 1;
         let line = self.line;
+        let length = raw.len() as i32;
         let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
         if raw.trim_ascii().is_empty() {
             return None;
@@ -956,17 +1297,11 @@ impl<'a> InputCheck<'a> {
             Some(_) => {}
         }
         self.seen.insert(custom_id.clone());
-        // Stored as the runner sends it: never a stream, so an item needs no
-        // rewrite when it runs.
-        let mut body = body.clone();
-        if let Some(obj) = body.as_object_mut() {
-            obj.insert("stream".into(), serde_json::Value::Bool(false));
-            obj.remove("stream_options");
-        }
         let item = NewBatchItem {
             line: self.items as i32,
             custom_id,
-            body: body.to_string(),
+            input_offset: offset,
+            input_length: length,
         };
         self.items += 1;
         Some(item)
@@ -995,6 +1330,19 @@ impl<'a> InputCheck<'a> {
     }
 }
 
+/// The request a line of an input file holds, as the runner sends it:
+/// never a stream. `None` when the line is not a request (every line was
+/// checked when its batch was created, so only damage gets here).
+pub(crate) fn request_body(raw: &[u8]) -> Option<serde_json::Value> {
+    let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+    let mut line: serde_json::Value = serde_json::from_slice(raw).ok()?;
+    let mut body = line.get_mut("body")?.take();
+    let obj = body.as_object_mut()?;
+    obj.insert("stream".into(), serde_json::Value::Bool(false));
+    obj.remove("stream_options");
+    Some(body)
+}
+
 /// Check a whole input file held in memory (see [`InputCheck`]).
 #[cfg(test)]
 pub(crate) fn parse_input(
@@ -1005,63 +1353,90 @@ pub(crate) fn parse_input(
     let mut check = InputCheck::new(endpoint, max_lines);
     let mut items = Vec::new();
     let body = content.strip_suffix(b"\n").unwrap_or(content);
+    let mut offset = 0i64;
     for raw in body.split(|b| *b == b'\n') {
-        items.extend(check.line(raw));
+        items.extend(check.line(offset, raw));
+        offset += raw.len() as i64 + 1;
     }
     let model = check.finish()?;
     Ok(ParsedInput { model, items })
 }
 
-/// Reads an uploaded file line by line from its stored chunks, holding one
+/// Reads an uploaded file line by line from its chunk objects, holding one
 /// chunk and a partial line at a time.
 struct LineReader {
-    store: obleth_store::Store,
+    bucket: Bucket,
     file_id: String,
-    seq: i32,
+    chunks: u64,
+    seq: u64,
     buf: Vec<u8>,
     start: usize,
-    done: bool,
+    /// The file offset of `buf[0]`.
+    buf_offset: i64,
 }
 
 impl LineReader {
-    fn new(store: obleth_store::Store, file_id: &str) -> Self {
+    fn new(bucket: Bucket, file: &BatchFile) -> Self {
         LineReader {
-            store,
-            file_id: file_id.to_string(),
+            bucket,
+            file_id: file.id.clone(),
+            chunks: chunk_count(file.bytes),
             seq: 0,
             buf: Vec::new(),
             start: 0,
-            done: false,
+            buf_offset: 0,
         }
     }
 
-    /// The next line without its newline; `None` at the end of the file.
-    async fn next_line(&mut self) -> Result<Option<Vec<u8>>, obleth_store::StoreError> {
+    /// The next line without its newline, with its byte offset in the file;
+    /// `None` at the end of the file.
+    async fn next_line(&mut self) -> Result<Option<(i64, Vec<u8>)>, BucketError> {
         loop {
+            let offset = self.buf_offset + self.start as i64;
             if let Some(pos) = self.buf[self.start..].iter().position(|b| *b == b'\n') {
                 let line = self.buf[self.start..self.start + pos].to_vec();
                 self.start += pos + 1;
-                return Ok(Some(line));
+                return Ok(Some((offset, line)));
             }
-            if self.done {
+            if self.seq == self.chunks {
                 if self.start < self.buf.len() {
                     let line = self.buf[self.start..].to_vec();
                     self.start = self.buf.len();
-                    return Ok(Some(line));
+                    return Ok(Some((offset, line)));
                 }
                 return Ok(None);
             }
             self.buf.drain(..self.start);
+            self.buf_offset += self.start as i64;
             self.start = 0;
-            match self.store.batch_file_chunk(&self.file_id, self.seq).await? {
-                Some(chunk) => {
-                    self.buf.extend_from_slice(&chunk);
-                    self.seq += 1;
-                }
-                None => self.done = true,
-            }
+            let chunk = self.bucket.get(&chunk_key(&self.file_id, self.seq)).await?;
+            self.buf.extend_from_slice(&chunk);
+            self.seq += 1;
         }
     }
+}
+
+/// The request at `offset` (`length` bytes) of an uploaded file, read from
+/// the chunk objects it falls in.
+async fn read_request(
+    bucket: &Bucket,
+    file_id: &str,
+    offset: i64,
+    length: i32,
+) -> Result<Vec<u8>, BucketError> {
+    let chunk = CHUNK_BYTES as u64;
+    let (mut pos, end) = (offset as u64, offset as u64 + length.max(0) as u64);
+    let mut out = Vec::with_capacity(length.max(0) as usize);
+    while pos < end {
+        let within = pos % chunk;
+        let take = (chunk - within).min(end - pos);
+        let part = bucket
+            .get_range(&chunk_key(file_id, pos / chunk), within, take)
+            .await?;
+        out.extend_from_slice(&part);
+        pos += take;
+    }
+    Ok(out)
 }
 
 async fn create(
@@ -1132,11 +1507,13 @@ async fn create(
             "`input_file_id` must name a file uploaded with purpose `batch`",
         ));
     }
-    // Pass 1: check every line, keeping nothing but the check's state.
+    // Check every line, keeping each valid one's place in the file (a few
+    // dozen bytes per request).
     let mut check = InputCheck::new(endpoint, cfg.max_lines);
-    let mut reader = LineReader::new(batches.store.clone(), &file.id);
-    while let Some(line) = reader.next_line().await.map_err(store_error)? {
-        check.line(&line);
+    let mut reader = LineReader::new(batches.bucket.clone(), &file);
+    let mut items = Vec::new();
+    while let Some((offset, line)) = reader.next_line().await.map_err(|e| storage_error(&e))? {
+        items.extend(check.line(offset, &line));
     }
     let checked = check.finish();
 
@@ -1178,20 +1555,12 @@ async fn create(
         })])
         .await;
     }
-    // Pass 2: every line is valid; store the items a run at a time, in one
+    // Every line is valid: store the items a run at a time, in one
     // transaction, so the batch appears complete or not at all.
     let mut writer = batches.store.begin_batch(&new).await.map_err(store_error)?;
-    let mut check = InputCheck::new(endpoint, cfg.max_lines);
-    let mut reader = LineReader::new(batches.store.clone(), &file.id);
-    let mut run = Vec::with_capacity(ITEM_RUN);
-    while let Some(line) = reader.next_line().await.map_err(store_error)? {
-        run.extend(check.line(&line));
-        if run.len() >= ITEM_RUN {
-            writer.add_items(&run).await.map_err(store_error)?;
-            run.clear();
-        }
+    for run in items.chunks(ITEM_RUN) {
+        writer.add_items(run).await.map_err(store_error)?;
     }
-    writer.add_items(&run).await.map_err(store_error)?;
     let b = writer.finish().await.map_err(store_error)?;
     tracing::info!(batch = %b.id, model = %b.model, total = b.total, tenant = %resolved.tenant_name, "batch created");
     Ok(json(batch_object(&b)))
@@ -1252,25 +1621,54 @@ async fn cancel(batches: &Batches, owner: JobOwner, id: &str) -> Handled {
 }
 
 async fn delete_batch(batches: &Batches, owner: JobOwner, id: &str) -> Handled {
-    match batches
+    let Some(b) = batches
         .store
-        .delete_batch(id, owner)
+        .get_batch(id, owner)
         .await
         .map_err(store_error)?
-    {
-        BatchDeletion::Deleted => Ok(json(
-            serde_json::json!({ "id": id, "object": "batch", "deleted": true }),
-        )),
-        BatchDeletion::Running => Err(invalid_request(
+    else {
+        return Err(not_found("batch", id));
+    };
+    if b.finished_at().is_none() {
+        return Err(invalid_request(
             StatusCode::CONFLICT,
             &format!(
                 "Batch '{id}' is still running. Cancel it, then delete it once it has stopped."
             ),
             Some("id"),
             Some("batch_running"),
-        )),
-        BatchDeletion::NotFound => Err(not_found("batch", id)),
+        ));
     }
+    let unavailable = |e: String| {
+        tracing::warn!(error = %e, batch = %id, "could not delete a batch");
+        error_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "batch storage is unavailable; try again shortly",
+        )
+    };
+    batches.delete_batch_data(id).await.map_err(unavailable)?;
+    // Its input file too, unless a batch still running reads it.
+    if let Some(input) = batches
+        .store
+        .get_batch_file(&b.input_file_id, owner)
+        .await
+        .map_err(store_error)?
+    {
+        if !batches
+            .store
+            .batch_file_in_use(&input.id)
+            .await
+            .map_err(store_error)?
+        {
+            batches
+                .delete_input_file(&input.id, input.bytes, false)
+                .await
+                .map_err(unavailable)?;
+        }
+    }
+    Ok(json(
+        serde_json::json!({ "id": id, "object": "batch", "deleted": true }),
+    ))
 }
 
 // ---- runner ---------------------------------------------------------------
@@ -1417,12 +1815,12 @@ pub(crate) fn spawn_runner(
     Some(handle)
 }
 
-/// Renew this runner's leases, sweep lapsed ones, finish batches and prune
-/// old ones. Every replica does this; each step is safe to race.
+/// Renew this runner's leases, sweep lapsed ones, finish batches and delete
+/// what is due. Every replica does this; each step is safe to race.
 async fn housekeeping(batches: Batches) {
     let mut tick = tokio::time::interval(ADVANCE);
     let mut last_leases = std::time::Instant::now() - HOUSEKEEPING;
-    let mut last_prune = std::time::Instant::now() - Duration::from_secs(3600);
+    let mut last_cleanup = std::time::Instant::now() - CLEANUP;
     loop {
         tick.tick().await;
         let store = &batches.store;
@@ -1446,14 +1844,53 @@ async fn housekeeping(batches: Batches) {
             }
             Err(e) => tracing::warn!(error = %e, "batch status update failed"),
         }
-        if last_prune.elapsed() >= Duration::from_secs(3600) {
-            last_prune = std::time::Instant::now();
-            match store.prune_batches(cfg.retention_days).await {
-                Ok((0, 0)) => {}
-                Ok((b, f)) => tracing::info!(batches = b, files = f, "pruned old batches"),
-                Err(e) => tracing::warn!(error = %e, "batch prune failed"),
+        if last_cleanup.elapsed() >= CLEANUP {
+            last_cleanup = std::time::Instant::now();
+            clean_up(&batches).await;
+        }
+    }
+}
+
+/// Delete the input files and batches that are due, objects first, then
+/// rows. Each is claimed by one replica; one that fails is retried by
+/// whichever replica claims it after the claim lapses.
+async fn clean_up(batches: &Batches) {
+    let (store, retention) = (&batches.store, batches.cfg.retention.as_secs() as i64);
+    let mut files = 0;
+    match store
+        .claim_spent_batch_files(retention, STALE_UPLOAD_SECS, CLEANUP_RUN)
+        .await
+    {
+        Ok(spent) => {
+            for f in spent {
+                match batches.delete_input_file(&f.id, f.bytes, f.uploading).await {
+                    Ok(()) => files += 1,
+                    Err(e) => {
+                        tracing::warn!(error = %e, file = %f.id, "could not delete a batch file")
+                    }
+                }
             }
         }
+        Err(e) => tracing::warn!(error = %e, "could not find batch files to delete"),
+    }
+    let mut done = 0;
+    match store.claim_expired_batches(retention, CLEANUP_RUN).await {
+        Ok(ids) => {
+            for id in ids {
+                match batches.delete_batch_data(&id).await {
+                    Ok(()) => done += 1,
+                    Err(e) => tracing::warn!(error = %e, batch = %id, "could not delete a batch"),
+                }
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "could not find batches to delete"),
+    }
+    if files + done > 0 {
+        tracing::info!(
+            files,
+            batches = done,
+            "deleted batch files and batches that were due"
+        );
     }
 }
 
@@ -1620,9 +2057,16 @@ async fn run_item(
         return;
     }
 
-    let body: serde_json::Value = match serde_json::from_str(&item.body) {
-        Ok(b) => b,
-        Err(_) => {
+    let raw = match read_request(
+        &batches.bucket,
+        &batch.input_file_id,
+        item.input_offset,
+        item.input_length,
+    )
+    .await
+    {
+        Ok(raw) => raw,
+        Err(BucketError::NotFound) => {
             let _ = store
                 .fail_batch_item(
                     &batch.id,
@@ -1630,13 +2074,43 @@ async fn run_item(
                     me,
                     None,
                     None,
-                    &error_text("invalid_body", "the stored request is not JSON"),
+                    &error_text("input_missing", "the batch's input file is gone"),
                     None,
                 )
                 .await
                 .map_err(finish_err);
             return;
         }
+        Err(e) => {
+            tracing::warn!(error = %e, batch = %batch.id, line = item.line, "could not read a batch request");
+            let _ = store
+                .retry_batch_item(
+                    &batch.id,
+                    item.line,
+                    me,
+                    STORAGE_PAUSE_SECS,
+                    &error_text("storage_unavailable", "the batch's input could not be read"),
+                    true,
+                )
+                .await
+                .map_err(finish_err);
+            return;
+        }
+    };
+    let Some(body) = request_body(&raw) else {
+        let _ = store
+            .fail_batch_item(
+                &batch.id,
+                item.line,
+                me,
+                None,
+                None,
+                &error_text("invalid_body", "the stored request is not JSON"),
+                None,
+            )
+            .await
+            .map_err(finish_err);
+        return;
     };
     let wait = (batch.deadline_at - Utc::now())
         .to_std()
@@ -1668,20 +2142,57 @@ async fn run_item(
     let resp = crate::proxy::run_internal(state.clone(), req, request_id).await;
     let status = resp.status();
     let bytes = axum::body::to_bytes(resp.into_body(), ITEM_RESPONSE_MAX).await;
-    let recorded = match (classify(status), bytes) {
-        (Outcome::Success, Ok(bytes)) => {
-            store
-                .complete_batch_item(
-                    &batch.id,
-                    item.line,
-                    me,
-                    status.as_u16() as i32,
-                    &bytes,
-                    request_id,
-                )
-                .await
+    // An answer worth keeping is stored before the item is finished with
+    // it; if the item turns out not to be this runner's any more, or cannot
+    // be finished, the object goes again.
+    let key = result_key(&batch.id, item.line, item.attempts);
+    let stored = |bytes: Bytes| {
+        let (bucket, key) = (batches.bucket.clone(), key.clone());
+        async move {
+            let len = bytes.len() as i32;
+            match bucket.put(&key, bytes).await {
+                Ok(()) => Some(len),
+                Err(e) => {
+                    tracing::warn!(error = %e, batch = %batch.id, line = item.line, "could not store a batch answer");
+                    None
+                }
+            }
         }
-        (Outcome::Success, Err(_)) => {
+    };
+    let (recorded, kept) = match (classify(status), bytes) {
+        (Outcome::Success, Ok(bytes)) => match stored(bytes).await {
+            Some(len) => (
+                store
+                    .complete_batch_item(
+                        &batch.id,
+                        item.line,
+                        me,
+                        status.as_u16() as i32,
+                        len,
+                        request_id,
+                    )
+                    .await,
+                true,
+            ),
+            None => (
+                store
+                    .retry_batch_item(
+                        &batch.id,
+                        item.line,
+                        me,
+                        STORAGE_PAUSE_SECS,
+                        &error_text(
+                            "storage_unavailable",
+                            "the answer could not be stored; the request runs again",
+                        ),
+                        // The bucket's fault, not the request's.
+                        true,
+                    )
+                    .await,
+                false,
+            ),
+        },
+        (Outcome::Success, Err(_)) => (
             store
                 .fail_batch_item(
                     &batch.id,
@@ -1695,41 +2206,60 @@ async fn run_item(
                     ),
                     Some(request_id),
                 )
-                .await
-        }
+                .await,
+            false,
+        ),
         (Outcome::Retry, bytes) if item.attempts < cfg.max_attempts => {
             let detail = bytes
                 .ok()
                 .map(|b| String::from_utf8_lossy(&b[..b.len().min(500)]).into_owned())
                 .unwrap_or_default();
-            store
-                .retry_batch_item(
-                    &batch.id,
-                    item.line,
-                    me,
-                    backoff(item.attempts),
-                    &error_text(&status.as_u16().to_string(), &detail),
-                    false,
-                )
-                .await
+            (
+                store
+                    .retry_batch_item(
+                        &batch.id,
+                        item.line,
+                        me,
+                        backoff(item.attempts),
+                        &error_text(&status.as_u16().to_string(), &detail),
+                        false,
+                    )
+                    .await,
+                false,
+            )
         }
         (_, bytes) => {
-            let bytes = bytes.ok();
-            store
-                .fail_batch_item(
-                    &batch.id,
-                    item.line,
-                    me,
-                    Some(status.as_u16() as i32),
-                    bytes.as_deref(),
-                    &error_text(&status.as_u16().to_string(), "request failed"),
-                    Some(request_id),
-                )
-                .await
+            let len = match bytes {
+                Ok(bytes) => stored(bytes).await,
+                Err(_) => None,
+            };
+            (
+                store
+                    .fail_batch_item(
+                        &batch.id,
+                        item.line,
+                        me,
+                        Some(status.as_u16() as i32),
+                        len,
+                        &error_text(&status.as_u16().to_string(), "request failed"),
+                        Some(request_id),
+                    )
+                    .await,
+                len.is_some(),
+            )
         }
     };
-    if let Err(e) = recorded {
-        finish_err(e);
+    let recorded = match recorded {
+        Ok(mine) => mine,
+        Err(e) => {
+            finish_err(e);
+            false
+        }
+    };
+    if kept && !recorded {
+        if let Err(e) = batches.bucket.delete(&key).await {
+            tracing::warn!(error = %e, key = %key, "could not delete an answer that was not kept");
+        }
     }
 }
 
@@ -1852,7 +2382,42 @@ mod tests {
             (parsed.items[1].line, parsed.items[1].custom_id.as_str()),
             (1, "b")
         );
-        assert!(parsed.items[0].body.contains("\"model\":\"m\""));
+        // Each item is its line's place in the file, from which the runner
+        // reads the request, never streamed.
+        let second = &parsed.items[1];
+        let raw = &file.as_bytes()[second.input_offset as usize..][..second.input_length as usize];
+        assert_eq!(raw, line("b", "m").as_bytes());
+        let body = request_body(raw).unwrap();
+        assert_eq!(
+            (body["model"].as_str(), body["stream"].as_bool()),
+            (Some("m"), Some(false))
+        );
+        // A carriage return ends a line as a newline does.
+        let crlf = format!("{}\r\n", line("c", "m"));
+        let item = &parse_input(crlf.as_bytes(), "/v1/chat/completions", 10)
+            .unwrap()
+            .items[0];
+        assert!(request_body(&crlf.as_bytes()[..item.input_length as usize]).is_some());
+    }
+
+    #[test]
+    fn requests_are_read_back_never_streamed() {
+        let raw = br#"{"custom_id":"a","method":"POST","url":"/v1/chat/completions","body":{"model":"m","stream":true,"stream_options":{"include_usage":true}}}"#;
+        let body = request_body(raw).unwrap();
+        assert_eq!(body["stream"], false);
+        assert!(body.get("stream_options").is_none());
+        assert!(request_body(b"not json").is_none());
+        assert!(request_body(br#"{"custom_id":"a"}"#).is_none());
+    }
+
+    #[test]
+    fn objects_are_named_by_file_chunk_and_answer_attempt() {
+        assert_eq!(chunk_key("file-1", 3), "files/file-1/00003");
+        assert_eq!(chunk_count(0), 0);
+        assert_eq!(chunk_count(1), 1);
+        assert_eq!(chunk_count(CHUNK_BYTES as i64), 1);
+        assert_eq!(chunk_count(CHUNK_BYTES as i64 + 1), 2);
+        assert_eq!(result_key("batch_x", 7, 2), "results/batch_x/7.2");
     }
 
     #[test]
@@ -1910,11 +2475,12 @@ mod tests {
             custom_id: "a".into(),
             status: "succeeded".into(),
             response_status: Some(200),
-            response: Some(br#"{"id":"chatcmpl-1"}"#.to_vec()),
+            response_bytes: Some(19),
+            attempts: 1,
             error: None,
             request_id: None,
         };
-        let v = output_line("batch_abc", &ok);
+        let v = output_line("batch_abc", &ok, Some(br#"{"id":"chatcmpl-1"}"#));
         assert_eq!(v["id"], "batch_req_abc_3");
         assert_eq!(v["custom_id"], "a");
         assert_eq!(v["response"]["status_code"], 200);
@@ -1926,11 +2492,12 @@ mod tests {
             custom_id: "b".into(),
             status: "expired".into(),
             response_status: None,
-            response: None,
+            response_bytes: None,
+            attempts: 1,
             error: Some(r#"{"code":"batch_expired","message":"late"}"#.into()),
             request_id: None,
         };
-        let v = output_line("batch_abc", &expired);
+        let v = output_line("batch_abc", &expired, None);
         assert!(v["response"].is_null());
         assert_eq!(v["error"]["code"], "batch_expired");
     }
