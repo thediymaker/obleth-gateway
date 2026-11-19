@@ -690,7 +690,7 @@ async fn handler_inner(
     let mut req_meta = RequestMeta {
         session_id: conversation.value,
         session_id_source: conversation.source.as_str(),
-        request_type: surfaced_request_type(&resolved, VERDICTS_PATH, &headers),
+        request_type: surfaced_request_type(&resolved, VERDICTS_PATH, None),
         device_id,
         end_user: end_user.clone().unwrap_or_default(),
         model_variant: String::new(),

@@ -129,14 +129,6 @@ fn canonical_path(method: &Method, path: &str) -> Option<String> {
 
 pub async fn proxy_handler(state: State<AppState>, mut req: Request<Body>) -> Response<Body> {
     let request_id = Uuid::new_v4();
-    // The surface marker is the gateway's own annotation (see
-    // `crate::responses::SURFACE_HEADER`); stripped here unconditionally so a
-    // caller cannot stamp a direct chat call as Responses traffic and pollute
-    // the adoption metric. The shim re-inserts it after this strip.
-    req.headers_mut().remove(crate::responses::SURFACE_HEADER);
-    // Likewise the effort the Responses and Messages shims carry over: a
-    // caller sets effort in the body, never with the gateway's own header.
-    req.headers_mut().remove(crate::reasoning::EFFORT_HEADER);
     if let Some(canonical) = canonical_path(req.method(), req.uri().path()) {
         let pq = match req.uri().query() {
             Some(q) => format!("{canonical}?{q}"),
@@ -208,6 +200,54 @@ pub(crate) async fn read_body(body: Body) -> Result<Bytes, BodyTooLarge> {
         .map_err(|_| BodyTooLarge)
 }
 
+/// Background admission for a batch item: its share of the model and the
+/// longest it may wait for a slot.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct BackgroundShare {
+    pub share: f64,
+    pub admission_wait: Duration,
+}
+
+/// What an in-process caller (a shim, the batch runner) already knows about
+/// the request it hands to the pipeline, as a request extension. The pipeline
+/// takes each piece from here instead of doing it again, and none of it rides
+/// on a header a client could set or strip. Only in-process code inserts it;
+/// it never arrives over HTTP.
+#[derive(Clone, Default)]
+pub(crate) struct PipelineInput {
+    /// The surface the caller used (`responses`, `messages`); chat when none.
+    pub surface: Option<&'static str>,
+    /// The effort the surface spelled in fields chat has no name for.
+    pub effort: Option<crate::reasoning::Requested>,
+    /// The credential the caller already authenticated and gated.
+    pub credential: Option<crate::jwt_auth::Credential>,
+    /// The translated body, so the pipeline parses nothing.
+    pub body: Option<serde_json::Value>,
+    /// The caller's input estimate, when it counts what the tokenizer does
+    /// not see (the Messages shim counts tools and images).
+    pub estimate: Option<u32>,
+    /// A batch item's background admission.
+    pub batch: Option<BackgroundShare>,
+}
+
+impl PipelineInput {
+    /// The input an in-process caller set, or nothing for a request over HTTP.
+    pub(crate) fn of(extensions: &http::Extensions) -> PipelineInput {
+        extensions
+            .get::<PipelineInput>()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The estimate to reserve: the caller's input count when it gave one.
+    fn reserve(&self, mut est: CostEstimate) -> CostEstimate {
+        if let Some(input_tokens) = self.estimate {
+            est.input_tokens = input_tokens;
+        }
+        est
+    }
+}
+
 /// Run a Responses request as a chat request and translate the answer back.
 ///
 /// Everything between the two conversions is the ordinary pipeline: the same
@@ -226,15 +266,16 @@ async fn responses_shim(
     let Some(secret) = bearer(&parts.headers) else {
         return error_json(StatusCode::UNAUTHORIZED, "missing bearer token");
     };
-    match crate::jwt_auth::authenticate_credential(&state, &secret).await {
+    let credential = match crate::jwt_auth::authenticate_credential(&state, &secret).await {
         Ok(cred) => {
             let client = crate::client::ClientInfo::of(&parts.extensions);
             if let Err(resp) = gate_resolved_key(&state, &cred.resolved, &client) {
                 return resp;
             }
+            cred
         }
         Err(resp) => return resp,
-    }
+    };
     let bytes = match read_body(body).await {
         Ok(bytes) => bytes,
         Err(too_large) => return too_large.openai(),
@@ -263,15 +304,6 @@ async fn responses_shim(
         .unwrap_or("unknown")
         .to_string();
     let chat_body = crate::responses::to_chat_request(&incoming);
-    let chat_bytes = match serde_json::to_vec(&chat_body) {
-        Ok(b) => b,
-        Err(_) => {
-            return error_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "request translation failed",
-            )
-        }
-    };
 
     // Re-point at the chat path so `is_chat_path` holds and every boon runs,
     // and record the surface the caller actually used so telemetry does not
@@ -289,17 +321,18 @@ async fn responses_shim(
     };
     parts.uri = uri;
     parts.headers.remove(header::CONTENT_LENGTH);
-    if let Ok(v) = header::HeaderValue::from_str("responses") {
-        parts.headers.insert(crate::responses::SURFACE_HEADER, v);
-    }
-    // `reasoning.effort` has no chat spelling the translation keeps; carry it
-    // for the pipeline to translate per model.
-    if let Some(v) =
-        crate::reasoning::header_value(obleth_config::reasoning::responses_effort(&incoming))
-    {
-        parts.headers.insert(crate::reasoning::EFFORT_HEADER, v);
-    }
-    let chat_req = Request::from_parts(parts, Body::from(chat_bytes));
+    // `reasoning.effort` has no chat spelling the translation keeps; the
+    // pipeline translates it per model.
+    parts.extensions.insert(PipelineInput {
+        surface: Some(crate::responses::SURFACE),
+        effort: crate::reasoning::Requested::of_surface(
+            obleth_config::reasoning::responses_effort(&incoming),
+        ),
+        credential: Some(credential),
+        body: Some(chat_body),
+        ..PipelineInput::default()
+    });
+    let chat_req = Request::from_parts(parts, Body::empty());
 
     let mut resp = proxy_handler_inner(state, chat_req, request_id).await;
     if !resp.headers().contains_key("x-obleth-request-id") {
@@ -575,14 +608,10 @@ async fn messages_shim(
         chat_body,
         requested_model,
         streaming,
+        credential,
+        effort,
+        estimate,
     } = front;
-    let Ok(chat_bytes) = serde_json::to_vec(&chat_body) else {
-        return anthropic_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "request translation failed",
-            None,
-        );
-    };
     let query = strip_beta_query(parts.uri.query())
         .map(|q| format!("?{q}"))
         .unwrap_or_default();
@@ -599,10 +628,15 @@ async fn messages_shim(
     // pointless at best (`anthropic-beta` also leaks which client library is
     // in use to a backend that has no use for the information).
     parts.headers.remove("anthropic-beta");
-    if let Ok(v) = header::HeaderValue::from_str(crate::messages::SURFACE) {
-        parts.headers.insert(crate::responses::SURFACE_HEADER, v);
-    }
-    let chat_req = Request::from_parts(parts, Body::from(chat_bytes));
+    parts.extensions.insert(PipelineInput {
+        surface: Some(crate::messages::SURFACE),
+        effort,
+        credential: Some(credential),
+        body: Some(chat_body),
+        estimate,
+        batch: None,
+    });
+    let chat_req = Request::from_parts(parts, Body::empty());
 
     let mut resp = proxy_handler_inner(state, chat_req, request_id).await;
     if !resp.headers().contains_key("x-obleth-request-id") {
@@ -661,6 +695,12 @@ struct MessagesFront {
     chat_body: serde_json::Value,
     requested_model: String,
     streaming: bool,
+    /// Authenticated and gated here, once.
+    credential: crate::jwt_auth::Credential,
+    /// `thinking` / `output_config.effort`, which chat has no spelling for.
+    effort: Option<crate::reasoning::Requested>,
+    /// The input estimate with tools and images counted, for the reservation.
+    estimate: Option<u32>,
 }
 
 /// Anthropic's real `count_tokens` endpoint takes no `max_tokens` field, and
@@ -683,7 +723,7 @@ async fn messages_front(
     req: Request<Body>,
     count_tokens: bool,
 ) -> Result<MessagesFront, Response<Body>> {
-    let (mut parts, body) = req.into_parts();
+    let (parts, body) = req.into_parts();
     // Authenticate before buffering (same reasoning as `responses_shim`).
     let Some(secret) = bearer(&parts.headers) else {
         return Err(anthropic_error(
@@ -692,15 +732,16 @@ async fn messages_front(
             None,
         ));
     };
-    match crate::jwt_auth::authenticate_credential(state, &secret).await {
+    let credential = match crate::jwt_auth::authenticate_credential(state, &secret).await {
         Ok(cred) => {
             let client = crate::client::ClientInfo::of(&parts.extensions);
             if let Err(resp) = gate_resolved_key(state, &cred.resolved, &client) {
                 return Err(redress_error(resp).await);
             }
+            cred
         }
         Err(resp) => return Err(redress_error(resp).await),
-    }
+    };
     let bytes = read_body(body).await.map_err(BodyTooLarge::anthropic)?;
     let Ok(mut incoming) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return Err(anthropic_error(
@@ -748,9 +789,11 @@ async fn messages_front(
     // every smaller candidate hard-filtered out by the router (503). Skipped
     // for `count_tokens`: its `max_tokens` is a backfilled placeholder, never
     // forwarded, and never dispatched to a pipeline that could reject it.
+    let mut estimate = None;
     if !count_tokens {
         let text_est = state.tokenizer.estimate_request(&chat_body).input_tokens as u64;
         let input_est = messages_input_estimate(&chat_body, text_est);
+        estimate = Some(u32::try_from(input_est).unwrap_or(u32::MAX));
         let window = context_window_for(state, &served, effort.clone().ok().flatten()).await;
         let requested_max_tokens = chat_body
             .get("max_tokens")
@@ -779,17 +822,14 @@ async fn messages_front(
         }
     }
     chat_body["model"] = serde_json::Value::String(served);
-    // `thinking` and `output_config.effort` have no chat spelling the
-    // translation keeps; carry the level for the pipeline to translate per
-    // model.
-    if let Some(v) = crate::reasoning::header_value(effort) {
-        parts.headers.insert(crate::reasoning::EFFORT_HEADER, v);
-    }
     Ok(MessagesFront {
         parts,
         chat_body,
         requested_model,
         streaming,
+        credential,
+        effort: crate::reasoning::Requested::of_surface(effort),
+        estimate,
     })
 }
 
@@ -886,6 +926,24 @@ pub(crate) const IMAGE_PART_TOKEN_ESTIMATE: u64 = 1500;
 /// the upstream still rejects on the real (text + tools + images) prompt.
 /// Not used for `count_tokens`'s reported figure: that endpoint's contract is
 /// "what the tokenizer counts", not this surface's own admission math.
+/// The length `value` serializes to, counted without building the string.
+fn serialized_len(value: &serde_json::Value) -> usize {
+    struct Counting(usize);
+    impl std::io::Write for Counting {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counting = Counting(0);
+    // A `Value` always serializes; the writer never fails.
+    let _ = serde_json::to_writer(&mut counting, value);
+    counting.0
+}
+
 fn messages_input_estimate(chat_body: &serde_json::Value, text_estimate: u64) -> u64 {
     // `to_string().len() / 3`, not the tokenizer's own chars-per-token-4
     // heuristic: `tools` is JSON schema (short, punctuation- and
@@ -896,7 +954,7 @@ fn messages_input_estimate(chat_body: &serde_json::Value, text_estimate: u64) ->
     // upstream-rejecting value.
     let tools_tokens = chat_body
         .get("tools")
-        .map(|t| t.to_string().len() as u64 / 3)
+        .map(|t| serialized_len(t) as u64 / 3)
         .unwrap_or(0);
     let image_count = chat_body
         .get("messages")
@@ -1113,7 +1171,7 @@ pub(crate) struct BackgroundAdmission {
 /// which is admitted as interactive work.
 pub(crate) fn background_admission(
     route: Option<&ResolvedModel>,
-    batch: Option<&crate::batches::BatchCaller>,
+    batch: Option<&BackgroundShare>,
     resolved: &ResolvedKey,
     key_share: impl FnOnce() -> f64,
 ) -> Option<BackgroundAdmission> {
@@ -1164,13 +1222,11 @@ async fn run_pipeline(
         .map(|q| format!("?{q}"))
         .unwrap_or_default();
     let headers = parts.headers;
-    // A batch item the runner sends in process: the caller is the batch's
-    // owner, already resolved, and the request is background work. Only the
-    // runner sets this; it never arrives over HTTP.
-    let batch = parts
-        .extensions
-        .get::<crate::batches::BatchCaller>()
-        .cloned();
+    // What an in-process caller already did: a shim's credential, surface,
+    // effort, body and estimate; a batch item's owner and background share.
+    let mut input = PipelineInput::of(&parts.extensions);
+    let batch = input.batch;
+    let presented = input.credential.is_some();
 
     // ---- reject path traversal before any upstream work ----
     if has_path_traversal(&path) {
@@ -1179,8 +1235,8 @@ async fn run_pipeline(
 
     // ---- auth ----
     let auth_start = crate::tracer::now_ms();
-    let (resolved, device_id, auth_kind) = match &batch {
-        Some(b) => (b.resolved.clone(), String::new(), "batch"),
+    let (resolved, device_id, auth_kind) = match input.credential.take() {
+        Some(c) => (c.resolved, c.device_id, c.auth_kind),
         None => {
             let Some(secret) = bearer(&headers) else {
                 return error_json(StatusCode::UNAUTHORIZED, "missing bearer token");
@@ -1202,8 +1258,12 @@ async fn run_pipeline(
     } else {
         crate::client::ClientInfo::of(&parts.extensions)
     };
-    if let Err(resp) = gate_resolved_key(&state, &resolved, &client) {
-        return resp;
+    // A shim gated the key before translating; a batch item's owner is gated
+    // again here, as in-process work.
+    if !presented || batch.is_some() {
+        if let Err(resp) = gate_resolved_key(&state, &resolved, &client) {
+            return resp;
+        }
     }
 
     // ---- job follow-ups: videos, meshes (poll, download, delete, list) ----
@@ -1276,12 +1336,21 @@ async fn run_pipeline(
     }
 
     // ---- read + parse body ----
-    let mut body_bytes = match read_body(body).await {
-        Ok(bytes) => bytes,
-        Err(too_large) => return too_large.openai(),
+    // An in-process caller hands over the body it built; its bytes are made
+    // once, where the cache key and the upstream need them.
+    let body_given = input.body.is_some();
+    let (mut body_bytes, mut json) = match input.body.take() {
+        Some(json) => (Bytes::new(), json),
+        None => {
+            let bytes = match read_body(body).await {
+                Ok(bytes) => bytes,
+                Err(too_large) => return too_large.openai(),
+            };
+            let json: serde_json::Value =
+                serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            (bytes, json)
+        }
     };
-    let mut json: serde_json::Value =
-        serde_json::from_slice(&body_bytes).unwrap_or(serde_json::Value::Null);
     // `stream` decides how the answer is read and what it is billed from. A
     // value that is neither true nor false (`1`, `"true"`) reads as "not a
     // stream" here while a model server may still stream for it, and that
@@ -1341,7 +1410,7 @@ async fn run_pipeline(
     };
     // The effort the caller asked for, read before the name resolves: a
     // family name needs it to pick the model that answers.
-    let requested_effort = crate::reasoning::Requested::read(&headers, &json);
+    let requested_effort = crate::reasoning::Requested::read(input.effort.take(), &json);
     // Set when the name was a family's: the level the member serves at, and
     // the family, which the ledger records apart from variants.
     let mut family_level: Option<obleth_config::ReasoningLevel> = None;
@@ -1416,7 +1485,7 @@ async fn run_pipeline(
         request_type: if batch.is_some() {
             obleth_config::BATCH_REQUEST_TYPE
         } else {
-            surfaced_request_type(&resolved, &path, &headers)
+            surfaced_request_type(&resolved, &path, input.surface)
         },
         device_id,
         end_user: end_user.clone().unwrap_or_default(),
@@ -1443,7 +1512,7 @@ async fn run_pipeline(
     // Cost estimate, computed once per request body. Re-estimated below only
     // when a boon actually rewrites the body; the later upstream model-name
     // swap does not affect it (the tokenizer ignores the `model` field).
-    let mut est = state.tokenizer.estimate_request(&json);
+    let mut est = input.reserve(state.tokenizer.estimate_request(&json));
 
     // The routed `auto` turn, stored once it is answered when stickiness is on.
     let mut sticky_turn: Option<crate::sticky::Turn> = None;
@@ -2185,6 +2254,17 @@ async fn run_pipeline(
     // never hit and would only cost a Redis round-trip.
     let cache_name =
         response_cache_name(&model, variant.as_deref(), effort_served.or(family_level));
+    if body_given && body_bytes.is_empty() {
+        match serde_json::to_vec(&json) {
+            Ok(bytes) => body_bytes = Bytes::from(bytes),
+            Err(_) => {
+                return error_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "request translation failed",
+                )
+            }
+        }
+    }
     let cache_key = (cache_enabled && cache_ttl > 0).then(|| {
         obleth_config::cache_key(&resolved.tenant_id.to_string(), &cache_name, &body_bytes)
     });
@@ -6892,10 +6972,12 @@ pub(crate) fn forward_headers(headers: &HeaderMap) -> HeaderMap {
     let mut out = HeaderMap::new();
     for (name, value) in headers {
         match name.as_str() {
-            // strip hop-by-hop / auth / encoding so the body stays inspectable;
-            // x-obleth-boons is a gateway directive, not an upstream header
+            // strip hop-by-hop / auth / encoding so the body stays inspectable
             "host" | "content-length" | "authorization" | "x-api-key" | "accept-encoding"
-            | "connection" | "x-obleth-boons" | END_USER_HEADER => continue,
+            | "connection" => continue,
+            // every x-obleth-* header is between the client and the gateway
+            // (directives, the end user, session hints); none is an upstream's
+            n if n.starts_with("x-obleth-") => continue,
             _ => {
                 out.insert(name.clone(), value.clone());
             }
@@ -7147,25 +7229,16 @@ fn effective_request_type(resolved: &ResolvedKey, path: &str) -> &'static str {
 pub(crate) fn surfaced_request_type(
     resolved: &ResolvedKey,
     path: &str,
-    headers: &HeaderMap,
+    surface: Option<&str>,
 ) -> &'static str {
     if !resolved.synthetic {
-        match surface(headers) {
-            Some("responses") => return "responses",
+        match surface {
+            Some(crate::responses::SURFACE) => return "responses",
             Some(crate::messages::SURFACE) => return "messages",
             _ => {}
         }
     }
     effective_request_type(resolved, path)
-}
-
-/// The API surface a shim translated this request from, if any. The header
-/// is set by the shims only: `proxy_handler` strips it from every incoming
-/// request before dispatch.
-fn surface(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(crate::responses::SURFACE_HEADER)
-        .and_then(|v| v.to_str().ok())
 }
 
 /// Whether chat-only boons (knowledge, compression, tools, structured output,
@@ -7727,7 +7800,7 @@ mod tests {
         messages_input_estimate, multipart_text_view, output_guardrails_unenforceable,
         parse_multipart, prepare_upstream_body, redress_error, request_type_for_path,
         requires_registered_model, resolve_conversation, response_cache_name, route_keeps_sessions,
-        should_translate_as_stream, strip_beta_query, strip_tool_strict, sure_overflow, surface,
+        should_translate_as_stream, strip_beta_query, strip_tool_strict, sure_overflow,
         tenant_active_now, MultipartField, RequestMeta, TooLong, END_USER_HEADER,
         REGISTERED_MODEL_PATHS, SEED_CAP,
     };
@@ -7762,7 +7835,7 @@ mod tests {
         }
     }
 
-    fn key_with_schedule(
+    pub(super) fn key_with_schedule(
         timezone: &str,
         active_from: Option<DateTime<Utc>>,
         active_until: Option<DateTime<Utc>>,
@@ -8141,28 +8214,6 @@ mod tests {
             ),
             "https://inference.example.com/v1/chat/completions"
         );
-    }
-
-    #[test]
-    fn a_translated_responses_call_is_distinguished_from_a_native_chat_one() {
-        // The shim runs the request down the chat path on purpose, so the path
-        // alone cannot tell the two surfaces apart — the header does.
-        let mut headers = HeaderMap::new();
-        assert_eq!(surface(&headers), None);
-        assert_eq!(request_type_for_path("/v1/chat/completions"), "chat");
-
-        headers.insert(
-            crate::responses::SURFACE_HEADER,
-            "responses".parse().unwrap(),
-        );
-        assert_eq!(surface(&headers), Some("responses"));
-
-        let mut other = HeaderMap::new();
-        other.insert(
-            crate::responses::SURFACE_HEADER,
-            "something-else".parse().unwrap(),
-        );
-        assert_eq!(surface(&other), Some("something-else"));
     }
 
     #[test]
@@ -9686,22 +9737,6 @@ mod tests {
     }
 
     #[test]
-    fn surface_recognises_both_shims() {
-        let mut h = HeaderMap::new();
-        assert_eq!(surface(&h), None);
-        h.insert(
-            crate::responses::SURFACE_HEADER,
-            header::HeaderValue::from_static("responses"),
-        );
-        assert_eq!(surface(&h), Some("responses"));
-        h.insert(
-            crate::responses::SURFACE_HEADER,
-            header::HeaderValue::from_static("messages"),
-        );
-        assert_eq!(surface(&h), Some("messages"));
-    }
-
-    #[test]
     fn stream_translation_falls_back_to_buffered_when_upstream_ignored_stream() {
         // A `stream: true` request whose upstream answered plain JSON (no
         // `text/event-stream`) must not be handed to the SSE translator: it
@@ -10676,8 +10711,7 @@ mod tests {
         assert_eq!(admission_pool(None), obleth_fairshare::PoolKey::Unrouted);
 
         // A batch item keeps its own share and wait.
-        let batch = crate::batches::BatchCaller {
-            resolved: std::sync::Arc::new(resolved.clone()),
+        let batch = super::BackgroundShare {
             share: 0.25,
             admission_wait: Duration::from_secs(7),
         };
@@ -11954,5 +11988,115 @@ mod client_error_tests {
         let (_, json) = error_body(rejected_field_response("m", "logprobs")).await;
         assert_eq!(json["error"]["param"], "logprobs");
         assert_eq!(json["error"]["code"], "unsupported_parameter");
+    }
+}
+
+#[cfg(test)]
+mod pipeline_input_tests {
+    use super::*;
+
+    fn key() -> ResolvedKey {
+        super::tests::key_with_schedule("UTC", None, None, None)
+    }
+
+    /// The surface is what the shim put in the extension; a header a client
+    /// sends is not read at all, so it cannot stamp a chat call as Responses.
+    #[test]
+    fn a_translated_call_is_distinguished_by_the_extension_not_a_header() {
+        let mut extensions = http::Extensions::new();
+        assert_eq!(PipelineInput::of(&extensions).surface, None);
+        extensions.insert(PipelineInput {
+            surface: Some(crate::responses::SURFACE),
+            ..PipelineInput::default()
+        });
+        assert_eq!(PipelineInput::of(&extensions).surface, Some("responses"));
+        let resolved = key();
+        assert_eq!(
+            surfaced_request_type(&resolved, "/v1/chat/completions", None),
+            "chat"
+        );
+        assert_eq!(
+            surfaced_request_type(&resolved, "/v1/chat/completions", Some("responses")),
+            "responses"
+        );
+        assert_eq!(
+            surfaced_request_type(
+                &resolved,
+                "/v1/chat/completions",
+                Some(crate::messages::SURFACE)
+            ),
+            "messages"
+        );
+        assert_eq!(
+            surfaced_request_type(&resolved, "/v1/chat/completions", Some("something-else")),
+            "chat"
+        );
+    }
+
+    /// No gateway header reaches a model server: directives, the end user and
+    /// any session hint stay between the client and the gateway.
+    #[test]
+    fn no_gateway_header_is_forwarded_upstream() {
+        let mut headers = HeaderMap::new();
+        for (name, value) in [
+            ("x-obleth-boons", "none"),
+            ("x-obleth-api-surface", "responses"),
+            ("x-obleth-internal-reasoning-effort", "high"),
+            (END_USER_HEADER, "ana"),
+            ("x-obleth-session", "s1"),
+            ("content-type", "application/json"),
+            ("x-request-id", "r1"),
+        ] {
+            headers.insert(name, header::HeaderValue::from_static(value));
+        }
+        let out = forward_headers(&headers);
+        assert!(
+            out.keys().all(|k| !k.as_str().starts_with("x-obleth-")),
+            "{out:?}"
+        );
+        assert_eq!(out.len(), 2);
+    }
+
+    /// The reservation uses the shim's estimate, which counts tools and
+    /// images, when it gave one.
+    #[test]
+    fn the_reservation_estimate_is_the_callers_when_it_gave_one() {
+        let est = CostEstimate {
+            input_tokens: 10,
+            estimated_output_tokens: 5,
+        };
+        assert_eq!(PipelineInput::default().reserve(est).input_tokens, 10);
+        let input = PipelineInput {
+            estimate: Some(400),
+            ..PipelineInput::default()
+        };
+        let reserved = input.reserve(est);
+        assert_eq!(
+            (reserved.input_tokens, reserved.estimated_output_tokens),
+            (400, 5)
+        );
+    }
+
+    /// The pipeline takes the caller's credential before it would read a
+    /// bearer token, and parses no body when one was handed over.
+    #[test]
+    fn the_pipeline_uses_the_input_before_authenticating_or_parsing_again() {
+        let src = include_str!("proxy.rs");
+        let start = src.find("async fn run_pipeline(").expect("run_pipeline");
+        let body = &src[start..];
+        let pos = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("{needle} in run_pipeline"))
+        };
+        assert!(pos("input.credential.take()") < pos("bearer(&headers)"));
+        assert!(pos("input.body.take()") < pos("read_body(body)"));
+        pos("input.reserve(");
+        pos("input.surface");
+    }
+
+    #[test]
+    fn the_tools_length_is_counted_not_built() {
+        let tools = serde_json::json!([{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]);
+        assert_eq!(serialized_len(&tools), tools.to_string().len());
     }
 }

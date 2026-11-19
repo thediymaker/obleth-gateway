@@ -26,10 +26,10 @@ pub(crate) const RESPONSES_PATH: &str = "/v1/responses";
 /// and the boons apply exactly as they would to a native chat call.
 pub(crate) const CHAT_PATH: &str = "/v1/chat/completions";
 
-/// Header stamped on a translated request so the handler can still record the
-/// surface the caller actually used, rather than logging every Responses call
-/// as chat.
-pub(crate) const SURFACE_HEADER: &str = "x-obleth-api-surface";
+/// The surface name a translated request carries to the pipeline (in
+/// `PipelineInput`), so the ledger records the Responses call the caller made
+/// rather than the chat call it became.
+pub(crate) const SURFACE: &str = "responses";
 
 /// Fields that only mean something with server-side conversation storage.
 /// Returning the offending name lets the caller be told which one to drop.

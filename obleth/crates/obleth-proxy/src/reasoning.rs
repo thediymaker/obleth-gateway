@@ -15,13 +15,9 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use axum::body::Body;
-use axum::http::{HeaderMap, HeaderValue, Response};
+use axum::http::{HeaderValue, Response};
 use obleth_config::{ModelFamily, ReasoningLevel, ReasoningPlan};
 
-/// The effort a Responses or Messages caller asked for, carried from the
-/// shim to the chat pipeline. The gateway's own annotation: stripped from
-/// every incoming request before the shims set it.
-pub(crate) const EFFORT_HEADER: &str = "x-obleth-internal-reasoning-effort";
 /// On a response: the level the request was served at, or `unsupported`
 /// when the model has no effort control and the caller's was removed.
 pub(crate) const SERVED_HEADER: &str = "x-obleth-reasoning-effort";
@@ -83,18 +79,24 @@ pub(crate) enum Requested {
 }
 
 impl Requested {
-    /// Read the request: the shim's header first, else the chat body.
-    pub(crate) fn read(headers: &HeaderMap, body: &serde_json::Value) -> Self {
-        if let Some(raw) = headers.get(EFFORT_HEADER).and_then(|v| v.to_str().ok()) {
-            return match ReasoningLevel::parse(raw) {
-                Some(level) => Requested::Level(level),
-                None => Requested::Unknown(raw.to_string()),
-            };
-        }
-        match obleth_config::reasoning::chat_effort(body) {
+    /// Read the request: what the shim read from its own surface first
+    /// (`reasoning.effort`, `thinking`), else the chat body.
+    pub(crate) fn read(surface: Option<Requested>, body: &serde_json::Value) -> Self {
+        surface.unwrap_or_else(|| match obleth_config::reasoning::chat_effort(body) {
             Ok(Some(level)) => Requested::Level(level),
             Ok(None) => Requested::Nothing,
             Err(raw) => Requested::Unknown(raw),
+        })
+    }
+
+    /// What a shim read on its surface, for the pipeline: a level or an
+    /// unknown spelling, or `None` when the surface named none and the chat
+    /// body decides.
+    pub(crate) fn of_surface(read: Result<Option<ReasoningLevel>, String>) -> Option<Requested> {
+        match read {
+            Ok(Some(level)) => Some(Requested::Level(level)),
+            Ok(None) => None,
+            Err(raw) => Some(Requested::Unknown(raw)),
         }
     }
 
@@ -119,15 +121,6 @@ pub(crate) fn unknown_message(raw: &str) -> String {
 /// The header value a shim forwards for a level it read: the canonical
 /// spelling, or the raw value when it is not one obleth knows (so the
 /// pipeline can refuse it with the caller's own word).
-pub(crate) fn header_value(read: Result<Option<ReasoningLevel>, String>) -> Option<HeaderValue> {
-    let raw = match read {
-        Ok(Some(level)) => level.as_str().to_string(),
-        Ok(None) => return None,
-        Err(raw) => raw,
-    };
-    HeaderValue::from_str(&raw).ok()
-}
-
 /// What a response says about effort.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Note {
@@ -229,27 +222,27 @@ mod tests {
     }
 
     #[test]
-    fn the_shim_header_wins_over_the_body() {
-        let mut headers = HeaderMap::new();
-        headers.insert(EFFORT_HEADER, HeaderValue::from_static("high"));
+    fn the_surface_effort_wins_over_the_body() {
         let body = json!({"reasoning_effort": "low"});
         assert_eq!(
-            Requested::read(&headers, &body),
+            Requested::read(Some(Requested::Level(ReasoningLevel::High)), &body),
             Requested::Level(ReasoningLevel::High)
         );
+        assert_eq!(Requested::of_surface(Ok(None)), None);
         assert_eq!(
-            Requested::read(&HeaderMap::new(), &body),
+            Requested::of_surface(Err("max".into())),
+            Some(Requested::Unknown("max".into()))
+        );
+        assert_eq!(
+            Requested::read(None, &body),
             Requested::Level(ReasoningLevel::Low)
         );
-        assert_eq!(
-            Requested::read(&HeaderMap::new(), &json!({})),
-            Requested::Nothing
-        );
+        assert_eq!(Requested::read(None, &json!({})), Requested::Nothing);
     }
 
     #[test]
     fn an_unknown_value_is_kept_for_the_refusal() {
-        let r = Requested::read(&HeaderMap::new(), &json!({"reasoning_effort": "turbo"}));
+        let r = Requested::read(None, &json!({"reasoning_effort": "turbo"}));
         assert_eq!(r, Requested::Unknown("turbo".into()));
         assert!(r.level().unwrap_err().contains("`turbo`"));
     }
@@ -345,13 +338,16 @@ mod tests {
     }
 
     #[test]
-    fn shims_forward_the_canonical_spelling_or_the_raw_value() {
+    fn shims_hand_over_the_level_or_the_raw_value() {
         assert_eq!(
-            header_value(Ok(Some(ReasoningLevel::High))).unwrap(),
-            "high"
+            Requested::of_surface(Ok(Some(ReasoningLevel::High))),
+            Some(Requested::Level(ReasoningLevel::High))
         );
-        assert!(header_value(Ok(None)).is_none());
-        assert_eq!(header_value(Err("turbo".into())).unwrap(), "turbo");
+        assert_eq!(Requested::of_surface(Ok(None)), None);
+        assert_eq!(
+            Requested::of_surface(Err("turbo".into())),
+            Some(Requested::Unknown("turbo".into()))
+        );
     }
 }
 
@@ -743,7 +739,8 @@ mod pipeline {
             .uri("/v1/chat/completions")
             .header(header::AUTHORIZATION, format!("Bearer {secret}"))
             .header(header::CONTENT_TYPE, "application/json")
-            .header(super::EFFORT_HEADER, "high")
+            // A client cannot set the effort through the gateway's own channel.
+            .header("x-obleth-internal-reasoning-effort", "high")
             .body(axum::body::Body::from(chat("two-level").to_string()))
             .unwrap();
         let resp = crate::proxy::proxy_handler(State(gw.state.clone()), req).await;

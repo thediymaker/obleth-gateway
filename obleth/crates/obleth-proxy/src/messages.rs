@@ -8,7 +8,8 @@ use serde_json::{json, Map, Value};
 
 pub(crate) const MESSAGES_PATH: &str = "/v1/messages";
 pub(crate) const COUNT_TOKENS_PATH: &str = "/v1/messages/count_tokens";
-/// Value for `crate::responses::SURFACE_HEADER` marking a translated request.
+/// The surface name a translated request carries to the pipeline (in
+/// `PipelineInput`), beside `crate::responses::SURFACE`.
 pub(crate) const SURFACE: &str = "messages";
 
 /// A request the shim refuses before it reaches the pipeline; rendered with

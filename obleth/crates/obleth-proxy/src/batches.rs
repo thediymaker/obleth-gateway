@@ -47,7 +47,9 @@ use obleth_store::batches::{
 use obleth_store::JobOwner;
 use uuid::Uuid;
 
-use crate::proxy::{error_json, invalid_request, read_body, BodyTooLarge};
+use crate::proxy::{
+    error_json, invalid_request, read_body, BackgroundShare, BodyTooLarge, PipelineInput,
+};
 use crate::state::AppState;
 
 /// Endpoints a batch may target. Each runs down the pipeline unchanged.
@@ -237,18 +239,6 @@ impl Batches {
             JobScope::Tenant => JobOwner::tenant(resolved.tenant_id),
         }
     }
-}
-
-/// Set on a request the runner sends in process: the pipeline takes the
-/// caller from here instead of a bearer token, and admits the request to the
-/// model's background pool. Only the runner can set it; it never arrives
-/// over HTTP.
-#[derive(Clone)]
-pub(crate) struct BatchCaller {
-    pub resolved: Arc<ResolvedKey>,
-    pub share: f64,
-    /// Longest the request may wait for a background slot.
-    pub admission_wait: Duration,
 }
 
 // ---- routing --------------------------------------------------------------
@@ -966,6 +956,13 @@ impl<'a> InputCheck<'a> {
             Some(_) => {}
         }
         self.seen.insert(custom_id.clone());
+        // Stored as the runner sends it: never a stream, so an item needs no
+        // rewrite when it runs.
+        let mut body = body.clone();
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("stream".into(), serde_json::Value::Bool(false));
+            obj.remove("stream_options");
+        }
         let item = NewBatchItem {
             line: self.items as i32,
             custom_id,
@@ -1623,7 +1620,7 @@ async fn run_item(
         return;
     }
 
-    let mut body: serde_json::Value = match serde_json::from_str(&item.body) {
+    let body: serde_json::Value = match serde_json::from_str(&item.body) {
         Ok(b) => b,
         Err(_) => {
             let _ = store
@@ -1641,27 +1638,33 @@ async fn run_item(
             return;
         }
     };
-    if let Some(obj) = body.as_object_mut() {
-        obj.insert("stream".into(), serde_json::Value::Bool(false));
-        obj.remove("stream_options");
-    }
     let wait = (batch.deadline_at - Utc::now())
         .to_std()
         .unwrap_or(Duration::from_secs(1))
         .min(MAX_ADMISSION_WAIT);
-    let caller = BatchCaller {
-        resolved: resolved.clone(),
-        share: cfg.share,
-        admission_wait: wait,
+    // The item's owner was checked when the batch was submitted; the request
+    // is background work with the batch's share. Only the runner sets this.
+    let input = PipelineInput {
+        credential: Some(crate::jwt_auth::Credential {
+            resolved: resolved.clone(),
+            device_id: String::new(),
+            auth_kind: "batch",
+        }),
+        body: Some(body),
+        batch: Some(BackgroundShare {
+            share: cfg.share,
+            admission_wait: wait,
+        }),
+        ..PipelineInput::default()
     };
     let request_id = Uuid::new_v4();
     let mut req = Request::builder()
         .method(Method::POST)
         .uri(batch.endpoint.as_str())
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(body.to_string()))
+        .body(Body::empty())
         .expect("static request parts");
-    req.extensions_mut().insert(caller);
+    req.extensions_mut().insert(input);
     let resp = crate::proxy::run_internal(state.clone(), req, request_id).await;
     let status = resp.status();
     let bytes = axum::body::to_bytes(resp.into_body(), ITEM_RESPONSE_MAX).await;

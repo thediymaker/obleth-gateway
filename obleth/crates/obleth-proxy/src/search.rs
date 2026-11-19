@@ -208,7 +208,7 @@ async fn handle(
     let meta = RequestMeta {
         session_id: conversation.value,
         session_id_source: conversation.source.as_str(),
-        request_type: surfaced_request_type(&resolved, SEARCH_PATH, &headers),
+        request_type: surfaced_request_type(&resolved, SEARCH_PATH, None),
         device_id,
         end_user: end_user.clone().unwrap_or_default(),
         model_variant: String::new(),

@@ -385,6 +385,7 @@ pub enum AuthFailure {
 /// A resolved bearer credential, shared by the data-plane proxy and the MCP
 /// gateway so both authenticate identically. `auth_kind` is `"identity"` or
 /// `"key"`, matching the tracer label `proxy_request` has always recorded.
+#[derive(Clone)]
 pub(crate) struct Credential {
     pub resolved: Arc<ResolvedKey>,
     pub device_id: String,
