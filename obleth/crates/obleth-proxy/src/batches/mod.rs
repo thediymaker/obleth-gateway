@@ -139,6 +139,12 @@ const OWNER_PAUSE_SECS: f64 = 60.0;
 /// longest a background key's request waits for a slot.
 pub(crate) const MAX_ADMISSION_WAIT: Duration = Duration::from_secs(3600);
 
+/// How long a batch request may run once admitted, answer read included,
+/// before the runner gives up on it and the item runs again (or fails, out
+/// of tries). The runner renews the leases of everything it holds, so
+/// without a limit a request that never ends would hold its item forever.
+const ITEM_RUN_LIMIT: Duration = Duration::from_secs(2 * 3600);
+
 /// Batch settings, from the environment.
 #[derive(Debug, Clone)]
 pub struct BatchConfig {
@@ -1902,7 +1908,6 @@ async fn fill(
                 .min(room)
                 .min(QUEUE_BUFFER.saturating_sub(*queued))
         };
-        *queued += want;
         if want == 0 {
             continue;
         }
@@ -1910,6 +1915,10 @@ async fn fill(
             .store
             .claim_batch_items(&batch.id, &cfg.instance, want as i64, LEASE_SECS)
             .await?;
+        // Only what was claimed waits for a slot. Counting `want` instead let
+        // a batch with nothing left to claim use up its owner's buffer on
+        // every pass, so the owner's other batches never ran.
+        *queued += items.len();
         if items.is_empty() {
             continue;
         }
@@ -2102,9 +2111,45 @@ async fn run_item(
         .body(Body::empty())
         .expect("static request parts");
     req.extensions_mut().insert(input);
-    let resp = crate::proxy::run_internal(state.clone(), req, request_id).await;
-    let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), ITEM_RESPONSE_MAX).await;
+    let ran = tokio::time::timeout(wait + ITEM_RUN_LIMIT, async {
+        let resp = crate::proxy::run_internal(state.clone(), req, request_id).await;
+        let status = resp.status();
+        (
+            status,
+            axum::body::to_bytes(resp.into_body(), ITEM_RESPONSE_MAX).await,
+        )
+    })
+    .await;
+    let Ok((status, bytes)) = ran else {
+        tracing::warn!(batch = %batch.id, line = item.line, "a batch request ran past its time limit");
+        let error = error_text("timeout", "the request ran past the batch's time limit");
+        let _ = if item.attempts < cfg.max_attempts {
+            store
+                .retry_batch_item(
+                    &batch.id,
+                    item.line,
+                    me,
+                    backoff(item.attempts),
+                    &error,
+                    false,
+                )
+                .await
+        } else {
+            store
+                .fail_batch_item(
+                    &batch.id,
+                    item.line,
+                    me,
+                    None,
+                    None,
+                    &error,
+                    Some(request_id),
+                )
+                .await
+        }
+        .map_err(finish_err);
+        return;
+    };
     // An answer worth keeping is stored before the item is finished with
     // it; if the item turns out not to be this runner's any more, or cannot
     // be finished, the object goes again.
