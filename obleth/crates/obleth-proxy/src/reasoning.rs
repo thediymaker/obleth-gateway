@@ -516,6 +516,75 @@ mod pipeline {
         Some(Gateway { state, wal_dir })
     }
 
+    /// A request refused before any upstream work still gets one ledger row,
+    /// with the time it took and its class; the row used to record a
+    /// `total_ms` of zero on several of these exits. The harness has no
+    /// ClickHouse, so the row lands in the usage WAL, which is read back.
+    #[tokio::test]
+    async fn a_refusal_writes_one_ledger_row_with_its_time_and_class() {
+        let Some(gw) = gateway().await else { return };
+        let (_seen, base) = spawn_upstream().await;
+        let mut r = route("strict-model", &base, ModelReasoning::default());
+        r.rejected_request_fields = vec!["logprobs".into()];
+        gw.register(r).await;
+        let secret = gw.key().await;
+        let before = gw
+            .state
+            .telemetry
+            .stats()
+            .recorded
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let resp = gw
+            .post(
+                "/v1/chat/completions",
+                &secret,
+                json!({"model": "strict-model", "messages": [{"role": "user", "content": "hi"}], "logprobs": true}),
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let request_id = resp.headers()["x-obleth-request-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            gw.state
+                .telemetry
+                .stats()
+                .recorded
+                .load(std::sync::atomic::Ordering::SeqCst),
+            before + 1,
+            "one row for the refusal"
+        );
+        // The sink spills to segment files under `<wal>.segments/`.
+        let segments = gw.wal_dir.join("usage.wal.segments");
+        let mut row = None;
+        for _ in 0..60 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let Ok(entries) = std::fs::read_dir(&segments) else {
+                continue;
+            };
+            row = entries
+                .flatten()
+                .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+                .flat_map(|text| {
+                    text.lines()
+                        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                        .collect::<Vec<_>>()
+                })
+                .find(|v| v["request_id"] == request_id.as_str());
+            if row.is_some() {
+                break;
+            }
+        }
+        let row = row.expect("the refusal's row in the WAL");
+        assert_eq!(row["status_code"], 400);
+        assert_eq!(row["admission"], "rejected");
+        assert_eq!(row["error_class"], "client_input");
+        // Measured, not a literal: a refusal this fast rounds to 0 ms, so the
+        // pin `every_refusal_measures_its_own_duration` holds the rule.
+        assert!(row["total_ms"].as_u64().is_some(), "{row}");
+    }
+
     fn route(name: &str, base: &str, reasoning: ModelReasoning) -> ResolvedModel {
         let mut r = crate::boons::test_support::test_route();
         r.model_name = name.into();

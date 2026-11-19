@@ -1087,6 +1087,47 @@ pub(crate) const MODEL_VARIANT_HEADER: &str = "x-obleth-model-variant";
 /// admitted response, so a client can tell time spent queued from time the model took.
 pub(crate) const QUEUE_WAIT_HEADER: &str = "x-obleth-queue-wait-ms";
 
+/// What every answer built after admission says about itself: the request
+/// id, how long it queued, that proxies must not buffer it, and the boons
+/// and compression that shaped it. One builder, so no exit forgets a header.
+struct Answer<'a> {
+    request_id: Uuid,
+    queue_wait_ms: u32,
+    boons_applied: &'a [&'static str],
+    compression: Option<&'a str>,
+}
+
+impl Answer<'_> {
+    fn respond(
+        &self,
+        status: impl Into<u16>,
+        content_type: header::HeaderValue,
+        body: Body,
+    ) -> Response<Body> {
+        let mut builder = Response::builder()
+            .status(status.into())
+            .header(header::CONTENT_TYPE, content_type)
+            .header("x-obleth-request-id", self.request_id.to_string())
+            .header(QUEUE_WAIT_HEADER, self.queue_wait_ms.to_string())
+            .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
+        if !self.boons_applied.is_empty() {
+            builder = builder.header(crate::boons::BOONS_HEADER, self.boons_applied.join(","));
+            if let Some(h) = self.compression {
+                builder = builder.header(crate::boons::COMPRESSION_HEADER, h);
+            }
+        }
+        builder.body(body).unwrap_or_else(|_| {
+            error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
+        })
+    }
+}
+
+/// `value` as a header, or `application/json` when it is not one.
+fn content_type_header(value: &str) -> header::HeaderValue {
+    header::HeaderValue::from_str(value)
+        .unwrap_or_else(|_| header::HeaderValue::from_static("application/json"))
+}
+
 /// The pipeline every proxied request runs ([`run_pipeline`]), plus the
 /// response headers that describe how it was served, whichever exit the
 /// pipeline took.
@@ -1832,28 +1873,19 @@ async fn run_pipeline(
                     obleth_config::ErrorClass::Retired,
                     &reason,
                 ));
-                let elapsed = request_start.elapsed().as_millis() as u32;
-                finalize(
+                reject(
                     &state,
                     request_id,
                     &resolved,
                     &req_meta,
                     &model,
-                    Admission::Rejected,
-                    CostEstimate {
-                        input_tokens: 0,
-                        estimated_output_tokens: 0,
+                    Rejection {
+                        status: StatusCode::GONE,
+                        since: request_start,
+                        est: CostEstimate::default(),
+                        cache_status: "off",
+                        queue_wait_ms: 0,
                     },
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    elapsed,
-                    StatusCode::GONE.as_u16(),
-                    "off",
-                    0.0,
-                    crate::energy::EnergyFigures::default(),
                 );
                 return resp;
             }
@@ -1922,31 +1954,19 @@ async fn run_pipeline(
         .as_ref()
         .and_then(|r| obleth_config::rejected_request_field(&json, &r.rejected_request_fields))
     {
-        if let Some(t) = tracer.take() {
-            t.finish("error");
-        }
-        let elapsed = request_start.elapsed().as_millis() as u32;
-        finalize(
+        reject(
             &state,
             request_id,
             &resolved,
             &req_meta,
             &model,
-            Admission::Rejected,
-            CostEstimate {
-                input_tokens: 0,
-                estimated_output_tokens: 0,
+            Rejection {
+                status: StatusCode::BAD_REQUEST,
+                since: request_start,
+                est: CostEstimate::default(),
+                cache_status: "off",
+                queue_wait_ms: 0,
             },
-            0,
-            0,
-            0,
-            0,
-            0,
-            elapsed,
-            StatusCode::BAD_REQUEST.as_u16(),
-            "off",
-            0.0,
-            crate::energy::EnergyFigures::default(),
         );
         return rejected_field_response(&model, field);
     }
@@ -1979,31 +1999,19 @@ async fn run_pipeline(
             };
             tracing::warn!(%request_id, model = %model, fingerprint = %req_meta.crash_fp, status = status.as_u16(), "crash guard: request not sent");
             req_meta.failure = Some(obleth_config::Failure::new(class, &msg));
-            if let Some(t) = tracer.take() {
-                t.finish("error");
-            }
-            let elapsed = request_start.elapsed().as_millis() as u32;
-            finalize(
+            reject(
                 &state,
                 request_id,
                 &resolved,
                 &req_meta,
                 &model,
-                Admission::Rejected,
-                CostEstimate {
-                    input_tokens: 0,
-                    estimated_output_tokens: 0,
+                Rejection {
+                    status,
+                    since: request_start,
+                    est: CostEstimate::default(),
+                    cache_status: "off",
+                    queue_wait_ms: 0,
                 },
-                0,
-                0,
-                0,
-                0,
-                0,
-                elapsed,
-                status.as_u16(),
-                "off",
-                0.0,
-                crate::energy::EnergyFigures::default(),
             );
             return crate::crash_guard::guard_response(status, &msg);
         }
@@ -2086,9 +2094,6 @@ async fn run_pipeline(
     // Refused before the input scan so a request that cannot be served never
     // spends a guard-model call first.
     if method == Method::POST && output_guardrails_unenforceable(&resolved, &path) {
-        if let Some(t) = tracer.take() {
-            t.finish("error");
-        }
         return error_json(
             StatusCode::BAD_REQUEST,
             "this tenant's output guardrails read chat responses only; \
@@ -2096,9 +2101,6 @@ async fn run_pipeline(
         );
     }
     if method == Method::POST && input_guardrails_unscannable(&resolved, &path) {
-        if let Some(t) = tracer.take() {
-            t.finish("error");
-        }
         return error_json(
             StatusCode::BAD_REQUEST,
             "this tenant's input guardrails cannot scan requests to this path; \n             use /v1/chat/completions, /v1/responses, or /v1/messages",
@@ -2120,9 +2122,6 @@ async fn run_pipeline(
         )
         .await;
     if let Some(block) = boon_outcome.blocked {
-        if let Some(t) = tracer.take() {
-            t.finish("error");
-        }
         return error_json(block.status, block.reason);
     }
     if boon_outcome.rewritten {
@@ -2172,27 +2171,19 @@ async fn run_pipeline(
                 obleth_config::ErrorClass::ClientInput,
                 &message,
             ));
-            if let Some(t) = tracer.take() {
-                t.finish("error");
-            }
-            finalize(
+            reject(
                 &state,
                 request_id,
                 &resolved,
                 &req_meta,
                 &model,
-                Admission::Rejected,
-                est,
-                0,
-                0,
-                0,
-                0,
-                0,
-                request_start.elapsed().as_millis() as u32,
-                StatusCode::BAD_REQUEST.as_u16(),
-                "off",
-                0.0,
-                crate::energy::EnergyFigures::default(),
+                Rejection {
+                    status: StatusCode::BAD_REQUEST,
+                    since: request_start,
+                    est,
+                    cache_status: "off",
+                    queue_wait_ms: 0,
+                },
             );
             return context_overflow_response(&message);
         }
@@ -2304,18 +2295,17 @@ async fn run_pipeline(
                     &model,
                     Admission::Fast,
                     est,
-                    cached.input_tokens,
-                    cached.output_tokens,
-                    0,
-                    0,
-                    0,
-                    0,
-                    cached.status,
-                    "hit",
-                    (cached.input_tokens as f64) * in_cost_rate
-                        + (cached.output_tokens as f64) * out_cost_rate
-                        + modality_cost,
-                    crate::energy::EnergyFigures::default(),
+                    FinalizeOutcome {
+                        input_tokens: cached.input_tokens,
+                        output_tokens: cached.output_tokens,
+                        total_ms: request_start.elapsed().as_millis() as u32,
+                        status_code: cached.status,
+                        cache_status: "hit",
+                        cost_usd: (cached.input_tokens as f64) * in_cost_rate
+                            + (cached.output_tokens as f64) * out_cost_rate
+                            + modality_cost,
+                        ..FinalizeOutcome::default()
+                    },
                 );
                 return cached_response(cached, request_id);
             }
@@ -2405,28 +2395,20 @@ async fn run_pipeline(
     let admitted = match timeout(admit_wait, admit).await {
         Ok(Some(a)) => a,
         Err(_) => {
-            if let Some(t) = tracer.take() {
-                t.finish("error");
-            }
             let queued_ms = (crate::tracer::now_ms() - admission_start) as u32;
-            finalize(
+            reject(
                 &state,
                 request_id,
                 &resolved,
                 &req_meta,
                 &model,
-                Admission::Rejected,
-                est,
-                0,
-                0,
-                0,
-                queued_ms,
-                0,
-                request_start.elapsed().as_millis() as u32,
-                503,
-                cache_status_label,
-                0.0,
-                crate::energy::EnergyFigures::default(),
+                Rejection {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    since: request_start,
+                    est,
+                    cache_status: cache_status_label,
+                    queue_wait_ms: queued_ms,
+                },
             );
             let mut resp = error_json(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -2439,9 +2421,6 @@ async fn run_pipeline(
             return resp;
         }
         Ok(None) => {
-            if let Some(t) = tracer.take() {
-                t.finish("error");
-            }
             state.alerts.issue(
                 "scheduler_unavailable",
                 "Fairshare scheduler unavailable",
@@ -2456,6 +2435,12 @@ async fn run_pipeline(
     let admission = admitted.admission;
     let permit = admitted.permit;
     let queue_wait_ms = admitted.waited.as_millis() as u32;
+    let answer = Answer {
+        request_id,
+        queue_wait_ms,
+        boons_applied: &boons_applied,
+        compression: compression_header.as_deref(),
+    };
     // Energy is metered from admission: queue time is never charged.
     let request_energy = state.energy.request(route.as_deref());
     let admission_ms = (crate::tracer::now_ms() - admission_start) as u32;
@@ -2542,28 +2527,20 @@ async fn run_pipeline(
                         resolved.key_budget_cost_usd,
                     ),
                 );
-                finalize(
+                reject(
                     &state,
                     request_id,
                     &resolved,
                     &req_meta,
                     &model,
-                    Admission::Rejected,
-                    est,
-                    0,
-                    0,
-                    0,
-                    queue_wait_ms,
-                    0,
-                    0,
-                    403,
-                    cache_status_label,
-                    0.0,
-                    crate::energy::EnergyFigures::default(),
+                    Rejection {
+                        status: StatusCode::FORBIDDEN,
+                        since: request_start,
+                        est,
+                        cache_status: cache_status_label,
+                        queue_wait_ms,
+                    },
                 );
-                if let Some(t) = tracer.take() {
-                    t.finish("error");
-                }
                 return error_json(StatusCode::FORBIDDEN, "api key term budget exhausted");
             }
             Err(e) => {
@@ -2578,9 +2555,6 @@ async fn run_pipeline(
                             resolved.key_id
                         ),
                     );
-                    if let Some(t) = tracer.take() {
-                        t.finish("error");
-                    }
                     return error_json(StatusCode::SERVICE_UNAVAILABLE, "key budget check failed");
                 }
                 tracing::warn!(error = %e, "key budget reserve failed; failing open");
@@ -2620,28 +2594,20 @@ async fn run_pipeline(
                 if let Some(hold) = key_hold.take() {
                     hold.release().await;
                 }
-                finalize(
+                reject(
                     &state,
                     request_id,
                     &resolved,
                     &req_meta,
                     &model,
-                    Admission::Rejected,
-                    est,
-                    0,
-                    0,
-                    0,
-                    queue_wait_ms,
-                    0,
-                    0,
-                    429,
-                    cache_status_label,
-                    0.0,
-                    crate::energy::EnergyFigures::default(),
+                    Rejection {
+                        status: StatusCode::TOO_MANY_REQUESTS,
+                        since: request_start,
+                        est,
+                        cache_status: cache_status_label,
+                        queue_wait_ms,
+                    },
                 );
-                if let Some(t) = tracer.take() {
-                    t.finish("error");
-                }
                 return error_json(StatusCode::TOO_MANY_REQUESTS, "token budget exceeded");
             }
             Ok(obleth_redis::ReserveOutcome::TermExhausted {
@@ -2662,28 +2628,20 @@ async fn run_pipeline(
                         resolved.budget_cost_usd,
                     ),
                 );
-                finalize(
+                reject(
                     &state,
                     request_id,
                     &resolved,
                     &req_meta,
                     &model,
-                    Admission::Rejected,
-                    est,
-                    0,
-                    0,
-                    0,
-                    queue_wait_ms,
-                    0,
-                    0,
-                    403,
-                    cache_status_label,
-                    0.0,
-                    crate::energy::EnergyFigures::default(),
+                    Rejection {
+                        status: StatusCode::FORBIDDEN,
+                        since: request_start,
+                        est,
+                        cache_status: cache_status_label,
+                        queue_wait_ms,
+                    },
                 );
-                if let Some(t) = tracer.take() {
-                    t.finish("error");
-                }
                 return error_json(StatusCode::FORBIDDEN, "tenant term budget exhausted");
             }
             Err(e) => {
@@ -2700,9 +2658,6 @@ async fn run_pipeline(
                             resolved.tenant_name
                         ),
                     );
-                    if let Some(t) = tracer.take() {
-                        t.finish("error");
-                    }
                     return error_json(StatusCode::SERVICE_UNAVAILABLE, "budget check failed");
                 }
                 tracing::warn!(error = %e, "budget reserve failed; failing open");
@@ -2825,22 +2780,16 @@ async fn run_pipeline(
                     if let Some(t) = tracer.take() {
                         t.finish("ok");
                     }
-                    let mut builder = Response::builder()
-                        .status(StatusCode::OK)
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .header("x-obleth-request-id", request_id.to_string())
-                        .header(QUEUE_WAIT_HEADER, queue_wait_ms.to_string())
-                        .header(crate::boons::speculation::DRAFTED_BY_HEADER, drafted_by)
-                        .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
-                    if !boons_applied.is_empty() {
-                        builder =
-                            builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
-                    }
-                    return builder
-                        .body(Body::from(body.to_string()))
-                        .unwrap_or_else(|_| {
-                            error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
-                        });
+                    let mut resp = answer.respond(
+                        StatusCode::OK,
+                        header::HeaderValue::from_static("application/json"),
+                        Body::from(body.to_string()),
+                    );
+                    resp.headers_mut().insert(
+                        crate::boons::speculation::DRAFTED_BY_HEADER,
+                        content_type_header(&drafted_by),
+                    );
+                    return resp;
                 }
                 crate::boons::speculation::Outcome::Stream { driver, drafted_by } => {
                     accounting.arm_estimate(&mut settle_guard);
@@ -2901,22 +2850,16 @@ async fn run_pipeline(
                     if let Some(t) = tracer.take() {
                         t.finish("ok");
                     }
-                    let mut builder = Response::builder()
-                        .status(StatusCode::OK)
-                        .header(header::CONTENT_TYPE, "text/event-stream")
-                        .header("x-obleth-request-id", request_id.to_string())
-                        .header(QUEUE_WAIT_HEADER, queue_wait_ms.to_string())
-                        .header(crate::boons::speculation::DRAFTED_BY_HEADER, drafted_by)
-                        .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
-                    if !boons_applied.is_empty() {
-                        builder =
-                            builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
-                    }
-                    return builder
-                        .body(Body::from_stream(body_stream))
-                        .unwrap_or_else(|_| {
-                            error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
-                        });
+                    let mut resp = answer.respond(
+                        StatusCode::OK,
+                        header::HeaderValue::from_static("text/event-stream"),
+                        Body::from_stream(body_stream),
+                    );
+                    resp.headers_mut().insert(
+                        crate::boons::speculation::DRAFTED_BY_HEADER,
+                        content_type_header(&drafted_by),
+                    );
+                    return resp;
                 }
             }
         }
@@ -3188,7 +3131,6 @@ async fn run_pipeline(
                         serde_json::to_value(&diag).unwrap_or_default(),
                     );
                 }
-                t.finish("error");
             }
             state.metrics.record_upstream_attempt("exhausted");
             let msg = last_err.unwrap_or_else(|| "upstream request failed".to_string());
@@ -3349,25 +3291,8 @@ async fn run_pipeline(
         let _ = settle_guard
             .complete(accounting.settle_with(tokens, ttft_ms, total_ms, status_code, None, billed))
             .await;
-        if let Some(t) = tracer.take() {
-            t.finish("error");
-        }
 
-        let mut builder = Response::builder()
-            .status(status_code)
-            .header(header::CONTENT_TYPE, content_type)
-            .header("x-obleth-request-id", request_id.to_string())
-            .header(QUEUE_WAIT_HEADER, queue_wait_ms.to_string())
-            .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
-        if !boons_applied.is_empty() {
-            builder = builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
-            if let Some(h) = &compression_header {
-                builder = builder.header(crate::boons::COMPRESSION_HEADER, h);
-            }
-        }
-        return builder.body(Body::from(buf)).unwrap_or_else(|_| {
-            error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
-        });
+        return answer.respond(status_code, content_type, Body::from(buf));
     }
 
     // Success: record the `upstream` span here (the error path above records its
@@ -3575,23 +3500,11 @@ async fn run_pipeline(
                 if let Some(t) = tracer.take() {
                     t.finish(if status_code < 400 { "ok" } else { "error" });
                 }
-                let mut builder = Response::builder()
-                    .status(status_code)
-                    .header(header::CONTENT_TYPE, "text/event-stream")
-                    .header("x-obleth-request-id", request_id.to_string())
-                    .header(QUEUE_WAIT_HEADER, queue_wait_ms.to_string())
-                    .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
-                if !boons_applied.is_empty() {
-                    builder = builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
-                    if let Some(h) = &compression_header {
-                        builder = builder.header(crate::boons::COMPRESSION_HEADER, h);
-                    }
-                }
-                return builder
-                    .body(Body::from_stream(body_stream))
-                    .unwrap_or_else(|_| {
-                        error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
-                    });
+                return answer.respond(
+                    status_code,
+                    header::HeaderValue::from_static("text/event-stream"),
+                    Body::from_stream(body_stream),
+                );
             }
         }
     }
@@ -3658,9 +3571,6 @@ async fn run_pipeline(
             let _ = settle_guard
                 .complete(accounting.settle_unbilled(ttft_ms, total_ms, 502))
                 .await;
-            if let Some(t) = tracer.take() {
-                t.finish("error");
-            }
             return error_json(StatusCode::BAD_GATEWAY, "upstream stream failed");
         }
 
@@ -3717,21 +3627,7 @@ async fn run_pipeline(
                     billed,
                 ))
                 .await;
-            if let Some(t) = tracer.take() {
-                t.finish("error");
-            }
-            let mut builder = Response::builder()
-                .status(failure.status)
-                .header(header::CONTENT_TYPE, content_type)
-                .header("x-obleth-request-id", request_id.to_string())
-                .header(QUEUE_WAIT_HEADER, queue_wait_ms.to_string())
-                .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
-            if !boons_applied.is_empty() {
-                builder = builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
-            }
-            return builder.body(Body::from(buf)).unwrap_or_else(|_| {
-                error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
-            });
+            return answer.respond(failure.status, content_type, Body::from(buf));
         }
 
         let (final_body, final_content_type): (Bytes, String) = match completion.as_mut() {
@@ -3789,9 +3685,6 @@ async fn run_pipeline(
                                     None,
                                 ))
                                 .await;
-                            if let Some(t) = tracer.take() {
-                                t.finish("error");
-                            }
                             return error_json(block.status, block.reason);
                         }
                         crate::boons::guardrails::ApplyOutputResult::Pass => {}
@@ -3836,9 +3729,6 @@ async fn run_pipeline(
                         None,
                     ))
                     .await;
-                if let Some(t) = tracer.take() {
-                    t.finish("error");
-                }
                 return error_json(block.status, block.reason);
             }
             None => (
@@ -3890,27 +3780,19 @@ async fn run_pipeline(
             turn.record(&state, done);
         }
 
-        let mut builder = Response::builder()
-            .status(status_code)
-            .header(header::CONTENT_TYPE, final_content_type)
-            .header("x-obleth-request-id", request_id.to_string())
-            .header(QUEUE_WAIT_HEADER, queue_wait_ms.to_string())
-            .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
-        if !boons_applied.is_empty() {
-            builder = builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
-            if let Some(h) = &compression_header {
-                builder = builder.header(crate::boons::COMPRESSION_HEADER, h);
-            }
-        }
+        let mut resp = answer.respond(
+            status_code,
+            content_type_header(&final_content_type),
+            Body::from(final_body),
+        );
         if let Some(w) = warning {
-            builder = builder.header(crate::boons::BOONS_WARNING_HEADER, w);
+            resp.headers_mut()
+                .insert(crate::boons::BOONS_WARNING_HEADER, content_type_header(w));
         }
         if let Some(t) = tracer.take() {
             t.finish(if status_code < 400 { "ok" } else { "error" });
         }
-        return builder.body(Body::from(final_body)).unwrap_or_else(|_| {
-            error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
-        });
+        return resp;
     }
 
     // Finish the tracer before entering the async stream body — the stream macro
@@ -4184,21 +4066,7 @@ async fn run_pipeline(
         }
     };
 
-    let mut builder = Response::builder().status(status_code);
-    builder = builder
-        .header(header::CONTENT_TYPE, content_type)
-        .header("x-obleth-request-id", request_id.to_string())
-        .header(QUEUE_WAIT_HEADER, queue_wait_ms.to_string())
-        .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
-    if !boons_applied.is_empty() {
-        builder = builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
-        if let Some(h) = &compression_header {
-            builder = builder.header(crate::boons::COMPRESSION_HEADER, h);
-        }
-    }
-    builder
-        .body(Body::from_stream(body_stream))
-        .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
+    answer.respond(status_code, content_type, Body::from_stream(body_stream))
 }
 
 /// Above this much held, unterminated buffer, [`UsageChunkFilter`] gives up
@@ -4959,34 +4827,8 @@ impl StreamAccounting {
         cache_put: Option<(String, i64, String, String)>,
         billed: bool,
     ) {
-        let cache_enabled = cache_put.is_some();
-        let (key, ttl, content_type, body) = cache_put.unwrap_or_default();
-        settle_inner(
-            &self.state,
-            self.request_id,
-            &self.resolved,
-            &self.meta,
-            &self.model,
-            self.admission,
-            self.est,
-            tokens,
-            self.queue_wait_ms,
-            ttft_ms,
-            total_ms,
-            status_code,
-            &self.cache_status,
-            self.capacity,
-            self.term_period.as_deref(),
-            self.key_term_period.as_deref(),
-            self.in_cost_rate,
-            self.out_cost_rate,
-            self.modality_cost,
-            &self.energy,
-            cache_enabled.then_some((key.as_str(), ttl, content_type.as_str(), body)),
-            self.holds,
-            billed,
-        )
-        .await;
+        self.settle_inner(tokens, ttft_ms, total_ms, status_code, cache_put, billed)
+            .await;
     }
 }
 
@@ -5003,215 +4845,234 @@ impl StreamAccounting {
 /// false` settles a request that produced nothing billable: tokens and cost
 /// are frozen at zero (energy is still charged) and the reservations are
 /// fully refunded.
-#[allow(clippy::too_many_arguments)]
-async fn settle_inner(
-    state: &AppState,
-    request_id: Uuid,
-    resolved: &ResolvedKey,
-    meta: &RequestMeta,
-    model: &str,
-    admission: Admission,
-    est: CostEstimate,
-    tokens: UpstreamUsage,
-    queue_wait_ms: u32,
-    ttft_ms: u32,
-    total_ms: u32,
-    status_code: u16,
-    cache_status: &str,
-    capacity: i64,
-    term_period: Option<&str>,
-    key_term_period: Option<&str>,
-    in_cost_rate: f64,
-    out_cost_rate: f64,
-    modality_cost: f64,
-    request_energy: &crate::energy::RequestEnergy,
-    cache_put: Option<(&str, i64, &str, String)>,
-    holds: TermHolds,
-    billed: bool,
-) {
-    let UpstreamUsage {
-        input: input_tokens,
-        output: output_tokens,
-        cached: cached_input_tokens,
-    } = tokens;
-    // The crash guard counts a strike against every request that was in
-    // flight when the model server's engine died.
-    if !meta.crash_fp.is_empty()
-        && meta
-            .failure
-            .as_ref()
-            .is_some_and(|f| crate::crash_guard::is_engine_death(&f.reason))
-    {
-        state
-            .crash_guard
-            .record_death(&state.redis, model, &meta.crash_fp)
-            .await;
-    }
-    // Feed the router's per-request cost estimate: one EWMA sample of how
-    // long this model's answers actually run. Successful requests only — an
-    // error body's usage says nothing about the model's answering behavior.
-    if status_code == 200 && output_tokens > 0 {
-        state.output_stats.observe(model, output_tokens as u64);
-    }
-
-    // store the full response for identical future requests
-    if let Some((ck, ttl, content_type, body)) = cache_put {
-        let cached = obleth_config::CachedResponse {
-            status: status_code,
-            content_type: content_type.to_string(),
-            body,
-            input_tokens,
-            output_tokens,
-        };
-        if let Err(e) = state.redis.cache_put(ck, &cached, ttl).await {
-            tracing::warn!(error = %e, "cache store failed");
-            state.alerts.issue(
-                "redis_cache_store_failed",
-                "Redis response-cache store failed",
-                format!(
-                    "tenant `{}` model `{model}` cache ttl `{ttl}`: {e}",
-                    resolved.tenant_name
-                ),
-            );
-        }
-    }
-
-    // Reconcile estimate vs actual against the per-minute budget bucket.
-    // A zero token rate means the tenant has no per-minute limiter.
-    if capacity > 0 {
-        if let Err(e) = state
-            .redis
-            .reconcile_budget(
-                &resolved.tenant_id,
-                capacity,
-                est.total(),
-                input_tokens.saturating_add(output_tokens),
-            )
-            .await
+impl StreamAccounting {
+    async fn settle_inner(
+        self,
+        tokens: UpstreamUsage,
+        ttft_ms: u32,
+        total_ms: u32,
+        status_code: u16,
+        cache_put: Option<(String, i64, String, String)>,
+        billed: bool,
+    ) {
+        let StreamAccounting {
+            state,
+            request_id,
+            resolved,
+            meta,
+            model,
+            admission,
+            est,
+            queue_wait_ms,
+            cache_status,
+            capacity,
+            term_period,
+            key_term_period,
+            in_cost_rate,
+            out_cost_rate,
+            modality_cost,
+            energy,
+            holds,
+            ..
+        } = self;
+        let (state, resolved, meta, model, cache_status) = (
+            &state,
+            &*resolved,
+            &meta,
+            model.as_str(),
+            cache_status.as_str(),
+        );
+        let (term_period, key_term_period) = (term_period.as_deref(), key_term_period.as_deref());
+        let request_energy = &energy;
+        let cache_put = cache_put.as_ref().map(|(key, ttl, content_type, body)| {
+            (key.as_str(), *ttl, content_type.as_str(), body.clone())
+        });
+        let UpstreamUsage {
+            input: input_tokens,
+            output: output_tokens,
+            cached: cached_input_tokens,
+        } = tokens;
+        // The crash guard counts a strike against every request that was in
+        // flight when the model server's engine died.
+        if !meta.crash_fp.is_empty()
+            && meta
+                .failure
+                .as_ref()
+                .is_some_and(|f| crate::crash_guard::is_engine_death(&f.reason))
         {
-            tracing::warn!(error = %e, "budget reconcile failed");
-            state.alerts.issue(
-                "redis_budget_reconcile_failed",
-                "Redis budget reconcile failed",
-                format!(
-                    "tenant `{}` model `{model}` estimated `{}` actual `{}`: {e}",
-                    resolved.tenant_name,
-                    est.total(),
-                    input_tokens.saturating_add(output_tokens),
-                ),
-            );
+            state
+                .crash_guard
+                .record_death(&state.redis, model, &meta.crash_fp)
+                .await;
         }
-    }
+        // Feed the router's per-request cost estimate: one EWMA sample of how
+        // long this model's answers actually run. Successful requests only — an
+        // error body's usage says nothing about the model's answering behavior.
+        if status_code == 200 && output_tokens > 0 {
+            state.output_stats.observe(model, output_tokens as u64);
+        }
 
-    // ---- term-usage commit + budget alerts (Phase 3 + Phase 5) ----
-    // Frozen request cost: per-token rates (captured at admission) plus any
-    // per-request modality surcharge. Computed once and used for both the
-    // term-budget commit and the persisted usage ledger so they agree.
-    // Frozen energy figures: the request's share of its model's measured
-    // power, or the slot share of node power, over serving time (queue wait
-    // excluded). Zeros when accounting is off. Frozen like `cost_usd` so
-    // later settings edits never rewrite history.
-    let (cost_usd, energy) = settled_figures(
-        &state.energy,
-        billed,
-        (input_tokens, output_tokens),
-        (in_cost_rate, out_cost_rate, modality_cost),
-        request_energy,
-        total_ms,
-        queue_wait_ms,
-    );
-    let added = input_tokens.saturating_add(output_tokens) as i64;
-    let est_tokens = est.total() as i64;
-    if let Some(period) = term_period {
-        let committed = if holds.tenant {
-            state
-                .redis
-                .term_reconcile(
-                    &resolved.tenant_id.to_string(),
-                    period,
-                    est_tokens,
-                    holds.est_cost,
-                    added,
-                    cost_usd,
-                )
-                .await
-        } else {
-            state
-                .redis
-                .term_usage_add(&resolved.tenant_id, period, added, cost_usd)
-                .await
-        };
-        match committed {
-            Ok((total_tokens, total_cost)) => {
-                maybe_alert_budget(state, resolved, total_tokens, total_cost);
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "term usage commit failed");
+        // store the full response for identical future requests
+        if let Some((ck, ttl, content_type, body)) = cache_put {
+            let cached = obleth_config::CachedResponse {
+                status: status_code,
+                content_type: content_type.to_string(),
+                body,
+                input_tokens,
+                output_tokens,
+            };
+            if let Err(e) = state.redis.cache_put(ck, &cached, ttl).await {
+                tracing::warn!(error = %e, "cache store failed");
                 state.alerts.issue(
-                    "redis_term_usage_failed",
-                    "Redis term-usage commit failed",
-                    format!("tenant `{}` model `{model}`: {e}", resolved.tenant_name),
-                );
-            }
-        }
-    }
-    if let Some(period) = key_term_period {
-        let committed = if holds.key {
-            state
-                .redis
-                .term_reconcile(
-                    &resolved.key_id.to_string(),
-                    period,
-                    est_tokens,
-                    holds.est_cost,
-                    added,
-                    cost_usd,
-                )
-                .await
-        } else {
-            state
-                .redis
-                .term_usage_add(&resolved.key_id, period, added, cost_usd)
-                .await
-        };
-        match committed {
-            Ok((total_tokens, total_cost)) => {
-                maybe_alert_key_budget(state, resolved, total_tokens, total_cost);
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "key term usage commit failed");
-                state.alerts.issue(
-                    "redis_key_term_usage_failed",
-                    "Redis key term-usage commit failed",
+                    "redis_cache_store_failed",
+                    "Redis response-cache store failed",
                     format!(
-                        "tenant `{}` key `{}` model `{model}`: {e}",
-                        resolved.tenant_name, resolved.key_id
+                        "tenant `{}` model `{model}` cache ttl `{ttl}`: {e}",
+                        resolved.tenant_name
                     ),
                 );
             }
         }
-    }
 
-    finalize(
-        state,
-        request_id,
-        resolved,
-        meta,
-        model,
-        admission,
-        est,
-        input_tokens,
-        output_tokens,
-        cached_input_tokens,
-        queue_wait_ms,
-        ttft_ms,
-        total_ms,
-        status_code,
-        cache_status,
-        cost_usd,
-        energy,
-    );
-    state.metrics.total_ms.observe(total_ms as f64);
+        // Reconcile estimate vs actual against the per-minute budget bucket.
+        // A zero token rate means the tenant has no per-minute limiter.
+        if capacity > 0 {
+            if let Err(e) = state
+                .redis
+                .reconcile_budget(
+                    &resolved.tenant_id,
+                    capacity,
+                    est.total(),
+                    input_tokens.saturating_add(output_tokens),
+                )
+                .await
+            {
+                tracing::warn!(error = %e, "budget reconcile failed");
+                state.alerts.issue(
+                    "redis_budget_reconcile_failed",
+                    "Redis budget reconcile failed",
+                    format!(
+                        "tenant `{}` model `{model}` estimated `{}` actual `{}`: {e}",
+                        resolved.tenant_name,
+                        est.total(),
+                        input_tokens.saturating_add(output_tokens),
+                    ),
+                );
+            }
+        }
+
+        // ---- term-usage commit + budget alerts (Phase 3 + Phase 5) ----
+        // Frozen request cost: per-token rates (captured at admission) plus any
+        // per-request modality surcharge. Computed once and used for both the
+        // term-budget commit and the persisted usage ledger so they agree.
+        // Frozen energy figures: the request's share of its model's measured
+        // power, or the slot share of node power, over serving time (queue wait
+        // excluded). Zeros when accounting is off. Frozen like `cost_usd` so
+        // later settings edits never rewrite history.
+        let (cost_usd, energy) = settled_figures(
+            &state.energy,
+            billed,
+            (input_tokens, output_tokens),
+            (in_cost_rate, out_cost_rate, modality_cost),
+            request_energy,
+            total_ms,
+            queue_wait_ms,
+        );
+        let added = input_tokens.saturating_add(output_tokens) as i64;
+        let est_tokens = est.total() as i64;
+        if let Some(period) = term_period {
+            let committed = if holds.tenant {
+                state
+                    .redis
+                    .term_reconcile(
+                        &resolved.tenant_id.to_string(),
+                        period,
+                        est_tokens,
+                        holds.est_cost,
+                        added,
+                        cost_usd,
+                    )
+                    .await
+            } else {
+                state
+                    .redis
+                    .term_usage_add(&resolved.tenant_id, period, added, cost_usd)
+                    .await
+            };
+            match committed {
+                Ok((total_tokens, total_cost)) => {
+                    maybe_alert_budget(state, resolved, total_tokens, total_cost);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "term usage commit failed");
+                    state.alerts.issue(
+                        "redis_term_usage_failed",
+                        "Redis term-usage commit failed",
+                        format!("tenant `{}` model `{model}`: {e}", resolved.tenant_name),
+                    );
+                }
+            }
+        }
+        if let Some(period) = key_term_period {
+            let committed = if holds.key {
+                state
+                    .redis
+                    .term_reconcile(
+                        &resolved.key_id.to_string(),
+                        period,
+                        est_tokens,
+                        holds.est_cost,
+                        added,
+                        cost_usd,
+                    )
+                    .await
+            } else {
+                state
+                    .redis
+                    .term_usage_add(&resolved.key_id, period, added, cost_usd)
+                    .await
+            };
+            match committed {
+                Ok((total_tokens, total_cost)) => {
+                    maybe_alert_key_budget(state, resolved, total_tokens, total_cost);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "key term usage commit failed");
+                    state.alerts.issue(
+                        "redis_key_term_usage_failed",
+                        "Redis key term-usage commit failed",
+                        format!(
+                            "tenant `{}` key `{}` model `{model}`: {e}",
+                            resolved.tenant_name, resolved.key_id
+                        ),
+                    );
+                }
+            }
+        }
+
+        finalize(
+            state,
+            request_id,
+            resolved,
+            meta,
+            model,
+            admission,
+            est,
+            FinalizeOutcome {
+                input_tokens,
+                output_tokens,
+                cached_input_tokens,
+                queue_wait_ms,
+                ttft_ms,
+                total_ms,
+                status_code,
+                cache_status,
+                cost_usd,
+                energy,
+            },
+        );
+        state.metrics.total_ms.observe(total_ms as f64);
+    }
 }
 
 /// Resolve a key via moka, falling back to Redis and caching the result.
@@ -7507,6 +7368,63 @@ fn recorded_ttft(streamed: bool, ttft_ms: u32) -> u32 {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// How a request came out, for its ledger row: everything `finalize` records
+/// beyond the request's identity. `Default` is a request that produced
+/// nothing and cost nothing; a refusal sets its status, time and class.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FinalizeOutcome<'a> {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub cached_input_tokens: u32,
+    pub queue_wait_ms: u32,
+    pub ttft_ms: u32,
+    pub total_ms: u32,
+    pub status_code: u16,
+    /// `off`, `hit`, `miss` or `bypass`; `off` when caching never applied.
+    pub cache_status: &'a str,
+    pub cost_usd: f64,
+    pub energy: crate::energy::EnergyFigures,
+}
+
+/// A request refused before it reached an upstream: its status, when it
+/// started (the row's `total_ms` is measured here, so no refusal records a
+/// zero), what it had reserved, and the cache status it had reached.
+pub(crate) struct Rejection<'a> {
+    pub status: StatusCode,
+    pub since: Instant,
+    pub est: CostEstimate,
+    pub cache_status: &'a str,
+    pub queue_wait_ms: u32,
+}
+
+/// Record one rejected request's ledger row. The class and reason come from
+/// `meta.failure` and the status, as for every other row.
+pub(crate) fn reject(
+    state: &AppState,
+    request_id: Uuid,
+    resolved: &ResolvedKey,
+    meta: &RequestMeta,
+    model: &str,
+    rejection: Rejection<'_>,
+) {
+    finalize(
+        state,
+        request_id,
+        resolved,
+        meta,
+        model,
+        Admission::Rejected,
+        rejection.est,
+        FinalizeOutcome {
+            total_ms: rejection.since.elapsed().as_millis() as u32,
+            status_code: rejection.status.as_u16(),
+            cache_status: rejection.cache_status,
+            queue_wait_ms: rejection.queue_wait_ms,
+            ..FinalizeOutcome::default()
+        },
+    );
+}
+
 pub(crate) fn finalize(
     state: &AppState,
     request_id: Uuid,
@@ -7515,17 +7433,20 @@ pub(crate) fn finalize(
     model: &str,
     admission: Admission,
     est: CostEstimate,
-    input_tokens: u32,
-    output_tokens: u32,
-    cached_input_tokens: u32,
-    queue_wait_ms: u32,
-    ttft_ms: u32,
-    total_ms: u32,
-    status_code: u16,
-    cache_status: &str,
-    cost_usd: f64,
-    energy: crate::energy::EnergyFigures,
+    outcome: FinalizeOutcome<'_>,
 ) {
+    let FinalizeOutcome {
+        input_tokens,
+        output_tokens,
+        cached_input_tokens,
+        queue_wait_ms,
+        ttft_ms,
+        total_ms,
+        status_code,
+        cache_status,
+        cost_usd,
+        energy,
+    } = outcome;
     let ttft_ms = recorded_ttft(meta.streamed, ttft_ms);
     state
         .metrics
@@ -11073,8 +10994,8 @@ mod lifecycle_tests {
         // A refusal is recorded before it is returned.
         let refuse = h.find("Gate::Refuse(resp,reason)").expect("refusal arm");
         let ret = refuse + h[refuse..].find("returnresp;").expect("refusal returns");
-        assert!(h[refuse..ret].contains("finalize("));
-        assert!(h[refuse..ret].contains("StatusCode::GONE"));
+        assert!(h[refuse..ret].contains("reject("));
+        assert!(h[refuse..ret].contains("status:StatusCode::GONE"));
     }
 
     #[test]
@@ -11097,9 +11018,8 @@ mod lifecycle_tests {
             + h[check..]
                 .find("returnrejected_field_response(&model,field);")
                 .expect("refusal returns");
-        assert!(h[check..ret].contains("finalize("));
-        assert!(h[check..ret].contains("Admission::Rejected"));
-        assert!(h[check..ret].contains("StatusCode::BAD_REQUEST.as_u16()"));
+        assert!(h[check..ret].contains("reject("));
+        assert!(h[check..ret].contains("status:StatusCode::BAD_REQUEST"));
     }
 
     #[test]
@@ -11168,7 +11088,7 @@ mod lifecycle_tests {
         let dispatch = h.find("letprepared_body").expect("normal dispatch");
         assert_eq!(
             h[spec..dispatch]
-                .matches(".header(crate::boons::speculation::DRAFTED_BY_HEADER,drafted_by)")
+                .matches("crate::boons::speculation::DRAFTED_BY_HEADER,content_type_header(&drafted_by),")
                 .count(),
             2,
             "both the buffered and the streamed commit carry the header"
@@ -11184,17 +11104,26 @@ mod lifecycle_tests {
             .find("letqueue_wait_ms=admitted.waited.as_millis()asu32;")
             .expect("admission wait");
         let after = &h[admitted..];
-        let builders = after
-            .matches(".header(\"x-obleth-request-id\",request_id.to_string())")
+        let answers = after.matches("answer.respond(").count();
+        assert!(answers >= 7, "found {answers} answers");
+        // No answer after admission is built by hand: `Answer::respond` owns
+        // the request id, the queue wait and the rest of the header set.
+        assert!(!after.contains(".header(\"x-obleth-request-id\""));
+        assert!(after.contains("letanswer=Answer{request_id,queue_wait_ms,"));
+    }
+
+    /// Every refusal before the upstream goes through `reject`, which measures
+    /// the row's `total_ms` from the request's start; none passes a duration
+    /// of its own (three used to record 0).
+    #[test]
+    fn every_refusal_measures_its_own_duration() {
+        let h = squash(handler());
+        let refusals = h
+            .matches("reject(&state,request_id,&resolved,&req_meta,&model,Rejection{")
             .count();
-        assert!(builders >= 7, "found {builders} response builders");
-        assert_eq!(
-            after
-                .matches(".header(\"x-obleth-request-id\",request_id.to_string()).header(QUEUE_WAIT_HEADER,queue_wait_ms.to_string())")
-                .count(),
-            builders,
-            "every response built after admission carries the queue wait"
-        );
+        assert!(refusals >= 8, "found {refusals} refusals");
+        assert_eq!(h.matches("since:request_start,").count(), refusals);
+        assert!(!h.contains("total_ms:0"));
     }
 
     #[test]
@@ -12098,5 +12027,55 @@ mod pipeline_input_tests {
     fn the_tools_length_is_counted_not_built() {
         let tools = serde_json::json!([{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]);
         assert_eq!(serialized_len(&tools), tools.to_string().len());
+    }
+}
+
+#[cfg(test)]
+mod answer_tests {
+    use super::*;
+
+    /// Every answer after admission carries the same header set, whatever
+    /// exit built it: the request id, the queue wait, no proxy buffering,
+    /// and the boons and compression when boons applied.
+    #[tokio::test]
+    async fn an_answer_carries_the_whole_header_set() {
+        let request_id = Uuid::new_v4();
+        let plain = Answer {
+            request_id,
+            queue_wait_ms: 7,
+            boons_applied: &[],
+            compression: Some("1000->500"),
+        };
+        let resp = plain.respond(
+            StatusCode::OK,
+            header::HeaderValue::from_static("application/json"),
+            Body::from("{}"),
+        );
+        let h = resp.headers();
+        assert_eq!(h["x-obleth-request-id"], request_id.to_string().as_str());
+        assert_eq!(h[QUEUE_WAIT_HEADER], "7");
+        assert_eq!(h[NO_BUFFER_HEADER.0], NO_BUFFER_HEADER.1);
+        assert_eq!(h[header::CONTENT_TYPE], "application/json");
+        assert!(h.get(crate::boons::BOONS_HEADER).is_none());
+        assert!(
+            h.get(crate::boons::COMPRESSION_HEADER).is_none(),
+            "no boons, no compression header"
+        );
+
+        let with_boons = Answer {
+            boons_applied: &["compression", "knowledge"],
+            ..plain
+        };
+        let resp = with_boons.respond(
+            StatusCode::BAD_GATEWAY,
+            content_type_header("text/event-stream"),
+            Body::empty(),
+        );
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let h = resp.headers();
+        assert_eq!(h[crate::boons::BOONS_HEADER], "compression,knowledge");
+        assert_eq!(h[crate::boons::COMPRESSION_HEADER], "1000->500");
+        assert_eq!(h[header::CONTENT_TYPE], "text/event-stream");
+        assert_eq!(content_type_header("not a header\n"), "application/json");
     }
 }

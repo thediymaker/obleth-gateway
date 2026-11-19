@@ -28,14 +28,15 @@ use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderValue, Request, Response, StatusCode};
 use axum::response::IntoResponse;
-use obleth_config::{routing::Candidate, Admission, ResolvedKey, ResolvedModel, SEARCH_MODEL_TYPE};
+use obleth_config::{routing::Candidate, ResolvedKey, ResolvedModel, SEARCH_MODEL_TYPE};
 use obleth_tokenizer::CostEstimate;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::proxy::{
     self, build_targets, effective_admission_weight, error_json, finalize, gate_resolved_key,
-    resolve_conversation, resolve_model, surfaced_request_type, RequestMeta,
+    reject, resolve_conversation, resolve_model, surfaced_request_type, FinalizeOutcome, Rejection,
+    RequestMeta,
 };
 use crate::state::AppState;
 
@@ -282,25 +283,19 @@ async fn handle(
             return error_json(StatusCode::SERVICE_UNAVAILABLE, "scheduler unavailable");
         }
         Err(_) => {
-            let elapsed = started.elapsed().as_millis() as u32;
-            finalize(
+            reject(
                 state,
                 request_id,
                 &resolved,
                 &meta,
                 &model,
-                Admission::Rejected,
-                est,
-                0,
-                0,
-                0,
-                elapsed,
-                0,
-                elapsed,
-                503,
-                "off",
-                0.0,
-                crate::energy::EnergyFigures::default(),
+                Rejection {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    since: started,
+                    est,
+                    cache_status: "off",
+                    queue_wait_ms: started.elapsed().as_millis() as u32,
+                },
             );
             let mut resp = error_json(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -333,16 +328,13 @@ async fn handle(
         &model,
         admitted.admission,
         est,
-        0,
-        0,
-        0,
-        queue_wait_ms,
-        0,
-        started.elapsed().as_millis() as u32,
-        resp.status().as_u16(),
-        "off",
-        0.0,
-        crate::energy::EnergyFigures::default(),
+        FinalizeOutcome {
+            queue_wait_ms,
+            total_ms: started.elapsed().as_millis() as u32,
+            status_code: resp.status().as_u16(),
+            cache_status: "off",
+            ..FinalizeOutcome::default()
+        },
     );
     resp
 }

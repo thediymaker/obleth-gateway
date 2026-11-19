@@ -26,14 +26,13 @@ use std::time::{Duration, Instant};
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{header, Request, Response, StatusCode};
-use obleth_config::Admission;
 use obleth_tokenizer::{CostEstimate, Tokenizer};
 use uuid::Uuid;
 
 use crate::proxy::{
-    self, build_targets, derive_intent, effective_admission_weight, error_json, finalize,
-    gate_resolved_key, key_term_period_key, resolve_conversation, resolve_model,
-    surfaced_request_type, term_period_key, union_candidate_tags, RequestMeta, BODY_LIMIT,
+    self, build_targets, derive_intent, effective_admission_weight, error_json, gate_resolved_key,
+    key_term_period_key, reject, resolve_conversation, resolve_model, surfaced_request_type,
+    term_period_key, union_candidate_tags, Rejection, RequestMeta, BODY_LIMIT,
 };
 use crate::state::AppState;
 
@@ -728,9 +727,6 @@ async fn handler_inner(
         .await
     {
         Err(block) => {
-            if let Some(t) = tracer.take() {
-                t.finish("error");
-            }
             return error_json(block.status, block.reason);
         }
         Ok(true) => {
@@ -745,9 +741,6 @@ async fn handler_inner(
             // Fail closed: sending the unredacted prompts would bypass the
             // policy the scan just applied.
             if texts.len() != users.len() + 1 {
-                if let Some(t) = tracer.take() {
-                    t.finish("error");
-                }
                 return error_json(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "guardrails redaction could not be applied",
@@ -945,9 +938,6 @@ async fn handler_inner(
     let admitted = match tokio::time::timeout(admit_wait, admit).await {
         Ok(Some(a)) => a,
         Ok(None) => {
-            if let Some(t) = tracer.take() {
-                t.finish("error");
-            }
             state.alerts.issue(
                 "scheduler_unavailable",
                 "Fairshare scheduler unavailable",
@@ -959,28 +949,20 @@ async fn handler_inner(
             return error_json(StatusCode::SERVICE_UNAVAILABLE, "scheduler unavailable");
         }
         Err(_) => {
-            if let Some(t) = tracer.take() {
-                t.finish("error");
-            }
             let queued_ms = (crate::tracer::now_ms() - admission_start) as u32;
-            finalize(
+            reject(
                 &state,
                 request_id,
                 &resolved,
                 &req_meta,
                 &model,
-                Admission::Rejected,
-                est,
-                0,
-                0,
-                0,
-                queued_ms,
-                0,
-                request_start.elapsed().as_millis() as u32,
-                503,
-                "off",
-                0.0,
-                crate::energy::EnergyFigures::default(),
+                Rejection {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    since: request_start,
+                    est,
+                    cache_status: "off",
+                    queue_wait_ms: queued_ms,
+                },
             );
             let mut resp = error_json(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1036,29 +1018,21 @@ async fn handler_inner(
             budget_tokens: resolved.key_budget_tokens,
             budget_cost_usd: resolved.key_budget_cost_usd,
         });
-    let reject = |status: StatusCode, msg: &str, tracer: Option<crate::tracer::SpanRecorder>| {
-        finalize(
+    let refuse = |status: StatusCode, msg: &str| {
+        reject(
             &state,
             request_id,
             &resolved,
             &req_meta,
             &model,
-            Admission::Rejected,
-            est,
-            0,
-            0,
-            0,
-            queue_wait_ms,
-            0,
-            0,
-            status.as_u16(),
-            "off",
-            0.0,
-            crate::energy::EnergyFigures::default(),
+            Rejection {
+                status,
+                since: request_start,
+                est,
+                cache_status: "off",
+                queue_wait_ms,
+            },
         );
-        if let Some(t) = tracer {
-            t.finish("error");
-        }
         error_json(status, msg)
     };
     // Reserve-then-reconcile, as in the passthrough pipeline: an admitted
@@ -1096,18 +1070,11 @@ async fn handler_inner(
                         resolved.key_budget_cost_usd,
                     ),
                 );
-                return reject(
-                    StatusCode::FORBIDDEN,
-                    "api key term budget exhausted",
-                    tracer.take(),
-                );
+                return refuse(StatusCode::FORBIDDEN, "api key term budget exhausted");
             }
             Err(e) => {
                 if !state.fail_open {
                     drop(permit);
-                    if let Some(t) = tracer.take() {
-                        t.finish("error");
-                    }
                     return error_json(StatusCode::SERVICE_UNAVAILABLE, "key budget check failed");
                 }
                 tracing::warn!(error = %e, "key budget reserve failed; failing open");
@@ -1136,11 +1103,7 @@ async fn handler_inner(
                 if let Some(hold) = key_hold.take() {
                     hold.release().await;
                 }
-                return reject(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "token budget exceeded",
-                    tracer.take(),
-                );
+                return refuse(StatusCode::TOO_MANY_REQUESTS, "token budget exceeded");
             }
             Ok(obleth_redis::ReserveOutcome::TermExhausted {
                 used_tokens,
@@ -1160,20 +1123,13 @@ async fn handler_inner(
                         resolved.budget_cost_usd,
                     ),
                 );
-                return reject(
-                    StatusCode::FORBIDDEN,
-                    "tenant term budget exhausted",
-                    tracer.take(),
-                );
+                return refuse(StatusCode::FORBIDDEN, "tenant term budget exhausted");
             }
             Err(e) => {
                 if !state.fail_open {
                     drop(permit);
                     if let Some(hold) = key_hold.take() {
                         hold.release().await;
-                    }
-                    if let Some(t) = tracer.take() {
-                        t.finish("error");
                     }
                     return error_json(StatusCode::SERVICE_UNAVAILABLE, "budget check failed");
                 }
@@ -1228,9 +1184,6 @@ async fn handler_inner(
         let _ = settle_guard
             .complete(accounting.settle_unbilled(0, total_ms, 502))
             .await;
-        if let Some(t) = tracer.take() {
-            t.finish("error");
-        }
         return error_json(
             StatusCode::BAD_GATEWAY,
             "model has no usable upstream endpoint",
@@ -1381,9 +1334,6 @@ async fn handler_inner(
         .await;
 
     if let Some(msg) = failure {
-        if let Some(t) = tracer.take() {
-            t.finish("error");
-        }
         return error_json(StatusCode::BAD_GATEWAY, &msg);
     }
     if let Some(t) = tracer.take() {
@@ -2128,7 +2078,7 @@ mod settlement_tests {
         assert_eq!(h[tenant..guard].matches("hold.release().await").count(), 3);
         assert!(h[tenant..guard].contains("hold.hand_off()"));
         // No legacy ledger-only rejection after the reservation owns budget.
-        assert!(!h[guard..].contains("returnreject("));
+        assert!(!h[guard..].contains("returnrefuse("));
         assert_eq!(h[guard..].matches("settle_guard.complete(").count(), 2);
     }
 
