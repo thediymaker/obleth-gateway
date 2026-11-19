@@ -28,6 +28,7 @@ pub struct Metrics {
     cache_lookups: IntCounterVec,
     tokens_saved: IntCounter,
     pub(crate) compression_tokens_saved: IntCounter,
+    compressor_scores: IntCounterVec,
     mcp_requests: IntCounterVec,
     upstream_attempts: IntCounterVec,
     jwt_verify: IntCounterVec,
@@ -154,6 +155,14 @@ impl Metrics {
             "Tokens served from cache instead of the upstream",
         ))
         .unwrap();
+        let compressor_scores = IntCounterVec::new(
+            Opts::new(
+                "obleth_compressor_scores_total",
+                "Calls to the compressor sidecar by outcome: neural (scored), timeout, error, breaker_open (not sent)",
+            ),
+            &["outcome"],
+        )
+        .unwrap();
         let compression_tokens_saved = IntCounter::with_opts(Opts::new(
             "obleth_compression_tokens_saved_total",
             "Input tokens saved by the compression boon before upstream dispatch",
@@ -239,6 +248,9 @@ impl Metrics {
         registry
             .register(Box::new(compression_tokens_saved.clone()))
             .unwrap();
+        registry
+            .register(Box::new(compressor_scores.clone()))
+            .unwrap();
         registry.register(Box::new(mcp_requests.clone())).unwrap();
         registry
             .register(Box::new(upstream_attempts.clone()))
@@ -269,6 +281,7 @@ impl Metrics {
             cache_lookups,
             tokens_saved,
             compression_tokens_saved,
+            compressor_scores,
             mcp_requests,
             upstream_attempts,
             jwt_verify,
@@ -314,6 +327,11 @@ impl Metrics {
 
     pub fn record_compression_saved(&self, saved: u32) {
         self.compression_tokens_saved.inc_by(saved as u64);
+    }
+
+    /// One compressor sidecar call ended with `outcome` (a `ScoreOutcome` name).
+    pub fn record_compressor_score(&self, outcome: &str) {
+        self.compressor_scores.with_label_values(&[outcome]).inc();
     }
 
     pub fn set_gauges(&self, in_flight: i64, queue_depth: i64) {

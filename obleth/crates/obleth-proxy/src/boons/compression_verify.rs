@@ -643,7 +643,7 @@ fn print_dedup_report() {
     let mut body = conversation_with_repeated_context();
     let msg_count = body["messages"].as_array().unwrap().len();
     let before = count_body_tokens(&body);
-    let (stats, stash) = compression::dedup_rewrite(&cfg, &mut body);
+    let (stats, stash) = compression::dedup_rewrite(&cfg, true, &mut body);
     let after = count_body_tokens(&body);
 
     println!("\nCROSS-TURN DEDUP — lossless removal of context re-sent across turns");
@@ -755,7 +755,7 @@ fn cross_turn_dedup_removes_repeated_blocks_losslessly() {
     };
     let mut body = conversation_with_repeated_context();
     let before = count_body_tokens(&body);
-    let (stats, stash) = compression::dedup_rewrite(&cfg, &mut body);
+    let (stats, stash) = compression::dedup_rewrite(&cfg, true, &mut body);
     let after = count_body_tokens(&body);
 
     // The doc appears 3× → first occurrence kept, the two later copies deduped.
@@ -975,7 +975,12 @@ fn log_rewrite_collapses_and_is_reversible() {
         ..Default::default()
     };
     let log = repetitive_log();
-    let mut body = json!({"model": "verify", "messages": [{"role": "user", "content": log}]});
+    // An earlier turn: the latest user message is never compacted.
+    let mut body = json!({"model": "verify", "messages": [
+        {"role": "user", "content": log},
+        {"role": "assistant", "content": "Noted."},
+        {"role": "user", "content": "What failed?"}
+    ]});
     let (stats, stash) = compression::log_rewrite(&cfg, &mut body);
 
     assert_eq!(
@@ -1062,7 +1067,7 @@ fn dedup_leaves_unique_content_untouched() {
         ]
     });
     let snapshot = body.clone();
-    let (stats, stash) = compression::dedup_rewrite(&cfg, &mut body);
+    let (stats, stash) = compression::dedup_rewrite(&cfg, true, &mut body);
     assert_eq!(stats.refs_created, 0, "no duplicates → nothing replaced");
     assert!(stash.is_empty());
     assert_eq!(

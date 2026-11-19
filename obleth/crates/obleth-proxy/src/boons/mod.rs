@@ -773,15 +773,18 @@ impl BoonEngine {
             );
         }
 
-        // Reversible compression passes (dedup + lossy text), per-piece. Run
-        // after tool-loop injection so retrieve_original can ride the same loop.
+        // Compression passes (dedup, log and lossy text), per-piece. Run after
+        // tool-loop injection so retrieve_original can ride the same loop. They
+        // are reversible only when the model can call that tool: then the
+        // originals are stashed and the markers say so.
+        let reversible = route.supports_function_calling && settings.tool_loop.active();
         if dedup_eligible(route, &settings, key)
             || log_compaction_eligible(route, &settings, key)
             || lossy_eligible(route, &settings, key, force_lossy)
         {
             if dedup_eligible(route, &settings, key) {
                 dedup =
-                    compression::apply_dedup(state, &settings.compression, key, session_id, json)
+                    compression::apply_dedup(state, &settings.compression, key, reversible, json)
                         .await;
             }
             if log_compaction_eligible(route, &settings, key) {
@@ -789,15 +792,18 @@ impl BoonEngine {
                     state,
                     &settings.compression,
                     key,
-                    session_id,
+                    reversible,
                     json,
                 )
                 .await;
             }
             if lossy_eligible(route, &settings, key, force_lossy) {
                 lossy =
-                    compression::apply_lossy(state, &settings.compression, key, session_id, json)
+                    compression::apply_lossy(state, &settings.compression, key, reversible, json)
                         .await;
+                if let Some(outcome) = lossy.scorer {
+                    state.metrics.record_compressor_score(outcome.name());
+                }
             }
             let refs = dedup
                 .refs_created
@@ -809,7 +815,6 @@ impl BoonEngine {
                     outcome.applied.push("compression");
                 }
                 // Bonus: when the model can call tools, let it recover originals.
-                let reversible = route.supports_function_calling && settings.tool_loop.active();
                 if reversible {
                     compression::inject_retrieve_original_tool(
                         json,
@@ -862,6 +867,8 @@ impl BoonEngine {
                         "dedup_refs": dedup.refs_created,
                         "log_segments": logs.refs_created,
                         "lossy_segments": lossy.refs_created,
+                        "scorer": lossy.scorer.map_or("heuristic", |o| o.name()),
+                        "score_ms": lossy.score_ms,
                         "tokens_before": tokens_before,
                         "tokens_after": tokens_after,
                         "tokens_saved": tokens_before.saturating_sub(tokens_after),
