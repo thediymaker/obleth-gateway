@@ -47,7 +47,7 @@ use obleth_store::batches::{
 use obleth_store::JobOwner;
 use uuid::Uuid;
 
-use crate::proxy::error_json;
+use crate::proxy::{error_json, invalid_request, read_body, BodyTooLarge};
 use crate::state::AppState;
 
 /// Endpoints a batch may target. Each runs down the pipeline unchanged.
@@ -343,18 +343,16 @@ fn store_error(e: obleth_store::StoreError) -> Response<Body> {
 }
 
 fn invalid(msg: &str) -> Response<Body> {
-    let body = serde_json::json!({ "error": {
-        "message": msg, "type": "invalid_request_error", "param": null, "code": null
-    }});
-    (StatusCode::BAD_REQUEST, axum::Json(body)).into_response()
+    invalid_request(StatusCode::BAD_REQUEST, msg, None, None)
 }
 
 fn not_found(what: &str, id: &str) -> Response<Body> {
-    let body = serde_json::json!({ "error": {
-        "message": format!("No such {what}: '{id}'"),
-        "type": "invalid_request_error", "param": "id", "code": null
-    }});
-    (StatusCode::NOT_FOUND, axum::Json(body)).into_response()
+    invalid_request(
+        StatusCode::NOT_FOUND,
+        &format!("No such {what}: '{id}'"),
+        Some("id"),
+        None,
+    )
 }
 
 fn json(value: serde_json::Value) -> Response<Body> {
@@ -424,9 +422,11 @@ impl LineCounter {
 }
 
 fn too_large(max: usize) -> Response<Body> {
-    error_json(
+    invalid_request(
         StatusCode::PAYLOAD_TOO_LARGE,
         &format!("the file is larger than the {max} bytes allowed"),
+        Some("file"),
+        None,
     )
 }
 
@@ -1073,9 +1073,7 @@ async fn create(
     resolved: &ResolvedKey,
     body: Body,
 ) -> Handled {
-    let bytes = axum::body::to_bytes(body, 1024 * 1024)
-        .await
-        .map_err(|_| invalid("request body too large"))?;
+    let bytes = read_body(body).await.map_err(BodyTooLarge::openai)?;
     let req: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|_| invalid("the request body is not JSON"))?;
     let input_file_id = req
@@ -1266,13 +1264,14 @@ async fn delete_batch(batches: &Batches, owner: JobOwner, id: &str) -> Handled {
         BatchDeletion::Deleted => Ok(json(
             serde_json::json!({ "id": id, "object": "batch", "deleted": true }),
         )),
-        BatchDeletion::Running => {
-            let body = serde_json::json!({ "error": {
-                "message": format!("Batch '{id}' is still running. Cancel it, then delete it once it has stopped."),
-                "type": "invalid_request_error", "param": "id", "code": "batch_running"
-            }});
-            Err((StatusCode::CONFLICT, axum::Json(body)).into_response())
-        }
+        BatchDeletion::Running => Err(invalid_request(
+            StatusCode::CONFLICT,
+            &format!(
+                "Batch '{id}' is still running. Cancel it, then delete it once it has stopped."
+            ),
+            Some("id"),
+            Some("batch_running"),
+        )),
         BatchDeletion::NotFound => Err(not_found("batch", id)),
     }
 }
@@ -1734,6 +1733,35 @@ async fn run_item(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn batch_errors_are_request_errors_with_param_and_code() {
+        async fn read(resp: Response<Body>) -> (StatusCode, serde_json::Value) {
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16)
+                .await
+                .unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap())
+        }
+        let (status, json) = read(invalid("missing `endpoint`")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+        assert!(json["error"]["param"].is_null() && json["error"]["code"].is_null());
+        let (status, json) = read(not_found("batch", "b1")).await;
+        assert_eq!(
+            (status, json["error"]["param"].as_str()),
+            (StatusCode::NOT_FOUND, Some("id"))
+        );
+        let (status, json) = read(too_large(7)).await;
+        assert_eq!(
+            (status, json["error"]["param"].as_str()),
+            (StatusCode::PAYLOAD_TOO_LARGE, Some("file"))
+        );
+        assert_eq!(
+            json["error"]["message"],
+            "the file is larger than the 7 bytes allowed"
+        );
+    }
 
     #[test]
     fn routes_match_the_openai_paths() {

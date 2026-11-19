@@ -26,7 +26,12 @@ use uuid::Uuid;
 use crate::state::AppState;
 pub(crate) use obleth_admin::{build_targets, UpstreamTarget as Target};
 
+/// Largest request body any surface accepts: `/v1/chat/completions`, the
+/// Responses and Messages shims, and the file-free batch and job calls read
+/// through [`read_body`], so one limit and one answer hold everywhere.
 pub(crate) const BODY_LIMIT: usize = 64 * 1024 * 1024;
+/// The message of the 413 every surface gives a body over [`BODY_LIMIT`].
+pub(crate) const BODY_TOO_LARGE: &str = "request body too large";
 const TAIL_CAP: usize = 16 * 1024;
 /// Upper bound on a response we are willing to cache. Larger responses stream
 /// through uncached so the cache can't be used to balloon Redis memory.
@@ -175,9 +180,33 @@ pub async fn proxy_handler(state: State<AppState>, mut req: Request<Body>) -> Re
     resp
 }
 
-/// Largest `/v1/responses` body accepted. The translated body is held in
-/// memory, and the pipeline's own limits apply after that.
-const RESPONSES_BODY_MAX: usize = 32 * 1024 * 1024;
+/// Largest upstream answer a shim translates whole; a larger one passes back
+/// untouched (see [`translate_body`]).
+const TRANSLATED_RESPONSE_MAX: usize = 32 * 1024 * 1024;
+
+/// A request body over [`BODY_LIMIT`]: the one thing `to_bytes` fails on,
+/// since a malformed transport read surfaces earlier, from the connection
+/// itself. Each surface renders it in its own error shape, with one status
+/// and one message.
+pub(crate) struct BodyTooLarge;
+
+impl BodyTooLarge {
+    /// The OpenAI-shaped 413 (`/v1/chat/completions`, `/v1/responses`, batches, jobs).
+    pub(crate) fn openai(self) -> Response<Body> {
+        error_json(StatusCode::PAYLOAD_TOO_LARGE, BODY_TOO_LARGE)
+    }
+    /// The Anthropic-shaped 413 (`/v1/messages`).
+    fn anthropic(self) -> Response<Body> {
+        anthropic_error(StatusCode::PAYLOAD_TOO_LARGE, BODY_TOO_LARGE, None)
+    }
+}
+
+/// The whole request body, or [`BodyTooLarge`] past [`BODY_LIMIT`].
+pub(crate) async fn read_body(body: Body) -> Result<Bytes, BodyTooLarge> {
+    axum::body::to_bytes(body, BODY_LIMIT)
+        .await
+        .map_err(|_| BodyTooLarge)
+}
 
 /// Run a Responses request as a chat request and translate the answer back.
 ///
@@ -206,11 +235,9 @@ async fn responses_shim(
         }
         Err(resp) => return resp,
     }
-    let Ok(bytes) = axum::body::to_bytes(body, RESPONSES_BODY_MAX).await else {
-        return error_json(
-            StatusCode::BAD_REQUEST,
-            "request body too large or unreadable",
-        );
+    let bytes = match read_body(body).await {
+        Ok(bytes) => bytes,
+        Err(too_large) => return too_large.openai(),
     };
     let Ok(incoming) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return error_json(StatusCode::BAD_REQUEST, "invalid JSON body");
@@ -432,7 +459,7 @@ async fn translate_body(
     translate: impl FnOnce(&serde_json::Value) -> serde_json::Value,
 ) -> Response<Body> {
     let (parts, body) = resp.into_parts();
-    let Ok(bytes) = axum::body::to_bytes(body, RESPONSES_BODY_MAX).await else {
+    let Ok(bytes) = axum::body::to_bytes(body, TRANSLATED_RESPONSE_MAX).await else {
         return too_large();
     };
     let Ok(chat) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
@@ -674,16 +701,7 @@ async fn messages_front(
         }
         Err(resp) => return Err(redress_error(resp).await),
     }
-    // `axum::body::to_bytes` fails only past the cap (a malformed transport
-    // read surfaces earlier, from `into_parts`/the connection itself), so
-    // every failure here is the client's body being too large.
-    let Ok(bytes) = axum::body::to_bytes(body, RESPONSES_BODY_MAX).await else {
-        return Err(anthropic_error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "request body too large",
-            None,
-        ));
-    };
+    let bytes = read_body(body).await.map_err(BodyTooLarge::anthropic)?;
     let Ok(mut incoming) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return Err(anthropic_error(
             StatusCode::BAD_REQUEST,
@@ -1258,9 +1276,9 @@ async fn run_pipeline(
     }
 
     // ---- read + parse body ----
-    let mut body_bytes = match axum::body::to_bytes(body, BODY_LIMIT).await {
-        Ok(b) => b,
-        Err(_) => return error_json(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
+    let mut body_bytes = match read_body(body).await {
+        Ok(bytes) => bytes,
+        Err(too_large) => return too_large.openai(),
     };
     let mut json: serde_json::Value =
         serde_json::from_slice(&body_bytes).unwrap_or(serde_json::Value::Null);
@@ -7651,23 +7669,41 @@ fn record_key_rejection(
 /// The `type` of an error the gateway itself reports, in OpenAI's error shape.
 pub(crate) const GATEWAY_ERROR_TYPE: &str = "obleth_gateway_error";
 
+/// An error about a gateway condition (no capacity, storage down, a key's
+/// limit) in OpenAI's error shape with the gateway's own `type`. An error
+/// about the request's shape on an OpenAI surface goes through
+/// [`invalid_request`] instead, so clients can match on `invalid_request_error`.
 pub(crate) fn error_json(status: StatusCode, msg: &str) -> Response<Body> {
     let body = serde_json::json!({ "error": { "message": msg, "type": GATEWAY_ERROR_TYPE } });
     (status, axum::Json(body)).into_response()
 }
 
-/// `400` for a request carrying a field the model is set to refuse, in the
-/// OpenAI error shape with the field as `param`.
-fn rejected_field_response(model: &str, field: &str) -> Response<Body> {
+/// An error about the request itself on an OpenAI surface: a missing or
+/// refused field (`param` names it), an unknown id, a body over the limit.
+/// `code` is the OpenAI code when one applies (`unsupported_parameter`,
+/// `batch_running`), else null.
+pub(crate) fn invalid_request(
+    status: StatusCode,
+    msg: &str,
+    param: Option<&str>,
+    code: Option<&str>,
+) -> Response<Body> {
     let body = serde_json::json!({ "error": {
-        "message": format!(
+        "message": msg, "type": "invalid_request_error", "param": param, "code": code,
+    } });
+    (status, axum::Json(body)).into_response()
+}
+
+/// `400` for a request carrying a field the model is set to refuse.
+fn rejected_field_response(model: &str, field: &str) -> Response<Body> {
+    invalid_request(
+        StatusCode::BAD_REQUEST,
+        &format!(
             "`{field}` is not supported by model `{model}`. Remove it from the request and retry."
         ),
-        "type": "invalid_request_error",
-        "param": field,
-        "code": "unsupported_parameter",
-    } });
-    (StatusCode::BAD_REQUEST, axum::Json(body)).into_response()
+        Some(field),
+        Some("unsupported_parameter"),
+    )
 }
 
 fn now_ms() -> i64 {
@@ -9551,7 +9587,7 @@ mod tests {
                 .find("async fn translate_response_body(")
                 .expect("end of responses_shim");
         let shim = &src[start..end];
-        let read = shim.find("to_bytes(").expect("body read");
+        let read = shim.find("read_body(").expect("body read");
         for step in [
             "bearer(",
             "UNAUTHORIZED",
@@ -9586,7 +9622,7 @@ mod tests {
             body.find(needle)
                 .unwrap_or_else(|| panic!("{needle} in messages_front"))
         };
-        let read = pos("to_bytes(");
+        let read = pos("read_body(");
         assert!(pos("bearer(") < read);
         assert!(pos("authenticate_credential(") < read);
         assert!(pos("gate_resolved_key(") < read);
@@ -11867,5 +11903,56 @@ mod lifecycle_tests {
         assert!(rest.contains(
             "letread_timed_out=e.is_timeout()&&!e.is_connect();timed_out|=read_timed_out;"
         ));
+    }
+}
+
+#[cfg(test)]
+mod client_error_tests {
+    use super::*;
+
+    async fn error_body(resp: Response<Body>) -> (StatusCode, serde_json::Value) {
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// One limit on every surface: a body one byte over it is refused with
+    /// 413 and the same message in the surface's own error shape; a body at
+    /// the limit is read whole.
+    #[tokio::test]
+    async fn a_body_over_the_limit_is_413_on_every_surface_and_at_the_limit_is_read() {
+        let Err(too_large) = read_body(Body::from(vec![b'x'; BODY_LIMIT + 1])).await else {
+            panic!("a body over the limit was read");
+        };
+        let (status, json) = error_body(too_large.openai()).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(json["error"]["message"], BODY_TOO_LARGE);
+        assert_eq!(json["error"]["type"], GATEWAY_ERROR_TYPE);
+        let (status, json) = error_body(BodyTooLarge.anthropic()).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(json["error"]["message"], BODY_TOO_LARGE);
+        assert_eq!(json["error"]["type"], "request_too_large");
+        let at = read_body(Body::from(vec![b'x'; BODY_LIMIT])).await;
+        assert_eq!(at.map(|b| b.len()).ok(), Some(BODY_LIMIT));
+    }
+
+    #[tokio::test]
+    async fn a_request_error_carries_type_param_and_code() {
+        let (status, json) = error_body(invalid_request(
+            StatusCode::NOT_FOUND,
+            "No such batch: 'b1'",
+            Some("id"),
+            None,
+        ))
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+        assert_eq!(json["error"]["param"], "id");
+        assert!(json["error"]["code"].is_null());
+        let (_, json) = error_body(rejected_field_response("m", "logprobs")).await;
+        assert_eq!(json["error"]["param"], "logprobs");
+        assert_eq!(json["error"]["code"], "unsupported_parameter");
     }
 }

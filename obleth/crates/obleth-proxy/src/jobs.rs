@@ -67,7 +67,9 @@ use obleth_store::JobOwner;
 use tokio::time::timeout;
 use uuid::Uuid;
 
-use crate::proxy::{build_upstream_url, error_json, forward_headers, resolve_model, Target};
+use crate::proxy::{
+    build_upstream_url, error_json, forward_headers, invalid_request, resolve_model, Target,
+};
 use crate::state::AppState;
 
 /// The video collection path: `POST` creates a job, `GET` lists them.
@@ -272,9 +274,11 @@ fn follow_up_path(kind: JobKind, call: FollowUp<'_>) -> String {
 /// another tenant (or, under `key` scope, another key). One message for all,
 /// so a caller learns nothing about ids it does not hold.
 fn no_such_job(kind: JobKind) -> Response<Body> {
-    error_json(
+    invalid_request(
         StatusCode::NOT_FOUND,
         &format!("no such {} job", kind.as_str()),
+        Some("id"),
+        None,
     )
 }
 
@@ -767,6 +771,19 @@ pub(crate) async fn record_create(job: CreatedJob, upstream: reqwest::Response) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_missing_job_has_the_batches_404_shape() {
+        let resp = no_such_job(JobKind::Video);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+        assert_eq!(json["error"]["param"], "id");
+        assert_eq!(json["error"]["message"], "no such video job");
+    }
 
     #[test]
     fn follow_ups_are_classified_by_method_and_shape() {
