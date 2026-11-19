@@ -735,7 +735,7 @@ impl Store {
             .await?;
         if moved.is_some() {
             sqlx::query(
-                "update batch_items set status = 'cancelled', finished_at = now()
+                "update batch_items set status = 'cancelled', body = '', finished_at = now()
                  where batch_id = $1 and status = 'pending'",
             )
             .bind(id)
@@ -879,7 +879,8 @@ impl Store {
         let done = sqlx::query(
             "update batch_items
              set status = 'succeeded', response_status = $4, response = $5, request_id = $6,
-                 error = null, lease_owner = null, lease_until = null, finished_at = now()
+                 error = null, body = '', lease_owner = null, lease_until = null,
+                 finished_at = now()
              where batch_id = $1 and line = $2 and lease_owner = $3 and status = 'running'",
         )
         .bind(batch_id)
@@ -909,7 +910,8 @@ impl Store {
         let done = sqlx::query(
             "update batch_items
              set status = 'failed', response_status = $4, response = $5, error = $6::jsonb,
-                 request_id = $7, lease_owner = null, lease_until = null, finished_at = now()
+                 request_id = $7, body = '', lease_owner = null, lease_until = null,
+                 finished_at = now()
              where batch_id = $1 and line = $2 and lease_owner = $3 and status = 'running'",
         )
         .bind(batch_id)
@@ -977,7 +979,7 @@ impl Store {
         let mut tx = self.pool.begin().await?;
         let failed = sqlx::query(
             "update batch_items
-             set status = 'failed', lease_owner = null, lease_until = null,
+             set status = 'failed', body = '', lease_owner = null, lease_until = null,
                  finished_at = now(),
                  error = jsonb_build_object('code', 'lease_lapsed',
                      'message', 'the request was retried the most times allowed')
@@ -1033,7 +1035,7 @@ impl Store {
         // Expire the queue of every batch past its deadline.
         sqlx::query(
             "update batch_items i
-             set status = 'expired', finished_at = now(),
+             set status = 'expired', body = '', finished_at = now(),
                  error = jsonb_build_object('code', 'batch_expired',
                      'message', 'the batch reached its completion window before this request ran')
              from batches b
@@ -1292,6 +1294,17 @@ mod tests {
             .expect("create")
     }
 
+    /// The lines of `batch_id` whose request body is still stored.
+    async fn lines_with_body(store: &Store, batch_id: &str) -> Vec<i32> {
+        sqlx::query_scalar(
+            "select line from batch_items where batch_id = $1 and body <> '' order by line",
+        )
+        .bind(batch_id)
+        .fetch_all(&store.pool)
+        .await
+        .unwrap()
+    }
+
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn files_are_scoped_to_their_owner() {
@@ -1453,6 +1466,9 @@ mod tests {
             .unwrap();
         assert_eq!(again.len(), 1);
         assert_eq!((again[0].line, again[0].attempts), (4, 2));
+        // Finished items drop their request body; a retried one keeps it.
+        assert!(again[0].body.contains("\"n\":4"));
+        assert_eq!(lines_with_body(&store, &batch.id).await, vec![4]);
         // Not finished while a request is still running (other tests' batches
         // may finish in the same pass).
         assert!(!store
@@ -1475,6 +1491,7 @@ mod tests {
             (b.status.as_str(), b.completed, b.failed),
             ("completed", 4, 1)
         );
+        assert!(lines_with_body(&store, &batch.id).await.is_empty());
         let out = b.output_file_id.clone().expect("output file");
         let err = b.error_file_id.clone().expect("error file");
         let out_file = store.get_batch_file(&out, owner).await.unwrap().unwrap();
@@ -1691,6 +1708,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(again.iter().map(|i| i.line).collect::<Vec<_>>(), vec![0]);
+        assert_eq!(lines_with_body(&store, &batch.id).await, vec![0]);
         let b = store.get_batch(&batch.id, owner).await.unwrap().unwrap();
         assert_eq!(b.failed, 1);
     }
@@ -1712,6 +1730,10 @@ mod tests {
             .unwrap();
         let b = store.cancel_batch(&batch.id, owner).await.unwrap().unwrap();
         assert_eq!(b.status, "cancelling");
+        assert_eq!(
+            lines_with_body(&store, &batch.id).await,
+            vec![running[0].line]
+        );
         assert!(store
             .claim_batch_items(&batch.id, "gw", 5, 60)
             .await
@@ -1756,6 +1778,7 @@ mod tests {
             .any(|d| d.id == late.id && d.status == "expired"));
         let b = store.get_batch(&late.id, owner).await.unwrap().unwrap();
         assert_eq!(b.failed, 2);
+        assert!(lines_with_body(&store, &late.id).await.is_empty());
         assert!(b.output_file_id.is_none());
         let errs = store
             .batch_output_rows(&late.id, BatchOutput::Error, -1, 10)

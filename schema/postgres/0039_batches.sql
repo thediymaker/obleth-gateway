@@ -81,6 +81,8 @@ create table if not exists batch_items (
     batch_id         text not null references batches (id) on delete cascade,
     line             integer not null,
     custom_id        text not null,
+    -- Read only when the item is claimed; cleared ('') once it reaches a
+    -- final status. The request stays readable in the input file.
     body             text not null,
     -- pending, running, succeeded, failed, cancelled, expired
     status           text not null default 'pending',
