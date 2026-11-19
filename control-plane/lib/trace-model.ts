@@ -3,7 +3,17 @@ import type { RouteExplainView, SpanEntry } from "@/lib/obleth";
 // A traced request's spans: names people read, attributes, the parent/child
 // tree, and a timeline on one scale. Pure, so the request panel stays thin.
 
-export function spanLabel(name: string): string {
+/** The question a verdict span is about: the `question_id` attribute (new rows) or the id the span was named by (old rows). */
+function verdictQuestion(name: string, attributes?: string): string | null {
+  if (name === "verdict:question") {
+    const id = parseAttrs(attributes ?? "").find(([k]) => k === "question_id")?.[1];
+    return id ?? "?";
+  }
+  if (name.startsWith("verdict:q:")) return name.slice("verdict:q:".length);
+  return null;
+}
+
+export function spanLabel(name: string, attributes?: string): string {
   const labels: Record<string, string> = {
     proxy_request: "Request",
     auth_resolve: "Auth",
@@ -18,7 +28,8 @@ export function spanLabel(name: string): string {
   };
   if (name in labels) return labels[name];
   if (name.startsWith("boon:tool_loop:iter:")) return `Iter ${name.split(":").pop()}`;
-  if (name.startsWith("verdict:q:")) return `Question ${name.slice("verdict:q:".length)}`;
+  const question = verdictQuestion(name, attributes);
+  if (question !== null) return `Question ${question}`;
   if (name.startsWith("mcp:")) return name.slice(4);
   return name;
 }
@@ -37,7 +48,7 @@ export function spanHint(name: string): string {
   };
   if (name in hints) return hints[name];
   if (name.startsWith("boon:tool_loop:iter:")) return "Tool call + model turn";
-  if (name.startsWith("verdict:q:")) return "Single-token typed-verdict call";
+  if (name === "verdict:question" || name.startsWith("verdict:q:")) return "Single-token typed-verdict call";
   if (name.startsWith("mcp:")) return "Tool server call";
   return "";
 }

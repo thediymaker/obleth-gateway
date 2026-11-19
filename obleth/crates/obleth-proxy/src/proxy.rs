@@ -2469,64 +2469,12 @@ async fn run_pipeline(
     // cannot all pass the gate on the same headroom; each such reservation is
     // settled exactly once, through `term_reconcile` at settlement or
     // `release_term_hold` on a rejection between the two scopes.
-    let capacity = resolved.tokens_per_minute.max(0);
-    let now = chrono::Utc::now();
     let est_cost = estimated_cost(est, in_cost_rate, out_cost_rate, modality_cost);
-    let term_period = term_period_key(&resolved, now);
-    let term_gate = term_period
-        .as_deref()
-        .map(|period_key| obleth_redis::TermGate {
-            period_key,
-            budget_tokens: resolved.budget_tokens,
-            budget_cost_usd: resolved.budget_cost_usd,
-        });
-    let key_term_period = key_term_period_key(&resolved, now);
-    let key_term_gate = key_term_period
-        .as_deref()
-        .map(|period_key| obleth_redis::TermGate {
-            period_key,
-            budget_tokens: resolved.key_budget_tokens,
-            budget_cost_usd: resolved.key_budget_cost_usd,
-        });
-    // Whether each scope holds a term reservation that settlement must
-    // reconcile. False on the fail-open path: nothing was reserved, so the
-    // settle commits usage with a plain add instead.
-    let mut key_term_held = false;
-    // Releases the key reservation if the request ends (client drop included)
-    // before settlement takes ownership of it.
-    let mut key_hold: Option<PendingTermHold> = None;
-    let mut tenant_term_held = false;
-    if let Some(gate) = key_term_gate {
-        match state
-            .redis
-            .reserve_with_term(&resolved.key_id, 0, 0, est.total(), Some(gate), est_cost)
-            .instrument(tracing::info_span!("reserve_key_budget"))
-            .await
-        {
-            Ok(obleth_redis::ReserveOutcome::Reserved { .. }) => {
-                key_term_held = true;
-                key_hold = key_term_period.clone().map(|period| {
-                    PendingTermHold::new(&state, resolved.key_id, period, est, est_cost)
-                });
-            }
-            // Capacity 0 has no per-minute bucket; nothing was reserved.
-            Ok(obleth_redis::ReserveOutcome::RateLimited { .. }) => {}
-            Ok(obleth_redis::ReserveOutcome::TermExhausted {
-                used_tokens,
-                used_cost,
-            }) => {
-                drop(permit);
-                state.alerts.issue(
-                    format!("key_term_budget_exhausted:{}", resolved.key_id),
-                    "API key term budget exhausted",
-                    format!(
-                        "tenant `{}` key `{}` blocked: used {used_tokens} tokens / ${used_cost:.4} against caps tokens={:?} cost={:?}",
-                        resolved.tenant_name,
-                        resolved.key_id,
-                        resolved.key_budget_tokens,
-                        resolved.key_budget_cost_usd,
-                    ),
-                );
+    let reserved = match reserve_budget(&state, &resolved, &model, est, est_cost).await {
+        Ok(reserved) => reserved,
+        Err(refusal) => {
+            drop(permit);
+            if refusal.ledger {
                 reject(
                     &state,
                     request_id,
@@ -2534,148 +2482,17 @@ async fn run_pipeline(
                     &req_meta,
                     &model,
                     Rejection {
-                        status: StatusCode::FORBIDDEN,
+                        status: refusal.status,
                         since: request_start,
                         est,
                         cache_status: cache_status_label,
                         queue_wait_ms,
                     },
                 );
-                return error_json(StatusCode::FORBIDDEN, "api key term budget exhausted");
             }
-            Err(e) => {
-                if !state.fail_open {
-                    drop(permit);
-                    state.alerts.issue(
-                        "redis_key_budget_reserve_failed_closed",
-                        "Redis key-budget reserve failed",
-                        format!(
-                            "fail-open is disabled; rejecting tenant `{}` key `{}` model `{model}`: {e}",
-                            resolved.tenant_name,
-                            resolved.key_id
-                        ),
-                    );
-                    return error_json(StatusCode::SERVICE_UNAVAILABLE, "key budget check failed");
-                }
-                tracing::warn!(error = %e, "key budget reserve failed; failing open");
-                state.alerts.issue(
-                    "redis_key_budget_reserve_failed_open",
-                    "Redis key-budget reserve failed",
-                    format!(
-                        "fail-open is enabled; admitting tenant `{}` key `{}` model `{model}` without key budget enforcement: {e}",
-                        resolved.tenant_name,
-                        resolved.key_id
-                    ),
-                );
-            }
+            return error_json(refusal.status, refusal.message);
         }
-    }
-    let tenant_gate_armed = term_gate.is_some();
-    let should_check_budget = capacity > 0 || tenant_gate_armed;
-    if should_check_budget {
-        match state
-            .redis
-            .reserve_with_term(
-                &resolved.tenant_id,
-                capacity,
-                resolved.tokens_per_minute,
-                est.total(),
-                term_gate,
-                est_cost,
-            )
-            .instrument(tracing::info_span!("reserve_budget"))
-            .await
-        {
-            Ok(obleth_redis::ReserveOutcome::Reserved { .. }) => {
-                tenant_term_held = tenant_gate_armed;
-            }
-            Ok(obleth_redis::ReserveOutcome::RateLimited { .. }) => {
-                drop(permit);
-                if let Some(hold) = key_hold.take() {
-                    hold.release().await;
-                }
-                reject(
-                    &state,
-                    request_id,
-                    &resolved,
-                    &req_meta,
-                    &model,
-                    Rejection {
-                        status: StatusCode::TOO_MANY_REQUESTS,
-                        since: request_start,
-                        est,
-                        cache_status: cache_status_label,
-                        queue_wait_ms,
-                    },
-                );
-                return error_json(StatusCode::TOO_MANY_REQUESTS, "token budget exceeded");
-            }
-            Ok(obleth_redis::ReserveOutcome::TermExhausted {
-                used_tokens,
-                used_cost,
-            }) => {
-                drop(permit);
-                if let Some(hold) = key_hold.take() {
-                    hold.release().await;
-                }
-                state.alerts.issue(
-                    format!("term_budget_exhausted:{}", resolved.tenant_id),
-                    "Tenant term budget exhausted",
-                    format!(
-                        "tenant `{}` blocked: used {used_tokens} tokens / ${used_cost:.4} against caps tokens={:?} cost={:?}",
-                        resolved.tenant_name,
-                        resolved.budget_tokens,
-                        resolved.budget_cost_usd,
-                    ),
-                );
-                reject(
-                    &state,
-                    request_id,
-                    &resolved,
-                    &req_meta,
-                    &model,
-                    Rejection {
-                        status: StatusCode::FORBIDDEN,
-                        since: request_start,
-                        est,
-                        cache_status: cache_status_label,
-                        queue_wait_ms,
-                    },
-                );
-                return error_json(StatusCode::FORBIDDEN, "tenant term budget exhausted");
-            }
-            Err(e) => {
-                if !state.fail_open {
-                    drop(permit);
-                    if let Some(hold) = key_hold.take() {
-                        hold.release().await;
-                    }
-                    state.alerts.issue(
-                        "redis_budget_reserve_failed_closed",
-                        "Redis budget reserve failed",
-                        format!(
-                            "fail-open is disabled; rejecting tenant `{}` model `{model}`: {e}",
-                            resolved.tenant_name
-                        ),
-                    );
-                    return error_json(StatusCode::SERVICE_UNAVAILABLE, "budget check failed");
-                }
-                tracing::warn!(error = %e, "budget reserve failed; failing open");
-                state.alerts.issue(
-                    "redis_budget_reserve_failed_open",
-                    "Redis budget reserve failed",
-                    format!(
-                        "fail-open is enabled; admitting tenant `{}` model `{model}` without budget enforcement: {e}",
-                        resolved.tenant_name
-                    ),
-                );
-            }
-        }
-    }
-
-    if let Some(hold) = key_hold.take() {
-        hold.hand_off();
-    }
+    };
 
     // From here on every exit settles through `settle_guard`, so the
     // per-minute bucket and any term reservation are reconciled exactly once
@@ -2695,18 +2512,14 @@ async fn run_pipeline(
         queue_wait_ms,
         request_start,
         cache_status: cache_status_label.to_string(),
-        capacity,
-        term_period: term_period.clone(),
-        key_term_period: key_term_period.clone(),
+        capacity: reserved.capacity,
+        term_period: reserved.term_period,
+        key_term_period: reserved.key_term_period,
         in_cost_rate,
         out_cost_rate,
         modality_cost,
         energy: request_energy,
-        holds: TermHolds {
-            tenant: tenant_term_held,
-            key: key_term_held,
-            est_cost,
-        },
+        holds: reserved.holds,
     };
     let mut settle_guard = accounting.unbilled_guard();
 
@@ -4320,6 +4133,230 @@ fn is_usage_only_event(event: &[u8]) -> bool {
         Some(c) => c.as_array().is_some_and(|a| a.is_empty()),
     };
     has_usage && no_choices
+}
+
+/// What an admitted request holds against its budgets, for settlement: the
+/// per-minute capacity it reserved under, the term periods it reserved in,
+/// and which of those reservations settlement must reconcile.
+pub(crate) struct Reserved {
+    pub(crate) capacity: i64,
+    pub(crate) term_period: Option<String>,
+    pub(crate) key_term_period: Option<String>,
+    pub(crate) holds: TermHolds,
+}
+
+/// Why a request could not reserve its budget: what to answer, and whether
+/// it is a refusal of the caller's (a cap or a rate limit, recorded as a
+/// rejected ledger row) or the gateway's own failure closed (no row).
+pub(crate) struct BudgetRefusal {
+    pub(crate) status: StatusCode,
+    pub(crate) message: &'static str,
+    pub(crate) ledger: bool,
+}
+
+/// Reserve an admitted request's estimate against the key's term cap, then
+/// the tenant's per-minute bucket and term cap, in one Redis round trip per
+/// scope. The term gate runs first inside the script, so a term-exhausted
+/// request never reserves per-minute tokens it has no completion path to
+/// refund; a key reservation is released when the tenant scope refuses, and
+/// handed to settlement otherwise. A Redis failure admits the request without
+/// enforcement when the gateway fails open, and refuses it otherwise; both
+/// raise an alert. Shared by the passthrough pipeline and verdicts, so the
+/// two cannot drift.
+pub(crate) async fn reserve_budget(
+    state: &AppState,
+    resolved: &ResolvedKey,
+    model: &str,
+    est: CostEstimate,
+    est_cost: f64,
+) -> Result<Reserved, BudgetRefusal> {
+    let capacity = resolved.tokens_per_minute.max(0);
+    let now = chrono::Utc::now();
+    let term_period = term_period_key(resolved, now);
+    let term_gate = term_period
+        .as_deref()
+        .map(|period_key| obleth_redis::TermGate {
+            period_key,
+            budget_tokens: resolved.budget_tokens,
+            budget_cost_usd: resolved.budget_cost_usd,
+        });
+    let key_term_period = key_term_period_key(resolved, now);
+    let key_term_gate = key_term_period
+        .as_deref()
+        .map(|period_key| obleth_redis::TermGate {
+            period_key,
+            budget_tokens: resolved.key_budget_tokens,
+            budget_cost_usd: resolved.key_budget_cost_usd,
+        });
+    // Whether each scope holds a term reservation that settlement must
+    // reconcile. False on the fail-open path: nothing was reserved, so the
+    // settle commits usage with a plain add instead.
+    let mut key_term_held = false;
+    // Releases the key reservation if the request ends before settlement
+    // takes ownership of it.
+    let mut key_hold: Option<PendingTermHold> = None;
+    let mut tenant_term_held = false;
+    if let Some(gate) = key_term_gate {
+        match state
+            .redis
+            .reserve_with_term(&resolved.key_id, 0, 0, est.total(), Some(gate), est_cost)
+            .instrument(tracing::info_span!("reserve_key_budget"))
+            .await
+        {
+            Ok(obleth_redis::ReserveOutcome::Reserved { .. }) => {
+                key_term_held = true;
+                key_hold = key_term_period.clone().map(|period| {
+                    PendingTermHold::new(state, resolved.key_id, period, est, est_cost)
+                });
+            }
+            // Capacity 0 has no per-minute bucket; nothing was reserved.
+            Ok(obleth_redis::ReserveOutcome::RateLimited { .. }) => {}
+            Ok(obleth_redis::ReserveOutcome::TermExhausted {
+                used_tokens,
+                used_cost,
+            }) => {
+                state.alerts.issue(
+                    format!("key_term_budget_exhausted:{}", resolved.key_id),
+                    "API key term budget exhausted",
+                    format!(
+                        "tenant `{}` key `{}` blocked: used {used_tokens} tokens / ${used_cost:.4} against caps tokens={:?} cost={:?}",
+                        resolved.tenant_name,
+                        resolved.key_id,
+                        resolved.key_budget_tokens,
+                        resolved.key_budget_cost_usd,
+                    ),
+                );
+                return Err(BudgetRefusal {
+                    status: StatusCode::FORBIDDEN,
+                    message: "api key term budget exhausted",
+                    ledger: true,
+                });
+            }
+            Err(e) => {
+                if !state.fail_open {
+                    state.alerts.issue(
+                        "redis_key_budget_reserve_failed_closed",
+                        "Redis key-budget reserve failed",
+                        format!(
+                            "fail-open is disabled; rejecting tenant `{}` key `{}` model `{model}`: {e}",
+                            resolved.tenant_name,
+                            resolved.key_id
+                        ),
+                    );
+                    return Err(BudgetRefusal {
+                        status: StatusCode::SERVICE_UNAVAILABLE,
+                        message: "key budget check failed",
+                        ledger: false,
+                    });
+                }
+                tracing::warn!(error = %e, "key budget reserve failed; failing open");
+                state.alerts.issue(
+                    "redis_key_budget_reserve_failed_open",
+                    "Redis key-budget reserve failed",
+                    format!(
+                        "fail-open is enabled; admitting tenant `{}` key `{}` model `{model}` without key budget enforcement: {e}",
+                        resolved.tenant_name,
+                        resolved.key_id
+                    ),
+                );
+            }
+        }
+    }
+    let tenant_gate_armed = term_gate.is_some();
+    if capacity > 0 || tenant_gate_armed {
+        match state
+            .redis
+            .reserve_with_term(
+                &resolved.tenant_id,
+                capacity,
+                resolved.tokens_per_minute,
+                est.total(),
+                term_gate,
+                est_cost,
+            )
+            .instrument(tracing::info_span!("reserve_budget"))
+            .await
+        {
+            Ok(obleth_redis::ReserveOutcome::Reserved { .. }) => {
+                tenant_term_held = tenant_gate_armed;
+            }
+            Ok(obleth_redis::ReserveOutcome::RateLimited { .. }) => {
+                if let Some(hold) = key_hold.take() {
+                    hold.release().await;
+                }
+                return Err(BudgetRefusal {
+                    status: StatusCode::TOO_MANY_REQUESTS,
+                    message: "token budget exceeded",
+                    ledger: true,
+                });
+            }
+            Ok(obleth_redis::ReserveOutcome::TermExhausted {
+                used_tokens,
+                used_cost,
+            }) => {
+                if let Some(hold) = key_hold.take() {
+                    hold.release().await;
+                }
+                state.alerts.issue(
+                    format!("term_budget_exhausted:{}", resolved.tenant_id),
+                    "Tenant term budget exhausted",
+                    format!(
+                        "tenant `{}` blocked: used {used_tokens} tokens / ${used_cost:.4} against caps tokens={:?} cost={:?}",
+                        resolved.tenant_name,
+                        resolved.budget_tokens,
+                        resolved.budget_cost_usd,
+                    ),
+                );
+                return Err(BudgetRefusal {
+                    status: StatusCode::FORBIDDEN,
+                    message: "tenant term budget exhausted",
+                    ledger: true,
+                });
+            }
+            Err(e) => {
+                if !state.fail_open {
+                    if let Some(hold) = key_hold.take() {
+                        hold.release().await;
+                    }
+                    state.alerts.issue(
+                        "redis_budget_reserve_failed_closed",
+                        "Redis budget reserve failed",
+                        format!(
+                            "fail-open is disabled; rejecting tenant `{}` model `{model}`: {e}",
+                            resolved.tenant_name
+                        ),
+                    );
+                    return Err(BudgetRefusal {
+                        status: StatusCode::SERVICE_UNAVAILABLE,
+                        message: "budget check failed",
+                        ledger: false,
+                    });
+                }
+                tracing::warn!(error = %e, "budget reserve failed; failing open");
+                state.alerts.issue(
+                    "redis_budget_reserve_failed_open",
+                    "Redis budget reserve failed",
+                    format!(
+                        "fail-open is enabled; admitting tenant `{}` model `{model}` without budget enforcement: {e}",
+                        resolved.tenant_name
+                    ),
+                );
+            }
+        }
+    }
+    if let Some(hold) = key_hold.take() {
+        hold.hand_off();
+    }
+    Ok(Reserved {
+        capacity,
+        term_period,
+        key_term_period,
+        holds: TermHolds {
+            tenant: tenant_term_held,
+            key: key_term_held,
+            est_cost,
+        },
+    })
 }
 
 /// Which term reservations a request holds, and the cost estimate they were
@@ -11121,7 +11158,9 @@ mod lifecycle_tests {
         let refusals = h
             .matches("reject(&state,request_id,&resolved,&req_meta,&model,Rejection{")
             .count();
-        assert!(refusals >= 8, "found {refusals} refusals");
+        // Retired, refused field, crash guard, prompt over the window, admission
+        // timeout, and the one refusal `reserve_budget` can answer with.
+        assert!(refusals >= 6, "found {refusals} refusals");
         assert_eq!(h.matches("since:request_start,").count(), refusals);
         assert!(!h.contains("total_ms:0"));
     }
@@ -11130,7 +11169,7 @@ mod lifecycle_tests {
     fn admission_precedes_the_budget_reservation() {
         let h = handler();
         let admit = h.find(".admit_to(").expect("admission");
-        let reserve = h.find(".reserve_with_term(").expect("reservation");
+        let reserve = h.find("reserve_budget(&state").expect("reservation");
         assert!(admit < reserve, "a queued request must hold no budget");
         assert!(h[admit..reserve].contains("timeout(admit_wait"));
     }
@@ -11160,24 +11199,36 @@ mod lifecycle_tests {
 
     #[test]
     fn a_rejection_between_the_two_scopes_releases_the_key_hold() {
-        let flat = squash(handler());
+        // The reservation lives in `reserve_budget`, shared with verdicts.
+        let src = squash(include_str!("proxy.rs"));
+        let start = src
+            .find("pub(crate)asyncfnreserve_budget(")
+            .expect("reserve_budget");
+        let flat = &src[start..];
+        let end = flat.find("Ok(Reserved{").expect("the reservation returns");
+        let flat = &flat[..end];
         let key = flat
             .find(".reserve_with_term(&resolved.key_id,")
             .expect("key reserve");
         let tenant = flat
             .find(".reserve_with_term(&resolved.tenant_id,")
             .expect("tenant reserve");
-        let proceed = flat
-            .find("letmutaccounting=StreamAccounting{")
-            .expect("accounting");
         assert!(key < tenant);
-        let releases = flat[tenant..proceed]
-            .matches("hold.release().await")
-            .count();
+        let releases = flat[tenant..].matches("hold.release().await").count();
         // Rate limited, term exhausted, and fail-closed error.
         assert_eq!(releases, 3);
         // Success hands the hold to settlement before the guard exists.
-        assert!(flat[tenant..proceed].contains("hold.hand_off()"));
+        assert!(flat[tenant..].contains("hold.hand_off()"));
+        // The pipeline takes the helper's answer and records a refusal once.
+        let h = squash(handler());
+        let reserve = h
+            .find("reserve_budget(&state,&resolved,&model,est,est_cost)")
+            .expect("pipeline reserve");
+        let guard = h
+            .find("letmutsettle_guard=accounting.unbilled_guard();")
+            .expect("guard");
+        assert!(reserve < guard);
+        assert!(h[reserve..guard].contains("ifrefusal.ledger{reject("));
     }
 
     #[test]

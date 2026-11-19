@@ -31,8 +31,8 @@ use uuid::Uuid;
 
 use crate::proxy::{
     self, build_targets, derive_intent, effective_admission_weight, error_json, gate_resolved_key,
-    key_term_period_key, reject, resolve_conversation, resolve_model, surfaced_request_type,
-    term_period_key, union_candidate_tags, Rejection, RequestMeta, BODY_LIMIT,
+    reject, resolve_conversation, resolve_model, surfaced_request_type, union_candidate_tags,
+    Rejection, RequestMeta, BODY_LIMIT,
 };
 use crate::state::AppState;
 
@@ -198,9 +198,83 @@ impl QuestionCall {
 /// inside the future so spans can be recorded after the join.
 pub(crate) struct QuestionOutcome {
     pub id: String,
-    pub result: Result<QuestionSuccess, String>,
+    pub result: Result<QuestionSuccess, VerdictError>,
     pub start_ms: i64,
     pub duration_ms: u32,
+}
+
+/// Why one question got no verdict. Each kind knows whether a second attempt
+/// is worth it, how the ledger classes it, and what status the caller gets.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum VerdictError {
+    /// The backend answered an error status, with its own message when it gave one.
+    Upstream { status: u16, detail: Option<String> },
+    /// The backend could not be reached.
+    Unreachable(String),
+    /// The backend did not answer within the request timeout.
+    Timeout(Duration),
+    /// The backend's 200 was not JSON.
+    BadBody(String),
+    /// The backend's answer carried no usable `top_logprobs`.
+    NoLogprobs(String),
+    /// The model's next token was not any answer label.
+    NoLabel(String),
+}
+
+impl VerdictError {
+    /// Worth one retry after a short pause: a 5xx, an unreachable backend, or
+    /// a degenerate 200, as a crash-looping replica behind a load balancer
+    /// answers. A backend that genuinely lacks logprobs support pays one extra
+    /// doomed call on a path that already fails.
+    pub(crate) fn is_transient(&self) -> bool {
+        match self {
+            VerdictError::Upstream { status, .. } => *status >= 500,
+            VerdictError::Unreachable(_)
+            | VerdictError::BadBody(_)
+            | VerdictError::NoLogprobs(_) => true,
+            VerdictError::Timeout(_) | VerdictError::NoLabel(_) => false,
+        }
+    }
+
+    /// The ledger's class for the failure.
+    pub(crate) fn class(&self) -> obleth_config::ErrorClass {
+        use obleth_config::ErrorClass;
+        match self {
+            VerdictError::Upstream { status, .. } if *status < 500 => ErrorClass::ClientInput,
+            VerdictError::Upstream { .. }
+            | VerdictError::BadBody(_)
+            | VerdictError::NoLogprobs(_)
+            | VerdictError::NoLabel(_) => ErrorClass::UpstreamError,
+            VerdictError::Unreachable(_) => ErrorClass::Network,
+            VerdictError::Timeout(_) => ErrorClass::UpstreamTimeout,
+        }
+    }
+
+    /// What the caller is answered: a backend's 4xx is the request's fault
+    /// (400), a timeout is 504, everything else a bad gateway.
+    pub(crate) fn status(&self) -> StatusCode {
+        match self {
+            VerdictError::Upstream { status, .. } if *status < 500 => StatusCode::BAD_REQUEST,
+            VerdictError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
+            _ => StatusCode::BAD_GATEWAY,
+        }
+    }
+}
+
+impl std::fmt::Display for VerdictError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VerdictError::Upstream {
+                status,
+                detail: Some(detail),
+            } => write!(f, "upstream returned {status}: {detail}"),
+            VerdictError::Upstream { status, .. } => write!(f, "upstream returned {status}"),
+            VerdictError::Unreachable(e) => write!(f, "upstream unreachable: {e}"),
+            VerdictError::Timeout(t) => write!(f, "upstream call timed out after {t:?}"),
+            VerdictError::BadBody(e) => write!(f, "upstream returned invalid JSON: {e}"),
+            VerdictError::NoLogprobs(e) | VerdictError::NoLabel(e) => f.write_str(e),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -409,18 +483,9 @@ async fn one_call(
     call: &QuestionCall,
     variant: Variant,
     timeout: Duration,
-) -> Result<QuestionSuccess, String> {
+) -> Result<QuestionSuccess, VerdictError> {
     let first = one_attempt(http, url, api_key, headers, call, variant, timeout).await;
-    // "backend returned …" covers a 200 with missing or empty logprobs —
-    // observed live from a crash-looping replica behind a load balancer that
-    // answers with degenerate bodies. A backend that genuinely lacks logprobs
-    // support pays one extra doomed call on a path that already fails.
-    let transient = matches!(&first,
-        Err(e) if e.contains("upstream returned 5")
-            || e.contains("unreachable")
-            || e.contains("invalid JSON")
-            || e.contains("backend returned"));
-    if transient {
+    if first.as_ref().is_err_and(VerdictError::is_transient) {
         tokio::time::sleep(TRANSIENT_RETRY_BACKOFF).await;
         if let Ok(success) = one_attempt(http, url, api_key, headers, call, variant, timeout).await
         {
@@ -440,7 +505,7 @@ async fn one_attempt(
     call: &QuestionCall,
     variant: Variant,
     timeout: Duration,
-) -> Result<QuestionSuccess, String> {
+) -> Result<QuestionSuccess, VerdictError> {
     let fut = async {
         let body = call.body(variant);
         let mut req = http.post(url).headers(headers.clone()).json(&body);
@@ -452,26 +517,27 @@ async fn one_attempt(
         let resp = req
             .send()
             .await
-            .map_err(|e| format!("upstream unreachable: {e}"))?;
+            .map_err(|e| VerdictError::Unreachable(e.without_url().to_string()))?;
         let status = resp.status();
         if !status.is_success() {
             // The backend's own message says why (a 400 for too many images,
             // a context overflow); the status alone does not.
             let detail = upstream_error_detail(&resp.text().await.unwrap_or_default());
-            return Err(match detail {
-                Some(detail) => format!("upstream returned {status}: {detail}"),
-                None => format!("upstream returned {status}"),
+            return Err(VerdictError::Upstream {
+                status: status.as_u16(),
+                detail,
             });
         }
         let completion: serde_json::Value = resp
             .json()
             .await
-            .map_err(|e| format!("upstream returned invalid JSON: {e}"))?;
+            .map_err(|e| VerdictError::BadBody(e.without_url().to_string()))?;
         let entries = if variant.is_splice() {
-            answers::parse_completions_top_logprobs(&completion)?
+            answers::parse_completions_top_logprobs(&completion)
         } else {
-            answers::parse_top_logprobs(&completion)?
-        };
+            answers::parse_top_logprobs(&completion)
+        }
+        .map_err(VerdictError::NoLogprobs)?;
         let input_tokens = completion
             .pointer("/usage/prompt_tokens")
             .and_then(|v| v.as_u64())
@@ -490,7 +556,7 @@ async fn one_attempt(
     };
     match tokio::time::timeout(timeout, fut).await {
         Ok(result) => result,
-        Err(_) => Err(format!("upstream call timed out after {timeout:?}")),
+        Err(_) => Err(VerdictError::Timeout(timeout)),
     }
 }
 
@@ -643,14 +709,19 @@ async fn handler_inner(
         Ok(b) => b,
         Err(_) => return error_json(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
     };
-    let json: serde_json::Value = match serde_json::from_slice(&body_bytes) {
-        Ok(v) => v,
-        Err(_) => return error_json(StatusCode::BAD_REQUEST, "invalid JSON body"),
-    };
-    let request: types::VerdictsRequest = match serde_json::from_value(json.clone()) {
+    let request: types::VerdictsRequest = match serde_json::from_slice(&body_bytes) {
         Ok(r) => r,
+        Err(e) if e.is_syntax() || e.is_eof() => {
+            return error_json(StatusCode::BAD_REQUEST, "invalid JSON body")
+        }
         Err(e) => return error_json(StatusCode::BAD_REQUEST, &format!("invalid request: {e}")),
     };
+    // The few fields the request log reads, without a second tree of the whole
+    // body: the bytes and the full tree are gone before admission.
+    let json = serde_json::from_slice::<types::Envelope>(&body_bytes)
+        .map(types::Envelope::into_value)
+        .unwrap_or(serde_json::Value::Null);
+    drop(body_bytes);
     if let Err(msg) = types::validate(&request) {
         return error_json(StatusCode::BAD_REQUEST, &msg);
     }
@@ -996,28 +1067,9 @@ async fn handler_inner(
     }
 
     // ---- token budget reserve + term gates ----
-    // Same semantics as the passthrough pipeline (see proxy.rs, "token budget
-    // reserve + cumulative term gate"): key-level gate first, then the tenant
-    // reserve; term exhaustion is 403, rate limiting 429, Redis failure obeys
-    // `fail_open`.
-    let capacity = resolved.tokens_per_minute.max(0);
-    let now = chrono::Utc::now();
-    let term_period = term_period_key(&resolved, now);
-    let term_gate = term_period
-        .as_deref()
-        .map(|period_key| obleth_redis::TermGate {
-            period_key,
-            budget_tokens: resolved.budget_tokens,
-            budget_cost_usd: resolved.budget_cost_usd,
-        });
-    let key_term_period = key_term_period_key(&resolved, now);
-    let key_term_gate = key_term_period
-        .as_deref()
-        .map(|period_key| obleth_redis::TermGate {
-            period_key,
-            budget_tokens: resolved.key_budget_tokens,
-            budget_cost_usd: resolved.key_budget_cost_usd,
-        });
+    // The passthrough pipeline's own reservation (`proxy::reserve_budget`):
+    // key-level gate first, then the tenant reserve; term exhaustion is 403,
+    // rate limiting 429, Redis failure obeys `fail_open`.
     let refuse = |status: StatusCode, msg: &str| {
         reject(
             &state,
@@ -1035,115 +1087,23 @@ async fn handler_inner(
         );
         error_json(status, msg)
     };
-    // Reserve-then-reconcile, as in the passthrough pipeline: an admitted
+    // Reserve-then-reconcile, through the pipeline's own helper: an admitted
     // request holds its estimate against each term cap until settlement.
     let est_cost = proxy::estimated_cost(est, in_cost_rate, out_cost_rate, 0.0);
-    let mut key_term_held = false;
-    let mut tenant_term_held = false;
-    let mut key_hold: Option<proxy::PendingTermHold> = None;
-    if let Some(gate) = key_term_gate {
-        match state
-            .redis
-            .reserve_with_term(&resolved.key_id, 0, 0, est.total(), Some(gate), est_cost)
-            .await
-        {
-            Ok(obleth_redis::ReserveOutcome::Reserved { .. }) => {
-                key_term_held = true;
-                key_hold = key_term_period.clone().map(|period| {
-                    proxy::PendingTermHold::new(&state, resolved.key_id, period, est, est_cost)
-                });
+    let reserved = match proxy::reserve_budget(&state, &resolved, &model, est, est_cost).await {
+        Ok(reserved) => reserved,
+        Err(refusal) => {
+            drop(permit);
+            if refusal.ledger {
+                return refuse(refusal.status, refusal.message);
             }
-            Ok(obleth_redis::ReserveOutcome::RateLimited { .. }) => {}
-            Ok(obleth_redis::ReserveOutcome::TermExhausted {
-                used_tokens,
-                used_cost,
-            }) => {
-                drop(permit);
-                state.alerts.issue(
-                    format!("key_term_budget_exhausted:{}", resolved.key_id),
-                    "API key term budget exhausted",
-                    format!(
-                        "tenant `{}` key `{}` blocked: used {used_tokens} tokens / ${used_cost:.4} against caps tokens={:?} cost={:?}",
-                        resolved.tenant_name,
-                        resolved.key_id,
-                        resolved.key_budget_tokens,
-                        resolved.key_budget_cost_usd,
-                    ),
-                );
-                return refuse(StatusCode::FORBIDDEN, "api key term budget exhausted");
-            }
-            Err(e) => {
-                if !state.fail_open {
-                    drop(permit);
-                    return error_json(StatusCode::SERVICE_UNAVAILABLE, "key budget check failed");
-                }
-                tracing::warn!(error = %e, "key budget reserve failed; failing open");
-            }
+            return error_json(refusal.status, refusal.message);
         }
-    }
-    let tenant_gate_armed = term_gate.is_some();
-    if capacity > 0 || tenant_gate_armed {
-        match state
-            .redis
-            .reserve_with_term(
-                &resolved.tenant_id,
-                capacity,
-                resolved.tokens_per_minute,
-                est.total(),
-                term_gate,
-                est_cost,
-            )
-            .await
-        {
-            Ok(obleth_redis::ReserveOutcome::Reserved { .. }) => {
-                tenant_term_held = tenant_gate_armed;
-            }
-            Ok(obleth_redis::ReserveOutcome::RateLimited { .. }) => {
-                drop(permit);
-                if let Some(hold) = key_hold.take() {
-                    hold.release().await;
-                }
-                return refuse(StatusCode::TOO_MANY_REQUESTS, "token budget exceeded");
-            }
-            Ok(obleth_redis::ReserveOutcome::TermExhausted {
-                used_tokens,
-                used_cost,
-            }) => {
-                drop(permit);
-                if let Some(hold) = key_hold.take() {
-                    hold.release().await;
-                }
-                state.alerts.issue(
-                    format!("term_budget_exhausted:{}", resolved.tenant_id),
-                    "Tenant term budget exhausted",
-                    format!(
-                        "tenant `{}` blocked: used {used_tokens} tokens / ${used_cost:.4} against caps tokens={:?} cost={:?}",
-                        resolved.tenant_name,
-                        resolved.budget_tokens,
-                        resolved.budget_cost_usd,
-                    ),
-                );
-                return refuse(StatusCode::FORBIDDEN, "tenant term budget exhausted");
-            }
-            Err(e) => {
-                if !state.fail_open {
-                    drop(permit);
-                    if let Some(hold) = key_hold.take() {
-                        hold.release().await;
-                    }
-                    return error_json(StatusCode::SERVICE_UNAVAILABLE, "budget check failed");
-                }
-                tracing::warn!(error = %e, "budget reserve failed; failing open");
-            }
-        }
-    }
-    if let Some(hold) = key_hold.take() {
-        hold.hand_off();
-    }
+    };
 
     // Every exit from here settles through `settle_guard` exactly once; a
     // client that leaves mid fan-out settles as unbilled 499 and refunds.
-    let accounting = proxy::StreamAccounting {
+    let mut accounting = proxy::StreamAccounting {
         state: state.clone(),
         request_id,
         resolved: resolved.clone(),
@@ -1154,18 +1114,14 @@ async fn handler_inner(
         queue_wait_ms,
         request_start,
         cache_status: "off".to_string(),
-        capacity,
-        term_period: term_period.clone(),
-        key_term_period: key_term_period.clone(),
+        capacity: reserved.capacity,
+        term_period: reserved.term_period,
+        key_term_period: reserved.key_term_period,
         in_cost_rate,
         out_cost_rate,
         modality_cost: 0.0,
         energy: request_energy,
-        holds: proxy::TermHolds {
-            tenant: tenant_term_held,
-            key: key_term_held,
-            est_cost,
-        },
+        holds: reserved.holds,
     };
     let mut settle_guard = accounting.unbilled_guard();
 
@@ -1236,7 +1192,7 @@ async fn handler_inner(
     let mut verdicts_map: BTreeMap<String, types::Verdict> = BTreeMap::new();
     let mut usage = types::Usage::default();
     let mut ttft_ms = u32::MAX;
-    let mut failure: Option<String> = None;
+    let mut failure: Option<(String, VerdictError)> = None;
     for outcome in &outcomes {
         ttft_ms = ttft_ms.min(outcome.duration_ms);
         let (status, attrs) = match &outcome.result {
@@ -1285,29 +1241,26 @@ async fn handler_inner(
                         ("ok", attrs)
                     }
                     Err(reason) => {
-                        if failure.is_none() {
-                            failure = Some(format!(
-                                "question '{}' on model '{model}': {reason}",
-                                outcome.id
-                            ));
-                        }
-                        ("error", serde_json::json!({ "error": reason }))
+                        let error = VerdictError::NoLabel(reason);
+                        let attrs = serde_json::json!({ "error": error.to_string() });
+                        failure.get_or_insert_with(|| (outcome.id.clone(), error));
+                        ("error", attrs)
                     }
                 }
             }
-            Err(reason) => {
-                if failure.is_none() {
-                    failure = Some(format!(
-                        "question '{}' on model '{model}': {reason}",
-                        outcome.id
-                    ));
-                }
-                ("error", serde_json::json!({ "error": reason }))
+            Err(error) => {
+                let attrs = serde_json::json!({ "error": error.to_string() });
+                failure.get_or_insert_with(|| (outcome.id.clone(), error.clone()));
+                ("error", attrs)
             }
         };
         if let Some(ref mut t) = tracer {
+            // One span name per question call; the id is an attribute, so a
+            // caller's id never names a span.
+            let mut attrs = attrs;
+            attrs["question_id"] = serde_json::Value::String(outcome.id.clone());
             t.record(
-                &format!("verdict:q:{}", outcome.id),
+                "verdict:question",
                 "proxy_request",
                 outcome.start_ms,
                 outcome.duration_ms,
@@ -1321,7 +1274,12 @@ async fn handler_inner(
     }
     usage.total_tokens = usage.prompt_tokens.saturating_add(usage.completion_tokens);
     let total_ms = request_start.elapsed().as_millis() as u32;
-    let status_code: u16 = if failure.is_some() { 502 } else { 200 };
+    let failed = failure.map(|(id, error)| {
+        let message = format!("question '{id}' on model '{model}': {error}");
+        accounting.fail(error.class(), &message);
+        (error.status(), message)
+    });
+    let status_code: u16 = failed.as_ref().map_or(200, |(status, _)| status.as_u16());
 
     let _ = settle_guard
         .complete(accounting.settle(
@@ -1333,8 +1291,8 @@ async fn handler_inner(
         ))
         .await;
 
-    if let Some(msg) = failure {
-        return error_json(StatusCode::BAD_GATEWAY, &msg);
+    if let Some((status, msg)) = failed {
+        return error_json(status, &msg);
     }
     if let Some(t) = tracer.take() {
         t.finish("ok");
@@ -1595,11 +1553,17 @@ mod tests {
         .await;
         let by_id = |id: &str| outcomes.iter().find(|o| o.id == id).unwrap();
         assert!(by_id("ok").result.is_ok());
-        assert!(by_id("bad").result.as_ref().unwrap_err().contains("500"));
+        assert!(by_id("bad")
+            .result
+            .as_ref()
+            .unwrap_err()
+            .to_string()
+            .contains("500"));
         assert!(by_id("nolp")
             .result
             .as_ref()
             .unwrap_err()
+            .to_string()
             .contains("no logprobs"));
     }
 
@@ -1619,7 +1583,7 @@ mod tests {
         .await;
         let err = outcomes[0].result.as_ref().unwrap_err();
         assert!(
-            err.contains("unreachable") || err.contains("timed out"),
+            err.to_string().contains("unreachable") || err.to_string().contains("timed out"),
             "unexpected error: {err}"
         );
     }
@@ -2044,6 +2008,10 @@ mod tests {
 
 #[cfg(test)]
 mod settlement_tests {
+    use super::VerdictError;
+    use axum::http::StatusCode;
+    use std::time::Duration;
+
     /// The handler's source with all whitespace removed. There is no AppState
     /// harness here (it needs live Redis), so the reservation contract is
     /// pinned at the source level, like the passthrough pipeline's.
@@ -2062,21 +2030,17 @@ mod settlement_tests {
         let h = handler();
         assert!(!h.contains("reserve_budget_with_term("), "check-only gate");
         assert!(!h.contains("settle_request("), "unguarded settlement");
-        assert!(
-            h.contains(".reserve_with_term(&resolved.key_id,0,0,est.total(),Some(gate),est_cost)")
-        );
-        let tenant = h
-            .find(".reserve_with_term(&resolved.tenant_id,")
-            .expect("tenant reserve");
+        // The reservation is the pipeline's own, so the two cannot drift.
+        let reserve = h
+            .find("proxy::reserve_budget(&state,&resolved,&model,est,est_cost)")
+            .expect("shared reserve");
         let guard = h
             .find("letmutsettle_guard=accounting.unbilled_guard();")
             .expect("guard");
-        assert!(tenant < guard);
+        assert!(reserve < guard);
+        assert!(h[reserve..guard].contains("ifrefusal.ledger{returnrefuse("));
         // Once the questions go to the model, a caller that hangs up pays for the prompt.
         assert!(h[guard..].contains("accounting.arm_dispatched(&mutsettle_guard);"));
-        // Rate limited, term exhausted, and fail-closed error release the key hold.
-        assert_eq!(h[tenant..guard].matches("hold.release().await").count(), 3);
-        assert!(h[tenant..guard].contains("hold.hand_off()"));
         // No legacy ledger-only rejection after the reservation owns budget.
         assert!(!h[guard..].contains("returnrefuse("));
         assert_eq!(h[guard..].matches("settle_guard.complete(").count(), 2);
@@ -2096,6 +2060,78 @@ mod settlement_tests {
         // A block answers with the policy's status; a redaction is read back.
         assert!(h[scan..estimate].contains("returnerror_json(block.status,block.reason);"));
         assert!(h[scan..estimate].contains("system=texts[0].clone();"));
+    }
+
+    #[test]
+    /// Each failure kind is answered with its own status and classed in the
+    /// ledger; only the kinds a second attempt can mend are transient.
+    fn each_verdict_error_has_a_status_a_class_and_a_retry_rule() {
+        use obleth_config::ErrorClass;
+        let cases = [
+            (
+                VerdictError::Upstream {
+                    status: 400,
+                    detail: Some("too many images".into()),
+                },
+                StatusCode::BAD_REQUEST,
+                ErrorClass::ClientInput,
+                false,
+            ),
+            (
+                VerdictError::Upstream {
+                    status: 503,
+                    detail: None,
+                },
+                StatusCode::BAD_GATEWAY,
+                ErrorClass::UpstreamError,
+                true,
+            ),
+            (
+                VerdictError::Unreachable("connection refused".into()),
+                StatusCode::BAD_GATEWAY,
+                ErrorClass::Network,
+                true,
+            ),
+            (
+                VerdictError::Timeout(Duration::from_secs(9)),
+                StatusCode::GATEWAY_TIMEOUT,
+                ErrorClass::UpstreamTimeout,
+                false,
+            ),
+            (
+                VerdictError::BadBody("expected value".into()),
+                StatusCode::BAD_GATEWAY,
+                ErrorClass::UpstreamError,
+                true,
+            ),
+            (
+                VerdictError::NoLogprobs("backend returned an empty `top_logprobs` list".into()),
+                StatusCode::BAD_GATEWAY,
+                ErrorClass::UpstreamError,
+                true,
+            ),
+            (
+                VerdictError::NoLabel("model produced no recognizable answer label".into()),
+                StatusCode::BAD_GATEWAY,
+                ErrorClass::UpstreamError,
+                false,
+            ),
+        ];
+        for (error, status, class, transient) in cases {
+            assert_eq!(
+                (error.status(), error.class(), error.is_transient()),
+                (status, class, transient),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            VerdictError::Upstream {
+                status: 400,
+                detail: Some("too many images".into())
+            }
+            .to_string(),
+            "upstream returned 400: too many images"
+        );
     }
 
     #[test]

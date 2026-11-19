@@ -396,7 +396,10 @@ mod tests {
     fn failed_outcome(id: &str) -> QuestionOutcome {
         QuestionOutcome {
             id: id.to_string(),
-            result: Err("upstream returned 500".to_string()),
+            result: Err(crate::verdicts::VerdictError::Upstream {
+                status: 500,
+                detail: None,
+            }),
             start_ms: 0,
             duration_ms: 1,
         }
