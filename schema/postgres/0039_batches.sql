@@ -10,7 +10,7 @@
 -- are read from the batch's items when downloaded.
 --
 -- Only state lives here. The bytes (input files, answers) are in the object
--- store named by OBLETH_BATCH_BUCKET: a file as chunk objects, an item as its
+-- store (OBLETH_S3_BUCKET), under batches/: a file as chunk objects, an item as its
 -- place in its input file, an answer as its size. The gateway deletes an input
 -- file when its batch ends, and a batch with its answers once it has been
 -- over for OBLETH_BATCH_RETENTION; objects first, then the rows naming them.

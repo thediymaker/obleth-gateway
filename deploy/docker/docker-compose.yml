@@ -126,13 +126,13 @@ services:
       OBLETH_SESSION_ID_DERIVATION: ${OBLETH_SESSION_ID_DERIVATION:-true}
       # GET /v1/load: each model's live load for callers. false answers 404.
       OBLETH_LOAD_ENDPOINT: ${OBLETH_LOAD_ENDPOINT:-true}
-      # The OpenAI Files and Batches APIs, run at background priority. They
-      # need an S3-compatible bucket (s3://<bucket>[/<prefix>]); empty = off.
-      OBLETH_BATCH_BUCKET: ${OBLETH_BATCH_BUCKET:-}
-      AWS_ENDPOINT_URL: ${AWS_ENDPOINT_URL:-}
-      AWS_REGION: ${AWS_REGION:-}
-      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
-      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      # Object storage: an S3 or S3-compatible bucket; empty = off. The Files
+      # and Batches APIs (background priority) are on while it is.
+      OBLETH_S3_BUCKET: ${OBLETH_S3_BUCKET:-}
+      OBLETH_S3_ENDPOINT: ${OBLETH_S3_ENDPOINT:-}
+      OBLETH_S3_REGION: ${OBLETH_S3_REGION:-}
+      OBLETH_S3_ACCESS_KEY_ID: ${OBLETH_S3_ACCESS_KEY_ID:-}
+      OBLETH_S3_SECRET_ACCESS_KEY: ${OBLETH_S3_SECRET_ACCESS_KEY:-}
       OBLETH_BATCH_RETENTION: ${OBLETH_BATCH_RETENTION:-24h}
       OBLETH_BATCH_MAX_SHARE: ${OBLETH_BATCH_MAX_SHARE:-0.75}
       # Boot-time seed only; the dashboard's routing settings win once saved.

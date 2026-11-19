@@ -1,5 +1,5 @@
 -- Idempotent: safe to re-run.
--- Batch bytes moved from Postgres to object storage (OBLETH_BATCH_BUCKET): an
+-- Batch bytes moved from Postgres to object storage (OBLETH_S3_BUCKET): an
 -- item keeps its place in the input file instead of a copy of its request, an
 -- answer keeps only its size, and file contents are no longer stored here.
 -- Batches stored the old way can neither run nor be read the new way, so they

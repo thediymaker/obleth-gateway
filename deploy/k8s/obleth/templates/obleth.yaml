@@ -108,14 +108,14 @@ spec:
             - { name: OBLETH_VIDEO_JOB_RETENTION_HOURS, value: {{ .Values.obleth.videoJobRetentionHours | quote }} }
             - { name: OBLETH_VIDEO_JOB_SCOPE, value: {{ .Values.obleth.videoJobScope | default "key" | quote }} }
             - { name: OBLETH_LOAD_ENDPOINT, value: {{ .Values.obleth.loadEndpoint | quote }} }
-            {{- with .Values.obleth.batches }}
-            {{- if .bucket }}
-            - { name: OBLETH_BATCH_BUCKET, value: {{ .bucket | quote }} }
+            {{- with .Values.obleth.objectStorage }}
+            {{- if .enabled }}
+            - { name: OBLETH_S3_BUCKET, value: {{ required "obleth.objectStorage.bucket is required when objectStorage is enabled" .bucket | quote }} }
             {{- with .endpoint }}
-            - { name: AWS_ENDPOINT_URL, value: {{ . | quote }} }
+            - { name: OBLETH_S3_ENDPOINT, value: {{ . | quote }} }
             {{- end }}
             {{- with .region }}
-            - { name: AWS_REGION, value: {{ . | quote }} }
+            - { name: OBLETH_S3_REGION, value: {{ . | quote }} }
             {{- end }}
             {{- end }}
             {{- end }}
@@ -138,9 +138,9 @@ spec:
           envFrom:
             - secretRef:
                 name: {{ include "obleth.secretName" . }}
-            {{- with .Values.obleth.batches.credentialsSecret }}
+            {{- if .Values.obleth.objectStorage.enabled }}
             - secretRef:
-                name: {{ . }}
+                name: {{ required "obleth.objectStorage.existingSecret is required when objectStorage is enabled: a Secret with OBLETH_S3_ACCESS_KEY_ID and OBLETH_S3_SECRET_ACCESS_KEY" .Values.obleth.objectStorage.existingSecret }}
             {{- end }}
           volumeMounts:
             - { name: wal, mountPath: /var/lib/obleth }

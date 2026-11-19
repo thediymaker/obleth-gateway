@@ -15,10 +15,11 @@
 //! DELETE /v1/batches/{id}           delete a stopped batch (obleth extension)
 //! ```
 //!
-//! Batches need an S3-compatible bucket (`OBLETH_BATCH_BUCKET`, see
-//! [`bucket`]); without one these routes are not served. The bytes live
-//! there: an uploaded file as 4 MiB chunk objects, written as the upload
-//! arrives, and each answer as one object. Postgres keeps only state.
+//! Batches need the gateway's object store (`OBLETH_S3_BUCKET`, see
+//! [`crate::object_store`]); without one these routes are not served. The
+//! bytes live there under `batches/`: an uploaded file as 4 MiB chunk
+//! objects, written as the upload arrives, and each answer as one object.
+//! Postgres keeps only state.
 //!
 //! A batch is checked line by line when it is created; each line becomes an
 //! item in Postgres that records where the request is in the input file. The
@@ -42,8 +43,6 @@
 // Handlers answer `Result<Response, Response>`: the error is the response.
 #![allow(clippy::result_large_err)]
 
-mod bucket;
-
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -61,11 +60,11 @@ use obleth_store::batches::{
 use obleth_store::JobOwner;
 use uuid::Uuid;
 
+use crate::object_store::{ObjectError, ObjectStore};
 use crate::proxy::{
     error_json, invalid_request, read_body, BackgroundShare, BodyTooLarge, PipelineInput,
 };
 use crate::state::AppState;
-use bucket::{Bucket, BucketError};
 
 /// Endpoints a batch may target. Each runs down the pipeline unchanged.
 pub(crate) const BATCH_ENDPOINTS: &[&str] =
@@ -269,13 +268,13 @@ pub(crate) fn parse_window(raw: &str) -> Option<Duration> {
 #[derive(Clone)]
 pub struct Batches {
     store: obleth_store::Store,
-    bucket: Bucket,
+    bucket: ObjectStore,
     cfg: Arc<BatchConfig>,
 }
 
 /// The object holding chunk `seq` of uploaded file `file_id`.
 fn chunk_key(file_id: &str, seq: u64) -> String {
-    format!("files/{file_id}/{seq:05}")
+    format!("batches/files/{file_id}/{seq:05}")
 }
 
 /// Chunk objects a file of `bytes` is stored in.
@@ -287,60 +286,24 @@ fn chunk_count(bytes: i64) -> u64 {
 /// attempt is part of the name so a runner whose lease lapsed cannot
 /// overwrite the answer the item was finished with.
 fn result_key(batch_id: &str, line: i32, attempt: i32) -> String {
-    format!("results/{batch_id}/{line}.{attempt}")
+    format!("batches/results/{batch_id}/{line}.{attempt}")
 }
 
 impl Batches {
-    /// Batches with their bucket from the environment; `None`, with the
-    /// reason logged, when `OBLETH_BATCH_BUCKET` is unset or unusable.
-    pub fn from_env(store: obleth_store::Store) -> Option<Self> {
-        match Bucket::from_env() {
-            Ok(Some(bucket)) => Some(Batches::new(store, bucket, BatchConfig::from_env())),
-            Ok(None) => {
-                tracing::info!(
-                    "batches off: set OBLETH_BATCH_BUCKET to an S3 bucket to serve /v1/files and /v1/batches"
-                );
-                None
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "batches off: the batch bucket is not usable");
-                None
-            }
-        }
-    }
-
-    fn new(store: obleth_store::Store, bucket: Bucket, cfg: BatchConfig) -> Self {
+    /// Batches keeping their bytes in `bucket`, with settings from the
+    /// environment.
+    pub(crate) fn new(store: obleth_store::Store, bucket: ObjectStore) -> Self {
         Batches {
             store,
             bucket,
-            cfg: Arc::new(cfg),
+            cfg: Arc::new(BatchConfig::from_env()),
         }
-    }
-
-    /// Where the bytes go, for logs.
-    pub fn storage(&self) -> String {
-        self.bucket.describe()
-    }
-
-    /// Check the bucket in the background: a write, a read and a delete. A
-    /// failure is logged; the routes stay up and answer 503 while it lasts.
-    pub fn spawn_storage_check(&self) {
-        let bucket = self.bucket.clone();
-        tokio::spawn(async move {
-            match bucket.check().await {
-                Ok(()) => tracing::info!(bucket = %bucket.describe(), "batch bucket reachable"),
-                Err(e) => tracing::error!(
-                    bucket = %bucket.describe(), error = %e,
-                    "batch bucket check failed: uploads, runs and downloads will fail until it works"
-                ),
-            }
-        });
     }
 
     /// Delete `keys`, a few at a time. Every key is tried; the first error,
     /// if any, is returned.
-    async fn delete_objects(&self, keys: Vec<String>) -> Result<(), BucketError> {
-        let errors: Vec<BucketError> = futures_util::stream::iter(keys)
+    async fn delete_objects(&self, keys: Vec<String>) -> Result<(), ObjectError> {
+        let errors: Vec<ObjectError> = futures_util::stream::iter(keys)
             .map(|key| {
                 let bucket = self.bucket.clone();
                 async move { bucket.delete(&key).await }
@@ -590,8 +553,8 @@ fn is_size_error(e: &multer::Error) -> bool {
     )
 }
 
-fn storage_error(e: &BucketError) -> Response<Body> {
-    tracing::warn!(error = %e, "batch bucket request failed");
+fn storage_error(e: &ObjectError) -> Response<Body> {
+    tracing::warn!(error = %e, "object store request failed");
     error_json(
         StatusCode::SERVICE_UNAVAILABLE,
         "batch storage is unavailable; try again shortly",
@@ -961,7 +924,7 @@ fn output_body(batches: &Batches, batch_id: String, which: BatchOutput) -> Body 
 /// continue after; `None` past the end.
 async fn output_page(
     store: &obleth_store::Store,
-    bucket: &Bucket,
+    bucket: &ObjectStore,
     batch_id: &str,
     which: BatchOutput,
     after: i32,
@@ -989,7 +952,7 @@ async fn output_page(
                 };
                 match bucket.get(&key).await {
                     Ok(b) => Ok(Some(b)),
-                    Err(BucketError::NotFound) => {
+                    Err(ObjectError::NotFound) => {
                         tracing::warn!(key = %key, "a batch answer's object is missing");
                         Ok(None)
                     }
@@ -1365,7 +1328,7 @@ pub(crate) fn parse_input(
 /// Reads an uploaded file line by line from its chunk objects, holding one
 /// chunk and a partial line at a time.
 struct LineReader {
-    bucket: Bucket,
+    bucket: ObjectStore,
     file_id: String,
     chunks: u64,
     seq: u64,
@@ -1376,7 +1339,7 @@ struct LineReader {
 }
 
 impl LineReader {
-    fn new(bucket: Bucket, file: &BatchFile) -> Self {
+    fn new(bucket: ObjectStore, file: &BatchFile) -> Self {
         LineReader {
             bucket,
             file_id: file.id.clone(),
@@ -1390,7 +1353,7 @@ impl LineReader {
 
     /// The next line without its newline, with its byte offset in the file;
     /// `None` at the end of the file.
-    async fn next_line(&mut self) -> Result<Option<(i64, Vec<u8>)>, BucketError> {
+    async fn next_line(&mut self) -> Result<Option<(i64, Vec<u8>)>, ObjectError> {
         loop {
             let offset = self.buf_offset + self.start as i64;
             if let Some(pos) = self.buf[self.start..].iter().position(|b| *b == b'\n') {
@@ -1419,11 +1382,11 @@ impl LineReader {
 /// The request at `offset` (`length` bytes) of an uploaded file, read from
 /// the chunk objects it falls in.
 async fn read_request(
-    bucket: &Bucket,
+    bucket: &ObjectStore,
     file_id: &str,
     offset: i64,
     length: i32,
-) -> Result<Vec<u8>, BucketError> {
+) -> Result<Vec<u8>, ObjectError> {
     let chunk = CHUNK_BYTES as u64;
     let (mut pos, end) = (offset as u64, offset as u64 + length.max(0) as u64);
     let mut out = Vec::with_capacity(length.max(0) as usize);
@@ -2066,7 +2029,7 @@ async fn run_item(
     .await
     {
         Ok(raw) => raw,
-        Err(BucketError::NotFound) => {
+        Err(ObjectError::NotFound) => {
             let _ = store
                 .fail_batch_item(
                     &batch.id,
@@ -2412,12 +2375,12 @@ mod tests {
 
     #[test]
     fn objects_are_named_by_file_chunk_and_answer_attempt() {
-        assert_eq!(chunk_key("file-1", 3), "files/file-1/00003");
+        assert_eq!(chunk_key("file-1", 3), "batches/files/file-1/00003");
         assert_eq!(chunk_count(0), 0);
         assert_eq!(chunk_count(1), 1);
         assert_eq!(chunk_count(CHUNK_BYTES as i64), 1);
         assert_eq!(chunk_count(CHUNK_BYTES as i64 + 1), 2);
-        assert_eq!(result_key("batch_x", 7, 2), "results/batch_x/7.2");
+        assert_eq!(result_key("batch_x", 7, 2), "batches/results/batch_x/7.2");
     }
 
     #[test]

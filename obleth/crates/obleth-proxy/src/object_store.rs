@@ -1,11 +1,12 @@
-//! The bucket batches keep their files and answers in: a small S3 client
-//! (put, get, ranged get, delete) signed with AWS Signature Version 4, for
-//! S3 and S3-compatible stores, using path-style addresses
-//! (`<endpoint>/<bucket>/<key>`).
+//! The gateway's object store: one S3 or S3-compatible bucket for bytes that
+//! do not belong in Postgres. Each feature keeps its objects under its own
+//! key prefix (batches use `batches/`).
 //!
-//! Configured with `OBLETH_BATCH_BUCKET=s3://<bucket>[/<prefix>]` and the
-//! standard `AWS_ENDPOINT_URL`, `AWS_REGION`, `AWS_ACCESS_KEY_ID` and
-//! `AWS_SECRET_ACCESS_KEY`.
+//! A small client (put, get, ranged get, delete) signed with AWS Signature
+//! Version 4, using path-style addresses (`<endpoint>/<bucket>/<key>`).
+//! Configured with `OBLETH_S3_BUCKET`, `OBLETH_S3_ENDPOINT`,
+//! `OBLETH_S3_REGION`, `OBLETH_S3_ACCESS_KEY_ID` and
+//! `OBLETH_S3_SECRET_ACCESS_KEY`; setting the bucket turns it on.
 
 use std::fmt;
 use std::time::Duration;
@@ -28,7 +29,7 @@ fn transfer_time(bytes: usize) -> Duration {
 }
 
 #[derive(Debug)]
-pub(crate) enum BucketError {
+pub(crate) enum ObjectError {
     /// The object does not exist.
     NotFound,
     /// The store answered with an error status.
@@ -37,34 +38,35 @@ pub(crate) enum BucketError {
     Transport(String),
 }
 
-impl fmt::Display for BucketError {
+impl fmt::Display for ObjectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            BucketError::NotFound => write!(f, "object not found"),
-            BucketError::Status(code, body) => write!(f, "object store answered {code}: {body}"),
-            BucketError::Transport(e) => write!(f, "object store unreachable: {e}"),
+            ObjectError::NotFound => write!(f, "object not found"),
+            ObjectError::Status(code, body) => write!(f, "object store answered {code}: {body}"),
+            ObjectError::Transport(e) => write!(f, "object store unreachable: {e}"),
         }
     }
 }
 
-impl BucketError {
+impl ObjectError {
     fn retryable(&self) -> bool {
         match self {
-            BucketError::NotFound => false,
-            BucketError::Status(code, _) => *code == 429 || *code >= 500,
-            BucketError::Transport(_) => true,
+            ObjectError::NotFound => false,
+            ObjectError::Status(code, _) => *code == 429 || *code >= 500,
+            ObjectError::Transport(_) => true,
         }
     }
 }
 
 #[derive(Clone)]
-pub(crate) struct Bucket {
+pub(crate) struct ObjectStore {
     http: reqwest::Client,
     endpoint: reqwest::Url,
     /// `host[:port]` as the request sends it, for signing.
     host: String,
     bucket: String,
-    /// Prepended to every key, without slashes at either end; may be empty.
+    /// Prepended to every key, without slashes at either end. Empty but in
+    /// tests, which each work under a prefix of their own.
     prefix: String,
     region: String,
     access_key: String,
@@ -78,88 +80,89 @@ fn env(name: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-/// `s3://<bucket>[/<prefix>]` as (bucket, prefix).
-fn parse_location(raw: &str) -> Result<(String, String), String> {
-    let rest = raw
-        .trim()
-        .strip_prefix("s3://")
-        .ok_or("OBLETH_BATCH_BUCKET must look like s3://<bucket>[/<prefix>]")?;
-    let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
-    let bucket_ok = (3..=63).contains(&bucket.len())
+/// S3's rule for bucket names, short of the corner cases: 3-63 lower-case
+/// letters, digits, '-' and '.'.
+fn check_bucket_name(bucket: &str) -> Result<(), String> {
+    let ok = (3..=63).contains(&bucket.len())
         && bucket
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.');
-    if !bucket_ok {
-        return Err(format!(
-            "OBLETH_BATCH_BUCKET: {bucket:?} is not a bucket name (3-63 lower-case letters, digits, '-' or '.')"
-        ));
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "OBLETH_S3_BUCKET: {bucket:?} is not a bucket name (3-63 lower-case letters, digits, '-' or '.')"
+        ))
     }
-    let prefix = prefix.trim_matches('/');
-    if !prefix
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
-    {
-        return Err(format!(
-            "OBLETH_BATCH_BUCKET: the prefix {prefix:?} may hold only letters, digits, '-', '_', '.' and '/'"
-        ));
-    }
-    Ok((bucket.to_string(), prefix.to_string()))
 }
 
-impl Bucket {
-    /// The bucket from the environment: `None` when `OBLETH_BATCH_BUCKET` is
+impl ObjectStore {
+    /// The store from the environment: `None` when `OBLETH_S3_BUCKET` is
     /// unset, an error when it is set but the rest of the settings are not
-    /// usable.
+    /// usable. Without `OBLETH_S3_ENDPOINT` the bucket is on AWS.
     pub(crate) fn from_env() -> Result<Option<Self>, String> {
-        let Some(location) = env("OBLETH_BATCH_BUCKET") else {
+        let Some(bucket) = env("OBLETH_S3_BUCKET") else {
             return Ok(None);
         };
-        let (bucket, prefix) = parse_location(&location)?;
-        let region = env("AWS_REGION")
-            .or_else(|| env("AWS_DEFAULT_REGION"))
-            .unwrap_or_else(|| "us-east-1".into());
-        let endpoint = env("AWS_ENDPOINT_URL_S3")
-            .or_else(|| env("AWS_ENDPOINT_URL"))
+        let region = env("OBLETH_S3_REGION").unwrap_or_else(|| "us-east-1".into());
+        let endpoint = env("OBLETH_S3_ENDPOINT")
             .unwrap_or_else(|| format!("https://s3.{region}.amazonaws.com"));
-        let access_key = env("AWS_ACCESS_KEY_ID")
-            .ok_or("OBLETH_BATCH_BUCKET is set but AWS_ACCESS_KEY_ID is not")?;
-        let secret_key = env("AWS_SECRET_ACCESS_KEY")
-            .ok_or("OBLETH_BATCH_BUCKET is set but AWS_SECRET_ACCESS_KEY is not")?;
-        Self::new(&endpoint, bucket, prefix, region, access_key, secret_key).map(Some)
+        let access_key = env("OBLETH_S3_ACCESS_KEY_ID")
+            .ok_or("OBLETH_S3_BUCKET is set but OBLETH_S3_ACCESS_KEY_ID is not")?;
+        let secret_key = env("OBLETH_S3_SECRET_ACCESS_KEY")
+            .ok_or("OBLETH_S3_BUCKET is set but OBLETH_S3_SECRET_ACCESS_KEY is not")?;
+        Self::new(&endpoint, bucket, region, access_key, secret_key).map(Some)
     }
 
     pub(crate) fn new(
         endpoint: &str,
         bucket: String,
-        prefix: String,
         region: String,
         access_key: String,
         secret_key: String,
     ) -> Result<Self, String> {
+        check_bucket_name(&bucket)?;
         let endpoint = reqwest::Url::parse(endpoint)
-            .map_err(|e| format!("AWS_ENDPOINT_URL {endpoint:?} is not a URL: {e}"))?;
+            .map_err(|e| format!("OBLETH_S3_ENDPOINT {endpoint:?} is not a URL: {e}"))?;
         let host = match (endpoint.host_str(), endpoint.port()) {
             (Some(h), Some(p)) => format!("{h}:{p}"),
             (Some(h), None) => h.to_string(),
-            (None, _) => return Err(format!("AWS_ENDPOINT_URL {endpoint} has no host")),
+            (None, _) => return Err(format!("OBLETH_S3_ENDPOINT {endpoint} has no host")),
         };
         if !matches!(endpoint.scheme(), "http" | "https") {
-            return Err(format!("AWS_ENDPOINT_URL {endpoint} must be http or https"));
+            return Err(format!(
+                "OBLETH_S3_ENDPOINT {endpoint} must be http or https"
+            ));
         }
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| format!("object store client: {e}"))?;
-        Ok(Bucket {
+        Ok(ObjectStore {
             http,
             endpoint,
             host,
             bucket,
-            prefix,
+            prefix: String::new(),
             region,
             access_key,
             secret_key,
         })
+    }
+
+    /// Check the store in the background: a write, a read and a delete. The
+    /// outcome is logged; nothing waits for it.
+    pub(crate) fn spawn_check(&self) {
+        let store = self.clone();
+        tokio::spawn(async move {
+            match store.check().await {
+                Ok(()) => tracing::info!(bucket = %store.describe(), "object store reachable"),
+                Err(e) => tracing::error!(
+                    bucket = %store.describe(), error = %e,
+                    "object store check failed: features that keep bytes there will fail until it works"
+                ),
+            }
+        });
     }
 
     /// Where objects go, for logs.
@@ -188,14 +191,14 @@ impl Bucket {
         path
     }
 
-    pub(crate) async fn put(&self, key: &str, body: Bytes) -> Result<(), BucketError> {
+    pub(crate) async fn put(&self, key: &str, body: Bytes) -> Result<(), ObjectError> {
         let timeout = transfer_time(body.len());
         self.send(reqwest::Method::PUT, key, None, body, timeout)
             .await
             .map(drop)
     }
 
-    pub(crate) async fn get(&self, key: &str) -> Result<Bytes, BucketError> {
+    pub(crate) async fn get(&self, key: &str) -> Result<Bytes, ObjectError> {
         self.send(
             reqwest::Method::GET,
             key,
@@ -212,7 +215,7 @@ impl Bucket {
         key: &str,
         start: u64,
         len: u64,
-    ) -> Result<Bytes, BucketError> {
+    ) -> Result<Bytes, ObjectError> {
         if len == 0 {
             return Ok(Bytes::new());
         }
@@ -227,7 +230,7 @@ impl Bucket {
             )
             .await?;
         if bytes.len() as u64 != len {
-            return Err(BucketError::Transport(format!(
+            return Err(ObjectError::Transport(format!(
                 "asked for {len} bytes of {key}, got {}",
                 bytes.len()
             )));
@@ -236,7 +239,7 @@ impl Bucket {
     }
 
     /// Delete `key`; a missing object counts as deleted.
-    pub(crate) async fn delete(&self, key: &str) -> Result<(), BucketError> {
+    pub(crate) async fn delete(&self, key: &str) -> Result<(), ObjectError> {
         match self
             .send(
                 reqwest::Method::DELETE,
@@ -247,21 +250,21 @@ impl Bucket {
             )
             .await
         {
-            Ok(_) | Err(BucketError::NotFound) => Ok(()),
+            Ok(_) | Err(ObjectError::NotFound) => Ok(()),
             Err(e) => Err(e),
         }
     }
 
     /// Write, read back and delete a small object: proves the endpoint, the
     /// credentials and the bucket at startup.
-    pub(crate) async fn check(&self) -> Result<(), BucketError> {
+    pub(crate) async fn check(&self) -> Result<(), ObjectError> {
         let key = format!("check/{}", crate::replicas::instance_id());
-        let probe = Bytes::from_static(b"obleth batch storage check");
+        let probe = Bytes::from_static(b"obleth object store check");
         self.put(&key, probe.clone()).await?;
         let back = self.get(&key).await?;
         self.delete(&key).await?;
         if back != probe {
-            return Err(BucketError::Transport(
+            return Err(ObjectError::Transport(
                 "the object read back differs from the one written".into(),
             ));
         }
@@ -275,7 +278,7 @@ impl Bucket {
         range: Option<&str>,
         body: Bytes,
         timeout: Duration,
-    ) -> Result<Bytes, BucketError> {
+    ) -> Result<Bytes, ObjectError> {
         let mut attempt = 1;
         loop {
             match self
@@ -299,7 +302,7 @@ impl Bucket {
         range: Option<&str>,
         body: Bytes,
         timeout: Duration,
-    ) -> Result<Bytes, BucketError> {
+    ) -> Result<Bytes, ObjectError> {
         let path = self.path(key);
         let payload_hash = hex::encode(Sha256::digest(&body));
         let mut extra = Vec::new();
@@ -334,18 +337,18 @@ impl Bucket {
         let resp = req
             .send()
             .await
-            .map_err(|e| BucketError::Transport(e.to_string()))?;
+            .map_err(|e| ObjectError::Transport(e.to_string()))?;
         let status = resp.status();
         if status == reqwest::StatusCode::NOT_FOUND {
-            return Err(BucketError::NotFound);
+            return Err(ObjectError::NotFound);
         }
         let bytes = resp
             .bytes()
             .await
-            .map_err(|e| BucketError::Transport(e.to_string()))?;
+            .map_err(|e| ObjectError::Transport(e.to_string()))?;
         if !status.is_success() {
             let text = String::from_utf8_lossy(&bytes[..bytes.len().min(300)]).into_owned();
-            return Err(BucketError::Status(status.as_u16(), text));
+            return Err(ObjectError::Status(status.as_u16(), text));
         }
         Ok(bytes)
     }
@@ -468,68 +471,61 @@ mod tests {
     }
 
     #[test]
-    fn locations_name_a_bucket_and_an_optional_prefix() {
-        assert_eq!(
-            parse_location("s3://obleth-batches").unwrap(),
-            ("obleth-batches".into(), "".into())
-        );
-        assert_eq!(
-            parse_location("s3://obleth-batches/prod/").unwrap(),
-            ("obleth-batches".into(), "prod".into())
-        );
-        assert!(parse_location("obleth-batches").is_err());
-        assert!(parse_location("s3://Upper").is_err());
-        assert!(parse_location("s3://ok-bucket/sp ace").is_err());
+    fn bucket_names_follow_the_s3_rule() {
+        assert!(check_bucket_name("obleth-dev").is_ok());
+        assert!(check_bucket_name("Upper").is_err());
+        assert!(check_bucket_name("s3://obleth").is_err());
+        assert!(check_bucket_name("ab").is_err());
     }
 
     #[test]
-    fn paths_are_path_style_under_the_prefix() {
-        let b = Bucket::new(
+    fn paths_are_path_style() {
+        let s = ObjectStore::new(
             "https://store.example:9021/base/",
             "bkt".into(),
-            "p/q".into(),
             "us-east-1".into(),
             "a".into(),
             "s".into(),
         )
         .unwrap();
-        assert_eq!(b.host, "store.example:9021");
-        assert_eq!(b.path("files/f1/00000"), "/base/bkt/p/q/files/f1/00000");
-        assert_eq!(b.describe(), "https://store.example:9021/base/bkt/p/q");
-    }
-
-    /// A bucket for integration tests: `OBLETH_TEST_BUCKET` (s3://...) with
-    /// the usual AWS_* settings, under a fresh prefix. None when unset.
-    pub(crate) fn test_bucket() -> Option<Bucket> {
-        let location = std::env::var("OBLETH_TEST_BUCKET").ok()?;
-        let (bucket, prefix) = parse_location(&location).expect("OBLETH_TEST_BUCKET");
-        let prefix = format!(
-            "{}test-{}",
-            if prefix.is_empty() {
-                String::new()
-            } else {
-                format!("{prefix}/")
-            },
-            uuid::Uuid::new_v4().simple()
+        assert_eq!(s.host, "store.example:9021");
+        assert_eq!(
+            s.path("batches/files/f1/00000"),
+            "/base/bkt/batches/files/f1/00000"
         );
-        Some(
-            Bucket::new(
-                &env("AWS_ENDPOINT_URL").expect("AWS_ENDPOINT_URL"),
-                bucket,
-                prefix,
-                env("AWS_REGION").unwrap_or_else(|| "us-east-1".into()),
-                env("AWS_ACCESS_KEY_ID").expect("AWS_ACCESS_KEY_ID"),
-                env("AWS_SECRET_ACCESS_KEY").expect("AWS_SECRET_ACCESS_KEY"),
-            )
-            .unwrap(),
-        )
+        assert_eq!(s.describe(), "https://store.example:9021/base/bkt");
+        let t = ObjectStore {
+            prefix: "test-1".into(),
+            ..s
+        };
+        assert_eq!(t.path("k"), "/base/bkt/test-1/k");
     }
 
-    /// Integration test; runs only when `OBLETH_TEST_BUCKET` is set.
+    /// A store for integration tests, from `OBLETH_TEST_S3_BUCKET`,
+    /// `OBLETH_TEST_S3_ENDPOINT`, `OBLETH_TEST_S3_ACCESS_KEY_ID` and
+    /// `OBLETH_TEST_S3_SECRET_ACCESS_KEY`, under a fresh prefix so runs do
+    /// not see each other's objects. None when the bucket is unset.
+    pub(crate) fn test_store() -> Option<ObjectStore> {
+        let bucket = env("OBLETH_TEST_S3_BUCKET")?;
+        let store = ObjectStore::new(
+            &env("OBLETH_TEST_S3_ENDPOINT").expect("OBLETH_TEST_S3_ENDPOINT"),
+            bucket,
+            env("OBLETH_TEST_S3_REGION").unwrap_or_else(|| "us-east-1".into()),
+            env("OBLETH_TEST_S3_ACCESS_KEY_ID").expect("OBLETH_TEST_S3_ACCESS_KEY_ID"),
+            env("OBLETH_TEST_S3_SECRET_ACCESS_KEY").expect("OBLETH_TEST_S3_SECRET_ACCESS_KEY"),
+        )
+        .unwrap();
+        Some(ObjectStore {
+            prefix: format!("test-{}", uuid::Uuid::new_v4().simple()),
+            ..store
+        })
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_S3_BUCKET` is set.
     #[tokio::test]
     async fn objects_are_written_read_in_ranges_and_deleted() {
-        let Some(b) = test_bucket() else {
-            eprintln!("skipping: set OBLETH_TEST_BUCKET to run");
+        let Some(b) = test_store() else {
+            eprintln!("skipping: set OBLETH_TEST_S3_BUCKET to run");
             return;
         };
         b.check().await.expect("check");
@@ -538,7 +534,7 @@ mod tests {
         assert_eq!(b.get("x/y").await.unwrap(), body);
         assert_eq!(&b.get_range("x/y", 3, 4).await.unwrap()[..], b"3456");
         b.delete("x/y").await.unwrap();
-        assert!(matches!(b.get("x/y").await, Err(BucketError::NotFound)));
+        assert!(matches!(b.get("x/y").await, Err(ObjectError::NotFound)));
         // Deleting what is not there is not an error.
         b.delete("x/y").await.unwrap();
     }

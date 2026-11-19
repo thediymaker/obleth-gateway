@@ -17,6 +17,7 @@ mod load;
 mod mcp;
 mod messages;
 mod metrics;
+mod object_store;
 mod output_monitor;
 mod proxy;
 mod reasoning;
@@ -466,6 +467,21 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("GET /v1/load is off (OBLETH_LOAD_ENDPOINT)");
     }
 
+    // The object store, for bytes that do not belong in Postgres. Features
+    // that need it (batches) are off without it.
+    let objects = match object_store::ObjectStore::from_env() {
+        Ok(Some(o)) => {
+            tracing::info!(bucket = %o.describe(), "object store on");
+            o.spawn_check();
+            Some(o)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            tracing::error!(error = %e, "object store off: its settings are not usable");
+            None
+        }
+    };
+
     let app_state = AppState {
         redis: redis.clone(),
         fairshare: fairshare.clone(),
@@ -504,7 +520,7 @@ async fn main() -> anyhow::Result<()> {
         jobs: jobs::JobStore::new(store.clone(), cfg.job_scope),
         load,
         crash_guard: crate::crash_guard::CrashGuard::new(Some(capacity_discovery.clone())),
-        batches: batches::Batches::from_env(store.clone()),
+        batches: objects.map(|o| batches::Batches::new(store.clone(), o)),
     };
     tracing::info!(
         scope = cfg.job_scope.as_str(),
@@ -518,16 +534,19 @@ async fn main() -> anyhow::Result<()> {
     let batch_runner = match app_state.batches.clone() {
         Some(b) => {
             tracing::info!(
-                bucket = %b.storage(),
                 max_lines = b.config().max_lines,
                 share = b.config().share,
                 retention_hours = b.config().retention.as_secs() / 3600,
                 "batches on: /v1/files and /v1/batches are served"
             );
-            b.spawn_storage_check();
             batches::spawn_runner(app_state.clone(), b, shutdown_rx.clone())
         }
-        None => None,
+        None => {
+            tracing::info!(
+                "batches off: they need an object store; set OBLETH_S3_BUCKET to serve /v1/files and /v1/batches"
+            );
+            None
+        }
     };
 
     match store.all_resolved_models().await {
