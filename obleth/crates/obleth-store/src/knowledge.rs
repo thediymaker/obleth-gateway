@@ -1079,6 +1079,23 @@ pub struct Scored {
     pub score: f32,
 }
 
+/// The dot product of two equal-length vectors, summed in eight lanes so the
+/// compiler can use SIMD; the lanes are added at the end, so the result can
+/// differ from a left-to-right sum in the last bits.
+pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+    const LANES: usize = 8;
+    let (a_body, a_tail) = a.as_chunks::<LANES>();
+    let (b_body, b_tail) = b.as_chunks::<LANES>();
+    let mut acc = [0.0f32; LANES];
+    for (x, y) in a_body.iter().zip(b_body) {
+        for i in 0..LANES {
+            acc[i] += x[i] * y[i];
+        }
+    }
+    let tail: f32 = a_tail.iter().zip(b_tail).map(|(x, y)| x * y).sum();
+    acc.iter().sum::<f32>() + tail
+}
+
 /// Rank `vectors` against `query` by cosine similarity, keeping the best
 /// `top_k` at or above `min_score`.
 ///
@@ -1114,9 +1131,9 @@ where
         .into_iter()
         .enumerate()
         .filter(|(_, v)| v.len() == query.len())
-        .map(|(index, v)| {
-            let score = query.iter().zip(v).map(|(a, b)| a * b).sum::<f32>();
-            Scored { index, score }
+        .map(|(index, v)| Scored {
+            index,
+            score: dot(query, v),
         })
         // A NaN sorts ABOVE every real number under `total_cmp`, so an
         // unfiltered NaN from a corrupt stored vector would rank first and be
@@ -1126,11 +1143,15 @@ where
         .filter(|s| s.score.is_finite())
         .filter(|s| s.score >= min_score)
         .collect();
-    // `total_cmp` rather than `partial_cmp().unwrap()`: a NaN score (which a
-    // corrupt or non-normalized vector could produce) must order predictably
-    // rather than panic the sort.
-    scored.sort_by(|a, b| b.score.total_cmp(&a.score));
-    scored.truncate(top_k);
+    // Best first, ties by position, so the result does not depend on how the
+    // selection below happened to partition. Only the best `top_k` are
+    // sorted: the rest are cut off by a linear-time selection first.
+    let better = |a: &Scored, b: &Scored| b.score.total_cmp(&a.score).then(a.index.cmp(&b.index));
+    if scored.len() > top_k {
+        scored.select_nth_unstable_by(top_k - 1, better);
+        scored.truncate(top_k);
+    }
+    scored.sort_unstable_by(better);
     debug_assert!(
         scored.windows(2).all(|w| w[0].score >= w[1].score),
         "score_against must return hits in descending score order; \
@@ -1141,6 +1162,47 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::{dot, score_against};
+
+    /// The selection-based ranking keeps what a full stable sort by score
+    /// kept, in the same order, and the lane-summed dot matches a plain sum.
+    #[test]
+    fn the_top_k_matches_a_full_sort() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            // Coarse values, so equal scores (ties) actually occur.
+            ((seed % 9) as f32 - 4.0) / 4.0
+        };
+        for dims in [3usize, 8, 13, 64] {
+            let query: Vec<f32> = (0..dims).map(|_| next()).collect();
+            let vectors: Vec<Vec<f32>> = (0..500)
+                .map(|_| (0..dims).map(|_| next()).collect())
+                .collect();
+            for v in &vectors {
+                let plain: f32 = query.iter().zip(v).map(|(a, b)| a * b).sum();
+                assert!((dot(&query, v) - plain).abs() < 1e-4);
+            }
+            for top_k in [1usize, 5, 37, 500, 900] {
+                let mut want: Vec<(usize, f32)> = vectors
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (i, dot(&query, v)))
+                    .collect();
+                want.sort_by(|a, b| b.1.total_cmp(&a.1));
+                want.truncate(top_k);
+                let got: Vec<(usize, f32)> =
+                    score_against(&query, vectors.iter().map(Vec::as_slice), top_k, f32::MIN)
+                        .into_iter()
+                        .map(|s| (s.index, s.score))
+                        .collect();
+                assert_eq!(got, want, "dims {dims}, top_k {top_k}");
+            }
+        }
+    }
+
     /// Migrate the test database exactly once per test binary.
     ///
     /// Every test calling `migrate()` meant N parallel threads each running the

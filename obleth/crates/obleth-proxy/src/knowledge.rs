@@ -62,6 +62,31 @@ pub struct CollectionSlab {
 /// long.
 pub const FULL_RELOAD_EVERY: Duration = Duration::from_secs(30 * 60);
 
+/// Above this many chunks a scan runs on the blocking pool, so scoring a
+/// large collection does not hold up the other requests on its worker thread
+/// (4,096 chunks of 1,024 dims is about 4 M multiply-adds).
+const BLOCKING_SCAN_CHUNKS: usize = 4096;
+
+/// [`CollectionSlab::retrieve`], on the blocking pool for a large slab.
+pub async fn retrieve_from(
+    slab: &Arc<CollectionSlab>,
+    query: &Arc<[f32]>,
+    top_k: usize,
+    min_score: f32,
+) -> Vec<Hit> {
+    if slab.chunks.len() < BLOCKING_SCAN_CHUNKS {
+        return slab.retrieve(query, top_k, min_score);
+    }
+    let (slab, query) = (slab.clone(), query.clone());
+    match tokio::task::spawn_blocking(move || slab.retrieve(&query, top_k, min_score)).await {
+        Ok(hits) => hits,
+        Err(e) => {
+            tracing::warn!(error = %e, "knowledge scan failed; retrieving nothing");
+            Vec::new()
+        }
+    }
+}
+
 /// One retrieved chunk.
 #[derive(Debug, Clone)]
 pub struct Hit {
@@ -384,13 +409,17 @@ pub async fn embed_query(
     .ok()?
     .into_iter()
     .next()?;
-    if let Err(e) = state
-        .redis
-        .put_query_vector(&key, &vector, settings.query_cache_ttl_s)
-        .await
-    {
-        tracing::debug!(error = %e, "knowledge query vector store failed");
-    }
+    // Kept for the next turn without holding this one up.
+    let (redis, stored, ttl) = (
+        state.redis.clone(),
+        vector.clone(),
+        settings.query_cache_ttl_s,
+    );
+    tokio::spawn(async move {
+        if let Err(e) = redis.put_query_vector(&key, &stored, ttl).await {
+            tracing::debug!(error = %e, "knowledge query vector store failed");
+        }
+    });
     Some(vector)
 }
 

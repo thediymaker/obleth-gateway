@@ -63,7 +63,8 @@ pub(super) async fn apply(
             );
             let notes = images
                 .iter()
-                .map(|(mi, pi, _)| ((*mi, *pi), Swap::Note(NOTE_NO_DESCRIBER.into())));
+                .map(|(mi, pi, _)| ((*mi, *pi), Swap::Note(NOTE_NO_DESCRIBER.into())))
+                .collect::<Vec<_>>();
             return swap_parts(json, notes);
         }
     };
@@ -78,10 +79,7 @@ pub(super) async fn apply(
     // earlier images again on every turn, so a description kept from an
     // earlier turn (same tenant, describer and prompt) is reused rather than
     // asked for again; a request that repeats an image asks once.
-    let hashes: Vec<String> = targets
-        .iter()
-        .map(|(_, _, url)| description_hash(&describer.model_name, prompt, url))
-        .collect();
+    let hashes = description_hashes(&describer.model_name, prompt, targets);
     let mut distinct: Vec<(&str, &str)> = Vec::new();
     for (hash, (_, _, url)) in hashes.iter().zip(targets) {
         if !distinct.iter().any(|(h, _)| *h == hash.as_str()) {
@@ -208,8 +206,9 @@ enum Swap {
     Note(String),
 }
 
-/// Every `image_url` part with a url: (message index, part index, url).
-fn image_parts(json: &Value) -> Vec<(usize, usize, String)> {
+/// Every `image_url` part with a url: (message index, part index, url),
+/// borrowed from the request until the parts are swapped.
+fn image_parts(json: &Value) -> Vec<(usize, usize, &str)> {
     let Some(messages) = json.get("messages").and_then(|m| m.as_array()) else {
         return Vec::new();
     };
@@ -227,7 +226,7 @@ fn image_parts(json: &Value) -> Vec<(usize, usize, String)> {
                 .and_then(|u| u.get("url"))
                 .and_then(|u| u.as_str())
             {
-                found.push((mi, pi, url.to_string()));
+                found.push((mi, pi, url));
             }
         }
     }
@@ -296,12 +295,65 @@ fn describe_request(upstream_model: &str, prompt: &str, image_url: &str) -> Valu
 /// What a kept description is filed under: the image, the describer and the
 /// prompt, so a change to either describes the image again.
 fn description_hash(describer: &str, prompt: &str, image_url: &str) -> String {
-    obleth_config::content_hash(&format!("{describer}\n{prompt}\n{image_url}"))
+    // Fed in pieces, the same bytes `content_hash` of the joined text hashes,
+    // so keys kept before are still found, without a copy of the image.
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for piece in [describer, "\n", prompt, "\n", image_url] {
+        h.update(piece.as_bytes());
+    }
+    hex::encode(h.finalize())
+}
+
+/// Inline images past this many bytes in all are hashed off the async
+/// worker: SHA-256 of 20 MB of base64 takes tens of milliseconds.
+const BLOCKING_HASH_BYTES: usize = 4 << 20;
+
+/// [`description_hash`] of each image, on the blocking side of a
+/// multi-threaded runtime when the images are large.
+fn description_hashes(
+    describer: &str,
+    prompt: &str,
+    images: &[(usize, usize, &str)],
+) -> Vec<String> {
+    let hash_all = || {
+        images
+            .iter()
+            .map(|(_, _, url)| description_hash(describer, prompt, url))
+            .collect()
+    };
+    let bytes: usize = images.iter().map(|(_, _, url)| url.len()).sum();
+    let threaded = tokio::runtime::Handle::try_current()
+        .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+    if bytes > BLOCKING_HASH_BYTES && threaded {
+        tokio::task::block_in_place(hash_all)
+    } else {
+        hash_all()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hashed in pieces, a description key is the one kept before, so a
+    /// roll does not throw the kept descriptions away.
+    #[test]
+    fn description_keys_are_unchanged() {
+        let url = format!("data:image/png;base64,{}", "QUJD".repeat(5000));
+        assert_eq!(
+            description_hash("qwen3-vl", "Describe it.", &url),
+            obleth_config::content_hash(&format!("qwen3-vl\nDescribe it.\n{url}"))
+        );
+        let images = [(0, 0, url.as_str()), (1, 2, "https://x/y.png")];
+        assert_eq!(
+            description_hashes("d", "p", &images),
+            vec![
+                description_hash("d", "p", &url),
+                description_hash("d", "p", "https://x/y.png")
+            ]
+        );
+    }
 
     fn req_with_image() -> Value {
         json!({
@@ -323,7 +375,7 @@ mod tests {
     fn detects_image_parts() {
         assert_eq!(
             image_parts(&req_with_image()),
-            vec![(1, 1, "data:image/png;base64,AAAA".to_string())]
+            vec![(1, 1, "data:image/png;base64,AAAA")]
         );
     }
 

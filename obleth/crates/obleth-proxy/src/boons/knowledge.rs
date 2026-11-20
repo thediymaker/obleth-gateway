@@ -243,7 +243,8 @@ pub async fn apply(
     // `None` is cached just like `Some`, so a dead embedder shared by several
     // collections pays `embed_timeout_ms` once per request, not once per
     // collection.
-    let mut vectors: std::collections::HashMap<String, Option<Vec<f32>>> = Default::default();
+    let mut vectors: std::collections::HashMap<String, Option<std::sync::Arc<[f32]>>> =
+        Default::default();
     let mut all: Vec<Hit> = Vec::new();
     // Did at least one attached collection have data, and did every embed
     // attempt for it fail? That is the "error" outcome (an outage), distinct
@@ -259,27 +260,24 @@ pub async fn apply(
             continue;
         }
         any_nonempty_slab = true;
-        let vector = if let Some(cached) = vectors.get(&slab.embedding_model) {
-            match cached {
-                Some(v) => v.clone(),
-                None => continue, // this embedder already failed this request
-            }
-        } else {
-            match crate::knowledge::embed_query(state, &slab.embedding_model, query, settings).await
-            {
-                Some(v) => {
-                    vectors.insert(slab.embedding_model.clone(), Some(v.clone()));
-                    v
-                }
-                None => {
-                    vectors.insert(slab.embedding_model.clone(), None);
-                    continue;
-                }
-            }
+        if !vectors.contains_key(&slab.embedding_model) {
+            let embedded =
+                crate::knowledge::embed_query(state, &slab.embedding_model, query, settings).await;
+            vectors.insert(slab.embedding_model.clone(), embedded.map(Into::into));
+        }
+        // `None`: this embedder already failed this request.
+        let Some(Some(vector)) = vectors.get(&slab.embedding_model) else {
+            continue;
         };
         any_embed_succeeded = true;
         searched.push(*id);
-        let found = slab.retrieve(&vector, settings.top_k as usize, settings.min_score);
+        let found = crate::knowledge::retrieve_from(
+            slab,
+            vector,
+            settings.top_k as usize,
+            settings.min_score,
+        )
+        .await;
         origin.extend(found.iter().map(|h| (h.id, *id)));
         all.extend(found);
     }
