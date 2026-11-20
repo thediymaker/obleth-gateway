@@ -332,7 +332,7 @@ impl Store {
              returning name, weight, created_at, updated_at",
         )
         .bind(name)
-        .bind(weight.max(1))
+        .bind(weight)
         .fetch_one(&self.pool)
         .await?;
         fairshare_group_from_row(&row)
@@ -348,7 +348,7 @@ impl Store {
              returning name, weight, created_at, updated_at",
         )
         .bind(name)
-        .bind(weight.max(1))
+        .bind(weight)
         .fetch_optional(&self.pool)
         .await?
         .ok_or(StoreError::NotFound)?;
@@ -391,7 +391,7 @@ impl Store {
         .bind(Uuid::new_v4())
         .bind(name)
         .bind(group)
-        .bind(weight.max(1))
+        .bind(weight)
         .bind(tokens_per_minute.max(0))
         .bind(max_in_flight)
         .fetch_one(&self.pool)
@@ -463,7 +463,7 @@ impl Store {
              returning {TENANT_COLUMNS}"
         ))
         .bind(id)
-        .bind(weight.max(1))
+        .bind(weight)
         .fetch_optional(&self.pool)
         .await?
         .ok_or(StoreError::NotFound)?;
@@ -731,7 +731,7 @@ impl Store {
         .bind(budget_cost_usd)
         .bind(budget_period)
         .bind(budget_started_at)
-        .bind(weight.max(1))
+        .bind(weight)
         .bind(max_in_flight)
         .bind(allowed_networks)
         .bind(allowed_countries)
@@ -1150,7 +1150,7 @@ impl Store {
         .bind(budget_cost_usd)
         .bind(budget_period)
         .bind(budget_started_at)
-        .bind(weight.max(1))
+        .bind(weight)
         .bind(max_in_flight)
         .bind(allowed_networks)
         .bind(allowed_countries)

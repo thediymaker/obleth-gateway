@@ -1925,7 +1925,7 @@ async fn create_tenant(
         .store
         .create_tenant(
             &body.name,
-            body.weight.unwrap_or(100),
+            validate_weight(body.weight.unwrap_or(100))?,
             body.tokens_per_minute.unwrap_or(0),
             body.max_in_flight,
             body.fairshare_group.as_deref(),
@@ -4188,46 +4188,64 @@ async fn put_boon_settings(
             draft_model: spec_draft_model,
             verify_model: spec_verify_model,
             classify_model: spec_classify_model,
-            agree_min: body
-                .speculation_agree_min
-                .filter(|v| (0.0..=1.0).contains(v))
-                .unwrap_or(existing.speculation.agree_min),
-            lp_min: body
-                .speculation_lp_min
-                .filter(|v| *v <= 0.0)
-                .unwrap_or(existing.speculation.lp_min),
-            abort_agree: body
-                .speculation_abort_agree
-                .filter(|v| (0.0..=1.0).contains(v))
-                .unwrap_or(existing.speculation.abort_agree),
-            abort_lp: body
-                .speculation_abort_lp
-                .filter(|v| *v <= 0.0)
-                .unwrap_or(existing.speculation.abort_lp),
-            first_chunk_tokens: body
-                .speculation_first_chunk_tokens
-                .filter(|n| *n > 0)
-                .unwrap_or(existing.speculation.first_chunk_tokens),
-            chunk_tokens: body
-                .speculation_chunk_tokens
-                .filter(|n| *n > 0)
-                .unwrap_or(existing.speculation.chunk_tokens),
-            decide_by_tokens: body
-                .speculation_decide_by_tokens
-                .filter(|n| *n > 0)
-                .unwrap_or(existing.speculation.decide_by_tokens),
-            max_draft_tokens: body
-                .speculation_max_draft_tokens
-                .filter(|n| *n > 0)
-                .unwrap_or(existing.speculation.max_draft_tokens),
+            agree_min: in_range(
+                "speculation_agree_min",
+                body.speculation_agree_min,
+                0.0..=1.0,
+                existing.speculation.agree_min,
+            )?,
+            lp_min: in_range(
+                "speculation_lp_min",
+                body.speculation_lp_min,
+                f64::NEG_INFINITY..=0.0,
+                existing.speculation.lp_min,
+            )?,
+            abort_agree: in_range(
+                "speculation_abort_agree",
+                body.speculation_abort_agree,
+                0.0..=1.0,
+                existing.speculation.abort_agree,
+            )?,
+            abort_lp: in_range(
+                "speculation_abort_lp",
+                body.speculation_abort_lp,
+                f64::NEG_INFINITY..=0.0,
+                existing.speculation.abort_lp,
+            )?,
+            first_chunk_tokens: at_least(
+                "speculation_first_chunk_tokens",
+                body.speculation_first_chunk_tokens,
+                1,
+                existing.speculation.first_chunk_tokens,
+            )?,
+            chunk_tokens: at_least(
+                "speculation_chunk_tokens",
+                body.speculation_chunk_tokens,
+                1,
+                existing.speculation.chunk_tokens,
+            )?,
+            decide_by_tokens: at_least(
+                "speculation_decide_by_tokens",
+                body.speculation_decide_by_tokens,
+                1,
+                existing.speculation.decide_by_tokens,
+            )?,
+            max_draft_tokens: at_least(
+                "speculation_max_draft_tokens",
+                body.speculation_max_draft_tokens,
+                1,
+                existing.speculation.max_draft_tokens,
+            )?,
             pace_ms: body
                 .speculation_pace_ms
                 .unwrap_or(existing.speculation.pace_ms),
             draft_chat_template_kwargs: spec_draft_kwargs,
-            timeout_ms: body
-                .speculation_timeout_ms
-                .filter(|ms| *ms > 0)
-                .unwrap_or(existing.speculation.timeout_ms),
+            timeout_ms: at_least(
+                "speculation_timeout_ms",
+                body.speculation_timeout_ms,
+                1,
+                existing.speculation.timeout_ms,
+            )?,
             category_gates: spec_category_gates,
             unlisted_categories_speculate: body
                 .speculation_unlisted_categories_speculate
@@ -4236,12 +4254,18 @@ async fn put_boon_settings(
                 .speculation_verify_url_template
                 .map(|t| t.trim().to_string())
                 .unwrap_or_else(|| existing.speculation.verify_url_template.clone()),
-            verify_timeout_ms: body
-                .speculation_verify_timeout_ms
-                .unwrap_or(existing.speculation.verify_timeout_ms),
-            verify_reply_max_bytes: body
-                .speculation_verify_reply_max_bytes
-                .unwrap_or(existing.speculation.verify_reply_max_bytes),
+            verify_timeout_ms: at_least(
+                "speculation_verify_timeout_ms",
+                body.speculation_verify_timeout_ms,
+                1,
+                existing.speculation.verify_timeout_ms,
+            )?,
+            verify_reply_max_bytes: at_least(
+                "speculation_verify_reply_max_bytes",
+                body.speculation_verify_reply_max_bytes,
+                1,
+                existing.speculation.verify_reply_max_bytes,
+            )?,
         },
         web_search: obleth_config::WebSearchBoonSettings {
             enabled: body
@@ -4359,7 +4383,7 @@ impl EnergySettingsView {
     }
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Default, Deserialize, ToSchema)]
 pub struct UpdateEnergySettings {
     #[serde(default)]
     pub enabled: Option<bool>,
@@ -4398,8 +4422,8 @@ pub struct UpdateEnergySettings {
 fn merge_energy_settings(
     existing: &obleth_config::EnergySettings,
     body: &UpdateEnergySettings,
-) -> obleth_config::EnergySettings {
-    obleth_config::EnergySettings {
+) -> Result<obleth_config::EnergySettings> {
+    Ok(obleth_config::EnergySettings {
         enabled: body.enabled.unwrap_or(existing.enabled),
         prometheus_url: body
             .prometheus_url
@@ -4426,20 +4450,27 @@ fn merge_energy_settings(
             .as_deref()
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|| existing.model_requests_query.clone()),
-        poll_interval_secs: body
-            .poll_interval_secs
-            .filter(|n| *n > 0)
-            .unwrap_or(existing.poll_interval_secs),
-        energy_cost_per_kwh: body
-            .energy_cost_per_kwh
-            .filter(|v| *v >= 0.0)
-            .unwrap_or(existing.energy_cost_per_kwh),
-        carbon_g_per_kwh: body
-            .carbon_g_per_kwh
-            .filter(|v| *v >= 0.0)
-            .unwrap_or(existing.carbon_g_per_kwh),
-        pue: body.pue.filter(|v| *v > 0.0).unwrap_or(existing.pue),
-    }
+        poll_interval_secs: at_least(
+            "poll_interval_secs",
+            body.poll_interval_secs,
+            1,
+            existing.poll_interval_secs,
+        )?,
+        energy_cost_per_kwh: at_least(
+            "energy_cost_per_kwh",
+            body.energy_cost_per_kwh,
+            0.0,
+            existing.energy_cost_per_kwh,
+        )?,
+        carbon_g_per_kwh: at_least(
+            "carbon_g_per_kwh",
+            body.carbon_g_per_kwh,
+            0.0,
+            existing.carbon_g_per_kwh,
+        )?,
+        // PUE is total facility power over IT power: 1.0 is the physical floor.
+        pue: at_least("pue", body.pue, 1.0, existing.pue)?,
+    })
 }
 
 #[utoipa::path(
@@ -4469,7 +4500,7 @@ async fn put_energy_settings(
             state.ssrf.validate(url).await?;
         }
     }
-    let settings = merge_energy_settings(&existing, &body);
+    let settings = merge_energy_settings(&existing, &body)?;
     state.store.put_energy_settings(&settings).await?;
     state
         .store
@@ -4871,7 +4902,10 @@ async fn patch_weight(
     headers: HeaderMap,
     Json(body): Json<UpdateWeight>,
 ) -> Result<Json<Tenant>> {
-    let tenant = state.store.update_tenant_weight(id, body.weight).await?;
+    let tenant = state
+        .store
+        .update_tenant_weight(id, validate_weight(body.weight)?)
+        .await?;
     sync_tenant_keys(&state, id).await?;
     state
         .store
@@ -7456,7 +7490,7 @@ async fn create_fairshare_group(
 ) -> Result<Json<FairshareGroup>> {
     let group = state
         .store
-        .create_fairshare_group(&body.name, body.weight.unwrap_or(100))
+        .create_fairshare_group(&body.name, validate_weight(body.weight.unwrap_or(100))?)
         .await?;
     state
         .store
@@ -7485,7 +7519,7 @@ async fn patch_fairshare_group_weight(
 ) -> Result<Json<FairshareGroup>> {
     let group = state
         .store
-        .update_fairshare_group_weight(&name, body.weight)
+        .update_fairshare_group_weight(&name, validate_weight(body.weight)?)
         .await?;
     sync_group_keys(&state, &name).await?;
     state
@@ -7755,6 +7789,77 @@ fn validate_quantization(raw: &str) -> Result<String> {
         )));
     }
     Ok(q)
+}
+
+/// A fairshare weight from the admin API: at least 1. The store used to fold
+/// 0 to 1 silently; an operator who sends 0 is told.
+fn validate_weight(weight: i64) -> Result<i64> {
+    if weight < 1 {
+        return Err(AdminError::BadRequest("weight must be >= 1".into()));
+    }
+    Ok(weight)
+}
+
+/// A model type from the admin API: one of the fixed vocabulary, rejected
+/// rather than folded to `chat`. The store's normaliser still runs for values
+/// a backend reports in its own spelling.
+fn validate_model_type(raw: &str) -> Result<String> {
+    let t = raw.trim().to_ascii_lowercase();
+    if !obleth_config::is_valid_model_type(&t) {
+        return Err(AdminError::BadRequest(format!(
+            "unknown model_type '{raw}' (expected one of: {})",
+            obleth_config::MODEL_TYPES.join(", ")
+        )));
+    }
+    Ok(t)
+}
+
+/// An endpoint selection mode from the admin API: one of the fixed
+/// vocabulary, rejected rather than folded to the default.
+fn validate_endpoint_selection_mode(raw: &str) -> Result<String> {
+    let m = raw.trim().to_ascii_lowercase();
+    if !obleth_config::is_valid_endpoint_selection_mode(&m) {
+        return Err(AdminError::BadRequest(format!(
+            "unknown endpoint_selection_mode '{raw}' (expected one of: {})",
+            obleth_config::ENDPOINT_SELECTION_MODES.join(", ")
+        )));
+    }
+    Ok(m)
+}
+
+/// A settings value that must lie in `range`, named by its field: a value
+/// outside it is 400, never kept silently as the old value.
+fn in_range<T: PartialOrd + Copy + std::fmt::Display>(
+    field: &str,
+    value: Option<T>,
+    range: std::ops::RangeInclusive<T>,
+    existing: T,
+) -> Result<T> {
+    match value {
+        None => Ok(existing),
+        Some(v) if range.contains(&v) => Ok(v),
+        Some(v) => Err(AdminError::BadRequest(format!(
+            "{field} must be between {} and {}, got {v}",
+            range.start(),
+            range.end()
+        ))),
+    }
+}
+
+/// A settings value that must be at least `min`, named by its field.
+fn at_least<T: PartialOrd + Copy + std::fmt::Display>(
+    field: &str,
+    value: Option<T>,
+    min: T,
+    existing: T,
+) -> Result<T> {
+    match value {
+        None => Ok(existing),
+        Some(v) if v >= min => Ok(v),
+        Some(v) => Err(AdminError::BadRequest(format!(
+            "{field} must be at least {min}, got {v}"
+        ))),
+    }
 }
 
 /// Normalize an alias list and reject any name already claimed elsewhere.
@@ -8088,6 +8193,7 @@ async fn create_model(
         &discovery,
         &[],
     )?;
+    let model_type = validate_model_type(body.model_type.as_deref().unwrap_or("chat"))?;
     let model = state
         .store
         .create_model(
@@ -8096,7 +8202,7 @@ async fn create_model(
             &body.upstream_model,
             &body.api_base,
             body.api_key.as_deref(),
-            body.model_type.as_deref().unwrap_or("chat"),
+            &model_type,
             body.input_cost_per_token.unwrap_or(0.0),
             body.output_cost_per_token.unwrap_or(0.0),
             body.cost_per_image.unwrap_or(0.0),
@@ -8293,6 +8399,8 @@ async fn update_model(
         &discovery,
         &endpoint_concurrency(&state, existing.id).await?,
     )?;
+    let model_type =
+        validate_model_type(body.model_type.as_deref().unwrap_or(&existing.model_type))?;
     let model = state
         .store
         .update_model(
@@ -8301,7 +8409,7 @@ async fn update_model(
             &body.upstream_model,
             &body.api_base,
             api_key,
-            body.model_type.as_deref().unwrap_or(&existing.model_type),
+            &model_type,
             body.input_cost_per_token
                 .unwrap_or(existing.input_cost_per_token),
             body.output_cost_per_token
@@ -9124,7 +9232,7 @@ async fn set_model_reliability(
             body.request_timeout_secs,
             body.max_retries,
             body.retry_backoff_ms,
-            &body.endpoint_selection_mode,
+            &validate_endpoint_selection_mode(&body.endpoint_selection_mode)?,
             body.debug_diagnostics,
         )
         .await?;
@@ -10932,6 +11040,95 @@ mod tests {
             .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
             .body(axum::body::Body::from(body.to_string()))
             .expect("build request")
+    }
+
+    /// Out-of-range or unknown values on the admin write path are 400 with
+    /// the field named, never coerced to a default or kept silently as the
+    /// old value.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn bad_admin_input_is_400_not_coerced() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let name = format!("m-{}", Uuid::new_v4());
+        let (status, body) = send(
+            &t.app,
+            json_request("POST", "/api/v1/models", serde_json::json!({
+                "model_name": name, "upstream_model": "u", "api_base": "http://127.0.0.1:1/v1", "model_type": "embeddings"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("model_type"),
+            "{body}"
+        );
+        let (status, body) = send(
+            &t.app,
+            json_request(
+                "POST",
+                "/api/v1/tenants",
+                serde_json::json!({ "name": format!("t-{}", Uuid::new_v4()), "weight": 0 }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let (status, body) = send(
+            &t.app,
+            json_request(
+                "POST",
+                "/api/v1/fairshare/groups",
+                serde_json::json!({ "name": format!("g-{}", Uuid::new_v4()), "weight": -3 }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        // A bad threshold is refused and the stored value stays as it was.
+        let (_, before) = send(
+            &t.app,
+            json_request("GET", "/api/v1/settings/boons", serde_json::Value::Null),
+        )
+        .await;
+        let (status, body) = send(
+            &t.app,
+            json_request(
+                "PUT",
+                "/api/v1/settings/boons",
+                serde_json::json!({ "speculation_agree_min": 1.5 }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("speculation_agree_min"),
+            "{body}"
+        );
+        let (_, after) = send(
+            &t.app,
+            json_request("GET", "/api/v1/settings/boons", serde_json::Value::Null),
+        )
+        .await;
+        assert_eq!(
+            after["speculation_agree_min"],
+            before["speculation_agree_min"]
+        );
+        let (status, body) = send(
+            &t.app,
+            json_request(
+                "PUT",
+                "/api/v1/settings/energy",
+                serde_json::json!({ "pue": 0.5 }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     }
 
     /// Recipes follow the admin API's conventions: a delete answers 204 and
@@ -14330,8 +14527,15 @@ mod tests {
             carbon_g_per_kwh: None,
             pue: None,
         };
-        let merged = merge_energy_settings(&existing, &body);
+        let merged = merge_energy_settings(&existing, &body).expect("valid");
         assert!(merged.enabled);
+        let bad = UpdateEnergySettings {
+            pue: Some(0.5),
+            ..UpdateEnergySettings::default()
+        };
+        assert!(
+            matches!(merge_energy_settings(&existing, &bad), Err(AdminError::BadRequest(m)) if m.contains("pue"))
+        );
         assert_eq!(merged.poll_interval_secs, 60); // untouched default
         assert_eq!(merged.energy_cost_per_kwh, 0.15);
         assert_eq!(merged.pue, 1.0);
