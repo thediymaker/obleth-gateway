@@ -1,17 +1,11 @@
-import { NextRequest, NextResponse } from "next/server";
 import { obleth } from "@/lib/obleth";
-import { guardAdmin } from "@/lib/auth/guard";
+import { liveRoute, RouteError } from "@/lib/auth/guard";
+import { numParam } from "@/lib/log-params";
 
 // MCP calls per server or knowledge searches per collection, per day.
-export async function GET(req: NextRequest) {
-  const denied = await guardAdmin();
-  if (denied) return denied;
-  const kind = req.nextUrl.searchParams.get("kind");
-  if (kind !== "mcp" && kind !== "knowledge") return NextResponse.json({ error: "kind must be mcp or knowledge" }, { status: 400 });
-  const days = Number(req.nextUrl.searchParams.get("days") ?? 7);
-  try {
-    return NextResponse.json(await obleth.dailyStats(kind, days));
-  } catch (e) {
-    return NextResponse.json({ error: String(e) }, { status: 502 });
-  }
-}
+export const GET = liveRoute((req) => {
+  const p = req.nextUrl.searchParams;
+  const kind = p.get("kind");
+  if (kind !== "mcp" && kind !== "knowledge") throw new RouteError(400, "kind must be mcp or knowledge");
+  return obleth.dailyStats(kind, numParam(p, "days", 7));
+});

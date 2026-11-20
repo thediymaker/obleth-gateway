@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { NextRequest } from "next/server";
 const mocks = vi.hoisted(() => ({ guard: vi.fn(), voices: vi.fn() }));
-vi.mock("@/lib/auth/guard", () => ({ guardAdmin: mocks.guard }));
+vi.mock("@/lib/auth/roles", () => ({ requireAdmin: mocks.guard }));
 vi.mock("@/lib/charo/gateway", () => ({ gatewayVoices: mocks.voices }));
 import { GET } from "./route";
 
@@ -11,12 +11,12 @@ const json = (body: unknown, status = 200) => new Response(JSON.stringify(body),
 
 beforeEach(() => {
   vi.clearAllMocks();
-  mocks.guard.mockResolvedValue(null);
+  mocks.guard.mockResolvedValue({ email: "admin@example.edu" });
 });
 
 describe("GET /api/live/playground/voices", () => {
   it("denies unauthorized callers", async () => {
-    mocks.guard.mockResolvedValue(new Response("unauthorized", { status: 401 }));
+    mocks.guard.mockRejectedValue(new Error("not an admin"));
     expect((await GET(request("tts"))).status).toBe(401);
     expect(mocks.voices).not.toHaveBeenCalled();
   });
@@ -50,9 +50,9 @@ describe("GET /api/live/playground/voices", () => {
   });
 
   it("reports an unreachable gateway as a 502", async () => {
-    mocks.voices.mockRejectedValue(new Error("connect ECONNREFUSED"));
+    mocks.voices.mockRejectedValue(new TypeError("fetch failed", { cause: new Error("connect ECONNREFUSED") }));
     const res = await GET(request("tts"));
     expect(res.status).toBe(502);
-    expect((await res.json()).error).toContain("ECONNREFUSED");
+    expect(await res.json()).toEqual({ error: "The gateway could not be reached." });
   });
 });

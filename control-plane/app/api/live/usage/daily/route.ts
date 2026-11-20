@@ -1,32 +1,16 @@
-import { NextRequest, NextResponse } from "next/server";
-import { obleth } from "@/lib/obleth";
-import type { UsageDailyGroupBy } from "@/lib/obleth";
-import { guardAdmin } from "@/lib/auth/guard";
+import { obleth, type UsageDailyGroupBy } from "@/lib/obleth";
+import { liveRoute } from "@/lib/auth/guard";
+import { strParam, utcDay } from "@/lib/log-params";
 
-function defaultStart(): string {
-  const d = new Date(Date.now() - 7 * 86_400_000);
-  return d.toISOString().slice(0, 10);
-}
-
-function today(): string {
-  return new Date().toISOString().slice(0, 10);
-}
-
-export async function GET(req: NextRequest) {
-  const denied = await guardAdmin();
-  if (denied) return denied;
-  try {
-    const p = req.nextUrl.searchParams;
-    const rows = await obleth.usageDaily({
-      startDay: p.get("start_day") ?? defaultStart(),
-      endDay: p.get("end_day") ?? today(),
-      groupBy: (p.get("group_by") as UsageDailyGroupBy | null) ?? undefined,
-      tenantId: p.get("tenant_id") ?? undefined,
-      keyId: p.get("key_id") ?? undefined,
-      model: p.get("model") ?? undefined,
-    });
-    return NextResponse.json(rows);
-  } catch (e) {
-    return NextResponse.json({ error: String(e) }, { status: 502 });
-  }
-}
+// The daily rollup; the last seven UTC days unless `start_day`/`end_day` say otherwise.
+export const GET = liveRoute((req) => {
+  const p = req.nextUrl.searchParams;
+  return obleth.usageDaily({
+    startDay: strParam(p, "start_day") ?? utcDay(7),
+    endDay: strParam(p, "end_day") ?? utcDay(),
+    groupBy: strParam(p, "group_by") as UsageDailyGroupBy | undefined,
+    tenantId: strParam(p, "tenant_id"),
+    keyId: strParam(p, "key_id"),
+    model: strParam(p, "model"),
+  });
+});

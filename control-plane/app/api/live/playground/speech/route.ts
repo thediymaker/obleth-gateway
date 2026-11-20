@@ -1,6 +1,6 @@
-import { NextRequest, NextResponse } from "next/server";
+import { NextResponse } from "next/server";
 import { z } from "zod";
-import { guardAdmin } from "@/lib/auth/guard";
+import { liveRoute, RouteError } from "@/lib/auth/guard";
 import { gatewaySpeech, type GatewaySpeechBody } from "@/lib/charo/gateway";
 import { apiErrorMessage } from "@/lib/charo/errors";
 
@@ -24,14 +24,9 @@ const bodySchema = z.object({
   instructions: z.string().max(2000).optional(),
 });
 
-export async function POST(req: NextRequest) {
-  const denied = await guardAdmin();
-  if (denied) return denied;
-
+export const POST = liveRoute(async (req) => {
   const parsed = bodySchema.safeParse(await req.json().catch(() => null));
-  if (!parsed.success || !parsed.data.input.trim()) {
-    return NextResponse.json({ error: "Invalid speech request." }, { status: 400 });
-  }
+  if (!parsed.success || !parsed.data.input.trim()) throw new RouteError(400, "Invalid speech request.");
   const { model, input, voice, instructions } = parsed.data;
 
   const body: GatewaySpeechBody = {
@@ -43,31 +38,20 @@ export async function POST(req: NextRequest) {
     ...(instructions?.trim() ? { instructions: instructions.trim() } : {}),
   };
 
-  try {
-    const upstream = await gatewaySpeech(body, req.signal);
-    const requestId = upstream.headers.get("x-obleth-request-id");
-    if (!upstream.ok) {
-      const text = await upstream.text().catch(() => "");
-      let json: unknown = null;
-      try { json = JSON.parse(text); } catch { /* not JSON; use the fallback */ }
-      return NextResponse.json(
-        { error: apiErrorMessage(json, `speech failed (HTTP ${upstream.status})`), requestId },
-        { status: upstream.status },
-      );
-    }
-    if (!upstream.body) {
-      return NextResponse.json({ error: "The model returned no audio.", requestId }, { status: 502 });
-    }
-    const headers = new Headers({
-      "content-type": upstream.headers.get("content-type") || "audio/wav",
-      "cache-control": "no-store",
-      // Stop any proxy in front of the dashboard from holding the audio back
-      // until the response is complete.
-      "x-accel-buffering": "no",
-    });
-    if (requestId) headers.set("x-obleth-request-id", requestId);
-    return new Response(upstream.body, { status: 200, headers });
-  } catch (e) {
-    return NextResponse.json({ error: String(e) }, { status: 502 });
+  const upstream = await gatewaySpeech(body, req.signal);
+  const requestId = upstream.headers.get("x-obleth-request-id");
+  if (!upstream.ok) {
+    const json = await upstream.json().catch(() => null);
+    return NextResponse.json({ error: apiErrorMessage(json, `speech failed (HTTP ${upstream.status})`), requestId }, { status: upstream.status });
   }
-}
+  if (!upstream.body) return NextResponse.json({ error: "The model returned no audio.", requestId }, { status: 502 });
+  const headers = new Headers({
+    "content-type": upstream.headers.get("content-type") || "audio/wav",
+    "cache-control": "no-store",
+    // Stop any proxy in front of the dashboard from holding the audio back
+    // until the response is complete.
+    "x-accel-buffering": "no",
+  });
+  if (requestId) headers.set("x-obleth-request-id", requestId);
+  return new Response(upstream.body, { status: 200, headers });
+});

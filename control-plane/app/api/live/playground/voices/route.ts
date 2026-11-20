@@ -1,5 +1,4 @@
-import { NextRequest, NextResponse } from "next/server";
-import { guardAdmin } from "@/lib/auth/guard";
+import { liveRoute, RouteError } from "@/lib/auth/guard";
 import { gatewayVoices } from "@/lib/charo/gateway";
 import { apiErrorMessage } from "@/lib/charo/errors";
 
@@ -32,28 +31,12 @@ function voiceNames(json: unknown): string[] {
   return out.slice(0, MAX_VOICES);
 }
 
-export async function GET(req: NextRequest) {
-  const denied = await guardAdmin();
-  if (denied) return denied;
-
+export const GET = liveRoute(async (req) => {
   const model = req.nextUrl.searchParams.get("model")?.trim() ?? "";
-  if (!model || model.length > 200) {
-    return NextResponse.json({ error: "Invalid voices request." }, { status: 400 });
-  }
-  try {
-    const upstream = await gatewayVoices(model, req.signal);
-    if (UNSUPPORTED.has(upstream.status)) {
-      return NextResponse.json({ voices: [], unsupported: true });
-    }
-    const json = await upstream.json().catch(() => null);
-    if (!upstream.ok) {
-      return NextResponse.json(
-        { error: apiErrorMessage(json, `voices unavailable (HTTP ${upstream.status})`) },
-        { status: upstream.status },
-      );
-    }
-    return NextResponse.json({ voices: voiceNames(json) });
-  } catch (e) {
-    return NextResponse.json({ error: String(e) }, { status: 502 });
-  }
-}
+  if (!model || model.length > 200) throw new RouteError(400, "Invalid voices request.");
+  const upstream = await gatewayVoices(model, req.signal);
+  if (UNSUPPORTED.has(upstream.status)) return { voices: [], unsupported: true };
+  const json = await upstream.json().catch(() => null);
+  if (!upstream.ok) throw new RouteError(upstream.status, apiErrorMessage(json, `voices unavailable (HTTP ${upstream.status})`));
+  return { voices: voiceNames(json) };
+});

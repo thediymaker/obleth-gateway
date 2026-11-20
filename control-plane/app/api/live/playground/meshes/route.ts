@@ -1,5 +1,4 @@
-import { NextRequest, NextResponse } from "next/server";
-import { guardAdmin } from "@/lib/auth/guard";
+import { liveRoute, RouteError } from "@/lib/auth/guard";
 import { gatewayMeshCreate } from "@/lib/charo/gateway";
 import { apiErrorMessage } from "@/lib/charo/errors";
 
@@ -22,18 +21,15 @@ const SETTINGS: Record<string, { min: number; max: number }> = {
   seed: { min: 0, max: 4_294_967_295 },
 };
 
-export async function POST(req: NextRequest) {
-  const denied = await guardAdmin();
-  if (denied) return denied;
-
+export const POST = liveRoute(async (req) => {
   const form = await req.formData().catch(() => null);
   const model = form?.get("model");
   const image = form?.get("image");
   if (!form || typeof model !== "string" || !model.trim() || model.length > 200 || !(image instanceof File)) {
-    return NextResponse.json({ error: "Choose a model and an image." }, { status: 400 });
+    throw new RouteError(400, "Choose a model and an image.");
   }
   if (!IMAGE_TYPES.has(image.type) || image.size > MAX_IMAGE_BYTES) {
-    return NextResponse.json({ error: "The image must be a PNG, JPEG or WebP of at most 20 MB." }, { status: 400 });
+    throw new RouteError(400, "The image must be a PNG, JPEG or WebP of at most 20 MB.");
   }
 
   const upstream = new FormData();
@@ -44,19 +40,13 @@ export async function POST(req: NextRequest) {
     if (typeof raw !== "string" || !raw.trim()) continue;
     const n = Number(raw);
     if (!Number.isInteger(n) || n < range.min || n > range.max) {
-      return NextResponse.json({ error: `Invalid ${name.replace("_", " ")}.` }, { status: 400 });
+      throw new RouteError(400, `Invalid ${name.replace("_", " ")}.`);
     }
     upstream.set(name, String(n));
   }
 
-  try {
-    const res = await gatewayMeshCreate(upstream);
-    const json = await res.json().catch(() => null);
-    if (!res.ok) {
-      return NextResponse.json({ error: apiErrorMessage(json, "the mesh job could not be started") }, { status: res.status });
-    }
-    return NextResponse.json({ job: json, requestId: res.headers.get("x-obleth-request-id") });
-  } catch (e) {
-    return NextResponse.json({ error: String(e) }, { status: 502 });
-  }
-}
+  const res = await gatewayMeshCreate(upstream);
+  const json = await res.json().catch(() => null);
+  if (!res.ok) throw new RouteError(res.status, apiErrorMessage(json, "the mesh job could not be started"));
+  return { job: json, requestId: res.headers.get("x-obleth-request-id") };
+});

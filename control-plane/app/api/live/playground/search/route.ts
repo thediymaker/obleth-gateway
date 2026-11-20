@@ -1,6 +1,6 @@
-import { NextRequest, NextResponse } from "next/server";
+import { NextResponse } from "next/server";
 import { z } from "zod";
-import { guardAdmin } from "@/lib/auth/guard";
+import { liveRoute, RouteError } from "@/lib/auth/guard";
 import { gatewaySearch, type GatewaySearchBody } from "@/lib/charo/gateway";
 import { apiErrorMessage } from "@/lib/charo/errors";
 
@@ -19,14 +19,9 @@ const bodySchema = z.object({
   timeRange: z.enum(["day", "week", "month", "year"]).optional(),
 });
 
-export async function POST(req: NextRequest) {
-  const denied = await guardAdmin();
-  if (denied) return denied;
-
+export const POST = liveRoute(async (req) => {
   const parsed = bodySchema.safeParse(await req.json().catch(() => null));
-  if (!parsed.success) {
-    return NextResponse.json({ error: "Invalid search request." }, { status: 400 });
-  }
+  if (!parsed.success) throw new RouteError(400, "Invalid search request.");
   const { tool, query, maxResults, domains, timeRange } = parsed.data;
   const body: GatewaySearchBody = {
     search_tool_name: tool,
@@ -36,23 +31,12 @@ export async function POST(req: NextRequest) {
     ...(timeRange ? { time_range: timeRange } : {}),
   };
   const started = Date.now();
-  try {
-    const upstream = await gatewaySearch(body);
-    const latencyMs = Date.now() - started;
-    const requestId = upstream.headers.get("x-obleth-request-id");
-    const json = await upstream.json().catch(() => null);
-    if (!upstream.ok) {
-      return NextResponse.json(
-        { error: apiErrorMessage(json, "search failed"), requestId },
-        { status: upstream.status },
-      );
-    }
-    return NextResponse.json({
-      results: Array.isArray(json?.results) ? json.results : [],
-      latencyMs,
-      requestId,
-    });
-  } catch (e) {
-    return NextResponse.json({ error: String(e) }, { status: 502 });
+  const upstream = await gatewaySearch(body);
+  const latencyMs = Date.now() - started;
+  const requestId = upstream.headers.get("x-obleth-request-id");
+  const json = await upstream.json().catch(() => null);
+  if (!upstream.ok) {
+    return NextResponse.json({ error: apiErrorMessage(json, "search failed"), requestId }, { status: upstream.status });
   }
-}
+  return { results: Array.isArray(json?.results) ? json.results : [], latencyMs, requestId };
+});

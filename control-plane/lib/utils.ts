@@ -18,9 +18,27 @@ export function formatCurrency(n: number) {
   }).format(n);
 }
 
-export async function getJson<T>(url: string): Promise<T> {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`fetch failed: ${url}`);
+/** A failed dashboard API call: the route's own message, and its status. */
+export class HttpError extends Error {
+  constructor(
+    public readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = "HttpError";
+  }
+}
+
+/**
+ * A dashboard API call's JSON. A failure throws `HttpError` with the route's
+ * `{ error }` message, so a caller can show why it failed.
+ */
+export async function getJson<T>(url: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(url, init);
+  if (!res.ok) {
+    const body = (await res.json().catch(() => null)) as { error?: unknown } | null;
+    throw new HttpError(res.status, typeof body?.error === "string" && body.error ? body.error : `That didn't work (HTTP ${res.status}).`);
+  }
   return (await res.json()) as T;
 }
 
