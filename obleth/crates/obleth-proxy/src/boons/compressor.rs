@@ -1,7 +1,7 @@
 //! Neural prose compression: extractive sentence selection plus an HTTP client
 //! for the optional compressor scoring sidecar.
 //!
-//! Pure functions (`split_sentences`, `select_kept`) are used by the lossy
+//! Pure functions (`split_at_most`, `select_kept`) are used by the lossy
 //! compression pass. `CompressorClient` handles the sidecar POST and is held on
 //! `AppState` so a single client is shared across requests.
 
@@ -164,8 +164,7 @@ impl CompressorClient {
 
     /// Most sentences one `/score` call may carry: what the sidecar can score
     /// within this client's timeout. More would time out (and be stopped by the
-    /// sidecar), so a segment that would cross it compacts by the heuristic
-    /// path instead.
+    /// sidecar), so a segment that would cross it is not sent and stays whole.
     pub(super) fn sentence_budget(&self) -> usize {
         let ms = self.timeout.as_millis() as u64;
         ((ms * SCORED_SENTENCES_PER_SEC / 1000) as usize).max(MIN_SENTENCE_BUDGET)
@@ -176,7 +175,7 @@ impl CompressorClient {
     ///
     /// Fails open: on a timeout, an unreachable sidecar, a non-2xx answer or an
     /// unreadable body the scores are `None` and the outcome says why, so the
-    /// request goes on with the heuristic path. After `BREAKER_AFTER`
+    /// request goes on with its new prose whole. After `BREAKER_AFTER`
     /// consecutive timeouts the sidecar is not asked for `BREAKER_HOLD`.
     /// The caller supplies the shared `http` client.
     pub(super) async fn score(&self, http: &reqwest::Client, batches: &[Vec<String>]) -> Scored {
@@ -245,7 +244,7 @@ impl CompressorClient {
             tracing::warn!(
                 outcome = outcome.name(),
                 elapsed_ms = now.duration_since(started).as_millis() as u64,
-                "compressor sidecar {why}; prose is compacted by the heuristic path meanwhile"
+                "compressor sidecar {why}; lossy leaves new prose whole meanwhile"
             );
         }
         Scored {
@@ -292,38 +291,51 @@ fn parse_score_response(v: &serde_json::Value, expected_len: usize) -> Option<Ve
 
 // ── Pure extractive helpers ───────────────────────────────────────────────────
 
-/// Split `text` into sentence substrings.
+/// All of `text`'s sentences, as [`split_at_most`] splits them.
+#[cfg(test)]
+pub(super) fn split_sentences(text: &str) -> Vec<String> {
+    split_at_most(text, usize::MAX).unwrap_or_default()
+}
+
+/// Split `text` into sentences, or `None` as soon as it has more than `max`:
+/// a segment too long to score costs a scan of its first `max` sentences, not
+/// of all of it.
 ///
 /// Breaks after `.`, `!`, or `?` when followed by whitespace, and also on hard
 /// newlines. Each piece is trimmed; empty pieces are dropped. The sentence text
 /// is preserved as-is otherwise (no other normalisation) so reassembly is
 /// faithful.
-pub(super) fn split_sentences(text: &str) -> Vec<String> {
-    let mut sentences: Vec<String> = Vec::new();
-    let mut push = |piece: &str| {
+pub(super) fn split_at_most(text: &str, max: usize) -> Option<Vec<String>> {
+    fn push(sentences: &mut Vec<String>, piece: &str) {
         let piece = piece.trim();
         if !piece.is_empty() {
             sentences.push(piece.to_owned());
         }
-    };
+    }
+    let mut sentences: Vec<String> = Vec::new();
     let mut start = 0;
     let mut chars = text.char_indices().peekable();
     while let Some((i, ch)) = chars.next() {
         if ch == '\n' {
             // A hard newline always ends the sentence, and is not part of it.
-            push(&text[start..i]);
+            push(&mut sentences, &text[start..i]);
             start = i + 1;
         } else if matches!(ch, '.' | '!' | '?')
             && chars.peek().is_none_or(|(_, next)| next.is_whitespace())
         {
             // Punctuation ends it when whitespace (or the end) follows.
-            push(&text[start..i + 1]);
+            push(&mut sentences, &text[start..i + 1]);
             start = i + 1;
+        } else {
+            continue;
+        }
+        if sentences.len() > max {
+            return None;
         }
     }
     // Trailing text that did not end with punctuation.
-    push(&text[start..]);
-    sentences
+    push(&mut sentences, &text[start..]);
+    (sentences.len() <= max).then_some(sentences)
 }
 
 /// Select the sentences to keep for the extractive compression result.
@@ -399,46 +411,13 @@ pub(super) fn select_kept(
     }
 }
 
-/// Choose the prose compaction for one segment: prefer the neural extractive
-/// selection when sidecar `scores` are available and productive, otherwise the
-/// deterministic heuristic. Text in 8 or more lines keeps its line structure
-/// ([`extract_prose`](super::compression::extract_prose)); prose in fewer,
-/// longer lines (a paragraph, a pasted answer) is ranked by sentence with the
-/// same heuristic, as the sidecar's scores would be. Pure; no I/O.
-pub(super) fn compact_prose_segment(
-    original: &str,
-    neural_scores: Option<&[f32]>,
-    keep_ratio: f32,
-    query_terms: &std::collections::HashSet<String>,
-) -> Option<String> {
-    let sentences = split_sentences(original);
-    if let Some(scores) = neural_scores {
-        if let Some(out) = select_kept(&sentences, scores, keep_ratio, query_terms) {
-            return Some(out);
-        }
-    }
-    super::compression::extract_prose(original, query_terms, keep_ratio).or_else(|| {
-        let scores = heuristic_scores(&sentences, query_terms);
-        select_kept(&sentences, &scores, keep_ratio, query_terms)
-    })
-}
-
-/// The heuristic's score for each sentence; a near-duplicate of an earlier
-/// sentence scores 0, so it is the first to go.
-fn heuristic_scores(
-    sentences: &[String],
-    query_terms: &std::collections::HashSet<String>,
-) -> Vec<f32> {
-    let mut seen = std::collections::HashSet::new();
+/// A stand-in for the sidecar's scores in tests: longer sentences score
+/// higher, as denser ones tend to.
+#[cfg(test)]
+pub(super) fn length_scores(sentences: &[String]) -> Vec<f32> {
     sentences
         .iter()
-        .map(|s| {
-            if seen.insert(super::compression::dedup_key(s)) {
-                super::compression::salience(s, query_terms)
-            } else {
-                0.0
-            }
-        })
+        .map(|s| s.len().min(120) as f32 / 120.0)
         .collect()
 }
 
@@ -687,81 +666,12 @@ mod tests {
     }
 
     #[test]
-    fn a_paragraph_without_sidecar_scores_is_ranked_by_sentence() {
-        // One line of ten sentences: too few lines for the line heuristic, so
-        // before this it was never shortened without the sidecar.
-        let text = "The queue drained overnight. Node seven rebooted twice. \
-                    Storage stayed at sixty percent. The scheduler restarted once. \
-                    Network latency was flat. A user asked about quotas. \
-                    Backups finished on time. The login node was busy. \
-                    Node seven rebooted twice. Nothing else changed.";
-        let terms: HashSet<String> = ["quotas".to_string()].into_iter().collect();
-        let out = compact_prose_segment(text, None, 0.5, &terms).expect("a paragraph compacts");
-        assert!(out.ends_with("sentences omitted]"), "{out}");
-        assert!(out.len() < text.len());
-        assert!(
-            out.contains("A user asked about quotas."),
-            "query match kept: {out}"
-        );
-        assert_eq!(
-            out.matches("Node seven rebooted twice.").count(),
-            1,
-            "a repeated sentence goes first: {out}"
-        );
-    }
-
-    #[test]
-    fn many_lines_without_scores_keep_the_line_heuristic() {
-        let text: String = (0..12)
-            .map(|i| format!("Line {i} reports a distinct observation about subsystem {i}.\n"))
-            .collect();
-        let out = compact_prose_segment(&text, None, 0.5, &HashSet::new()).expect("compacts");
-        assert!(out.contains("lines omitted]"), "{out}");
-    }
-
-    #[test]
-    fn three_sentences_are_left_alone() {
-        let text = "One short thing. Another short thing. A third.";
-        assert_eq!(
-            compact_prose_segment(text, None, 0.5, &HashSet::new()),
-            None
-        );
-    }
-
-    #[test]
-    fn compact_prose_segment_uses_neural_when_scores_help() {
-        let text = "Alpha one. Beta two. Gamma three. Delta four. Epsilon five. Zeta six.";
-        let sents = split_sentences(text);
-        // High score to first three, low to the rest.
-        let scores: Vec<f32> = sents
-            .iter()
-            .enumerate()
-            .map(|(i, _)| if i < 3 { 0.9 } else { 0.1 })
-            .collect();
-        let out = compact_prose_segment(text, Some(&scores), 0.5, &HashSet::new()).unwrap();
-        assert!(out.contains("sentences omitted]"));
-        assert!(out.len() < text.len());
-    }
-
-    #[test]
-    fn compact_prose_segment_falls_back_to_heuristic_without_scores() {
-        // 12 distinct non-trivial lines so extract_prose (line-based, needs >=8 lines) fires.
-        let text: String = (0..12)
-            .map(|i| format!("This is a reasonably long note line number {i} with content.\n"))
-            .collect();
-        let out = compact_prose_segment(&text, None, 0.4, &HashSet::new());
-        assert!(out.is_some(), "heuristic should compact 12 lines");
-        assert!(out.unwrap().contains("lines omitted]"));
-    }
-
-    #[test]
-    fn compact_prose_segment_falls_back_when_scores_mismatch() {
-        let text: String = (0..12)
-            .map(|i| format!("This is a reasonably long note line number {i} with content.\n"))
-            .collect();
-        // Wrong-length scores → select_kept returns None → heuristic path used.
-        let out = compact_prose_segment(&text, Some(&[0.9, 0.1]), 0.4, &HashSet::new());
-        assert!(out.is_some());
-        assert!(out.unwrap().contains("lines omitted]"));
+    fn split_at_most_stops_past_the_cap() {
+        let text = "One. Two. Three.\nFour";
+        assert_eq!(split_at_most(text, 4), Some(split_sentences(text)));
+        assert_eq!(split_sentences(text).len(), 4);
+        assert_eq!(split_at_most(text, 3), None);
+        assert_eq!(split_at_most("One. Two.", 1), None);
+        assert_eq!(split_at_most("", 0), Some(vec![]));
     }
 }

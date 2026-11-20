@@ -6,10 +6,10 @@
 //!
 //! Then the reversible text passes over one shared segment index
 //! ([`TextPasses`]): cross-turn dedup, log-template collapse (`compact_log`)
-//! and lossy prose extraction (`extract_prose`, or the compressor sidecar's
-//! sentence scores), each replacing a segment with a shorter form plus a
-//! `[ref:HASH]` marker; when the model can call `retrieve_original`, the
-//! original is stashed for it, best effort.
+//! and lossy prose extraction (by the compressor sidecar's sentence scores),
+//! each replacing a segment with a shorter form plus a `[ref:HASH]` marker;
+//! when the model can call `retrieve_original`, the original is stashed for
+//! it, best effort.
 
 use obleth_config::{CompressionBoonSettings, ResolvedKey};
 use obleth_tokenizer::{HeuristicTokenizer, Tokenizer};
@@ -324,8 +324,8 @@ pub(super) struct LossyStats {
     /// Of `pass.replaced`, segments given the compacted form kept from an
     /// earlier turn.
     pub reused: u32,
-    /// How the sidecar call ended, when one was made; `None` means the
-    /// heuristic path alone (no sidecar, or nothing worth scoring).
+    /// How the sidecar call ended, when one was made; `None` means no call
+    /// (no sidecar, or nothing new to score), so nothing new was cut.
     pub scorer: Option<super::compressor::ScoreOutcome>,
     pub score_ms: u64,
 }
@@ -517,9 +517,11 @@ impl<'c> TextPasses<'c> {
         stats
     }
 
-    /// The lossy pass: long Prose segments are cut to their most salient
-    /// sentences (ranked by the compressor sidecar when there is one, by
-    /// [`extract_prose`] otherwise) plus a `[ref:HASH]` marker.
+    /// The lossy pass: long Prose segments are cut to the sentences the
+    /// compressor sidecar ranks highest, plus a `[ref:HASH]` marker. Without
+    /// the sidecar's scores (none set up, busy, timed out, or a segment over
+    /// its sentence budget) a new segment stays whole: ranking it here would
+    /// spend gateway CPU on every request and cut by a cruder measure.
     ///
     /// A segment's compacted form is kept (next to its original, for as
     /// long) and given again on later turns, so earlier turns read the same
@@ -534,31 +536,30 @@ impl<'c> TextPasses<'c> {
         json: &Value,
     ) -> LossyStats {
         let mut stats = LossyStats::default();
+        let Some(kc) = state.compressor.as_ref() else {
+            return stats;
+        };
         let order = self.lossy_order(json);
         let hashes: Vec<String> = order
             .iter()
             .map(|&i| obleth_config::content_hash(self.text(json, i)))
             .collect();
         let kept = self.kept_forms(state, key, &hashes).await;
-        let budget = state
-            .compressor
-            .as_ref()
-            .map_or(0, |kc| kc.sentence_budget());
-        let (scored, batches) = self.scoring_batches(json, &order, &kept, budget);
-        let mut scores: Vec<Option<Vec<f32>>> = vec![None; order.len()];
-        if let Some(kc) = state.compressor.as_ref().filter(|_| !scored.is_empty()) {
+        let (at, batches) = self.scoring_batches(json, &order, &kept, kc.sentence_budget());
+        let mut scored: Vec<Option<Scored>> = vec![None; order.len()];
+        if !at.is_empty() {
             let answer = kc.score(&state.http, &batches).await;
             stats.scorer = Some(answer.outcome);
             stats.score_ms = answer.elapsed.as_millis() as u64;
-            if let Some(found) = answer.scores.filter(|v| v.len() == scored.len()) {
-                for (at, s) in scored.into_iter().zip(found) {
-                    scores[at] = Some(s);
+            if let Some(found) = answer.scores.filter(|v| v.len() == at.len()) {
+                for ((pos, sentences), scores) in at.into_iter().zip(batches).zip(found) {
+                    scored[pos] = Some((sentences, scores));
                 }
             }
         }
         let terms = latest_user_query_terms(json);
         (stats.pass, stats.reused) =
-            self.lossy_rewrite(json, &order, &hashes, &kept, &scores, &terms);
+            self.lossy_rewrite(json, &order, &hashes, &kept, &scored, &terms);
         stats
     }
 
@@ -617,7 +618,7 @@ impl<'c> TextPasses<'c> {
     /// scoring the whole history would ship every old turn to the sidecar on
     /// every request. `max_sentences` caps the sentences of one call (see
     /// `CompressorClient::sentence_budget`); a segment that would cross it is
-    /// left unscored and compacts via the heuristic path instead.
+    /// not sent, and is read only as far as the sentences left in the budget.
     fn scoring_batches(
         &self,
         json: &Value,
@@ -636,10 +637,11 @@ impl<'c> TextPasses<'c> {
             if kept[pos].is_some() {
                 continue; // its form is kept: nothing to score
             }
-            let batch = super::compressor::split_sentences(self.text(json, i));
-            if sentences + batch.len() > max_sentences {
+            let Some(batch) =
+                super::compressor::split_at_most(self.text(json, i), max_sentences - sentences)
+            else {
                 continue;
-            }
+            };
             sentences += batch.len();
             at.push(pos);
             batches.push(batch);
@@ -649,15 +651,15 @@ impl<'c> TextPasses<'c> {
 
     /// Pure core of the lossy pass, returning its stats and how many forms
     /// it reused. For `order[k]`: `hashes[k]` is its content hash, `kept[k]`
-    /// its form kept from an earlier turn, and `scores[k]` the sidecar's
-    /// scores, when there are any.
+    /// its form kept from an earlier turn, and `scored[k]` its sentences and
+    /// the sidecar's scores for them, when there are any.
     fn lossy_rewrite(
         &mut self,
         json: &Value,
         order: &[usize],
         hashes: &[String],
         kept: &[Option<String>],
-        scores: &[Option<Vec<f32>>],
+        scored: &[Option<Scored>],
         terms: &std::collections::HashSet<String>,
     ) -> (PassStats, u32) {
         let mut stats = PassStats::default();
@@ -668,12 +670,15 @@ impl<'c> TextPasses<'c> {
             let marker = match &kept[k] {
                 Some(form) => form.clone(),
                 None => {
+                    let Some((sentences, scores)) = &scored[k] else {
+                        continue; // not scored: left whole
+                    };
                     if fresh >= self.cfg.max_lossy_segments {
                         continue;
                     }
-                    let Some(compacted) = super::compressor::compact_prose_segment(
-                        original,
-                        scores[k].as_deref(),
+                    let Some(compacted) = super::compressor::select_kept(
+                        sentences,
+                        scores,
                         self.cfg.neural_keep_ratio,
                         terms,
                     ) else {
@@ -747,6 +752,9 @@ fn is_table(text: &str) -> bool {
     // `<<OBLETH_TABLE:` skeleton/block form.
     text.contains("OBLETH_TABLE")
 }
+
+/// A segment's sentences and the sidecar's score for each, index-aligned.
+type Scored = (Vec<String>, Vec<f32>);
 
 /// Hard ceiling on segments sent to the compressor sidecar in one `/score`
 /// call, whatever `max_lossy_segments` says.
@@ -871,7 +879,21 @@ pub(super) fn log_rewrite(
     (stats, passes.write(json))
 }
 
-/// The lossy pass alone without a sidecar, as [`dedup_rewrite`].
+/// Every segment in `order` scored by a stand-in for the sidecar.
+#[cfg(test)]
+fn stand_in_scores(passes: &TextPasses, json: &Value, order: &[usize]) -> Vec<Option<Scored>> {
+    order
+        .iter()
+        .map(|&i| {
+            let sentences = super::compressor::split_sentences(passes.text(json, i));
+            let scores = super::compressor::length_scores(&sentences);
+            Some((sentences, scores))
+        })
+        .collect()
+}
+
+/// The lossy pass alone, the sidecar's scores stood in for, as
+/// [`dedup_rewrite`].
 #[cfg(test)]
 pub(super) fn lossy_rewrite(
     cfg: &CompressionBoonSettings,
@@ -883,92 +905,17 @@ pub(super) fn lossy_rewrite(
         .iter()
         .map(|&i| obleth_config::content_hash(passes.text(json, i)))
         .collect();
-    let none = vec![None; order.len()];
+    let scored = stand_in_scores(&passes, json, &order);
     let terms = latest_user_query_terms(json);
     let (stats, _) = passes.lossy_rewrite(
         json,
         &order,
         &hashes,
-        &none,
         &vec![None; order.len()],
+        &scored,
         &terms,
     );
     (stats, passes.write(json))
-}
-
-/// Normalize a line for near-duplicate detection: trim + lowercase + collapse digits.
-pub(super) fn dedup_key(line: &str) -> String {
-    line.trim()
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_ascii_digit() { '#' } else { c })
-        .collect()
-}
-
-/// What the heuristic thinks a line or sentence is worth keeping: its length
-/// as a density proxy (capped at 120 bytes), plus 2 when it mentions one of the
-/// request's query terms.
-pub(super) fn salience(text: &str, query_terms: &std::collections::HashSet<String>) -> f32 {
-    let mut score = (text.len().min(120) as f32) / 120.0;
-    if mentions_any(text, query_terms) {
-        score += 2.0;
-    }
-    score
-}
-
-/// Deterministic extractive compaction of prose/log-ish text: score each line by
-/// salience (length/density + overlap with the request's query terms), drop
-/// blank lines and near-duplicates, and keep the top `keep_ratio` of lines in
-/// original order. Returns `Some` only when strictly shorter than the input.
-pub(super) fn extract_prose(
-    text: &str,
-    query_terms: &std::collections::HashSet<String>,
-    keep_ratio: f32,
-) -> Option<String> {
-    let lines: Vec<&str> = text.lines().collect();
-    if lines.len() < 8 {
-        return None; // too small to benefit
-    }
-    let mut seen = std::collections::HashSet::new();
-    // (original_index, score) for non-blank, non-duplicate lines.
-    let mut scored: Vec<(usize, f32)> = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if !seen.insert(dedup_key(line)) {
-            continue; // near-duplicate
-        }
-        scored.push((i, salience(trimmed, query_terms)));
-    }
-    if scored.is_empty() {
-        return None;
-    }
-    let keep = ((scored.len() as f32) * keep_ratio).ceil().max(1.0) as usize;
-    if keep >= scored.len() {
-        return None; // nothing meaningfully dropped
-    }
-    // Choose the top `keep` by score, then restore original order.
-    let mut by_score = scored.clone();
-    by_score.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.0.cmp(&b.0))
-    });
-    let mut kept_idx: Vec<usize> = by_score.into_iter().take(keep).map(|(i, _)| i).collect();
-    kept_idx.sort_unstable();
-    let omitted = lines.len() - kept_idx.len();
-    let mut out = String::with_capacity(text.len());
-    for i in &kept_idx {
-        out.push_str(lines[*i]);
-        out.push('\n');
-    }
-    out.push_str(&format!("[… {omitted} lines omitted]"));
-    if out.len() >= text.len() {
-        return None;
-    }
-    Some(out)
 }
 
 /// Collapse repeated log lines via Drain-style template mining: lines whose
@@ -1415,31 +1362,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_prose_drops_low_value_and_dupes_keeps_query_lines() {
-        use std::collections::HashSet;
-        let mut text = String::new();
-        for _ in 0..40 {
-            text.push_str("boilerplate filler line that repeats a lot\n");
-        }
-        text.push_str("the deadbeef token error occurred in module X\n");
-        for _ in 0..40 {
-            text.push_str("more boilerplate filler line that repeats\n");
-        }
-        let mut q = HashSet::new();
-        q.insert("deadbeef".to_string());
-        let out = extract_prose(&text, &q, 0.3).expect("should extract");
-        assert!(out.len() < text.len());
-        assert!(out.contains("deadbeef")); // query-relevant line is kept
-        assert!(out.contains("omitted")); // omission marker present
-    }
-
-    #[test]
-    fn extract_prose_returns_none_when_short() {
-        use std::collections::HashSet;
-        assert_eq!(extract_prose("a\nb\nc", &HashSet::new(), 0.5), None);
-    }
-
-    #[test]
     fn compact_log_collapses_repeated_templates_keeps_errors() {
         let mut text = String::new();
         for i in 0..50 {
@@ -1586,10 +1508,13 @@ mod tests {
     }
 
     #[test]
-    fn extract_prose_shortens_pasted_notes_around_the_query_terms() {
-        // Build a long prose user message (the latest turn) + a short follow-up question.
+    fn lossy_shortens_pasted_notes_and_keeps_what_the_question_names() {
+        // A long pasted message, then a short question naming a few of its lines.
         let big: String = (0..60)
-            .map(|i| format!("This is line number {i} of some pasted notes.\n"))
+            .map(|i| {
+                let about = if i % 20 == 7 { "notes" } else { "text" };
+                format!("This is line number {i} of some pasted {about}.\n")
+            })
             .collect();
         let mut body = json!({
             "model": "m",
@@ -1606,6 +1531,9 @@ mod tests {
         assert_eq!((stats.examined, stats.replaced, stash.len()), (1, 1, 1));
         let compacted = body["messages"][0]["content"].as_str().unwrap();
         assert!(compacted.len() < big.len() && compacted.contains("[ref:"));
+        for i in [7, 27, 47] {
+            assert!(compacted.contains(&format!("line number {i} of some pasted notes.")));
+        }
         // The active question is untouched.
         assert_eq!(body["messages"][1]["content"], "summarize the notes above");
     }
@@ -1650,6 +1578,44 @@ mod tests {
         );
     }
 
+    /// A new segment the sidecar did not score is left whole; a form kept
+    /// from an earlier turn is still given.
+    #[test]
+    fn an_unscored_segment_stays_whole() {
+        let doc = |w: &str| -> String {
+            (0..20)
+                .map(|i| format!("Sentence {i} of the {w} notes, in plain words.\n"))
+                .collect()
+        };
+        let mut body = turns(&[doc("first"), doc("second")]);
+        let cfg = lossy_cfg(4);
+        let mut passes = TextPasses::new(&cfg, true, &body);
+        let order = passes.lossy_order(&body);
+        let hashes: Vec<String> = order
+            .iter()
+            .map(|&i| obleth_config::content_hash(passes.text(&body, i)))
+            .collect();
+        let kept = vec![Some("[ref:kept]".to_owned()), None];
+        let (stats, reused) = passes.lossy_rewrite(
+            &body,
+            &order,
+            &hashes,
+            &kept,
+            &[None, None],
+            &Default::default(),
+        );
+        assert_eq!((stats.examined, stats.replaced, reused), (1, 1, 1));
+        passes.write(&mut body);
+        let contents: Vec<&str> = (0..2)
+            .map(|m| body["messages"][m]["content"].as_str().unwrap())
+            .collect();
+        assert!(contents.contains(&"[ref:kept]"), "{contents:?}");
+        assert!(
+            contents.iter().any(|c| c.starts_with("Sentence 0")),
+            "{contents:?}"
+        );
+    }
+
     /// The passes share one index: a segment dedup replaced is not offered to
     /// the lossy pass, and the originals of both go out in one stash.
     #[test]
@@ -1671,13 +1637,13 @@ mod tests {
             .iter()
             .map(|&i| obleth_config::content_hash(passes.text(&body, i)))
             .collect();
-        let none = vec![None; order.len()];
+        let scored = stand_in_scores(&passes, &body, &order);
         let (lossy, _) = passes.lossy_rewrite(
             &body,
             &order,
             &hashes,
-            &none,
             &vec![None; order.len()],
+            &scored,
             &Default::default(),
         );
         assert_eq!(lossy.replaced, 2);
@@ -1707,8 +1673,8 @@ mod tests {
             .map(|h| store.get(&passes.form_id(h)).cloned())
             .collect();
         let terms = latest_user_query_terms(body);
-        let none = vec![None; order.len()];
-        let (_, reused) = passes.lossy_rewrite(body, &order, &hashes, &kept, &none, &terms);
+        let scored = stand_in_scores(&passes, body, &order);
+        let (_, reused) = passes.lossy_rewrite(body, &order, &hashes, &kept, &scored, &terms);
         store.extend(std::mem::take(&mut passes.forms));
         passes.write(body);
         reused
@@ -1769,7 +1735,8 @@ mod tests {
     }
 
     /// Lossy output on fixed fixtures, digested: whole-word query matching
-    /// (P2-15) moved it deliberately; it must not move again by accident.
+    /// (P2-15) moved it deliberately, and so did cutting only by the sidecar's
+    /// scores (stood in for by length here); it must not move by accident.
     #[test]
     fn lossy_output_is_byte_identical_to_the_recorded_digest() {
         use sha2::{Digest, Sha256};
@@ -1781,12 +1748,12 @@ mod tests {
                     (0..(10 + 5 * ((k + j) % 7)))
                         .map(|i| {
                             format!(
-                                "Item {i} on the {} rollout notes the latency budget{}\n",
+                                "Item {i} on the {} rollout notes the {}\n",
                                 ["gateway", "chat", "docs"][(i + j) % 3],
                                 if i % 4 == 0 {
-                                    " and the config drift."
+                                    "latency budget and the config drift."
                                 } else {
-                                    "."
+                                    "budget."
                                 }
                             )
                         })
@@ -1804,7 +1771,7 @@ mod tests {
         let digest = hex::encode(h.finalize());
         assert_eq!(
             digest,
-            "b125890fa94e4350d41da9f2883b6b15bddd2627893847f186f6d747286196ba"
+            "4364d7f5f0c0c01b6c594fcfc8a61be2e30be22e62237d7a4255b1afad9d495d"
         );
     }
 

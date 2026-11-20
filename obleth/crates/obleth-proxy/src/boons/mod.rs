@@ -862,7 +862,7 @@ impl BoonEngine {
                             "logs": logs.to_json(),
                             "lossy": lossy.pass.to_json(),
                         },
-                        "scorer": lossy.scorer.map_or("heuristic", |o| o.name()),
+                        "scorer": lossy.scorer.map_or("none", |o| o.name()),
                         "score_ms": lossy.score_ms,
                         "tokens_before": tokens_before,
                         "tokens_after": tokens_after,

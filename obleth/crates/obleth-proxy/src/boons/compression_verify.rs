@@ -21,7 +21,13 @@ use obleth_config::CompressionBoonSettings;
 use obleth_tokenizer::{HeuristicTokenizer, Tokenizer};
 use serde_json::{json, Value};
 
-use super::{compression, structural_json};
+use super::{compression, compressor, structural_json};
+
+/// `text` cut as the lossy pass cuts it, the sidecar's scores stood in for.
+fn lossy_cut(text: &str, q: &std::collections::HashSet<String>) -> Option<String> {
+    let sentences = compressor::split_sentences(text);
+    compressor::select_kept(&sentences, &compressor::length_scores(&sentences), 0.4, q)
+}
 
 // ── Fixture corpus ───────────────────────────────────────────────────────────
 
@@ -602,7 +608,7 @@ fn print_other_content_report() {
         (
             "redundant_chat (verbose turn)",
             chat_in.clone(),
-            compression::extract_prose(&chat_in, &q, 0.4).unwrap_or_else(|| chat_in.clone()),
+            lossy_cut(&chat_in, &q).unwrap_or_else(|| chat_in.clone()),
             "lossy",
             "opt-in: allow_lossy",
         ),
@@ -681,8 +687,8 @@ fn report() {
     print_dedup_report();
     println!(
         "\nNote: 'plain_prose_thread_control' and 'redundant_chat' show the deterministic \
-         ceiling on human prose — only the lossy line-dropper touches chat, and only when \
-         allow_lossy is on. Real, faithful chat/prose compression is Phase 2 (neural Compressor).\n"
+         ceiling on human prose — only the lossy pass touches chat, only when allow_lossy is \
+         on, and only with the compressor sidecar's scores (stood in for here by length).\n"
     );
 }
 
@@ -740,7 +746,7 @@ fn chat_prose_extraction_thins_filler() {
     .iter()
     .map(|s| s.to_string())
     .collect();
-    let out = compression::extract_prose(&chat, &q, 0.4).expect("verbose chat should thin");
+    let out = lossy_cut(&chat, &q).expect("verbose chat should thin");
     assert!(tk.count_text(&out) < tk.count_text(&chat));
     // The substantive, query-relevant line is retained.
     assert!(out.contains("connection-pool exhaustion in the payments service"));
