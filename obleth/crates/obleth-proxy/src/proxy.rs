@@ -438,9 +438,10 @@ fn translate_stream_with<T: StreamShim>(
     let (parts, body) = resp.into_parts();
     let stream = async_stream::stream! {
         let mut upstream = body.into_data_stream();
-        // Bytes in, complete lines out — see `drain_sse_data_lines` for why
-        // the split happens on bytes rather than decoded text.
-        let mut buffer: Vec<u8> = Vec::new();
+        // Bytes in, whole events out: an event is decoded only once it is
+        // complete, so a character split across chunks is never cut in two.
+        let mut events = crate::sse::Splitter::unbounded();
+        let mut broke_off = false;
         loop {
             let item = match tokio::time::timeout(ping_interval, upstream.next()).await {
                 Ok(item) => item,
@@ -462,15 +463,20 @@ fn translate_stream_with<T: StreamShim>(
                 for frame in translator.fail("upstream stream ended before the response finished") {
                     yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
                 }
+                broke_off = true;
                 break;
             };
-            buffer.extend_from_slice(&chunk);
-            for payload in crate::responses::drain_sse_data_lines(&mut buffer) {
-                if payload == "[DONE]" {
-                    continue;
+            events.push(&chunk);
+            while let Some(event) = events.next_event() {
+                for frame in translate_event(&mut translator, event) {
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
                 }
-                let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload) else { continue };
-                for frame in translator.on_chunk(&value) {
+            }
+        }
+        // A last event the upstream closed without a blank line.
+        if !broke_off {
+            if let Some(crate::sse::Piece::Event(event)) = events.finish() {
+                for frame in translate_event(&mut translator, event) {
                     yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
                 }
             }
@@ -482,6 +488,21 @@ fn translate_stream_with<T: StreamShim>(
         }
     };
     translated_response(parts, "text/event-stream", Body::from_stream(stream))
+}
+
+/// The frames one upstream event translates to; none for `[DONE]`, a
+/// heartbeat or data that is not JSON.
+fn translate_event<T: StreamShim>(translator: &mut T, event: &[u8]) -> Vec<String> {
+    let Some(payload) = crate::sse::data_text(event) else {
+        return Vec::new();
+    };
+    if payload == "[DONE]" {
+        return Vec::new();
+    }
+    match serde_json::from_str::<serde_json::Value>(&payload) {
+        Ok(value) => translator.on_chunk(&value),
+        Err(_) => Vec::new(),
+    }
 }
 
 /// Buffer a chat reply and hand back `translate` of it. A body that is not JSON
@@ -2552,7 +2573,7 @@ async fn run_pipeline(
                     drop(permit);
                     // Zero figures (accounting off, nothing measured) leave it as is.
                     let mut body = body;
-                    stamp_usage(&mut body, accounting.energy_now());
+                    crate::sse::stamp_usage(&mut body, accounting.energy_now());
                     let total_ms = request_start.elapsed().as_millis() as u32;
                     let _ = settle_guard
                         .complete(accounting.settle(
@@ -2590,7 +2611,7 @@ async fn run_pipeline(
                             match item {
                                 Ok(chunk) => {
                                     let chunk = match energy_stamp.as_mut() {
-                                        Some(stamp) => stamp.push(chunk, || accounting.energy_now()),
+                                        Some(stamp) => stamp.push(chunk, || accounting.energy_now()).client,
                                         None => chunk,
                                     };
                                     if !chunk.is_empty() {
@@ -2603,7 +2624,7 @@ async fn run_pipeline(
                                 }
                             }
                         }
-                        if let Some(rest) = energy_stamp.take().map(|s| s.finish(|| accounting.energy_now())) {
+                        if let Some(rest) = energy_stamp.take().map(|s| s.finish(|| accounting.energy_now()).client) {
                             if !rest.is_empty() {
                                 yield Ok(rest);
                             }
@@ -3229,7 +3250,7 @@ async fn run_pipeline(
                                     monitor.push(&chunk);
                                 }
                                 let chunk = match energy_stamp.as_mut() {
-                                    Some(stamp) => stamp.push(chunk, || accounting.energy_now()),
+                                    Some(stamp) => stamp.push(chunk, || accounting.energy_now()).client,
                                     None => chunk,
                                 };
                                 if !chunk.is_empty() {
@@ -3242,7 +3263,7 @@ async fn run_pipeline(
                             }
                         }
                     }
-                    if let Some(rest) = energy_stamp.take().map(|s| s.finish(|| accounting.energy_now())) {
+                    if let Some(rest) = energy_stamp.take().map(|s| s.finish(|| accounting.energy_now()).client) {
                         if !rest.is_empty() {
                             yield Ok(rest);
                         }
@@ -3555,7 +3576,7 @@ async fn run_pipeline(
                 total_ms,
                 accounting.queue_wait_ms,
             );
-            stamp_body(final_body, &final_content_type, figures)
+            crate::sse::stamp_body(final_body, &final_content_type, figures)
         } else {
             final_body
         };
@@ -3612,11 +3633,13 @@ async fn run_pipeline(
         let mut tail: Vec<u8> = Vec::with_capacity(TAIL_CAP.min(4 * 1024));
         let mut full: Vec<u8> = Vec::new();
         let mut cacheable = store_in_cache.is_some();
-        let mut usage_filter = strip_usage_chunk.then(UsageChunkFilter::default);
-        // The usage a client asked for also carries the energy measured for it.
-        let mut energy_stamp = (expect_end && status_code == 200)
-            .then(|| accounting.energy_stamp(&content_type_str))
-            .flatten();
+        // Drops the usage chunk the gateway asked for on the client's behalf;
+        // the usage a client asked for also carries the energy measured for it.
+        let mut usage = crate::sse::UsageRewriter::new(
+            &content_type_str,
+            strip_usage_chunk,
+            expect_end && status_code == 200 && accounting.energy_on(),
+        );
         let mut broke_off = false;
         // Characters of generated text delivered so far, for billing a stream
         // the upstream breaks off before reporting usage.
@@ -3637,31 +3660,28 @@ async fn run_pipeline(
                     append_tail(&mut tail, &chunk);
                     streamed_chars += delta_text_chars(&chunk);
                     if let Some(watch) = failure_watch.as_mut() { watch.push(&chunk); }
-                    let chunk = match usage_filter.as_mut() {
-                        Some(filter) => filter.push(chunk),
-                        None => chunk,
+                    let crate::sse::Rewritten { client, unstamped } = match usage.as_mut() {
+                        Some(usage) => usage.push(chunk, || accounting.energy_now()),
+                        None => crate::sse::Rewritten { client: chunk.clone(), unstamped: chunk },
                     };
-                    if chunk.is_empty() {
-                        continue;
-                    }
-                    if let Some(monitor) = output_monitor.as_mut() { monitor.push(&chunk); }
-                    if cacheable {
-                        if full.len() + chunk.len() <= CACHE_MAX_BYTES {
-                            full.extend_from_slice(&chunk);
-                        } else {
-                            cacheable = false;
-                            full = Vec::new();
+                    // The monitor and the cache read the answer without the
+                    // energy added: a cache hit uses none.
+                    if !unstamped.is_empty() {
+                        if let Some(monitor) = output_monitor.as_mut() { monitor.push(&unstamped); }
+                        if cacheable {
+                            if full.len() + unstamped.len() <= CACHE_MAX_BYTES {
+                                full.extend_from_slice(&unstamped);
+                            } else {
+                                cacheable = false;
+                                full = Vec::new();
+                            }
                         }
                     }
-                    let chunk = match energy_stamp.as_mut() {
-                        Some(stamp) => stamp.push(chunk, || accounting.energy_now()),
-                        None => chunk,
-                    };
-                    if chunk.is_empty() {
+                    if client.is_empty() {
                         continue;
                     }
-                    crate::upstream_failure::remember_sent(&mut sent_tail, &chunk);
-                    yield Ok::<Bytes, std::io::Error>(chunk);
+                    crate::upstream_failure::remember_sent(&mut sent_tail, &client);
+                    yield Ok::<Bytes, std::io::Error>(client);
                 }
                 Err(e) if failure_watch.as_ref().is_some_and(|w| w.saw_done()) => {
                     // The answer is whole once `[DONE]` is in; a connection
@@ -3686,34 +3706,25 @@ async fn run_pipeline(
             }
         }
         if !broke_off {
-            // A partial trailing event is passed through as received.
-            if let Some(rest) = usage_filter.take().map(UsageChunkFilter::finish) {
-                if !rest.is_empty() {
-                    if let Some(monitor) = output_monitor.as_mut() { monitor.push(&rest); }
+            // A JSON answer is held until it ends; a partial trailing event
+            // is passed through as received.
+            if let Some(usage) = usage.take() {
+                let crate::sse::Rewritten { client, unstamped } =
+                    usage.finish(|| accounting.energy_now());
+                if !unstamped.is_empty() {
+                    if let Some(monitor) = output_monitor.as_mut() { monitor.push(&unstamped); }
                     if cacheable {
-                        if full.len() + rest.len() <= CACHE_MAX_BYTES {
-                            full.extend_from_slice(&rest);
+                        if full.len() + unstamped.len() <= CACHE_MAX_BYTES {
+                            full.extend_from_slice(&unstamped);
                         } else {
                             cacheable = false;
                             full = Vec::new();
                         }
                     }
-                    let rest = match energy_stamp.as_mut() {
-                        Some(stamp) => stamp.push(rest, || accounting.energy_now()),
-                        None => rest,
-                    };
-                    if !rest.is_empty() {
-                        crate::upstream_failure::remember_sent(&mut sent_tail, &rest);
-                        yield Ok::<Bytes, std::io::Error>(rest);
-                    }
                 }
-            }
-            if let Some(rest) = energy_stamp
-                .take()
-                .map(|s| s.finish(|| accounting.energy_now())) {
-                if !rest.is_empty() {
-                    crate::upstream_failure::remember_sent(&mut sent_tail, &rest);
-                    yield Ok::<Bytes, std::io::Error>(rest);
+                if !client.is_empty() {
+                    crate::upstream_failure::remember_sent(&mut sent_tail, &client);
+                    yield Ok::<Bytes, std::io::Error>(client);
                 }
             }
         }
@@ -3853,259 +3864,6 @@ async fn run_pipeline(
     };
 
     answer.respond(status_code, content_type, Body::from_stream(body_stream))
-}
-
-/// Above this much held, unterminated buffer, [`UsageChunkFilter`] gives up
-/// waiting for an SSE blank-line terminator and flushes what it has. An
-/// upstream that never emits one (non-compliant, or a non-SSE error body)
-/// would otherwise hold the whole stream indefinitely.
-const USAGE_FILTER_MAX_PENDING: usize = 64 * 1024;
-
-/// Drops the usage-only SSE event the gateway asked the upstream for on a
-/// client's behalf (see `prepare_upstream_body`), passing every other event
-/// through byte-for-byte. Complete events are released as soon as their
-/// terminating blank line arrives, so it adds no latency to a live stream.
-#[derive(Default)]
-struct UsageChunkFilter {
-    pending: Vec<u8>,
-    /// Set once the cap has been hit, so the fallback is logged only once
-    /// per stream rather than on every subsequent chunk.
-    overflowed: bool,
-}
-
-impl UsageChunkFilter {
-    fn push(&mut self, chunk: Bytes) -> Bytes {
-        // Common case: a chunk of whole events with no usage in it.
-        if self.pending.is_empty()
-            && (chunk.ends_with(b"\n\n") || chunk.ends_with(b"\r\n\r\n"))
-            && find_bytes(&chunk, b"prompt_tokens").is_none()
-        {
-            return chunk;
-        }
-        self.pending.extend_from_slice(&chunk);
-        let mut out = Vec::with_capacity(self.pending.len());
-        while let Some(end) = sse_event_end(&self.pending) {
-            let event: Vec<u8> = self.pending.drain(..end).collect();
-            if !is_usage_only_event(&event) {
-                out.extend_from_slice(&event);
-            }
-        }
-        // No event boundary showed up and the buffer has grown past the cap:
-        // stop holding it hostage. The client may then see the injected usage
-        // chunk verbatim, which is acceptable next to holding the stream.
-        if self.pending.len() > USAGE_FILTER_MAX_PENDING {
-            if !self.overflowed {
-                self.overflowed = true;
-                tracing::debug!(
-                    pending_bytes = self.pending.len(),
-                    "usage-chunk filter buffer exceeded cap; flushing unfiltered"
-                );
-            }
-            out.extend_from_slice(&self.pending);
-            self.pending.clear();
-        }
-        Bytes::from(out)
-    }
-
-    fn finish(self) -> Bytes {
-        Bytes::from(self.pending)
-    }
-}
-
-/// Adds the request's measured energy and carbon to the usage a client
-/// receives, as `usage.energy_wh` and `usage.co2_g`. In a stream only events
-/// that carry usage are parsed and rewritten, and every other byte passes
-/// through as is; a JSON answer is held until it ends, as a client can read it
-/// only whole. The figures are read as the usage goes by, the end of the
-/// answer, so they match what settlement records to within that moment.
-#[derive(Default)]
-struct UsageEnergyStamp {
-    pending: Vec<u8>,
-    /// A whole JSON answer rather than a stream of events.
-    json: bool,
-    /// The JSON answer outgrew [`USAGE_STAMP_MAX_BODY`] and passes unchanged.
-    passing: bool,
-}
-
-/// The largest JSON answer held to add energy to its usage.
-const USAGE_STAMP_MAX_BODY: usize = 1024 * 1024;
-
-impl UsageEnergyStamp {
-    /// A stamp for an answer of this content type; None for one it can't read.
-    fn for_content_type(content_type: &str) -> Option<Self> {
-        if content_type.starts_with("text/event-stream") {
-            Some(Self::default())
-        } else if content_type.contains("json") {
-            Some(Self {
-                json: true,
-                ..Self::default()
-            })
-        } else {
-            None
-        }
-    }
-
-    fn push(&mut self, chunk: Bytes, figures: impl Fn() -> crate::energy::EnergyFigures) -> Bytes {
-        if self.json {
-            if self.passing {
-                return chunk;
-            }
-            self.pending.extend_from_slice(&chunk);
-            if self.pending.len() > USAGE_STAMP_MAX_BODY {
-                self.passing = true;
-                return Bytes::from(std::mem::take(&mut self.pending));
-            }
-            return Bytes::new();
-        }
-        if self.pending.is_empty()
-            && (chunk.ends_with(b"\n\n") || chunk.ends_with(b"\r\n\r\n"))
-            && find_bytes(&chunk, b"prompt_tokens").is_none()
-        {
-            return chunk;
-        }
-        self.pending.extend_from_slice(&chunk);
-        let mut out = Vec::with_capacity(self.pending.len() + 64);
-        while let Some(end) = sse_event_end(&self.pending) {
-            let event: Vec<u8> = self.pending.drain(..end).collect();
-            match stamp_usage_event(&event, &figures) {
-                Some(stamped) => out.extend_from_slice(&stamped),
-                None => out.extend_from_slice(&event),
-            }
-        }
-        // An event this long without its end is not a usage event: let it go.
-        if self.pending.len() > USAGE_FILTER_MAX_PENDING {
-            out.extend_from_slice(&self.pending);
-            self.pending.clear();
-        }
-        Bytes::from(out)
-    }
-
-    fn finish(self, figures: impl Fn() -> crate::energy::EnergyFigures) -> Bytes {
-        if self.json && !self.passing && !self.pending.is_empty() {
-            return stamp_body(Bytes::from(self.pending), "application/json", figures());
-        }
-        Bytes::from(self.pending)
-    }
-}
-
-/// Writes `energy_wh` and `co2_g` into a body's `usage` object (chat and text
-/// completion shape), rounded to a millionth. False when there is no such
-/// object or nothing was measured.
-fn stamp_usage(value: &mut serde_json::Value, figures: crate::energy::EnergyFigures) -> bool {
-    let Some(usage) = value
-        .get_mut("usage")
-        .and_then(serde_json::Value::as_object_mut)
-    else {
-        return false;
-    };
-    if !usage.contains_key("prompt_tokens")
-        || !figures.energy_wh.is_finite()
-        || figures.energy_wh <= 0.0
-    {
-        return false;
-    }
-    let round = |n: f64| (n * 1e6).round() / 1e6;
-    usage.insert(
-        "energy_wh".into(),
-        serde_json::json!(round(figures.energy_wh)),
-    );
-    if figures.co2_g.is_finite() && figures.co2_g > 0.0 {
-        usage.insert("co2_g".into(), serde_json::json!(round(figures.co2_g)));
-    }
-    true
-}
-
-/// [`UsageEnergyStamp`] for a whole buffered body: JSON, or SSE the gateway
-/// assembled for a client that asked to stream.
-fn stamp_body(body: Bytes, content_type: &str, figures: crate::energy::EnergyFigures) -> Bytes {
-    if content_type.starts_with("text/event-stream") {
-        let mut stamp = UsageEnergyStamp::default();
-        let mut out = stamp.push(body, || figures).to_vec();
-        out.extend_from_slice(&stamp.finish(|| figures));
-        return Bytes::from(out);
-    }
-    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&body) else {
-        return body;
-    };
-    if !stamp_usage(&mut value, figures) {
-        return body;
-    }
-    serde_json::to_vec(&value).map(Bytes::from).unwrap_or(body)
-}
-
-/// One SSE event with its usage stamped, or None to send it unchanged.
-fn stamp_usage_event(
-    event: &[u8],
-    figures: &dyn Fn() -> crate::energy::EnergyFigures,
-) -> Option<Vec<u8>> {
-    find_bytes(event, b"prompt_tokens")?;
-    let text = std::str::from_utf8(event).ok()?;
-    let mut data = Vec::new();
-    let mut other = Vec::new();
-    for line in text.lines() {
-        match line.trim_start().strip_prefix("data:") {
-            Some(payload) => data.push(payload.trim()),
-            None if line.trim().is_empty() => {}
-            None => other.push(line),
-        }
-    }
-    let mut value: serde_json::Value = serde_json::from_str(&data.join("\n")).ok()?;
-    if !stamp_usage(&mut value, figures()) {
-        return None;
-    }
-    let end = if event.ends_with(b"\r\n\r\n") {
-        "\r\n"
-    } else {
-        "\n"
-    };
-    let mut out = String::with_capacity(event.len() + 64);
-    for line in other {
-        out.push_str(line);
-        out.push_str(end);
-    }
-    out.push_str("data: ");
-    out.push_str(&serde_json::to_string(&value).ok()?);
-    out.push_str(end);
-    out.push_str(end);
-    Some(out.into_bytes())
-}
-
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
-}
-
-/// Index just past the first SSE event terminator (a blank line).
-fn sse_event_end(buf: &[u8]) -> Option<usize> {
-    let lf = find_bytes(buf, b"\n\n").map(|i| i + 2);
-    let crlf = find_bytes(buf, b"\r\n\r\n").map(|i| i + 4);
-    match (lf, crlf) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (a, b) => a.or(b),
-    }
-}
-
-/// An event carrying only usage: a `usage` object and no choices. Content
-/// chunks that also carry usage (continuous usage stats) are not dropped.
-fn is_usage_only_event(event: &[u8]) -> bool {
-    if find_bytes(event, b"prompt_tokens").is_none() {
-        return false;
-    }
-    let text = String::from_utf8_lossy(event);
-    let payload = text
-        .lines()
-        .filter_map(|l| l.trim_start().strip_prefix("data:"))
-        .map(str::trim)
-        .collect::<Vec<_>>()
-        .join("\n");
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload) else {
-        return false;
-    };
-    let has_usage = value.get("usage").is_some_and(serde_json::Value::is_object);
-    let no_choices = match value.get("choices") {
-        None => true,
-        Some(c) => c.as_array().is_some_and(|a| a.is_empty()),
-    };
-    has_usage && no_choices
 }
 
 /// What an admitted request holds against its budgets, for settlement: the
@@ -4562,7 +4320,7 @@ fn field_text_chars(chunk: &[u8], key: &[u8]) -> usize {
     };
     let mut total = 0;
     let mut from = 0;
-    while let Some(at) = find_bytes(&chunk[from..], key) {
+    while let Some(at) = crate::sse::find_bytes(&chunk[from..], key) {
         let mut i = skip_spaces(from + at + key.len());
         if i >= chunk.len() || chunk[i] != b':' {
             from = i;
@@ -4713,15 +4471,15 @@ impl StreamAccounting {
         )
     }
 
-    /// A stamp that adds the measured energy to the usage of an answer of
+    /// Energy accounting is on, so the usage a client receives carries it.
+    fn energy_on(&self) -> bool {
+        self.state.energy.settings().enabled
+    }
+
+    /// A rewriter that adds the measured energy to the usage of an answer of
     /// this content type; None while energy accounting is off.
-    fn energy_stamp(&self, content_type: &str) -> Option<UsageEnergyStamp> {
-        self.state
-            .energy
-            .settings()
-            .enabled
-            .then(|| UsageEnergyStamp::for_content_type(content_type))
-            .flatten()
+    fn energy_stamp(&self, content_type: &str) -> Option<crate::sse::UsageRewriter> {
+        crate::sse::UsageRewriter::new(content_type, false, self.energy_on())
     }
 
     fn monitor(
@@ -7503,7 +7261,7 @@ pub(crate) fn finalize(
         energy_wh: energy.energy_wh,
         energy_cost_usd: energy.energy_cost_usd,
         co2_g: energy.co2_g,
-        ts_ms: now_ms(),
+        ts_ms: crate::tracer::now_ms(),
         session_id: meta.session_id.clone(),
         session_id_source: meta.session_id_source.to_string(),
         request_type: meta.request_type.to_string(),
@@ -7865,7 +7623,7 @@ fn record_key_rejection(
         return;
     }
     state.telemetry.record_rejection(KeyRejection {
-        ts_ms: now_ms(),
+        ts_ms: crate::tracer::now_ms(),
         key_id: resolved.key_id,
         key_name: resolved.key_name.clone(),
         tenant_id: resolved.tenant_id,
@@ -7917,14 +7675,6 @@ fn rejected_field_response(model: &str, field: &str) -> Response<Body> {
         Some(field),
         Some("unsupported_parameter"),
     )
-}
-
-fn now_ms() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -11182,7 +10932,7 @@ mod lifecycle_tests {
         let start = src.find("async fn run_pipeline(").expect("run_pipeline");
         let end = start
             + src[start..]
-                .find("\n/// Drops the usage-only SSE event")
+                .find("\n/// What an admitted request holds against its budgets")
                 .expect("end of the handler");
         &src[start..end]
     }
@@ -11532,14 +11282,34 @@ mod lifecycle_tests {
         }))
     }
 
-    fn run_filter(chunks: &[&[u8]]) -> String {
-        let mut filter = UsageChunkFilter::default();
-        let mut out = Vec::new();
+    /// Run chunks through a usage rewriter; the client's copy and the
+    /// unstamped one.
+    fn run_usage(
+        strip: bool,
+        stamp: bool,
+        chunks: &[&[u8]],
+        figures: crate::energy::EnergyFigures,
+    ) -> (String, String) {
+        let mut usage = crate::sse::UsageRewriter::new("text/event-stream", strip, stamp).unwrap();
+        let (mut client, mut unstamped) = (Vec::new(), Vec::new());
         for c in chunks {
-            out.extend_from_slice(&filter.push(Bytes::copy_from_slice(c)));
+            let out = usage.push(Bytes::copy_from_slice(c), || figures);
+            client.extend_from_slice(&out.client);
+            unstamped.extend_from_slice(&out.unstamped);
         }
-        out.extend_from_slice(&filter.finish());
-        String::from_utf8(out).unwrap()
+        let out = usage.finish(|| figures);
+        client.extend_from_slice(&out.client);
+        unstamped.extend_from_slice(&out.unstamped);
+        (
+            String::from_utf8(client).unwrap(),
+            String::from_utf8(unstamped).unwrap(),
+        )
+    }
+
+    fn run_filter(chunks: &[&[u8]]) -> String {
+        let (client, unstamped) = run_usage(true, false, chunks, measured(0.0, 0.0));
+        assert_eq!(client, unstamped);
+        client
     }
 
     #[test]
@@ -11573,13 +11343,46 @@ mod lifecycle_tests {
     }
 
     fn run_stamp(chunks: &[&[u8]], figures: crate::energy::EnergyFigures) -> String {
-        let mut stamp = UsageEnergyStamp::default();
-        let mut out = Vec::new();
-        for c in chunks {
-            out.extend_from_slice(&stamp.push(Bytes::copy_from_slice(c), || figures));
-        }
-        out.extend_from_slice(&stamp.finish(|| figures));
-        String::from_utf8(out).unwrap()
+        let (client, unstamped) = run_usage(false, true, chunks, figures);
+        // The unstamped copy is the stream as the upstream sent it.
+        assert_eq!(
+            unstamped,
+            chunks
+                .iter()
+                .map(|c| String::from_utf8_lossy(c))
+                .collect::<String>()
+        );
+        client
+    }
+
+    #[test]
+    fn one_pass_strips_the_injected_usage_and_stamps_what_the_client_asked_for() {
+        let a = content_event("Hel");
+        let u = usage_event();
+        let done = "data: [DONE]\n\n";
+        let joined = format!("{a}{u}{done}");
+        // The gateway asked for usage on the client's behalf: dropped, not
+        // stamped.
+        let (client, unstamped) = run_usage(true, true, &[joined.as_bytes()], measured(1.5, 0.5));
+        assert_eq!(client, format!("{a}{done}"));
+        assert_eq!(unstamped, client);
+        // Usage riding on a content chunk is stamped; the cache's copy keeps
+        // the upstream's bytes.
+        let riding = sse(serde_json::json!({
+            "choices": [{ "index": 0, "delta": { "content": "x" } }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 1 },
+        }));
+        let wire = format!("{a}{riding}{done}");
+        let cut = a.len() + 10;
+        let (client, unstamped) = run_usage(
+            true,
+            true,
+            &[&wire.as_bytes()[..cut], &wire.as_bytes()[cut..]],
+            measured(1.5, 0.5),
+        );
+        assert_eq!(unstamped, wire);
+        assert!(client.starts_with(&a) && client.ends_with(done), "{client}");
+        assert!(client.contains("\"energy_wh\":1.5"), "{client}");
     }
 
     fn measured(energy_wh: f64, co2_g: f64) -> crate::energy::EnergyFigures {
@@ -11658,29 +11461,33 @@ mod lifecycle_tests {
             "usage": { "prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10 },
         });
         let bytes = Bytes::from(serde_json::to_vec(&body).unwrap());
-        let out = stamp_body(bytes.clone(), "application/json", measured(2.0, 0.674));
+        let out = crate::sse::stamp_body(bytes.clone(), "application/json", measured(2.0, 0.674));
         let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(value["usage"]["energy_wh"], 2.0);
         assert_eq!(value["usage"]["co2_g"], 0.674);
         assert_eq!(value["choices"], body["choices"]);
         // Passed through in pieces, it is held and stamped once it ends.
-        let mut stamp = UsageEnergyStamp::for_content_type("application/json").unwrap();
+        let mut stamp = crate::sse::UsageRewriter::new("application/json", false, true).unwrap();
         let (a, b) = bytes.split_at(bytes.len() / 2);
         assert!(stamp
             .push(Bytes::copy_from_slice(a), || measured(2.0, 0.674))
+            .client
             .is_empty());
         assert!(stamp
             .push(Bytes::copy_from_slice(b), || measured(2.0, 0.674))
+            .client
             .is_empty());
-        assert_eq!(stamp.finish(|| measured(2.0, 0.674)), out);
+        let end = stamp.finish(|| measured(2.0, 0.674));
+        assert_eq!(end.client, out);
+        assert_eq!(end.unstamped, bytes);
         // Nothing measured, or no usage, sends the body unchanged.
         assert_eq!(
-            stamp_body(bytes.clone(), "application/json", measured(0.0, 0.0)),
+            crate::sse::stamp_body(bytes.clone(), "application/json", measured(0.0, 0.0)),
             bytes
         );
         let plain = Bytes::from_static(b"{\"data\":[]}");
         assert_eq!(
-            stamp_body(plain.clone(), "application/json", measured(2.0, 1.0)),
+            crate::sse::stamp_body(plain.clone(), "application/json", measured(2.0, 1.0)),
             plain
         );
     }
@@ -11690,19 +11497,21 @@ mod lifecycle_tests {
         // A non-SSE (or non-compliant) body that never sends a blank-line
         // terminator must not be held for the life of the stream once it
         // exceeds the cap.
-        let body = vec![b'x'; USAGE_FILTER_MAX_PENDING + 1];
-        let mut filter = UsageChunkFilter::default();
-        let out = filter.push(Bytes::copy_from_slice(&body));
-        assert_eq!(out.as_ref(), body.as_slice());
-        assert!(filter.pending.is_empty());
-        // The filter keeps working on whatever follows the flush (it does not
-        // latch into a permanently-disabled state); a later complete event
-        // is still filtered normally.
+        let none = || measured(0.0, 0.0);
+        let body = vec![b'x'; crate::sse::USAGE_MAX_EVENT + 1];
+        let mut filter = crate::sse::UsageRewriter::new("text/event-stream", true, false).unwrap();
+        let out = filter.push(Bytes::copy_from_slice(&body), none);
+        assert_eq!(out.client.as_ref(), body.as_slice());
+        // The filter keeps working past the long event (it does not latch
+        // into a permanently-disabled state): its end passes on, and a usage
+        // event after it is still dropped.
         let done = "data: [DONE]\n\n";
+        let u = usage_event();
         let mut tail = Vec::new();
-        tail.extend_from_slice(&filter.push(Bytes::from_static(done.as_bytes())));
-        tail.extend_from_slice(&filter.finish());
-        assert_eq!(tail, done.as_bytes());
+        tail.extend_from_slice(&filter.push(Bytes::from_static(b"\n\n"), none).client);
+        tail.extend_from_slice(&filter.push(Bytes::from(format!("{u}{done}")), none).client);
+        tail.extend_from_slice(&filter.finish(none).client);
+        assert_eq!(tail, format!("\n\n{done}").as_bytes());
     }
 
     #[test]
@@ -12072,8 +11881,13 @@ mod lifecycle_tests {
         // The watch sees the bytes as the upstream sent them, before the
         // gateway's own usage chunk is filtered out of the client's copy.
         let watch = rest.find("watch.push(&chunk);").expect("the failure watch");
-        let filter = rest.find("filter.push(chunk)").expect("the usage filter");
+        let filter = rest.find("usage.push(chunk,").expect("the usage rewriter");
         assert!(watch < filter);
+        // The cache keeps the answer without the energy added.
+        let cached = rest
+            .find("full.extend_from_slice(&unstamped)")
+            .expect("the cache copy");
+        assert!(filter < cached);
         assert!(rest.contains("letcache_put=ifcacheable&&settled.cacheable{"));
         assert!(
             !rest.contains("estimated_output_tokens"),

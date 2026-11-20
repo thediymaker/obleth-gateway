@@ -3,6 +3,8 @@
 
 use serde_json::{json, Value};
 
+use crate::sse::{self, Piece, Splitter};
+
 const MAX_BYTES: usize = 512 * 1024;
 /// Streamed tool calls are indexed by the upstream; an index past this is
 /// treated as invalid output rather than allocated.
@@ -19,8 +21,10 @@ struct ToolCall {
 pub(crate) struct OutputMonitor {
     sse: bool,
     received: usize,
+    /// A JSON body so far.
     pending: Vec<u8>,
-    event: Vec<u8>,
+    /// An SSE stream, split into events.
+    events: Splitter,
     channels: [String; 4],
     tool_calls: Vec<ToolCall>,
     finish_reason: Option<String>,
@@ -33,7 +37,7 @@ impl OutputMonitor {
             sse,
             received: 0,
             pending: Vec::new(),
-            event: Vec::new(),
+            events: Splitter::new(MAX_BYTES),
             channels: Default::default(),
             tool_calls: Vec::new(),
             finish_reason: None,
@@ -54,51 +58,34 @@ impl OutputMonitor {
             self.pending.extend_from_slice(chunk);
             return;
         }
-        for &byte in chunk {
-            if byte == b'\n' {
-                self.line();
-                if self.failed {
-                    return;
-                }
-            } else {
-                self.pending.push(byte);
-            }
+        self.events.push(chunk);
+        while !self.failed {
+            let value = match self.events.next() {
+                None => return,
+                Some(piece) => read_event(piece),
+            };
+            self.dispatch(value);
         }
     }
 
     fn fail(&mut self) {
         self.failed = true;
         self.pending = Vec::new();
-        self.event = Vec::new();
+        self.events = Splitter::new(0);
         self.channels = Default::default();
         self.tool_calls = Vec::new();
         self.finish_reason = None;
     }
 
-    fn line(&mut self) {
-        let mut line = std::mem::take(&mut self.pending);
-        if line.last() == Some(&b'\r') {
-            line.pop();
-        }
-        if line.is_empty() {
-            self.dispatch();
-        } else if let Some(data) = line.strip_prefix(b"data:") {
-            let data = data.strip_prefix(b" ").unwrap_or(data);
-            if !self.event.is_empty() {
-                self.event.push(b'\n');
+    /// Take in one event read by [`read_event`].
+    fn dispatch(&mut self, value: Result<Option<Value>, ()>) {
+        let value = match value {
+            Ok(Some(value)) => value,
+            Ok(None) => return,
+            Err(()) => {
+                self.fail();
+                return;
             }
-            self.event.extend_from_slice(data);
-        }
-    }
-
-    fn dispatch(&mut self) {
-        let event = std::mem::take(&mut self.event);
-        if event.is_empty() || event == b"[DONE]" {
-            return;
-        }
-        let Ok(value) = serde_json::from_slice::<Value>(&event) else {
-            self.fail();
-            return;
         };
         // Keep channels separate until completion: inserting a separator between
         // deltas would hide a keyword split across tokens, while interleaving
@@ -153,10 +140,10 @@ impl OutputMonitor {
         if !self.sse {
             return serde_json::from_slice(&self.pending).map_err(|_| "invalid JSON output");
         }
-        if !self.pending.is_empty() {
-            self.line();
+        if let Some(piece) = self.events.finish() {
+            let value = read_event(piece);
+            self.dispatch(value);
         }
-        self.dispatch();
         if self.failed {
             return Err("invalid SSE output");
         }
@@ -177,6 +164,19 @@ impl OutputMonitor {
         }
         Ok(json!({"choices": [{"message": message, "finish_reason": self.finish_reason}]}))
     }
+}
+
+/// One event's chunk: `None` for an event with no data or `[DONE]`, and an
+/// error for an oversized event or data that is not JSON.
+fn read_event(piece: Piece<'_>) -> Result<Option<Value>, ()> {
+    let Piece::Event(event) = piece else {
+        return Err(());
+    };
+    let data = sse::data_payload(event);
+    if data.is_empty() || &data[..] == b"[DONE]" {
+        return Ok(None);
+    }
+    serde_json::from_slice(&data).map(Some).map_err(|_| ())
 }
 
 #[cfg(test)]

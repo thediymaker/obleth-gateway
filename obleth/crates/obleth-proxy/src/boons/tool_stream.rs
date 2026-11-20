@@ -131,7 +131,7 @@ pub fn run(
         let tool_timeout = Duration::from_millis(settings.tool_timeout_ms.max(1));
         let max_turns = settings.max_turns.clamp(1, obleth_config::TOOL_LOOP_MAX_TURNS);
         let upstream_model = route.upstream_model.clone();
-        let created = super::now_ms() / 1000;
+        let created = crate::tracer::now_ms() / 1000;
         let mut request = base_request;
         // The upstream's role chunk carries no content, so the content filter
         // below drops it; the driver opens the client stream with its own role
@@ -190,7 +190,7 @@ pub fn run(
             };
 
             let mut bytes = resp.bytes_stream();
-            let mut buf: Vec<u8> = Vec::new();
+            let mut events = crate::sse::Splitter::unbounded();
             let mut content_acc = String::new();
             let mut tool_acc: BTreeMap<u64, ToolAccum> = BTreeMap::new();
             let mut buffered_tool_deltas: Vec<Value> = Vec::new();
@@ -216,9 +216,9 @@ pub fn run(
                         break 'read;
                     }
                 };
-                buf.extend_from_slice(&chunk);
-                while let Some(event) = split_event(&mut buf) {
-                    for data in parse_data_lines(&event) {
+                events.push(&chunk);
+                while let Some(event) = events.next_event() {
+                    if let Some(data) = crate::sse::data_text(event) {
                         if data == "[DONE]" {
                             turn_done = true;
                             continue;
@@ -486,7 +486,7 @@ pub fn run(
         };
 
         let mut bytes = final_resp.bytes_stream();
-        let mut buf: Vec<u8> = Vec::new();
+        let mut events = crate::sse::Splitter::unbounded();
         let mut usage: Option<UpstreamUsage> = None;
         let mut id = String::from("chatcmpl-toolstream");
         let mut model_name = upstream_model.clone();
@@ -506,9 +506,9 @@ pub fn run(
                     break 'final_read;
                 }
             };
-            buf.extend_from_slice(&chunk);
-            while let Some(event) = split_event(&mut buf) {
-                for data in parse_data_lines(&event) {
+            events.push(&chunk);
+            while let Some(event) = events.next_event() {
+                if let Some(data) = crate::sse::data_text(event) {
                     if data == "[DONE]" {
                         turn_done = true;
                         continue;
@@ -738,32 +738,6 @@ fn fail_stats(
     }
 }
 
-/// Extract the next complete SSE event (up to and including its blank-line
-/// delimiter, `\n\n` or `\r\n\r\n`) from the buffer, draining it. Returns
-/// `None` while no full event is buffered yet.
-pub(crate) fn split_event(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
-    let lf = buf.windows(2).position(|w| w == b"\n\n").map(|pos| pos + 2);
-    let crlf = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|pos| pos + 4);
-    let end = match (lf, crlf) {
-        (Some(a), Some(b)) => a.min(b),
-        (a, b) => a.or(b)?,
-    };
-    Some(buf.drain(..end).collect())
-}
-
-/// Pull the `data:` payloads out of one SSE event.
-pub(crate) fn parse_data_lines(event: &[u8]) -> Vec<String> {
-    let text = String::from_utf8_lossy(event);
-    text.lines()
-        .filter_map(|line| line.trim_start().strip_prefix("data:"))
-        .map(|d| d.trim().to_string())
-        .filter(|d| !d.is_empty())
-        .collect()
-}
-
 /// Merge one streamed `tool_calls` delta into the per-turn accumulator.
 fn accumulate(map: &mut BTreeMap<u64, ToolAccum>, tc: &Value) {
     let index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
@@ -969,30 +943,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn split_event_extracts_one_event_at_a_time() {
-        let mut buf = b"data: a\n\ndata: b\n\ndata: c".to_vec();
-        let e1 = split_event(&mut buf).unwrap();
-        assert_eq!(e1, b"data: a\n\n");
-        let e2 = split_event(&mut buf).unwrap();
-        assert_eq!(e2, b"data: b\n\n");
-        // "data: c" has no terminator yet.
-        assert!(split_event(&mut buf).is_none());
-        assert_eq!(buf, b"data: c");
-    }
-
-    #[test]
-    fn split_event_accepts_crlf_delimiters() {
-        let mut buf = b"data: a\r\n\r\ndata: b\n\ndata: c\r\n".to_vec();
-        let e1 = split_event(&mut buf).unwrap();
-        assert_eq!(e1, b"data: a\r\n\r\n");
-        assert_eq!(parse_data_lines(&e1), vec!["a".to_string()]);
-        let e2 = split_event(&mut buf).unwrap();
-        assert_eq!(e2, b"data: b\n\n");
-        assert!(split_event(&mut buf).is_none());
-        assert_eq!(buf, b"data: c\r\n");
-    }
-
-    #[test]
     fn idle_timeout_secs_matches_the_upstream_read_timeout_fallback() {
         // Same fallback chain as `obleth_config::Config::upstream_read_timeout_secs`:
         // an explicit read timeout wins; otherwise the request timeout,
@@ -1020,14 +970,6 @@ mod tests {
         assert!(next_within(&mut live, Some(Duration::from_secs(1)))
             .await
             .is_none());
-    }
-
-    #[test]
-    fn parse_data_lines_reads_payloads() {
-        let lines = parse_data_lines(b"data: {\"a\":1}\n\n");
-        assert_eq!(lines, vec!["{\"a\":1}".to_string()]);
-        let done = parse_data_lines(b"data: [DONE]\n\n");
-        assert_eq!(done, vec!["[DONE]".to_string()]);
     }
 
     #[test]

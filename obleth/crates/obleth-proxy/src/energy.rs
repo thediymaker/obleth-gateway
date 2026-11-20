@@ -366,7 +366,7 @@ pub fn spawn_energy_poller(
                         engine.store_reading(PowerReading {
                             cluster_watts: watts,
                             node_count: nodes.max(0.0) as u64,
-                            at_ms: now_ms(),
+                            at_ms: crate::tracer::now_ms(),
                         });
                     }
                     (Err(e), _) | (_, Err(e)) => {
@@ -480,14 +480,6 @@ fn peers(local: usize, cluster: Option<usize>, replicas: usize) -> usize {
         Some(total) => total.saturating_sub(local),
         None => local * replicas.saturating_sub(1),
     }
-}
-
-fn now_ms() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

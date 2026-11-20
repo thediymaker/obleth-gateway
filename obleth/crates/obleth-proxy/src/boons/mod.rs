@@ -1395,7 +1395,7 @@ fn helper_usage_record(
         energy_wh: 0.0,
         energy_cost_usd: 0.0,
         co2_g: 0.0,
-        ts_ms: now_ms(),
+        ts_ms: crate::tracer::now_ms(),
         session_id: session_id.to_string(),
         session_id_source: "none".to_string(),
         request_type: request_type.to_string(),
@@ -1548,14 +1548,6 @@ async fn apply_term_commits(
 pub(crate) fn build_chat_url(api_base: &str) -> String {
     let base = api_base.trim_end_matches('/');
     format!("{base}/chat/completions")
-}
-
-pub(crate) fn now_ms() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 /// Test fixtures other modules of the crate reuse.

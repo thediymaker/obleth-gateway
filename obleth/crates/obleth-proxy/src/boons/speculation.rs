@@ -46,9 +46,7 @@ use futures_util::Stream;
 use obleth_config::{ResolvedKey, ResolvedModel, SpeculationBoonSettings};
 use serde_json::{json, Value};
 
-use super::tool_stream::{
-    content_chunk, done, finish_chunk, parse_data_lines, split_event, usage_chunk,
-};
+use super::tool_stream::{content_chunk, done, finish_chunk, usage_chunk};
 use crate::state::AppState;
 use crate::upstream_failure::{payload_failure, stream_cut_error, DEFAULT_FAILURE_STATUS};
 
@@ -710,7 +708,7 @@ async fn dispatch_stream(
 /// and captures finish_reason/usage.
 struct DraftReader {
     bytes: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
-    buf: Vec<u8>,
+    events: crate::sse::Splitter,
     pub deltas: Vec<String>,
     pub finish: Option<String>,
     pub usage: Option<(u32, u32)>,
@@ -721,7 +719,7 @@ impl DraftReader {
     fn new(resp: reqwest::Response) -> Self {
         DraftReader {
             bytes: Box::pin(resp.bytes_stream()),
-            buf: Vec::new(),
+            events: crate::sse::Splitter::unbounded(),
             deltas: Vec::new(),
             finish: None,
             usage: None,
@@ -764,8 +762,8 @@ impl DraftReader {
     /// Returns false when the stream is exhausted.
     async fn advance(&mut self) -> anyhow::Result<bool> {
         loop {
-            if let Some(event) = split_event(&mut self.buf) {
-                for data in parse_data_lines(&event) {
+            if let Some(event) = self.events.next_event() {
+                if let Some(data) = crate::sse::data_text(event).map(std::borrow::Cow::into_owned) {
                     self.consume_data(&data);
                 }
                 return Ok(true);
@@ -776,7 +774,7 @@ impl DraftReader {
             )
             .await
             {
-                Some(Ok(chunk)) => self.buf.extend_from_slice(&chunk),
+                Some(Ok(chunk)) => self.events.push(&chunk),
                 Some(Err(e)) => anyhow::bail!("draft stream read failed: {e}"),
                 None => {
                     self.done = true;
@@ -1105,7 +1103,7 @@ async fn run_nonstream(
     let body = json!({
         "id": format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
         "object": "chat.completion",
-        "created": super::now_ms() / 1000,
+        "created": crate::tracer::now_ms() / 1000,
         "model": req.route.model_name,
         "choices": [{
             "index": 0,
@@ -1267,7 +1265,7 @@ fn drive_stream(
         let s = plan.settings.clone();
         let Committed { mut reader, mut last_check, release_upto } = committed;
         let id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
-        let created = super::now_ms() / 1000;
+        let created = crate::tracer::now_ms() / 1000;
         let model_name = route.model_name.clone();
         let mut released = 0usize;
         let mut ttft_set = false;
@@ -1465,10 +1463,10 @@ fn drive_stream(
         match dispatch_stream(&state, &route, &body, dispatch_timeout).await {
             Ok(resp) => {
                 let mut bytes = Box::pin(resp.bytes_stream());
-                let mut buf: Vec<u8> = Vec::new();
+                let mut events = crate::sse::Splitter::unbounded();
                 'relay: loop {
-                    while let Some(event) = split_event(&mut buf) {
-                        for data in parse_data_lines(&event) {
+                    while let Some(event) = events.next_event() {
+                        if let Some(data) = crate::sse::data_text(event) {
                             if data == "[DONE]" {
                                 done_seen = true;
                                 break 'relay;
@@ -1511,7 +1509,7 @@ fn drive_stream(
                         }
                     }
                     match super::tool_stream::next_within(&mut bytes, super::tool_stream::stream_idle_timeout()).await {
-                        Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
+                        Some(Ok(chunk)) => events.push(&chunk),
                         Some(Err(e)) => {
                             tracing::warn!(error = %e, "speculation continuation stream failed");
                             broke_off = true;

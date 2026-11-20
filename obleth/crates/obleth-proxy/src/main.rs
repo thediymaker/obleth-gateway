@@ -26,6 +26,7 @@ mod responses;
 mod router;
 mod search;
 mod speech;
+mod sse;
 mod state;
 mod sticky;
 mod tool_slots;

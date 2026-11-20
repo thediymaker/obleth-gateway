@@ -203,7 +203,7 @@ pub fn synthesize_sse(completion: &Value, include_usage: bool) -> String {
     let created = completion
         .get("created")
         .and_then(|v| v.as_u64())
-        .unwrap_or_else(|| (super::now_ms() / 1000) as u64);
+        .unwrap_or_else(|| (crate::tracer::now_ms() / 1000) as u64);
     let model = completion
         .get("model")
         .and_then(|v| v.as_str())

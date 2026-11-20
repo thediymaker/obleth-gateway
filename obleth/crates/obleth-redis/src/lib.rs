@@ -94,13 +94,6 @@ const CRASH_PREFIX: &str = "obleth:crashguard:";
 /// read drops the expired members, so the set stays as small as the list of
 /// models struck recently.
 const CRASH_RECENT_KEY: &str = "obleth:crashrecent";
-
-/// Now, as Unix milliseconds.
-fn unix_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as i64)
-}
 const INVALIDATE_CHANNEL: &str = "obleth:invalidate";
 /// Per-day request counters (see `daily_stats_key`).
 const DAILY_STATS_PREFIX: &str = "obleth:daily:";
@@ -646,7 +639,7 @@ impl RedisStore {
             .invoke_async(&mut conn)
             .await?;
         // The model has a live strike record until `ttl` from now.
-        let until = unix_ms() + ttl.as_millis() as i64;
+        let until = now_ms() + ttl.as_millis() as i64;
         let _: () = redis::pipe()
             .cmd("ZADD")
             .arg(CRASH_RECENT_KEY)
@@ -661,7 +654,7 @@ impl RedisStore {
     /// Models that may have live strike records, with how long until their
     /// newest one expires; one command. Expired members are dropped.
     pub async fn crash_recent_models(&self) -> Result<Vec<(String, std::time::Duration)>> {
-        let now = unix_ms();
+        let now = now_ms();
         let mut conn = self.conn.clone();
         let (found,): (Vec<(String, i64)>,) = redis::pipe()
             .cmd("ZRANGEBYSCORE")

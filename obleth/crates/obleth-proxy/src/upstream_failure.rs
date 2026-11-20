@@ -23,6 +23,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use serde_json::Value;
 
+use crate::sse::{self, contains, Piece, Splitter};
+
 /// Status recorded for a failure that carries no HTTP code of its own.
 pub(crate) const DEFAULT_FAILURE_STATUS: u16 = 502;
 
@@ -231,10 +233,6 @@ fn reports_finish(payload: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len()).any(|w| w == needle)
-}
-
 /// Watches the raw bytes of a response for a reported failure, as they pass
 /// through to the client. Never alters or holds the stream.
 ///
@@ -247,16 +245,12 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 /// upstreams that send no `[DONE]`.
 pub(crate) struct FailureWatch {
     sse: bool,
-    /// SSE: the line being read. JSON: the body so far.
+    /// SSE: the stream, split into events.
+    events: Splitter,
+    /// JSON: the body so far.
     pending: Vec<u8>,
-    /// SSE: `data:` of the event being read.
-    data: Vec<u8>,
-    /// SSE: the event was named `error` (`event: error`).
-    error_event: bool,
-    /// The current line or JSON body outgrew the cap.
+    /// JSON: the body outgrew the cap.
     pending_oversized: bool,
-    /// SSE: the current event outgrew the cap.
-    event_oversized: bool,
     failure: Option<UpstreamFailure>,
     /// SSE: the stream is a chat or text completion, which has an end.
     expect_end: bool,
@@ -274,11 +268,9 @@ impl FailureWatch {
         let sse = content_type.contains("text/event-stream");
         (sse || content_type.contains("json")).then(|| Self {
             sse,
+            events: Splitter::new(MAX_INSPECTED_BYTES),
             pending: Vec::new(),
-            data: Vec::new(),
-            error_event: false,
             pending_oversized: false,
-            event_oversized: false,
             failure: None,
             expect_end: false,
             done: false,
@@ -319,16 +311,19 @@ impl FailureWatch {
             self.extend_pending(chunk);
             return;
         }
-        let mut rest = chunk;
-        while let Some(newline) = rest.iter().position(|&b| b == b'\n') {
-            self.extend_pending(&rest[..newline]);
-            self.end_line();
-            if self.failure.is_some() {
-                return;
+        self.events.push(chunk);
+        while let Some(piece) = self.events.next() {
+            // Events past the cap are generated content, not error reports.
+            if let Piece::Event(event) = piece {
+                let judged = judge_event(event, self.expect_end, self.finished);
+                self.done |= judged.done;
+                self.finished |= judged.finished;
+                if judged.failure.is_some() {
+                    self.failure = judged.failure;
+                    return;
+                }
             }
-            rest = &rest[newline + 1..];
         }
-        self.extend_pending(rest);
     }
 
     /// The failure the response reported, if any. Called once, when the body
@@ -339,10 +334,12 @@ impl FailureWatch {
         }
         if self.sse {
             // A last event the upstream never terminated with a blank line.
-            if !self.pending.is_empty() || self.pending_oversized {
-                self.end_line();
+            if let Some(Piece::Event(event)) = self.events.finish() {
+                let judged = judge_event(event, self.expect_end, self.finished);
+                self.done |= judged.done;
+                self.finished |= judged.finished;
+                self.failure = judged.failure;
             }
-            self.dispatch();
             return self.failure.clone();
         }
         if self.pending_oversized || !may_report_failure(&self.pending) {
@@ -365,77 +362,41 @@ impl FailureWatch {
         }
         self.pending.extend_from_slice(bytes);
     }
+}
 
-    fn end_line(&mut self) {
-        if std::mem::take(&mut self.pending_oversized) {
-            // Only generated content runs this long; the event it belongs to
-            // is not an error report.
-            self.pending.clear();
-            self.event_oversized = true;
-            return;
-        }
-        let line = match self.pending.split_last() {
-            Some((b'\r', rest)) => rest,
-            _ => &self.pending[..],
-        };
-        if line.is_empty() {
-            self.pending.clear();
-            self.dispatch();
-            return;
-        }
-        if let Some(data) = line.strip_prefix(b"data:") {
-            let data = data.strip_prefix(b" ").unwrap_or(data);
-            if !self.event_oversized {
-                if self.data.len() + data.len() + 1 > MAX_INSPECTED_BYTES {
-                    self.event_oversized = true;
-                    self.data.clear();
-                } else {
-                    if !self.data.is_empty() {
-                        self.data.push(b'\n');
-                    }
-                    self.data.extend_from_slice(data);
-                }
-            }
-        } else if let Some(name) = line.strip_prefix(b"event:") {
-            if name.trim_ascii() == b"error" {
-                self.error_event = true;
-            }
-        }
-        // Comments (`:`), `id:` and `retry:` lines carry nothing to judge.
-        self.pending.clear();
-    }
+/// What one SSE event says about the response.
+struct Judged {
+    done: bool,
+    finished: bool,
+    failure: Option<UpstreamFailure>,
+}
 
-    /// Judge the event read so far, then start the next one. The buffers are
-    /// cleared rather than replaced, so a long stream reuses them.
-    fn dispatch(&mut self) {
-        let error_event = std::mem::take(&mut self.error_event);
-        let oversized = std::mem::take(&mut self.event_oversized);
-        let data = &self.data[..];
-        if self.expect_end && !oversized {
-            if data == b"[DONE]" {
-                self.done = true;
-            } else if !self.finished && reports_finish(data) {
-                self.finished = true;
-            }
-        }
-        let failure = if error_event {
-            let reported = serde_json::from_slice::<Value>(data)
-                .ok()
-                .and_then(|v| payload_failure(&v));
-            Some(reported.unwrap_or_else(|| {
-                UpstreamFailure::new(None, String::from_utf8_lossy(data).trim().to_string())
-            }))
-        } else if oversized || data.is_empty() || data == b"[DONE]" || !may_report_failure(data) {
-            None
-        } else {
-            serde_json::from_slice::<Value>(data)
-                .ok()
-                .and_then(|value| payload_failure(&value))
-        };
-        self.data.clear();
-        if failure.is_some() {
-            self.failure = failure;
-        }
+/// Judge one event: its end (`[DONE]`, or a finish reason not yet seen)
+/// when the stream is `expect_end`, and a failure the upstream reports, in an
+/// `error` event or in an error payload.
+fn judge_event(event: &[u8], expect_end: bool, finished: bool) -> Judged {
+    let data = sse::data_payload(event);
+    let data = &data[..];
+    let done = expect_end && data == b"[DONE]";
+    let finished = expect_end && !finished && !done && reports_finish(data);
+    let failure = if sse::event_name(event) == Some(b"error") {
+        let reported = serde_json::from_slice::<Value>(data)
+            .ok()
+            .and_then(|v| payload_failure(&v));
+        Some(reported.unwrap_or_else(|| {
+            UpstreamFailure::new(None, String::from_utf8_lossy(data).trim().to_string())
+        }))
+    } else if data.is_empty() || data == b"[DONE]" || !may_report_failure(data) {
+        None
+    } else {
+        serde_json::from_slice::<Value>(data)
+            .ok()
+            .and_then(|value| payload_failure(&value))
+    };
+    Judged {
+        done,
+        finished,
+        failure,
     }
 }
 

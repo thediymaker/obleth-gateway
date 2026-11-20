@@ -9,6 +9,7 @@ name = "obleth"
 path = "src/main.rs"
 
 [dependencies]
+memchr.workspace = true
 axum.workspace = true
 tower.workspace = true
 tower-http.workspace = true

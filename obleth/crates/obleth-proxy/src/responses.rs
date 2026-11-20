@@ -332,30 +332,6 @@ fn status_for(finish_reason: &str) -> &'static str {
     }
 }
 
-/// Drain the `data:` payloads of every complete line in an SSE byte buffer,
-/// leaving any partial trailing line in place.
-///
-/// The buffer is split on the newline BYTE and only complete lines are
-/// decoded: a UTF-8 continuation byte can never be 0x0A, so the split cannot
-/// land inside a character. Decoding each network chunk independently
-/// corrupted CJK and emoji whenever a codepoint straddled a chunk boundary —
-/// each half became U+FFFD.
-pub(crate) fn drain_sse_data_lines(buffer: &mut Vec<u8>) -> Vec<String> {
-    let mut out = Vec::new();
-    while let Some(idx) = buffer.iter().position(|b| *b == b'\n') {
-        let line_bytes: Vec<u8> = buffer.drain(..=idx).collect();
-        let line = String::from_utf8_lossy(&line_bytes);
-        let Some(payload) = line.trim().strip_prefix("data:") else {
-            continue;
-        };
-        let payload = payload.trim();
-        if !payload.is_empty() {
-            out.push(payload.to_string());
-        }
-    }
-    out
-}
-
 /// Translates a Chat Completions SSE stream into Responses events.
 ///
 /// The event vocabulary is the one a Responses client actually consumes:
@@ -1397,32 +1373,6 @@ mod tests {
             .filter(|(e, _)| e == "response.output_item.done")
             .count();
         assert_eq!(dones, 3);
-    }
-
-    #[test]
-    fn sse_lines_survive_a_chunk_split_inside_a_multibyte_character() {
-        // "猫" is three bytes; split the stream between its first and second.
-        let frame = "data: {\"text\":\"猫\"}\n".as_bytes();
-        let (a, b) = frame.split_at(frame.iter().position(|c| *c >= 0x80).unwrap() + 1);
-
-        let mut buffer: Vec<u8> = Vec::new();
-        buffer.extend_from_slice(a);
-        assert!(
-            drain_sse_data_lines(&mut buffer).is_empty(),
-            "no complete line yet"
-        );
-        buffer.extend_from_slice(b);
-        let lines = drain_sse_data_lines(&mut buffer);
-        assert_eq!(lines, vec!["{\"text\":\"猫\"}".to_string()]);
-        assert!(buffer.is_empty());
-    }
-
-    #[test]
-    fn sse_draining_skips_blank_and_non_data_lines_and_keeps_partials() {
-        let mut buffer = b"event: ping\n\ndata: one\ndata: tw".to_vec();
-        assert_eq!(drain_sse_data_lines(&mut buffer), vec!["one".to_string()]);
-        // The partial "data: tw" stays buffered for the next chunk.
-        assert_eq!(buffer, b"data: tw".to_vec());
     }
 
     #[test]

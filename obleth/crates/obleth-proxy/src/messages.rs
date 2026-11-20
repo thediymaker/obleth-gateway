@@ -657,7 +657,7 @@ impl AnthropicStreamTranslator {
             return out;
         };
         self.start(&mut out);
-        let delta = choice.get("delta").cloned().unwrap_or(Value::Null);
+        let delta = choice.get("delta").unwrap_or(&Value::Null);
         // Both spellings: LiteLLM normalises to `reasoning_content`, a vLLM
         // server straight behind the gateway sends `reasoning`.
         let reasoning = delta
