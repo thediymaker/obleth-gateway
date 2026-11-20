@@ -137,6 +137,8 @@ pub fn run(
         // below drops it; the driver opens the client stream with its own role
         // chunk instead, once, ahead of the first forwarded chunk.
         let mut role_sent = false;
+        // Time to first token is recorded once, on the first text forwarded.
+        let mut ttft_set = false;
         let mut sessions = super::tool_loop::Sessions::default();
         let deadline = super::tool_loop::LoopDeadline::new(&settings);
         // Follow-up turns go to the endpoint that served turn 0 (prefix-cache
@@ -189,110 +191,58 @@ pub fn run(
                 }
             };
 
-            let mut bytes = resp.bytes_stream();
-            let mut events = crate::sse::Splitter::unbounded();
-            let mut content_acc = String::new();
-            let mut tool_acc: BTreeMap<u64, ToolAccum> = BTreeMap::new();
-            let mut buffered_tool_deltas: Vec<Value> = Vec::new();
-            let mut usage: Option<UpstreamUsage> = None;
-            let mut id = String::from("chatcmpl-toolstream");
-            let mut model_name = upstream_model.clone();
-            let mut finish_reason: Option<Value> = None;
-            let mut turn_done = false;
-            // A failed turn: the status to record, whether the upstream's own
-            // error event already went to the client, and the text delivered.
-            let mut failure: Option<u16> = None;
-            let mut error_forwarded = false;
-            let mut turn_chars = 0usize;
-            // The upstream stopped short: its connection broke or went silent.
-            let mut broke_off = false;
-
-            'read: while let Some(item) = next_within(&mut bytes, idle).await {
-                let chunk = match item {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "tool stream upstream read error");
-                        broke_off = true;
-                        break 'read;
-                    }
-                };
-                events.push(&chunk);
-                while let Some(event) = events.next_event() {
-                    if let Some(data) = crate::sse::data_text(event) {
-                        if data == "[DONE]" {
-                            turn_done = true;
-                            continue;
+            let mut reader = TurnReader::new(resp, idle);
+            let mut turn = Turn::new(&upstream_model, true);
+            loop {
+                match reader.next().await {
+                    TurnEvent::Chunk { value, failure } => {
+                        if let Some(status) = failure {
+                            turn.failure.get_or_insert(status);
                         }
-                        let Ok(v) = serde_json::from_str::<Value>(&data) else {
-                            continue;
-                        };
-                        if let Some(reported) = payload_failure(&v) {
-                            failure.get_or_insert(reported.status);
-                            if v.get("choices").is_none() {
-                                // An error event ends the turn: the client gets
-                                // it as the upstream sent it.
-                                tracing::warn!(
-                                    status = reported.status,
-                                    message = %reported.message,
-                                    "tool stream upstream reported an error"
-                                );
-                                yield Ok(Bytes::from(format!("data: {data}\n\n")));
-                                error_forwarded = true;
-                                break 'read;
-                            }
-                        }
-                        if let Some(x) = v.get("id").and_then(|x| x.as_str()) {
-                            id = x.to_string();
-                        }
-                        if let Some(x) = v.get("model").and_then(|x| x.as_str()) {
-                            model_name = x.to_string();
-                        }
-                        if !role_sent {
-                            role_sent = true;
-                            yield Ok(Bytes::from(role_chunk(&id, &model_name, created)));
-                        }
-                        if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
-                            usage = Some(chunk_usage(u));
-                        }
-                        // Capture the turn's terminal finish reason so the plain
-                        // answer can be closed with a proper finish chunk. The
-                        // upstream's finish chunk usually carries an empty delta
-                        // (so it is not forwarded below); without re-emitting it
-                        // strict clients see a stream that never completes.
-                        if let Some(fr) = v
-                            .pointer("/choices/0/finish_reason")
-                            .filter(|fr| !fr.is_null())
-                        {
-                            finish_reason = Some(fr.clone());
-                        }
-                        let delta = v.pointer("/choices/0/delta").cloned().unwrap_or(Value::Null);
-                        if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
-                            for tc in tcs {
-                                accumulate(&mut tool_acc, tc);
-                            }
-                            buffered_tool_deltas.push(delta.clone());
-                        }
-                        let content = delta.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                        let reasoning = delta
-                            .get("reasoning_content")
-                            .or_else(|| delta.get("reasoning"))
-                            .and_then(|c| c.as_str())
-                            .unwrap_or("");
-                        if !content.is_empty() || !reasoning.is_empty() {
+                        let (frames, text) = turn.take(value, &mut role_sent, created);
+                        if text && !ttft_set {
+                            ttft_set = true;
                             set_ttft(&stats, upstream_start.elapsed().as_millis() as u32);
-                            yield Ok(Bytes::from(format!(
-                                "data: {}\n\n",
-                                forward_delta(&v)
-                            )));
-                            content_acc.push_str(content);
-                            turn_chars += content.chars().count() + reasoning.chars().count();
+                        }
+                        for frame in frames {
+                            yield Ok(Bytes::from(frame));
                         }
                     }
-                }
-                if turn_done {
-                    break 'read;
+                    TurnEvent::Error { data, status, message } => {
+                        // An error event ends the turn: the client gets it as
+                        // the upstream sent it.
+                        tracing::warn!(status, %message, "tool stream upstream reported an error");
+                        turn.failure.get_or_insert(status);
+                        yield Ok(Bytes::from(format!("data: {data}\n\n")));
+                        turn.error_forwarded = true;
+                        break;
+                    }
+                    TurnEvent::Done => {
+                        turn.done = true;
+                        break;
+                    }
+                    TurnEvent::Cut(e) => {
+                        tracing::warn!(error = %e, "tool stream upstream read error");
+                        turn.broke_off = true;
+                        break;
+                    }
+                    TurnEvent::End => break,
                 }
             }
+            let Turn {
+                id,
+                model: model_name,
+                content: content_acc,
+                tools,
+                usage,
+                finish_reason,
+                done: turn_done,
+                failure,
+                error_forwarded,
+                chars: turn_chars,
+                broke_off,
+            } = turn;
+            let (tool_acc, buffered_tool_deltas) = tools.unwrap_or_default();
 
             // A turn the upstream stopped short of, or that closed with
             // neither `[DONE]` nor a finish reason, ends with an error item
@@ -311,21 +261,15 @@ pub fn run(
             // a generation it aborted) ends the loop too, with what it said.
             if let Some(status) = failure {
                 if !error_forwarded {
-                    if let Some(ctx) = image_ctx.as_ref() {
-                        if let Some(chunk) = image_chunk(&id, &model_name, created, &ctx.images) {
-                            yield Ok(Bytes::from(chunk));
-                        }
-                    }
-                    yield Ok(Bytes::from(finish_chunk(
+                    for frame in closing(
                         &id,
                         &model_name,
                         created,
+                        image_ctx.as_ref().map(|ctx| &ctx.images[..]),
                         finish_reason.clone(),
-                    )));
-                    if client_include_usage {
-                        if let Some(u) = usage {
-                            yield Ok(Bytes::from(usage_chunk(&id, &model_name, created, u)));
-                        }
+                        usage.filter(|_| client_include_usage),
+                    ) {
+                        yield Ok(Bytes::from(frame));
                     }
                 }
                 yield Ok(Bytes::from(done()));
@@ -343,21 +287,15 @@ pub fn run(
             // upstream's was dropped above because it carried no content), then
             // the optional usage chunk and `[DONE]`.
             if calls.is_empty() {
-                if let Some(ctx) = image_ctx.as_ref() {
-                    if let Some(chunk) = image_chunk(&id, &model_name, created, &ctx.images) {
-                        yield Ok(Bytes::from(chunk));
-                    }
-                }
-                yield Ok(Bytes::from(finish_chunk(
+                for frame in closing(
                     &id,
                     &model_name,
                     created,
+                    image_ctx.as_ref().map(|ctx| &ctx.images[..]),
                     finish_reason.clone(),
-                )));
-                if client_include_usage {
-                    if let Some(u) = usage {
-                        yield Ok(Bytes::from(usage_chunk(&id, &model_name, created, u)));
-                    }
+                    usage.filter(|_| client_include_usage),
+                ) {
+                    yield Ok(Bytes::from(frame));
                 }
                 yield Ok(Bytes::from(done()));
                 finalize_stats(&stats, usage);
@@ -379,23 +317,15 @@ pub fn run(
                     });
                     yield Ok(Bytes::from(format!("data: {chunk}\n\n")));
                 }
-                if let Some(ctx) = image_ctx.as_ref() {
-                    if let Some(chunk) = image_chunk(&id, &model_name, created, &ctx.images) {
-                        yield Ok(Bytes::from(chunk));
-                    }
-                }
-                let fin = json!({
-                    "id": id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model_name,
-                    "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }],
-                });
-                yield Ok(Bytes::from(format!("data: {fin}\n\n")));
-                if client_include_usage {
-                    if let Some(u) = usage {
-                        yield Ok(Bytes::from(usage_chunk(&id, &model_name, created, u)));
-                    }
+                for frame in closing(
+                    &id,
+                    &model_name,
+                    created,
+                    image_ctx.as_ref().map(|ctx| &ctx.images[..]),
+                    Some(Value::String("tool_calls".into())),
+                    usage.filter(|_| client_include_usage),
+                ) {
+                    yield Ok(Bytes::from(frame));
                 }
                 yield Ok(Bytes::from(done()));
                 finalize_stats(&stats, usage);
@@ -488,87 +418,54 @@ pub fn run(
             }
         };
 
-        let mut bytes = final_resp.bytes_stream();
-        let mut events = crate::sse::Splitter::unbounded();
-        let mut usage: Option<UpstreamUsage> = None;
-        let mut id = String::from("chatcmpl-toolstream");
-        let mut model_name = upstream_model.clone();
-        let mut finish_reason: Option<Value> = None;
-        let mut turn_done = false;
-        let mut failure: Option<u16> = None;
-        let mut error_forwarded = false;
-        let mut turn_chars = 0usize;
-        let mut broke_off = false;
-
-        'final_read: while let Some(item) = next_within(&mut bytes, idle).await {
-            let chunk = match item {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(error = %e, "tool stream final read error");
-                    broke_off = true;
-                    break 'final_read;
-                }
-            };
-            events.push(&chunk);
-            while let Some(event) = events.next_event() {
-                if let Some(data) = crate::sse::data_text(event) {
-                    if data == "[DONE]" {
-                        turn_done = true;
-                        continue;
+        let mut reader = TurnReader::new(final_resp, idle);
+        let mut turn = Turn::new(&upstream_model, false);
+        loop {
+            match reader.next().await {
+                TurnEvent::Chunk { value, failure } => {
+                    if let Some(status) = failure {
+                        turn.failure.get_or_insert(status);
                     }
-                    let Ok(v) = serde_json::from_str::<Value>(&data) else {
-                        continue;
-                    };
-                    if let Some(reported) = payload_failure(&v) {
-                        failure.get_or_insert(reported.status);
-                        if v.get("choices").is_none() {
-                            tracing::warn!(
-                                status = reported.status,
-                                message = %reported.message,
-                                "tool stream upstream reported an error"
-                            );
-                            yield Ok(Bytes::from(format!("data: {data}\n\n")));
-                            error_forwarded = true;
-                            break 'final_read;
-                        }
-                    }
-                    if let Some(x) = v.get("id").and_then(|x| x.as_str()) {
-                        id = x.to_string();
-                    }
-                    if let Some(x) = v.get("model").and_then(|x| x.as_str()) {
-                        model_name = x.to_string();
-                    }
-                    if !role_sent {
-                        role_sent = true;
-                        yield Ok(Bytes::from(role_chunk(&id, &model_name, created)));
-                    }
-                    if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
-                        usage = Some(chunk_usage(u));
-                    }
-                    if let Some(fr) = v
-                        .pointer("/choices/0/finish_reason")
-                        .filter(|fr| !fr.is_null())
-                    {
-                        finish_reason = Some(fr.clone());
-                    }
-                    let delta = v.pointer("/choices/0/delta").cloned().unwrap_or(Value::Null);
-                    let content = delta.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                    let reasoning = delta
-                        .get("reasoning_content")
-                        .or_else(|| delta.get("reasoning"))
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("");
-                    if !content.is_empty() || !reasoning.is_empty() {
+                    let (frames, text) = turn.take(value, &mut role_sent, created);
+                    if text && !ttft_set {
+                        ttft_set = true;
                         set_ttft(&stats, upstream_start.elapsed().as_millis() as u32);
-                        yield Ok(Bytes::from(format!("data: {}\n\n", forward_delta(&v))));
-                        turn_chars += content.chars().count() + reasoning.chars().count();
+                    }
+                    for frame in frames {
+                        yield Ok(Bytes::from(frame));
                     }
                 }
-            }
-            if turn_done {
-                break 'final_read;
+                TurnEvent::Error { data, status, message } => {
+                    tracing::warn!(status, %message, "tool stream upstream reported an error");
+                    turn.failure.get_or_insert(status);
+                    yield Ok(Bytes::from(format!("data: {data}\n\n")));
+                    turn.error_forwarded = true;
+                    break;
+                }
+                TurnEvent::Done => {
+                    turn.done = true;
+                    break;
+                }
+                TurnEvent::Cut(e) => {
+                    tracing::warn!(error = %e, "tool stream final read error");
+                    turn.broke_off = true;
+                    break;
+                }
+                TurnEvent::End => break,
             }
         }
+        let Turn {
+            id,
+            model: model_name,
+            usage,
+            finish_reason,
+            done: turn_done,
+            failure,
+            error_forwarded,
+            chars: turn_chars,
+            broke_off,
+            ..
+        } = turn;
 
         // Stopped short, as a tool turn can be: the same error item.
         if !error_forwarded && (broke_off || (!turn_done && finish_reason.is_none())) {
@@ -584,16 +481,15 @@ pub fn run(
         // settled as the main request via `finalize_stats` below — not billed
         // as a separate helper call (that would double-charge this turn).
         if !error_forwarded {
-            if let Some(ctx) = image_ctx.as_ref() {
-                if let Some(chunk) = image_chunk(&id, &model_name, created, &ctx.images) {
-                    yield Ok(Bytes::from(chunk));
-                }
-            }
-            yield Ok(Bytes::from(finish_chunk(&id, &model_name, created, finish_reason)));
-            if client_include_usage {
-                if let Some(u) = usage {
-                    yield Ok(Bytes::from(usage_chunk(&id, &model_name, created, u)));
-                }
+            for frame in closing(
+                &id,
+                &model_name,
+                created,
+                image_ctx.as_ref().map(|ctx| &ctx.images[..]),
+                finish_reason,
+                usage.filter(|_| client_include_usage),
+            ) {
+                yield Ok(Bytes::from(frame));
             }
         }
         yield Ok(Bytes::from(done()));
@@ -677,6 +573,209 @@ fn idle_timeout_secs(read_raw: Option<&str>, request_raw: Option<&str>) -> u64 {
 }
 
 /// The next item of `stream`, or an error once it has been silent for `idle`.
+/// What a [`TurnReader`] reads next from an upstream chat stream.
+pub(crate) enum TurnEvent {
+    /// One chunk. `failure` is the status of a failure it reports alongside
+    /// its choices (a generation the upstream aborted).
+    Chunk { value: Value, failure: Option<u16> },
+    /// The upstream's own error event (no choices): its data as sent, and
+    /// what it reports.
+    Error {
+        data: String,
+        status: u16,
+        message: String,
+    },
+    /// `[DONE]`.
+    Done,
+    /// The connection broke, or went silent past the idle limit.
+    Cut(anyhow::Error),
+    /// The connection closed.
+    End,
+}
+
+/// Reads one upstream chat stream as [`TurnEvent`]s: the byte stream, its
+/// event splitter and the idle limit in one place, for the tool-stream turns,
+/// the speculation drafter and the continuation relay. Events with no data,
+/// and data that is not JSON, are skipped.
+pub(crate) struct TurnReader {
+    bytes: std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
+    events: crate::sse::Splitter,
+    idle: Option<Duration>,
+}
+
+impl TurnReader {
+    pub(crate) fn new(resp: reqwest::Response, idle: Option<Duration>) -> Self {
+        Self::from_stream(Box::pin(resp.bytes_stream()), idle)
+    }
+
+    pub(crate) fn from_stream(
+        bytes: std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
+        idle: Option<Duration>,
+    ) -> Self {
+        Self {
+            bytes,
+            events: crate::sse::Splitter::unbounded(),
+            idle,
+        }
+    }
+
+    pub(crate) async fn next(&mut self) -> TurnEvent {
+        loop {
+            while let Some(event) = self.events.next_event() {
+                let Some(data) = crate::sse::data_text(event) else {
+                    continue;
+                };
+                if data == "[DONE]" {
+                    return TurnEvent::Done;
+                }
+                let Ok(value) = serde_json::from_str::<Value>(&data) else {
+                    continue;
+                };
+                let failure = payload_failure(&value);
+                if let Some(reported) = failure.as_ref().filter(|_| value.get("choices").is_none())
+                {
+                    return TurnEvent::Error {
+                        status: reported.status,
+                        message: reported.message.clone(),
+                        data: data.into_owned(),
+                    };
+                }
+                return TurnEvent::Chunk {
+                    failure: failure.map(|f| f.status),
+                    value,
+                };
+            }
+            match next_within(&mut self.bytes, self.idle).await {
+                Some(Ok(chunk)) => self.events.push(&chunk),
+                Some(Err(e)) => return TurnEvent::Cut(e),
+                None => return TurnEvent::End,
+            }
+        }
+    }
+}
+
+/// What one streamed turn of the tool loop has read so far.
+struct Turn {
+    id: String,
+    model: String,
+    /// Answer text, kept for the assistant message of a tool turn.
+    content: String,
+    /// The tool-call deltas, merged and as sent, on a turn that may call
+    /// tools.
+    tools: Option<(BTreeMap<u64, ToolAccum>, Vec<Value>)>,
+    usage: Option<UpstreamUsage>,
+    finish_reason: Option<Value>,
+    /// `[DONE]` arrived.
+    done: bool,
+    /// The status to record for a failed turn.
+    failure: Option<u16>,
+    /// The upstream's own error event already went to the client.
+    error_forwarded: bool,
+    /// Characters of text delivered, for billing a turn cut short.
+    chars: usize,
+    /// The upstream stopped short: its connection broke or went silent.
+    broke_off: bool,
+}
+
+impl Turn {
+    fn new(upstream_model: &str, tools: bool) -> Self {
+        Self {
+            id: String::from("chatcmpl-toolstream"),
+            model: upstream_model.to_string(),
+            content: String::new(),
+            tools: tools.then(Default::default),
+            usage: None,
+            finish_reason: None,
+            done: false,
+            failure: None,
+            error_forwarded: false,
+            chars: 0,
+            broke_off: false,
+        }
+    }
+
+    /// Take in one chunk; the frames to send the client (the stream's role
+    /// chunk first, once), and whether it carried text.
+    fn take(&mut self, value: Value, role_sent: &mut bool, created: i64) -> (Vec<String>, bool) {
+        if let Some(x) = value.get("id").and_then(Value::as_str) {
+            if self.id != x {
+                self.id = x.to_string();
+            }
+        }
+        if let Some(x) = value.get("model").and_then(Value::as_str) {
+            if self.model != x {
+                self.model = x.to_string();
+            }
+        }
+        let mut frames = Vec::new();
+        if !*role_sent {
+            *role_sent = true;
+            frames.push(role_chunk(&self.id, &self.model, created));
+        }
+        if let Some(u) = value.get("usage").filter(|u| !u.is_null()) {
+            self.usage = Some(chunk_usage(u));
+        }
+        // Capture the turn's terminal finish reason so the plain answer can be
+        // closed with a proper finish chunk. The upstream's finish chunk
+        // usually carries an empty delta (so it is not forwarded below);
+        // without re-emitting it strict clients see a stream that never
+        // completes.
+        if let Some(fr) = value
+            .pointer("/choices/0/finish_reason")
+            .filter(|fr| !fr.is_null())
+        {
+            self.finish_reason = Some(fr.clone());
+        }
+        let delta = value.pointer("/choices/0/delta").unwrap_or(&Value::Null);
+        if let Some((acc, sent)) = self.tools.as_mut() {
+            if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
+                for tc in tcs {
+                    accumulate(acc, tc);
+                }
+                sent.push(delta.clone());
+            }
+        }
+        let content = delta.get("content").and_then(Value::as_str).unwrap_or("");
+        let reasoning = delta
+            .get("reasoning_content")
+            .or_else(|| delta.get("reasoning"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let text = !content.is_empty() || !reasoning.is_empty();
+        if text {
+            self.chars += content.chars().count() + reasoning.chars().count();
+            if self.tools.is_some() {
+                self.content.push_str(content);
+            }
+            frames.push(format!("data: {}\n\n", forward_delta(value)));
+        }
+        (frames, text)
+    }
+}
+
+/// The chunks that close a turn's answer, before `[DONE]`: the generated
+/// images, the terminal finish chunk a normal OpenAI stream always sends (the
+/// upstream's was not forwarded, as it carried no text), and the usage chunk
+/// when the client asked for it.
+fn closing(
+    id: &str,
+    model: &str,
+    created: i64,
+    images: Option<&[super::image_gen::GeneratedImage]>,
+    finish_reason: Option<Value>,
+    usage: Option<UpstreamUsage>,
+) -> Vec<String> {
+    let mut frames = Vec::with_capacity(3);
+    if let Some(chunk) = images.and_then(|images| image_chunk(id, model, created, images)) {
+        frames.push(chunk);
+    }
+    frames.push(finish_chunk(id, model, created, finish_reason));
+    if let Some(u) = usage {
+        frames.push(usage_chunk(id, model, created, u));
+    }
+    frames
+}
+
 pub(crate) async fn next_within<S, T, E>(
     stream: &mut S,
     idle: Option<Duration>,
@@ -902,8 +1001,7 @@ pub(crate) fn usage_chunk(id: &str, model: &str, created: i64, usage: UpstreamUs
 /// and force `finish_reason: null`. The driver re-emits a single terminal
 /// finish chunk itself, so content chunks must never carry one — otherwise a
 /// model that combines the last token with `finish_reason` would produce two.
-fn forward_delta(v: &Value) -> Value {
-    let mut v = v.clone();
+fn forward_delta(mut v: Value) -> Value {
     if let Some(choice) = v.pointer_mut("/choices/0").and_then(|c| c.as_object_mut()) {
         if let Some(delta) = choice.get_mut("delta").and_then(|d| d.as_object_mut()) {
             delta.remove("tool_calls");
@@ -1034,6 +1132,120 @@ mod tests {
         assert!(m.contains("do_thing"));
     }
 
+    fn reader(chunks: Vec<&'static str>, idle: Option<Duration>) -> TurnReader {
+        let items: Vec<Result<Bytes, reqwest::Error>> = chunks
+            .into_iter()
+            .map(|c| Ok(Bytes::from_static(c.as_bytes())))
+            .collect();
+        TurnReader::from_stream(Box::pin(futures_util::stream::iter(items)), idle)
+    }
+
+    async fn read_all(mut r: TurnReader) -> Vec<String> {
+        let mut seen = Vec::new();
+        loop {
+            let (label, last) = match r.next().await {
+                TurnEvent::Chunk { value, failure } => (
+                    format!("chunk {failure:?} {}", value["choices"][0]["delta"]),
+                    false,
+                ),
+                TurnEvent::Error { data, status, .. } => (format!("error {status} {data}"), true),
+                TurnEvent::Done => ("done".into(), true),
+                TurnEvent::Cut(_) => ("cut".into(), true),
+                TurnEvent::End => ("end".into(), true),
+            };
+            seen.push(label);
+            if last {
+                return seen;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_turn_reader_reads_chunks_errors_and_ends_across_splits() {
+        // A vLLM-shaped stream split mid-event, with a keep-alive comment and
+        // a chunk that is not JSON.
+        let seen = read_all(reader(
+            vec![
+                ": ping\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n",
+                "\ndata: not json\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"lo\"},",
+                "\"finish_reason\":\"abort\"}]}\r\n\r\ndata: [DONE]\n\ndata: {\"choices\":[]}\n\n",
+            ],
+            None,
+        ))
+        .await;
+        assert_eq!(
+            seen,
+            vec![
+                r#"chunk None {"content":"Hel"}"#,
+                r#"chunk Some(502) {"content":"lo"}"#,
+                "done",
+            ]
+        );
+        // The upstream's own error event, as it sent it.
+        let seen = read_all(reader(
+            vec!["data: {\"error\": {\"message\": \"x\", \"code\": 503}}\n\n"],
+            None,
+        ))
+        .await;
+        assert_eq!(
+            seen,
+            vec![r#"error 503 {"error": {"message": "x", "code": 503}}"#]
+        );
+        // A stream that closes without [DONE] ends; one that goes silent is cut.
+        assert_eq!(
+            read_all(reader(vec!["data: {}\n\n"], None)).await,
+            vec!["chunk None null", "end"]
+        );
+        let silent = TurnReader::from_stream(
+            Box::pin(futures_util::stream::pending()),
+            Some(Duration::from_millis(20)),
+        );
+        assert_eq!(read_all(silent).await, vec!["cut"]);
+    }
+
+    #[test]
+    fn a_turn_forwards_text_chunks_as_before_and_keeps_tool_calls() {
+        let chunks = [
+            json!({"id": "c1", "model": "m", "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]}),
+            json!({"id": "c1", "model": "m", "choices": [{"index": 0, "delta": {"content": "Hi"}, "finish_reason": null}]}),
+            json!({"id": "c1", "model": "m", "choices": [{"index": 0, "delta": {"reasoning": "hm"}, "finish_reason": null}]}),
+            json!({"id": "c1", "model": "m", "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "t", "function": {"name": "search", "arguments": "{}"}}]}, "finish_reason": null}]}),
+            json!({"id": "c1", "model": "m", "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}], "usage": {"prompt_tokens": 5, "completion_tokens": 2}}),
+        ];
+        let mut turn = Turn::new("up", true);
+        let mut role_sent = false;
+        let mut frames = Vec::new();
+        for c in &chunks {
+            frames.extend(turn.take(c.clone(), &mut role_sent, 7).0);
+        }
+        // The role chunk once, then each text chunk without tool calls or a
+        // finish reason, byte for byte as the loop sent them before.
+        let forwarded = |v: &Value| {
+            let mut v = v.clone();
+            v["choices"][0]["delta"]
+                .as_object_mut()
+                .unwrap()
+                .remove("tool_calls");
+            v["choices"][0]["finish_reason"] = Value::Null;
+            format!("data: {v}\n\n")
+        };
+        assert_eq!(
+            frames,
+            vec![
+                role_chunk("c1", "m", 7),
+                forwarded(&chunks[1]),
+                forwarded(&chunks[2])
+            ]
+        );
+        assert_eq!(turn.content, "Hi");
+        assert_eq!(turn.chars, 4);
+        assert_eq!(turn.finish_reason, Some(json!("tool_calls")));
+        assert_eq!(turn.usage, Some(UpstreamUsage::uncached(5, 2)));
+        let (acc, sent) = turn.tools.unwrap();
+        assert_eq!(acc[&0].name, "search");
+        assert_eq!(sent.len(), 1);
+    }
+
     #[test]
     fn forward_delta_strips_tool_calls_and_nulls_finish_reason() {
         let v = json!({
@@ -1042,7 +1254,7 @@ mod tests {
                 "finish_reason": "stop"
             }]
         });
-        let forwarded = forward_delta(&v);
+        let forwarded = forward_delta(v);
         assert_eq!(forwarded["choices"][0]["delta"]["content"], "hi");
         assert!(forwarded["choices"][0]["delta"].get("tool_calls").is_none());
         // Content chunks must not carry a finish reason; the driver emits a

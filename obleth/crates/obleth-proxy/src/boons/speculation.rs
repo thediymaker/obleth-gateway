@@ -49,7 +49,7 @@ use serde_json::{json, Value};
 use super::tool_stream::{chunk_usage, content_chunk, done, finish_chunk, usage_chunk};
 use crate::proxy::UpstreamUsage;
 use crate::state::AppState;
-use crate::upstream_failure::{payload_failure, stream_cut_error, DEFAULT_FAILURE_STATUS};
+use crate::upstream_failure::{stream_cut_error, DEFAULT_FAILURE_STATUS};
 
 /// Response header naming the drafter model whose verified text reached the
 /// client. Set only when the cascade committed (released a verified draft);
@@ -953,8 +953,7 @@ async fn dispatch_stream(
 /// Incremental reader over a drafter SSE stream: accumulates content deltas
 /// and captures finish_reason/usage.
 struct DraftReader {
-    bytes: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
-    events: crate::sse::Splitter,
+    turn: super::tool_stream::TurnReader,
     pub deltas: Vec<String>,
     pub finish: Option<String>,
     pub usage: Option<UpstreamUsage>,
@@ -964,8 +963,10 @@ struct DraftReader {
 impl DraftReader {
     fn new(resp: reqwest::Response) -> Self {
         DraftReader {
-            bytes: Box::pin(resp.bytes_stream()),
-            events: crate::sse::Splitter::unbounded(),
+            turn: super::tool_stream::TurnReader::new(
+                resp,
+                super::tool_stream::stream_idle_timeout(),
+            ),
             deltas: Vec::new(),
             finish: None,
             usage: None,
@@ -973,14 +974,7 @@ impl DraftReader {
         }
     }
 
-    fn consume_data(&mut self, data: &str) {
-        if data == "[DONE]" {
-            self.done = true;
-            return;
-        }
-        let Ok(v) = serde_json::from_str::<Value>(data) else {
-            return;
-        };
+    fn consume(&mut self, v: &Value) {
         if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
             self.usage = Some(chunk_usage(u));
         }
@@ -1002,27 +996,19 @@ impl DraftReader {
     /// Read until at least one more event is consumed or the stream ends.
     /// Returns false when the stream is exhausted.
     async fn advance(&mut self) -> anyhow::Result<bool> {
-        loop {
-            if let Some(event) = self.events.next_event() {
-                if let Some(data) = crate::sse::data_text(event).map(std::borrow::Cow::into_owned) {
-                    self.consume_data(&data);
-                }
-                return Ok(true);
-            }
-            match super::tool_stream::next_within(
-                &mut self.bytes,
-                super::tool_stream::stream_idle_timeout(),
-            )
-            .await
-            {
-                Some(Ok(chunk)) => self.events.push(&chunk),
-                Some(Err(e)) => anyhow::bail!("draft stream read failed: {e}"),
-                None => {
-                    self.done = true;
-                    return Ok(false);
-                }
+        use super::tool_stream::TurnEvent;
+        match self.turn.next().await {
+            TurnEvent::Chunk { value, .. } => self.consume(&value),
+            // An error event carries no draft text; the stream ends after it.
+            TurnEvent::Error { .. } => {}
+            TurnEvent::Done => self.done = true,
+            TurnEvent::Cut(e) => anyhow::bail!("draft stream read failed: {e}"),
+            TurnEvent::End => {
+                self.done = true;
+                return Ok(false);
             }
         }
+        Ok(true)
     }
 }
 
@@ -1715,57 +1701,52 @@ fn drive_stream(
         let mut cont_chars = 0usize;
         match dispatch_stream(&state, &route, &body, dispatch_timeout).await {
             Ok(resp) => {
-                let mut bytes = Box::pin(resp.bytes_stream());
-                let mut events = crate::sse::Splitter::unbounded();
-                'relay: loop {
-                    while let Some(event) = events.next_event() {
-                        if let Some(data) = crate::sse::data_text(event) {
-                            if data == "[DONE]" {
-                                done_seen = true;
-                                break 'relay;
-                            }
-                            let Ok(v) = serde_json::from_str::<Value>(&data) else { continue };
-                            if let Some(reported) = payload_failure(&v) {
-                                failure.get_or_insert(reported.status);
-                                if v.get("choices").is_none() {
-                                    tracing::warn!(
-                                        status = reported.status,
-                                        message = %reported.message,
-                                        "speculation continuation reported an error"
-                                    );
-                                    yield Ok(Bytes::from(format!("data: {data}\n\n")));
-                                    error_forwarded = true;
-                                    break 'relay;
-                                }
-                            }
-                            if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
-                                cont_usage = Some(chunk_usage(u));
-                            }
-                            let Some(choice) = v.pointer("/choices/0") else { continue };
-                            if let Some(f) = choice.get("finish_reason").filter(|f| !f.is_null()) {
-                                finish = Some(f.clone());
-                            }
-                            let delta = choice.get("delta").unwrap_or(&Value::Null);
-                            let mut text = String::new();
-                            for k in ["reasoning", "reasoning_content", "content"] {
-                                if let Some(t) = delta.get(k).and_then(|t| t.as_str()) {
-                                    text.push_str(t);
-                                }
-                            }
-                            if !text.is_empty() {
-                                cont_chars += text.chars().count();
-                                yield Ok(Bytes::from(content_chunk(&id, &model_name, created, &text)));
-                            }
+                use super::tool_stream::TurnEvent;
+                let mut reader = super::tool_stream::TurnReader::new(
+                    resp,
+                    super::tool_stream::stream_idle_timeout(),
+                );
+                loop {
+                    let (v, reported) = match reader.next().await {
+                        TurnEvent::Chunk { value, failure } => (value, failure),
+                        TurnEvent::Error { data, status, message } => {
+                            tracing::warn!(status, %message, "speculation continuation reported an error");
+                            failure.get_or_insert(status);
+                            yield Ok(Bytes::from(format!("data: {data}\n\n")));
+                            error_forwarded = true;
+                            break;
                         }
-                    }
-                    match super::tool_stream::next_within(&mut bytes, super::tool_stream::stream_idle_timeout()).await {
-                        Some(Ok(chunk)) => events.push(&chunk),
-                        Some(Err(e)) => {
+                        TurnEvent::Done => {
+                            done_seen = true;
+                            break;
+                        }
+                        TurnEvent::Cut(e) => {
                             tracing::warn!(error = %e, "speculation continuation stream failed");
                             broke_off = true;
-                            break 'relay;
+                            break;
                         }
-                        None => break 'relay,
+                        TurnEvent::End => break,
+                    };
+                    if let Some(status) = reported {
+                        failure.get_or_insert(status);
+                    }
+                    if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
+                        cont_usage = Some(chunk_usage(u));
+                    }
+                    let Some(choice) = v.pointer("/choices/0") else { continue };
+                    if let Some(f) = choice.get("finish_reason").filter(|f| !f.is_null()) {
+                        finish = Some(f.clone());
+                    }
+                    let delta = choice.get("delta").unwrap_or(&Value::Null);
+                    let mut text = String::new();
+                    for k in ["reasoning", "reasoning_content", "content"] {
+                        if let Some(t) = delta.get(k).and_then(|t| t.as_str()) {
+                            text.push_str(t);
+                        }
+                    }
+                    if !text.is_empty() {
+                        cont_chars += text.chars().count();
+                        yield Ok(Bytes::from(content_chunk(&id, &model_name, created, &text)));
                     }
                 }
             }

@@ -662,7 +662,10 @@ mod tests {
             healthy: true,
             max_in_flight: None,
         }];
-        let settings: AutoRouterSettings = serde_json::from_value(serde_json::json!({})).unwrap();
+        // Far past the 250 ms default: a loaded test run must not time the
+        // mock brain out.
+        let settings: AutoRouterSettings =
+            serde_json::from_value(serde_json::json!({ "classifier_timeout_ms": 10_000 })).unwrap();
         let intent = Classifier::new(settings)
             .classify(
                 &reqwest::Client::new(),
@@ -729,7 +732,10 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
 
-        let settings: AutoRouterSettings = serde_json::from_value(serde_json::json!({})).unwrap();
+        // Far past the 250 ms default: a loaded test run must not time the
+        // mock brain out.
+        let settings: AutoRouterSettings =
+            serde_json::from_value(serde_json::json!({ "classifier_timeout_ms": 10_000 })).unwrap();
         let classifier = Classifier::new(settings);
         let tags = vec!["coding".to_string(), "math".to_string()];
         let intent = classifier
