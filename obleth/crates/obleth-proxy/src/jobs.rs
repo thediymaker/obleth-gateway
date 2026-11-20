@@ -1455,7 +1455,7 @@ mod pipeline_tests {
             let period = crate::proxy::term_period_key(key, chrono::Utc::now()).expect("capped");
             self.state
                 .redis
-                .term_usage_read(&key.tenant_id, &period)
+                .term_usage_peek(&key.tenant_id, &period)
                 .await
                 .expect("term usage")
                 .1

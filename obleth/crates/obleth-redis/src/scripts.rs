@@ -6,53 +6,20 @@
 //! in tokens: we *reserve* an estimate at admission and *reconcile* the true cost
 //! after the stream completes.
 
-/// Reserve `requested` tokens from a tenant's bucket.
-///
-/// KEYS[1] = bucket key
-/// ARGV[1] = capacity (burst ceiling, tokens)
-/// ARGV[2] = refill_per_ms (tokens added per millisecond)
-/// ARGV[3] = now_ms
-/// ARGV[4] = requested tokens
-///
-/// An estimate larger than the whole bucket can never fit, so it is admitted
-/// when the bucket is full and runs into the bounded debt (floor `-capacity`)
-/// instead of being rejected forever.
-///
-/// Returns `{allowed (0|1), remaining_tokens}`.
-pub const RESERVE: &str = r#"
-local key   = KEYS[1]
-local cap   = tonumber(ARGV[1])
-local rate  = tonumber(ARGV[2])
-local now   = tonumber(ARGV[3])
-local req   = tonumber(ARGV[4])
-
-if cap <= 0 then
-  return { 1, 0 }
+/// The Redis clock in ms, for scripts that stamp or compare times: pods'
+/// clocks differ, and a bucket refilled on one pod's clock and drained on
+/// another's would gain or lose tokens by the skew.
+macro_rules! redis_clock {
+    () => {
+        r#"
+if redis.replicate_commands then redis.replicate_commands() end
+local function now_ms()
+  local t = redis.call('TIME')
+  return tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 end
-
-local data    = redis.call('HMGET', key, 'tokens', 'ts')
-local tokens  = tonumber(data[1])
-local ts      = tonumber(data[2])
-if tokens == nil then tokens = cap end
-if ts == nil then ts = now end
-
-local elapsed = now - ts
-if elapsed < 0 then elapsed = 0 end
-tokens = math.min(cap, tokens + elapsed * rate)
-
-local allowed = 0
-if tokens >= req then
-  tokens = tokens - req
-  allowed = 1
-elseif req > cap and tokens >= cap then
-  tokens = math.max(tokens - req, -cap)
-  allowed = 1
-end
-
-redis.call('HSET', key, 'tokens', tokens, 'ts', now)
-redis.call('PEXPIRE', key, 600000)
-return { allowed, math.floor(tokens) }
-"#;
+"#
+    };
+}
 
 /// Combined admission check: cumulative term budget gate + token-bucket
 /// reserve, in one round trip.
@@ -63,9 +30,9 @@ return { allowed, math.floor(tokens) }
 ///
 /// The gate counts both committed usage (term-usage hash `tokens`/`cost`) and
 /// in-flight reservations (term-reserved hash `tokens`/`cost`), rejecting when
-/// `committed + reserved >= cap`. With `reserve_term = 1` an admitted request
-/// adds its estimate to the reserved hash in the same script, so N concurrent
-/// requests at cap-1 cannot all pass. The reservation is only made when the
+/// `committed + reserved >= cap`. An admitted request adds its estimate to the
+/// reserved hash in the same script, so N concurrent requests at cap-1 cannot
+/// all pass. The reservation is only made when the
 /// bucket also admits, since rejected requests are never settled.
 ///
 /// Why reservations live in their own short-lived key: a request that is
@@ -84,29 +51,32 @@ return { allowed, math.floor(tokens) }
 /// KEYS[3] = term-reserved key (in-flight; `period`, `tokens`, `cost`)
 /// ARGV[1] = capacity (burst ceiling, tokens)
 /// ARGV[2] = refill_per_ms
-/// ARGV[3] = now_ms
-/// ARGV[4] = requested tokens (also the term token reservation)
-/// ARGV[5] = check_term (0|1)
-/// ARGV[6] = period_key (ignored when check_term is 0)
-/// ARGV[7] = term token cap ('' = uncapped)
-/// ARGV[8] = term cost cap in USD ('' = uncapped)
-/// ARGV[9] = reserve_term (0|1; ignored when check_term is 0)
-/// ARGV[10] = estimated cost in USD to reserve
+/// ARGV[3] = requested tokens (also the term token reservation)
+/// ARGV[4] = check_term (0|1)
+/// ARGV[5] = period_key (ignored when check_term is 0)
+/// ARGV[6] = term token cap ('' = uncapped)
+/// ARGV[7] = term cost cap in USD ('' = uncapped)
+/// ARGV[8] = estimated cost in USD to reserve
+///
+/// An estimate larger than the whole bucket can never fit, so it is admitted
+/// when the bucket is full and runs into the bounded debt (floor `-capacity`)
+/// instead of being rejected forever. Times are the Redis clock's.
 ///
 /// Returns `{status, remaining_tokens, term_tokens, term_cost_string}` where
 /// status is 1 (reserved), 0 (per-minute bucket exhausted), or -1 (term budget
 /// exhausted; nothing reserved). `term_tokens`/`term_cost` are the committed
 /// usage observed by the gate.
-pub const RESERVE_WITH_TERM: &str = r#"
+pub const RESERVE_WITH_TERM: &str = concat!(
+    redis_clock!(),
+    r#"
 local bucket = KEYS[1]
 local term   = KEYS[2]
 local rkey   = KEYS[3]
 local cap    = tonumber(ARGV[1])
 local rate   = tonumber(ARGV[2])
-local now    = tonumber(ARGV[3])
-local req    = tonumber(ARGV[4])
-local check_term = ARGV[5] == '1'
-local period = ARGV[6]
+local req    = tonumber(ARGV[3])
+local check_term = ARGV[4] == '1'
+local period = ARGV[5]
 
 local term_tokens = 0
 local term_cost   = '0'
@@ -132,8 +102,8 @@ if check_term then
   elseif r[1] then
     redis.call('DEL', rkey)
   end
-  local cap_tokens = ARGV[7]
-  local cap_cost   = ARGV[8]
+  local cap_tokens = ARGV[6]
+  local cap_cost   = ARGV[7]
   if (cap_tokens ~= '' and term_tokens + reserved_tokens >= tonumber(cap_tokens))
      or (cap_cost ~= '' and tonumber(term_cost) + reserved_cost >= tonumber(cap_cost)) then
     return { -1, 0, term_tokens, term_cost }
@@ -143,6 +113,7 @@ end
 local allowed   = 1
 local remaining = 0
 if cap > 0 then
+  local now     = now_ms()
   local data    = redis.call('HMGET', bucket, 'tokens', 'ts')
   local tokens  = tonumber(data[1])
   local ts      = tonumber(data[2])
@@ -158,7 +129,7 @@ if cap > 0 then
     tokens = tokens - req
     allowed = 1
   elseif req > cap and tokens >= cap then
-    -- see RESERVE: an estimate above capacity may only drain a full bucket
+    -- an estimate above capacity may only drain a full bucket
     tokens = math.max(tokens - req, -cap)
     allowed = 1
   end
@@ -168,31 +139,32 @@ if cap > 0 then
   remaining = math.floor(tokens)
 end
 
-if allowed == 1 and check_term and ARGV[9] == '1' then
+if allowed == 1 and check_term then
   redis.call('HSET', rkey, 'period', period)
   redis.call('HINCRBY', rkey, 'tokens', req)
-  redis.call('HINCRBYFLOAT', rkey, 'cost', ARGV[10])
+  redis.call('HINCRBYFLOAT', rkey, 'cost', ARGV[8])
   -- arm the TTL only on creation (PTTL -1); never refresh, see above.
   -- Emulates PEXPIRE ... NX so Redis 6.x deployments keep working.
   if redis.call('PTTL', rkey) < 0 then redis.call('PEXPIRE', rkey, 600000) end
 end
 
 return { allowed, remaining, term_tokens, term_cost }
-"#;
+"#
+);
 
 /// Reconcile estimated vs actual cost after completion.
 ///
 /// KEYS[1] = bucket key
 /// ARGV[1] = capacity
 /// ARGV[2] = delta (estimated - actual; positive refunds, negative charges more)
-/// ARGV[3] = now_ms
 ///
 /// Returns remaining tokens.
-pub const RECONCILE: &str = r#"
+pub const RECONCILE: &str = concat!(
+    redis_clock!(),
+    r#"
 local key   = KEYS[1]
 local cap   = tonumber(ARGV[1])
 local delta = tonumber(ARGV[2])
-local now   = tonumber(ARGV[3])
 
 if cap <= 0 then
   return 0
@@ -209,36 +181,14 @@ if tokens < -cap then tokens = -cap end
 if recreated then
   -- the bucket expired mid-request; without ts the next reserve would treat
   -- the debt as fresh and without a TTL the hash would never expire
-  redis.call('HSET', key, 'tokens', tokens, 'ts', now)
+  redis.call('HSET', key, 'tokens', tokens, 'ts', now_ms())
 else
   redis.call('HSET', key, 'tokens', tokens)
 end
 redis.call('PEXPIRE', key, 600000)
 return math.floor(tokens)
-"#;
-
-/// Read a tenant's cumulative term usage, rolling the period if it changed.
-///
-/// KEYS[1] = term-usage key
-/// ARGV[1] = period_key (opaque string identifying the current term/month)
-///
-/// If the stored period differs from the supplied one, the counters reset to
-/// zero before the read. Returns `{tokens, cost_string}`.
-pub const TERM_USAGE_READ: &str = r#"
-local key    = KEYS[1]
-local period = ARGV[1]
-
-local stored = redis.call('HGET', key, 'period')
-if stored ~= period then
-  redis.call('DEL', key)
-  redis.call('HSET', key, 'period', period)
-end
--- clears a TTL left by an earlier version (committed usage never expires)
-redis.call('PERSIST', key)
-local tokens = tonumber(redis.call('HGET', key, 'tokens')) or 0
-local cost   = redis.call('HGET', key, 'cost') or '0'
-return { tokens, cost }
-"#;
+"#
+);
 
 /// Add observed usage to a tenant's cumulative term counters, rolling first.
 ///
@@ -811,14 +761,19 @@ return 1
 /// the count again: only engine deaths close together add up. The hash
 /// expires `ARGV[3]` seconds after its last strike.
 ///
-/// ARGV: now ms, window ms, ttl secs. Returns the strike count.
-pub const CRASH_STRIKE: &str = r#"
+/// ARGV: window ms, ttl secs. Returns the strike count. Times are the Redis
+/// clock's.
+pub const CRASH_STRIKE: &str = concat!(
+    redis_clock!(),
+    r#"
+local now = now_ms()
 local last = redis.call('HGET', KEYS[1], 'last')
-if last and (tonumber(ARGV[1]) - tonumber(last)) > tonumber(ARGV[2]) then
+if last and (now - tonumber(last)) > tonumber(ARGV[1]) then
   redis.call('DEL', KEYS[1])
 end
 local n = redis.call('HINCRBY', KEYS[1], 'n', 1)
-redis.call('HSET', KEYS[1], 'last', ARGV[1])
-redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
+redis.call('HSET', KEYS[1], 'last', now)
+redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
 return n
-"#;
+"#
+);

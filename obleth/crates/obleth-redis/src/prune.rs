@@ -109,10 +109,6 @@ mod tests {
     use crate::{KEY_PREFIX, MCP_PREFIX, MODEL_PREFIX};
     use redis::AsyncCommands;
 
-    /// The prune tests list a namespace and then prune everything else in
-    /// it, so two running at once would delete each other's entries.
-    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     #[derive(Clone, Copy)]
     enum Namespace {
         Keys,
@@ -192,7 +188,7 @@ mod tests {
             eprintln!("skipping: set OBLETH_TEST_REDIS_URL to run");
             return;
         };
-        let _serial = SERIAL.lock().await;
+        let _serial = crate::RESOLVER_TEST_LOCK.lock().await;
         let store = RedisStore::connect(&url).await.expect("connect");
         prune_removes_only_the_unlisted_entry(&store, Namespace::Keys).await;
     }
@@ -204,7 +200,7 @@ mod tests {
             eprintln!("skipping: set OBLETH_TEST_REDIS_URL to run");
             return;
         };
-        let _serial = SERIAL.lock().await;
+        let _serial = crate::RESOLVER_TEST_LOCK.lock().await;
         let store = RedisStore::connect(&url).await.expect("connect");
         prune_removes_only_the_unlisted_entry(&store, Namespace::Models).await;
         prune_removes_only_the_unlisted_entry(&store, Namespace::McpServers).await;
@@ -232,7 +228,7 @@ mod tests {
             eprintln!("skipping: set OBLETH_TEST_REDIS_URL to run");
             return;
         };
-        let _serial = SERIAL.lock().await;
+        let _serial = crate::RESOLVER_TEST_LOCK.lock().await;
         let store = RedisStore::connect(&url).await.expect("connect");
         let mut conn = store.conn.clone();
         let resolvers = [Resolver::Keys, Resolver::Models, Resolver::McpServers];

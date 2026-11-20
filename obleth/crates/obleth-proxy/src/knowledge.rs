@@ -281,8 +281,11 @@ pub async fn embed_query(
     settings: &obleth_config::KnowledgeBoonSettings,
 ) -> Option<Vec<f32>> {
     let key = query_cache_key(embedding_model, query);
-    if let Some(v) = state.redis.get_query_vector(&key).await {
-        return Some(v);
+    // The cache only saves an embedding call: a Redis error is a miss.
+    match state.redis.get_query_vector(&key).await {
+        Ok(Some(v)) => return Some(v),
+        Ok(None) => {}
+        Err(e) => tracing::debug!(error = %e, "knowledge query vector read failed; embedding"),
     }
     let route = crate::proxy::resolve_model(state, embedding_model).await?;
     let target = match embed_target(&route) {
@@ -302,10 +305,13 @@ pub async fn embed_query(
     .ok()?
     .into_iter()
     .next()?;
-    state
+    if let Err(e) = state
         .redis
         .put_query_vector(&key, &vector, settings.query_cache_ttl_s)
-        .await;
+        .await
+    {
+        tracing::debug!(error = %e, "knowledge query vector store failed");
+    }
     Some(vector)
 }
 

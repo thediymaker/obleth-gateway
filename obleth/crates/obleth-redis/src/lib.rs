@@ -35,10 +35,8 @@ macro_rules! cached_script {
     };
 }
 
-cached_script!(reserve_script, scripts::RESERVE);
 cached_script!(reserve_with_term_script, scripts::RESERVE_WITH_TERM);
 cached_script!(reconcile_script, scripts::RECONCILE);
-cached_script!(term_usage_read_script, scripts::TERM_USAGE_READ);
 cached_script!(term_usage_add_script, scripts::TERM_USAGE_ADD);
 cached_script!(term_reconcile_script, scripts::TERM_RECONCILE);
 cached_script!(replica_heartbeat_script, scripts::REPLICA_HEARTBEAT);
@@ -89,6 +87,10 @@ const AUTO_TURN_PREFIX: &str = "obleth:auto:";
 /// fingerprint) was being answered at, per model. A hash (`n`, `last`).
 const CRASH_PREFIX: &str = "obleth:crashguard:";
 const INVALIDATE_CHANNEL: &str = "obleth:invalidate";
+/// Per-day request counters (see `daily_stats_key`).
+const DAILY_STATS_PREFIX: &str = "obleth:daily:";
+/// Fixed-window call counters (see `count_call`).
+const CALL_COUNT_PREFIX: &str = "obleth:calls:";
 /// Single shared key holding the provisioner's last-seen epoch seconds. Shared
 /// via Redis (not per-pod memory) so the dashboard reads a consistent value no
 /// matter which gateway pod served the provisioner's poll vs. the settings read.
@@ -184,7 +186,7 @@ impl RedisStore {
     fn term_usage_key(tenant: &Uuid) -> String {
         format!("{TERM_USAGE_PREFIX}{tenant}")
     }
-    fn term_reserved_key(scope: impl std::fmt::Display) -> String {
+    fn term_reserved_key(scope: &Uuid) -> String {
         format!("{TERM_RESERVED_PREFIX}{scope}")
     }
 
@@ -563,7 +565,6 @@ impl RedisStore {
         let mut conn = self.conn.clone();
         let n: u32 = crash_strike_script()
             .key(Self::crash_key(model, fingerprint))
-            .arg(now_ms())
             .arg(window.as_millis() as i64)
             .arg(ttl.as_secs() as i64)
             .invoke_async(&mut conn)
@@ -575,29 +576,24 @@ impl RedisStore {
         format!("{KNOWLEDGE_QUERY_PREFIX}{hash}")
     }
 
-    /// Fetch a cached query vector by its hash. Any error, a missing key, or a
-    /// byte length that is not a multiple of 4 (a misaligned vector, which
-    /// would score plausibly but wrongly) is treated as a plain miss: the
-    /// caller re-embeds. The cache is an optimization, never a correctness
-    /// requirement.
-    pub async fn get_query_vector(&self, hash: &str) -> Option<Vec<f32>> {
+    /// Fetch a cached query vector by its hash. A missing key, or a byte
+    /// length that is not a multiple of 4 (a misaligned vector, which would
+    /// score plausibly but wrongly), is `None`: the caller re-embeds.
+    pub async fn get_query_vector(&self, hash: &str) -> Result<Option<Vec<f32>>> {
         let mut conn = self.conn.clone();
-        let bytes: Option<Vec<u8>> = conn.get(Self::query_vector_key(hash)).await.ok()?;
-        let bytes = bytes?;
-        if bytes.is_empty() || bytes.len() % 4 != 0 {
-            return None;
-        }
-        Some(
-            bytes
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect(),
-        )
+        let bytes: Option<Vec<u8>> = conn.get(Self::query_vector_key(hash)).await?;
+        Ok(bytes
+            .filter(|b| !b.is_empty() && b.len() % 4 == 0)
+            .map(|b| {
+                b.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
+                    .collect()
+            }))
     }
 
     /// Store a query vector under its hash, little-endian f32 encoded.
-    /// Failures are ignored — the cache is an optimization, never a
-    /// correctness requirement.
     ///
     /// As with `cache_put` and `compress_put`, `ttl_secs == 0` here means
     /// "caching disabled — skip the write entirely" rather than "store with no
@@ -606,55 +602,19 @@ impl RedisStore {
     /// hot-path store, which also serves key resolution and budget enforcement.
     /// A storage-boundary method should not depend on a caller in another
     /// crate validating this for it.
-    pub async fn put_query_vector(&self, hash: &str, vector: &[f32], ttl_secs: u64) {
+    pub async fn put_query_vector(&self, hash: &str, vector: &[f32], ttl_secs: u64) -> Result<()> {
         if ttl_secs == 0 {
-            return;
+            return Ok(());
         }
         let mut bytes = Vec::with_capacity(vector.len() * 4);
         for f in vector {
             bytes.extend_from_slice(&f.to_le_bytes());
         }
         let mut conn = self.conn.clone();
-        let redis_key = Self::query_vector_key(hash);
-        let _: redis::RedisResult<()> = conn.set_ex(redis_key, bytes, ttl_secs).await;
-    }
-
-    /// Atomically reserve `requested` tokens. Returns `(allowed, remaining)`.
-    pub async fn reserve_budget(
-        &self,
-        tenant: &Uuid,
-        capacity: i64,
-        tokens_per_minute: i64,
-        requested: u32,
-    ) -> Result<(bool, i64)> {
-        let mut conn = self.conn.clone();
-        let now_ms = now_ms();
-        let refill_per_ms = tokens_per_minute as f64 / 60_000.0;
-        let (allowed, remaining): (i64, i64) = reserve_script()
-            .key(Self::budget_key(tenant))
-            .arg(capacity)
-            .arg(refill_per_ms)
-            .arg(now_ms)
-            .arg(requested)
-            .invoke_async(&mut conn)
+        let _: () = conn
+            .set_ex(Self::query_vector_key(hash), bytes, ttl_secs)
             .await?;
-        Ok((allowed == 1, remaining))
-    }
-
-    /// Check-only variant of [`Self::reserve_with_term`]: gates on the term
-    /// budget but reserves nothing against it. Kept for callers that settle
-    /// with [`Self::term_usage_add`]; a reservation made here would never be
-    /// released.
-    pub async fn reserve_budget_with_term(
-        &self,
-        tenant: &Uuid,
-        capacity: i64,
-        tokens_per_minute: i64,
-        requested: u32,
-        term: Option<TermGate<'_>>,
-    ) -> Result<ReserveOutcome> {
-        self.reserve_inner(tenant, capacity, tokens_per_minute, requested, term, None)
-            .await
+        Ok(())
     }
 
     /// Combined admission check in a single round trip: an optional cumulative
@@ -683,28 +643,7 @@ impl RedisStore {
         term: Option<TermGate<'_>>,
         est_cost: f64,
     ) -> Result<ReserveOutcome> {
-        self.reserve_inner(
-            scope,
-            capacity,
-            tokens_per_minute,
-            requested,
-            term,
-            Some(est_cost),
-        )
-        .await
-    }
-
-    async fn reserve_inner(
-        &self,
-        tenant: &Uuid,
-        capacity: i64,
-        tokens_per_minute: i64,
-        requested: u32,
-        term: Option<TermGate<'_>>,
-        reserve_cost: Option<f64>,
-    ) -> Result<ReserveOutcome> {
         let mut conn = self.conn.clone();
-        let now_ms = now_ms();
         let refill_per_ms = tokens_per_minute as f64 / 60_000.0;
         let (check_term, period_key, cap_tokens, cap_cost) = match &term {
             Some(gate) => (
@@ -721,19 +660,17 @@ impl RedisStore {
         };
         let (status, remaining, term_tokens, term_cost): (i64, i64, i64, String) =
             reserve_with_term_script()
-                .key(Self::budget_key(tenant))
-                .key(Self::term_usage_key(tenant))
-                .key(Self::term_reserved_key(tenant))
+                .key(Self::budget_key(scope))
+                .key(Self::term_usage_key(scope))
+                .key(Self::term_reserved_key(scope))
                 .arg(capacity)
                 .arg(refill_per_ms)
-                .arg(now_ms)
                 .arg(requested)
                 .arg(check_term)
                 .arg(period_key)
                 .arg(cap_tokens)
                 .arg(cap_cost)
-                .arg(u8::from(reserve_cost.is_some()))
-                .arg(reserve_cost.unwrap_or(0.0))
+                .arg(est_cost)
                 .invoke_async(&mut conn)
                 .await?;
         Ok(match status {
@@ -760,7 +697,6 @@ impl RedisStore {
             .key(Self::budget_key(tenant))
             .arg(capacity)
             .arg(delta)
-            .arg(now_ms())
             .invoke_async(&mut conn)
             .await?;
         Ok(remaining)
@@ -769,14 +705,14 @@ impl RedisStore {
     /// Settle a request admitted by [`Self::reserve_with_term`]: release the
     /// `est_*` reservation (floored at 0) and commit the `actual_*` usage to
     /// the scope's term counters, atomically. `scope` is the tenant or API-key
-    /// id (as a string) that was passed to `reserve_with_term`, and `period`
-    /// is the period key used at admission.
+    /// id that was passed to `reserve_with_term`, and `period` is the period
+    /// key used at admission.
     ///
     /// Returns the committed `(tokens, cost_usd)` after the reconcile (same
     /// shape as [`Self::term_usage_add`]), for budget alerting.
     pub async fn term_reconcile(
         &self,
-        scope: &str,
+        scope: &Uuid,
         period: &str,
         est_tokens: i64,
         est_cost: f64,
@@ -785,7 +721,7 @@ impl RedisStore {
     ) -> Result<(i64, f64)> {
         let mut conn = self.conn.clone();
         let (tokens, cost): (i64, String) = term_reconcile_script()
-            .key(format!("{TERM_USAGE_PREFIX}{scope}"))
+            .key(Self::term_usage_key(scope))
             .key(Self::term_reserved_key(scope))
             .arg(period)
             .arg(est_tokens)
@@ -797,23 +733,11 @@ impl RedisStore {
         Ok((tokens, cost.parse().unwrap_or(0.0)))
     }
 
-    /// Read a tenant's cumulative term usage `(tokens, cost_usd)`, rolling the
-    /// period counters if `period_key` no longer matches the stored term.
-    pub async fn term_usage_read(&self, tenant: &Uuid, period_key: &str) -> Result<(i64, f64)> {
-        let mut conn = self.conn.clone();
-        let (tokens, cost): (i64, String) = term_usage_read_script()
-            .key(Self::term_usage_key(tenant))
-            .arg(period_key)
-            .invoke_async(&mut conn)
-            .await?;
-        Ok((tokens, cost.parse().unwrap_or(0.0)))
-    }
-
     /// How long daily counters live: a little over a month of history.
     const DAILY_STATS_TTL_SECS: i64 = 40 * 86_400;
 
     fn daily_stats_key(kind: &str, id: &str, day: &str) -> String {
-        format!("obleth:daily:{kind}:{id}:{day}")
+        format!("{DAILY_STATS_PREFIX}{kind}:{id}:{day}")
     }
 
     /// Count one call by `who` against `what` in the current minute, and say
@@ -823,7 +747,7 @@ impl RedisStore {
     pub async fn count_call(&self, what: &str, who: &Uuid, limit: u32) -> Result<(bool, u64)> {
         let now = now_ms().max(0) as u64;
         let minute = now / 60_000;
-        let key = format!("obleth:calls:{what}:{who}:{minute}");
+        let key = format!("{CALL_COUNT_PREFIX}{what}:{who}:{minute}");
         let mut pipe = redis::pipe();
         pipe.cmd("INCR").arg(&key);
         pipe.cmd("EXPIRE").arg(&key).arg(120).ignore();
@@ -1073,6 +997,13 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Held by every test that writes resolver entries (`obleth:key3:*`,
+/// `obleth:model:*`, `obleth:mcp:*`) in the shared test Redis: the prune tests
+/// delete whatever those namespaces hold that they did not list, so a write
+/// from a test running alongside would be pruned, or counted as stale.
+#[cfg(test)]
+pub(crate) static RESOLVER_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1104,19 +1035,31 @@ mod tests {
         let tpm = 0i64; // no refill, so accounting is deterministic
 
         // first reserve of 60 succeeds, leaving 40
-        let (ok, remaining) = store
-            .reserve_budget(&tenant, capacity, tpm, 60)
+        let out = store
+            .reserve_with_term(&tenant, capacity, tpm, 60, None, 0.0)
             .await
             .unwrap();
-        assert!(ok);
-        assert_eq!(remaining, 40);
+        assert_eq!(out, ReserveOutcome::Reserved { remaining: 40 });
+
+        // The bucket is stamped with the Redis clock, not this process's.
+        let mut conn = store.conn.clone();
+        let ts: i64 = conn
+            .hget(RedisStore::budget_key(&tenant), "ts")
+            .await
+            .unwrap();
+        let (secs, micros): (i64, i64) = redis::cmd("TIME").query_async(&mut conn).await.unwrap();
+        let redis_now = secs * 1000 + micros / 1000;
+        assert!(
+            (redis_now - ts).abs() < 5_000,
+            "ts {ts} vs Redis {redis_now}"
+        );
 
         // 50 more exceeds the remaining 40 -> denied
-        let (ok, _) = store
-            .reserve_budget(&tenant, capacity, tpm, 50)
+        let out = store
+            .reserve_with_term(&tenant, capacity, tpm, 50, None, 0.0)
             .await
             .unwrap();
-        assert!(!ok);
+        assert!(matches!(out, ReserveOutcome::RateLimited { .. }));
 
         // reconcile: estimated 60 but actual 10 -> refund 50, back to 90
         let after = store
@@ -1140,14 +1083,14 @@ mod tests {
 
         // No term gate: behaves like a plain reserve.
         let out = store
-            .reserve_budget_with_term(&tenant, capacity, tpm, 60, None)
+            .reserve_with_term(&tenant, capacity, tpm, 60, None, 0.0)
             .await
             .unwrap();
         assert_eq!(out, ReserveOutcome::Reserved { remaining: 40 });
 
         // Bucket exhausted -> RateLimited, nothing reserved.
         let out = store
-            .reserve_budget_with_term(&tenant, capacity, tpm, 50, None)
+            .reserve_with_term(&tenant, capacity, tpm, 50, None, 0.0)
             .await
             .unwrap();
         assert!(matches!(out, ReserveOutcome::RateLimited { .. }));
@@ -1164,7 +1107,7 @@ mod tests {
             budget_cost_usd: None,
         };
         let out = store
-            .reserve_budget_with_term(&tenant, capacity, tpm, 10, Some(gate))
+            .reserve_with_term(&tenant, capacity, tpm, 10, Some(gate), 0.0)
             .await
             .unwrap();
         assert_eq!(
@@ -1176,7 +1119,7 @@ mod tests {
         );
         // Bucket untouched by the term rejection: 40 tokens still reservable.
         let out = store
-            .reserve_budget_with_term(&tenant, capacity, tpm, 40, None)
+            .reserve_with_term(&tenant, capacity, tpm, 40, None, 0.0)
             .await
             .unwrap();
         assert_eq!(out, ReserveOutcome::Reserved { remaining: 0 });
@@ -1188,7 +1131,7 @@ mod tests {
             budget_cost_usd: Some(100.0),
         };
         let out = store
-            .reserve_budget_with_term(&tenant, capacity, tpm, 10, Some(gate))
+            .reserve_with_term(&tenant, capacity, tpm, 10, Some(gate), 0.0)
             .await
             .unwrap();
         assert!(matches!(out, ReserveOutcome::RateLimited { .. }));
@@ -1200,7 +1143,7 @@ mod tests {
             budget_cost_usd: None,
         };
         let out = store
-            .reserve_budget_with_term(&Uuid::new_v4(), capacity, tpm, 10, Some(gate))
+            .reserve_with_term(&Uuid::new_v4(), capacity, tpm, 10, Some(gate), 0.0)
             .await
             .unwrap();
         assert_eq!(out, ReserveOutcome::Reserved { remaining: 90 });
@@ -1217,7 +1160,7 @@ mod tests {
         let tenant = Uuid::new_v4();
 
         let out = store
-            .reserve_budget_with_term(&tenant, 0, 0, 1_000_000, None)
+            .reserve_with_term(&tenant, 0, 0, 1_000_000, None, 0.0)
             .await
             .unwrap();
         assert_eq!(out, ReserveOutcome::Reserved { remaining: 0 });
@@ -1232,7 +1175,7 @@ mod tests {
             budget_cost_usd: None,
         };
         let out = store
-            .reserve_budget_with_term(&tenant, 0, 0, 10, Some(gate))
+            .reserve_with_term(&tenant, 0, 0, 10, Some(gate), 0.0)
             .await
             .unwrap();
         assert!(matches!(out, ReserveOutcome::TermExhausted { .. }));
@@ -1244,6 +1187,7 @@ mod tests {
             eprintln!("skipping: set OBLETH_TEST_REDIS_URL to run");
             return;
         };
+        let _serial = RESOLVER_TEST_LOCK.lock().await;
         let store = RedisStore::connect(&url).await.expect("connect");
         let hash = format!("test-{}", Uuid::new_v4());
         let key = ResolvedKey {
@@ -1435,11 +1379,11 @@ mod tests {
         let hash = format!("q-{}", Uuid::new_v4());
 
         // Miss before write.
-        assert!(store.get_query_vector(&hash).await.is_none());
+        assert!(store.get_query_vector(&hash).await.unwrap().is_none());
 
         let vector = vec![0.5f32, -1.25, 3.0, 0.0];
-        store.put_query_vector(&hash, &vector, 60).await;
-        assert_eq!(store.get_query_vector(&hash).await, Some(vector));
+        store.put_query_vector(&hash, &vector, 60).await.unwrap();
+        assert_eq!(store.get_query_vector(&hash).await.unwrap(), Some(vector));
     }
 
     /// A misaligned byte length must be treated as a miss, not a decode
@@ -1457,7 +1401,7 @@ mod tests {
         let mut conn = store.conn.clone();
         let _: () = conn.set(redis_key, vec![1u8, 2, 3]).await.unwrap();
 
-        assert!(store.get_query_vector(&hash).await.is_none());
+        assert!(store.get_query_vector(&hash).await.unwrap().is_none());
     }
 
     async fn test_store() -> Option<RedisStore> {
@@ -1501,7 +1445,7 @@ mod tests {
             return;
         };
         let scope = Uuid::new_v4();
-        let rkey = RedisStore::term_reserved_key(scope);
+        let rkey = RedisStore::term_reserved_key(&scope);
         store
             .reserve_with_term(&scope, 0, 0, 10, Some(token_gate("l:0", 100)), 0.0)
             .await
@@ -1625,22 +1569,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ttl, -1, "a legacy TTL must be cleared on the next add");
-        assert_eq!(store.term_usage_read(&scope, "l:0").await.unwrap().0, 15);
+        assert_eq!(store.term_usage_peek(&scope, "l:0").await.unwrap().0, 15);
 
-        // A scope that is only ever read (no new usage) is cleared too.
+        // A scope that is only ever gated (no new usage) is cleared too.
         let _: i64 = redis::cmd("PEXPIRE")
             .arg(&key)
             .arg(31_536_000_000_i64)
             .query_async(&mut conn)
             .await
             .unwrap();
-        assert_eq!(store.term_usage_read(&scope, "l:0").await.unwrap().0, 15);
+        store
+            .reserve_with_term(&scope, 0, 0, 1, Some(token_gate("l:0", 100)), 0.0)
+            .await
+            .unwrap();
         let ttl: i64 = redis::cmd("PTTL")
             .arg(&key)
             .query_async(&mut conn)
             .await
             .unwrap();
-        assert_eq!(ttl, -1, "a legacy TTL must be cleared on read");
+        assert_eq!(ttl, -1, "a legacy TTL must be cleared by the gate");
 
         let _: () = conn.del(&key).await.unwrap();
     }
@@ -1692,7 +1639,7 @@ mod tests {
         expire_reservations_now(&store, &scope).await;
 
         let committed = store
-            .term_reconcile(&scope.to_string(), "l:0", 40, 0.4, 25, 0.3)
+            .term_reconcile(&scope, "l:0", 40, 0.4, 25, 0.3)
             .await
             .unwrap();
         assert_eq!(committed, (25, 0.3));
@@ -1864,38 +1811,22 @@ mod tests {
 
     /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
     #[tokio::test]
-    async fn legacy_check_only_reserve_leaves_no_reservation() {
-        let Some(store) = test_store().await else {
-            return;
-        };
-        let scope = Uuid::new_v4();
-        let out = store
-            .reserve_budget_with_term(&scope, 0, 0, 40, Some(token_gate("l:0", 100)))
-            .await
-            .unwrap();
-        assert!(matches!(out, ReserveOutcome::Reserved { .. }));
-        assert_eq!(reserved_field(&store, &scope, "tokens").await, None);
-    }
-
-    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
-    #[tokio::test]
     async fn term_reconcile_moves_reservation_to_committed() {
         let Some(store) = test_store().await else {
             return;
         };
         let scope = Uuid::new_v4();
-        let s = scope.to_string();
         store
             .reserve_with_term(&scope, 0, 0, 40, Some(token_gate("l:0", 100)), 0.4)
             .await
             .unwrap();
         let committed = store
-            .term_reconcile(&s, "l:0", 40, 0.4, 25, 0.3)
+            .term_reconcile(&scope, "l:0", 40, 0.4, 25, 0.3)
             .await
             .unwrap();
         assert_eq!(committed, (25, 0.3));
         assert_eq!(
-            store.term_usage_read(&scope, "l:0").await.unwrap(),
+            store.term_usage_peek(&scope, "l:0").await.unwrap(),
             committed
         );
         assert_eq!(
@@ -1912,7 +1843,7 @@ mod tests {
         // Releasing more than is reserved floors at zero instead of going
         // negative (a negative reservation would inflate headroom).
         let (tokens, cost) = store
-            .term_reconcile(&s, "l:0", 1_000, 5.0, 5, 0.05)
+            .term_reconcile(&scope, "l:0", 1_000, 5.0, 5, 0.05)
             .await
             .unwrap();
         assert_eq!(tokens, 30);
@@ -1927,7 +1858,7 @@ mod tests {
             .parse()
             .unwrap();
         assert_eq!(reserved_cost, 0.0);
-        let (tokens, cost) = store.term_usage_read(&scope, "l:0").await.unwrap();
+        let (tokens, cost) = store.term_usage_peek(&scope, "l:0").await.unwrap();
         assert_eq!(tokens, 30);
         assert!((cost - 0.35).abs() < 1e-9, "{cost}");
     }
@@ -1952,7 +1883,7 @@ mod tests {
         // but it must neither wipe the new period nor release the new
         // period's reservation.
         let committed = store
-            .term_reconcile(&scope.to_string(), "m:2026-08", 40, 0.0, 30, 0.0)
+            .term_reconcile(&scope, "m:2026-08", 40, 0.0, 30, 0.0)
             .await
             .unwrap();
         assert_eq!(committed, (30, 0.0));
@@ -2024,48 +1955,43 @@ mod tests {
         };
         let (capacity, tpm) = (100i64, 0i64);
 
+        let reserve = |tenant: Uuid, n: u32| {
+            let store = store.clone();
+            async move {
+                store
+                    .reserve_with_term(&tenant, capacity, tpm, n, None, 0.0)
+                    .await
+                    .unwrap()
+            }
+        };
+
         let tenant = Uuid::new_v4();
-        let (ok, remaining) = store
-            .reserve_budget(&tenant, capacity, tpm, 150)
-            .await
-            .unwrap();
-        assert!(ok, "oversized request against a full bucket must pass");
-        assert_eq!(remaining, -50);
+        assert_eq!(
+            reserve(tenant, 150).await,
+            ReserveOutcome::Reserved { remaining: -50 },
+            "oversized request against a full bucket must pass"
+        );
         // Bucket now in debt: the next request waits for refill.
-        let (ok, _) = store
-            .reserve_budget(&tenant, capacity, tpm, 150)
-            .await
-            .unwrap();
-        assert!(!ok);
+        assert!(matches!(
+            reserve(tenant, 150).await,
+            ReserveOutcome::RateLimited { .. }
+        ));
 
         // The debt floor (-capacity) still holds.
-        let tenant = Uuid::new_v4();
-        let (ok, remaining) = store
-            .reserve_budget(&tenant, capacity, tpm, 10_000)
-            .await
-            .unwrap();
-        assert!(ok);
-        assert_eq!(remaining, -capacity);
+        assert_eq!(
+            reserve(Uuid::new_v4(), 10_000).await,
+            ReserveOutcome::Reserved {
+                remaining: -capacity
+            }
+        );
 
         // A partially drained bucket still rejects the oversized request.
         let tenant = Uuid::new_v4();
-        store
-            .reserve_budget(&tenant, capacity, tpm, 1)
-            .await
-            .unwrap();
-        let (ok, _) = store
-            .reserve_budget(&tenant, capacity, tpm, 150)
-            .await
-            .unwrap();
-        assert!(!ok);
-
-        // Same rule through the combined term + bucket script.
-        let tenant = Uuid::new_v4();
-        let out = store
-            .reserve_with_term(&tenant, capacity, tpm, 150, None, 0.0)
-            .await
-            .unwrap();
-        assert_eq!(out, ReserveOutcome::Reserved { remaining: -50 });
+        reserve(tenant, 1).await;
+        assert!(matches!(
+            reserve(tenant, 150).await,
+            ReserveOutcome::RateLimited { .. }
+        ));
     }
 
     fn replica_test_key() -> SlotKeys {

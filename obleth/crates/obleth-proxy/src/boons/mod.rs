@@ -2391,7 +2391,7 @@ mod tests {
         apply_term_commits(&redis, &commits, 120, 0.5).await;
         apply_term_commits(&redis, &commits, 30, 0.25).await;
         for id in [tenant, key_id] {
-            let (tokens, cost) = redis.term_usage_read(&id, "l:0").await.unwrap();
+            let (tokens, cost) = redis.term_usage_peek(&id, "l:0").await.unwrap();
             assert_eq!(tokens, 150);
             assert!((cost - 0.75).abs() < 1e-9, "cost {cost}");
         }

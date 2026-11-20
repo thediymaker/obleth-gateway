@@ -4439,14 +4439,7 @@ async fn release_term_hold(
     };
     if let Err(e) = state
         .redis
-        .term_reconcile(
-            &scope.to_string(),
-            period,
-            est.total() as i64,
-            est_cost,
-            0,
-            0.0,
-        )
+        .term_reconcile(&scope, period, est.total() as i64, est_cost, 0, 0.0)
         .await
     {
         tracing::warn!(error = %e, "term reservation release failed");
@@ -4904,56 +4897,7 @@ impl StreamAccounting {
             state.output_stats.observe(model, output_tokens as u64);
         }
 
-        // store the full response for identical future requests
-        if let Some((ck, ttl, content_type, body)) = cache_put {
-            let cached = obleth_config::CachedResponse {
-                status: status_code,
-                content_type: content_type.to_string(),
-                body,
-                input_tokens,
-                output_tokens,
-            };
-            if let Err(e) = state.redis.cache_put(ck, &cached, ttl).await {
-                tracing::warn!(error = %e, "cache store failed");
-                state.alerts.issue(
-                    "redis_cache_store_failed",
-                    "Redis response-cache store failed",
-                    format!(
-                        "tenant `{}` model `{model}` cache ttl `{ttl}`: {e}",
-                        resolved.tenant_name
-                    ),
-                );
-            }
-        }
-
-        // Reconcile estimate vs actual against the per-minute budget bucket.
-        // A zero token rate means the tenant has no per-minute limiter.
-        if capacity > 0 {
-            if let Err(e) = state
-                .redis
-                .reconcile_budget(
-                    &resolved.tenant_id,
-                    capacity,
-                    est.total(),
-                    input_tokens.saturating_add(output_tokens),
-                )
-                .await
-            {
-                tracing::warn!(error = %e, "budget reconcile failed");
-                state.alerts.issue(
-                    "redis_budget_reconcile_failed",
-                    "Redis budget reconcile failed",
-                    format!(
-                        "tenant `{}` model `{model}` estimated `{}` actual `{}`: {e}",
-                        resolved.tenant_name,
-                        est.total(),
-                        input_tokens.saturating_add(output_tokens),
-                    ),
-                );
-            }
-        }
-
-        // ---- term-usage commit + budget alerts (Phase 3 + Phase 5) ----
+        // ---- settlement: the request's cost, then its Redis writes ----
         // Frozen request cost: per-token rates (captured at admission) plus any
         // per-request modality surcharge. Computed once and used for both the
         // term-budget commit and the persisted usage ledger so they agree.
@@ -4972,75 +4916,141 @@ impl StreamAccounting {
         );
         let added = input_tokens.saturating_add(output_tokens) as i64;
         let est_tokens = est.total() as i64;
-        if let Some(period) = term_period {
-            let committed = if holds.tenant {
-                state
-                    .redis
-                    .term_reconcile(
-                        &resolved.tenant_id.to_string(),
-                        period,
-                        est_tokens,
-                        holds.est_cost,
-                        added,
-                        cost_usd,
-                    )
-                    .await
-            } else {
-                state
-                    .redis
-                    .term_usage_add(&resolved.tenant_id, period, added, cost_usd)
-                    .await
-            };
-            match committed {
-                Ok((total_tokens, total_cost)) => {
-                    maybe_alert_budget(state, resolved, total_tokens, total_cost);
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "term usage commit failed");
+
+        // The response-cache store, the per-minute bucket and the two term
+        // commits touch different keys and do not depend on each other, so
+        // they go out together instead of as four round trips in a row. Each
+        // reports its own failure.
+        let store_cached = async {
+            // store the full response for identical future requests
+            if let Some((ck, ttl, content_type, body)) = cache_put {
+                let cached = obleth_config::CachedResponse {
+                    status: status_code,
+                    content_type: content_type.to_string(),
+                    body,
+                    input_tokens,
+                    output_tokens,
+                };
+                if let Err(e) = state.redis.cache_put(ck, &cached, ttl).await {
+                    tracing::warn!(error = %e, "cache store failed");
                     state.alerts.issue(
-                        "redis_term_usage_failed",
-                        "Redis term-usage commit failed",
-                        format!("tenant `{}` model `{model}`: {e}", resolved.tenant_name),
-                    );
-                }
-            }
-        }
-        if let Some(period) = key_term_period {
-            let committed = if holds.key {
-                state
-                    .redis
-                    .term_reconcile(
-                        &resolved.key_id.to_string(),
-                        period,
-                        est_tokens,
-                        holds.est_cost,
-                        added,
-                        cost_usd,
-                    )
-                    .await
-            } else {
-                state
-                    .redis
-                    .term_usage_add(&resolved.key_id, period, added, cost_usd)
-                    .await
-            };
-            match committed {
-                Ok((total_tokens, total_cost)) => {
-                    maybe_alert_key_budget(state, resolved, total_tokens, total_cost);
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "key term usage commit failed");
-                    state.alerts.issue(
-                        "redis_key_term_usage_failed",
-                        "Redis key term-usage commit failed",
+                        "redis_cache_store_failed",
+                        "Redis response-cache store failed",
                         format!(
-                            "tenant `{}` key `{}` model `{model}`: {e}",
-                            resolved.tenant_name, resolved.key_id
+                            "tenant `{}` model `{model}` cache ttl `{ttl}`: {e}",
+                            resolved.tenant_name
                         ),
                     );
                 }
             }
-        }
+        };
+        let reconcile_bucket = async {
+            // Reconcile estimate vs actual against the per-minute budget bucket.
+            // A zero token rate means the tenant has no per-minute limiter.
+            if capacity > 0 {
+                if let Err(e) = state
+                    .redis
+                    .reconcile_budget(
+                        &resolved.tenant_id,
+                        capacity,
+                        est.total(),
+                        input_tokens.saturating_add(output_tokens),
+                    )
+                    .await
+                {
+                    tracing::warn!(error = %e, "budget reconcile failed");
+                    state.alerts.issue(
+                        "redis_budget_reconcile_failed",
+                        "Redis budget reconcile failed",
+                        format!(
+                            "tenant `{}` model `{model}` estimated `{}` actual `{}`: {e}",
+                            resolved.tenant_name,
+                            est.total(),
+                            input_tokens.saturating_add(output_tokens),
+                        ),
+                    );
+                }
+            }
+        };
+        let commit_tenant_term = async {
+            if let Some(period) = term_period {
+                let committed = if holds.tenant {
+                    state
+                        .redis
+                        .term_reconcile(
+                            &resolved.tenant_id,
+                            period,
+                            est_tokens,
+                            holds.est_cost,
+                            added,
+                            cost_usd,
+                        )
+                        .await
+                } else {
+                    state
+                        .redis
+                        .term_usage_add(&resolved.tenant_id, period, added, cost_usd)
+                        .await
+                };
+                match committed {
+                    Ok((total_tokens, total_cost)) => {
+                        maybe_alert_budget(state, resolved, total_tokens, total_cost);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "term usage commit failed");
+                        state.alerts.issue(
+                            "redis_term_usage_failed",
+                            "Redis term-usage commit failed",
+                            format!("tenant `{}` model `{model}`: {e}", resolved.tenant_name),
+                        );
+                    }
+                }
+            }
+        };
+        let commit_key_term = async {
+            if let Some(period) = key_term_period {
+                let committed = if holds.key {
+                    state
+                        .redis
+                        .term_reconcile(
+                            &resolved.key_id,
+                            period,
+                            est_tokens,
+                            holds.est_cost,
+                            added,
+                            cost_usd,
+                        )
+                        .await
+                } else {
+                    state
+                        .redis
+                        .term_usage_add(&resolved.key_id, period, added, cost_usd)
+                        .await
+                };
+                match committed {
+                    Ok((total_tokens, total_cost)) => {
+                        maybe_alert_key_budget(state, resolved, total_tokens, total_cost);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "key term usage commit failed");
+                        state.alerts.issue(
+                            "redis_key_term_usage_failed",
+                            "Redis key term-usage commit failed",
+                            format!(
+                                "tenant `{}` key `{}` model `{model}`: {e}",
+                                resolved.tenant_name, resolved.key_id
+                            ),
+                        );
+                    }
+                }
+            }
+        };
+        tokio::join!(
+            store_cached,
+            reconcile_bucket,
+            commit_tenant_term,
+            commit_key_term
+        );
 
         finalize(
             state,
