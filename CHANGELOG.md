@@ -4,7 +4,16 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
-## Unreleased
+## v2.13.0
+
+The review's first wave: usage reads share one bounded filter and agree on what a first token is, update bodies keep what they are not sent, the admin API refuses bad values instead of coercing them, the side endpoints and helper calls share one envelope and one set of limits, and the dashboard reaches every row of its long lists, says when a read failed, and passes the gateway's own errors through. No Postgres migrations; ClickHouse's daily rollup gains a column, applied when the gateway starts.
+
+> **Upgrade notes.**
+>
+> - **The admin API is stricter.** A query parameter a usage read does not take is a `400` (`/usage` no longer accepts `group_by`); a bad `model_type`, `endpoint_selection_mode`, weight of 0, speculation threshold or energy setting is a `400` naming the field instead of being coerced; recipes answer `404` for a missing id, and `PUT /api/v1/recipes/{id}` no longer creates one. Scripts that relied on the old behaviour see `400`/`404` where they saw `200`.
+> - **Update bodies keep omitted fields.** `PUT /api/v1/keys/{id}`, `PUT /api/v1/models/{id}/reliability` and `PUT /api/v1/models/{id}/endpoints/{endpoint_id}` keep any field they are not sent, and `null` clears a cap, a budget or a list. A client that relied on omission resetting a field must send the value it wants.
+> - **Usage windows.** `until_ms` is exclusive on every usage read, and grouped reads (`/usage`, `/usage/keys`, `/usage/models`, `/costs`, `/usage/keys/summary`) return the busiest 1,000 rows unless `limit` asks for up to 10,000.
+> - **One restart of the bundled ClickHouse.** Its config (cache sizes) changes and its image is pinned to `24.8.14.39`; the gateway adds `ttft_requests` to `usage_daily` and recreates the rollup's view once when it starts.
 
 - **The bundled ClickHouse sizes its caches for its container and runs a fixed release.** The image's caches assume a large host (5 GiB of marks, 5 GiB of index marks, 8 GiB uncompressed) while the bundled server runs in 4 GiB; the chart and the Compose config now cap them at 256 MiB, 64 MiB and none. The image is pinned to `clickhouse/clickhouse-server:24.8.14.39`, the release the floating `24.8` tag gives today, so a restart can no longer bring a different server. The values comment records what two gateways measured (about 1 GiB resident, merges under 200 MiB). CI now renders the chart's ClickHouse config and fails if it differs from the Compose file. The new config restarts the ClickHouse pod once; no system log table is renamed.
 - **The dashboard's own API reports the gateway's answer.** Every `/api/live` route repeated its own admin check and catch block, and answered every failure with a 502 and the error's class name in front of its message (`OblethApiError: name taken`), so a refused change looked like the gateway being down. All 60 routes now share one wrapper: a gateway refusal keeps its status and plain message (409 `name taken`), a body that isn't JSON is a 400, 502 means the gateway could not be reached and 504 that it did not answer in time, and an error in the dashboard itself is logged and answered with a plain 500. Numeric query parameters are checked, so a malformed one is ignored instead of sent on as `NaN`. The dashboard's fetch helper now shows the route's message when a read or change fails.
