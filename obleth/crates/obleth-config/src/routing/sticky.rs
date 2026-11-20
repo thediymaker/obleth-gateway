@@ -25,7 +25,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{Candidate, Intent, GENERAL_DOMAIN, GENERAL_TAG};
+use super::{message_text, messages, role, Candidate, Intent, GENERAL_DOMAIN, GENERAL_TAG};
 
 /// How long a conversation's record outlives its last turn.
 pub const STICKY_TTL_SECS: u64 = 2 * 60 * 60;
@@ -120,7 +120,7 @@ impl SessionRecord {
 pub fn session_key(session_id: &str) -> String {
     let mut h = Sha256::new();
     h.update(session_id.as_bytes());
-    format!("s:{}", hex(&h.finalize()))
+    format!("s:{}", hex::encode(h.finalize()))
 }
 
 /// Evidence that the incumbent is not doing a good job.
@@ -382,16 +382,23 @@ pub fn turn_key(user: &str, assistant: &serde_json::Value) -> String {
             _ => h.update(call_signature(call).as_bytes()),
         }
     }
-    hex(&h.finalize())
+    hex::encode(h.finalize())
 }
 
 /// Fingerprint of the request after its last assistant turn. The same key
 /// twice means the client sent the same request again after it was answered.
 pub fn retry_key(json: &serde_json::Value) -> Option<String> {
+    let turn = incumbent_key(json)?;
+    retry_key_from(json, &turn)
+}
+
+/// [`retry_key`] for a caller that already has the last assistant turn's
+/// key ([`incumbent_key`]), so the turn is hashed once per request.
+pub fn retry_key_from(json: &serde_json::Value, turn_key: &str) -> Option<String> {
     let messages = messages(json);
     let i = last_assistant(messages)?;
     let mut h = Sha256::new();
-    h.update(turn_key(&user_before(messages, i), &messages[i]).as_bytes());
+    h.update(turn_key.as_bytes());
     for m in &messages[i + 1..] {
         h.update([0]);
         h.update(role(m).as_bytes());
@@ -401,7 +408,7 @@ pub fn retry_key(json: &serde_json::Value) -> Option<String> {
             h.update(id.as_bytes());
         }
     }
-    Some(hex(&h.finalize()))
+    Some(hex::encode(h.finalize()))
 }
 
 /// True when a completion is broken: no answer and no tool call (an empty
@@ -498,17 +505,6 @@ fn call_signature(call: &serde_json::Value) -> String {
     format!("{name}\0{args}")
 }
 
-fn messages(json: &serde_json::Value) -> &[serde_json::Value] {
-    json.get("messages")
-        .and_then(|m| m.as_array())
-        .map(Vec::as_slice)
-        .unwrap_or(&[])
-}
-
-fn role(m: &serde_json::Value) -> &str {
-    m.get("role").and_then(|r| r.as_str()).unwrap_or("")
-}
-
 fn last_assistant(messages: &[serde_json::Value]) -> Option<usize> {
     messages.iter().rposition(|m| role(m) == "assistant")
 }
@@ -529,10 +525,6 @@ fn tool_calls(message: &serde_json::Value) -> &[serde_json::Value] {
         .and_then(|v| v.as_array())
         .map(Vec::as_slice)
         .unwrap_or(&[])
-}
-
-fn message_text(content: Option<&serde_json::Value>) -> String {
-    super::classifier_message_text(content)
 }
 
 /// Text as it is compared across round trips: reasoning blocks some clients
@@ -578,10 +570,6 @@ fn without_blocks(text: &str, open: &str, close: &str) -> String {
     }
     out.push_str(rest);
     out
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]

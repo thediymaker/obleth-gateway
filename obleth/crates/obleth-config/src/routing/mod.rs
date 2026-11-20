@@ -245,23 +245,10 @@ impl RequestFeatures {
 
         // Same message-part scan shape as `heuristic_intent`, but as a hard
         // capability: any image part makes vision a requirement.
-        let needs_vision =
-            json.get("messages")
-                .and_then(|m| m.as_array())
-                .is_some_and(|messages| {
-                    messages.iter().any(|msg| {
-                        msg.get("content")
-                            .and_then(|c| c.as_array())
-                            .is_some_and(|parts| {
-                                parts.iter().any(|part| {
-                                    matches!(
-                                        part.get("type").and_then(|t| t.as_str()),
-                                        Some("image_url") | Some("input_image")
-                                    )
-                                })
-                            })
-                    })
-                });
+        let needs_vision = json
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .is_some_and(|messages| messages.iter().any(has_image_part));
 
         Self {
             est_input_tokens,
@@ -1030,33 +1017,27 @@ pub fn difficulty_from_header(raw: Option<&str>) -> Option<u8> {
 /// Only emits tags from the fixed vocabulary. Difficulty starts at 1 (a quiet
 /// prompt always routes cheap) and only ever rises from signals found during
 /// the same scan used for tags — no second pass over the message content.
+///
+/// It reads what the classifier reads: the newest user turn with text (back
+/// to [`CLASSIFIER_LOOKBACK_TURNS`] when the newest is empty), at most
+/// [`HEURISTIC_MAX_BYTES`] of it. System prompts, assistant replies and tool
+/// output are not read, so a long system prompt that mentions code or a tool
+/// result with a stack trace does not tag every turn. Images count from any
+/// user turn: a request carrying one needs a model that can see it.
 pub fn heuristic_intent(json: &serde_json::Value, est_input_tokens: u64) -> Intent {
-    let mut text = String::new();
-    let mut has_image = false;
-    if let Some(messages) = json.get("messages").and_then(|m| m.as_array()) {
-        for msg in messages {
-            match msg.get("content") {
-                Some(serde_json::Value::String(s)) => {
-                    text.push_str(s);
-                    text.push('\n');
-                }
-                Some(serde_json::Value::Array(parts)) => {
-                    for part in parts {
-                        match part.get("type").and_then(|t| t.as_str()) {
-                            Some("image_url") => has_image = true,
-                            _ => {
-                                if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
-                                    text.push_str(t);
-                                    text.push('\n');
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
+    let user_turns: Vec<&serde_json::Value> = messages(json)
+        .iter()
+        .filter(|m| role(m) == "user")
+        .collect();
+    let has_image = user_turns.iter().any(|m| has_image_part(m));
+    let text = user_turns
+        .iter()
+        .rev()
+        .take(CLASSIFIER_LOOKBACK_TURNS)
+        .map(|m| message_text(m.get("content")))
+        .find(|t| !t.trim().is_empty())
+        .unwrap_or_default();
+    let text = head_bytes(&text, HEURISTIC_MAX_BYTES);
     let lower = text.to_ascii_lowercase();
 
     let mut tags: Vec<String> = Vec::new();
@@ -1098,7 +1079,7 @@ pub fn heuristic_intent(json: &serde_json::Value, est_input_tokens: u64) -> Inte
             "regex",
         ]
         .iter()
-        .any(|k| lower.contains(k));
+        .any(|k| has_word(&lower, k));
     if code_signal {
         push("coding");
     }
@@ -1151,7 +1132,7 @@ pub fn heuristic_intent(json: &serde_json::Value, est_input_tokens: u64) -> Inte
         "matrix",
     ]
     .iter()
-    .any(|k| lower.contains(k))
+    .any(|k| has_word(&lower, k))
         || (lower.contains('=')
             && lower
                 .chars()
@@ -1196,10 +1177,9 @@ pub fn heuristic_intent(json: &serde_json::Value, est_input_tokens: u64) -> Inte
     {
         bump(2);
     }
-    if est_input_tokens > 32_000 {
-        bump(2);
-    }
-    if text.len() > 8_000 {
+    // A long request is more work: the estimate covers the whole request, as
+    // the classifier's does, not only the turn read here.
+    if est_input_tokens > HEURISTIC_LONG_REQUEST_TOKENS {
         bump(2);
     }
 
@@ -1208,6 +1188,57 @@ pub fn heuristic_intent(json: &serde_json::Value, est_input_tokens: u64) -> Inte
         difficulty,
         source: IntentSource::Heuristic,
     }
+}
+
+/// Most bytes of the newest user turn the heuristic reads.
+pub const HEURISTIC_MAX_BYTES: usize = 8_000;
+/// Estimated request tokens from which the heuristic counts a request as
+/// long enough to bump its difficulty (about 8 KB of text).
+pub const HEURISTIC_LONG_REQUEST_TOKENS: u64 = 2_000;
+
+/// True when `word` occurs in `text` as a whole word (a letter or digit on
+/// neither side), so "java" matches "a java class" and not "javascript", and
+/// "bug" matches "a bug" and not "debug".
+fn has_word(text: &str, word: &str) -> bool {
+    let boundary = |c: Option<char>| c.is_none_or(|c| !c.is_alphanumeric());
+    text.match_indices(word).any(|(at, _)| {
+        boundary(text[..at].chars().next_back()) && boundary(text[at + word.len()..].chars().next())
+    })
+}
+
+/// The request's messages, or none.
+pub(crate) fn messages(json: &serde_json::Value) -> &[serde_json::Value] {
+    json.get("messages")
+        .and_then(|m| m.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+/// A message's role, or "" when it has none.
+pub(crate) fn role(m: &serde_json::Value) -> &str {
+    m.get("role").and_then(|r| r.as_str()).unwrap_or("")
+}
+
+/// A message's text: a string content as is, a part list's text parts joined
+/// by newlines, anything else empty.
+pub(crate) fn message_text(content: Option<&serde_json::Value>) -> String {
+    classifier_message_text(content)
+}
+
+/// True for a content part that carries an image, in either API's spelling.
+pub(crate) fn is_image_part(part: &serde_json::Value) -> bool {
+    matches!(
+        part.get("type").and_then(|t| t.as_str()),
+        Some("image_url") | Some("input_image")
+    )
+}
+
+/// True when a message's content has an image part.
+pub(crate) fn has_image_part(message: &serde_json::Value) -> bool {
+    message
+        .get("content")
+        .and_then(|c| c.as_array())
+        .is_some_and(|parts| parts.iter().any(is_image_part))
 }
 
 /// Request header naming how many bytes at the end of the system text the
@@ -1251,11 +1282,9 @@ const GENERAL_TAG: &str = "general";
 /// mostly its own instructions (tools, display formats) sends it, so those
 /// instructions do not decide the topic; `Some(0)` reads no system text.
 pub fn classifier_prompts(json: &serde_json::Value, system_tail: Option<usize>) -> Vec<String> {
-    let Some(messages) = json.get("messages").and_then(|m| m.as_array()) else {
+    let messages = messages(json);
+    if messages.is_empty() {
         return Vec::new();
-    };
-    fn role(msg: &serde_json::Value) -> &str {
-        msg.get("role").and_then(|r| r.as_str()).unwrap_or("")
     }
 
     let mut system: Vec<String> = Vec::new();
@@ -1913,6 +1942,68 @@ mod tests {
         let tags = heuristic_intent(&body, 10).tags;
         assert!(tags.contains(&"coding".to_string()));
         assert!(tags.contains(&"vision".to_string()));
+    }
+
+    /// The heuristic reads what the classifier reads: the newest user turn.
+    /// A system prompt or a tool result that mentions code does not make a
+    /// plain question a coding request; a user turn asking for code still does.
+    #[test]
+    fn heuristic_intent_reads_only_the_newest_user_turn() {
+        let body = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": "You are a coding assistant. Fix every bug; python, rust and sql are fair game. ```never mind```"},
+                {"role": "user", "content": "Find the bug in this python function: ```def f(): pass```"},
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "run", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "thread 'main' panicked at src/x.rs:12\nstack backtrace:\n 0: foo"},
+                {"role": "user", "content": "What is the capital of France?"}
+            ]
+        });
+        let intent = heuristic_intent(&body, 10);
+        assert!(intent.tags.is_empty(), "{:?}", intent.tags);
+        assert_eq!(intent.difficulty, 1);
+        // The newest turn asks for code.
+        let body = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": "Be brief."},
+                {"role": "user", "content": "What is the capital of France?"},
+                {"role": "assistant", "content": "Paris."},
+                {"role": "user", "content": "Now write a python function that reverses a string."}
+            ]
+        });
+        assert!(heuristic_intent(&body, 10)
+            .tags
+            .contains(&"coding".to_string()));
+        // An empty newest turn falls back to the one before it.
+        let body = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "Write a regex that validates an email address."},
+                {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "http://x/y.png"}}]}
+            ]
+        });
+        let tags = heuristic_intent(&body, 10).tags;
+        assert!(
+            tags.contains(&"coding".to_string()) && tags.contains(&"vision".to_string()),
+            "{tags:?}"
+        );
+    }
+
+    #[test]
+    fn heuristic_keywords_match_whole_words() {
+        for (prompt, coding) in [
+            ("I need to debug my feelings about javascripting", false),
+            ("A java class that reads a file", true),
+            ("How do I compile this?", true),
+            ("Explain the rustic charm of this village", false),
+        ] {
+            let body = serde_json::json!({ "messages": [{"role": "user", "content": prompt}] });
+            assert_eq!(
+                heuristic_intent(&body, 10)
+                    .tags
+                    .contains(&"coding".to_string()),
+                coding,
+                "{prompt}"
+            );
+        }
     }
 
     #[test]
