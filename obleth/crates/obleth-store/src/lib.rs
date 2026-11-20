@@ -56,72 +56,68 @@ pub enum StoreError {
 
 type Result<T> = std::result::Result<T, StoreError>;
 
-/// Embedded idempotent schema, applied on boot. A versioned copy also lives in
-/// `schema/postgres/` for operators who manage migrations out of band.
-const SCHEMA: &str = include_str!("../../../../schema/postgres/0001_init.sql");
-const SCHEMA_V2: &str = include_str!("../../../../schema/postgres/0002_tracing_flag.sql");
-const SCHEMA_V3: &str = include_str!("../../../../schema/postgres/0003_guardrails_policy.sql");
-const SCHEMA_V4: &str = include_str!("../../../../schema/postgres/0004_saved_recipes.sql");
-const SCHEMA_V5: &str = include_str!("../../../../schema/postgres/0005_managed_launcher_spec.sql");
-const SCHEMA_V6: &str = include_str!("../../../../schema/postgres/0006_recipes.sql");
-const SCHEMA_V7: &str =
-    include_str!("../../../../schema/postgres/0007_replica_port_and_min_replicas.sql");
-const SCHEMA_V8: &str =
-    include_str!("../../../../schema/postgres/0008_managed_provision_error.sql");
-const SCHEMA_V9: &str =
-    include_str!("../../../../schema/postgres/0009_replica_cancel_requested.sql");
-const SCHEMA_V10: &str =
-    include_str!("../../../../schema/postgres/0010_drop_replica_model_cascade.sql");
-const SCHEMA_V11: &str =
-    include_str!("../../../../schema/postgres/0011_endpoint_selection_session_hash.sql");
-const SCHEMA_V12: &str =
-    include_str!("../../../../schema/postgres/0012_model_debug_diagnostics.sql");
-const SCHEMA_V13: &str = include_str!("../../../../schema/postgres/0013_compression_policy.sql");
-const SCHEMA_V14: &str = include_str!("../../../../schema/postgres/0014_model_energy_slots.sql");
-const SCHEMA_V15: &str = include_str!("../../../../schema/postgres/0015_tenant_synthetic.sql");
-const SCHEMA_V16: &str = include_str!("../../../../schema/postgres/0016_api_keys_identity.sql");
-const SCHEMA_V17: &str = include_str!("../../../../schema/postgres/0017_model_route_bias.sql");
-const SCHEMA_V18: &str = include_str!("../../../../schema/postgres/0018_knowledge_base.sql");
-const SCHEMA_V19: &str = include_str!("../../../../schema/postgres/0019_model_auto_eligible.sql");
-const SCHEMA_V20: &str =
-    include_str!("../../../../schema/postgres/0020_knowledge_chunk_unique.sql");
-const SCHEMA_V23: &str =
-    include_str!("../../../../schema/postgres/0023_model_speculation_fields.sql");
-const SCHEMA_V22: &str = include_str!("../../../../schema/postgres/0022_model_verifier_for.sql");
-const SCHEMA_V21: &str =
-    include_str!("../../../../schema/postgres/0021_knowledge_reindex_requested.sql");
-const SCHEMA_V24: &str =
-    include_str!("../../../../schema/postgres/0024_model_aliases_and_quantization.sql");
-const SCHEMA_V25: &str = include_str!("../../../../schema/postgres/0025_api_key_fairshare.sql");
-const SCHEMA_V26: &str =
-    include_str!("../../../../schema/postgres/0026_model_upstream_headers.sql");
-const SCHEMA_V27: &str = include_str!("../../../../schema/postgres/0027_model_cost_per_video.sql");
-const SCHEMA_V28: &str = include_str!("../../../../schema/postgres/0028_video_jobs.sql");
-const SCHEMA_V29: &str =
-    include_str!("../../../../schema/postgres/0029_model_capacity_discovery.sql");
-const SCHEMA_V30: &str = include_str!("../../../../schema/postgres/0030_video_jobs_key_index.sql");
-const SCHEMA_V31: &str = include_str!("../../../../schema/postgres/0031_deployment_launches.sql");
-const SCHEMA_V32: &str =
-    include_str!("../../../../schema/postgres/0032_api_key_end_user_fairshare.sql");
-const SCHEMA_V33: &str = include_str!("../../../../schema/postgres/0033_model_variants.sql");
-const SCHEMA_V34: &str = include_str!("../../../../schema/postgres/0034_model_lifecycle.sql");
-const SCHEMA_V35: &str = include_str!("../../../../schema/postgres/0035_reasoning_effort.sql");
-const SCHEMA_V36: &str =
-    include_str!("../../../../schema/postgres/0036_model_rejected_request_fields.sql");
-const SCHEMA_V37: &str = include_str!("../../../../schema/postgres/0037_job_kind.sql");
-const SCHEMA_V38: &str =
-    include_str!("../../../../schema/postgres/0038_model_session_affinity.sql");
-const SCHEMA_V39: &str = include_str!("../../../../schema/postgres/0039_batches.sql");
-const SCHEMA_V40: &str = include_str!("../../../../schema/postgres/0040_mcp_server_tenants.sql");
-const SCHEMA_V41: &str = include_str!("../../../../schema/postgres/0041_slurm_connector.sql");
-const SCHEMA_V42: &str = include_str!("../../../../schema/postgres/0042_api_key_background.sql");
-const SCHEMA_V43: &str =
-    include_str!("../../../../schema/postgres/0043_api_key_allowed_networks.sql");
-const SCHEMA_V44: &str = include_str!("../../../../schema/postgres/0044_key_prefix_keeps_obl.sql");
-const SCHEMA_V45: &str =
-    include_str!("../../../../schema/postgres/0045_api_key_allowed_countries.sql");
-const SCHEMA_V46: &str = include_str!("../../../../schema/postgres/0046_batch_object_storage.sql");
-const SCHEMA_V47: &str = include_str!("../../../../schema/postgres/0047_batch_item_indexes.sql");
+/// One schema file from `schema/postgres/`: its version (the file name
+/// without `.sql`) and its SQL, embedded at build time.
+macro_rules! migration {
+    ($name:literal) => {
+        (
+            $name,
+            include_str!(concat!("../../../../schema/postgres/", $name, ".sql")),
+        )
+    };
+}
+
+/// The schema, in order. `migrate` runs each file a database has not
+/// recorded in `schema_migrations`; see `schema/postgres/README.md`.
+const MIGRATIONS: &[(&str, &str)] = &[
+    migration!("0001_init"),
+    migration!("0002_tracing_flag"),
+    migration!("0003_guardrails_policy"),
+    migration!("0005_managed_launcher_spec"),
+    migration!("0006_recipes"),
+    migration!("0007_replica_port_and_min_replicas"),
+    migration!("0008_managed_provision_error"),
+    migration!("0009_replica_cancel_requested"),
+    migration!("0010_drop_replica_model_cascade"),
+    migration!("0011_endpoint_selection_session_hash"),
+    migration!("0012_model_debug_diagnostics"),
+    migration!("0013_compression_policy"),
+    migration!("0014_model_energy_slots"),
+    migration!("0015_tenant_synthetic"),
+    migration!("0016_api_keys_identity"),
+    migration!("0017_model_route_bias"),
+    migration!("0018_knowledge_base"),
+    migration!("0019_model_auto_eligible"),
+    migration!("0020_knowledge_chunk_unique"),
+    migration!("0021_knowledge_reindex_requested"),
+    migration!("0022_model_verifier_for"),
+    migration!("0023_model_speculation_fields"),
+    migration!("0024_model_aliases_and_quantization"),
+    migration!("0025_api_key_fairshare"),
+    migration!("0026_model_upstream_headers"),
+    migration!("0027_model_cost_per_video"),
+    migration!("0028_video_jobs"),
+    migration!("0029_model_capacity_discovery"),
+    migration!("0030_video_jobs_key_index"),
+    migration!("0031_deployment_launches"),
+    migration!("0032_api_key_end_user_fairshare"),
+    migration!("0033_model_variants"),
+    migration!("0034_model_lifecycle"),
+    migration!("0035_reasoning_effort"),
+    migration!("0036_model_rejected_request_fields"),
+    migration!("0037_job_kind"),
+    migration!("0038_model_session_affinity"),
+    migration!("0039_batches"),
+    migration!("0040_mcp_server_tenants"),
+    migration!("0041_slurm_connector"),
+    migration!("0042_api_key_background"),
+    migration!("0043_api_key_allowed_networks"),
+    migration!("0044_key_prefix_keeps_obl"),
+    migration!("0045_api_key_allowed_countries"),
+    migration!("0046_batch_object_storage"),
+    migration!("0047_batch_item_indexes"),
+    migration!("0048_schema_tidy"),
+];
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -277,70 +273,41 @@ impl Store {
     /// thus races across replicas / parallel test binaries), we serialize the
     /// whole schema apply behind a session-level advisory lock taken on a single
     /// dedicated connection.
+    /// Bring the schema up to date: under an advisory lock (so one replica
+    /// applies while the others wait), run every file in [`MIGRATIONS`] that
+    /// `schema_migrations` does not record, in order, recording each as it
+    /// succeeds. A database with no record yet (new, or made by a gateway
+    /// that re-ran every file on each boot) runs every file once, all of
+    /// which are re-runnable, and then records the full set.
     pub async fn migrate(&self) -> Result<()> {
         let mut conn = self.pool.acquire().await?;
         sqlx::query("select pg_advisory_lock($1)")
             .bind(MIGRATE_LOCK_KEY)
             .execute(&mut *conn)
             .await?;
-        let result: Result<()> = async {
-            sqlx::raw_sql(SCHEMA).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V2).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V3).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V4).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V5).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V6).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V7).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V8).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V9).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V10).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V11).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V12).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V13).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V14).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V15).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V16).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V17).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V18).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V19).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V20).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V21).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V22).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V23).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V24).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V25).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V26).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V27).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V28).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V29).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V30).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V31).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V32).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V33).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V34).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V35).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V36).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V37).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V38).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V39).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V40).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V41).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V42).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V43).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V44).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V45).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V46).execute(&mut *conn).await?;
-            sqlx::raw_sql(SCHEMA_V47).execute(&mut *conn).await?;
-            Ok(())
-        }
-        .await;
+        let result = apply_migrations(&mut conn, MIGRATIONS).await;
         // Always release the lock, even if the schema apply failed.
         let _ = sqlx::query("select pg_advisory_unlock($1)")
             .bind(MIGRATE_LOCK_KEY)
             .execute(&mut *conn)
             .await;
-        result?;
+        let applied = result?;
+        if !applied.is_empty() {
+            tracing::info!(files = applied.len(), first = %applied[0], last = %applied[applied.len() - 1], "schema migrations applied");
+        }
         Ok(())
+    }
+
+    /// The schema files this database has not recorded, without applying
+    /// anything (`OBLETH_SCHEMA_VERIFY_ONLY`). Every file, when the database
+    /// has no record at all.
+    pub async fn pending_migrations(&self) -> Result<Vec<&'static str>> {
+        let applied = recorded_migrations(&mut *self.pool.acquire().await?).await?;
+        Ok(MIGRATIONS
+            .iter()
+            .map(|(version, _)| *version)
+            .filter(|v| !applied.contains(*v))
+            .collect())
     }
 
     // ---- fairshare groups -----------------------------------------------
@@ -4135,6 +4102,74 @@ pub struct ModelHealthRecordOutcome {
 /// and `returning` list splices this in, so a write can never hand back a row
 /// the mapper only half-fills (tracing_enabled and synthetic used to go
 /// missing from every write and read as false).
+const SCHEMA_MIGRATIONS_TABLE: &str = "create table if not exists schema_migrations (
+    version    text primary key,
+    applied_at timestamptz not null default now()
+)";
+
+/// The versions `schema_migrations` records; empty when the table does not
+/// exist yet.
+async fn recorded_migrations(
+    conn: &mut sqlx::PgConnection,
+) -> Result<std::collections::HashSet<String>> {
+    let rows: Vec<String> = sqlx::query_scalar("select version from schema_migrations")
+        .fetch_all(&mut *conn)
+        .await
+        .or_else(|e| match &e {
+            // undefined_table: a database no versioned gateway has migrated.
+            sqlx::Error::Database(db) if db.code().as_deref() == Some("42P01") => Ok(Vec::new()),
+            _ => Err(e),
+        })?;
+    Ok(rows.into_iter().collect())
+}
+
+/// Apply `files` to the database `conn` is on (the caller holds the
+/// migration lock) and return the versions run. See [`Store::migrate`].
+async fn apply_migrations(
+    conn: &mut sqlx::PgConnection,
+    files: &[(&'static str, &'static str)],
+) -> Result<Vec<&'static str>> {
+    sqlx::raw_sql(SCHEMA_MIGRATIONS_TABLE)
+        .execute(&mut *conn)
+        .await?;
+    let recorded = recorded_migrations(&mut *conn).await?;
+    let mut applied = Vec::new();
+    if recorded.is_empty() {
+        // Baseline: every file once, then the whole set recorded together,
+        // so a failure part-way leaves no record and the next boot runs them
+        // all again, as before versioning.
+        for (version, sql) in files {
+            sqlx::raw_sql(sql).execute(&mut *conn).await?;
+            applied.push(*version);
+        }
+        let versions: Vec<&str> = files.iter().map(|(v, _)| *v).collect();
+        sqlx::query(
+            "insert into schema_migrations (version) select unnest($1::text[])
+             on conflict do nothing",
+        )
+        .bind(&versions)
+        .execute(&mut *conn)
+        .await?;
+        return Ok(applied);
+    }
+    for (version, sql) in files {
+        if recorded.contains(*version) {
+            continue;
+        }
+        // The file and its record commit together, so a file that fails is
+        // neither half-applied nor recorded.
+        let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+        sqlx::raw_sql(sql).execute(&mut *tx).await?;
+        sqlx::query("insert into schema_migrations (version) values ($1)")
+            .bind(version)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        applied.push(*version);
+    }
+    Ok(applied)
+}
+
 pub(crate) const TENANT_COLUMNS: &str = "id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, tracing_enabled, synthetic, created_at, updated_at";
 
 fn tenant_from_row(row: &PgRow) -> Result<Tenant> {
@@ -5952,12 +5987,8 @@ mod tests {
         assert_eq!(m.per_replica_max_in_flight, Some(4));
         assert_eq!(m.capacity_headroom, 1.0);
 
-        // The columns' CHECK constraints hold whatever the caller sends.
-        let bad = sqlx::query("update models set capacity_mode = 'automatic' where id = $1")
-            .bind(model.id)
-            .execute(&store.pool)
-            .await;
-        assert!(bad.is_err(), "capacity_mode is a closed vocabulary");
+        // The range CHECKs hold whatever the caller sends (the vocabularies
+        // are checked in obleth-config; see schema/postgres/README.md).
         let bad = sqlx::query("update models set capacity_headroom = 0 where id = $1")
             .bind(model.id)
             .execute(&store.pool)
@@ -6074,6 +6105,152 @@ mod tests {
             ..base
         };
         assert_eq!(store.list_audit_filtered(&byid).await.unwrap().len(), 3);
+    }
+
+    /// Tables, columns, indexes and constraints of `public`, one line each,
+    /// sorted: two databases with the same text have the same schema.
+    async fn schema_fingerprint(pool: &PgPool) -> String {
+        sqlx::query_scalar(
+            "select string_agg(x, E'\\n' order by x) from (
+               select 'col ' || table_name || '.' || column_name || ' ' || data_type || ' '
+                      || coalesce(column_default, '') || ' ' || is_nullable
+                 from information_schema.columns where table_schema = 'public'
+               union all
+               select 'idx ' || indexdef from pg_indexes where schemaname = 'public'
+               union all
+               select 'con ' || conrelid::regclass || ' ' || conname || ' ' || pg_get_constraintdef(oid)
+                 from pg_constraint where connamespace = 'public'::regnamespace
+             ) s(x)",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("fingerprint")
+    }
+
+    /// Versioned migrations on a database of their own: a first run applies
+    /// and records every file; a second runs none; a database with the
+    /// schema but no record (an older gateway's) is brought to the same
+    /// state by a baseline run; a new file runs exactly once; a failing file
+    /// leaves nothing behind and is not recorded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn migrations_run_once_and_a_baseline_matches_a_fresh_database() {
+        let Some(url) = crate::test_support::test_db_url() else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let name = format!("obleth_test_mig_{}", Uuid::new_v4().simple());
+        let admin = PgPool::connect(&url).await.expect("connect");
+        sqlx::query(&format!("create database {name}"))
+            .execute(&admin)
+            .await
+            .expect("create database");
+        let (base, query) = match url.split_once('?') {
+            Some((b, q)) => (b, format!("?{q}")),
+            None => (url.as_str(), String::new()),
+        };
+        let own_url = format!("{}/{name}{query}", base.rsplit_once('/').unwrap().0);
+
+        let _drop = DropDatabase {
+            admin: admin.clone(),
+            name: name.clone(),
+        };
+        {
+            let store = Store::connect(&own_url).await.expect("connect own db");
+            store.migrate().await.expect("first migrate");
+            assert!(store.pending_migrations().await.unwrap().is_empty());
+            let recorded: i64 = sqlx::query_scalar("select count(*) from schema_migrations")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+            assert_eq!(recorded as usize, MIGRATIONS.len());
+            let fresh = schema_fingerprint(&store.pool).await;
+            assert!(
+                !fresh.contains("verifier_for"),
+                "0048 drops the dead column"
+            );
+            assert!(!fresh.contains("models_capacity_mode_check"));
+            assert!(!fresh.contains("model_replicas_model_idx"));
+            assert!(
+                fresh.contains("health_check_interval_secs >= 60"),
+                "range checks stay"
+            );
+
+            let mut conn = store.pool.acquire().await.unwrap();
+            let again = apply_migrations(&mut conn, MIGRATIONS).await.unwrap();
+            assert!(again.is_empty(), "a second run applies nothing: {again:?}");
+
+            // What a gateway from before versioning leaves: the schema, no record.
+            sqlx::query("drop table schema_migrations")
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+            assert_eq!(
+                store.pending_migrations().await.unwrap().len(),
+                MIGRATIONS.len()
+            );
+            let baseline = apply_migrations(&mut conn, MIGRATIONS).await.unwrap();
+            assert_eq!(baseline.len(), MIGRATIONS.len());
+            assert_eq!(schema_fingerprint(&store.pool).await, fresh);
+
+            let mut with_new = MIGRATIONS.to_vec();
+            with_new.push((
+                "9999_probe",
+                "create table if not exists migration_probe (n int);
+                 insert into migration_probe values (1);",
+            ));
+            let first = apply_migrations(&mut conn, &with_new).await.unwrap();
+            let second = apply_migrations(&mut conn, &with_new).await.unwrap();
+            assert_eq!(first, vec!["9999_probe"]);
+            assert!(second.is_empty());
+            let rows: i64 = sqlx::query_scalar("select count(*) from migration_probe")
+                .fetch_one(&mut *conn)
+                .await
+                .unwrap();
+            assert_eq!(rows, 1, "the new file ran once");
+
+            let mut with_bad = with_new.clone();
+            with_bad.push((
+                "9999_zz_bad",
+                "create table bad_probe (n int); select 1 / 0;",
+            ));
+            assert!(apply_migrations(&mut conn, &with_bad).await.is_err());
+            let leftover: Option<String> =
+                sqlx::query_scalar("select to_regclass('bad_probe')::text")
+                    .fetch_one(&mut *conn)
+                    .await
+                    .unwrap();
+            assert_eq!(leftover, None, "a failed file is rolled back");
+            assert_eq!(
+                apply_migrations(&mut conn, &with_new).await.unwrap(),
+                Vec::<&str>::new()
+            );
+            let bad_recorded: i64 = sqlx::query_scalar(
+                "select count(*) from schema_migrations where version = '9999_zz_bad'",
+            )
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+            assert_eq!(bad_recorded, 0);
+            drop(conn);
+            store.pool.close().await;
+        }
+    }
+
+    /// Drops a test's own database when the test ends, passed or not.
+    struct DropDatabase {
+        admin: PgPool,
+        name: String,
+    }
+
+    impl Drop for DropDatabase {
+        fn drop(&mut self) {
+            let sql = format!("drop database if exists {} with (force)", self.name);
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    let _ = sqlx::query(&sql).execute(&self.admin).await;
+                })
+            });
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -6207,16 +6384,25 @@ mod tests {
             .await
             .expect("create obl key");
         assert!(obl.starts_with("obl_"), "{obl}");
+        // Upgrading: 0044 runs once on an instance that has not recorded it.
         sqlx::query("delete from app_settings where key = 'key_prefix'")
             .execute(&store.pool)
             .await
             .expect("clear setting");
+        sqlx::query("delete from schema_migrations where version = '0044_key_prefix_keeps_obl'")
+            .execute(&store.pool)
+            .await
+            .expect("forget 0044");
         store.migrate().await.expect("migrate again");
         assert_eq!(
             store.get_key_prefix_setting().await.unwrap().as_deref(),
             Some("obl")
         );
         store.put_key_prefix_setting("rc").await.expect("save rc");
+        sqlx::query("delete from schema_migrations where version = '0044_key_prefix_keeps_obl'")
+            .execute(&store.pool)
+            .await
+            .expect("forget 0044 again");
         store.migrate().await.expect("migrate again");
         assert_eq!(store.key_prefix().await.unwrap(), "rc");
 

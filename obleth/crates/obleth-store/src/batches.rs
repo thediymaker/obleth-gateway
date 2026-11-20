@@ -592,21 +592,20 @@ impl Store {
         rows.iter().map(row_to_batch).collect()
     }
 
-    /// How many batches a key has that are still working.
-    pub async fn active_batch_count(&self, key_id: Uuid) -> Result<i64> {
+    /// How many batches a key has that are still working. The tenant is
+    /// passed so the count reads `batches_owner_idx` (tenant, key, ...).
+    pub async fn active_batch_count(&self, tenant_id: Uuid, key_id: Uuid) -> Result<i64> {
         let row = sqlx::query(&format!(
-            "select count(*) as n from batches where key_id = $1 and status in {ACTIVE}"
+            "select count(*) as n from batches
+             where tenant_id = $1 and key_id = $2 and status in {ACTIVE}"
         ))
+        .bind(tenant_id)
         .bind(key_id)
         .fetch_one(&self.pool)
         .await?;
         Ok(row.try_get("n")?)
     }
 
-    /// Cancel a batch within `owner`: an active batch moves to `cancelling`
-    /// and its pending items to `cancelled`; requests already running finish
-    /// and the runner then moves the batch to `cancelled`. A batch in a final
-    /// status is returned unchanged. `None` when there is no such batch.
     /// A batch by id, whoever owns it (the admin API).
     pub async fn get_batch_any(&self, id: &str) -> Result<Option<BatchRecord>> {
         let row = sqlx::query(&format!(
@@ -708,6 +707,10 @@ impl Store {
             .collect()
     }
 
+    /// Cancel a batch within `owner`: an active batch moves to `cancelling`
+    /// and its pending items to `cancelled`; requests already running finish
+    /// and the runner then moves the batch to `cancelled`. A batch in a final
+    /// status is returned unchanged. `None` when there is no such batch.
     pub async fn cancel_batch(&self, id: &str, owner: JobOwner) -> Result<Option<BatchRecord>> {
         let mut tx = self.pool.begin().await?;
         let sql = format!(
@@ -1538,7 +1541,7 @@ mod tests {
         assert_eq!((batch.status.as_str(), batch.total), ("in_progress", 5));
         assert_eq!(
             store
-                .active_batch_count(owner.key_id.unwrap())
+                .active_batch_count(owner.tenant_id, owner.key_id.unwrap())
                 .await
                 .unwrap(),
             1
@@ -1641,7 +1644,7 @@ mod tests {
         assert_eq!(errs[0].response_status, Some(400));
         assert_eq!(
             store
-                .active_batch_count(owner.key_id.unwrap())
+                .active_batch_count(owner.tenant_id, owner.key_id.unwrap())
                 .await
                 .unwrap(),
             0

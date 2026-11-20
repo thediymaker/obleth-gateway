@@ -101,6 +101,11 @@ pub struct Config {
     /// a model that turns affinity on uses for anything it does not set.
     pub fairshare_session_affinity_settings: SessionAffinityConfig,
 
+    /// `OBLETH_SCHEMA_VERIFY_ONLY`: check that Postgres has every schema
+    /// file applied and refuse to start if not, without changing anything.
+    /// For a gateway whose database role cannot alter the schema, or one
+    /// started while migrations are applied out of band.
+    pub schema_verify_only: bool,
     /// Fail-open: keep serving from cache + buffer telemetry to WAL when
     /// Redis/ClickHouse are unavailable. Fail-closed rejects instead.
     pub fail_open: bool,
@@ -533,6 +538,7 @@ impl Config {
             capacity_discovery: CapacityDiscoveryConfig::from_env(),
             fairshare_session_affinity: SessionAffinityConfig::from_env(),
             fairshare_session_affinity_settings: SessionAffinityConfig::settings_from_env(),
+            schema_verify_only: require_bool("OBLETH_SCHEMA_VERIFY_ONLY", false),
             fail_open: require_bool("OBLETH_FAIL_OPEN", true),
             wal_path: env_or("OBLETH_WAL_PATH", "./obleth-telemetry.wal"),
             telemetry_flush_interval: telemetry_flush_interval(

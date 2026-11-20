@@ -65,6 +65,10 @@ obleth:
     maxBypassSecs: 30
     maxHeldPercent: 25
   failOpen: true
+  # true: apply no Postgres schema files at start, and refuse to start while
+  # the database is missing any (for a role without DDL, or migrations run out
+  # of band). Default: apply the files schema_migrations does not record.
+  schemaVerifyOnly: false
   # REQUIRED. No default is shipped — supply via `--set obleth.adminToken=...`,
   # a values override, or (preferred) an external Secret. `openssl rand -hex 32`.
   adminToken: ""

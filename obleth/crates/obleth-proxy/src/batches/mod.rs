@@ -1452,7 +1452,7 @@ async fn create(
     };
     let active = batches
         .store
-        .active_batch_count(resolved.key_id)
+        .active_batch_count(resolved.tenant_id, resolved.key_id)
         .await
         .map_err(store_error)?;
     if active >= cfg.max_active_per_key {

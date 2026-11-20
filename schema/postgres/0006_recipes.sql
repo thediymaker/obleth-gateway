@@ -14,7 +14,3 @@ create table if not exists recipes (
 );
 
 create index if not exists recipes_updated_idx on recipes (updated_at desc);
-
--- Supersedes the orphaned launcher-preset store (its only consumer, the launch
--- wizard, was removed).
-drop table if exists saved_recipes;

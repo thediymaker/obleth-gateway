@@ -71,7 +71,18 @@ async fn main() -> anyhow::Result<()> {
         Store::connect_with(&cfg.database_url, cfg.pg_pool)
     })
     .await?;
-    store.migrate().await?;
+    if cfg.schema_verify_only {
+        let pending = store.pending_migrations().await?;
+        if !pending.is_empty() {
+            anyhow::bail!(
+                "OBLETH_SCHEMA_VERIFY_ONLY is set and Postgres is missing {} schema file(s): {}",
+                pending.len(),
+                pending.join(", ")
+            );
+        }
+    } else {
+        store.migrate().await?;
+    }
     // Provision the reserved control-plane identity (Charo) — idempotent.
     store.ensure_control_plane_identity().await?;
     tracing::info!("postgres connected + schema applied");
