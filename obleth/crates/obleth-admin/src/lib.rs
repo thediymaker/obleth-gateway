@@ -8194,101 +8194,61 @@ async fn create_model(
         &[],
     )?;
     let model_type = validate_model_type(body.model_type.as_deref().unwrap_or("chat"))?;
+    let lifecycle = obleth_config::ModelLifecycle {
+        status: initial_status,
+        changed_at: (initial_status == obleth_config::ModelStatus::Staged).then(chrono::Utc::now),
+        ..Default::default()
+    };
+    // One insert: switched off, staged, restricted and scheduled for health
+    // checks as asked before the first publish below, so the data plane
+    // never sees the route any other way.
     let model = state
         .store
-        .create_model(
-            &body.model_name,
-            body.description.as_deref().unwrap_or_default(),
-            &body.upstream_model,
-            &body.api_base,
-            body.api_key.as_deref(),
-            &model_type,
-            body.input_cost_per_token.unwrap_or(0.0),
-            body.output_cost_per_token.unwrap_or(0.0),
-            body.cost_per_image.unwrap_or(0.0),
-            body.cost_per_audio_second.unwrap_or(0.0),
-            body.cost_per_character.unwrap_or(0.0),
-            body.context_window.unwrap_or(8192),
-            body.admission_weight.unwrap_or(100),
-            body.max_in_flight,
-            body.supports_function_calling.unwrap_or(false),
-            body.supports_system_messages.unwrap_or(true),
-            body.supports_response_schema.unwrap_or(false),
-            body.supports_tool_choice.unwrap_or(false),
-            body.supports_vision.unwrap_or(false),
-            &body.tags.clone().unwrap_or_default(),
-            &body.boons.clone().unwrap_or_default(),
-            &body.tool_servers.clone().unwrap_or_default(),
-            body.energy_slots_per_node.unwrap_or(0),
-            body.route_bias.unwrap_or(1.0),
-            body.auto_eligible.unwrap_or(true),
-            body.draft_model.as_deref().unwrap_or(""),
-            body.verify_api_base.as_deref().unwrap_or(""),
-            body.verify_upstream_model.as_deref().unwrap_or(""),
-            &aliases,
-            &quantization,
-            &upstream_headers,
-            body.cost_per_video.unwrap_or(0.0),
-            &capacity_mode,
-            &discovery,
-            &variants,
-        )
+        .create_model(&obleth_store::NewModel {
+            model_name: body.model_name.clone(),
+            fields: obleth_store::ModelFields {
+                description: body.description.clone().unwrap_or_default(),
+                upstream_model: body.upstream_model.clone(),
+                api_base: body.api_base.clone(),
+                api_key: body.api_key.clone(),
+                model_type,
+                input_cost_per_token: body.input_cost_per_token.unwrap_or(0.0),
+                output_cost_per_token: body.output_cost_per_token.unwrap_or(0.0),
+                cost_per_image: body.cost_per_image.unwrap_or(0.0),
+                cost_per_audio_second: body.cost_per_audio_second.unwrap_or(0.0),
+                cost_per_character: body.cost_per_character.unwrap_or(0.0),
+                cost_per_video: body.cost_per_video.unwrap_or(0.0),
+                context_window: body.context_window.unwrap_or(8192),
+                admission_weight: body.admission_weight.unwrap_or(100),
+                max_in_flight: body.max_in_flight,
+                supports_function_calling: body.supports_function_calling.unwrap_or(false),
+                supports_system_messages: body.supports_system_messages.unwrap_or(true),
+                supports_response_schema: body.supports_response_schema.unwrap_or(false),
+                supports_tool_choice: body.supports_tool_choice.unwrap_or(false),
+                supports_vision: body.supports_vision.unwrap_or(false),
+                tags: body.tags.clone().unwrap_or_default(),
+                boons: body.boons.clone().unwrap_or_default(),
+                tool_servers: body.tool_servers.clone().unwrap_or_default(),
+                energy_slots_per_node: body.energy_slots_per_node.unwrap_or(0),
+                route_bias: body.route_bias.unwrap_or(1.0),
+                auto_eligible: body.auto_eligible.unwrap_or(true),
+                draft_model: body.draft_model.clone().unwrap_or_default(),
+                verify_api_base: body.verify_api_base.clone().unwrap_or_default(),
+                verify_upstream_model: body.verify_upstream_model.clone().unwrap_or_default(),
+                aliases,
+                quantization,
+                upstream_headers,
+                capacity_mode,
+                discovery,
+                variants,
+            },
+            enabled: body.enabled != Some(false),
+            lifecycle,
+            rejected_request_fields,
+            session_affinity,
+            health_check_interval_secs: state.health.default_interval_secs,
+        })
         .await?;
-    // Switched off before the first publish below, so the data plane never
-    // sees the route on.
-    let model = if body.enabled == Some(false) {
-        state.store.set_model_enabled(model.id, false).await?
-    } else {
-        model
-    };
-    // Set the same way, before the first publish.
-    let model = if rejected_request_fields.is_empty() {
-        model
-    } else {
-        state
-            .store
-            .set_model_rejected_request_fields(model.id, &rejected_request_fields)
-            .await?
-    };
-    // Set the same way, before the first publish.
-    let model = if session_affinity.is_default() {
-        model
-    } else {
-        state
-            .store
-            .set_model_session_affinity(model.id, &session_affinity)
-            .await?
-    };
-    // Staged the same way, before the first publish.
-    let model = if initial_status == obleth_config::ModelStatus::Staged {
-        let lifecycle = obleth_config::ModelLifecycle {
-            status: initial_status,
-            changed_at: Some(chrono::Utc::now()),
-            ..Default::default()
-        };
-        state
-            .store
-            .set_model_lifecycle(model.id, &lifecycle)
-            .await?
-    } else {
-        model
-    };
-    if state.health.default_interval_secs != 900 {
-        let _ = state
-            .store
-            .update_model_health_config(
-                model.id,
-                obleth_store::ModelHealthConfigUpdate {
-                    checks_enabled: true,
-                    alerts_enabled: true,
-                    check_interval_secs: state.health.default_interval_secs,
-                    failure_threshold: 2,
-                    maintenance_until: None,
-                    maintenance_note: None,
-                },
-            )
-            .await?;
-    }
     sync_model(&state, &model).await?;
     state
         .store
@@ -8405,77 +8365,82 @@ async fn update_model(
         .store
         .update_model(
             id,
-            body.description.as_deref().unwrap_or(&existing.description),
-            &body.upstream_model,
-            &body.api_base,
-            api_key,
-            &model_type,
-            body.input_cost_per_token
-                .unwrap_or(existing.input_cost_per_token),
-            body.output_cost_per_token
-                .unwrap_or(existing.output_cost_per_token),
-            body.cost_per_image.unwrap_or(existing.cost_per_image),
-            body.cost_per_audio_second
-                .unwrap_or(existing.cost_per_audio_second),
-            body.cost_per_character
-                .unwrap_or(existing.cost_per_character),
-            body.context_window.unwrap_or(existing.context_window),
-            body.admission_weight.unwrap_or(existing.admission_weight),
-            body.max_in_flight.or(existing.max_in_flight),
-            body.supports_function_calling
-                .unwrap_or(existing.supports_function_calling),
-            body.supports_system_messages
-                .unwrap_or(existing.supports_system_messages),
-            body.supports_response_schema
-                .unwrap_or(existing.supports_response_schema),
-            body.supports_tool_choice
-                .unwrap_or(existing.supports_tool_choice),
-            body.supports_vision.unwrap_or(existing.supports_vision),
-            body.enabled.unwrap_or(existing.enabled),
-            &body.tags.clone().unwrap_or_else(|| existing.tags.clone()),
-            &body.boons.clone().unwrap_or_else(|| existing.boons.clone()),
-            &body
-                .tool_servers
-                .clone()
-                .unwrap_or_else(|| existing.tool_servers.clone()),
-            body.energy_slots_per_node
-                .unwrap_or(existing.energy_slots_per_node),
-            body.route_bias.unwrap_or(existing.route_bias),
-            body.auto_eligible.unwrap_or(existing.auto_eligible),
-            body.draft_model.as_deref().unwrap_or(&existing.draft_model),
-            body.verify_api_base
-                .as_deref()
-                .unwrap_or(&existing.verify_api_base),
-            body.verify_upstream_model
-                .as_deref()
-                .unwrap_or(&existing.verify_upstream_model),
-            &aliases,
-            &quantization,
-            &upstream_headers,
-            body.cost_per_video.unwrap_or(existing.cost_per_video),
-            &capacity_mode,
-            &discovery,
-            &variants,
+            &obleth_store::ModelUpdate {
+                fields: obleth_store::ModelFields {
+                    description: body
+                        .description
+                        .clone()
+                        .unwrap_or_else(|| existing.description.clone()),
+                    upstream_model: body.upstream_model.clone(),
+                    api_base: body.api_base.clone(),
+                    api_key: api_key.map(str::to_string),
+                    model_type,
+                    input_cost_per_token: body
+                        .input_cost_per_token
+                        .unwrap_or(existing.input_cost_per_token),
+                    output_cost_per_token: body
+                        .output_cost_per_token
+                        .unwrap_or(existing.output_cost_per_token),
+                    cost_per_image: body.cost_per_image.unwrap_or(existing.cost_per_image),
+                    cost_per_audio_second: body
+                        .cost_per_audio_second
+                        .unwrap_or(existing.cost_per_audio_second),
+                    cost_per_character: body
+                        .cost_per_character
+                        .unwrap_or(existing.cost_per_character),
+                    cost_per_video: body.cost_per_video.unwrap_or(existing.cost_per_video),
+                    context_window: body.context_window.unwrap_or(existing.context_window),
+                    admission_weight: body.admission_weight.unwrap_or(existing.admission_weight),
+                    max_in_flight: body.max_in_flight.or(existing.max_in_flight),
+                    supports_function_calling: body
+                        .supports_function_calling
+                        .unwrap_or(existing.supports_function_calling),
+                    supports_system_messages: body
+                        .supports_system_messages
+                        .unwrap_or(existing.supports_system_messages),
+                    supports_response_schema: body
+                        .supports_response_schema
+                        .unwrap_or(existing.supports_response_schema),
+                    supports_tool_choice: body
+                        .supports_tool_choice
+                        .unwrap_or(existing.supports_tool_choice),
+                    supports_vision: body.supports_vision.unwrap_or(existing.supports_vision),
+                    tags: body.tags.clone().unwrap_or_else(|| existing.tags.clone()),
+                    boons: body.boons.clone().unwrap_or_else(|| existing.boons.clone()),
+                    tool_servers: body
+                        .tool_servers
+                        .clone()
+                        .unwrap_or_else(|| existing.tool_servers.clone()),
+                    energy_slots_per_node: body
+                        .energy_slots_per_node
+                        .unwrap_or(existing.energy_slots_per_node),
+                    route_bias: body.route_bias.unwrap_or(existing.route_bias),
+                    auto_eligible: body.auto_eligible.unwrap_or(existing.auto_eligible),
+                    draft_model: body
+                        .draft_model
+                        .clone()
+                        .unwrap_or_else(|| existing.draft_model.clone()),
+                    verify_api_base: body
+                        .verify_api_base
+                        .clone()
+                        .unwrap_or_else(|| existing.verify_api_base.clone()),
+                    verify_upstream_model: body
+                        .verify_upstream_model
+                        .clone()
+                        .unwrap_or_else(|| existing.verify_upstream_model.clone()),
+                    aliases,
+                    quantization,
+                    upstream_headers,
+                    capacity_mode,
+                    discovery,
+                    variants,
+                },
+                enabled: body.enabled.unwrap_or(existing.enabled),
+                rejected_request_fields,
+                session_affinity: body.session_affinity,
+            },
         )
         .await?;
-    let model = match rejected_request_fields {
-        Some(fields) if fields != model.rejected_request_fields => {
-            state
-                .store
-                .set_model_rejected_request_fields(id, &fields)
-                .await?
-        }
-        _ => model,
-    };
-    let model = match body.session_affinity {
-        Some(affinity) if affinity != model.session_affinity => {
-            state
-                .store
-                .set_model_session_affinity(id, &affinity)
-                .await?
-        }
-        _ => model,
-    };
     if model_health::probe_config_changed(&existing, &model) {
         // The old failure streak / alert state describe a configuration that
         // no longer exists; reset so the scheduler re-verifies immediately.
@@ -10842,43 +10807,27 @@ mod tests {
             input_cost_per_token: f64,
         ) -> ModelRoute {
             store
-                .create_model(
+                .create_model(&obleth_store::NewModel::new(
                     name,
-                    "",
-                    name,
-                    "http://upstream.invalid",
-                    None,
-                    obleth_config::DEFAULT_MODEL_TYPE,
-                    input_cost_per_token,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    128_000,
-                    100,
-                    Some(4),
-                    true,
-                    true,
-                    true,
-                    true,
-                    false,
-                    &["coding".to_string()],
-                    &[],
-                    &[],
-                    0,
-                    1.0,
-                    true,
-                    "",
-                    "",
-                    "",
-                    &[],
-                    "",
-                    &Default::default(),
-                    0.0,
-                    "static",
-                    &Default::default(),
-                    &[],
-                )
+                    obleth_store::ModelFields {
+                        upstream_model: name.into(),
+                        api_base: "http://upstream.invalid".into(),
+                        model_type: obleth_config::DEFAULT_MODEL_TYPE.into(),
+                        input_cost_per_token,
+                        context_window: 128_000,
+                        admission_weight: 100,
+                        max_in_flight: Some(4),
+                        supports_function_calling: true,
+                        supports_system_messages: true,
+                        supports_response_schema: true,
+                        supports_tool_choice: true,
+                        tags: vec!["coding".into()],
+                        route_bias: 1.0,
+                        auto_eligible: true,
+                        capacity_mode: "static".into(),
+                        ..Default::default()
+                    },
+                ))
                 .await
                 .expect("create fixture model")
         }

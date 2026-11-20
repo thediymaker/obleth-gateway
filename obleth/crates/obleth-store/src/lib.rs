@@ -1568,106 +1568,28 @@ impl Store {
 
     // ---- models ----------------------------------------------------------
 
-    #[allow(clippy::too_many_arguments)]
-    pub async fn create_model(
-        &self,
-        model_name: &str,
-        description: &str,
-        upstream_model: &str,
-        api_base: &str,
-        api_key: Option<&str>,
-        model_type: &str,
-        input_cost_per_token: f64,
-        output_cost_per_token: f64,
-        cost_per_image: f64,
-        cost_per_audio_second: f64,
-        cost_per_character: f64,
-        context_window: i64,
-        admission_weight: i64,
-        max_in_flight: Option<i64>,
-        supports_function_calling: bool,
-        supports_system_messages: bool,
-        supports_response_schema: bool,
-        supports_tool_choice: bool,
-        supports_vision: bool,
-        tags: &[String],
-        boons: &[String],
-        tool_servers: &[String],
-        energy_slots_per_node: i64,
-        route_bias: f64,
-        auto_eligible: bool,
-        draft_model: &str,
-        verify_api_base: &str,
-        verify_upstream_model: &str,
-        aliases: &[String],
-        quantization: &str,
-        upstream_headers: &obleth_config::UpstreamHeaders,
-        cost_per_video: f64,
-        capacity_mode: &str,
-        discovery: &obleth_config::capacity::DiscoveryFields,
-        variants: &[obleth_config::ModelVariant],
-    ) -> Result<ModelRoute> {
-        let api_key = cipher().encrypt_opt(api_key);
-        let discovery = discovery.normalized();
-        let row = sqlx::query(&format!(
-            "insert into models (
-                id, model_name, description, upstream_model, api_base, api_key, model_type,
-                input_cost_per_token, output_cost_per_token,
-                cost_per_image, cost_per_audio_second, cost_per_character, context_window,
-                admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
-                supports_response_schema, supports_tool_choice, supports_vision, tags, boons, tool_servers,
-                energy_slots_per_node, route_bias, auto_eligible,
-                draft_model, verify_api_base, verify_upstream_model, aliases, quantization,
-                upstream_headers, cost_per_video, capacity_mode, capacity_namespace,
-                capacity_service, per_replica_max_in_flight, capacity_source, capacity_headroom,
-                variants
-             ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40)
-             returning {MODEL_COLUMNS}"),
-        )
-        .bind(Uuid::new_v4())
-        .bind(model_name)
-        .bind(description)
-        .bind(upstream_model)
-        .bind(api_base)
-        .bind(api_key)
-        .bind(obleth_config::normalize_model_type(model_type))
-        .bind(input_cost_per_token)
-        .bind(output_cost_per_token)
-        .bind(cost_per_image.max(0.0))
-        .bind(cost_per_audio_second.max(0.0))
-        .bind(cost_per_character.max(0.0))
-        .bind(context_window.max(0))
-        .bind(admission_weight.max(1))
-        .bind(max_in_flight.map(|n| n.max(1)))
-        .bind(supports_function_calling)
-        .bind(supports_system_messages)
-        .bind(supports_response_schema)
-        .bind(supports_tool_choice)
-        .bind(supports_vision)
-        .bind(sqlx::types::Json(serialize_tag_levels(tags)))
-        .bind(sqlx::types::Json(obleth_config::normalize_boons(boons)))
-        .bind(sqlx::types::Json(obleth_config::normalize_tool_servers(
-            tool_servers,
-        )))
-        .bind(energy_slots_per_node.max(0))
-        .bind(route_bias)
-        .bind(auto_eligible)
-        .bind(draft_model.trim())
-        .bind(verify_api_base.trim())
-        .bind(verify_upstream_model.trim())
-        .bind(sqlx::types::Json(obleth_config::normalize_aliases(aliases)))
-        .bind(obleth_config::normalize_quantization(quantization))
-        .bind(encrypt_upstream_headers(upstream_headers))
-        .bind(cost_per_video.max(0.0))
-        .bind(obleth_config::normalize_capacity_mode(capacity_mode))
-        .bind(&discovery.namespace)
-        .bind(&discovery.service)
-        .bind(discovery.per_replica_max_in_flight.map(|n| n.max(1)))
-        .bind(&discovery.source)
-        .bind(discovery.headroom)
-        .bind(sqlx::types::Json(obleth_config::normalize_variants(variants)))
-        .fetch_one(&self.pool)
-        .await?;
+    pub async fn create_model(&self, model: &NewModel) -> Result<ModelRoute> {
+        let sql = format!(
+            "insert into models (id, model_name, enabled, lifecycle, rejected_request_fields,
+                                 session_affinity, health_check_interval_secs, {cols})
+             values ($1, $2, $3, $4, $5, $6, $7, {vals})
+             returning {MODEL_COLUMNS}",
+            cols = MODEL_FIELD_COLUMNS.join(", "),
+            vals = model_field_placeholders(8),
+        );
+        let q = sqlx::query(&sql)
+            .bind(Uuid::new_v4())
+            .bind(&model.model_name)
+            .bind(model.enabled)
+            .bind(sqlx::types::Json(&model.lifecycle))
+            .bind(sqlx::types::Json(
+                obleth_config::normalize_rejected_request_fields(&model.rejected_request_fields),
+            ))
+            .bind(sqlx::types::Json(model.session_affinity))
+            .bind(model.health_check_interval_secs.max(60));
+        let row = bind_model_fields(q, &model.fields)
+            .fetch_one(&self.pool)
+            .await?;
         model_from_row(&row)
     }
 
@@ -1734,117 +1656,27 @@ impl Store {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub async fn update_model(
-        &self,
-        id: Uuid,
-        description: &str,
-        upstream_model: &str,
-        api_base: &str,
-        api_key: Option<&str>,
-        model_type: &str,
-        input_cost_per_token: f64,
-        output_cost_per_token: f64,
-        cost_per_image: f64,
-        cost_per_audio_second: f64,
-        cost_per_character: f64,
-        context_window: i64,
-        admission_weight: i64,
-        max_in_flight: Option<i64>,
-        supports_function_calling: bool,
-        supports_system_messages: bool,
-        supports_response_schema: bool,
-        supports_tool_choice: bool,
-        supports_vision: bool,
-        enabled: bool,
-        tags: &[String],
-        boons: &[String],
-        tool_servers: &[String],
-        energy_slots_per_node: i64,
-        route_bias: f64,
-        auto_eligible: bool,
-        draft_model: &str,
-        verify_api_base: &str,
-        verify_upstream_model: &str,
-        aliases: &[String],
-        quantization: &str,
-        upstream_headers: &obleth_config::UpstreamHeaders,
-        cost_per_video: f64,
-        capacity_mode: &str,
-        discovery: &obleth_config::capacity::DiscoveryFields,
-        variants: &[obleth_config::ModelVariant],
-    ) -> Result<ModelRoute> {
-        let api_key = cipher().encrypt_opt(api_key);
-        let discovery = discovery.normalized();
-        let row = sqlx::query(&format!(
-            "update models set
-                description = $2, upstream_model = $3, api_base = $4, api_key = $5,
-                input_cost_per_token = $6, output_cost_per_token = $7,
-                context_window = $8, admission_weight = $9,
-                max_in_flight = $10,
-                supports_function_calling = $11, supports_system_messages = $12,
-                supports_response_schema = $13, supports_tool_choice = $14,
-                enabled = $15, tags = $16, model_type = $17,
-                cost_per_image = $18, cost_per_audio_second = $19, cost_per_character = $20,
-                supports_vision = $21, boons = $22, tool_servers = $23,
-                energy_slots_per_node = $24, route_bias = $25,
-                auto_eligible = $26,
-                draft_model = $27, verify_api_base = $28, verify_upstream_model = $29,
-                aliases = $30, quantization = $31, upstream_headers = $32,
-                cost_per_video = $33, capacity_mode = $34, capacity_namespace = $35,
-                capacity_service = $36, per_replica_max_in_flight = $37,
-                capacity_source = $38, capacity_headroom = $39, variants = $40,
-                updated_at = now()
+    pub async fn update_model(&self, id: Uuid, update: &ModelUpdate) -> Result<ModelRoute> {
+        let sql = format!(
+            "update models set enabled = $2,
+                rejected_request_fields = coalesce($3, rejected_request_fields),
+                session_affinity = coalesce($4, session_affinity),
+                {sets}, updated_at = now()
              where id = $1
-             returning {MODEL_COLUMNS}"
-        ))
-        .bind(id)
-        .bind(description)
-        .bind(upstream_model)
-        .bind(api_base)
-        .bind(api_key)
-        .bind(input_cost_per_token)
-        .bind(output_cost_per_token)
-        .bind(context_window.max(0))
-        .bind(admission_weight.max(1))
-        .bind(max_in_flight.map(|n| n.max(1)))
-        .bind(supports_function_calling)
-        .bind(supports_system_messages)
-        .bind(supports_response_schema)
-        .bind(supports_tool_choice)
-        .bind(enabled)
-        .bind(sqlx::types::Json(serialize_tag_levels(tags)))
-        .bind(obleth_config::normalize_model_type(model_type))
-        .bind(cost_per_image.max(0.0))
-        .bind(cost_per_audio_second.max(0.0))
-        .bind(cost_per_character.max(0.0))
-        .bind(supports_vision)
-        .bind(sqlx::types::Json(obleth_config::normalize_boons(boons)))
-        .bind(sqlx::types::Json(obleth_config::normalize_tool_servers(
-            tool_servers,
-        )))
-        .bind(energy_slots_per_node.max(0))
-        .bind(route_bias)
-        .bind(auto_eligible)
-        .bind(draft_model.trim())
-        .bind(verify_api_base.trim())
-        .bind(verify_upstream_model.trim())
-        .bind(sqlx::types::Json(obleth_config::normalize_aliases(aliases)))
-        .bind(obleth_config::normalize_quantization(quantization))
-        .bind(encrypt_upstream_headers(upstream_headers))
-        .bind(cost_per_video.max(0.0))
-        .bind(obleth_config::normalize_capacity_mode(capacity_mode))
-        .bind(&discovery.namespace)
-        .bind(&discovery.service)
-        .bind(discovery.per_replica_max_in_flight.map(|n| n.max(1)))
-        .bind(&discovery.source)
-        .bind(discovery.headroom)
-        .bind(sqlx::types::Json(obleth_config::normalize_variants(
-            variants,
-        )))
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(StoreError::NotFound)?;
+             returning {MODEL_COLUMNS}",
+            sets = model_field_assignments(5),
+        );
+        let q = sqlx::query(&sql)
+            .bind(id)
+            .bind(update.enabled)
+            .bind(update.rejected_request_fields.as_deref().map(|fields| {
+                sqlx::types::Json(obleth_config::normalize_rejected_request_fields(fields))
+            }))
+            .bind(update.session_affinity.map(sqlx::types::Json));
+        let row = bind_model_fields(q, &update.fields)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(StoreError::NotFound)?;
         model_from_row(&row)
     }
 
@@ -4630,6 +4462,207 @@ fn lifecycle_from_row(row: &PgRow) -> obleth_config::ModelLifecycle {
         .unwrap_or_default()
 }
 
+/// Everything a model is written with, apart from the settings that have
+/// their own endpoints. The Management API handler fills the defaults and
+/// validates the values; the store normalizes and binds them in one
+/// statement.
+#[derive(Debug, Clone, Default)]
+pub struct ModelFields {
+    pub description: String,
+    pub upstream_model: String,
+    pub api_base: String,
+    pub api_key: Option<String>,
+    pub model_type: String,
+    pub input_cost_per_token: f64,
+    pub output_cost_per_token: f64,
+    pub cost_per_image: f64,
+    pub cost_per_audio_second: f64,
+    pub cost_per_character: f64,
+    pub cost_per_video: f64,
+    pub context_window: i64,
+    pub admission_weight: i64,
+    pub max_in_flight: Option<i64>,
+    pub supports_function_calling: bool,
+    pub supports_system_messages: bool,
+    pub supports_response_schema: bool,
+    pub supports_tool_choice: bool,
+    pub supports_vision: bool,
+    pub tags: Vec<String>,
+    pub boons: Vec<String>,
+    pub tool_servers: Vec<String>,
+    pub energy_slots_per_node: i64,
+    pub route_bias: f64,
+    pub auto_eligible: bool,
+    pub draft_model: String,
+    pub verify_api_base: String,
+    pub verify_upstream_model: String,
+    pub aliases: Vec<String>,
+    pub quantization: String,
+    pub upstream_headers: obleth_config::UpstreamHeaders,
+    pub capacity_mode: String,
+    pub discovery: obleth_config::capacity::DiscoveryFields,
+    pub variants: Vec<obleth_config::ModelVariant>,
+}
+
+/// A model to create. Its switch, lifecycle, refused fields, session
+/// affinity and health-check interval go into the same insert as its
+/// fields, so a failed create leaves no half-configured row behind and the
+/// data plane never sees the model before it is set the way it was asked.
+#[derive(Debug, Clone)]
+pub struct NewModel {
+    pub model_name: String,
+    pub fields: ModelFields,
+    pub enabled: bool,
+    pub lifecycle: obleth_config::ModelLifecycle,
+    pub rejected_request_fields: Vec<String>,
+    pub session_affinity: obleth_config::ModelSessionAffinity,
+    pub health_check_interval_secs: i64,
+}
+
+impl NewModel {
+    /// The schema's default interval between health checks.
+    pub const DEFAULT_HEALTH_CHECK_INTERVAL_SECS: i64 = 900;
+
+    /// An enabled, active model with default settings: what a test or an
+    /// import needs before it sets the fields it cares about.
+    pub fn new(model_name: impl Into<String>, fields: ModelFields) -> Self {
+        NewModel {
+            model_name: model_name.into(),
+            fields,
+            enabled: true,
+            lifecycle: Default::default(),
+            rejected_request_fields: Vec::new(),
+            session_affinity: Default::default(),
+            health_check_interval_secs: Self::DEFAULT_HEALTH_CHECK_INTERVAL_SECS,
+        }
+    }
+}
+
+/// A rewrite of a model's fields and switch. The refused fields and session
+/// affinity are kept as stored when `None`, since they have their own
+/// endpoints and a client may leave them out of a full update.
+#[derive(Debug, Clone)]
+pub struct ModelUpdate {
+    pub fields: ModelFields,
+    pub enabled: bool,
+    pub rejected_request_fields: Option<Vec<String>>,
+    pub session_affinity: Option<obleth_config::ModelSessionAffinity>,
+}
+
+/// The columns [`ModelFields`] writes, in the order [`bind_model_fields`]
+/// binds them. The `discovery` fields take the last five.
+const MODEL_FIELD_COLUMNS: [&str; 38] = [
+    "description",
+    "upstream_model",
+    "api_base",
+    "api_key",
+    "model_type",
+    "input_cost_per_token",
+    "output_cost_per_token",
+    "cost_per_image",
+    "cost_per_audio_second",
+    "cost_per_character",
+    "cost_per_video",
+    "context_window",
+    "admission_weight",
+    "max_in_flight",
+    "supports_function_calling",
+    "supports_system_messages",
+    "supports_response_schema",
+    "supports_tool_choice",
+    "supports_vision",
+    "tags",
+    "boons",
+    "tool_servers",
+    "energy_slots_per_node",
+    "route_bias",
+    "auto_eligible",
+    "draft_model",
+    "verify_api_base",
+    "verify_upstream_model",
+    "aliases",
+    "quantization",
+    "upstream_headers",
+    "capacity_mode",
+    "capacity_namespace",
+    "capacity_service",
+    "per_replica_max_in_flight",
+    "capacity_source",
+    "capacity_headroom",
+    "variants",
+];
+
+/// `$from, $from+1, ...` for the [`MODEL_FIELD_COLUMNS`].
+fn model_field_placeholders(from: usize) -> String {
+    (0..MODEL_FIELD_COLUMNS.len())
+        .map(|i| format!("${}", from + i))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `col = $from, col = $from+1, ...` for the [`MODEL_FIELD_COLUMNS`].
+fn model_field_assignments(from: usize) -> String {
+    MODEL_FIELD_COLUMNS
+        .iter()
+        .enumerate()
+        .map(|(i, col)| format!("{col} = ${}", from + i))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Bind the [`ModelFields`] in [`MODEL_FIELD_COLUMNS`] order, normalized the
+/// way every model write normalizes them.
+fn bind_model_fields<'q>(
+    q: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    f: &'q ModelFields,
+) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
+    let discovery = f.discovery.normalized();
+    q.bind(&f.description)
+        .bind(&f.upstream_model)
+        .bind(&f.api_base)
+        .bind(cipher().encrypt_opt(f.api_key.as_deref()))
+        .bind(obleth_config::normalize_model_type(&f.model_type))
+        .bind(f.input_cost_per_token)
+        .bind(f.output_cost_per_token)
+        .bind(f.cost_per_image.max(0.0))
+        .bind(f.cost_per_audio_second.max(0.0))
+        .bind(f.cost_per_character.max(0.0))
+        .bind(f.cost_per_video.max(0.0))
+        .bind(f.context_window.max(0))
+        .bind(f.admission_weight.max(1))
+        .bind(f.max_in_flight.map(|n| n.max(1)))
+        .bind(f.supports_function_calling)
+        .bind(f.supports_system_messages)
+        .bind(f.supports_response_schema)
+        .bind(f.supports_tool_choice)
+        .bind(f.supports_vision)
+        .bind(sqlx::types::Json(serialize_tag_levels(&f.tags)))
+        .bind(sqlx::types::Json(obleth_config::normalize_boons(&f.boons)))
+        .bind(sqlx::types::Json(obleth_config::normalize_tool_servers(
+            &f.tool_servers,
+        )))
+        .bind(f.energy_slots_per_node.max(0))
+        .bind(f.route_bias)
+        .bind(f.auto_eligible)
+        .bind(f.draft_model.trim())
+        .bind(f.verify_api_base.trim())
+        .bind(f.verify_upstream_model.trim())
+        .bind(sqlx::types::Json(obleth_config::normalize_aliases(
+            &f.aliases,
+        )))
+        .bind(obleth_config::normalize_quantization(&f.quantization))
+        .bind(encrypt_upstream_headers(&f.upstream_headers))
+        .bind(obleth_config::normalize_capacity_mode(&f.capacity_mode))
+        .bind(discovery.namespace)
+        .bind(discovery.service)
+        .bind(discovery.per_replica_max_in_flight.map(|n| n.max(1)))
+        .bind(discovery.source)
+        .bind(discovery.headroom)
+        .bind(sqlx::types::Json(obleth_config::normalize_variants(
+            &f.variants,
+        )))
+}
+
 pub(crate) fn encrypt_upstream_headers(
     headers: &obleth_config::UpstreamHeaders,
 ) -> sqlx::types::Json<obleth_config::UpstreamHeaders> {
@@ -5219,45 +5252,15 @@ mod tests {
         ]
         .into();
         let name = format!("m-{}", Uuid::new_v4());
-        let d = default_test_model(&name);
         let model = store
-            .create_model(
-                d.0,
-                d.1,
-                d.2,
-                d.3,
-                d.4,
-                d.5,
-                d.6,
-                d.7,
-                d.8,
-                d.9,
-                d.10,
-                d.11,
-                d.12,
-                d.13,
-                d.14,
-                d.15,
-                d.16,
-                d.17,
-                d.18,
-                &d.19,
-                &d.20,
-                &d.21,
-                d.22,
-                d.23,
-                true,
-                "",
-                "",
-                "",
-                &[],
-                "unknown",
-                &headers,
-                0.0,
-                "static",
-                &Default::default(),
-                &[],
-            )
+            .create_model(&NewModel::new(
+                &name,
+                ModelFields {
+                    quantization: "unknown".into(),
+                    upstream_headers: headers.clone(),
+                    ..default_test_fields()
+                },
+            ))
             .await
             .expect("create model");
         fixtures.track_model(model.id);
@@ -5300,43 +5303,21 @@ mod tests {
 
         let name = format!("m-{}", Uuid::new_v4());
         let model = store
-            .create_model(
+            .create_model(&NewModel::new(
                 &name,
-                "lifecycle round trip",
-                "upstream-model",
-                "http://127.0.0.1:8081",
-                None,
-                obleth_config::DEFAULT_MODEL_TYPE,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                8192,
-                100,
-                None,
-                false,
-                true,
-                false,
-                false,
-                false,
-                &[],
-                &[],
-                &[],
-                0,
-                1.0,
-                true,
-                "",
-                "",
-                "",
-                &[],
-                "fp8",
-                &Default::default(),
-                0.0,
-                "static",
-                &Default::default(),
-                &[],
-            )
+                ModelFields {
+                    description: "lifecycle round trip".into(),
+                    upstream_model: "upstream-model".into(),
+                    api_base: "http://127.0.0.1:8081".into(),
+                    model_type: obleth_config::DEFAULT_MODEL_TYPE.into(),
+                    context_window: 8192,
+                    admission_weight: 100,
+                    supports_system_messages: true,
+                    route_bias: 1.0,
+                    quantization: "fp8".into(),
+                    ..default_test_fields()
+                },
+            ))
             .await
             .expect("create model");
         fixtures.track_model(model.id);
@@ -5404,43 +5385,21 @@ mod tests {
 
         let name = format!("m-{}", Uuid::new_v4());
         let model = store
-            .create_model(
+            .create_model(&NewModel::new(
                 &name,
-                "reasoning round trip",
-                "upstream-model",
-                "http://127.0.0.1:8081",
-                None,
-                obleth_config::DEFAULT_MODEL_TYPE,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                8192,
-                100,
-                None,
-                false,
-                true,
-                false,
-                false,
-                false,
-                &[],
-                &[],
-                &[],
-                0,
-                1.0,
-                true,
-                "",
-                "",
-                "",
-                &[],
-                "fp8",
-                &Default::default(),
-                0.0,
-                "static",
-                &Default::default(),
-                &[],
-            )
+                ModelFields {
+                    description: "reasoning round trip".into(),
+                    upstream_model: "upstream-model".into(),
+                    api_base: "http://127.0.0.1:8081".into(),
+                    model_type: obleth_config::DEFAULT_MODEL_TYPE.into(),
+                    context_window: 8192,
+                    admission_weight: 100,
+                    supports_system_messages: true,
+                    route_bias: 1.0,
+                    quantization: "fp8".into(),
+                    ..default_test_fields()
+                },
+            ))
             .await
             .expect("create model");
         fixtures.track_model(model.id);
@@ -5650,53 +5609,33 @@ mod tests {
         let alias = format!("{name}-mxfp4");
         let variant = format!("{name}-spec");
         let model = store
-            .create_model(
+            .create_model(&NewModel::new(
                 &name,
-                "alias round trip",
-                "upstream-model-mxfp4",
-                "http://127.0.0.1:8081",
-                None,
-                obleth_config::DEFAULT_MODEL_TYPE,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                8192,
-                100,
-                None,
-                false,
-                true,
-                false,
-                false,
-                false,
-                &[],
-                &[],
-                &[],
-                0,
-                1.0,
-                true,
-                "",
-                "",
-                "",
-                // A blank entry and a duplicate: normalization drops both.
-                &[alias.clone(), String::new(), alias.clone()],
-                // A backend's own spelling, folded onto the vocabulary value.
-                "FP8-e4m3",
-                &Default::default(),
-                0.0,
-                "static",
-                &Default::default(),
-                // An unknown boon and a blank variant: normalization drops both.
-                &[
-                    obleth_config::ModelVariant {
-                        name: format!(" {variant} "),
-                        description: "drafted, then verified".into(),
-                        boons: vec!["speculation".into(), "teleportation".into()],
-                    },
-                    obleth_config::ModelVariant::default(),
-                ],
-            )
+                ModelFields {
+                    description: "alias round trip".into(),
+                    upstream_model: "upstream-model-mxfp4".into(),
+                    api_base: "http://127.0.0.1:8081".into(),
+                    model_type: obleth_config::DEFAULT_MODEL_TYPE.into(),
+                    context_window: 8192,
+                    admission_weight: 100,
+                    supports_system_messages: true,
+                    route_bias: 1.0,
+                    // A blank entry and a duplicate: normalization drops both.
+                    aliases: vec![alias.clone(), String::new(), alias.clone()],
+                    // A backend's own spelling, folded onto the vocabulary value.
+                    quantization: "FP8-e4m3".into(),
+                    // An unknown boon and a blank variant: normalization drops both.
+                    variants: vec![
+                        obleth_config::ModelVariant {
+                            name: format!(" {variant} "),
+                            description: "drafted, then verified".into(),
+                            boons: vec!["speculation".into(), "teleportation".into()],
+                        },
+                        obleth_config::ModelVariant::default(),
+                    ],
+                    ..default_test_fields()
+                },
+            ))
             .await
             .expect("create model");
         fixtures.track_model(model.id);
@@ -5762,41 +5701,23 @@ mod tests {
         let updated = store
             .update_model(
                 model.id,
-                "alias round trip",
-                "upstream-model-mxfp4",
-                "http://127.0.0.1:8081",
-                None,
-                obleth_config::DEFAULT_MODEL_TYPE,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                8192,
-                100,
-                None,
-                false,
-                true,
-                false,
-                false,
-                false,
-                true,
-                &[],
-                &[],
-                &[],
-                0,
-                1.0,
-                true,
-                "",
-                "",
-                "",
-                &[],
-                "mxfp4",
-                &Default::default(),
-                0.0,
-                "static",
-                &Default::default(),
-                &[],
+                &ModelUpdate {
+                    fields: ModelFields {
+                        description: "alias round trip".into(),
+                        upstream_model: "upstream-model-mxfp4".into(),
+                        api_base: "http://127.0.0.1:8081".into(),
+                        model_type: obleth_config::DEFAULT_MODEL_TYPE.into(),
+                        context_window: 8192,
+                        admission_weight: 100,
+                        supports_system_messages: true,
+                        route_bias: 1.0,
+                        quantization: "mxfp4".into(),
+                        ..default_test_fields()
+                    },
+                    enabled: true,
+                    rejected_request_fields: None,
+                    session_affinity: None,
+                },
             )
             .await
             .expect("update model");
@@ -5840,43 +5761,23 @@ mod tests {
             headroom: 1.25,
         };
         let model = store
-            .create_model(
+            .create_model(&NewModel::new(
                 &name,
-                "discovery round trip",
-                "served",
-                "http://127.0.0.1:8081",
-                None,
-                obleth_config::DEFAULT_MODEL_TYPE,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                8192,
-                100,
-                Some(6),
-                false,
-                true,
-                false,
-                false,
-                false,
-                &[],
-                &[],
-                &[],
-                0,
-                1.0,
-                true,
-                "",
-                "",
-                "",
-                &[],
-                "",
-                &Default::default(),
-                0.0,
-                "discovered",
-                &discovery,
-                &[],
-            )
+                ModelFields {
+                    description: "discovery round trip".into(),
+                    upstream_model: "served".into(),
+                    api_base: "http://127.0.0.1:8081".into(),
+                    model_type: obleth_config::DEFAULT_MODEL_TYPE.into(),
+                    context_window: 8192,
+                    admission_weight: 100,
+                    max_in_flight: Some(6),
+                    supports_system_messages: true,
+                    route_bias: 1.0,
+                    capacity_mode: "discovered".into(),
+                    discovery: discovery.clone(),
+                    ..default_test_fields()
+                },
+            ))
             .await
             .expect("create model");
         fixtures.track_model(model.id);
@@ -6295,47 +6196,24 @@ mod tests {
         assert!(!audit.is_empty());
 
         let model = store
-            .create_model(
-                &format!("m-{}", Uuid::new_v4()),
-                "integration test model",
-                "upstream-model",
-                "http://127.0.0.1:8081",
-                None,
-                // A non-chat type: the scheduled claim query must round-trip
-                // `model_type`, or the worker probes every model against
-                // /chat/completions (regression 2026-07-06 — embedding/TTS
-                // models were pinned `degraded` by a chat probe they don't serve).
-                "embedding",
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                8192,
-                100,
-                None,
-                false,
-                true,
-                false,
-                false,
-                false,
-                &[],
-                &[],
-                &[],
-                0,
-                1.0,
-                true,
-                "",
-                "",
-                "",
-                &[],
-                "",
-                &Default::default(),
-                0.0,
-                "static",
-                &Default::default(),
-                &[],
-            )
+            .create_model(&NewModel::new(
+                format!("m-{}", Uuid::new_v4()),
+                ModelFields {
+                    description: "integration test model".into(),
+                    upstream_model: "upstream-model".into(),
+                    api_base: "http://127.0.0.1:8081".into(),
+                    // A non-chat type: the scheduled claim query must round-trip
+                    // `model_type`, or the worker probes every model against
+                    // /chat/completions (regression 2026-07-06 — embedding/TTS
+                    // models were pinned `degraded` by a chat probe they don't serve).
+                    model_type: "embedding".into(),
+                    context_window: 8192,
+                    admission_weight: 100,
+                    supports_system_messages: true,
+                    route_bias: 1.0,
+                    ..default_test_fields()
+                },
+            ))
             .await
             .expect("create model");
         fixtures.track_model(model.id);
@@ -6747,43 +6625,20 @@ mod tests {
 
         // Same positional create_model call as `tenant_key_audit_roundtrip`.
         let model = store
-            .create_model(
-                &format!("m-{}", Uuid::new_v4()),
-                "hysteresis test model",
-                "upstream-model",
-                "http://127.0.0.1:8081",
-                None,
-                "chat",
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                8192,
-                100,
-                None,
-                false,
-                true,
-                false,
-                false,
-                false,
-                &[],
-                &[],
-                &[],
-                0,
-                1.0,
-                true,
-                "",
-                "",
-                "",
-                &[],
-                "",
-                &Default::default(),
-                0.0,
-                "static",
-                &Default::default(),
-                &[],
-            )
+            .create_model(&NewModel::new(
+                format!("m-{}", Uuid::new_v4()),
+                ModelFields {
+                    description: "hysteresis test model".into(),
+                    upstream_model: "upstream-model".into(),
+                    api_base: "http://127.0.0.1:8081".into(),
+                    model_type: "chat".into(),
+                    context_window: 8192,
+                    admission_weight: 100,
+                    supports_system_messages: true,
+                    route_bias: 1.0,
+                    ..default_test_fields()
+                },
+            ))
             .await
             .expect("create model");
         fixtures.track_model(model.id);
@@ -6889,43 +6744,20 @@ mod tests {
         let mut ids = Vec::new();
         for _ in 0..2 {
             let model = store
-                .create_model(
-                    &format!("m-{}", Uuid::new_v4()),
-                    "endpoint scoping test model",
-                    "upstream-model",
-                    "http://127.0.0.1:8081",
-                    None,
-                    "chat",
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    8192,
-                    100,
-                    None,
-                    false,
-                    true,
-                    false,
-                    false,
-                    false,
-                    &[],
-                    &[],
-                    &[],
-                    0,
-                    1.0,
-                    true,
-                    "",
-                    "",
-                    "",
-                    &[],
-                    "",
-                    &Default::default(),
-                    0.0,
-                    "static",
-                    &Default::default(),
-                    &[],
-                )
+                .create_model(&NewModel::new(
+                    format!("m-{}", Uuid::new_v4()),
+                    ModelFields {
+                        description: "endpoint scoping test model".into(),
+                        upstream_model: "upstream-model".into(),
+                        api_base: "http://127.0.0.1:8081".into(),
+                        model_type: "chat".into(),
+                        context_window: 8192,
+                        admission_weight: 100,
+                        supports_system_messages: true,
+                        route_bias: 1.0,
+                        ..default_test_fields()
+                    },
+                ))
                 .await
                 .expect("create model");
             fixtures.track_model(model.id);
@@ -7011,43 +6843,20 @@ mod tests {
 
         // Same positional create_model call as the other health tests.
         let model = store
-            .create_model(
-                &format!("m-{}", Uuid::new_v4()),
-                "endpoint health test model",
-                "upstream-model",
-                "http://127.0.0.1:8081",
-                None,
-                "chat",
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                8192,
-                100,
-                None,
-                false,
-                true,
-                false,
-                false,
-                false,
-                &[],
-                &[],
-                &[],
-                0,
-                1.0,
-                true,
-                "",
-                "",
-                "",
-                &[],
-                "",
-                &Default::default(),
-                0.0,
-                "static",
-                &Default::default(),
-                &[],
-            )
+            .create_model(&NewModel::new(
+                format!("m-{}", Uuid::new_v4()),
+                ModelFields {
+                    description: "endpoint health test model".into(),
+                    upstream_model: "upstream-model".into(),
+                    api_base: "http://127.0.0.1:8081".into(),
+                    model_type: "chat".into(),
+                    context_window: 8192,
+                    admission_weight: 100,
+                    supports_system_messages: true,
+                    route_bias: 1.0,
+                    ..default_test_fields()
+                },
+            ))
             .await
             .expect("create model");
         fixtures.track_model(model.id);
@@ -7144,60 +6953,22 @@ mod tests {
     // A positional bundle of column values for a model insert; test-only, so the
     // wide tuple is clearer inline than a named alias would be.
     #[allow(clippy::type_complexity)]
-    fn default_test_model(
-        name: &str,
-    ) -> (
-        &str,
-        &str,
-        &str,
-        &str,
-        Option<&str>,
-        &str,
-        f64,
-        f64,
-        f64,
-        f64,
-        f64,
-        i64,
-        i64,
-        Option<i64>,
-        bool,
-        bool,
-        bool,
-        bool,
-        bool,
-        Vec<String>,
-        Vec<String>,
-        Vec<String>,
-        i64,
-        f64,
-    ) {
-        (
-            name,
-            "integration test model",
-            "upstream-model",
-            "http://127.0.0.1:8081",
-            None,
-            "chat",
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            8192,
-            100,
-            None,
-            false,
-            true,
-            false,
-            false,
-            false,
-            vec![],
-            vec![],
-            vec![],
-            0,
-            1.0,
-        )
+    /// The fields an integration-test model is created with before a test
+    /// sets the ones it is about.
+    fn default_test_fields() -> ModelFields {
+        ModelFields {
+            description: "integration test model".into(),
+            upstream_model: "upstream-model".into(),
+            api_base: "http://127.0.0.1:8081".into(),
+            model_type: "chat".into(),
+            context_window: 8192,
+            admission_weight: 100,
+            supports_system_messages: true,
+            route_bias: 1.0,
+            auto_eligible: true,
+            capacity_mode: "static".into(),
+            ..Default::default()
+        }
     }
 
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
@@ -7226,50 +6997,19 @@ mod tests {
         let mut fixtures = FixtureGuard::new(&store);
 
         let model_name = format!("m-{}", Uuid::new_v4());
-        let args = default_test_model(&model_name);
         let created_tags = vec![
             "coding:3".to_string(),    // declared, tiered
             "math".to_string(),        // declared, untiered -> level 1, stored bare
             "astrology:2".to_string(), // invalid base -> dropped, as today
         ];
         let model = store
-            .create_model(
-                args.0,
-                args.1,
-                args.2,
-                args.3,
-                args.4,
-                args.5,
-                args.6,
-                args.7,
-                args.8,
-                args.9,
-                args.10,
-                args.11,
-                args.12,
-                args.13,
-                args.14,
-                args.15,
-                args.16,
-                args.17,
-                args.18,
-                &created_tags,
-                &args.20,
-                &args.21,
-                args.22,
-                args.23,
-                true,
-                "",
-                "",
-                "",
-                &[],
-                "",
-                &Default::default(),
-                0.0,
-                "static",
-                &Default::default(),
-                &[],
-            )
+            .create_model(&NewModel::new(
+                &model_name,
+                ModelFields {
+                    tags: created_tags.clone(),
+                    ..default_test_fields()
+                },
+            ))
             .await
             .expect("create model");
         fixtures.track_model(model.id);
@@ -7312,41 +7052,15 @@ mod tests {
         let updated = store
             .update_model(
                 model.id,
-                args.1,
-                args.2,
-                args.3,
-                args.4,
-                args.5,
-                args.6,
-                args.7,
-                args.8,
-                args.9,
-                args.10,
-                args.11,
-                args.12,
-                args.13,
-                args.14,
-                args.15,
-                args.16,
-                args.17,
-                args.18,
-                true,
-                &updated_tags,
-                &args.20,
-                &args.21,
-                args.22,
-                args.23,
-                true,
-                "",
-                "",
-                "",
-                &[],
-                "",
-                &Default::default(),
-                0.0,
-                "static",
-                &Default::default(),
-                &[],
+                &ModelUpdate {
+                    fields: ModelFields {
+                        tags: updated_tags.clone(),
+                        ..default_test_fields()
+                    },
+                    enabled: true,
+                    rejected_request_fields: None,
+                    session_affinity: None,
+                },
             )
             .await
             .expect("update model");
@@ -7466,45 +7180,8 @@ mod tests {
 
         // a model is required (FK). Reuse create_model with minimal args.
         let model_name = format!("m-{}", Uuid::new_v4());
-        let args = default_test_model(&model_name);
         let model = store
-            .create_model(
-                args.0,
-                args.1,
-                args.2,
-                args.3,
-                args.4,
-                args.5,
-                args.6,
-                args.7,
-                args.8,
-                args.9,
-                args.10,
-                args.11,
-                args.12,
-                args.13,
-                args.14,
-                args.15,
-                args.16,
-                args.17,
-                args.18,
-                &args.19,
-                &args.20,
-                &args.21,
-                args.22,
-                args.23,
-                true,
-                "",
-                "",
-                "",
-                &[],
-                "",
-                &Default::default(),
-                0.0,
-                "static",
-                &Default::default(),
-                &[],
-            )
+            .create_model(&NewModel::new(&model_name, default_test_fields()))
             .await
             .expect("create model");
         fixtures.track_model(model.id);
@@ -7578,45 +7255,8 @@ mod tests {
         let mut fixtures = FixtureGuard::new(&store);
 
         let model_name = format!("m-{}", Uuid::new_v4());
-        let args = default_test_model(&model_name);
         let model = store
-            .create_model(
-                args.0,
-                args.1,
-                args.2,
-                args.3,
-                args.4,
-                args.5,
-                args.6,
-                args.7,
-                args.8,
-                args.9,
-                args.10,
-                args.11,
-                args.12,
-                args.13,
-                args.14,
-                args.15,
-                args.16,
-                args.17,
-                args.18,
-                &args.19,
-                &args.20,
-                &args.21,
-                args.22,
-                args.23,
-                true,
-                "",
-                "",
-                "",
-                &[],
-                "",
-                &Default::default(),
-                0.0,
-                "static",
-                &Default::default(),
-                &[],
-            )
+            .create_model(&NewModel::new(&model_name, default_test_fields()))
             .await
             .expect("model");
         fixtures.track_model(model.id);
@@ -7691,45 +7331,8 @@ mod tests {
         let mut fixtures = FixtureGuard::new(&store);
 
         let model_name = format!("m-{}", Uuid::new_v4());
-        let args = default_test_model(&model_name);
         let model = store
-            .create_model(
-                args.0,
-                args.1,
-                args.2,
-                args.3,
-                args.4,
-                args.5,
-                args.6,
-                args.7,
-                args.8,
-                args.9,
-                args.10,
-                args.11,
-                args.12,
-                args.13,
-                args.14,
-                args.15,
-                args.16,
-                args.17,
-                args.18,
-                &args.19,
-                &args.20,
-                &args.21,
-                args.22,
-                args.23,
-                true,
-                "",
-                "",
-                "",
-                &[],
-                "",
-                &Default::default(),
-                0.0,
-                "static",
-                &Default::default(),
-                &[],
-            )
+            .create_model(&NewModel::new(&model_name, default_test_fields()))
             .await
             .expect("model");
         fixtures.track_model(model.id);
@@ -7930,45 +7533,8 @@ mod tests {
         let mut fixtures = FixtureGuard::new(&store);
 
         let model_name = format!("m-{}", Uuid::new_v4());
-        let args = default_test_model(&model_name);
         let model = store
-            .create_model(
-                args.0,
-                args.1,
-                args.2,
-                args.3,
-                args.4,
-                args.5,
-                args.6,
-                args.7,
-                args.8,
-                args.9,
-                args.10,
-                args.11,
-                args.12,
-                args.13,
-                args.14,
-                args.15,
-                args.16,
-                args.17,
-                args.18,
-                &args.19,
-                &args.20,
-                &args.21,
-                args.22,
-                args.23,
-                true,
-                "",
-                "",
-                "",
-                &[],
-                "",
-                &Default::default(),
-                0.0,
-                "static",
-                &Default::default(),
-                &[],
-            )
+            .create_model(&NewModel::new(&model_name, default_test_fields()))
             .await
             .expect("create model");
         fixtures.track_model(model.id);
@@ -8176,45 +7742,8 @@ mod tests {
         let mut fixtures = FixtureGuard::new(&store);
 
         let model_name = format!("m-{}", Uuid::new_v4());
-        let args = default_test_model(&model_name);
         let model = store
-            .create_model(
-                args.0,
-                args.1,
-                args.2,
-                args.3,
-                args.4,
-                args.5,
-                args.6,
-                args.7,
-                args.8,
-                args.9,
-                args.10,
-                args.11,
-                args.12,
-                args.13,
-                args.14,
-                args.15,
-                args.16,
-                args.17,
-                args.18,
-                &args.19,
-                &args.20,
-                &args.21,
-                args.22,
-                args.23,
-                true,
-                "",
-                "",
-                "",
-                &[],
-                "",
-                &Default::default(),
-                0.0,
-                "static",
-                &Default::default(),
-                &[],
-            )
+            .create_model(&NewModel::new(&model_name, default_test_fields()))
             .await
             .expect("create model");
         fixtures.track_model(model.id);
@@ -8312,45 +7841,8 @@ mod tests {
         let mut fixtures = FixtureGuard::new(&store);
 
         let model_name = format!("m-{}", Uuid::new_v4());
-        let args = default_test_model(&model_name);
         let model = store
-            .create_model(
-                args.0,
-                args.1,
-                args.2,
-                args.3,
-                args.4,
-                args.5,
-                args.6,
-                args.7,
-                args.8,
-                args.9,
-                args.10,
-                args.11,
-                args.12,
-                args.13,
-                args.14,
-                args.15,
-                args.16,
-                args.17,
-                args.18,
-                &args.19,
-                &args.20,
-                &args.21,
-                args.22,
-                args.23,
-                true,
-                "",
-                "",
-                "",
-                &[],
-                "",
-                &Default::default(),
-                0.0,
-                "static",
-                &Default::default(),
-                &[],
-            )
+            .create_model(&NewModel::new(&model_name, default_test_fields()))
             .await
             .expect("create model");
         fixtures.track_model(model.id);
@@ -8531,45 +8023,14 @@ mod tests {
             .expect("create mcp server");
         fixtures.track_mcp_server(server.id);
         let name = format!("m-{}", Uuid::new_v4());
-        let args = default_test_model(&name);
         let model = store
-            .create_model(
-                args.0,
-                args.1,
-                args.2,
-                args.3,
-                args.4,
-                args.5,
-                args.6,
-                args.7,
-                args.8,
-                args.9,
-                args.10,
-                args.11,
-                args.12,
-                args.13,
-                args.14,
-                args.15,
-                args.16,
-                args.17,
-                args.18,
-                &args.19,
-                &args.20,
-                &[old.clone(), other.clone()],
-                args.22,
-                args.23,
-                true,
-                "",
-                "",
-                "",
-                &[],
-                "",
-                &Default::default(),
-                0.0,
-                "static",
-                &Default::default(),
-                &[],
-            )
+            .create_model(&NewModel::new(
+                &name,
+                ModelFields {
+                    tool_servers: vec![old.clone(), other.clone()],
+                    ..default_test_fields()
+                },
+            ))
             .await
             .expect("create model");
         fixtures.track_model(model.id);
@@ -8613,89 +8074,27 @@ mod tests {
 
         // One model granted both servers, one granted only the surviving one.
         let both_name = format!("m-{}", Uuid::new_v4());
-        let args = default_test_model(&both_name);
         let both = store
-            .create_model(
-                args.0,
-                args.1,
-                args.2,
-                args.3,
-                args.4,
-                args.5,
-                args.6,
-                args.7,
-                args.8,
-                args.9,
-                args.10,
-                args.11,
-                args.12,
-                args.13,
-                args.14,
-                args.15,
-                args.16,
-                args.17,
-                args.18,
-                &args.19,
-                &args.20,
-                &[doomed.clone(), kept.clone()],
-                args.22,
-                args.23,
-                true,
-                "",
-                "",
-                "",
-                &[],
-                "",
-                &Default::default(),
-                0.0,
-                "static",
-                &Default::default(),
-                &[],
-            )
+            .create_model(&NewModel::new(
+                &both_name,
+                ModelFields {
+                    tool_servers: vec![doomed.clone(), kept.clone()],
+                    ..default_test_fields()
+                },
+            ))
             .await
             .expect("create model with both grants");
         fixtures.track_model(both.id);
 
         let kept_only_name = format!("m-{}", Uuid::new_v4());
-        let args = default_test_model(&kept_only_name);
         let kept_only = store
-            .create_model(
-                args.0,
-                args.1,
-                args.2,
-                args.3,
-                args.4,
-                args.5,
-                args.6,
-                args.7,
-                args.8,
-                args.9,
-                args.10,
-                args.11,
-                args.12,
-                args.13,
-                args.14,
-                args.15,
-                args.16,
-                args.17,
-                args.18,
-                &args.19,
-                &args.20,
-                std::slice::from_ref(&kept),
-                args.22,
-                args.23,
-                true,
-                "",
-                "",
-                "",
-                &[],
-                "",
-                &Default::default(),
-                0.0,
-                "static",
-                &Default::default(),
-                &[],
-            )
+            .create_model(&NewModel::new(
+                &kept_only_name,
+                ModelFields {
+                    tool_servers: vec![kept.clone()],
+                    ..default_test_fields()
+                },
+            ))
             .await
             .expect("create model with kept grant");
         fixtures.track_model(kept_only.id);
@@ -8738,45 +8137,8 @@ mod tests {
         let mut fixtures = FixtureGuard::new(&store);
 
         let model_name = format!("m-{}", Uuid::new_v4());
-        let args = default_test_model(&model_name);
         let model = store
-            .create_model(
-                args.0,
-                args.1,
-                args.2,
-                args.3,
-                args.4,
-                args.5,
-                args.6,
-                args.7,
-                args.8,
-                args.9,
-                args.10,
-                args.11,
-                args.12,
-                args.13,
-                args.14,
-                args.15,
-                args.16,
-                args.17,
-                args.18,
-                &args.19,
-                &args.20,
-                &args.21,
-                args.22,
-                args.23,
-                true,
-                "",
-                "",
-                "",
-                &[],
-                "",
-                &Default::default(),
-                0.0,
-                "static",
-                &Default::default(),
-                &[],
-            )
+            .create_model(&NewModel::new(&model_name, default_test_fields()))
             .await
             .expect("create model");
         fixtures.track_model(model.id);
@@ -8822,43 +8184,20 @@ mod tests {
 
         // Same positional create_model call as `tenant_key_audit_roundtrip`.
         let model = store
-            .create_model(
-                &format!("m-{}", Uuid::new_v4()),
-                "replica-survival test model",
-                "upstream-model",
-                "http://127.0.0.1:8081",
-                None,
-                "chat",
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                8192,
-                100,
-                None,
-                false,
-                true,
-                false,
-                false,
-                false,
-                &[],
-                &[],
-                &[],
-                0,
-                1.0,
-                true,
-                "",
-                "",
-                "",
-                &[],
-                "",
-                &Default::default(),
-                0.0,
-                "static",
-                &Default::default(),
-                &[],
-            )
+            .create_model(&NewModel::new(
+                format!("m-{}", Uuid::new_v4()),
+                ModelFields {
+                    description: "replica-survival test model".into(),
+                    upstream_model: "upstream-model".into(),
+                    api_base: "http://127.0.0.1:8081".into(),
+                    model_type: "chat".into(),
+                    context_window: 8192,
+                    admission_weight: 100,
+                    supports_system_messages: true,
+                    route_bias: 1.0,
+                    ..default_test_fields()
+                },
+            ))
             .await
             .expect("create model");
         fixtures.track_model(model.id);
@@ -9002,43 +8341,22 @@ mod tests {
         let mut fixtures = FixtureGuard::new(&store);
 
         let model = store
-            .create_model(
-                &format!("enabled-{}", Uuid::new_v4()),
-                "enabled switch test model",
-                "upstream-model",
-                "http://127.0.0.1:8081",
-                None,
-                "chat",
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                8192,
-                100,
-                Some(12),
-                false,
-                true,
-                false,
-                false,
-                false,
-                &["coding".to_string()],
-                &[],
-                &[],
-                0,
-                1.0,
-                true,
-                "",
-                "",
-                "",
-                &[],
-                "",
-                &Default::default(),
-                0.0,
-                "static",
-                &Default::default(),
-                &[],
-            )
+            .create_model(&NewModel::new(
+                format!("enabled-{}", Uuid::new_v4()),
+                ModelFields {
+                    description: "enabled switch test model".into(),
+                    upstream_model: "upstream-model".into(),
+                    api_base: "http://127.0.0.1:8081".into(),
+                    model_type: "chat".into(),
+                    context_window: 8192,
+                    admission_weight: 100,
+                    max_in_flight: Some(12),
+                    supports_system_messages: true,
+                    tags: vec!["coding".to_string()],
+                    route_bias: 1.0,
+                    ..default_test_fields()
+                },
+            ))
             .await
             .expect("create model");
         fixtures.track_model(model.id);
@@ -9081,43 +8399,20 @@ mod tests {
         let mut fixtures = FixtureGuard::new(&store);
 
         let model = store
-            .create_model(
-                &format!("diag-{}", Uuid::new_v4()),
-                "debug diagnostics test model",
-                "upstream-model",
-                "http://127.0.0.1:8081",
-                None,
-                "chat",
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                8192,
-                100,
-                None,
-                false,
-                true,
-                false,
-                false,
-                false,
-                &[],
-                &[],
-                &[],
-                0,
-                1.0,
-                true,
-                "",
-                "",
-                "",
-                &[],
-                "",
-                &Default::default(),
-                0.0,
-                "static",
-                &Default::default(),
-                &[],
-            )
+            .create_model(&NewModel::new(
+                format!("diag-{}", Uuid::new_v4()),
+                ModelFields {
+                    description: "debug diagnostics test model".into(),
+                    upstream_model: "upstream-model".into(),
+                    api_base: "http://127.0.0.1:8081".into(),
+                    model_type: "chat".into(),
+                    context_window: 8192,
+                    admission_weight: 100,
+                    supports_system_messages: true,
+                    route_bias: 1.0,
+                    ..default_test_fields()
+                },
+            ))
             .await
             .expect("create model");
         fixtures.track_model(model.id);
@@ -9178,45 +8473,8 @@ mod tests {
         let mut fixtures = FixtureGuard::new(&store);
 
         let model_name = format!("m-{}", Uuid::new_v4());
-        let args = default_test_model(&model_name);
         let model = store
-            .create_model(
-                args.0,
-                args.1,
-                args.2,
-                args.3,
-                args.4,
-                args.5,
-                args.6,
-                args.7,
-                args.8,
-                args.9,
-                args.10,
-                args.11,
-                args.12,
-                args.13,
-                args.14,
-                args.15,
-                args.16,
-                args.17,
-                args.18,
-                &args.19,
-                &args.20,
-                &args.21,
-                args.22,
-                args.23,
-                true,
-                "",
-                "",
-                "",
-                &[],
-                "",
-                &Default::default(),
-                0.0,
-                "static",
-                &Default::default(),
-                &[],
-            )
+            .create_model(&NewModel::new(&model_name, default_test_fields()))
             .await
             .expect("create model");
         fixtures.track_model(model.id);
@@ -9299,43 +8557,21 @@ mod tests {
         let mut fixtures = FixtureGuard::new(&store);
 
         let model = store
-            .create_model(
-                &format!("eslots-{}", Uuid::new_v4()),
-                "energy slots test model",
-                "upstream-model",
-                "http://127.0.0.1:8081",
-                None,
-                "chat",
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                8192,
-                100,
-                None,
-                false,
-                true,
-                false,
-                false,
-                false,
-                &[],
-                &[],
-                &[],
-                8,
-                1.0,
-                true,
-                "",
-                "",
-                "",
-                &[],
-                "",
-                &Default::default(),
-                0.0,
-                "static",
-                &Default::default(),
-                &[],
-            )
+            .create_model(&NewModel::new(
+                format!("eslots-{}", Uuid::new_v4()),
+                ModelFields {
+                    description: "energy slots test model".into(),
+                    upstream_model: "upstream-model".into(),
+                    api_base: "http://127.0.0.1:8081".into(),
+                    model_type: "chat".into(),
+                    context_window: 8192,
+                    admission_weight: 100,
+                    supports_system_messages: true,
+                    energy_slots_per_node: 8,
+                    route_bias: 1.0,
+                    ..default_test_fields()
+                },
+            ))
             .await
             .expect("create model");
         fixtures.track_model(model.id);
@@ -9401,46 +8637,14 @@ mod tests {
         let mut fixtures = FixtureGuard::new(&store);
 
         let model_name = format!("biased-{}", Uuid::new_v4());
-        let mut args = default_test_model(&model_name);
-        args.23 = 1.4;
         let model = store
-            .create_model(
-                args.0,
-                args.1,
-                args.2,
-                args.3,
-                args.4,
-                args.5,
-                args.6,
-                args.7,
-                args.8,
-                args.9,
-                args.10,
-                args.11,
-                args.12,
-                args.13,
-                args.14,
-                args.15,
-                args.16,
-                args.17,
-                args.18,
-                &args.19,
-                &args.20,
-                &args.21,
-                args.22,
-                args.23,
-                true,
-                "",
-                "",
-                "",
-                &[],
-                "",
-                &Default::default(),
-                0.0,
-                "static",
-                &Default::default(),
-                &[],
-            )
+            .create_model(&NewModel::new(
+                &model_name,
+                ModelFields {
+                    route_bias: 1.4,
+                    ..default_test_fields()
+                },
+            ))
             .await
             .expect("create model");
         fixtures.track_model(model.id);
@@ -9468,6 +8672,118 @@ mod tests {
     }
 
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
+    /// A create sets everything it was asked in one statement: the switch,
+    /// lifecycle, refused fields, session affinity and health interval come
+    /// back from the one call, and a create that fails leaves no row. An
+    /// update keeps the settings it was not given and clears the ones it was.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_create_sets_every_setting_in_one_statement_or_leaves_nothing() {
+        let Some(url) = crate::test_support::test_db_url() else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        let mut fixtures = FixtureGuard::new(&store);
+
+        let name = format!("m-{}", Uuid::new_v4());
+        let affinity = obleth_config::ModelSessionAffinity {
+            enabled: Some(true),
+            hold_ms: Some(2_000),
+            ..Default::default()
+        };
+        let new = NewModel {
+            model_name: name.clone(),
+            fields: ModelFields {
+                aliases: vec![format!("{name}-alias")],
+                quantization: "fp8".into(),
+                ..default_test_fields()
+            },
+            enabled: false,
+            lifecycle: obleth_config::ModelLifecycle {
+                status: obleth_config::ModelStatus::Staged,
+                changed_at: Some(chrono::Utc::now()),
+                ..Default::default()
+            },
+            rejected_request_fields: vec!["logprobs".into(), " logprobs ".into()],
+            session_affinity: affinity,
+            health_check_interval_secs: 120,
+        };
+        let model = store.create_model(&new).await.expect("create");
+        fixtures.track_model(model.id);
+        assert!(!model.enabled);
+        assert_eq!(model.lifecycle.status, obleth_config::ModelStatus::Staged);
+        assert_eq!(model.rejected_request_fields, vec!["logprobs".to_string()]);
+        assert_eq!(model.session_affinity, affinity);
+        assert_eq!(model.aliases, vec![format!("{name}-alias")]);
+        assert_eq!(model.quantization, "fp8");
+        let health = store
+            .get_model_health_summary(model.id)
+            .await
+            .expect("health");
+        assert_eq!(health.check_interval_secs, 120);
+
+        // The same name again is refused, and the refused create leaves
+        // nothing behind: still one row.
+        assert!(store.create_model(&new).await.is_err());
+        let rows: i64 = sqlx::query_scalar("select count(*) from models where model_name = $1")
+            .bind(&name)
+            .fetch_one(store.pool())
+            .await
+            .expect("count");
+        assert_eq!(rows, 1);
+
+        let update = |fields: ModelFields,
+                      rejected: Option<Vec<String>>,
+                      affinity: Option<obleth_config::ModelSessionAffinity>| {
+            ModelUpdate {
+                fields,
+                enabled: true,
+                rejected_request_fields: rejected,
+                session_affinity: affinity,
+            }
+        };
+        let kept = store
+            .update_model(
+                model.id,
+                &update(
+                    ModelFields {
+                        description: "changed".into(),
+                        ..default_test_fields()
+                    },
+                    None,
+                    None,
+                ),
+            )
+            .await
+            .expect("update");
+        assert!(kept.enabled);
+        assert_eq!(kept.description, "changed");
+        assert_eq!(kept.rejected_request_fields, vec!["logprobs".to_string()]);
+        assert_eq!(kept.session_affinity, affinity);
+        let cleared = store
+            .update_model(
+                model.id,
+                &update(
+                    default_test_fields(),
+                    Some(Vec::new()),
+                    Some(Default::default()),
+                ),
+            )
+            .await
+            .expect("update");
+        assert!(cleared.rejected_request_fields.is_empty());
+        assert_eq!(cleared.session_affinity, Default::default());
+        assert!(matches!(
+            store
+                .update_model(Uuid::new_v4(), &update(default_test_fields(), None, None))
+                .await,
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
     /// An auto-excluded model must stay excluded across reads, across an
     /// unrelated update, and in the resolved view the router actually consumes.
     /// The tolerant reads that back this column default to `true`, so a
@@ -9485,45 +8801,14 @@ mod tests {
         let mut fixtures = FixtureGuard::new(&store);
 
         let model_name = format!("excluded-{}", Uuid::new_v4());
-        let args = default_test_model(&model_name);
         let model = store
-            .create_model(
-                args.0,
-                args.1,
-                args.2,
-                args.3,
-                args.4,
-                args.5,
-                args.6,
-                args.7,
-                args.8,
-                args.9,
-                args.10,
-                args.11,
-                args.12,
-                args.13,
-                args.14,
-                args.15,
-                args.16,
-                args.17,
-                args.18,
-                &args.19,
-                &args.20,
-                &args.21,
-                args.22,
-                args.23,
-                false,
-                "",
-                "",
-                "",
-                &[],
-                "",
-                &Default::default(),
-                0.0,
-                "static",
-                &Default::default(),
-                &[],
-            )
+            .create_model(&NewModel::new(
+                &model_name,
+                ModelFields {
+                    auto_eligible: false,
+                    ..default_test_fields()
+                },
+            ))
             .await
             .expect("create model");
         fixtures.track_model(model.id);
@@ -9589,45 +8874,8 @@ mod tests {
         let mut fixtures = FixtureGuard::new(&store);
 
         let model_name = format!("included-{}", Uuid::new_v4());
-        let args = default_test_model(&model_name);
         let model = store
-            .create_model(
-                args.0,
-                args.1,
-                args.2,
-                args.3,
-                args.4,
-                args.5,
-                args.6,
-                args.7,
-                args.8,
-                args.9,
-                args.10,
-                args.11,
-                args.12,
-                args.13,
-                args.14,
-                args.15,
-                args.16,
-                args.17,
-                args.18,
-                &args.19,
-                &args.20,
-                &args.21,
-                args.22,
-                args.23,
-                true,
-                "",
-                "",
-                "",
-                &[],
-                "",
-                &Default::default(),
-                0.0,
-                "static",
-                &Default::default(),
-                &[],
-            )
+            .create_model(&NewModel::new(&model_name, default_test_fields()))
             .await
             .expect("create model");
         fixtures.track_model(model.id);
@@ -9663,45 +8911,8 @@ mod tests {
         let mut fixtures = FixtureGuard::new(&store);
 
         let model_name = format!("plain-{}", Uuid::new_v4());
-        let args = default_test_model(&model_name);
         let model = store
-            .create_model(
-                args.0,
-                args.1,
-                args.2,
-                args.3,
-                args.4,
-                args.5,
-                args.6,
-                args.7,
-                args.8,
-                args.9,
-                args.10,
-                args.11,
-                args.12,
-                args.13,
-                args.14,
-                args.15,
-                args.16,
-                args.17,
-                args.18,
-                &args.19,
-                &args.20,
-                &args.21,
-                args.22,
-                args.23,
-                true,
-                "",
-                "",
-                "",
-                &[],
-                "",
-                &Default::default(),
-                0.0,
-                "static",
-                &Default::default(),
-                &[],
-            )
+            .create_model(&NewModel::new(&model_name, default_test_fields()))
             .await
             .expect("create model");
         fixtures.track_model(model.id);
