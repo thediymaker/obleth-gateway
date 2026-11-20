@@ -276,8 +276,21 @@ export function fieldChanges(e: AuditEntry, previous: AuditEntry | undefined): F
 }
 
 /** The same thing's previous event in the loaded rows (older), for comparing. */
-export function previousOf(e: AuditEntry, entries: AuditEntry[]): AuditEntry | undefined {
-  return entries.find((x) => x.id < e.id && x.entity_type === e.entity_type && x.entity_id === e.entity_id && (e.entity_type !== "settings" || x.action === e.action));
+/**
+ * Each entry's previous change to the same thing (for settings, the same
+ * kind of change), by entry id, in one pass: what a line compares with.
+ * Entries without an earlier one in view are absent.
+ */
+export function previousEntries(entries: AuditEntry[]): Map<number, AuditEntry> {
+  const thing = (e: AuditEntry) => `${e.entity_type}\u0000${e.entity_id}\u0000${e.entity_type === "settings" ? e.action : ""}`;
+  const previous = new Map<number, AuditEntry>();
+  const last = new Map<string, AuditEntry>();
+  for (const e of [...entries].sort((a, b) => a.id - b.id)) {
+    const before = last.get(thing(e));
+    if (before) previous.set(e.id, before);
+    last.set(thing(e), e);
+  }
+  return previous;
 }
 
 /** A one-line summary of what changed, for the event's line: "classifier_model router-classifier-v1 → router-classifier-v2". */

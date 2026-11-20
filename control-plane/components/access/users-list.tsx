@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState, useTransition } from "react";
+import { memo, useCallback, useDeferredValue, useMemo, useState, useTransition } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { MoreHorizontal, Search } from "lucide-react";
@@ -11,9 +11,11 @@ import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { ListFooter, useRowLimit } from "@/components/ui/list-footer";
 import { Select } from "@/components/ui/select";
 import { lastUsed, reachLabel, reachOf, tenantHref, type Reach } from "@/lib/access-model";
 import type { AdminUser } from "@/lib/auth/users";
+import { useLatestCallback } from "@/lib/use-latest-callback";
 import { cn } from "@/lib/utils";
 
 type Show = "everyone" | "admins" | "portal" | "none";
@@ -116,6 +118,48 @@ function ChangeDialog({ user, tenants, onClose, onDone }: { user: AdminUser; ten
   );
 }
 
+/** One person's row. Memoised: typing in the search leaves it alone. */
+const UserRow = memo(function UserRow({ user: u, reach, tenantName: tname, isMe, lastAdmin, onChange, onTakeAway, onOpen }: {
+  user: AdminUser;
+  reach: Reach;
+  tenantName: string | undefined;
+  isMe: boolean;
+  /** The only admin: their access cannot be taken away. */
+  lastAdmin: boolean;
+  onChange: (u: AdminUser) => void;
+  onTakeAway: (u: AdminUser) => void;
+  onOpen: (href: string) => void;
+}) {
+  return (
+    <div className={cn("grid min-h-[50px] items-center gap-3.5 border-t border-border px-[18px] py-2 text-[13px]", COLS)}>
+      <span className="flex min-w-0 flex-col">
+        <span className="truncate font-medium">{u.email}</span>
+        {(isMe || lastAdmin) && <span className="text-[11.5px] text-muted-foreground">{[isMe ? "you" : null, lastAdmin ? "the only admin" : null].filter(Boolean).join(" · ")}</span>}
+      </span>
+      <span><Pill>{u.role === "admin" ? "Admin" : "User"}</Pill></span>
+      <span className="text-secondary-foreground">Active</span>
+      <span className="truncate">
+        {tname ? <Link href={tenantHref({ name: tname })} className="underline decoration-muted-foreground/40 underline-offset-[3px] hover:decoration-foreground">{tname}</Link> : <span className="text-muted-foreground">{u.tenantId ? "Deleted tenant" : "No tenant"}</span>}
+      </span>
+      <span className="min-w-0"><Pill inverted={reach === "nothing"} className="max-w-full truncate">{reachLabel(reach, tname)}</Pill></span>
+      <span className="font-mono text-[12px] text-muted-foreground">{joined(u.createdAt)}</span>
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <button type="button" aria-label={`Change ${u.email}`} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-muted-foreground hover:bg-secondary hover:text-foreground"><MoreHorizontal className="h-4 w-4" /></button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end">
+          <DropdownMenuItem onSelect={() => onChange(u)}>Change role or tenant…</DropdownMenuItem>
+          {u.tenantId && tname && <DropdownMenuItem onSelect={() => onOpen(tenantHref({ name: tname }))}>Open {tname}</DropdownMenuItem>}
+          <DropdownMenuSeparator />
+          <DropdownMenuItem disabled={isMe || lastAdmin} onSelect={() => onTakeAway(u)}>
+            {isMe ? "Take access away (not your own)" : lastAdmin ? "Take access away (the only admin)" : "Take access away…"}
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </div>
+  );
+});
+
 export function UsersList({ users, tenants, me }: { users: AdminUser[]; tenants: { id: string; name: string }[]; me: string }) {
   const router = useRouter();
   const { confirm, confirmElement } = useConfirm();
@@ -132,12 +176,16 @@ export function UsersList({ users, tenants, me }: { users: AdminUser[]; tenants:
   const admins = active.filter((u) => u.role === "admin");
   const reach = (u: AdminUser): Reach => reachOf(u);
   const stranded = active.filter((u) => reach(u) === "nothing");
-  const q = query.trim().toLowerCase();
+  // The search box stays responsive; the rows catch up when typing pauses.
+  const q = useDeferredValue(query).trim().toLowerCase();
   const shown = active
     .filter((u) => show === "everyone" || (show === "admins" && u.role === "admin") || (show === "portal" && reach(u) === "portal") || (show === "none" && reach(u) === "nothing"))
     .filter((u) => !tenant || u.tenantId === tenant)
     .filter((u) => !q || `${u.email} ${names.get(u.tenantId ?? "") ?? ""}`.toLowerCase().includes(q))
     .sort((a, b) => Number(b.id === me) - Number(a.id === me) || Number(b.role === "admin") - Number(a.role === "admin") || a.email.localeCompare(b.email));
+
+  const { visible, more, showMore } = useRowLimit(shown);
+  const open = useCallback((href: string) => router.push(href), [router]);
 
   const done = (text: string | null, error?: boolean) => {
     if (text) setNotice({ text, strong: error });
@@ -156,6 +204,8 @@ export function UsersList({ users, tenants, me }: { users: AdminUser[]; tenants:
       done(res.ok ? `${u.email} is back to waiting for approval.` : res.error, !res.ok);
     });
   }
+
+  const onTakeAway = useLatestCallback(takeAway);
 
   const line = [
     `${users.length} ${users.length === 1 ? "person" : "people"}`,
@@ -210,41 +260,13 @@ export function UsersList({ users, tenants, me }: { users: AdminUser[]; tenants:
               <span>Person</span><span>Role</span><span>Status</span><span>Tenant</span><span>Can reach</span><span>Joined</span><span />
             </div>
             {shown.length === 0 && <p className="border-t border-border px-[18px] py-8 text-center text-[13px] text-muted-foreground">{active.length ? "Nobody matches these filters." : "Nobody is approved yet."}</p>}
-            {shown.map((u) => {
-              const r = reach(u);
+            {visible.map((u) => {
               const tname = u.tenantId ? names.get(u.tenantId) : undefined;
-              const lastAdmin = u.role === "admin" && admins.length === 1;
-              return (
-                <div key={u.id} className={cn("grid min-h-[50px] items-center gap-3.5 border-t border-border px-[18px] py-2 text-[13px]", COLS)}>
-                  <span className="flex min-w-0 flex-col">
-                    <span className="truncate font-medium">{u.email}</span>
-                    {(u.id === me || lastAdmin) && <span className="text-[11.5px] text-muted-foreground">{[u.id === me ? "you" : null, lastAdmin ? "the only admin" : null].filter(Boolean).join(" · ")}</span>}
-                  </span>
-                  <span><Pill>{u.role === "admin" ? "Admin" : "User"}</Pill></span>
-                  <span className="text-secondary-foreground">Active</span>
-                  <span className="truncate">
-                    {tname ? <Link href={tenantHref({ name: tname })} className="underline decoration-muted-foreground/40 underline-offset-[3px] hover:decoration-foreground">{tname}</Link> : <span className="text-muted-foreground">{u.tenantId ? "Deleted tenant" : "No tenant"}</span>}
-                  </span>
-                  <span className="min-w-0"><Pill inverted={r === "nothing"} className="max-w-full truncate">{reachLabel(r, tname)}</Pill></span>
-                  <span className="font-mono text-[12px] text-muted-foreground">{joined(u.createdAt)}</span>
-                  <DropdownMenu>
-                    <DropdownMenuTrigger asChild>
-                      <button type="button" aria-label={`Change ${u.email}`} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-muted-foreground hover:bg-secondary hover:text-foreground"><MoreHorizontal className="h-4 w-4" /></button>
-                    </DropdownMenuTrigger>
-                    <DropdownMenuContent align="end">
-                      <DropdownMenuItem onSelect={() => setChanging(u)}>Change role or tenant…</DropdownMenuItem>
-                      {u.tenantId && tname && <DropdownMenuItem onSelect={() => router.push(tenantHref({ name: tname }))}>Open {tname}</DropdownMenuItem>}
-                      <DropdownMenuSeparator />
-                      <DropdownMenuItem disabled={u.id === me || lastAdmin} onSelect={() => takeAway(u)}>
-                        {u.id === me ? "Take access away (not your own)" : lastAdmin ? "Take access away (the only admin)" : "Take access away…"}
-                      </DropdownMenuItem>
-                    </DropdownMenuContent>
-                  </DropdownMenu>
-                </div>
-              );
+              return <UserRow key={u.id} user={u} reach={reach(u)} tenantName={tname} isMe={u.id === me} lastAdmin={u.role === "admin" && admins.length === 1} onChange={setChanging} onTakeAway={onTakeAway} onOpen={open} />;
             })}
           </div>
         </div>
+        <ListFooter shown={visible.length} total={shown.length} noun="people" more={more} onMore={showMore} action="Show more" />
         <p className="border-t border-border px-[18px] py-3 text-[12.5px] text-muted-foreground">The ⋯ menu changes role and tenant, or takes access away (they go back to waiting for approval). You can&apos;t remove the last admin.</p>
       </section>
 

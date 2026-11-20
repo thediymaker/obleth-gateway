@@ -1,5 +1,6 @@
 import type { AdminUser } from "@/lib/auth/users";
-import type { ApiKey, BudgetUsage, FairshareLiveView, KeyUsageSummary, Tenant, UsageAgg, WeeklyWindow } from "@/lib/obleth";
+import { networksSummary } from "@/lib/key-networks";
+import type { ApiKey, BudgetUsage, FairshareLiveView, KeyUsageSummary, NamedNetwork, Tenant, UsageAgg, WeeklyWindow } from "@/lib/obleth";
 
 /**
  * The Tenants, API Keys and Users pages' pure logic: time zones and access
@@ -236,9 +237,22 @@ export interface TenantRow {
   waiting: number;
 }
 
+/** Each tenant's keys, counted: what the Tenants page sends instead of every key. */
+export type KeyCounts = Record<string, { keys: number; off: number }>;
+
+export function countKeys(keys: Pick<ApiKey, "tenant_id" | "disabled">[]): KeyCounts {
+  const counts: KeyCounts = {};
+  for (const k of keys) {
+    const c = (counts[k.tenant_id] ??= { keys: 0, off: 0 });
+    c.keys += 1;
+    if (k.disabled) c.off += 1;
+  }
+  return counts;
+}
+
 export function buildTenantRows(
   tenants: Tenant[],
-  keys: Pick<ApiKey, "tenant_id" | "disabled">[],
+  keyCounts: KeyCounts,
   users: Pick<AdminUser, "tenantId">[],
   usage24h: UsageAgg[],
   budgets: BudgetUsage[],
@@ -248,11 +262,13 @@ export function buildTenantRows(
   const use = new Map(usage24h.map((u) => [u.tenant_id, u]));
   const budget = new Map(budgets.filter((b) => b.scope === "tenant").map((b) => [b.id, b]));
   const live = new Map((fairshare?.tenants ?? []).map((t) => [t.tenant_id, t]));
+  const people = new Map<string, number>();
+  for (const u of users) if (u.tenantId) people.set(u.tenantId, (people.get(u.tenantId) ?? 0) + 1);
   return tenants.map((t) => ({
     tenant: t,
-    keys: keys.filter((k) => k.tenant_id === t.id).length,
-    keysOff: keys.filter((k) => k.tenant_id === t.id && k.disabled).length,
-    users: users.filter((u) => u.tenantId === t.id).length,
+    keys: keyCounts[t.id]?.keys ?? 0,
+    keysOff: keyCounts[t.id]?.off ?? 0,
+    users: people.get(t.id) ?? 0,
     requests24h: Number(use.get(t.id)?.requests ?? 0),
     cost24h: Number(use.get(t.id)?.cost_usd ?? 0),
     budget: budgetView(budget.get(t.id), now),
@@ -316,6 +332,8 @@ export interface KeyRow {
   usage: KeyUsageSummary | undefined;
   budget: BudgetView | null;
   lastUsedMs: number;
+  /** Where the key may be used from, in words; `null` when anywhere. */
+  networks: string | null;
 }
 
 /** Per-key use covers 30 days: long enough for "last used" to mean something for
@@ -324,7 +342,14 @@ export const KEY_USAGE_WINDOW_MS = 30 * 86_400_000;
 /** The Keys page reads use for this many keys, the busiest first. */
 export const KEY_USAGE_LIMIT = 5000;
 
-export function buildKeyRows(keys: ApiKey[], tenants: Pick<Tenant, "id" | "name">[], usage: KeyUsageSummary[], budgets: BudgetUsage[], now = new Date()): KeyRow[] {
+export function buildKeyRows(
+  keys: ApiKey[],
+  tenants: Pick<Tenant, "id" | "name">[],
+  usage: KeyUsageSummary[],
+  budgets: BudgetUsage[],
+  named: readonly NamedNetwork[] = [],
+  now = new Date(),
+): KeyRow[] {
   const names = new Map(tenants.map((t) => [t.id, t.name]));
   const use = new Map(usage.map((u) => [u.key_id, u]));
   const budget = new Map(budgets.filter((b) => b.scope === "key").map((b) => [b.id, b]));
@@ -334,6 +359,10 @@ export function buildKeyRows(keys: ApiKey[], tenants: Pick<Tenant, "id" | "name"
     usage: use.get(k.id),
     budget: budgetView(budget.get(k.id), now),
     lastUsedMs: use.get(k.id)?.last_used_ms ?? 0,
+    networks:
+      k.allowed_networks?.length || k.allowed_countries?.length
+        ? networksSummary(k.allowed_networks, k.allowed_countries, named)
+        : null,
   }));
 }
 

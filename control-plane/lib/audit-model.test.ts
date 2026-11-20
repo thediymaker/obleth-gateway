@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { auditHref, buildNames, burstSummary, changeLine, fieldChanges, filtersFromParams, groupBursts, paramsFor, previousOf, queryFor, tailOf, thingHref, verbOf } from "./audit-model";
+import { auditHref, buildNames, burstSummary, changeLine, fieldChanges, filtersFromParams, groupBursts, paramsFor, previousEntries, queryFor, tailOf, thingHref, verbOf } from "./audit-model";
 import type { AuditEntry } from "./obleth";
 
 let id = 1000;
@@ -56,8 +56,13 @@ describe("what changed", () => {
     // Newer events have higher ids.
     const after = ev({ entity_type: "settings", entity_id: "auto_router", action: "set_auto_router_settings", detail: { classifier_model: "router-classifier-v2", cost_weight: 0.4, updated_at: "x" } });
     const before = ev({ entity_type: "settings", entity_id: "auto_router", action: "set_auto_router_settings", detail: { classifier_model: "router-classifier-v1", cost_weight: 0.4 } });
-    const all = [after, before];
-    expect(previousOf(after, all)).toBe(before);
+    const other = ev({ entity_type: "settings", entity_id: "auto_router", action: "set_other_settings", detail: {} });
+    const all = [other, after, before];
+    const previous = previousEntries(all);
+    expect(previous.get(after.id)).toBe(before);
+    expect(previous.has(before.id)).toBe(false);
+    // A different kind of settings change is not compared with.
+    expect(previous.has(other.id)).toBe(false);
     expect(fieldChanges(after, before)).toEqual([
       { field: "classifier_model", before: "router-classifier-v1", after: "router-classifier-v2", changed: true },
       { field: "cost_weight", before: "0.4", after: "0.4", changed: false },

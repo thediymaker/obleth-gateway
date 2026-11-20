@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
@@ -33,4 +34,22 @@ export function ListFooter({ shown, total, noun, more, loading, onMore, action =
       )}
     </div>
   );
+}
+
+/** Rows a long list renders before "Show more". */
+export const LIST_STEP = 100;
+
+/**
+ * The first rows of a long list, `step` more each time it is asked: a list
+ * that renders thousands of rows stalls every keystroke and click. Pair it
+ * with `ListFooter` (`action="Show more"`). Filters change `rows`, not how
+ * many are shown, so the footer still says how many match.
+ */
+export function useRowLimit<T>(rows: readonly T[], step = LIST_STEP) {
+  const [limit, setLimit] = useState(step);
+  return {
+    visible: rows.length > limit ? rows.slice(0, limit) : rows,
+    more: rows.length > limit,
+    showMore: () => setLimit((n) => n + step),
+  };
 }

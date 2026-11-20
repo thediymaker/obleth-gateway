@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState, useTransition } from "react";
+import { memo, useCallback, useDeferredValue, useEffect, useMemo, useState, useTransition } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { Plus, Search } from "lucide-react";
 import { deleteKeysAction, setKeysDisabledAction } from "@/app/actions";
@@ -11,6 +11,7 @@ import { Notice, Tile } from "@/components/models/ui";
 import { Pill } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm-dialog";
+import { ListFooter, useRowLimit } from "@/components/ui/list-footer";
 import { Select } from "@/components/ui/select";
 import {
   buildKeyRows,
@@ -26,7 +27,6 @@ import {
 } from "@/lib/access-model";
 import { logsHref } from "@/lib/log-links";
 import { money } from "@/lib/models-model";
-import { networksSummary } from "@/lib/key-networks";
 import type { ApiKey, BudgetUsage, KeyUsageSummary, NamedNetwork, Tenant } from "@/lib/obleth";
 import { compact } from "@/lib/overview-model";
 import { cn } from "@/lib/utils";
@@ -54,6 +54,54 @@ function csv(rows: KeyRow[]): string {
   ].map(esc).join(","));
   return [head.join(","), ...lines].join("\n");
 }
+
+/** One key's row. Memoised: a keystroke or a checkbox elsewhere leaves it alone. */
+const KeyListRow = memo(function KeyListRow({ row: r, now, picked, isOpen, onOpen, onToggle }: {
+  row: KeyRow;
+  now: number;
+  picked: boolean;
+  isOpen: boolean;
+  onOpen: (id: string) => void;
+  onToggle: (id: string) => void;
+}) {
+  const k = r.key;
+  return (
+    <div
+      onClick={(e) => {
+        if (e.target instanceof Element && e.target.closest("a, button, input, label")) return;
+        onOpen(k.id);
+      }}
+      className={cn("grid min-h-[52px] cursor-pointer items-center gap-3.5 border-t border-border px-[18px] py-2 text-[13px] hover:bg-muted/30", COLS, k.disabled && "text-muted-foreground", isOpen && "bg-muted/40")}
+    >
+      <input type="checkbox" aria-label={`Select ${k.name}`} checked={picked} onChange={() => onToggle(k.id)} className="accent-foreground" />
+      <button type="button" aria-label={`Open ${k.name}`} onClick={() => onOpen(k.id)} className="flex min-w-0 flex-col text-left">
+        <span className="flex min-w-0 items-center gap-1.5">
+          <span className={cn("truncate font-medium", !k.disabled && "text-foreground")}>{k.name || k.key_prefix}</span>
+          {k.background && <Pill className="h-[18px] px-1.5 text-[10.5px]">Background</Pill>}
+          {r.networks && <Pill className="h-[18px] px-1.5 text-[10.5px]">{r.networks}</Pill>}
+        </span>
+        <span className="truncate font-mono text-[11.5px] text-muted-foreground">{k.kind === "identity" ? `identity · ${k.identity_subject ?? ""}` : `${k.key_prefix}…`}</span>
+      </button>
+      <span className="truncate">{r.tenantName}</span>
+      <span className="inline-flex items-center gap-2"><StateDot state={k.disabled ? "off" : "on"} />{k.disabled ? "Off" : "On"}</span>
+      <span className="flex min-w-0 flex-col">
+        <span className="font-mono text-[12px]">{lastUsed(r.lastUsedMs, now)}</span>
+        {r.usage?.last_model && <span className="truncate text-[11.5px] text-muted-foreground">{r.usage.last_model}</span>}
+      </span>
+      {r.usage?.requests ? (
+        <a href={logsHref({ key: k.id, window: "30d" })} title="See these requests" className="text-right font-mono text-[12px] underline decoration-muted-foreground/40 underline-offset-[3px] hover:decoration-foreground">{compact(r.usage.requests)}</a>
+      ) : (
+        <span className="text-right font-mono text-[12px] text-muted-foreground">—</span>
+      )}
+      <span className="text-right font-mono text-[12px]">{r.usage?.cost_usd ? money(r.usage.cost_usd) : "—"}</span>
+      <span className="flex min-w-0 flex-col gap-1">
+        <span className="truncate text-[12px]">{r.budget ? r.budget.label : "No budget"}</span>
+        <BudgetBar share={r.budget ? r.budget.share : null} />
+      </span>
+      <span className="text-right font-mono text-[12px]">{k.weight}</span>
+    </div>
+  );
+});
 
 export function KeysList({
   tenants,
@@ -87,8 +135,11 @@ export function KeysList({
   const [notice, setNotice] = useState<string | null>(null);
   const [now] = useState(() => Date.now());
 
-  const rows = useMemo(() => buildKeyRows(keys, tenants, usage, budgets), [keys, tenants, usage, budgets]);
-  const shown = useMemo(() => sortKeys(filterKeys(rows, filters, now), sort), [rows, filters, sort, now]);
+  const rows = useMemo(() => buildKeyRows(keys, tenants, usage, budgets, named), [keys, tenants, usage, budgets, named]);
+  // The search box stays responsive; the rows catch up when typing pauses.
+  const applied = useDeferredValue(filters);
+  const shown = useMemo(() => sortKeys(filterKeys(rows, applied, now), sort), [rows, applied, sort, now]);
+  const { visible, more, showMore } = useRowLimit(shown);
   const patch = (p: Partial<KeyFilters>) => setFilters((f) => ({ ...f, ...p }));
   const openRow = rows.find((r) => r.key.id === open) ?? null;
   const chosen = rows.filter((r) => selected.has(r.key.id));
@@ -114,9 +165,10 @@ export function KeysList({
   const idleOn = idle.filter((r) => !r.key.disabled).length;
   const tenantCount = new Set(keys.map((k) => k.tenant_id)).size;
 
+  // "Select all" takes every key the filters match, rendered or not.
   const allShown = shown.length > 0 && shown.every((r) => selected.has(r.key.id));
   const toggleAll = () => setSelected(allShown ? new Set() : new Set(shown.map((r) => r.key.id)));
-  const toggle = (id: string) => setSelected((s) => { const n = new Set(s); if (n.has(id)) n.delete(id); else n.add(id); return n; });
+  const toggle = useCallback((id: string) => setSelected((s) => { const n = new Set(s); if (n.has(id)) n.delete(id); else n.add(id); return n; }), []);
 
   function bulkDisabled(disabled: boolean) {
     start(async () => {
@@ -230,52 +282,16 @@ export function KeysList({
         <div className="overflow-x-auto">
           <div className="min-w-[1040px]">
             <div className={cn("grid items-center gap-3.5 px-[18px] py-2.5 text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground", COLS)}>
-              <input type="checkbox" aria-label="Select every key shown" checked={allShown} onChange={toggleAll} className="accent-foreground" />
+              <input type="checkbox" aria-label={`Select all ${shown.length} matching keys`} checked={allShown} onChange={toggleAll} className="accent-foreground" />
               <span>Key</span><span>Tenant</span><span>Status</span><span>Last used</span><span className="text-right">Req · 30d</span><span className="text-right">Spend</span><span>Budget this period</span><span className="text-right">Weight</span>
             </div>
             {shown.length === 0 && <p className="border-t border-border px-[18px] py-8 text-center text-[13px] text-muted-foreground">{keys.length ? "No key matches these filters." : "No keys yet."}</p>}
-            {shown.map((r) => {
-              const k = r.key;
-              return (
-                <div
-                  key={k.id}
-                  onClick={(e) => {
-                    if (e.target instanceof Element && e.target.closest("a, button, input, label")) return;
-                    setOpen(k.id);
-                  }}
-                  className={cn("grid min-h-[52px] cursor-pointer items-center gap-3.5 border-t border-border px-[18px] py-2 text-[13px] hover:bg-muted/30", COLS, k.disabled && "text-muted-foreground", open === k.id && "bg-muted/40")}
-                >
-                  <input type="checkbox" aria-label={`Select ${k.name}`} checked={selected.has(k.id)} onChange={() => toggle(k.id)} className="accent-foreground" />
-                  <button type="button" aria-label={`Open ${k.name}`} onClick={() => setOpen(k.id)} className="flex min-w-0 flex-col text-left">
-                    <span className="flex min-w-0 items-center gap-1.5">
-                      <span className={cn("truncate font-medium", !k.disabled && "text-foreground")}>{k.name || k.key_prefix}</span>
-                      {k.background && <Pill className="h-[18px] px-1.5 text-[10.5px]">Background</Pill>}
-                      {k.allowed_networks?.length || k.allowed_countries?.length ? <Pill className="h-[18px] px-1.5 text-[10.5px]">{networksSummary(k.allowed_networks, k.allowed_countries, named)}</Pill> : null}
-                    </span>
-                    <span className="truncate font-mono text-[11.5px] text-muted-foreground">{k.kind === "identity" ? `identity · ${k.identity_subject ?? ""}` : `${k.key_prefix}…`}</span>
-                  </button>
-                  <span className="truncate">{r.tenantName}</span>
-                  <span className="inline-flex items-center gap-2"><StateDot state={k.disabled ? "off" : "on"} />{k.disabled ? "Off" : "On"}</span>
-                  <span className="flex min-w-0 flex-col">
-                    <span className="font-mono text-[12px]">{lastUsed(r.lastUsedMs, now)}</span>
-                    {r.usage?.last_model && <span className="truncate text-[11.5px] text-muted-foreground">{r.usage.last_model}</span>}
-                  </span>
-                  {r.usage?.requests ? (
-                    <a href={logsHref({ key: k.id, window: "30d" })} title="See these requests" className="text-right font-mono text-[12px] underline decoration-muted-foreground/40 underline-offset-[3px] hover:decoration-foreground">{compact(r.usage.requests)}</a>
-                  ) : (
-                    <span className="text-right font-mono text-[12px] text-muted-foreground">—</span>
-                  )}
-                  <span className="text-right font-mono text-[12px]">{r.usage?.cost_usd ? money(r.usage.cost_usd) : "—"}</span>
-                  <span className="flex min-w-0 flex-col gap-1">
-                    <span className="truncate text-[12px]">{r.budget ? r.budget.label : "No budget"}</span>
-                    <BudgetBar share={r.budget ? r.budget.share : null} />
-                  </span>
-                  <span className="text-right font-mono text-[12px]">{k.weight}</span>
-                </div>
-              );
-            })}
+            {visible.map((r) => (
+              <KeyListRow key={r.key.id} row={r} now={now} picked={selected.has(r.key.id)} isOpen={open === r.key.id} onOpen={setOpen} onToggle={toggle} />
+            ))}
           </div>
         </div>
+        <ListFooter shown={visible.length} total={shown.length} noun="keys" more={more} onMore={showMore} action="Show more" />
         <div className="flex flex-wrap justify-between gap-2 border-t border-border px-[18px] py-3 text-[12.5px] text-muted-foreground">
           <span>{shown.length === keys.length ? `${keys.length} keys` : `${shown.length} of ${keys.length} keys`} · click one to see and change it</span>
           <span>

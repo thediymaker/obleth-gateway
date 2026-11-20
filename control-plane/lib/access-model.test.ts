@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildTenantRows,
+  countKeys,
   accessState,
   budgetView,
   buildKeyRows,
@@ -19,7 +21,7 @@ import {
   windowsToGrid,
   zonedToUtc,
 } from "./access-model";
-import type { ApiKey, BudgetUsage, KeyUsageSummary } from "./obleth";
+import type { ApiKey, BudgetUsage, KeyUsageSummary, Tenant } from "./obleth";
 
 const key = (over: Partial<ApiKey> = {}): ApiKey => ({
   id: "k1", tenant_id: "t1", name: "alice", description: "", key_prefix: "sk-abc", kind: "secret",
@@ -149,5 +151,30 @@ describe("what a person can reach", () => {
     expect(reachLabel(reachOf({ role: "admin", status: "active", tenantId: "t" }), "rcusers")).toBe("Dashboard and portal · rcusers");
     expect(reachLabel(reachOf({ role: "user", status: "active", tenantId: null }))).toBe("Nothing yet: no tenant");
     expect(reachOf({ role: "user", status: "pending", tenantId: "t" })).toBe("waiting");
+  });
+});
+
+describe("tenant rows from counts", () => {
+  it("count each tenant's keys and people without a scan per tenant", () => {
+    const counts = countKeys([
+      { tenant_id: "t1", disabled: false },
+      { tenant_id: "t1", disabled: true },
+      { tenant_id: "t2", disabled: false },
+    ]);
+    expect(counts).toEqual({ t1: { keys: 2, off: 1 }, t2: { keys: 1, off: 0 } });
+    const tenants = [{ id: "t1", name: "a" }, { id: "t3", name: "c" }] as unknown as Tenant[];
+    const rows = buildTenantRows(tenants, counts, [{ tenantId: "t1" }, { tenantId: "t1" }, { tenantId: null }], [], []);
+    expect(rows.map((r) => [r.keys, r.keysOff, r.users])).toEqual([[2, 1, 2], [0, 0, 0]]);
+  });
+
+  it("summarise a key's networks once, as rows are built", () => {
+    const [open, limited] = buildKeyRows(
+      [key(), key({ id: "k2", allowed_networks: ["10.0.0.0/8", "192.0.2.0/24"] })],
+      [{ id: "t1", name: "rcusers" }],
+      [],
+      [],
+    );
+    expect(open.networks).toBeNull();
+    expect(limited.networks).toBe("Only 2 networks");
   });
 });

@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { memo, useCallback, useDeferredValue, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Plus, Search } from "lucide-react";
@@ -10,6 +10,7 @@ import { useFairshareLive } from "@/components/fairshare/hooks";
 import { Tile } from "@/components/models/ui";
 import { Segmented } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
+import { ListFooter, useRowLimit } from "@/components/ui/list-footer";
 import { Select } from "@/components/ui/select";
 import {
   accessLabel,
@@ -19,6 +20,7 @@ import {
   limitsLabel,
   NEAR_BUDGET,
   sortTenants,
+  type KeyCounts,
   type TenantHas,
   type TenantRow,
   type TenantSort,
@@ -27,7 +29,7 @@ import {
 import type { AdminUser } from "@/lib/auth/users";
 import { logsHref } from "@/lib/log-links";
 import { money } from "@/lib/models-model";
-import type { ApiKey, BudgetUsage, Tenant, UsageAgg } from "@/lib/obleth";
+import type { BudgetUsage, Tenant, UsageAgg } from "@/lib/obleth";
 import { compact } from "@/lib/overview-model";
 import { cn } from "@/lib/utils";
 
@@ -55,16 +57,60 @@ function nearReason(r: TenantRow): string | null {
   return null;
 }
 
+/** One tenant's row. Memoised: typing in the search leaves it alone. */
+const TenantListRow = memo(function TenantListRow({ row: r, monthSpend, onOpen }: {
+  row: TenantRow;
+  /** This calendar month's spend. */
+  monthSpend: number;
+  onOpen: (href: string) => void;
+}) {
+  const t = r.tenant;
+  const href = tenantHref(t);
+  return (
+    <div
+      onClick={(e) => {
+        if (e.target instanceof Element && e.target.closest("a, button")) return;
+        onOpen(href);
+      }}
+      className={cn("grid min-h-[52px] cursor-pointer items-center gap-3.5 border-t border-border px-[18px] py-2 text-[13px] hover:bg-muted/30", COLS, t.status !== "active" && "text-muted-foreground")}
+    >
+      <span className="flex min-w-0 flex-col">
+        <Link href={href} className="truncate font-medium text-foreground hover:underline">{t.name}</Link>
+        <span className="truncate text-[11.5px] text-muted-foreground">{t.organization || t.description || t.contact_email || " "}</span>
+      </span>
+      <span className="inline-flex items-center gap-2"><StateDot state={tenantState(t.status)} />{TENANT_STATUS_LABEL[t.status] ?? t.status}</span>
+      <span className="truncate font-mono text-[12px]">{t.fairshare_group} · {t.weight}</span>
+      <Link href={`/keys?tenant=${t.id}`} className="text-right font-mono text-[12px] hover:underline" title={r.keysOff ? `${r.keysOff} off` : undefined}>{r.keys}</Link>
+      <span className="text-right font-mono text-[12px]">{r.users}</span>
+      {r.requests24h ? (
+        <Link href={logsHref({ team: t.id, window: "24h" })} title="See these requests" className="text-right font-mono text-[12px] underline decoration-muted-foreground/40 underline-offset-[3px] hover:decoration-foreground">{compact(r.requests24h)}</Link>
+      ) : (
+        <span className="text-right font-mono text-[12px] text-muted-foreground">0</span>
+      )}
+      <span className="flex min-w-0 flex-col gap-1">
+        <span className="truncate font-mono text-[12px]">{r.budget ? r.budget.label : `${money(monthSpend)} · no budget`}</span>
+        <BudgetBar share={r.budget ? r.budget.share : null} />
+      </span>
+      <span className="truncate text-[12px] text-secondary-foreground" title={limitsLabel(t)}>
+        {limitsLabel(t)}
+        {r.waiting > 0 && <span className="text-foreground"> · {r.waiting} waiting</span>}
+      </span>
+      <span className="truncate text-[12.5px] text-secondary-foreground" title={accessLabel(t)}>{accessLabel(t)}</span>
+    </div>
+  );
+});
+
 export function TenantsList({
   tenants,
-  keys,
+  keyCounts,
   users,
   usage24h,
   budgets,
   monthSpend,
 }: {
   tenants: Tenant[];
-  keys: ApiKey[];
+  /** Keys per tenant, counted on the server. */
+  keyCounts: KeyCounts;
   users: AdminUser[];
   usage24h: UsageAgg[];
   budgets: BudgetUsage[];
@@ -80,8 +126,12 @@ export function TenantsList({
   const [sort, setSort] = useState<TenantSort>("requests");
   const [adding, setAdding] = useState(false);
 
-  const rows = useMemo(() => buildTenantRows(tenants, keys, users, usage24h, budgets, fairshare.data), [tenants, keys, users, usage24h, budgets, fairshare.data]);
-  const shown = useMemo(() => sortTenants(filterTenants(rows, { query, status, group, has }), sort), [rows, query, status, group, has, sort]);
+  const rows = useMemo(() => buildTenantRows(tenants, keyCounts, users, usage24h, budgets, fairshare.data), [tenants, keyCounts, users, usage24h, budgets, fairshare.data]);
+  // The search box stays responsive; the rows catch up when typing pauses.
+  const applied = useDeferredValue(query);
+  const shown = useMemo(() => sortTenants(filterTenants(rows, { query: applied, status, group, has }), sort), [rows, applied, status, group, has, sort]);
+  const { visible, more, showMore } = useRowLimit(shown);
+  const open = useCallback((href: string) => router.push(href), [router]);
   const groups = [...new Set(tenants.map((t) => t.fairshare_group))].sort();
   const count = (s: string) => tenants.filter((t) => t.status === s).length;
 
@@ -93,7 +143,7 @@ export function TenantsList({
   const nearBudget = rows.filter((r) => (r.budget?.share ?? 0) >= NEAR_BUDGET).length;
   const closed = rows.filter((r) => r.access === "closed" || r.access === "ended" || r.access === "not-yet").length;
   const waiting = rows.filter((r) => r.waiting > 0).length;
-  const keysOff = keys.filter((k) => k.disabled).length;
+  const keyTotals = Object.values(keyCounts).reduce((n, c) => ({ keys: n.keys + c.keys, off: n.off + c.off }), { keys: 0, off: 0 });
   const pendingUsers = users.filter((u) => u.status !== "active").length;
   const line = [
     `${count("active")} active`,
@@ -135,7 +185,7 @@ export function TenantsList({
           pressed={has === "near-limit"}
           detail={near.length ? near.map(nearReason).join(" · ") : "None near a budget or waiting"}
         />
-        <Tile label="Keys · users" value={`${keys.length} · ${users.length}`} detail={`${keysOff} keys off · ${pendingUsers} users pending`} />
+        <Tile label="Keys · users" value={`${keyTotals.keys} · ${users.length}`} detail={`${keyTotals.off} keys off · ${pendingUsers} users pending`} />
       </div>
 
       <div className="flex flex-wrap items-center gap-2">
@@ -168,45 +218,10 @@ export function TenantsList({
               <span>Tenant</span><span>Status</span><span>Group · weight</span><span className="text-right">Keys</span><span className="text-right">Users</span><span className="text-right">Req · 24h</span><span>Spend vs budget</span><span>Limits</span><span>Access</span>
             </div>
             {shown.length === 0 && <p className="border-t border-border px-[18px] py-8 text-center text-[13px] text-muted-foreground">{tenants.length ? "No tenant matches these filters." : "No tenants yet. Add one to hand out keys."}</p>}
-            {shown.map((r) => {
-              const t = r.tenant;
-              const href = tenantHref(t);
-              return (
-                <div
-                  key={t.id}
-                  onClick={(e) => {
-                    if (e.target instanceof Element && e.target.closest("a, button")) return;
-                    router.push(href);
-                  }}
-                  className={cn("grid min-h-[52px] cursor-pointer items-center gap-3.5 border-t border-border px-[18px] py-2 text-[13px] hover:bg-muted/30", COLS, t.status !== "active" && "text-muted-foreground")}
-                >
-                  <span className="flex min-w-0 flex-col">
-                    <Link href={href} className="truncate font-medium text-foreground hover:underline">{t.name}</Link>
-                    <span className="truncate text-[11.5px] text-muted-foreground">{t.organization || t.description || t.contact_email || " "}</span>
-                  </span>
-                  <span className="inline-flex items-center gap-2"><StateDot state={tenantState(t.status)} />{TENANT_STATUS_LABEL[t.status] ?? t.status}</span>
-                  <span className="truncate font-mono text-[12px]">{t.fairshare_group} · {t.weight}</span>
-                  <Link href={`/keys?tenant=${t.id}`} className="text-right font-mono text-[12px] hover:underline" title={r.keysOff ? `${r.keysOff} off` : undefined}>{r.keys}</Link>
-                  <span className="text-right font-mono text-[12px]">{r.users}</span>
-                  {r.requests24h ? (
-                    <Link href={logsHref({ team: t.id, window: "24h" })} title="See these requests" className="text-right font-mono text-[12px] underline decoration-muted-foreground/40 underline-offset-[3px] hover:decoration-foreground">{compact(r.requests24h)}</Link>
-                  ) : (
-                    <span className="text-right font-mono text-[12px] text-muted-foreground">0</span>
-                  )}
-                  <span className="flex min-w-0 flex-col gap-1">
-                    <span className="truncate font-mono text-[12px]">{r.budget ? r.budget.label : `${money(monthSpend[t.id] ?? 0)} · no budget`}</span>
-                    <BudgetBar share={r.budget ? r.budget.share : null} />
-                  </span>
-                  <span className="truncate text-[12px] text-secondary-foreground" title={limitsLabel(t)}>
-                    {limitsLabel(t)}
-                    {r.waiting > 0 && <span className="text-foreground"> · {r.waiting} waiting</span>}
-                  </span>
-                  <span className="truncate text-[12.5px] text-secondary-foreground" title={accessLabel(t)}>{accessLabel(t)}</span>
-                </div>
-              );
-            })}
+            {visible.map((r) => <TenantListRow key={r.tenant.id} row={r} monthSpend={monthSpend[r.tenant.id] ?? 0} onOpen={open} />)}
           </div>
         </div>
+        <ListFooter shown={visible.length} total={shown.length} noun="tenants" more={more} onMore={showMore} action="Show more" />
         <div className="flex flex-wrap justify-between gap-2 border-t border-border px-[18px] py-3 text-[12.5px] text-muted-foreground">
           <span>{shown.length === tenants.length ? `${tenants.length} tenants` : `${shown.length} of ${tenants.length} tenants`} · click one for its page</span>
           <span>Policies set: guardrails {policies.guardrails} · compression {policies.compression} · tracing {policies.tracing}</span>

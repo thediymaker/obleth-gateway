@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { Bookmark, Search, X } from "lucide-react";
 import { Facets } from "@/components/logs/facets";
@@ -133,13 +133,21 @@ function Strip({ buckets, bucketMs, split, loading, onZoom }: { buckets: Histogr
   );
 }
 
-function Row({ row, selected, onOpen, now }: { row: UsageLogEntry; selected: boolean; onOpen: () => void; now: number }) {
+/** Rows newer than this show a relative time ("12 s ago"), so they follow the clock. */
+const RELATIVE_MS = 3_600_000;
+
+/**
+ * One request's row. Memoised: the 5 s clock re-renders only rows young
+ * enough to show a relative time (`now` is passed to those alone), and a
+ * keystroke in the search re-renders none.
+ */
+const Row = memo(function Row({ row, selected, onOpen, now }: { row: UsageLogEntry; selected: boolean; onOpen: (id: string) => void; now?: number }) {
   const failed = isFailure(row);
   const t = timeSplit(row);
   const pct = (ms: number) => `${t.total ? (ms / t.total) * 100 : 0}%`;
   return (
-    <tr onClick={onOpen} className={cn("cursor-pointer border-t border-border/70 transition-colors hover:bg-muted/30", selected && "bg-secondary")}>
-      <td className="whitespace-nowrap py-2 pl-[18px] pr-3 font-mono text-[12px] text-muted-foreground" title={new Date(row.ts_ms).toLocaleString()}>{when(row.ts_ms, now)}</td>
+    <tr onClick={() => onOpen(row.request_id)} className={cn("cursor-pointer border-t border-border/70 transition-colors hover:bg-muted/30", selected && "bg-secondary")}>
+      <td className="whitespace-nowrap py-2 pl-[18px] pr-3 font-mono text-[12px] text-muted-foreground" title={new Date(row.ts_ms).toLocaleString()}>{when(row.ts_ms, now ?? Date.now())}</td>
       <td className="max-w-[18rem] py-2 pr-3">
         <span className="flex min-w-0 items-center gap-2">
           <span className={cn("inline-flex h-5 shrink-0 items-center rounded-full border px-1.5 font-mono text-[11px]", failed ? "border-foreground bg-foreground font-semibold text-background" : "border-border text-secondary-foreground")}>{row.status_code}</span>
@@ -175,7 +183,7 @@ function Row({ row, selected, onOpen, now }: { row: UsageLogEntry; selected: boo
       <td className="w-8 py-2 pr-[18px] text-center text-muted-foreground" title={row.has_trace ? "Traced" : undefined}>{row.has_trace ? "◇" : ""}</td>
     </tr>
   );
-}
+});
 
 export function RequestLogs({
   tenants,
@@ -267,7 +275,10 @@ export function RequestLogs({
     return [...(head.data ?? []), ...older].filter((r) => (seen.has(r.request_id) ? false : (seen.add(r.request_id), true)));
   }, [head.data, older]);
   const range = windowRange(filters, rangeAt ?? now);
-  const buckets = fillHistogram(histogram.data?.buckets ?? [], range, histogram.data?.bucket_ms ?? bucketMs);
+  const buckets = useMemo(
+    () => fillHistogram(histogram.data?.buckets ?? [], { since: range.since, until: range.until }, histogram.data?.bucket_ms ?? bucketMs),
+    [histogram.data, range.since, range.until, bucketMs],
+  );
   const total = buckets.reduce((n, b) => n + b.requests, 0);
   const failedCount = buckets.reduce((n, b) => n + b.errors, 0);
   // Every bucket from the gateway splits its failures by side, or none does.
@@ -314,9 +325,15 @@ export function RequestLogs({
     });
   }, [rows]);
 
-  const tenantName = new Map(tenants.map((t) => [t.id, t.name]));
-  const teams = listOf(filters.tenantId);
-  const teamKeys = teams.length ? keys.filter((k) => teams.includes(k.tenantId)) : keys;
+  const tenantName = useMemo(() => new Map(tenants.map((t) => [t.id, t.name])), [tenants]);
+  const teamOptions = useMemo(() => tenants.map((t) => ({ value: t.id, label: t.name })), [tenants]);
+  const modelOptions = useMemo(() => models.map((m) => ({ value: m, label: m })), [models]);
+  // Up to 500 keys of the chosen teams, built when the team or the key list changes.
+  const keyOptions = useMemo(() => {
+    const chosen = listOf(filters.tenantId);
+    const teamKeys = chosen.length ? keys.filter((k) => chosen.includes(k.tenantId)) : keys;
+    return teamKeys.slice(0, 500).map((k) => ({ value: k.id, label: `${k.name || k.prefix}`, hint: chosen.length === 1 ? k.prefix : `${k.prefix} · ${tenantName.get(k.tenantId) ?? ""}` }));
+  }, [filters.tenantId, keys, tenantName]);
   // A `*` search's list shows in its menu as one choice: the pattern and its count.
   const listOption = (field: "model" | "tenantId" | "keyId", noun: string) => {
     const label = listLabel(filters, field, noun);
@@ -410,9 +427,9 @@ export function RequestLogs({
         {searchNote && <p className="text-xs text-foreground">{searchNote}</p>}
         <div className="flex flex-wrap items-center gap-2">
           <Select aria-label="Status" value={filters.status} onValueChange={(v) => patch({ status: v as LogFilters["status"] })} className={cn("h-8 w-auto min-w-[8.5rem] text-[12.5px]", filters.status && "border-foreground")} options={[{ value: "", label: "Any status" }, { value: "success", label: "Succeeded" }, { value: "error", label: "Failed" }]} />
-          <Select aria-label="Model" value={filters.model} onValueChange={(v) => patch(pickOne(filters, "model", v))} searchPlaceholder="Find a model" className={cn("h-8 w-auto min-w-[9rem] text-[12.5px]", filters.model && "border-foreground")} options={[{ value: "", label: "Any model" }, ...listOption("model", "models"), ...models.map((m) => ({ value: m, label: m }))]} />
-          <Select aria-label="Team" value={filters.tenantId} onValueChange={(v) => patch({ ...pickOne(filters, "tenantId", v), keyId: "" })} searchPlaceholder="Find a team" className={cn("h-8 w-auto min-w-[9rem] text-[12.5px]", filters.tenantId && "border-foreground")} options={[{ value: "", label: "Any team" }, ...listOption("tenantId", "teams"), ...tenants.map((t) => ({ value: t.id, label: t.name }))]} />
-          <Select aria-label="Key" value={filters.keyId} onValueChange={(v) => { const k = keys.find((x) => x.id === v); patch({ ...pickOne(filters, "keyId", v), ...(k ? { tenantId: k.tenantId } : {}) }); }} searchPlaceholder="Find a key" className={cn("h-8 w-auto min-w-[8rem] text-[12.5px]", filters.keyId && "border-foreground")} options={[{ value: "", label: "Any key" }, ...listOption("keyId", "keys"), ...teamKeys.slice(0, 500).map((k) => ({ value: k.id, label: `${k.name || k.prefix}`, hint: teams.length === 1 ? k.prefix : `${k.prefix} · ${tenantName.get(k.tenantId) ?? ""}` }))]} />
+          <Select aria-label="Model" value={filters.model} onValueChange={(v) => patch(pickOne(filters, "model", v))} searchPlaceholder="Find a model" className={cn("h-8 w-auto min-w-[9rem] text-[12.5px]", filters.model && "border-foreground")} options={[{ value: "", label: "Any model" }, ...listOption("model", "models"), ...modelOptions]} />
+          <Select aria-label="Team" value={filters.tenantId} onValueChange={(v) => patch({ ...pickOne(filters, "tenantId", v), keyId: "" })} searchPlaceholder="Find a team" className={cn("h-8 w-auto min-w-[9rem] text-[12.5px]", filters.tenantId && "border-foreground")} options={[{ value: "", label: "Any team" }, ...listOption("tenantId", "teams"), ...teamOptions]} />
+          <Select aria-label="Key" value={filters.keyId} onValueChange={(v) => { const k = keys.find((x) => x.id === v); patch({ ...pickOne(filters, "keyId", v), ...(k ? { tenantId: k.tenantId } : {}) }); }} searchPlaceholder="Find a key" className={cn("h-8 w-auto min-w-[8rem] text-[12.5px]", filters.keyId && "border-foreground")} options={[{ value: "", label: "Any key" }, ...listOption("keyId", "keys"), ...keyOptions]} />
           <Select aria-label="Type" value={filters.requestType} onValueChange={(v) => patch({ requestType: v })} className={cn("h-8 w-auto min-w-[7.5rem] text-[12.5px]", filters.requestType && "border-foreground")} options={[{ value: "", label: "Any type" }, ...typeOptions(seenTypes, filters.requestType).map((t) => ({ value: t, label: t }))]} />
           <Toggle on={filters.tracedOnly} onClick={() => patch({ tracedOnly: !filters.tracedOnly })}>Traced only</Toggle>
           <Toggle on={filters.includeInternal} onClick={() => patch({ includeInternal: !filters.includeInternal })}>Include health checks</Toggle>
@@ -460,7 +477,7 @@ export function RequestLogs({
               </tr>
             </thead>
             <tbody>
-              {rows.map((r) => <Row key={r.request_id} row={r} selected={r.request_id === openId} onOpen={() => setOpenId(r.request_id)} now={now} />)}
+              {rows.map((r) => <Row key={r.request_id} row={r} selected={r.request_id === openId} onOpen={setOpenId} now={now - r.ts_ms < RELATIVE_MS ? now : undefined} />)}
             </tbody>
           </table>
         </div>

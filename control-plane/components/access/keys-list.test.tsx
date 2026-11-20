@@ -123,4 +123,21 @@ describe("keys", () => {
     expect(mocks.moveKeys).toHaveBeenCalledWith(["k1"], { newTenant: { name: "alice-own", copyFrom: "t1" } });
     expect(document.body.textContent).toContain("alice-own is made and the keys are in it.");
   });
+
+  it("renders the first 100 keys, and Select all still takes every match", async () => {
+    const many = Array.from({ length: 150 }, (_, i) => ({ ...key, id: `k${i}`, name: `key-${String(i).padStart(3, "0")}` }));
+    await render(many);
+    const rows = () => host.querySelectorAll('[aria-label="Keys"] input[aria-label^="Select key-"]').length;
+    expect(rows()).toBe(100);
+    expect(host.textContent).toContain("100 of 150 keys shown");
+    await act(async () => host.querySelector<HTMLInputElement>('input[aria-label="Select all 150 matching keys"]')!.click());
+    expect(host.querySelector('[aria-label="Selected keys"]')!.textContent).toContain("150 selected");
+    await click("Show more");
+    expect(rows()).toBe(150);
+  });
+
+  it("shows where a key may be used from", async () => {
+    await render([{ ...key, allowed_networks: ["10.0.0.0/8"] }]);
+    expect(host.querySelector('[aria-label="Keys"]')!.textContent).toContain("Only 10.0.0.0/8");
+  });
 });

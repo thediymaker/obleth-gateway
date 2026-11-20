@@ -1,4 +1,5 @@
 import { TenantsList } from "@/components/access/tenants-list";
+import { countKeys } from "@/lib/access-model";
 import { requireAdmin } from "@/lib/auth/roles";
 import { listUsers, type AdminUser } from "@/lib/auth/users";
 import { obleth, type ApiKey, type BudgetUsage, type Tenant, type UsageAgg, type UsageDailyRow } from "@/lib/obleth";
@@ -26,7 +27,7 @@ export default async function TenantsPage() {
   return (
     <TenantsList
       tenants={tenants}
-      keys={keys}
+      keyCounts={countKeys(keys)}
       users={users}
       usage24h={usage24h}
       budgets={budgets}

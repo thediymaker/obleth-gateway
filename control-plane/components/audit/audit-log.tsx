@@ -1,6 +1,6 @@
 "use client";
 
-import { Fragment, useEffect, useMemo, useState, useTransition } from "react";
+import { Fragment, memo, useCallback, useEffect, useMemo, useState, useTransition } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { Download, Search, X } from "lucide-react";
@@ -21,7 +21,7 @@ import {
   KIND_LABEL,
   kindOf,
   paramsFor,
-  previousOf,
+  previousEntries,
   queryFor,
   RANGE_LABEL,
   tailOf,
@@ -62,9 +62,8 @@ function Thing({ e, names, alive }: { e: AuditEntry; names: Record<string, strin
   return <Link href={href} className={cn(cls, "underline decoration-muted-foreground/40 underline-offset-[3px] hover:decoration-foreground")}>{name}</Link>;
 }
 
-function Detail({ e, entries }: { e: AuditEntry; entries: AuditEntry[] }) {
+function Detail({ e, prev }: { e: AuditEntry; prev: AuditEntry | undefined }) {
   const [raw, setRaw] = useState(false);
-  const prev = previousOf(e, entries);
   const rows = fieldChanges(e, prev);
   return (
     <div className="mb-2 ml-[104px] mr-[18px] rounded-lg border border-border bg-background px-3.5 py-2.5">
@@ -90,13 +89,14 @@ function Detail({ e, entries }: { e: AuditEntry; entries: AuditEntry[] }) {
   );
 }
 
-function GroupLine({ g, names, alive, entries, open, onToggle }: { g: AuditGroup; names: Record<string, string>; alive: Set<string>; entries: AuditEntry[]; open: boolean; onToggle: () => void }) {
+/** One burst of changes. Memoised: typing a search or opening another line leaves it alone. */
+const GroupLine = memo(function GroupLine({ g, names, alive, previous, open, onToggle }: { g: AuditGroup; names: Record<string, string>; alive: Set<string>; previous: Map<number, AuditEntry>; open: boolean; onToggle: (id: number) => void }) {
   const e = g.events[0];
   const time = new Date(e.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   const single = g.events.length === 1;
   const sum = burstSummary(g, names);
   const tail = single ? tailOf(e, names) : null;
-  const change = single ? changeLine(e, previousOf(e, entries)) : null;
+  const change = single ? changeLine(e, previous.get(e.id)) : null;
   return (
     <>
       <div className={cn("grid min-h-[44px] grid-cols-[64px_28px_minmax(0,1fr)_110px] items-center gap-3 px-[18px] py-1.5 text-[13px] hover:bg-muted/30", open && "bg-muted/30")}>
@@ -118,16 +118,16 @@ function GroupLine({ g, names, alive, entries, open, onToggle }: { g: AuditGroup
             </>
           )}
         </span>
-        <button type="button" onClick={onToggle} aria-expanded={open} className={cn("text-right text-xs", open ? "text-foreground" : "text-muted-foreground hover:text-foreground")}>
+        <button type="button" onClick={() => onToggle(e.id)} aria-expanded={open} className={cn("text-right text-xs", open ? "text-foreground" : "text-muted-foreground hover:text-foreground")}>
           {open ? "hide" : single ? "details ›" : `${g.events.length} changes ›`}
         </button>
       </div>
       {open && (single ? (
-        <Detail e={e} entries={entries} />
+        <Detail e={e} prev={previous.get(e.id)} />
       ) : (
         <div className="mb-2 ml-[104px] mr-[18px] rounded-lg border border-border bg-background px-3.5 py-1.5">
           {g.events.map((x) => {
-            const c = changeLine(x, previousOf(x, entries));
+            const c = changeLine(x, previous.get(x.id));
             return (
               <div key={x.id} className="grid grid-cols-[56px_minmax(0,1fr)] gap-3 border-t border-border py-1.5 text-[12.5px] first:border-t-0">
                 <span className="font-mono text-[11px] text-muted-foreground">{new Date(x.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</span>
@@ -139,7 +139,7 @@ function GroupLine({ g, names, alive, entries, open, onToggle }: { g: AuditGroup
       ))}
     </>
   );
-}
+});
 
 export function AuditLog({ entries: initial, filters, names, alive: aliveIds, total }: { entries: AuditEntry[]; filters: AuditFilters; names: Record<string, string>; alive: string[]; total: number | null }) {
   const router = useRouter();
@@ -152,6 +152,8 @@ export function AuditLog({ entries: initial, filters, names, alive: aliveIds, to
   const alive = useMemo(() => new Set(aliveIds), [aliveIds]);
   const entries = useMemo(() => [...initial, ...extra], [initial, extra]);
   const groups = useMemo(() => groupBursts(entries), [entries]);
+  const previous = useMemo(() => previousEntries(entries), [entries]);
+  const toggle = useCallback((id: number) => setOpen((o) => { const n = new Set(o); if (n.has(id)) n.delete(id); else n.add(id); return n; }), []);
 
   useEffect(() => { setExtra([]); setDone(initial.length < AUDIT_PAGE); setOpen(new Set()); }, [initial]);
 
@@ -251,7 +253,7 @@ export function AuditLog({ entries: initial, filters, names, alive: aliveIds, to
           return (
             <Fragment key={id}>
               {header && <div className="border-t border-border px-[18px] pb-1.5 pt-3.5 text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground first:border-t-0">{day}</div>}
-              <GroupLine g={g} names={names} alive={alive} entries={entries} open={open.has(id)} onToggle={() => setOpen((o) => { const n = new Set(o); if (n.has(id)) n.delete(id); else n.add(id); return n; })} />
+              <GroupLine g={g} names={names} alive={alive} previous={previous} open={open.has(id)} onToggle={toggle} />
             </Fragment>
           );
         })}
