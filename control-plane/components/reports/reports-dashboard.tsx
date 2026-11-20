@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useCallback, useDeferredValue, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
@@ -17,7 +17,8 @@ import { Button } from "@/components/ui/button";
 import { Calendar } from "@/components/ui/calendar";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Select } from "@/components/ui/select";
-import type { ApiKey, Tenant, UsageDailyGroupBy, UsageDailyRow } from "@/lib/obleth";
+import type { UsageDailyGroupBy, UsageDailyRow } from "@/lib/obleth";
+import type { KeyOption, Named } from "@/lib/logs-model";
 import { linkTime, logsHref, type LogsLink } from "@/lib/log-links";
 import { compact, formatMs } from "@/lib/overview-model";
 import {
@@ -105,7 +106,10 @@ function ChartTip({ active, payload, label, measure, series }: { active?: boolea
   );
 }
 
-export function ReportsDashboard({ tenants, keys, models, retentionDays = null, modelTypes }: { tenants: Tenant[]; keys: ApiKey[]; models: string[]; retentionDays?: number | null; modelTypes?: Record<string, string> }) {
+/** Breakdown rows shown before "Show all": a long table re-rendered on every change stalls the page. */
+const TABLE_ROWS_SHOWN = 300;
+
+export function ReportsDashboard({ tenants, keys, models, retentionDays = null, modelTypes }: { tenants: Named[]; keys: KeyOption[]; models: string[]; retentionDays?: number | null; modelTypes?: Record<string, string> }) {
   const [preset, setPreset] = useState<RangePreset>("month");
   const [custom, setCustom] = useState<DateRange | undefined>();
   const [picker, setPicker] = useState(false);
@@ -117,20 +121,23 @@ export function ReportsDashboard({ tenants, keys, models, retentionDays = null, 
   const [group, setGroup] = useState<TableGroup>("tenant");
   const [sort, setSort] = useState<{ col: SortColumn; desc: boolean }>({ col: "cost_usd", desc: true });
   const [rowFilter, setRowFilter] = useState("");
+  const [showAllRows, setShowAllRows] = useState(false);
   const [exporting, setExporting] = useState(false);
 
   const router = useRouter();
-  const range: DayRange | null = preset === "custom"
+  // Stable between renders, so the chart and table below recompute only when
+  // what they show changes, not on each keystroke in the row filter.
+  const range = useMemo<DayRange | null>(() => preset === "custom"
     ? custom?.from ? { start: pickedDay(custom.from), end: pickedDay(custom.to ?? custom.from) } : null
-    : presetRange(preset);
-  const prev = range ? previousRange(range, preset) : null;
+    : presetRange(preset), [preset, custom]);
+  const prev = useMemo(() => (range ? previousRange(range, preset) : null), [range, preset]);
   const filters = { tenantId, keyId, model };
   const against = preset === "month" ? "the same days last month" : preset === "last-month" ? "the month before" : "the previous period";
 
   const names = useMemo(() => ({
     tenantNames: new Map(tenants.map((t) => [t.id, t.name])),
     keyNames: new Map(keys.map((k) => [k.id, k.name])),
-    keyPrefixes: new Map(keys.map((k) => [k.id, k.key_prefix])),
+    keyPrefixes: new Map(keys.map((k) => [k.id, k.prefix])),
   }), [tenants, keys]);
 
   const days = useDaily(range, filters, "day");
@@ -147,21 +154,38 @@ export function ReportsDashboard({ tenants, keys, models, retentionDays = null, 
   const successRate = cur.requests ? (cur.succeeded / cur.requests) * 100 : 0;
   const prevSuccess = before && before.requests ? (before.succeeded / before.requests) * 100 : null;
 
-  const labelFor = (r: UsageDailyRow) => (split === "tenant" ? names.tenantNames.get(r.tenant_id) ?? "Deleted team" : r.model || "(unknown)");
-  const chart = range ? buildChart(range, measure, split, days.data ?? [], prev && prevDays.data ? { range: prev, rows: prevDays.data } : null, splitRows.data ?? [], labelFor) : { days: [], series: [] };
-  // The newest day is still filling up until 00:00 UTC.
-  const today = isoDay(new Date());
-  const chartRows = chart.days.map((d) => ({ label: `${dayLabel(d.day)} UTC${d.day === today ? ", so far" : ""}`, tick: dayLabel(d.day), value: d.value, previous: d.previous, ...d.parts }));
+  const labelFor = useCallback(
+    (r: UsageDailyRow) => (split === "tenant" ? names.tenantNames.get(r.tenant_id) ?? "Deleted team" : r.model || "(unknown)"),
+    [split, names],
+  );
+  const chart = useMemo(
+    () => range ? buildChart(range, measure, split, days.data ?? [], prev && prevDays.data ? { range: prev, rows: prevDays.data } : null, splitRows.data ?? [], labelFor) : { days: [], series: [] },
+    [range, measure, split, days.data, prev, prevDays.data, splitRows.data, labelFor],
+  );
+  const chartRows = useMemo(() => {
+    // The newest day is still filling up until 00:00 UTC.
+    const today = isoDay(new Date());
+    return chart.days.map((d) => ({ label: `${dayLabel(d.day)} UTC${d.day === today ? ", so far" : ""}`, tick: dayLabel(d.day), value: d.value, previous: d.previous, ...d.parts }));
+  }, [chart]);
   const chartEmpty = chart.days.every((d) => !d.value);
 
   const teamRank = [...(teams.data ?? [])].sort((a, b) => b.cost_usd - a.cost_usd);
   const teamSpend = teamRank.reduce((n, r) => n + r.cost_usd, 0);
   const modelRank = [...(modelRows.data ?? [])].sort((a, b) => b.total_tokens - a.total_tokens);
-  const q = rowFilter.trim().toLowerCase();
-  const labeled = sortRows(toBreakdownRows(table.data ?? [], group, names), sort.col, sort.desc).filter((r) => !q || `${r.label} ${r.sublabel}`.toLowerCase().includes(q));
-  const tableTotal = totals(labeled);
-  const maxSpend = Math.max(...labeled.map((r) => r.cost_usd), 0);
-  const tenantKeys = tenantId ? keys.filter((k) => k.tenant_id === tenantId) : [];
+  const sorted = useMemo(
+    () => sortRows(toBreakdownRows(table.data ?? [], group, names), sort.col, sort.desc),
+    [table.data, group, names, sort],
+  );
+  // The filter box stays responsive; the table catches up when typing pauses.
+  const q = useDeferredValue(rowFilter).trim().toLowerCase();
+  const labeled = useMemo(
+    () => sorted.filter((r) => !q || `${r.label} ${r.sublabel}`.toLowerCase().includes(q)),
+    [sorted, q],
+  );
+  const tableTotal = useMemo(() => totals(labeled), [labeled]);
+  const maxSpend = useMemo(() => Math.max(...labeled.map((r) => r.cost_usd), 0), [labeled]);
+  const shownRows = showAllRows ? labeled : labeled.slice(0, TABLE_ROWS_SHOWN);
+  const tenantKeys = tenantId ? keys.filter((k) => k.tenantId === tenantId) : [];
   const filterLine = [tenantId ? names.tenantNames.get(tenantId) : "every team", keyId ? `key ${names.keyNames.get(keyId) || names.keyPrefixes.get(keyId)}` : null, model || null].filter(Boolean).join(" · ");
   const groupInfo = TABLE_GROUPS.find((g) => g.value === group)!;
 
@@ -211,7 +235,7 @@ export function ReportsDashboard({ tenants, keys, models, retentionDays = null, 
         <div className="flex flex-wrap items-center gap-2">
           <Segmented<RangePreset> label="Date range" value={preset} onChange={(v) => { setPreset(v); if (v === "custom") setPicker(true); }} options={RANGE_PRESETS.map((r) => ({ value: r.value, label: r.value === "custom" && preset === "custom" && range ? rangeLabel(range) : r.label }))} />
           <Select aria-label="Team" value={tenantId} onValueChange={(v) => { setTenantId(v); setKeyId(""); }} searchPlaceholder="Find a team" className={cn("h-9 w-auto min-w-[9rem] text-[12.5px]", tenantId && "border-foreground")} options={[{ value: "", label: "All teams" }, ...tenants.map((t) => ({ value: t.id, label: t.name }))]} />
-          {tenantId && <Select aria-label="Key" value={keyId} onValueChange={setKeyId} searchPlaceholder="Find a key" className={cn("h-9 w-auto min-w-[8rem] text-[12.5px]", keyId && "border-foreground")} options={[{ value: "", label: "All keys" }, ...tenantKeys.map((k) => ({ value: k.id, label: k.name || k.key_prefix, hint: k.key_prefix }))]} />}
+          {tenantId && <Select aria-label="Key" value={keyId} onValueChange={setKeyId} searchPlaceholder="Find a key" className={cn("h-9 w-auto min-w-[8rem] text-[12.5px]", keyId && "border-foreground")} options={[{ value: "", label: "All keys" }, ...tenantKeys.map((k) => ({ value: k.id, label: k.name || k.prefix, hint: k.prefix }))]} />}
           <Select aria-label="Model" value={model} onValueChange={setModel} searchPlaceholder="Find a model" className={cn("h-9 w-auto min-w-[9rem] text-[12.5px]", model && "border-foreground")} options={[{ value: "", label: "All models" }, ...models.map((m) => ({ value: m, label: m }))]} />
           <Button type="button" size="sm" className="h-9" disabled={!range} onClick={() => setExporting(true)}><Download className="h-3.5 w-3.5" />Export</Button>
         </div>
@@ -376,7 +400,7 @@ export function ReportsDashboard({ tenants, keys, models, retentionDays = null, 
               </tr>
             </thead>
             <tbody>
-              {labeled.map((r) => {
+              {shownRows.map((r) => {
                 const drillable = group === "tenant" || group === "key" || group === "model";
                 return (
                   <tr key={`${r.day}|${r.tenant_id}|${r.key_id}|${r.model}`} onClick={drillable ? () => drill(r) : undefined} className={cn("border-t border-border/70", drillable && "cursor-pointer hover:bg-muted/30")}>
@@ -406,6 +430,13 @@ export function ReportsDashboard({ tenants, keys, models, retentionDays = null, 
                   </tr>
                 );
               })}
+              {shownRows.length < labeled.length && (
+                <tr className="border-t border-border/70">
+                  <td colSpan={9} className="py-2.5 text-center">
+                    <Button variant="ghost" size="sm" onClick={() => setShowAllRows(true)}>Show all {labeled.length.toLocaleString()} {groupInfo.plural}</Button>
+                  </td>
+                </tr>
+              )}
               {labeled.length === 0 && (
                 <tr><td colSpan={9} className="py-10 text-center text-muted-foreground">{readFailed(table) ? readProblem(table, "the breakdown") : table.isLoading ? "Loading…" : q ? `No ${groupInfo.plural} match “${rowFilter}”.` : "No usage in these days."}</td></tr>
               )}

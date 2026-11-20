@@ -4,6 +4,7 @@ import { ReportsDashboard } from "@/components/reports/reports-dashboard";
 import { isKeyAccessRange, keyAccessRange, type KeyAccessRange } from "@/lib/key-access-model";
 import { KEY_REJECTION_ROWS, obleth } from "@/lib/obleth";
 import type { ApiKey, KeyRejectionAgg, KeySource, ModelRoute, Tenant } from "@/lib/obleth";
+import { keyOptions, tenantOptions } from "@/lib/logs-model";
 import { safe } from "@/lib/safe";
 
 export const dynamic = "force-dynamic";
@@ -22,8 +23,8 @@ export default async function ReportsPage({ searchParams }: { searchParams: Prom
   ]);
   return (
     <ReportsDashboard
-      tenants={[...tenants].sort((a, b) => a.name.localeCompare(b.name))}
-      keys={keys}
+      tenants={tenantOptions(tenants)}
+      keys={keyOptions(keys)}
       models={models.map((m) => m.model_name).sort((a, b) => a.localeCompare(b))}
       retentionDays={retention?.days ?? null}
       modelTypes={Object.fromEntries(models.map((m) => [m.model_name, m.model_type]))}
@@ -44,7 +45,7 @@ async function KeyAccessTab({ q }: { q: Params }) {
   return (
     <KeyAccessView
       key={`${range}:${tenantId ?? ""}`}
-      tenants={[...tenants].sort((a, b) => a.name.localeCompare(b.name)).map((t) => ({ id: t.id, name: t.name }))}
+      tenants={tenantOptions(tenants)}
       initialRange={range}
       initialTenant={tenantId ?? ""}
       initialSearch={q.q ?? ""}

@@ -1,5 +1,5 @@
 import { parseClasses, parseFault } from "@/lib/failure-classes";
-import type { SpanEntry, UsageLogEntry } from "@/lib/obleth";
+import type { ApiKey, SpanEntry, Tenant, UsageLogEntry } from "@/lib/obleth";
 
 /**
  * The Request logs page's pure logic: filters and the search box's tokens,
@@ -141,6 +141,21 @@ const REQUEST_ID_TEXT = /^[0-9a-f-]+$/i;
 
 export interface Named { id: string; name: string }
 export interface KeyOption { id: string; name: string; prefix: string; tenantId: string }
+
+/**
+ * Teams as a filter picker needs them, by name: what a page sends the
+ * browser instead of every tenant's settings.
+ */
+export function tenantOptions(tenants: Tenant[]): Named[] {
+  return tenants.map((t) => ({ id: t.id, name: t.name })).sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** Keys as a filter picker needs them, by name (or prefix): never their settings. */
+export function keyOptions(keys: ApiKey[]): KeyOption[] {
+  return keys
+    .map((k) => ({ id: k.id, name: k.name, prefix: k.key_prefix, tenantId: k.tenant_id }))
+    .sort((a, b) => (a.name || a.prefix).localeCompare(b.name || b.prefix));
+}
 
 export interface SearchLookups {
   tenants: Named[];

@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   effortText,
+  keyOptions,
+  tenantOptions,
   bucketFor,
   bucketLabel,
   DEFAULT_LOG_FILTERS,
@@ -23,7 +25,7 @@ import {
   windowRange,
   withPatterns,
 } from "./logs-model";
-import type { SpanEntry, UsageLogEntry } from "./obleth";
+import type { ApiKey, SpanEntry, Tenant, UsageLogEntry } from "./obleth";
 
 const lookups = {
   tenants: [{ id: "t-cs", name: "cs-teaching" }],
@@ -308,5 +310,23 @@ describe("the reasoning effort line", () => {
     expect(effortText({ reasoning_effort: "unsupported", reasoning_effort_requested: "medium" })).toMatch(/no effort control/);
     expect(effortText({ reasoning_effort: "", reasoning_effort_requested: "medium" })).toMatch(/as asked/);
     expect(effortText({ reasoning_effort: "none", reasoning_effort_requested: "" })).toMatch(/default for this model/);
+  });
+});
+
+describe("picker options", () => {
+  it("send the browser names only, never a key's or team's settings", () => {
+    const tenants = [
+      { id: "t2", name: "voyager", budget_usd: 100, rate_limit_rpm: 60 },
+      { id: "t1", name: "research", budget_usd: 5, rate_limit_rpm: 10 },
+    ] as unknown as Tenant[];
+    const keys = [
+      { id: "k1", name: "", key_prefix: "obl_ab", tenant_id: "t1", allowed_networks: ["10.0.0.0/8"], budget_usd: 1 },
+      { id: "k2", name: "ci", key_prefix: "obl_cd", tenant_id: "t2", allowed_networks: [], budget_usd: 2 },
+    ] as unknown as ApiKey[];
+    expect(tenantOptions(tenants)).toEqual([{ id: "t1", name: "research" }, { id: "t2", name: "voyager" }]);
+    expect(keyOptions(keys)).toEqual([
+      { id: "k2", name: "ci", prefix: "obl_cd", tenantId: "t2" },
+      { id: "k1", name: "", prefix: "obl_ab", tenantId: "t1" },
+    ]);
   });
 });

@@ -2,7 +2,7 @@ import { requireAdmin } from "@/lib/auth/roles";
 import { RequestLogs } from "@/components/logs/request-logs";
 import { parseClasses, parseFault } from "@/lib/failure-classes";
 import { linkTime } from "@/lib/log-links";
-import { LOG_WINDOWS, type LogFilters } from "@/lib/logs-model";
+import { keyOptions, LOG_WINDOWS, tenantOptions, type LogFilters } from "@/lib/logs-model";
 import { obleth } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
 
@@ -21,10 +21,8 @@ export default async function LogsPage({ searchParams }: { searchParams: Promise
     safe(obleth.listModels(), []),
     safe(obleth.listKeys(), []),
   ]);
-  const tenantOptions = tenants.map((t) => ({ id: t.id, name: t.name })).sort((a, b) => a.name.localeCompare(b.name));
-  const keyOptions = keys
-    .map((k) => ({ id: k.id, name: k.name, prefix: k.key_prefix, tenantId: k.tenant_id }))
-    .sort((a, b) => (a.name || a.prefix).localeCompare(b.name || b.prefix));
+  const teamOptions = tenantOptions(tenants);
+  const keyChoices = keyOptions(keys);
   const modelOptions = models.map((m) => m.model_name).sort((a, b) => a.localeCompare(b));
 
   // Other pages link here with a filter already chosen (lib/log-links.ts):
@@ -40,8 +38,8 @@ export default async function LogsPage({ searchParams }: { searchParams: Promise
     ...(fault ? { fault } : {}),
     ...(classes ? { errorClass: classes.join(",") } : {}),
     ...(q.model && modelOptions.includes(q.model) ? { model: q.model } : {}),
-    ...(q.team && tenantOptions.some((t) => t.id === q.team) ? { tenantId: q.team } : {}),
-    ...(q.key ? (() => { const k = keyOptions.find((x) => x.id === q.key); return k ? { keyId: k.id, tenantId: k.tenantId } : {}; })() : {}),
+    ...(q.team && teamOptions.some((t) => t.id === q.team) ? { tenantId: q.team } : {}),
+    ...(q.key ? (() => { const k = keyChoices.find((x) => x.id === q.key); return k ? { keyId: k.id, tenantId: k.tenantId } : {}; })() : {}),
     ...(q.session ? { sessionId: q.session } : {}),
     ...(LOG_WINDOWS.some((w) => w.id === q.window) ? { window: q.window as LogFilters["window"] } : {}),
     ...(since !== undefined ? { window: "custom" as const, sinceMs: since, untilMs: until } : {}),
@@ -50,9 +48,9 @@ export default async function LogsPage({ searchParams }: { searchParams: Promise
   return (
     <RequestLogs
       key={q.requestId ?? JSON.stringify(initial)}
-      tenants={tenantOptions}
+      tenants={teamOptions}
       models={modelOptions}
-      keys={keyOptions}
+      keys={keyChoices}
       initial={initial}
       initialRequestId={q.requestId}
     />

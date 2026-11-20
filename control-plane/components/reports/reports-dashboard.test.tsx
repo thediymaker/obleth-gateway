@@ -5,8 +5,14 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ReportsDashboard } from "./reports-dashboard";
 
 vi.mock("next/navigation", () => ({ useRouter: () => ({ push: vi.fn() }) }));
+// The real chart builder, counted, to see what a keystroke recomputes.
+const chartBuilds = vi.hoisted(() => ({ count: 0 }));
+vi.mock("@/lib/reports-model", async (load) => {
+  const real = await load<typeof import("@/lib/reports-model")>();
+  return { ...real, buildChart: (...args: Parameters<typeof real.buildChart>) => { chartBuilds.count++; return real.buildChart(...args); } };
+});
 vi.mock("next/link", () => ({ default: ({ href, children, ...rest }: { href: string; children: React.ReactNode }) => <a href={href} {...rest}>{children}</a> }));
-import type { ApiKey, Tenant, UsageDailyRow } from "@/lib/obleth";
+import type { UsageDailyRow } from "@/lib/obleth";
 
 const EMPTY = "00000000-0000-0000-0000-000000000000";
 const row = (over: Partial<UsageDailyRow> = {}): UsageDailyRow => ({
@@ -55,8 +61,8 @@ async function render() {
     root.render(
       <QueryClientProvider client={client}>
         <ReportsDashboard
-          tenants={[{ id: "t1", name: "research-computing" }, { id: "t2", name: "voyager" }] as Tenant[]}
-          keys={[] as ApiKey[]}
+          tenants={[{ id: "t1", name: "research-computing" }, { id: "t2", name: "voyager" }]}
+          keys={[]}
           models={["glm-5-3"]}
         />
       </QueryClientProvider>,
@@ -90,6 +96,37 @@ describe("the Reports page", () => {
   it("splits the chart by team from the per-day rows", async () => {
     await render();
     expect(calls.some((c) => c.includes("group_by=day_tenant"))).toBe(true);
+  });
+
+  it("filters the table without rebuilding the chart", async () => {
+    await render();
+    const before = chartBuilds.count;
+    const box = host.querySelector<HTMLInputElement>("input[aria-label='Filter rows']")!;
+    const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
+    for (const text of ["v", "vo", "voy"]) {
+      await act(async () => { setValue.call(box, text); box.dispatchEvent(new Event("input", { bubbles: true })); });
+    }
+    expect(chartBuilds.count).toBe(before);
+    const rows = [...host.querySelectorAll("tbody tr")].map((r) => r.textContent ?? "");
+    expect(rows.some((r) => r.includes("voyager"))).toBe(true);
+    expect(rows.some((r) => r.includes("research-computing"))).toBe(false);
+  });
+
+  it("shows the first 300 breakdown rows until asked for all", async () => {
+    const many = Array.from({ length: 350 }, (_, i) => row({ tenant_id: `t${i}`, cost_usd: 1 }));
+    const real = globalThis.fetch;
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      if (new URL(url, "http://x").searchParams.get("group_by") === "tenant") return { ok: true, json: async () => many } as Response;
+      return real(url);
+    }));
+    await render();
+    const bodyRows = () => host.querySelectorAll("tbody tr[class*='border-t']").length;
+    const showAll = () => [...host.querySelectorAll("button")].find((b) => b.textContent?.startsWith("Show all 350"));
+    expect(showAll()).toBeTruthy();
+    expect(bodyRows()).toBe(301);
+    await act(async () => showAll()!.click());
+    expect(showAll()).toBeUndefined();
+    expect(bodyRows()).toBe(350);
   });
 
   it("filters the whole page to a team clicked in the ranking", async () => {
