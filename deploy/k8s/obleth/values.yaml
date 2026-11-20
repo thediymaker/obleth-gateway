@@ -176,6 +176,12 @@ obleth:
   # these same defaults.
   redisResponseTimeoutMs: 250
   redisConnectTimeoutMs: 2000
+  # Postgres connections each gateway replica may hold, and how long (seconds)
+  # a request waits for a free one before it fails instead of queueing behind
+  # the pool. Postgres max_connections must cover replicas x pgMaxConnections
+  # plus the control plane. 0 or invalid values fall back to these defaults.
+  pgMaxConnections: 10
+  pgAcquireTimeoutSecs: 5
   # Longest a request waits in the fairshare queue before a 503 with
   # Retry-After: 5. 0 or invalid falls back to this default.
   admissionTimeoutSecs: 60

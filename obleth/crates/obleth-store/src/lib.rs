@@ -5,6 +5,7 @@
 //! hot path — the data plane reads Redis, which this layer keeps in sync.
 
 use chrono::{DateTime, Utc};
+use obleth_config::PgPoolSettings;
 use obleth_config::{
     generate_api_key_with_prefix, ApiKey, DeploymentLaunch, FairshareGroup, IdentityProvision,
     ManagedModelSpec, McpServer, ModelEndpoint, ModelHealthCheck, ModelHealthDetail,
@@ -226,9 +227,15 @@ pub struct Store {
 }
 
 impl Store {
+    /// Connect with the default pool settings (tests and tools).
     pub async fn connect(database_url: &str) -> Result<Self> {
+        Self::connect_with(database_url, PgPoolSettings::default()).await
+    }
+
+    pub async fn connect_with(database_url: &str, pool: PgPoolSettings) -> Result<Self> {
         let pool = PgPoolOptions::new()
-            .max_connections(10)
+            .max_connections(pool.max_connections)
+            .acquire_timeout(pool.acquire_timeout)
             .connect(database_url)
             .await?;
         // Eagerly initialize the cipher so a misconfigured key fails at boot.

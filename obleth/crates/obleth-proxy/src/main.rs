@@ -67,7 +67,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ---- connect dependencies (with simple boot-time retries) ----
-    let store = retry("postgres", || Store::connect(&cfg.database_url)).await?;
+    let store = retry("postgres", || {
+        Store::connect_with(&cfg.database_url, cfg.pg_pool)
+    })
+    .await?;
     store.migrate().await?;
     // Provision the reserved control-plane identity (Charo) — idempotent.
     store.ensure_control_plane_identity().await?;

@@ -16,7 +16,9 @@ pub mod routing;
 pub mod slurm;
 pub mod types;
 
-pub use config::{CapacityDiscoveryConfig, Config, SessionAffinityConfig, SlackAlertConfig};
+pub use config::{
+    CapacityDiscoveryConfig, Config, PgPoolSettings, SessionAffinityConfig, SlackAlertConfig,
+};
 pub use failure::{
     class_for_status, clean_reason, ledger_failure, reason_for_status, reason_from_body,
     ErrorClass, Failure, EFFECTIVE_CLASS_SQL, ERROR_REASON_MAX_CHARS, PLATFORM_CLASSES_SQL,

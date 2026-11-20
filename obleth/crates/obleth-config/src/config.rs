@@ -51,6 +51,8 @@ pub struct Config {
     /// Per-command and per-connect timeouts for the shared Redis connection.
     pub redis_timeouts: RedisTimeouts,
     pub database_url: String,
+    /// Size of, and wait for, the Postgres connection pool.
+    pub pg_pool: PgPoolSettings,
     pub clickhouse_url: String,
     pub clickhouse_db: String,
     pub clickhouse_user: String,
@@ -423,6 +425,57 @@ impl Default for RedisTimeouts {
     }
 }
 
+/// The Postgres connection pool: how many connections one gateway process
+/// may hold, and how long a request waits for a free one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PgPoolSettings {
+    /// `OBLETH_PG_MAX_CONNECTIONS`, default 10. Every replica holds up to
+    /// this many, so Postgres `max_connections` must cover replicas times
+    /// this plus the control plane and the migrations.
+    pub max_connections: u32,
+    /// `OBLETH_PG_ACQUIRE_TIMEOUT_SECS`, default 5: how long a request waits
+    /// for a connection when all are busy before it fails instead of
+    /// queueing behind the pool.
+    pub acquire_timeout: Duration,
+}
+
+impl PgPoolSettings {
+    pub const DEFAULT_MAX_CONNECTIONS: u32 = 10;
+    pub const DEFAULT_ACQUIRE_TIMEOUT_SECS: u64 = 5;
+
+    pub fn from_env() -> Self {
+        Self::from_values(
+            env::var("OBLETH_PG_MAX_CONNECTIONS").ok().as_deref(),
+            env::var("OBLETH_PG_ACQUIRE_TIMEOUT_SECS").ok().as_deref(),
+        )
+    }
+
+    /// Build from raw env values; missing, unparseable, or zero values fall
+    /// back to the defaults (an empty pool or a zero wait would fail every
+    /// query).
+    pub fn from_values(max_connections: Option<&str>, acquire_timeout_secs: Option<&str>) -> Self {
+        fn positive(v: Option<&str>, default: u64) -> u64 {
+            v.and_then(|s| s.trim().parse::<u64>().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(default)
+        }
+        PgPoolSettings {
+            max_connections: positive(max_connections, Self::DEFAULT_MAX_CONNECTIONS as u64)
+                .min(u32::MAX as u64) as u32,
+            acquire_timeout: Duration::from_secs(positive(
+                acquire_timeout_secs,
+                Self::DEFAULT_ACQUIRE_TIMEOUT_SECS,
+            )),
+        }
+    }
+}
+
+impl Default for PgPoolSettings {
+    fn default() -> Self {
+        Self::from_values(None, None)
+    }
+}
+
 impl Config {
     pub fn from_env() -> Self {
         let mut warnings = Vec::new();
@@ -457,6 +510,7 @@ impl Config {
                 "OBLETH_DATABASE_URL",
                 "postgres://obleth:obleth@127.0.0.1:5432/obleth",
             ),
+            pg_pool: PgPoolSettings::from_env(),
             clickhouse_url: env_or("OBLETH_CLICKHOUSE_URL", "http://127.0.0.1:8123"),
             clickhouse_db: env_or("OBLETH_CLICKHOUSE_DB", "obleth"),
             clickhouse_user: env_or("OBLETH_CLICKHOUSE_USER", "default"),
@@ -739,6 +793,18 @@ mod tests {
         assert_eq!(t.connect, Duration::from_millis(500));
         let t = RedisTimeouts::from_values(Some("nope"), None);
         assert_eq!(t, RedisTimeouts::default());
+    }
+
+    #[test]
+    fn pg_pool_settings_default_and_parse() {
+        let d = PgPoolSettings::default();
+        assert_eq!(d.max_connections, 10);
+        assert_eq!(d.acquire_timeout, Duration::from_secs(5));
+        let p = PgPoolSettings::from_values(Some("40"), Some("2"));
+        assert_eq!(p.max_connections, 40);
+        assert_eq!(p.acquire_timeout, Duration::from_secs(2));
+        let p = PgPoolSettings::from_values(Some("0"), Some("nope"));
+        assert_eq!(p, PgPoolSettings::default());
     }
 
     #[test]
