@@ -636,13 +636,16 @@ mod tests {
             embedding_model: "embed-a".into(),
             dim: 2,
             version: 1,
-            chunks: vec![crate::knowledge::SlabChunk {
+            chunks: vec![std::sync::Arc::new(crate::knowledge::SlabChunk {
                 id: Uuid::new_v4(),
+                document_id: Uuid::nil(),
                 title: "A".into(),
                 text: "a".into(),
                 token_count: 10,
                 embedding: vec![1.0, 0.0],
-            }],
+            })],
+            documents: Default::default(),
+            loaded_at: std::time::Instant::now(),
         };
         // The query matches the only chunk exactly (score 1.0), but the
         // threshold demands more than a perfect match — nothing clears it.
@@ -701,13 +704,16 @@ mod tests {
             embedding_model: "embed-a".into(),
             dim: 768,
             version: 1,
-            chunks: vec![crate::knowledge::SlabChunk {
+            chunks: vec![std::sync::Arc::new(crate::knowledge::SlabChunk {
                 id: Uuid::new_v4(),
+                document_id: Uuid::nil(),
                 title: "Doc".into(),
                 text: "chunk".into(),
                 token_count: 10,
                 embedding: vec![1.0; 768],
-            }],
+            })],
+            documents: Default::default(),
+            loaded_at: std::time::Instant::now(),
         };
         assert!(slab.retrieve(&[1.0, 0.0], 5, -1.0).is_empty());
     }

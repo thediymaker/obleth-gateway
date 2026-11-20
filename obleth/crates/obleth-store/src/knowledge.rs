@@ -248,6 +248,15 @@ impl ChunkInsert {
     }
 }
 
+/// A document a collection serves chunks from (see
+/// [`Store::active_documents`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveDocument {
+    pub id: Uuid,
+    pub generation: i32,
+    pub title: String,
+}
+
 /// A chunk's vector and where it came from, without its text.
 #[derive(Debug, Clone)]
 pub struct ChunkVector {
@@ -820,6 +829,25 @@ impl Store {
     /// order is stable within a document.
     /// Background-loop use only — never call this from the request path.
     pub async fn load_active_chunks(&self, collection_id: Uuid) -> Result<Vec<KnowledgeChunk>> {
+        self.active_chunks_where(collection_id, None).await
+    }
+
+    /// [`Self::load_active_chunks`] for the given documents only, for
+    /// reloading the documents that changed since a slab was built.
+    pub async fn load_active_chunks_of(
+        &self,
+        collection_id: Uuid,
+        document_ids: &[Uuid],
+    ) -> Result<Vec<KnowledgeChunk>> {
+        self.active_chunks_where(collection_id, Some(document_ids))
+            .await
+    }
+
+    async fn active_chunks_where(
+        &self,
+        collection_id: Uuid,
+        document_ids: Option<&[Uuid]>,
+    ) -> Result<Vec<KnowledgeChunk>> {
         let rows = sqlx::query(
             "select k.id as id, k.document_id as document_id, k.text as text,
                     k.token_count as token_count, k.embedding as embedding
@@ -829,22 +857,47 @@ impl Store {
               where k.collection_id = $1
                 and k.generation = d.active_generation
                 and d.indexed_embedding_model = c.indexed_embedding_model
+                and ($2::uuid[] is null or k.document_id = any($2))
               order by k.document_id, k.ordinal",
+        )
+        .bind(collection_id)
+        .bind(document_ids)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| KnowledgeChunk {
+                id: r.get("id"),
+                document_id: r.get("document_id"),
+                text: r.get("text"),
+                token_count: r.get("token_count"),
+                embedding: decode_vector(r.get::<&[u8], _>("embedding")),
+            })
+            .collect())
+    }
+
+    /// The documents whose chunks a collection serves (their embedder
+    /// matches the collection's), each with its active generation and title:
+    /// what a slab compares against to reload only what changed.
+    pub async fn active_documents(&self, collection_id: Uuid) -> Result<Vec<ActiveDocument>> {
+        let rows = sqlx::query(
+            "select d.id, d.active_generation, d.title
+               from knowledge_documents d
+               join knowledge_collections c on c.id = d.collection_id
+              where d.collection_id = $1
+                and d.chunk_count > 0
+                and d.indexed_embedding_model = c.indexed_embedding_model
+              order by d.id",
         )
         .bind(collection_id)
         .fetch_all(self.pool())
         .await?;
         Ok(rows
             .iter()
-            .map(|r| {
-                let bytes: Vec<u8> = r.get("embedding");
-                KnowledgeChunk {
-                    id: r.get("id"),
-                    document_id: r.get("document_id"),
-                    text: r.get("text"),
-                    token_count: r.get("token_count"),
-                    embedding: decode_vector(&bytes),
-                }
+            .map(|r| ActiveDocument {
+                id: r.get("id"),
+                generation: r.get("active_generation"),
+                title: r.get("title"),
             })
             .collect())
     }
@@ -886,18 +939,6 @@ impl Store {
             .fetch_all(self.pool())
             .await?;
         Ok(rows.iter().map(|r| (r.get("id"), r.get("text"))).collect())
-    }
-
-    /// Document id -> title, for labelling chunks in injected context.
-    /// Background-loop use only (the proxy slab rebuild) — never call this
-    /// from the request path.
-    pub async fn document_titles(&self, collection_id: Uuid) -> Result<HashMap<Uuid, String>> {
-        let rows =
-            sqlx::query("select id, title from knowledge_documents where collection_id = $1")
-                .bind(collection_id)
-                .fetch_all(self.pool())
-                .await?;
-        Ok(rows.iter().map(|r| (r.get("id"), r.get("title"))).collect())
     }
 
     /// Collections a model grounds on. Used by the admin API to render the
@@ -2496,40 +2537,6 @@ mod tests {
         );
 
         store.delete_collection(c.id).await.ok();
-    }
-
-    #[tokio::test]
-    async fn document_titles_maps_id_to_title_scoped_to_the_collection() {
-        let Some((store, _serial)) = test_store().await else {
-            return;
-        };
-        let a = store
-            .create_collection(&format!("titles-a-{}", uuid::Uuid::new_v4()), "", "embed-a")
-            .await
-            .expect("a");
-        let b = store
-            .create_collection(&format!("titles-b-{}", uuid::Uuid::new_v4()), "", "embed-a")
-            .await
-            .expect("b");
-        let doc_a = store
-            .upsert_document(a.id, "Doc A", "a.md", "text/markdown", "body a")
-            .await
-            .expect("doc a");
-        store
-            .upsert_document(b.id, "Doc B", "b.md", "text/markdown", "body b")
-            .await
-            .expect("doc b");
-
-        let titles = store.document_titles(a.id).await.expect("titles");
-        assert_eq!(
-            titles.len(),
-            1,
-            "must be scoped to the requested collection"
-        );
-        assert_eq!(titles.get(&doc_a.id), Some(&"Doc A".to_string()));
-
-        store.delete_collection(a.id).await.ok();
-        store.delete_collection(b.id).await.ok();
     }
 
     #[test]
