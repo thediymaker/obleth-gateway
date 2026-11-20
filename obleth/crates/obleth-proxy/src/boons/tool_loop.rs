@@ -110,7 +110,10 @@ pub struct ToolLoopPlan {
     pub tool_servers: HashMap<String, String>,
     /// The enriched request body (tools injected, `stream` forced off), used
     /// to re-dispatch follow-up turns with the conversation appended.
-    pub request: Value,
+    /// The request as dispatched for turn 0, set by the proxy once it has
+    /// prepared the upstream body. Follow-up turns copy it only when a
+    /// gateway tool call needs one.
+    pub request: Arc<Value>,
     /// Settings snapshot taken at request time.
     pub settings: ToolLoopSettings,
     /// True when the client supplied its own `tools` and the gateway merged
@@ -486,10 +489,9 @@ pub async fn run(
     // settle with turn 0, not with whatever turn the loop ends on.
     let turn0 = completion_usage(body);
     let mut replaced = false;
-    let mut request = loop_plan.request.clone();
-    if let Some(obj) = request.as_object_mut() {
-        obj.insert("model".into(), Value::String(route.upstream_model.clone()));
-    }
+    // Copied from the plan only once a gateway tool call needs a follow-up.
+    let mut request = Arc::clone(&loop_plan.request);
+    let model = route.upstream_model.as_str();
     let tool_timeout = Duration::from_millis(loop_plan.settings.tool_timeout_ms.max(1));
     let max_turns = loop_plan
         .settings
@@ -616,7 +618,7 @@ pub async fn run(
 
         // Record the assistant turn, execute each call, and append results.
         if let Some(message) = body.pointer("/choices/0/message") {
-            push_message(&mut request, message.clone());
+            push_message(follow_up_request(&mut request, model), message.clone());
         }
         let tool_exec_start = crate::tracer::now_ms();
         let results = run_turn(
@@ -639,7 +641,7 @@ pub async fn run(
                 "gateway tool loop executed a tool call"
             );
             push_message(
-                &mut request,
+                follow_up_request(&mut request, model),
                 json!({
                     "role": "tool",
                     "tool_call_id": call.id,
@@ -691,7 +693,7 @@ pub async fn run(
                 DEADLINE_WARNING,
             ),
             Some(timeout) => (
-                dispatch_follow_up(&state.http, &mut target, request.clone(), timeout).await,
+                dispatch_follow_up(&state.http, &mut target, &request, timeout).await,
                 "tool_loop_dispatch_failed",
             ),
         };
@@ -780,12 +782,12 @@ pub async fn run(
         max_turns,
         "gateway tool loop hit its turn limit; forcing a final answer"
     );
-    if let Some(obj) = request.as_object_mut() {
+    if let Some(obj) = follow_up_request(&mut request, model).as_object_mut() {
         obj.remove("tools");
         obj.remove("tool_choice");
     }
     push_message(
-        &mut request,
+        follow_up_request(&mut request, model),
         json!({
             "role": "user",
             "content": "Please answer the original question now using the information \
@@ -794,7 +796,7 @@ pub async fn run(
     );
     let mut limit_warning = "tool_loop_turn_limit";
     let finalized = match deadline.bound(dispatch_timeout) {
-        Some(timeout) => dispatch_follow_up(&state.http, &mut target, request, timeout).await,
+        Some(timeout) => dispatch_follow_up(&state.http, &mut target, &request, timeout).await,
         None => {
             limit_warning = DEADLINE_WARNING;
             Err(anyhow::anyhow!("tool loop time budget exhausted"))
@@ -858,10 +860,24 @@ fn turn0_or_estimate(
 
 /// One non-streaming follow-up turn against the loop's pinned target. A
 /// target that could not be resolved is reported once, with its cause chain.
+/// The follow-up request to change, copied from the plan's on first use: the
+/// buffered loop's own dispatches go to the upstream model, non-streaming.
+fn follow_up_request<'a>(request: &'a mut Arc<Value>, model: &str) -> &'a mut Value {
+    let request = Arc::make_mut(request);
+    if let Some(obj) = request.as_object_mut() {
+        if obj.get("model").and_then(Value::as_str) != Some(model) {
+            obj.insert("model".into(), Value::String(model.to_string()));
+        }
+        obj.insert("stream".into(), Value::Bool(false));
+        obj.remove("stream_options");
+    }
+    request
+}
+
 async fn dispatch_follow_up(
     http: &reqwest::Client,
     target: &mut anyhow::Result<crate::proxy::Target>,
-    request: Value,
+    request: &Value,
     timeout: Duration,
 ) -> anyhow::Result<Value> {
     let target = match target {
@@ -1285,7 +1301,7 @@ mod tests {
         });
         let plan = ToolLoopPlan {
             tool_servers: HashMap::new(),
-            request: json!({}),
+            request: Arc::new(json!({})),
             settings: ToolLoopSettings::default(),
             passthrough_unmapped: false,
             image_gen: None,
@@ -1296,7 +1312,7 @@ mod tests {
         for _ in 0..20 {
             let mut target =
                 crate::boons::helper_target(&route, "session", plan.served_url.as_deref());
-            dispatch_follow_up(&http, &mut target, json!({}), Duration::from_secs(5))
+            dispatch_follow_up(&http, &mut target, &json!({}), Duration::from_secs(5))
                 .await
                 .unwrap();
         }
@@ -1312,7 +1328,7 @@ mod tests {
         let err = dispatch_follow_up(
             &reqwest::Client::new(),
             &mut target,
-            json!({}),
+            &json!({}),
             Duration::from_secs(1),
         )
         .await
@@ -1419,6 +1435,33 @@ mod tests {
         }
         assert_eq!(opens.load(Ordering::SeqCst), 2);
         assert!(sessions.get("never").is_err());
+    }
+
+    #[test]
+    fn the_plans_request_is_copied_only_for_a_follow_up_and_only_once() {
+        let plan = Arc::new(json!({
+            "model": "upstream-m", "stream": true, "stream_options": { "include_usage": true },
+            "messages": [{ "role": "user", "content": "hi" }],
+        }));
+        let mut request = Arc::clone(&plan);
+        // No follow-up yet: the plan's request is shared, not copied.
+        assert!(Arc::ptr_eq(&request, &plan));
+        push_message(
+            follow_up_request(&mut request, "upstream-m"),
+            json!({ "role": "assistant" }),
+        );
+        assert!(!Arc::ptr_eq(&request, &plan));
+        let copied = Arc::as_ptr(&request);
+        push_message(
+            follow_up_request(&mut request, "upstream-m"),
+            json!({ "role": "tool" }),
+        );
+        assert_eq!(Arc::as_ptr(&request), copied, "copied once");
+        assert_eq!(request["messages"].as_array().unwrap().len(), 3);
+        assert_eq!(request["stream"], false);
+        assert!(request.get("stream_options").is_none());
+        // The plan's own request is untouched.
+        assert_eq!(plan["messages"].as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]

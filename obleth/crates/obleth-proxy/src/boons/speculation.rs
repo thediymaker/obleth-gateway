@@ -1274,7 +1274,7 @@ async fn run_nonstream(
     // The scoring prefix is tokenized while the drafter writes; a failure
     // here is retried by the first score.
     let (completion, _) = tokio::join!(
-        super::chat_call_completion(req.state, drafter, body, req.dispatch_timeout),
+        super::chat_call_completion(req.state, drafter, &body, req.dispatch_timeout),
         verifier.prefix_ids(&req.state.http, &plan.messages),
     );
     let completion = match completion {

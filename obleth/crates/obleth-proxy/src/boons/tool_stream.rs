@@ -76,7 +76,7 @@ pub struct StreamLoop {
     pub request_id: uuid::Uuid,
     /// The enriched request body (tools injected) used as the base for
     /// follow-up turns. Its `stream` flag is overwritten per dispatch.
-    pub base_request: Value,
+    pub base_request: Arc<Value>,
     /// Tool name -> MCP server name, for executing and ownership checks.
     pub tool_servers: HashMap<String, String>,
     pub settings: ToolLoopSettings,
@@ -169,7 +169,7 @@ pub fn run(
             let resp = match current.take() {
                 Some(r) => r,
                 None => {
-                    if let Some(obj) = request.as_object_mut() {
+                    if let Some(obj) = Arc::make_mut(&mut request).as_object_mut() {
                         obj.insert("stream".into(), Value::Bool(true));
                         obj.insert(
                             "stream_options".into(),
@@ -338,7 +338,7 @@ pub fn run(
                 super::bill_helper_call(&state, &route, &key, &session_id, request_id, "tool_loop", u);
             }
             super::tool_loop::push_message(
-                &mut request,
+                Arc::make_mut(&mut request),
                 assistant_message(&content_acc, &calls),
             );
             // Emit the "searching…" markers on the reasoning channel, not as
@@ -376,7 +376,7 @@ pub fn run(
             .await;
             for (c, result) in calls.iter().zip(results) {
                 super::tool_loop::push_message(
-                    &mut request,
+                    Arc::make_mut(&mut request),
                     json!({
                         "role": "tool",
                         "tool_call_id": c.id,
@@ -392,7 +392,7 @@ pub fn run(
         // already gathered, and stream that final turn live. Emitting only a
         // bare "[turn limit]" marker (as before) left the user with no answer
         // at all even though tool results were collected.
-        if let Some(obj) = request.as_object_mut() {
+        if let Some(obj) = Arc::make_mut(&mut request).as_object_mut() {
             obj.remove("tools");
             obj.remove("tool_choice");
             obj.insert("stream".into(), Value::Bool(true));
@@ -400,7 +400,7 @@ pub fn run(
             obj.insert("model".into(), Value::String(upstream_model.clone()));
         }
         super::tool_loop::push_message(
-            &mut request,
+            Arc::make_mut(&mut request),
             json!({
                 "role": "user",
                 "content": "Please answer the original question now using the information \

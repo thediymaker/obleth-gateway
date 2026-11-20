@@ -615,7 +615,7 @@ pub(crate) async fn scan_harm(
         "stream": false,
     });
     let timeout = Duration::from_millis(settings.timeout_ms.max(1));
-    let completion = match super::chat_call_completion(state, &guard_model, body, timeout).await {
+    let completion = match super::chat_call_completion(state, &guard_model, &body, timeout).await {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(error = %e, model = %guard_model_name, "guardrails harm: call failed");

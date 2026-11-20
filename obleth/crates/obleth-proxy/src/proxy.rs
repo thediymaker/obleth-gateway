@@ -2195,7 +2195,7 @@ async fn run_pipeline(
             before.saturating_sub(after)
         )
     });
-    let response_plan = boon_outcome.response_plan;
+    let mut response_plan = boon_outcome.response_plan;
     let speculation_plan = boon_outcome.speculation;
 
     // ---- a prompt the model cannot hold ----
@@ -2710,6 +2710,11 @@ async fn run_pipeline(
             stream_tap || inject_usage,
         )
     });
+    // Follow-up tool turns start from the request as dispatched; the body is
+    // not read past this point, so the plan takes it instead of a copy.
+    if let Some(loop_plan) = response_plan.as_mut().and_then(|p| p.tool_loop.as_mut()) {
+        loop_plan.request = std::sync::Arc::new(std::mem::take(&mut json));
+    }
 
     // TTFT is measured from the moment we dispatch the *successful* upstream
     // request, *after* fairshare admission. Time spent waiting in the queue is
@@ -11867,6 +11872,33 @@ mod lifecycle_tests {
             let failure = crate::upstream_failure::payload_failure(&payload).unwrap();
             assert!((400..=599).contains(&failure.status), "{payload}");
         }
+    }
+
+    #[test]
+    fn the_tool_loop_takes_the_dispatched_body_and_nothing_reads_it_after() {
+        let src = handler();
+        let prepared = src
+            .find("prepare_upstream_body(")
+            .expect("the body is prepared");
+        let hand_off = "loop_plan.request = std::sync::Arc::new(std::mem::take(&mut json));";
+        let taken = src.find(hand_off).expect("the plan takes the body");
+        assert!(prepared < taken);
+        // Past the hand-off the body is `Null`: nothing may read it.
+        let rest = &src[taken + hand_off.len()..];
+        let reads: Vec<usize> = rest
+            .match_indices("json")
+            .map(|(at, _)| at)
+            .filter(|&at| {
+                let before = rest[..at].chars().next_back().unwrap_or(' ');
+                let after = rest[at + 4..].chars().next().unwrap_or(' ');
+                !(before.is_alphanumeric() || before == '_' || before == '/')
+                    && !(after.is_alphanumeric() || after == '_' || after == '!')
+            })
+            .collect();
+        assert!(
+            reads.is_empty(),
+            "the body is read after the hand-off: {reads:?}"
+        );
     }
 
     #[test]

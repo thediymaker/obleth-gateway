@@ -982,26 +982,19 @@ impl BoonEngine {
             state.metrics.record_knowledge_retrieval(outcome_label);
         }
 
-        // The tool loop captures the fully enriched request body so follow-up
-        // turns re-dispatch with identical sampling parameters; its own
-        // dispatches are always non-streaming. Captured after the knowledge
-        // boon's phase 2 so a follow-up tool turn re-dispatches WITH the
-        // injected knowledge block, not without it.
-        let tool_loop_plan = tool_loop_servers.map(|servers| {
-            let mut request = json.clone();
-            if let Some(obj) = request.as_object_mut() {
-                obj.insert("stream".into(), Value::Bool(false));
-                obj.remove("stream_options");
-            }
-            tool_loop::ToolLoopPlan {
-                tool_servers: servers,
-                request,
-                settings: settings.tool_loop.clone(),
-                passthrough_unmapped: client_sent_tools,
-                image_gen: image_gen_cfg.clone(),
-                web_search: web_search_cfg.clone(),
-                served_url: None,
-            }
+        // Follow-up tool turns re-dispatch the fully enriched request (the
+        // knowledge block included) with identical sampling parameters. The
+        // proxy hands the plan that request once it has prepared it for the
+        // upstream (`ToolLoopPlan::request`), rather than a copy taken here
+        // for turns that may never happen.
+        let tool_loop_plan = tool_loop_servers.map(|servers| tool_loop::ToolLoopPlan {
+            tool_servers: servers,
+            request: Arc::new(Value::Null),
+            settings: settings.tool_loop.clone(),
+            passthrough_unmapped: client_sent_tools,
+            image_gen: image_gen_cfg.clone(),
+            web_search: web_search_cfg.clone(),
+            served_url: None,
         });
 
         if structured_plan.is_some() || tool_loop_plan.is_some() {
@@ -1045,7 +1038,9 @@ impl BoonEngine {
             if let Some(messages) = speculation::eligible_messages(json) {
                 outcome.applied.push("speculation");
                 outcome.speculation = Some(speculation::SpeculationPlan {
-                    request: json.clone(),
+                    // Without its messages, which `messages` holds flattened:
+                    // the speculation calls supply their own.
+                    request: without_messages(json),
                     messages,
                     settings: settings.speculation.clone(),
                     client_stream,
@@ -1260,7 +1255,7 @@ async fn chat_call_with(
 pub(crate) async fn chat_call_completion(
     state: &AppState,
     model: &ResolvedModel,
-    body: Value,
+    body: &Value,
     timeout: Duration,
 ) -> anyhow::Result<Value> {
     let target = helper_target(model, "", None)?;
@@ -1272,13 +1267,13 @@ pub(crate) async fn chat_call_completion(
 pub(crate) async fn chat_call_completion_on(
     http: &reqwest::Client,
     target: &crate::proxy::Target,
-    body: Value,
+    body: &Value,
     timeout: Duration,
 ) -> anyhow::Result<Value> {
     with_timeout(
         "chat call",
         timeout,
-        post_chat_completion(http, target, &body),
+        post_chat_completion(http, target, body),
     )
     .await
 }
@@ -1545,6 +1540,19 @@ async fn apply_term_commits(
     }
 }
 
+/// A copy of a request body without its `messages`.
+fn without_messages(json: &Value) -> Value {
+    match json.as_object() {
+        Some(obj) => Value::Object(
+            obj.iter()
+                .filter(|(k, _)| k.as_str() != "messages")
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        ),
+        None => json.clone(),
+    }
+}
+
 pub(crate) fn build_chat_url(api_base: &str) -> String {
     let base = api_base.trim_end_matches('/');
     format!("{base}/chat/completions")
@@ -1686,7 +1694,7 @@ mod tests {
         );
         tool_loop::ToolLoopPlan {
             tool_servers: servers,
-            request: serde_json::json!({}),
+            request: Arc::new(serde_json::json!({})),
             settings: obleth_config::ToolLoopSettings::default(),
             passthrough_unmapped: false,
             image_gen: None,
@@ -2326,7 +2334,7 @@ mod tests {
         let err = chat_call_completion_on(
             &reqwest::Client::new(),
             &target,
-            serde_json::json!({}),
+            &serde_json::json!({}),
             Duration::from_secs(10),
         )
         .await
