@@ -42,3 +42,22 @@ it("relays the thinking of a buffered (non-streaming) completion", async () => {
   expect(text).toContain('event: reasoning\ndata: {"text":"It factors."}');
   expect(text).toContain('event: token\ndata: {"text":"No."}');
 });
+it("streams each token as it arrives from a CRLF-framed upstream, before the upstream closes", async () => {
+  const enc = new TextEncoder();
+  let finish!: () => void;
+  const upstream = new ReadableStream<Uint8Array>({
+    start(c) {
+      c.enqueue(enc.encode('data: {"choices":[{"delta":{"content":"first"}}]}\r\n\r\n'));
+      finish = () => { c.enqueue(enc.encode("data: [DONE]\r\n\r\n")); c.close(); };
+    },
+  });
+  mocks.chat.mockResolvedValue(new Response(upstream, { headers: { "Content-Type": "text/event-stream" } }));
+  const res = await POST(request({ model: "m", bare: true, messages: [{ role: "user", content: "hi" }] }));
+  const reader = res.body!.getReader();
+  const dec = new TextDecoder();
+  let seen = "";
+  while (!seen.includes('"text":"first"')) seen += dec.decode((await reader.read()).value);
+  finish();
+  while (true) { const { value, done } = await reader.read(); if (done) break; seen += dec.decode(value); }
+  expect(seen).toContain("event: done");
+});
