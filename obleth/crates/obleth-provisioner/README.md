@@ -97,6 +97,8 @@ cancelled at once.
 
 **Tick outcome reporting.** Each settings fetch carries the previous tick's
 outcome (`ok`, `idle` or `error` with detail) and its warnings to the gateway.
+A failing tick is logged as a warning when its error changes, and again at
+debug while it repeats.
 The dashboard shows them on the Slurm connection, and the gateway raises
 `slurm_reconcile_held` when ticks have failed for 10 minutes.
 

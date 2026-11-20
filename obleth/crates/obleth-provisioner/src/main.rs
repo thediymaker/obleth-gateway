@@ -153,8 +153,9 @@ async fn main() -> anyhow::Result<()> {
     let obleth = HttpObleth::new(&cfg, http.clone());
     tracing::info!(interval = cfg.interval_secs, "obleth-provisioner started");
 
-    // Track the last idle reason so we only log on transitions.
+    // Track the last idle reason and tick error so we only log on transitions.
     let mut last_idle: Option<&'static str> = None;
+    let mut last_error: Option<String> = None;
     let mut mem = Memory::default();
     // Long-lived so its success cache survives across ticks: once a node name is
     // resolved (or aliased) the provisioner stops touching DNS for it.
@@ -172,11 +173,12 @@ async fn main() -> anyhow::Result<()> {
         match run_once(&cfg, &obleth, &http, &resolver, &mut mem).await {
             Ok(Tick::Ran(warnings)) => {
                 obleth.set_last_tick(TickReport::ok().with_warnings(warnings));
-                if last_idle.take().is_some() {
+                if last_idle.take().is_some() || last_error.take().is_some() {
                     tracing::info!("slurm active; reconciling managed models");
                 }
             }
             Ok(Tick::Idle(reason)) => {
+                last_error = None;
                 obleth.set_last_tick(TickReport::idle(reason));
                 if last_idle != Some(reason) {
                     tracing::info!(reason, "provisioner idle (no slurm work)");
@@ -187,8 +189,14 @@ async fn main() -> anyhow::Result<()> {
                 // Reported to the gateway on the next settings fetch so the
                 // dashboard can show "reconcile failing since X" instead of a
                 // deceptively green heartbeat while every tick holds.
-                obleth.set_last_tick(TickReport::error(&format!("{e:#}")));
-                tracing::warn!(error = %e, "tick failed; holding (no destructive action)");
+                let error = format!("{e:#}");
+                obleth.set_last_tick(TickReport::error(&error));
+                if last_error.as_ref() != Some(&error) {
+                    tracing::warn!(%error, "tick failed; holding (no destructive action)");
+                    last_error = Some(error);
+                } else {
+                    tracing::debug!(%error, "tick failed again; still holding");
+                }
             }
         }
         // Ticks start at a fixed rate, so the self-heal window counted in
