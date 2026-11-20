@@ -449,12 +449,16 @@ redis:
 
 clickhouse:
   enabled: true
-  image: clickhouse/clickhouse-server:24.8
+  # A fixed patch release, so a restart never brings a different server.
+  image: clickhouse/clickhouse-server:24.8.14.39
   db: obleth
   user: obleth
   # REQUIRED when clickhouse.enabled=true. Supply via --set or an external Secret.
   password: ""
   # Container resources for the bundled ClickHouse. Override to size for load.
+  # Measured on two gateways in Nov 2026 (24.8.14.39, metric_log off): about
+  # 0.9-1.1 GiB resident, the largest merge in a week about 160 MiB. The
+  # request covers that with room; the limit leaves the merges headroom.
   resources:
     requests: { cpu: "500m", memory: "2Gi" }
     limits: { cpu: "1", memory: "4Gi" }

@@ -72,7 +72,7 @@ services:
       retries: 20
 
   clickhouse:
-    image: clickhouse/clickhouse-server:24.8
+    image: clickhouse/clickhouse-server:24.8.14.39
     restart: unless-stopped
     environment:
       # The image restricts the built-in `default` user to localhost; provision a
