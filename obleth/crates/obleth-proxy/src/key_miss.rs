@@ -26,6 +26,20 @@ pub const KEY_MISS_TTL: Duration = Duration::from_secs(60);
 /// Most misses remembered at once; the least useful are dropped past this.
 pub const KEY_MISS_MAX_ENTRIES: u64 = 100_000;
 
+/// How long a model name's miss is remembered. A model created by name is
+/// published on the invalidation channel, which forgets the miss on every
+/// pod; this bounds how late a model pushed without one (a re-warm after a
+/// Redis flush) can show.
+pub const MODEL_MISS_TTL: Duration = Duration::from_secs(30);
+
+/// Most model-name misses remembered at once.
+pub const MODEL_MISS_MAX_ENTRIES: u64 = 10_000;
+
+/// The cache for model names; [`KeyMissCache`] works for any name.
+pub fn model_misses() -> KeyMissCache {
+    KeyMissCache::new(MODEL_MISS_TTL, MODEL_MISS_MAX_ENTRIES)
+}
+
 #[derive(Clone)]
 pub struct KeyMissCache(Cache<String, ()>);
 

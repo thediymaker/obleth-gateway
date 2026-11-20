@@ -35,6 +35,11 @@ pub struct AppState {
     /// API key hashes Redis recently did not know, so a repeated made-up or
     /// deleted key skips Redis for a minute.
     pub key_misses: crate::key_miss::KeyMissCache,
+    /// Model names Redis recently did not know (a family's name, or a name
+    /// the Messages surface serves with its default model), so a request
+    /// naming one skips Redis; forgotten when a model by that name is
+    /// published (see [`crate::key_miss::MODEL_MISS_TTL`]).
+    pub model_misses: crate::key_miss::KeyMissCache,
     pub model_cache: Cache<String, Arc<ResolvedModel>>,
     /// Variant names to their parent's route with the variant's boons added
     /// (see `proxy::serve_variant`), so a variant request does not copy the

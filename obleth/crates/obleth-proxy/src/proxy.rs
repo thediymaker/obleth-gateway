@@ -5263,7 +5263,11 @@ pub(crate) async fn resolve_model(state: &AppState, name: &str) -> Option<Arc<Re
     if let Some(r) = state.model_cache.get(name).await {
         return Some(r);
     }
-    match state.redis.get_resolved_model(name).await {
+    let looked_up = state
+        .model_misses
+        .lookup(name, true, || state.redis.get_resolved_model(name))
+        .await;
+    match looked_up {
         Ok(Some(r)) => {
             let r = Arc::new(r);
             state.model_cache.insert(name.to_string(), r.clone()).await;

@@ -708,6 +708,7 @@ mod tests {
             upstream_timeout: Duration::from_secs(30),
             key_cache: moka::future::Cache::builder().build(),
             key_misses: Default::default(),
+            model_misses: Default::default(),
             model_cache: moka::future::Cache::builder().build(),
             variant_cache: moka::future::Cache::builder().build(),
             mcp_cache: moka::future::Cache::builder().build(),

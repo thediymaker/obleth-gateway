@@ -2282,6 +2282,7 @@ mod model_choice_tests {
             upstream_timeout: Duration::from_secs(30),
             key_cache: Cache::builder().build(),
             key_misses: Default::default(),
+            model_misses: Default::default(),
             model_cache: Cache::builder().build(),
             variant_cache: Cache::builder().build(),
             mcp_cache: Cache::builder().build(),

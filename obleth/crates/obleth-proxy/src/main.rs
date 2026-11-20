@@ -250,6 +250,7 @@ async fn main() -> anyhow::Result<()> {
     // Hashes Redis did not know, so a flood of one made-up key costs one
     // Redis lookup a minute on this pod (see key_miss.rs).
     let key_misses = key_miss::KeyMissCache::default();
+    let model_misses = key_miss::model_misses();
     let model_cache: Cache<String, Arc<obleth_config::ResolvedModel>> = Cache::builder()
         .time_to_live(Duration::from_secs(300))
         .max_capacity(10_000)
@@ -506,6 +507,7 @@ async fn main() -> anyhow::Result<()> {
         upstream_timeout: cfg.upstream_timeout,
         key_cache: key_cache.clone(),
         key_misses: key_misses.clone(),
+        model_misses: model_misses.clone(),
         model_cache: model_cache.clone(),
         variant_cache: variant_cache.clone(),
         mcp_cache: mcp_cache.clone(),
@@ -663,6 +665,7 @@ async fn main() -> anyhow::Result<()> {
         InvalidationCaches {
             keys: key_cache.clone(),
             key_misses: key_misses.clone(),
+            model_misses: model_misses.clone(),
             models: model_cache.clone(),
             variants: variant_cache.clone(),
             mcp: mcp_cache.clone(),
@@ -676,7 +679,7 @@ async fn main() -> anyhow::Result<()> {
         (cfg.redis_rewarm_secs > 0)
             .then(|| Duration::from_secs(clamped_redis_rewarm_secs(cfg.redis_rewarm_secs))),
         redis_reconnected,
-        key_misses.clone(),
+        [key_misses.clone(), model_misses.clone()],
     );
 
     // ---- admin (Management API) ----
@@ -1290,6 +1293,7 @@ fn spawn_tool_cache_prewarm(state: AppState, store: Store) {
 struct InvalidationCaches {
     keys: Cache<String, Arc<obleth_config::ResolvedKey>>,
     key_misses: key_miss::KeyMissCache,
+    model_misses: key_miss::KeyMissCache,
     models: Cache<String, Arc<obleth_config::ResolvedModel>>,
     variants: Cache<String, Arc<obleth_config::ResolvedModel>>,
     mcp: Cache<String, Arc<obleth_config::ResolvedMcpServer>>,
@@ -1300,6 +1304,7 @@ impl InvalidationCaches {
     fn invalidate_all(&self) {
         self.keys.invalidate_all();
         self.key_misses.clear();
+        self.model_misses.clear();
         self.models.invalidate_all();
         self.variants.invalidate_all();
         self.mcp.invalidate_all();
@@ -1312,6 +1317,8 @@ impl InvalidationCaches {
             Invalidation::Model(name) => {
                 self.models.invalidate(&name).await;
                 self.variants.invalidate(&name).await;
+                // A model by this name may have just been created.
+                self.model_misses.forget(&name).await;
             }
             Invalidation::Mcp(name) => self.mcp.invalidate(&name).await,
             Invalidation::CrashStrike(model) => self
@@ -1388,7 +1395,7 @@ fn spawn_redis_rewarm(
     redis: RedisStore,
     every: Option<Duration>,
     reconnected: Arc<tokio::sync::Notify>,
-    key_misses: key_miss::KeyMissCache,
+    misses: [key_miss::KeyMissCache; 2],
 ) {
     tokio::spawn(async move {
         let mut tick = every.map(|period| {
@@ -1414,7 +1421,7 @@ fn spawn_redis_rewarm(
                 _ = periodic => {}
                 _ = reconnected.notified() => {}
             }
-            rewarm_redis(&store, &redis, &key_misses).await;
+            rewarm_redis(&store, &redis, &misses).await;
         }
     });
 }
@@ -1423,15 +1430,20 @@ fn spawn_redis_rewarm(
 /// while Redis was missing it (after a restart or flush, before this pass
 /// pushed it back) was remembered as unknown; the push publishes no per-key
 /// invalidation, so every miss is forgotten once Redis holds the keys again.
-async fn rewarm_redis(store: &Store, redis: &RedisStore, key_misses: &key_miss::KeyMissCache) {
+async fn rewarm_redis(store: &Store, redis: &RedisStore, misses: &[key_miss::KeyMissCache; 2]) {
     let pass = obleth_admin::rewarm::push_and_prune(
         store,
         redis,
         obleth_admin::rewarm::Reread::WhenPruned,
     )
     .await;
+    // Keys and model names, which a pass also pushes without a message.
+    let [key_misses, model_misses] = misses;
     if pass.keys.is_ok() {
         key_misses.clear();
+    }
+    if pass.models.is_ok() {
+        model_misses.clear();
     }
     let count = |o: &obleth_admin::rewarm::Outcome| o.as_ref().ok().map(|p| p.ids.len());
     tracing::debug!(
@@ -1541,6 +1553,44 @@ where
 #[cfg(test)]
 mod registry_refresh_tests {
     use super::*;
+
+    /// A model name Redis did not know is remembered, so a family's name
+    /// costs one lookup, not one per request; a model published under the
+    /// name forgets it on every pod.
+    #[tokio::test]
+    async fn a_published_model_forgets_its_name_miss() {
+        let caches = InvalidationCaches {
+            keys: Cache::builder().build(),
+            key_misses: Default::default(),
+            model_misses: key_miss::model_misses(),
+            models: Cache::builder().build(),
+            variants: Cache::builder().build(),
+            mcp: Cache::builder().build(),
+            crash_guard: crash_guard::CrashGuard::disabled(),
+        };
+        let lookups = std::sync::atomic::AtomicUsize::new(0);
+        let lookup = || async {
+            lookups.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok::<Option<()>, ()>(None)
+        };
+        for _ in 0..3 {
+            caches
+                .model_misses
+                .lookup("family-x", true, lookup)
+                .await
+                .unwrap();
+        }
+        assert_eq!(lookups.load(std::sync::atomic::Ordering::SeqCst), 1);
+        caches
+            .apply(obleth_redis::Invalidation::Model("family-x".into()))
+            .await;
+        caches
+            .model_misses
+            .lookup("family-x", true, lookup)
+            .await
+            .unwrap();
+        assert_eq!(lookups.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
 
     /// A row that differs from the live settings replaces them; an identical
     /// row leaves the live snapshot untouched, so an unchanged save on another
