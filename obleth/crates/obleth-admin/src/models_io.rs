@@ -21,7 +21,30 @@ use obleth_store::ModelImportWrite;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 
-use crate::{audit_actor, sync_model_from, AdminError, AdminState, Result};
+use crate::{
+    audit_actor, sync_model_from, validate_capacity_fields, AdminError, AdminState, Result,
+};
+
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub(crate) struct ExportQuery {
+    /// Comma-separated model names to export. Absent or empty: every model.
+    /// Names that match no model are skipped.
+    #[serde(default)]
+    names: Option<String>,
+}
+
+/// Every model's endpoints from one read, keyed by model id, in the store's
+/// order (priority within a model).
+async fn endpoints_by_model(state: &AdminState) -> Result<HashMap<uuid::Uuid, Vec<ModelEndpoint>>> {
+    let mut by_model: HashMap<uuid::Uuid, Vec<ModelEndpoint>> = HashMap::new();
+    for endpoint in state.store.all_model_endpoints().await? {
+        by_model
+            .entry(endpoint.model_id)
+            .or_default()
+            .push(endpoint);
+    }
+    Ok(by_model)
+}
 
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub(crate) struct ImportQuery {
@@ -32,13 +55,26 @@ pub(crate) struct ImportQuery {
 
 #[utoipa::path(
     get, path = "/api/v1/models/export", tag = "models",
+    params(ExportQuery),
     responses((status = 200, body = ModelManifest))
 )]
 pub(crate) async fn export_models(
     State(state): State<AdminState>,
     headers: HeaderMap,
+    Query(query): Query<ExportQuery>,
 ) -> Result<Json<ModelManifest>> {
+    let wanted: HashSet<&str> = query
+        .names
+        .as_deref()
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .collect();
     let mut models = state.store.list_models().await?;
+    if !wanted.is_empty() {
+        models.retain(|m| wanted.contains(m.model_name.as_str()));
+    }
     // Stable order so two exports of the same registry diff cleanly in git.
     models.sort_by(|a, b| a.model_name.cmp(&b.model_name));
 
@@ -52,10 +88,11 @@ pub(crate) async fn export_models(
         .filter_map(|r| r.endpoint_id)
         .collect();
 
+    let mut endpoints_of = endpoints_by_model(&state).await?;
     let mut entries = Vec::with_capacity(models.len());
     for model in &models {
         let mut entry = model_to_manifest_entry(model);
-        let mut endpoints = state.store.list_model_endpoints(model.id).await?;
+        let mut endpoints = endpoints_of.remove(&model.id).unwrap_or_default();
         endpoints.retain(|e| !job_endpoints.contains(&e.id));
         endpoints.sort_by(|a, b| a.name.cmp(&b.name));
         // Omit the key entirely for models with no endpoints, so re-importing
@@ -119,6 +156,7 @@ pub(crate) async fn import_models(
         .into_iter()
         .map(|m| (m.model_name.clone(), m))
         .collect();
+    let mut endpoints_of = endpoints_by_model(&state).await?;
     let registered_servers: Vec<String> = state
         .store
         .list_mcp_servers()
@@ -174,13 +212,12 @@ pub(crate) async fn import_models(
         let mut changed_fields = resolved.changed_fields.clone();
         let warnings = resolved.warnings.clone();
 
+        let current_endpoints: Vec<ModelEndpoint> = current
+            .and_then(|m| endpoints_of.remove(&m.id))
+            .unwrap_or_default();
         let endpoints = match &entry.endpoints {
             None => None,
             Some(list) => {
-                let current_endpoints: Vec<ModelEndpoint> = match current {
-                    Some(m) => state.store.list_model_endpoints(m.id).await?,
-                    None => Vec::new(),
-                };
                 let by_name: HashMap<&str, &ModelEndpoint> = current_endpoints
                     .iter()
                     .map(|e| (e.name.as_str(), e))
@@ -234,21 +271,17 @@ pub(crate) async fn import_models(
         // by name, so the model's endpoints after the import are the stored
         // ones with the listed ones laid over them.
         let c = &resolved.config;
-        let mut endpoint_values: HashMap<String, Option<i64>> = match current {
-            Some(m) if c.capacity_mode == obleth_config::DISCOVERED_CAPACITY_MODE => state
-                .store
-                .list_model_endpoints(m.id)
-                .await?
-                .into_iter()
-                .map(|e| (e.name, e.max_in_flight))
-                .collect(),
-            _ => HashMap::new(),
-        };
+        let mut endpoint_values: HashMap<&str, Option<i64>> = current_endpoints
+            .iter()
+            .map(|e| (e.name.as_str(), e.max_in_flight))
+            .collect();
         for e in endpoints.iter().flatten() {
-            endpoint_values.insert(e.name.clone(), e.max_in_flight);
+            endpoint_values.insert(e.name.as_str(), e.max_in_flight);
         }
         let endpoint_values: Vec<Option<i64>> = endpoint_values.into_values().collect();
-        if let Err(e) = obleth_config::capacity::validate_discovery_fields(
+        if let Err(e) = validate_capacity_fields(
+            &state,
+            &c.capacity_mode,
             &name,
             &c.upstream_model,
             &obleth_config::capacity::DiscoveryFields {
@@ -258,8 +291,6 @@ pub(crate) async fn import_models(
                 per_replica_max_in_flight: c.per_replica_max_in_flight,
                 headroom: c.capacity_headroom,
             },
-            c.capacity_mode == obleth_config::DISCOVERED_CAPACITY_MODE,
-            state.capacity_discovery.policy(),
             &endpoint_values,
         ) {
             errors.push(format!("model '{name}': {e}"));
@@ -329,15 +360,12 @@ pub(crate) async fn import_models(
 
     // Skip rows the manifest would write identically — no pointless
     // `updated_at` churn, and no cache invalidation storm for a no-op import.
+    // `writes` and the report's entries are pushed together, one per model.
     let touched: Vec<ModelImportWrite> = writes
         .into_iter()
-        .filter(|w| {
-            report
-                .models
-                .iter()
-                .find(|e| e.model_name == w.model_name)
-                .is_some_and(|e| e.action != obleth_config::IMPORT_ACTION_UNCHANGED)
-        })
+        .zip(&report.models)
+        .filter(|(_, e)| e.action != obleth_config::IMPORT_ACTION_UNCHANGED)
+        .map(|(w, _)| w)
         .collect();
 
     let outcomes = state.store.apply_model_manifest(&touched).await?;

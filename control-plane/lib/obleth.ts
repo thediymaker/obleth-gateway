@@ -3355,8 +3355,9 @@ export const obleth = {
       headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
-  exportModels: (options?: AuditOptions) =>
-    api<ModelManifest>("/models/export", {
+  /** The model manifest; `names` limits it to those models (unknown names are skipped). */
+  exportModels: (names: string[] = [], options?: AuditOptions) =>
+    api<ModelManifest>(`/models/export${qs({ names: names.length ? names.join(",") : undefined })}`, {
       headers: auditActorHeaders(options),
     }),
   importModels: (

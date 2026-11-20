@@ -7,10 +7,8 @@ import { liveRoute } from "@/lib/auth/guard";
 // carries no secrets — upstream keys are reported as a presence flag only — so
 // it is safe to keep in a repository. `?names=a,b` exports just those models.
 export const GET = liveRoute(async (req) => {
-  const full = await obleth.exportModels();
   const names = (req.nextUrl.searchParams.get("names") ?? "").split(",").map((n) => n.trim()).filter(Boolean);
-  const wanted = new Set(names);
-  const manifest = names.length ? { ...full, models: full.models.filter((m) => wanted.has(m.model_name)) } : full;
+  const manifest = await obleth.exportModels(names);
   const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
   const filename = names.length === 1 ? `obleth-model-${names[0]}-${stamp}.json` : `obleth-models-${stamp}.json`;
   return new Response(JSON.stringify(manifest, null, 2), {

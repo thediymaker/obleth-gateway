@@ -33,6 +33,8 @@ use axum::http::HeaderMap;
 use axum::Json;
 use chrono::{DateTime, Utc};
 use clickhouse::Row;
+use futures::future::{BoxFuture, FutureExt};
+use futures::stream::{self, StreamExt, TryStreamExt};
 use obleth_config::{ModelHealthDetail, ModelHealthSummary, ModelRoute};
 use obleth_store::{
     ModelHealthAlertEvent, ModelHealthClaim, ModelHealthConfigUpdate, ModelHealthRecordOutcome,
@@ -46,6 +48,14 @@ use crate::{audit_actor, AdminError, AdminState, Result};
 
 pub const HEALTH_GROUP: &str = "model-health";
 const CHECK_LIMIT: i64 = 50;
+/// Endpoints of one model probed at once. Each probe may retry up to
+/// [`LIVENESS_MAX_ATTEMPTS`] times, so serial probes of a large pool took the
+/// sum of every endpoint's latency; a small bound keeps the burst on a shared
+/// upstream modest.
+const ENDPOINT_PROBE_CONCURRENCY: usize = 4;
+/// Models checked at once by the bulk check (each with up to
+/// [`ENDPOINT_PROBE_CONCURRENCY`] endpoint probes of its own).
+const BULK_CHECK_CONCURRENCY: usize = 4;
 const WORKER_CLAIM_LIMIT: i64 = 4;
 const WORKER_SLEEP_SECS: u64 = 30;
 /// Window of real traffic that counts as a passive health signal.
@@ -254,25 +264,31 @@ pub async fn check_all(State(state): State<AdminState>) -> Result<Json<BulkModel
     let health_by_model: std::collections::HashMap<Uuid, ModelHealthSummary> =
         health.into_iter().map(|row| (row.model_id, row)).collect();
     let now = Utc::now();
-    let mut checked = Vec::new();
-    let mut skipped = 0usize;
-
-    for model in models {
-        let Some(summary) = health_by_model.get(&model.id) else {
-            skipped += 1;
-            continue;
-        };
-        let in_maintenance = summary
-            .maintenance_until
-            .map(|until| until > now)
-            .unwrap_or(false);
-        let retired = model.lifecycle.status_at(now) == obleth_config::ModelStatus::Retired;
-        if !model.enabled || !summary.checks_enabled || in_maintenance || retired {
-            skipped += 1;
-            continue;
-        }
-        checked.push(run_and_fetch_detail(&state, model, "bulk").await?.0);
-    }
+    let total = models.len();
+    let due: Vec<ModelRoute> = models
+        .into_iter()
+        .filter(|model| {
+            let Some(summary) = health_by_model.get(&model.id) else {
+                return false;
+            };
+            let in_maintenance = summary
+                .maintenance_until
+                .map(|until| until > now)
+                .unwrap_or(false);
+            let retired = model.lifecycle.status_at(now) == obleth_config::ModelStatus::Retired;
+            model.enabled && summary.checks_enabled && !in_maintenance && !retired
+        })
+        .collect();
+    let skipped = total - due.len();
+    let checks: Vec<BoxFuture<'_, Result<Json<ModelHealthDetail>>>> = due
+        .into_iter()
+        .map(|model| run_and_fetch_detail(&state, model, "bulk").boxed())
+        .collect();
+    let checked: Vec<ModelHealthDetail> = stream::iter(checks)
+        .buffered(BULK_CHECK_CONCURRENCY)
+        .map_ok(|detail| detail.0)
+        .try_collect()
+        .await?;
 
     Ok(Json(BulkModelHealthResult { checked, skipped }))
 }
@@ -1134,39 +1150,58 @@ async fn probe_endpoints(state: &AdminState, model: &ModelRoute) -> Vec<ProbeRes
         .map(|e| (e.id.as_str(), e.api_key.as_deref()))
         .collect();
 
-    let mut results = Vec::with_capacity(endpoints.len());
-    for endpoint in &endpoints {
-        let result = if !endpoint.enabled {
-            ProbeResult {
-                status: "disabled".to_string(),
-                latency_ms: None,
-                http_status: None,
-                message: Some("endpoint is disabled".to_string()),
-                response_excerpt: None,
-            }
-        } else {
+    // Boxed so the stream's item type names no borrow of its own; a closure
+    // returning `async move` over these borrows is not provably `Send` for
+    // every lifetime, which the axum handler and the worker's spawn need.
+    let probes: Vec<BoxFuture<'_, ProbeResult>> = endpoints
+        .iter()
+        .map(|endpoint| {
             let api_key = key_by_id
                 .get(endpoint.id.to_string().as_str())
                 .copied()
                 .flatten();
-            inference_probe(state, model, &endpoint.api_base, api_key).await
-        };
-        if let Err(error) = state
-            .store
-            .record_endpoint_health(
-                endpoint.id,
-                &result.status,
-                result.latency_ms,
-                result.http_status,
-                result.message.as_deref(),
-            )
-            .await
-        {
-            tracing::warn!(%error, endpoint = %endpoint.name, "failed to record endpoint health");
+            probe_endpoint(state, model, endpoint, api_key).boxed()
+        })
+        .collect();
+    stream::iter(probes)
+        .buffered(ENDPOINT_PROBE_CONCURRENCY)
+        .collect()
+        .await
+}
+
+/// Probe one endpoint (a disabled one is recorded without a call) and record
+/// the result on it.
+async fn probe_endpoint(
+    state: &AdminState,
+    model: &ModelRoute,
+    endpoint: &obleth_config::ModelEndpoint,
+    api_key: Option<&str>,
+) -> ProbeResult {
+    let result = if !endpoint.enabled {
+        ProbeResult {
+            status: "disabled".to_string(),
+            latency_ms: None,
+            http_status: None,
+            message: Some("endpoint is disabled".to_string()),
+            response_excerpt: None,
         }
-        results.push(result);
+    } else {
+        inference_probe(state, model, &endpoint.api_base, api_key).await
+    };
+    if let Err(error) = state
+        .store
+        .record_endpoint_health(
+            endpoint.id,
+            &result.status,
+            result.latency_ms,
+            result.http_status,
+            result.message.as_deref(),
+        )
+        .await
+    {
+        tracing::warn!(%error, endpoint = %endpoint.name, "failed to record endpoint health");
     }
-    results
+    result
 }
 
 /// True when a dynamic-endpoint pool has at least one live endpoint answering

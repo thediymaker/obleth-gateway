@@ -8038,7 +8038,7 @@ fn patch_discovery_fields(
 /// `endpoint_max_in_flight` is each of the model's endpoints' own
 /// `max_in_flight` (see [`endpoint_concurrency`]), which decides whether an
 /// `endpoints`-source model needs its own per-replica value.
-fn validate_capacity_fields(
+pub(crate) fn validate_capacity_fields(
     state: &AdminState,
     capacity_mode: &str,
     model_name: &str,
@@ -11171,6 +11171,164 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// A model's endpoints are probed together: four endpoints that each take
+    /// 400 ms answer in about that long, not 1.6 s, and every one has its
+    /// result recorded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_models_endpoints_are_probed_concurrently() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let upstream = axum::Router::new().route(
+            "/v1/embeddings",
+            axum::routing::post(|| async {
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                Json(serde_json::json!({"data": [{"index": 0, "embedding": [1.0, 0.0]}]}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+        let name = format!("probe-pool-{}", Uuid::new_v4());
+        let (status, created) = send(
+            &t.app,
+            json_request(
+                "POST",
+                "/api/v1/models",
+                serde_json::json!({
+                    "model_name": name,
+                    "upstream_model": "bge-m3",
+                    "api_base": "",
+                    "model_type": "embedding",
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let model_id: Uuid = created["id"].as_str().unwrap().parse().unwrap();
+        for i in 0..4 {
+            t.store
+                .create_model_endpoint(
+                    model_id,
+                    &format!("e{i}"),
+                    &format!("http://{addr}/v1"),
+                    None,
+                    i,
+                    100,
+                    true,
+                    None,
+                )
+                .await
+                .expect("endpoint");
+        }
+
+        let started = std::time::Instant::now();
+        let (status, body) = send(
+            &t.app,
+            json_request(
+                "POST",
+                &format!("/api/v1/models/{model_id}/health/check"),
+                serde_json::json!({}),
+            ),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            elapsed < std::time::Duration::from_millis(1200),
+            "four 400 ms probes took {elapsed:?}; serial would be 1.6 s"
+        );
+        let endpoints = t.store.list_model_endpoints(model_id).await.expect("list");
+        assert_eq!(endpoints.len(), 4);
+        assert!(
+            endpoints.iter().all(|e| e.last_checked_at.is_some()),
+            "every endpoint has its probe recorded: {endpoints:?}"
+        );
+        t.store.delete_model(model_id).await.ok();
+    }
+
+    /// Export takes a names filter and reads every endpoint in one go; the
+    /// exported file imports back as unchanged.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn export_filters_by_name_and_round_trips_unchanged() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let wanted = fixture_model(&t.store, &format!("export-a-{}", Uuid::new_v4()), 0.0).await;
+        let other = fixture_model(&t.store, &format!("export-b-{}", Uuid::new_v4()), 0.0).await;
+        // The import re-checks destinations, and the fixture's host does not
+        // resolve; a private address passes the test gateway's policy.
+        sqlx::query("update models set api_base = 'http://10.0.0.1/v1' where id = $1")
+            .bind(wanted.id)
+            .execute(t.store.pool())
+            .await
+            .expect("point at a resolvable address");
+        t.store
+            .create_model_endpoint(
+                wanted.id,
+                "east",
+                "http://10.0.0.2/v1",
+                None,
+                0,
+                100,
+                true,
+                Some(8),
+            )
+            .await
+            .expect("endpoint");
+        let get = |path: String| {
+            axum::http::Request::get(path)
+                .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+                .body(axum::body::Body::empty())
+                .expect("build request")
+        };
+
+        let (status, manifest) = send(
+            &t.app,
+            get(format!(
+                "/api/v1/models/export?names={},no-such-model",
+                wanted.model_name
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{manifest}");
+        let models = manifest["models"].as_array().expect("models");
+        assert_eq!(models.len(), 1, "{manifest}");
+        assert_eq!(
+            models[0]["model_name"],
+            serde_json::json!(wanted.model_name)
+        );
+        assert_eq!(models[0]["endpoints"][0]["name"], serde_json::json!("east"));
+        assert_eq!(
+            models[0]["endpoints"][0]["max_in_flight"],
+            serde_json::json!(8)
+        );
+
+        let (status, all) = send(&t.app, get("/api/v1/models/export".into())).await;
+        assert_eq!(status, StatusCode::OK, "{all}");
+        assert!(all["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["model_name"] == serde_json::json!(other.model_name)));
+
+        let (status, report) = send(
+            &t.app,
+            json_request("POST", "/api/v1/models/import?dry_run=true", manifest),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{report}");
+        assert_eq!(report["unchanged"], serde_json::json!(1), "{report}");
+        assert_eq!(report["updated"], serde_json::json!(0), "{report}");
+        assert_eq!(report["created"], serde_json::json!(0), "{report}");
+
+        t.store.delete_model(wanted.id).await.ok();
+        t.store.delete_model(other.id).await.ok();
     }
 
     /// A Slurm-managed embedder has a blank `api_base` and lives only in its
