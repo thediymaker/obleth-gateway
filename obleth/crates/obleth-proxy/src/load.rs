@@ -30,7 +30,7 @@ use obleth_fairshare::FairShare;
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::proxy::{self, error_json, gate_resolved_key};
+use crate::proxy::{self, error_json};
 use crate::reasoning::FamilyRegistry;
 use crate::router::ModelRegistry;
 use crate::state::AppState;
@@ -208,19 +208,14 @@ pub async fn load(
     headers: HeaderMap,
 ) -> Response<Body> {
     let request_id = Uuid::new_v4();
-    let mut resp = handle(
+    let resp = handle(
         &state,
         query.get("model").map(String::as_str),
         &headers,
         &client,
     )
     .await;
-    if let Ok(value) = HeaderValue::from_str(&request_id.to_string()) {
-        resp.headers_mut()
-            .entry("x-obleth-request-id")
-            .or_insert(value);
-    }
-    resp
+    proxy::with_request_id(resp, request_id)
 }
 
 async fn handle(
@@ -232,16 +227,10 @@ async fn handle(
     let Some(reporter) = &state.load else {
         return error_json(StatusCode::NOT_FOUND, "unknown endpoint");
     };
-    let Some(secret) = proxy::bearer(headers) else {
-        return error_json(StatusCode::UNAUTHORIZED, "missing bearer token");
-    };
-    let resolved = match crate::jwt_auth::authenticate_credential(state, &secret).await {
+    let resolved = match proxy::authenticate_and_gate(state, headers, client).await {
         Ok(cred) => cred.resolved,
         Err(resp) => return resp,
     };
-    if let Err(resp) = gate_resolved_key(state, &resolved, client) {
-        return resp;
-    }
     reporter.answer(&resolved, model, headers).await
 }
 

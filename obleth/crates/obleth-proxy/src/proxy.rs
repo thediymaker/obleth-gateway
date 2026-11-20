@@ -1140,7 +1140,10 @@ async fn proxy_handler_inner(
     let mut lifecycle: Option<crate::lifecycle::Notice> = None;
     let mut reasoning: Option<crate::reasoning::Note> = None;
     let mut auto_note: Option<crate::sticky::Note> = None;
-    let resp = run_pipeline(
+    // Boxed: the pipeline's state is the largest future in the gateway, and
+    // on the heap it cannot overflow a 2 MB worker or test thread stack in
+    // debug builds.
+    let resp = Box::pin(run_pipeline(
         state,
         req,
         request_id,
@@ -1148,7 +1151,7 @@ async fn proxy_handler_inner(
         &mut lifecycle,
         &mut reasoning,
         &mut auto_note,
-    )
+    ))
     .await;
     let mut resp = with_variant_header(resp, variant.as_deref());
     if let Some(notice) = &lifecycle {
@@ -1320,8 +1323,12 @@ async fn run_pipeline(
             query: &query,
             headers: &headers,
         };
-        return crate::jobs::handle_follow_up(&state, &resolved, kind, call, inbound, request_id)
-            .await;
+        // Boxed: a follow-up streams a whole file, and its state must not sit
+        // inline in every request's future.
+        return Box::pin(crate::jobs::handle_follow_up(
+            &state, &resolved, kind, call, inbound, request_id,
+        ))
+        .await;
     }
     let job_create = crate::jobs::is_create(&method, &path);
 
@@ -2352,50 +2359,24 @@ async fn run_pipeline(
     // because nothing is dispatched until the reservation has succeeded.
     // Requests with no registered route share one pool, so arbitrary model
     // strings cannot each mint scheduler state.
-    let admission_start = crate::tracer::now_ms();
-    let pool = admission_pool(route.as_deref());
-    // A batch item, or a request from a background key, waits in the model's
-    // background pool, without the interactive admission timeout.
-    let background = background_admission(route.as_deref(), batch.as_ref(), &resolved, || {
-        crate::batches::background_share(state.batches.as_ref())
-    });
-    let pool = match (pool, &background) {
-        (obleth_fairshare::PoolKey::Model(m), Some(_)) => obleth_fairshare::PoolKey::Background(m),
-        (pool, _) => pool,
-    };
-    let admit_wait = background.map(|b| b.wait).unwrap_or_else(admission_timeout);
-    // Session affinity can only keep a conversation warm on an upstream it
-    // keeps going back to.
-    let mut admit_req = admit_request_for(
-        &resolved,
-        &model,
-        route.as_deref(),
-        effective_weight,
-        est.total(),
-        end_user.as_deref(),
-    );
-    // Background work keeps no session slots: a slot held idle for a
-    // session's next step would hold back interactive requests.
-    if let Some(b) = &background {
-        admit_req = admit_req.background_share(b.share);
-    } else if route_keeps_sessions(route.as_deref()) {
-        admit_req = admit_req.session(req_meta.session_id.as_str());
-    }
-    if let Some(r) = route
-        .as_deref()
-        .filter(|r| !r.session_affinity.is_default())
-    {
-        // The model's own session affinity setting, over the gateway's.
-        admit_req = admit_req.session_affinity(r.session_affinity.resolve(
-            state.session_affinity.is_some(),
-            &state.session_affinity_settings,
-        ));
-    }
-    let admit = state.fairshare.admit_to(pool, admit_req);
-    let admitted = match timeout(admit_wait, admit).await {
-        Ok(Some(a)) => a,
-        Err(_) => {
-            let queued_ms = (crate::tracer::now_ms() - admission_start) as u32;
+    // Boxed: like the reservation below, the admission's state would otherwise
+    // sit inline in this function's already large future.
+    let admitted = match Box::pin(admit(
+        &state,
+        Admit {
+            resolved: &resolved,
+            model: &model,
+            route: route.as_deref(),
+            weight: effective_weight,
+            cost: est.total(),
+            end_user: end_user.as_deref(),
+            batch: batch.as_ref(),
+            session_id: Some(req_meta.session_id.as_str()),
+            path: &path,
+        },
+        tracer.as_mut(),
+        serde_json::json!({}),
+        |queued_ms| {
             reject(
                 &state,
                 request_id,
@@ -2409,32 +2390,17 @@ async fn run_pipeline(
                     cache_status: cache_status_label,
                     queue_wait_ms: queued_ms,
                 },
-            );
-            let mut resp = error_json(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "timed out waiting for model capacity",
-            );
-            resp.headers_mut().insert(
-                header::RETRY_AFTER,
-                header::HeaderValue::from_static(ADMISSION_RETRY_AFTER_SECS),
-            );
-            return resp;
-        }
-        Ok(None) => {
-            state.alerts.issue(
-                "scheduler_unavailable",
-                "Fairshare scheduler unavailable",
-                format!(
-                    "tenant `{}` model `{model}` path `{path}`",
-                    resolved.tenant_name
-                ),
-            );
-            return error_json(StatusCode::SERVICE_UNAVAILABLE, "scheduler unavailable");
-        }
+            )
+        },
+    ))
+    .await
+    {
+        Ok(admitted) => admitted,
+        Err(resp) => return resp,
     };
     let admission = admitted.admission;
     let permit = admitted.permit;
-    let queue_wait_ms = admitted.waited.as_millis() as u32;
+    let queue_wait_ms = admitted.queue_wait_ms;
     let answer = Answer {
         request_id,
         queue_wait_ms,
@@ -2443,20 +2409,6 @@ async fn run_pipeline(
     };
     // Energy is metered from admission: queue time is never charged.
     let request_energy = state.energy.request(route.as_deref());
-    let admission_ms = (crate::tracer::now_ms() - admission_start) as u32;
-    if let Some(ref mut t) = tracer {
-        t.record(
-            "admission",
-            "proxy_request",
-            admission_start,
-            admission_ms,
-            "ok",
-            serde_json::json!({
-                "decision": admission.as_str(),
-                "queue_wait_ms": queue_wait_ms,
-            }),
-        );
-    }
 
     let send_bytes = body_bytes;
 
@@ -7576,6 +7528,201 @@ fn cached_response(cached: obleth_config::CachedResponse, request_id: Uuid) -> R
 // (`return resp`); boxing it would push a deref into each call site for a
 // rejection path that is cold anyway.
 #[allow(clippy::result_large_err)]
+/// The request id every answer of an endpoint carries, on a response that
+/// did not set one itself.
+pub(crate) fn with_request_id(mut resp: Response<Body>, request_id: Uuid) -> Response<Body> {
+    if let Ok(value) = header::HeaderValue::from_str(&request_id.to_string()) {
+        resp.headers_mut()
+            .entry("x-obleth-request-id")
+            .or_insert(value);
+    }
+    resp
+}
+
+/// The handler envelope every side endpoint opens with: the bearer token,
+/// the credential it names (JWT or secret key), and the post-auth key gates.
+/// The error is the finished refusal the caller returns as is, so every
+/// endpoint refuses a missing token, a bad credential, a disabled key, an
+/// inactive tenant or a closed schedule with the same status and body.
+// The error is a finished response, like `gate_resolved_key`'s.
+#[allow(clippy::result_large_err)]
+pub(crate) async fn authenticate_and_gate(
+    state: &AppState,
+    headers: &HeaderMap,
+    client: &crate::client::ClientInfo,
+) -> Result<crate::jwt_auth::Credential, Response<Body>> {
+    let Some(secret) = bearer(headers) else {
+        return Err(error_json(StatusCode::UNAUTHORIZED, "missing bearer token"));
+    };
+    let cred = crate::jwt_auth::authenticate_credential(state, &secret).await?;
+    gate_resolved_key(state, &cred.resolved, client)?;
+    Ok(cred)
+}
+
+/// `s` percent-encoded as one URL component: everything but RFC 3986's
+/// unreserved characters is escaped, so a value can add neither a path
+/// segment nor a query parameter. One encoder for every upstream URL the
+/// gateway builds from a caller's or a model's text.
+pub(crate) fn encode_url_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Headers for a call to `target`: the client's forwarded headers, then the
+/// model's own, then its key, the order the pipeline applies.
+pub(crate) fn upstream_headers(client: &HeaderMap, target: &Target) -> HeaderMap {
+    let mut out = forward_headers(client);
+    out.extend(target.headers.clone());
+    if let Some(key) = &target.api_key {
+        if let Ok(v) = header::HeaderValue::from_str(&format!("Bearer {key}")) {
+            out.insert(header::AUTHORIZATION, v);
+        }
+    }
+    out
+}
+
+/// The per-request timeout the pipeline would use for `route`: the model's
+/// own when it names one, else the gateway's.
+pub(crate) fn request_timeout(state: &AppState, route: &ResolvedModel) -> Duration {
+    route
+        .request_timeout_secs
+        .filter(|s| *s >= 1)
+        .map(|s| Duration::from_secs(s as u64))
+        .unwrap_or(state.upstream_timeout)
+}
+
+/// One admission to a model's pool, for every endpoint that takes a slot in
+/// one: the pipeline, `/v1/search` and `/v1/verdicts`.
+pub(crate) struct Admit<'a> {
+    pub resolved: &'a ResolvedKey,
+    pub model: &'a str,
+    pub route: Option<&'a ResolvedModel>,
+    pub weight: i64,
+    pub cost: u32,
+    pub end_user: Option<&'a str>,
+    /// A batch item's own share and wait; interactive work has none.
+    pub batch: Option<&'a BackgroundShare>,
+    /// The conversation a session-keeping route pins to an upstream; none
+    /// for work that keeps no session.
+    pub session_id: Option<&'a str>,
+    /// Names the endpoint in the scheduler alert.
+    pub path: &'a str,
+}
+
+pub(crate) struct Admitted {
+    pub admission: obleth_config::Admission,
+    pub permit: obleth_fairshare::Permit,
+    pub queue_wait_ms: u32,
+}
+
+/// Admission, the same on every endpoint: the model's pool (its background
+/// pool for a batch item or a background key, without the interactive
+/// timeout), the key's weight and caps, session affinity where the route
+/// keeps sessions, the `admission` span when traced, and one refusal shape
+/// when the wait runs out (`on_timeout` records the rejection) or the
+/// scheduler is gone.
+pub(crate) async fn admit(
+    state: &AppState,
+    spec: Admit<'_>,
+    tracer: Option<&mut crate::tracer::SpanRecorder>,
+    span_extra: serde_json::Value,
+    on_timeout: impl FnOnce(u32),
+) -> Result<Admitted, Response<Body>> {
+    let admission_start = crate::tracer::now_ms();
+    let pool = admission_pool(spec.route);
+    let background = background_admission(spec.route, spec.batch, spec.resolved, || {
+        crate::batches::background_share(state.batches.as_ref())
+    });
+    let pool = match (pool, &background) {
+        (obleth_fairshare::PoolKey::Model(m), Some(_)) => obleth_fairshare::PoolKey::Background(m),
+        (pool, _) => pool,
+    };
+    let admit_wait = background.map(|b| b.wait).unwrap_or_else(admission_timeout);
+    let mut admit_req = admit_request_for(
+        spec.resolved,
+        spec.model,
+        spec.route,
+        spec.weight,
+        spec.cost,
+        spec.end_user,
+    );
+    // Background work keeps no session slots: a slot held idle for a
+    // session's next step would hold back interactive requests.
+    match (&background, spec.session_id) {
+        (Some(b), _) => admit_req = admit_req.background_share(b.share),
+        (None, Some(session)) if route_keeps_sessions(spec.route) => {
+            admit_req = admit_req.session(session)
+        }
+        _ => {}
+    }
+    if let Some(r) = spec.route.filter(|r| !r.session_affinity.is_default()) {
+        // The model's own session affinity setting, over the gateway's.
+        admit_req = admit_req.session_affinity(r.session_affinity.resolve(
+            state.session_affinity.is_some(),
+            &state.session_affinity_settings,
+        ));
+    }
+    let admitted = match timeout(admit_wait, state.fairshare.admit_to(pool, admit_req)).await {
+        Ok(Some(a)) => a,
+        Err(_) => {
+            on_timeout((crate::tracer::now_ms() - admission_start) as u32);
+            let mut resp = error_json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "timed out waiting for model capacity",
+            );
+            resp.headers_mut().insert(
+                header::RETRY_AFTER,
+                header::HeaderValue::from_static(ADMISSION_RETRY_AFTER_SECS),
+            );
+            return Err(resp);
+        }
+        Ok(None) => {
+            state.alerts.issue(
+                "scheduler_unavailable",
+                "Fairshare scheduler unavailable",
+                format!(
+                    "tenant `{}` model `{}` path `{}`",
+                    spec.resolved.tenant_name, spec.model, spec.path
+                ),
+            );
+            return Err(error_json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "scheduler unavailable",
+            ));
+        }
+    };
+    let queue_wait_ms = admitted.waited.as_millis() as u32;
+    if let Some(t) = tracer {
+        let mut attrs = serde_json::json!({
+            "decision": admitted.admission.as_str(),
+            "queue_wait_ms": queue_wait_ms,
+        });
+        if let (Some(into), Some(extra)) = (attrs.as_object_mut(), span_extra.as_object()) {
+            into.extend(extra.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+        t.record(
+            "admission",
+            "proxy_request",
+            admission_start,
+            (crate::tracer::now_ms() - admission_start) as u32,
+            "ok",
+            attrs,
+        );
+    }
+    Ok(Admitted {
+        admission: admitted.admission,
+        permit: admitted.permit,
+        queue_wait_ms,
+    })
+}
+
 pub(crate) fn gate_resolved_key(
     state: &AppState,
     resolved: &ResolvedKey,
@@ -10977,6 +11124,19 @@ mod lifecycle_tests {
         &src[start..end]
     }
 
+    /// The source of the shared `admit()`, which the pipeline, search and
+    /// verdicts all run their admission through.
+    fn shared_admission() -> &'static str {
+        let src = include_str!("proxy.rs");
+        let src = &src[..src.find("\nmod tests {").expect("the test module")];
+        let start = src.find("pub(crate) async fn admit(").expect("admit");
+        let end = start
+            + src[start..]
+                .find("\npub(crate) fn gate_resolved_key(")
+                .expect("end of admit");
+        &src[start..end]
+    }
+
     #[test]
     fn a_family_is_logged_apart_from_variants() {
         let mut meta = super::RequestMeta {
@@ -11008,11 +11168,12 @@ mod lifecycle_tests {
         let adopt = h
             .find("model=r.model_name.clone();")
             .expect("parent name adopted");
-        let pool = h
-            .find("letpool=admission_pool(route.as_deref());")
-            .expect("pool keyed by the served route");
-        let admit = h.find(".admit_to(").expect("admission");
-        assert!(serve < adopt && adopt < pool && pool < admit);
+        let admit = h
+            .find("letadmitted=matchBox::pin(admit(&state,Admit{resolved:&resolved,model:&model,route:route.as_deref(),")
+            .expect("admission keyed by the served route");
+        let pool = admit;
+        assert!(serve < adopt && adopt < pool);
+        assert!(squash(shared_admission()).contains("letpool=admission_pool(spec.route);"));
         // The ledger and the allowlist see the parent name; the variant rides
         // on the request's metadata for its usage row and response header.
         assert!(h[serve..pool].contains("record_called_name(&mutreq_meta,"));
@@ -11026,7 +11187,7 @@ mod lifecycle_tests {
         let gate = h.find("crate::lifecycle::gate(").expect("lifecycle gate");
         let allow = h.find("modelnotpermittedfortenant").expect("allowlist");
         let pool = h
-            .find("letpool=admission_pool(route.as_deref());")
+            .find("letadmitted=matchBox::pin(admit(&state,Admit{")
             .expect("admission pool");
         // Resolved first (aliases and variants answer for their model), then
         // gated, so a redirect is allowlisted and admitted as the replacement.
@@ -11048,7 +11209,7 @@ mod lifecycle_tests {
         let effort = h.find("r.reasoning.plan(level)").expect("reasoning effort");
         let boons = h.find(".enrich_request(").expect("boons");
         let pool = h
-            .find("letpool=admission_pool(route.as_deref());")
+            .find("letadmitted=matchBox::pin(admit(&state,Admit{")
             .expect("admission pool");
         // On the caller's body as the model resolved, before effort and
         // boons add fields of their own and before admission or dispatch.
@@ -11064,9 +11225,13 @@ mod lifecycle_tests {
 
     #[test]
     fn background_work_is_admitted_in_the_background_pool_without_sessions() {
-        let h = squash(handler());
+        // The pipeline hands its batch share and session to the shared admission.
+        let pipeline = squash(handler());
+        assert!(pipeline
+            .contains("batch:batch.as_ref(),session_id:Some(req_meta.session_id.as_str()),"));
+        let h = squash(shared_admission());
         let plan = h
-            .find("letbackground=background_admission(route.as_deref(),batch.as_ref(),&resolved,")
+            .find("letbackground=background_admission(spec.route,spec.batch,spec.resolved,")
             .expect("background admission is decided");
         let pool = h
             .find("(obleth_fairshare::PoolKey::Model(m),Some(_))=>obleth_fairshare::PoolKey::Background(m)")
@@ -11075,7 +11240,7 @@ mod lifecycle_tests {
             .find("letadmit_wait=background.map(|b|b.wait).unwrap_or_else(admission_timeout);")
             .expect("background work waits longer");
         let share = h
-            .find("ifletSome(b)=&background{admit_req=admit_req.background_share(b.share);}elseifroute_keeps_sessions(")
+            .find("(Some(b),_)=>admit_req=admit_req.background_share(b.share),(None,Some(session))ifroute_keeps_sessions(spec.route)=>")
             .expect("background work keeps no session");
         let admit = h
             .find("state.fairshare.admit_to(pool,admit_req)")
@@ -11086,7 +11251,7 @@ mod lifecycle_tests {
 
     #[test]
     fn a_models_session_affinity_setting_goes_with_its_admission() {
-        let h = squash(handler());
+        let h = squash(shared_admission());
         let set = h
             .find("admit_req=admit_req.session_affinity(r.session_affinity.resolve(")
             .expect("the model's setting is resolved");
@@ -11117,7 +11282,7 @@ mod lifecycle_tests {
         let start = src
             .find("asyncfnproxy_handler_inner(")
             .expect("inner handler");
-        let body = &src[start..start + 600];
+        let body = &src[start..start + 900];
         assert!(body.contains("crate::lifecycle::apply_headers(&mutresp,notice)"));
     }
 
@@ -11141,7 +11306,7 @@ mod lifecycle_tests {
     fn every_admitted_response_says_how_long_it_queued() {
         let h = squash(handler());
         let admitted = h
-            .find("letqueue_wait_ms=admitted.waited.as_millis()asu32;")
+            .find("letqueue_wait_ms=admitted.queue_wait_ms;")
             .expect("admission wait");
         let after = &h[admitted..];
         let answers = after.matches("answer.respond(").count();
@@ -11171,10 +11336,12 @@ mod lifecycle_tests {
     #[test]
     fn admission_precedes_the_budget_reservation() {
         let h = handler();
-        let admit = h.find(".admit_to(").expect("admission");
+        let admit = h.find("match Box::pin(admit(").expect("admission");
         let reserve = h.find("reserve_budget(&state").expect("reservation");
         assert!(admit < reserve, "a queued request must hold no budget");
-        assert!(h[admit..reserve].contains("timeout(admit_wait"));
+        // The wait itself, bounded, lives in the shared admission.
+        assert!(shared_admission()
+            .contains("timeout(admit_wait, state.fairshare.admit_to(pool, admit_req))"));
     }
 
     #[test]
@@ -12087,6 +12254,76 @@ mod pipeline_input_tests {
 #[cfg(test)]
 mod answer_tests {
     use super::*;
+
+    #[test]
+    fn every_side_endpoint_opens_with_the_shared_envelope() {
+        // Each endpoint authenticates and gates through one helper and stamps
+        // its request id through one helper, so no endpoint can drift in what
+        // it refuses or in the header it answers with.
+        let handlers = |src: &'static str| &src[..src.find("\nmod tests {").unwrap_or(src.len())];
+        for (name, source) in [
+            ("search", handlers(include_str!("search.rs"))),
+            ("speech", handlers(include_str!("speech.rs"))),
+            ("load", handlers(include_str!("load.rs"))),
+            ("mcp", handlers(include_str!("mcp.rs"))),
+            ("verdicts", handlers(include_str!("verdicts/mod.rs"))),
+        ] {
+            assert!(
+                source.contains("authenticate_and_gate("),
+                "{name} authenticates on its own"
+            );
+            assert!(
+                source.contains("with_request_id("),
+                "{name} stamps its request id on its own"
+            );
+            assert!(
+                !source.contains("authenticate_credential("),
+                "{name} bypasses the envelope"
+            );
+            assert!(
+                !source.contains("\"missing bearer token\""),
+                "{name} words its own refusal"
+            );
+        }
+        for (name, source) in [
+            ("search", include_str!("search.rs")),
+            ("verdicts", include_str!("verdicts/mod.rs")),
+        ] {
+            assert!(
+                source.contains("proxy::admit("),
+                "{name} runs its own admission"
+            );
+        }
+    }
+
+    #[test]
+    fn the_request_id_is_stamped_once_and_kept_when_set() {
+        let id = Uuid::new_v4();
+        let fresh = with_request_id(error_json(StatusCode::NOT_FOUND, "no"), id);
+        assert_eq!(
+            fresh.headers()["x-obleth-request-id"],
+            id.to_string().as_str()
+        );
+        let mut own = error_json(StatusCode::OK, "ok");
+        own.headers_mut().insert(
+            "x-obleth-request-id",
+            header::HeaderValue::from_static("mine"),
+        );
+        assert_eq!(
+            with_request_id(own, id).headers()["x-obleth-request-id"],
+            "mine"
+        );
+    }
+
+    #[test]
+    fn one_url_encoder_for_path_segments_and_query_values() {
+        assert_eq!(
+            encode_url_component("job:abc/../x y"),
+            "job%3Aabc%2F..%2Fx%20y"
+        );
+        assert_eq!(encode_url_component("a-b_c.d~e"), "a-b_c.d~e");
+        assert_eq!(encode_url_component("é&="), "%C3%A9%26%3D");
+    }
 
     /// Every answer after admission carries the same header set, whatever
     /// exit built it: the request id, the queue wait, no proxy buffering,

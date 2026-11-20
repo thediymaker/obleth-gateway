@@ -24,14 +24,10 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, Response, StatusCode};
-use bytes::Bytes;
 use obleth_config::ResolvedModel;
 use uuid::Uuid;
 
-use crate::proxy::{
-    self, build_targets, build_upstream_url, error_json, forward_headers, gate_resolved_key,
-    resolve_model, Target,
-};
+use crate::proxy::{self, build_upstream_url, error_json, resolve_model, Target};
 use crate::state::AppState;
 
 pub(crate) const VOICES_PATH: &str = "/v1/audio/voices";
@@ -53,19 +49,14 @@ pub async fn voices(
     headers: HeaderMap,
 ) -> Response<Body> {
     let request_id = Uuid::new_v4();
-    let mut resp = handle(
+    let resp = handle(
         &state,
         query.get("model").map(String::as_str),
         &headers,
         &client,
     )
     .await;
-    if let Ok(value) = HeaderValue::from_str(&request_id.to_string()) {
-        resp.headers_mut()
-            .entry("x-obleth-request-id")
-            .or_insert(value);
-    }
-    resp
+    proxy::with_request_id(resp, request_id)
 }
 
 async fn handle(
@@ -74,16 +65,10 @@ async fn handle(
     headers: &HeaderMap,
     client: &crate::client::ClientInfo,
 ) -> Response<Body> {
-    let Some(secret) = proxy::bearer(headers) else {
-        return error_json(StatusCode::UNAUTHORIZED, "missing bearer token");
-    };
-    let resolved = match crate::jwt_auth::authenticate_credential(state, &secret).await {
+    let resolved = match proxy::authenticate_and_gate(state, headers, client).await {
         Ok(cred) => cred.resolved,
         Err(resp) => return resp,
     };
-    if let Err(resp) = gate_resolved_key(state, &resolved, client) {
-        return resp;
-    }
     let Some(name) = model.map(str::trim).filter(|n| !n.is_empty()) else {
         return error_json(
             StatusCode::BAD_REQUEST,
@@ -113,13 +98,18 @@ async fn handle(
     ) {
         return error_json(StatusCode::FORBIDDEN, "model not permitted for tenant");
     }
-    let Some(target) = build_targets(Some(&route), &state.upstream_base, "failover", "")
-        .into_iter()
-        .next()
-    else {
-        return error_json(StatusCode::BAD_GATEWAY, "the model has no upstream");
+    let target = match crate::boons::helper_target(&route, "", None) {
+        Ok(target) => target,
+        Err(_) => return error_json(StatusCode::BAD_GATEWAY, "the model has no upstream"),
     };
-    fetch_voices(&state.http, &target, &route.upstream_model, headers).await
+    fetch_voices(
+        &state.http,
+        &target,
+        &route.upstream_model,
+        headers,
+        proxy::request_timeout(state, &route).min(VOICES_TIMEOUT),
+    )
+    .await
 }
 
 /// Whether `route` can answer a voices call at all.
@@ -147,27 +137,23 @@ async fn fetch_voices(
     target: &Target,
     upstream_model: &str,
     client_headers: &HeaderMap,
+    timeout: Duration,
 ) -> Response<Body> {
     let url = build_upstream_url(
         &target.base,
         VOICES_PATH,
-        &format!("?model={}", encode_query_value(upstream_model)),
+        &format!("?model={}", proxy::encode_url_component(upstream_model)),
     );
-    let mut headers = forward_headers(client_headers);
-    headers.extend(target.headers.clone());
-    if let Some(key) = &target.api_key {
-        if let Ok(v) = HeaderValue::from_str(&format!("Bearer {key}")) {
-            headers.insert(header::AUTHORIZATION, v);
-        }
-    }
+    let headers = proxy::upstream_headers(client_headers, target);
     let call = async {
         let resp = http.get(&url).headers(headers).send().await?;
         let status = resp.status();
         let content_type = resp.headers().get(header::CONTENT_TYPE).cloned();
-        let body = read_capped(resp).await?;
-        Ok::<_, reqwest::Error>((status, content_type, body))
+        // Over the cap is an error, never a listing cut short.
+        let body = crate::boons::read_body_capped(resp, VOICES_BODY_MAX).await?;
+        Ok::<_, anyhow::Error>((status, content_type, body))
     };
-    let (status, content_type, body) = match tokio::time::timeout(VOICES_TIMEOUT, call).await {
+    let (status, content_type, body) = match tokio::time::timeout(timeout, call).await {
         Ok(Ok(answer)) => answer,
         Ok(Err(e)) => {
             tracing::warn!(error = %e, url = %url, "voices request failed");
@@ -182,34 +168,6 @@ async fn fetch_voices(
     builder
         .body(Body::from(body))
         .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
-}
-
-async fn read_capped(resp: reqwest::Response) -> Result<Bytes, reqwest::Error> {
-    use futures_util::StreamExt;
-    let mut stream = resp.bytes_stream();
-    let mut buf = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        let room = VOICES_BODY_MAX.saturating_sub(buf.len());
-        buf.extend_from_slice(&chunk[..chunk.len().min(room)]);
-        if chunk.len() > room {
-            break;
-        }
-    }
-    Ok(Bytes::from(buf))
-}
-
-/// Percent-encode a query value, leaving only RFC 3986 unreserved characters.
-fn encode_query_value(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for b in value.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -287,6 +245,7 @@ mod tests {
 
     #[test]
     fn query_values_are_percent_encoded() {
+        use crate::proxy::encode_url_component as encode_query_value;
         assert_eq!(encode_query_value("org/reader 3b"), "org%2Freader%203b");
         assert_eq!(encode_query_value("a-b_c.d~e"), "a-b_c.d~e");
         assert_eq!(encode_query_value("é&="), "%C3%A9%26%3D");
@@ -345,6 +304,7 @@ mod tests {
             &target(base),
             "org/reader 3b",
             &client,
+            VOICES_TIMEOUT,
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -373,6 +333,7 @@ mod tests {
             &target(base),
             "m",
             &HeaderMap::new(),
+            VOICES_TIMEOUT,
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -385,6 +346,27 @@ mod tests {
             &target("http://127.0.0.1:1/v1".into()),
             "m",
             &HeaderMap::new(),
+            VOICES_TIMEOUT,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// A listing over the cap is refused whole, never passed through cut short
+    /// (a truncated JSON array would look like fewer voices).
+    #[tokio::test]
+    async fn an_oversize_voice_listing_is_an_error_not_a_shorter_list() {
+        let app = Router::new().route(
+            VOICES_PATH,
+            axum::routing::get(|| async { "x".repeat(VOICES_BODY_MAX + 1) }),
+        );
+        let base = spawn_server(app).await;
+        let resp = fetch_voices(
+            &reqwest::Client::new(),
+            &target(base),
+            "m",
+            &HeaderMap::new(),
+            VOICES_TIMEOUT,
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);

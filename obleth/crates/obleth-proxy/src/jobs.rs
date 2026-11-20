@@ -68,7 +68,8 @@ use tokio::time::timeout;
 use uuid::Uuid;
 
 use crate::proxy::{
-    build_upstream_url, error_json, forward_headers, invalid_request, resolve_model, Target,
+    build_upstream_url, encode_url_component, error_json, invalid_request, request_timeout,
+    resolve_model, upstream_headers, Target,
 };
 use crate::state::AppState;
 
@@ -243,20 +244,6 @@ fn valid_job_id(id: &str) -> bool {
             .all(|b| b.is_ascii_graphic() && !matches!(b, b'/' | b'\\' | b'?' | b'#' | b'%'))
 }
 
-/// `s` percent-encoded as one URL path segment: everything but RFC 3986's
-/// unreserved characters is escaped, so no id can add a segment or a query.
-fn encode_path_segment(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
-}
-
 /// The upstream path of a follow-up: the endpoint's path, rebuilt with the
 /// job id encoded as a single segment rather than copied from the client.
 fn follow_up_path(kind: JobKind, call: FollowUp<'_>) -> String {
@@ -264,9 +251,9 @@ fn follow_up_path(kind: JobKind, call: FollowUp<'_>) -> String {
     match call {
         FollowUp::List => base.to_string(),
         FollowUp::Retrieve(id) | FollowUp::Delete(id) => {
-            format!("{base}/{}", encode_path_segment(id))
+            format!("{base}/{}", encode_url_component(id))
         }
-        FollowUp::Content(id) => format!("{base}/{}/content", encode_path_segment(id)),
+        FollowUp::Content(id) => format!("{base}/{}/content", encode_url_component(id)),
     }
 }
 
@@ -333,30 +320,6 @@ fn affinity_target(route: &ResolvedModel, base: &str) -> Option<Target> {
         api_key: route.api_key.clone(),
         headers,
     })
-}
-
-/// Headers for a call to `target`: the client's forwarded headers, then the
-/// model's own, then its key — the same order the pipeline applies.
-fn upstream_headers(client: &HeaderMap, target: &Target) -> HeaderMap {
-    let mut out = forward_headers(client);
-    out.extend(target.headers.clone());
-    if let Some(key) = &target.api_key {
-        if let Ok(v) = HeaderValue::from_str(&format!("Bearer {key}")) {
-            out.insert(header::AUTHORIZATION, v);
-        }
-    }
-    out
-}
-
-/// The per-request timeout the pipeline would use for this model. It bounds
-/// the wait for response headers only; a download then streams under the
-/// client's read timeout, however long the file.
-fn request_timeout(state: &AppState, route: &ResolvedModel) -> Duration {
-    route
-        .request_timeout_secs
-        .filter(|s| *s >= 1)
-        .map(|s| Duration::from_secs(s as u64))
-        .unwrap_or(state.upstream_timeout)
 }
 
 /// Where a job's route leads, or the status and message explaining why it
@@ -899,14 +862,14 @@ mod tests {
             "...",
         ] {
             assert!(valid_job_id(id), "{id}");
-            let enc = encode_path_segment(id);
+            let enc = encode_url_component(id);
             assert!(
                 !enc.contains('/') && !enc.contains('?') && !enc.contains('#'),
                 "{enc}"
             );
             assert_eq!(decode(&enc), id, "round trip of {id}");
         }
-        assert_eq!(encode_path_segment("job:abc"), "job%3Aabc");
+        assert_eq!(encode_url_component("job:abc"), "job%3Aabc");
         assert_eq!(
             follow_up_path(JobKind::Video, FollowUp::Content("job:1")),
             "/v1/videos/job%3A1/content"

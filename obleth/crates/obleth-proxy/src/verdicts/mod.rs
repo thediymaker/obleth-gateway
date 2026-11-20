@@ -30,9 +30,9 @@ use obleth_tokenizer::{CostEstimate, Tokenizer};
 use uuid::Uuid;
 
 use crate::proxy::{
-    self, build_targets, derive_intent, effective_admission_weight, error_json, gate_resolved_key,
-    reject, resolve_conversation, resolve_model, surfaced_request_type, union_candidate_tags,
-    Rejection, RequestMeta, BODY_LIMIT,
+    self, build_targets, derive_intent, effective_admission_weight, error_json, reject,
+    resolve_conversation, resolve_model, surfaced_request_type, union_candidate_tags, Rejection,
+    RequestMeta, BODY_LIMIT,
 };
 use crate::state::AppState;
 
@@ -645,13 +645,7 @@ async fn resolve_named(
 
 pub async fn handler(state: State<AppState>, req: Request<Body>) -> Response<Body> {
     let request_id = Uuid::new_v4();
-    let mut resp = handler_inner(state, req, request_id).await;
-    if !resp.headers().contains_key("x-obleth-request-id") {
-        if let Ok(value) = header::HeaderValue::from_str(&request_id.to_string()) {
-            resp.headers_mut().insert("x-obleth-request-id", value);
-        }
-    }
-    resp
+    proxy::with_request_id(handler_inner(state, req, request_id).await, request_id)
 }
 
 async fn handler_inner(
@@ -666,19 +660,13 @@ async fn handler_inner(
     let client = crate::client::ClientInfo::of(&parts.extensions);
 
     // ---- auth (same gates as the passthrough pipeline) ----
-    let Some(secret) = proxy::bearer(&headers) else {
-        return error_json(StatusCode::UNAUTHORIZED, "missing bearer token");
-    };
     let auth_start = crate::tracer::now_ms();
     let (resolved, device_id, auth_kind) =
-        match crate::jwt_auth::authenticate_credential(&state, &secret).await {
+        match proxy::authenticate_and_gate(&state, &headers, &client).await {
             Ok(cred) => (cred.resolved, cred.device_id, cred.auth_kind),
             Err(resp) => return resp,
         };
     let auth_duration = (crate::tracer::now_ms() - auth_start) as u32;
-    if let Err(resp) = gate_resolved_key(&state, &resolved, &client) {
-        return resp;
-    }
 
     let mut tracer: Option<crate::tracer::SpanRecorder> = if resolved.tracing_enabled {
         Some(crate::tracer::SpanRecorder::new(
@@ -996,31 +984,22 @@ async fn handler_inner(
     // chat/completions and responses paths use, so a saturated pool cannot
     // park a verdicts caller indefinitely.
     let effective_weight = effective_admission_weight(resolved.weight, Some(&route));
-    let admission_start = crate::tracer::now_ms();
-    let admit_wait = proxy::admission_timeout();
-    let admit = state.fairshare.admit(crate::proxy::admit_request_for(
-        &resolved,
-        &model,
-        Some(&route),
-        effective_weight,
-        est.total(),
-        end_user.as_deref(),
-    ));
-    let admitted = match tokio::time::timeout(admit_wait, admit).await {
-        Ok(Some(a)) => a,
-        Ok(None) => {
-            state.alerts.issue(
-                "scheduler_unavailable",
-                "Fairshare scheduler unavailable",
-                format!(
-                    "tenant `{}` model `{model}` path `{VERDICTS_PATH}`",
-                    resolved.tenant_name
-                ),
-            );
-            return error_json(StatusCode::SERVICE_UNAVAILABLE, "scheduler unavailable");
-        }
-        Err(_) => {
-            let queued_ms = (crate::tracer::now_ms() - admission_start) as u32;
+    let admitted = match Box::pin(proxy::admit(
+        &state,
+        proxy::Admit {
+            resolved: &resolved,
+            model: &model,
+            route: Some(&route),
+            weight: effective_weight,
+            cost: est.total(),
+            end_user: end_user.as_deref(),
+            batch: None,
+            session_id: None,
+            path: VERDICTS_PATH,
+        },
+        tracer.as_mut(),
+        serde_json::json!({ "questions": request.questions.len(), "images": image_count }),
+        |queued_ms| {
             reject(
                 &state,
                 request_id,
@@ -1034,37 +1013,18 @@ async fn handler_inner(
                     cache_status: "off",
                     queue_wait_ms: queued_ms,
                 },
-            );
-            let mut resp = error_json(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "timed out waiting for model capacity",
-            );
-            resp.headers_mut().insert(
-                header::RETRY_AFTER,
-                header::HeaderValue::from_static(proxy::ADMISSION_RETRY_AFTER_SECS),
-            );
-            return resp;
-        }
+            )
+        },
+    ))
+    .await
+    {
+        Ok(admitted) => admitted,
+        Err(resp) => return resp,
     };
     let admission = admitted.admission;
     let permit = admitted.permit;
-    let queue_wait_ms = admitted.waited.as_millis() as u32;
+    let queue_wait_ms = admitted.queue_wait_ms;
     let request_energy = state.energy.request(Some(&route));
-    if let Some(ref mut t) = tracer {
-        t.record(
-            "admission",
-            "proxy_request",
-            admission_start,
-            (crate::tracer::now_ms() - admission_start) as u32,
-            "ok",
-            serde_json::json!({
-                "decision": admission.as_str(),
-                "queue_wait_ms": queue_wait_ms,
-                "questions": request.questions.len(),
-                "images": image_count,
-            }),
-        );
-    }
 
     // ---- token budget reserve + term gates ----
     // The passthrough pipeline's own reservation (`proxy::reserve_budget`):
@@ -2060,7 +2020,7 @@ mod settlement_tests {
         let estimate = h
             .find("letest=estimate(&*state.tokenizer,&system,&users,image_count);")
             .expect("cost estimate");
-        let admit = h.find("state.fairshare.admit(").expect("admission");
+        let admit = h.find("Box::pin(proxy::admit(").expect("admission");
         assert!(scan < estimate && estimate < admit);
         // A block answers with the policy's status; a redaction is read back.
         assert!(h[scan..estimate].contains("returnerror_json(block.status,block.reason);"));
@@ -2145,18 +2105,29 @@ mod settlement_tests {
         // Same wrapper as the passthrough pipeline (proxy.rs): bounded by
         // `OBLETH_ADMISSION_TIMEOUT_SECS`, and a timed-out wait answers 503
         // with the shared `Retry-After` value rather than parking forever.
-        assert!(h.contains("letadmit_wait=proxy::admission_timeout();"));
-        assert!(h.contains("tokio::time::timeout(admit_wait,admit).await"));
+        // The wait, its bound and its refusal live in the shared `proxy::admit`.
+        let full = include_str!("../proxy.rs");
+        let shared = &full[full.find("pub(crate) async fn admit(").expect("admit")..];
+        let h: String = shared[..shared
+            .find("\npub(crate) fn gate_resolved_key(")
+            .expect("end")]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(h.contains(
+            "letadmit_wait=background.map(|b|b.wait).unwrap_or_else(admission_timeout);"
+        ));
+        assert!(h.contains("timeout(admit_wait,state.fairshare.admit_to(pool,admit_req)).await"));
         let timeout_branch = h.find("Err(_)=>{").expect("the timeout branch");
         let scope = &h[timeout_branch..];
         let end = scope
-            .find("letadmission=admitted.admission;")
+            .find("Ok(None)=>{")
             .expect("the match ends before the admission is unpacked");
         let scope = &scope[..end];
         assert!(scope.contains("StatusCode::SERVICE_UNAVAILABLE"));
         assert!(scope.contains("\"timedoutwaitingformodelcapacity\""));
         assert!(scope.contains("header::RETRY_AFTER"));
-        assert!(scope.contains("proxy::ADMISSION_RETRY_AFTER_SECS"));
+        assert!(scope.contains("ADMISSION_RETRY_AFTER_SECS"));
     }
 }
 

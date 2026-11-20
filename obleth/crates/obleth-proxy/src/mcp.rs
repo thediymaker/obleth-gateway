@@ -19,7 +19,7 @@ use obleth_config::{ResolvedKey, ResolvedMcpServer, UsageRecord};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::proxy::{bearer, error_json, forward_headers, has_path_traversal};
+use crate::proxy::{error_json, forward_headers, has_path_traversal};
 use crate::state::AppState;
 
 const MCP_BODY_LIMIT: usize = 16 * 1024 * 1024;
@@ -159,15 +159,12 @@ pub async fn mcp_handler(
     req: Request<Body>,
 ) -> Response<Body> {
     let request_id = Uuid::new_v4();
-    let (mut resp, logged) = handle(&state, params, req, request_id).await;
+    let (resp, logged) = handle(&state, params, req, request_id).await;
     if logged {
-        if let Ok(value) = header::HeaderValue::from_str(&request_id.to_string()) {
-            resp.headers_mut()
-                .entry("x-obleth-request-id")
-                .or_insert(value);
-        }
+        crate::proxy::with_request_id(resp, request_id)
+    } else {
+        resp
     }
-    resp
 }
 
 /// The call itself, and whether it reached the ledger (it does once the
@@ -192,23 +189,12 @@ async fn handle(
         }
     }
 
-    // ---- auth: same bearer credential the data plane accepts, JWT or
-    // secret key (`crate::jwt_auth::authenticate_credential`) ----
-    let Some(secret) = bearer(&headers) else {
-        return (
-            error_json(StatusCode::UNAUTHORIZED, "missing bearer token"),
-            false,
-        );
-    };
-    let (resolved, device_id) = match crate::jwt_auth::authenticate_credential(state, &secret).await
-    {
-        Ok(cred) => (cred.resolved, cred.device_id),
-        Err(resp) => return (resp, false),
-    };
-    // Same gate as the data plane: disabled key, inactive tenant, schedule.
-    if let Err(resp) = crate::proxy::gate_resolved_key(state, &resolved, &client) {
-        return (resp, false);
-    }
+    // ---- auth: the same bearer credential and key gates as every endpoint ----
+    let (resolved, device_id) =
+        match crate::proxy::authenticate_and_gate(state, &headers, &client).await {
+            Ok(cred) => (cred.resolved, cred.device_id),
+            Err(resp) => return (resp, false),
+        };
 
     // From here every answer is a row in the ledger. Internal keys are not
     // recorded, as in `finalize`.
@@ -610,18 +596,17 @@ mod tests {
         // ClickHouse), so the wiring is pinned at the source level.
         let src = include_str!("mcp.rs");
         let handler = &src[..src.find("\nmod tests {").expect("the test module")];
+        // The shared envelope authenticates and gates in one call.
         let auth = handler
-            .find("authenticate_credential(")
+            .find("crate::proxy::authenticate_and_gate(state, &headers, &client)")
             .expect("the auth call");
-        let gate = handler
-            .find("crate::proxy::gate_resolved_key(state, &resolved, &client)")
-            .expect("the MCP handler must call gate_resolved_key");
+        let gate = auth;
         let upstream = handler
             .find("resolve_mcp(state")
             .expect("the server lookup");
         assert!(
-            auth < gate && gate < upstream,
-            "gate after auth, before any upstream work"
+            auth <= gate && gate < upstream,
+            "gate with auth, before any upstream work"
         );
         assert!(
             !handler.contains("if resolved.disabled"),
