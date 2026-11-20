@@ -2420,26 +2420,69 @@ async function api<T>(path: string, init?: ApiInit): Promise<T> {
 /** One Management API call: the response body, or an `OblethApiError`. */
 async function send<T>(path: string, fetchInit: ApiInit): Promise<T> {
   const res = await fetch(`${BASE}/api/v1${path}`, fetchInit);
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    // The management API returns errors as `{"error": "..."}`. Surface that
-    // message directly so callers (and the UI) get something actionable instead
-    // of a raw status dump.
-    let message = text;
-    try {
-      const parsed = JSON.parse(text);
-      if (parsed && typeof parsed.error === "string") message = parsed.error;
-    } catch {
-      // Non-JSON body; fall back to the raw text.
-    }
-    throw new OblethApiError(
-      res.status,
-      message || `request failed with status ${res.status}`,
-      path,
-    );
-  }
+  if (!res.ok) throw await apiError(res, path);
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
+}
+
+/** A non-2xx Management API response as an `OblethApiError`. */
+async function apiError(res: Response, path: string): Promise<OblethApiError> {
+  const text = await res.text().catch(() => "");
+  // The management API returns errors as `{"error": "..."}`. Surface that
+  // message directly so callers (and the UI) get something actionable instead
+  // of a raw status dump.
+  let message = text;
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed.error === "string") message = parsed.error;
+  } catch {
+    // Non-JSON body; fall back to the raw text.
+  }
+  return new OblethApiError(
+    res.status,
+    message || `request failed with status ${res.status}`,
+    path,
+  );
+}
+
+/**
+ * A Management API call whose bodies pass through untouched: a request body
+ * streamed on from the browser (`duplex: "half"`), and the response returned
+ * as is for the caller to stream back. Nothing is parsed or copied, so a large
+ * upload or export never sits whole in the dashboard's memory. The caller sets
+ * Content-Type, and can pass a `signal` (the browser's request) that stops the
+ * call. A non-2xx answer throws `OblethApiError`, as `api` does; the time
+ * limit also covers reading the response body.
+ */
+async function apiStream(
+  path: string,
+  init: Omit<ApiInit, "next" | "cache"> & { duplex?: "half" },
+): Promise<Response> {
+  const { headers, timeoutMs, signal, ...rest } = init;
+  const limit =
+    timeoutMs ??
+    ((rest.method ?? "GET").toUpperCase() === "GET" ? API_TIMEOUT_MS.read : API_TIMEOUT_MS.write);
+  const timeout = AbortSignal.timeout(limit);
+  try {
+    const res = await fetch(`${BASE}/api/v1${path}`, {
+      ...rest,
+      cache: "no-store",
+      // The caller's signal (the browser's request) stops it too.
+      signal: signal ? AbortSignal.any([timeout, signal]) : timeout,
+      headers: { Authorization: `Bearer ${adminToken()}`, ...(headers ?? {}) },
+    } as RequestInit);
+    if (!res.ok) throw await apiError(res, path);
+    return res;
+  } catch (e) {
+    if (timeout.aborted) {
+      throw new OblethApiError(
+        504,
+        `The gateway did not answer in ${Math.round(limit / 1000)} s.`,
+        path,
+      );
+    }
+    throw e;
+  }
 }
 
 /**
@@ -3421,17 +3464,19 @@ export const obleth = {
     }),
   testSlurmConnection: () =>
     api<SlurmHealthView>("/settings/slurm/test", { method: "POST" }),
+  /** The config backup as the gateway's own response, to stream to the browser. */
   exportBackup: (options?: AuditOptions) =>
-    api<ConfigBackup>("/backup/export", {
+    apiStream("/backup/export", {
       timeoutMs: API_TIMEOUT_MS.long,
       headers: auditActorHeaders(options),
     }),
-  restoreBackup: (body: ConfigBackup, options?: AuditOptions) =>
+  /** Restores a backup from its file's text, sent as it is (not re-serialised). */
+  restoreBackup: (text: string, options?: AuditOptions) =>
     api<RestoreReport>("/backup/restore", {
       method: "POST",
       timeoutMs: API_TIMEOUT_MS.long,
       headers: auditActorHeaders(options),
-      body: JSON.stringify(body),
+      body: text,
     }),
   /** The model manifest; `names` limits it to those models (unknown names are skipped). */
   exportModels: (names: string[] = [], options?: AuditOptions) =>
@@ -3489,20 +3534,26 @@ export const obleth = {
     api<KnowledgeDocument[]>(
       `/knowledge/collections/${seg(collectionId)}/documents`,
     ),
+  /**
+   * Uploads a document by streaming the browser's request body (the JSON with
+   * `title`, `filename` and `content_base64`) straight on to the gateway, which
+   * enforces the size limit and checks the content. Returns the gateway's
+   * response to pass back as is.
+   */
   uploadDocument: (
     collectionId: string,
-    body: { title: string; filename: string; content_base64: string },
-    options?: AuditOptions,
+    body: ReadableStream<Uint8Array>,
+    contentType: string,
+    options?: AuditOptions & { signal?: AbortSignal },
   ) =>
-    api<KnowledgeDocument>(
-      `/knowledge/collections/${seg(collectionId)}/documents`,
-      {
-        method: "POST",
-        timeoutMs: API_TIMEOUT_MS.long,
-        headers: auditActorHeaders(options),
-        body: JSON.stringify(body),
-      },
-    ),
+    apiStream(`/knowledge/collections/${seg(collectionId)}/documents`, {
+      method: "POST",
+      signal: options?.signal,
+      timeoutMs: API_TIMEOUT_MS.long,
+      headers: { "Content-Type": contentType, ...auditActorHeaders(options) },
+      body,
+      duplex: "half",
+    }),
   deleteDocument: (id: string, options?: AuditOptions) =>
     api<void>(`/knowledge/documents/${seg(id)}`, {
       method: "DELETE",

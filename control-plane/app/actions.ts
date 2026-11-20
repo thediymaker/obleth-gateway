@@ -1641,8 +1641,9 @@ export type RestoreBackupResult =
   | { ok: true; report: RestoreReport }
   | { ok: false; error: string };
 
-// Restores an uploaded obleth config backup. The file is parsed and
-// format-checked here, then handed to the admin API's atomic merge-restore;
+// Restores an uploaded obleth config backup. The file is parsed once to check
+// its format here, then its text (not a re-serialised copy) goes to the admin
+// API's atomic merge-restore;
 // the gateway rejects it up front when its encryption key doesn't match the
 // backup's. Every entity list the restore can touch is revalidated.
 export async function restoreBackupAction(
@@ -1650,18 +1651,18 @@ export async function restoreBackupAction(
 ): Promise<RestoreBackupResult> {
   const session = await requireAdmin();
 
-  let parsed: ConfigBackup;
+  let format: unknown;
   try {
-    parsed = JSON.parse(text) as ConfigBackup;
+    format = (JSON.parse(text) as Partial<ConfigBackup> | null)?.format;
   } catch {
     return { ok: false, error: "Not a valid JSON file." };
   }
-  if (!parsed || parsed.format !== "obleth-config-backup") {
+  if (format !== "obleth-config-backup") {
     return { ok: false, error: "Not an obleth config backup file." };
   }
 
   try {
-    const report = await obleth.restoreBackup(parsed, { auditActor: session.email });
+    const report = await obleth.restoreBackup(text, { auditActor: session.email });
     revalidatePath("/");
     revalidatePath("/tenants");
     revalidatePath("/keys");

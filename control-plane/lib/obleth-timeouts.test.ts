@@ -56,7 +56,7 @@ describe("Management API time limits", () => {
   it("waits longer for writes and long operations", async () => {
     stalledGateway();
     let settled = false;
-    const restore = obleth.restoreBackup({} as never).catch(() => {
+    const restore = obleth.restoreBackup("{}").catch(() => {
       settled = true;
     });
     await vi.advanceTimersByTimeAsync(API_TIMEOUT_MS.write);
