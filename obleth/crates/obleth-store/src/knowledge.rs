@@ -198,8 +198,10 @@ pub fn decode_vector(bytes: &[u8]) -> Vec<f32> {
         return Vec::new();
     }
     bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }
 
@@ -237,7 +239,25 @@ pub struct ChunkInsert {
     pub embedding: Vec<f32>,
 }
 
-/// A chunk loaded for the proxy slab or the admin preview.
+impl ChunkInsert {
+    /// What the chunk adds to its collection's size: text characters plus
+    /// embedding bytes, as `length(text) + octet_length(embedding)` counts
+    /// them in Postgres.
+    fn stored_bytes(&self) -> i64 {
+        (self.text.chars().count() + self.embedding.len() * 4) as i64
+    }
+}
+
+/// A chunk's vector and where it came from, without its text.
+#[derive(Debug, Clone)]
+pub struct ChunkVector {
+    pub id: Uuid,
+    pub document_id: Uuid,
+    pub token_count: i32,
+    pub embedding: Vec<f32>,
+}
+
+/// A chunk loaded for the proxy slab.
 #[derive(Debug, Clone)]
 pub struct KnowledgeChunk {
     pub id: Uuid,
@@ -633,7 +653,7 @@ impl Store {
         sqlx::query(
             "update knowledge_documents
                 set active_generation = $2, indexed_embedding_model = $3,
-                    chunk_count = $4, indexed_at = now(),
+                    chunk_count = $4, chunk_bytes = $5, indexed_at = now(),
                     status = case
                                 when status = 'indexing' and reindex_requested then 'pending'
                                 when status = 'indexing' then 'ready'
@@ -654,6 +674,7 @@ impl Store {
         .bind(generation)
         .bind(embedding_model)
         .bind(chunks.len() as i32)
+        .bind(chunks.iter().map(ChunkInsert::stored_bytes).sum::<i64>())
         .execute(&mut *tx)
         .await?;
 
@@ -736,14 +757,12 @@ impl Store {
         exclude_document_id: Uuid,
     ) -> Result<i64> {
         let row = sqlx::query(
-            "select count(*) as n
-               from knowledge_chunks k
-               join knowledge_documents d on d.id = k.document_id
-               join knowledge_collections c on c.id = k.collection_id
-              where k.collection_id = $1
-                and k.generation = d.active_generation
+            "select coalesce(sum(d.chunk_count), 0)::bigint as n
+               from knowledge_documents d
+               join knowledge_collections c on c.id = d.collection_id
+              where d.collection_id = $1
                 and d.indexed_embedding_model = c.indexed_embedding_model
-                and k.document_id <> $2",
+                and d.id <> $2",
         )
         .bind(collection_id)
         .bind(exclude_document_id)
@@ -753,22 +772,39 @@ impl Store {
     }
 
     /// Chunk count and approximate stored bytes per collection, for the
-    /// dashboard's size display. Same per-document-generation, embedder-matched
-    /// scope as `collection_chunk_count`, so the reported size matches what is
-    /// actually retrievable.
+    /// dashboard's size display: the documents' active generations whose
+    /// embedder matches the collection's (the same scope as
+    /// `collection_chunk_count_excluding`), so the size matches what is
+    /// retrievable. Read from the document rows, which carry each active
+    /// generation's count and bytes, not from the chunk table.
     pub async fn collection_sizes(&self) -> Result<Vec<(Uuid, i64, i64)>> {
+        self.sizes_where(None).await
+    }
+
+    /// [`Self::collection_sizes`] for one collection; zeros for one with no
+    /// retrievable chunks.
+    pub async fn collection_size(&self, id: Uuid) -> Result<(i64, i64)> {
+        Ok(self
+            .sizes_where(Some(id))
+            .await?
+            .first()
+            .map(|(_, chunks, bytes)| (*chunks, *bytes))
+            .unwrap_or((0, 0)))
+    }
+
+    async fn sizes_where(&self, id: Option<Uuid>) -> Result<Vec<(Uuid, i64, i64)>> {
         let rows = sqlx::query(
             "select c.id as id,
-                    count(k.id) as chunks,
-                    coalesce(sum(length(k.text) + octet_length(k.embedding)), 0) as bytes
+                    coalesce(sum(d.chunk_count), 0)::bigint as chunks,
+                    coalesce(sum(d.chunk_bytes), 0)::bigint as bytes
                from knowledge_collections c
-               left join knowledge_documents d on d.collection_id = c.id
-               left join knowledge_chunks k
-                 on k.document_id = d.id
-                and k.generation = d.active_generation
+               left join knowledge_documents d
+                 on d.collection_id = c.id
                 and d.indexed_embedding_model = c.indexed_embedding_model
+              where $1::uuid is null or c.id = $1
               group by c.id",
         )
+        .bind(id)
         .fetch_all(self.pool())
         .await?;
         Ok(rows
@@ -811,6 +847,45 @@ impl Store {
                 }
             })
             .collect())
+    }
+
+    /// A collection's retrievable chunks without their text, for scoring a
+    /// query (the admin search preview): the same scope and order as
+    /// [`Self::load_active_chunks`]. Fetch the text of the hits with
+    /// [`Self::chunk_texts`].
+    pub async fn load_chunk_vectors(&self, collection_id: Uuid) -> Result<Vec<ChunkVector>> {
+        let rows = sqlx::query(
+            "select k.id as id, k.document_id as document_id,
+                    k.token_count as token_count, k.embedding as embedding
+               from knowledge_chunks k
+               join knowledge_documents d on d.id = k.document_id
+               join knowledge_collections c on c.id = k.collection_id
+              where k.collection_id = $1
+                and k.generation = d.active_generation
+                and d.indexed_embedding_model = c.indexed_embedding_model
+              order by k.document_id, k.ordinal",
+        )
+        .bind(collection_id)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| ChunkVector {
+                id: r.get("id"),
+                document_id: r.get("document_id"),
+                token_count: r.get("token_count"),
+                embedding: decode_vector(r.get::<&[u8], _>("embedding")),
+            })
+            .collect())
+    }
+
+    /// The text of the given chunks.
+    pub async fn chunk_texts(&self, ids: &[Uuid]) -> Result<HashMap<Uuid, String>> {
+        let rows = sqlx::query("select id, text from knowledge_chunks where id = any($1)")
+            .bind(ids)
+            .fetch_all(self.pool())
+            .await?;
+        Ok(rows.iter().map(|r| (r.get("id"), r.get("text"))).collect())
     }
 
     /// Document id -> title, for labelling chunks in injected context.
@@ -1451,6 +1526,110 @@ mod tests {
         assert_eq!(chunks.len(), 1, "the old generation must be gone");
         assert_eq!(chunks[0].text, "new");
 
+        store.delete_collection(c.id).await.ok();
+    }
+
+    /// The chunk-table aggregate the sizes used to be read from, as the
+    /// reference the document-row figures must match.
+    async fn sizes_from_chunks(store: &crate::Store, collection_id: uuid::Uuid) -> (i64, i64) {
+        let row = sqlx::query(
+            "select count(k.id) as chunks,
+                    coalesce(sum(length(k.text) + octet_length(k.embedding)), 0)::bigint as bytes
+               from knowledge_collections c
+               left join knowledge_documents d on d.collection_id = c.id
+               left join knowledge_chunks k
+                 on k.document_id = d.id
+                and k.generation = d.active_generation
+                and d.indexed_embedding_model = c.indexed_embedding_model
+              where c.id = $1",
+        )
+        .bind(collection_id)
+        .fetch_one(store.pool())
+        .await
+        .expect("reference sizes");
+        use sqlx::Row;
+        (row.get("chunks"), row.get("bytes"))
+    }
+
+    /// Sizes and the cap count come from document rows and agree with the
+    /// chunk table through a commit, a re-index to a different size, a
+    /// pending upload, and a delete.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn sizes_from_document_rows_match_the_chunk_table() {
+        let Some((store, _serial)) = test_store().await else {
+            return;
+        };
+        let c = store
+            .create_collection(&format!("size-{}", uuid::Uuid::new_v4()), "", "embed-a")
+            .await
+            .expect("collection");
+        let chunks = |prefix: &str, n: i32, dim: usize| -> Vec<super::ChunkInsert> {
+            (0..n)
+                .map(|i| super::ChunkInsert {
+                    ordinal: i,
+                    text: format!("{prefix}-chunk-{i} \u{e9}t\u{e9}"),
+                    token_count: 2,
+                    embedding: vec![0.5; dim],
+                })
+                .collect()
+        };
+        let agree = |label: &'static str| {
+            let store = store.clone();
+            async move {
+                let reference = sizes_from_chunks(&store, c.id).await;
+                assert_eq!(
+                    store.collection_size(c.id).await.unwrap(),
+                    reference,
+                    "{label}"
+                );
+                let listed = store.collection_sizes().await.unwrap();
+                let (_, chunks, bytes) = listed.iter().find(|(id, _, _)| *id == c.id).unwrap();
+                assert_eq!((*chunks, *bytes), reference, "{label}: listed");
+                assert_eq!(
+                    store
+                        .collection_chunk_count_excluding(c.id, uuid::Uuid::new_v4())
+                        .await
+                        .unwrap(),
+                    reference.0,
+                    "{label}: cap count"
+                );
+                reference
+            }
+        };
+        assert_eq!(agree("empty").await, (0, 0));
+
+        let a = store
+            .upsert_document(c.id, "A", "a.md", "text/markdown", "body a")
+            .await
+            .expect("doc a");
+        let b = store
+            .upsert_document(c.id, "B", "b.md", "text/markdown", "body b")
+            .await
+            .expect("doc b");
+        mark_indexing(&store, a.id).await;
+        store
+            .commit_document_generation(c.id, a.id, 1, "embed-a", 4, &chunks("a", 3, 4))
+            .await
+            .expect("commit a");
+        let one = agree("one committed, one pending").await;
+        assert_eq!(one.0, 3);
+
+        mark_indexing(&store, b.id).await;
+        store
+            .commit_document_generation(c.id, b.id, 1, "embed-a", 4, &chunks("b", 2, 4))
+            .await
+            .expect("commit b");
+        assert_eq!(agree("both committed").await.0, 5);
+
+        mark_indexing(&store, a.id).await;
+        store
+            .commit_document_generation(c.id, a.id, 2, "embed-a", 4, &chunks("a2", 6, 4))
+            .await
+            .expect("re-index a");
+        assert_eq!(agree("a re-indexed larger").await.0, 8);
+
+        store.delete_document(b.id).await.expect("delete b");
+        assert_eq!(agree("b deleted").await.0, 6);
         store.delete_collection(c.id).await.ok();
     }
 

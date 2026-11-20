@@ -95,17 +95,9 @@ impl CollectionView {
     }
 }
 
-/// Look up one collection's size in the bulk `collection_sizes` result,
-/// defaulting to zero for a brand-new collection that has not been sized yet.
+/// One collection's view, with its size read for it alone.
 async fn view_with_size(state: &AdminState, c: KnowledgeCollection) -> Result<CollectionView> {
-    let (chunk_count, estimated_bytes) = state
-        .store
-        .collection_sizes()
-        .await?
-        .into_iter()
-        .find(|(id, _, _)| *id == c.id)
-        .map(|(_, chunks, bytes)| (chunks, bytes))
-        .unwrap_or((0, 0));
+    let (chunk_count, estimated_bytes) = state.store.collection_size(c.id).await?;
     Ok(CollectionView::from_collection(
         &c,
         chunk_count,
@@ -619,15 +611,17 @@ pub async fn search_collection(
     .next()
     .unwrap_or_default();
 
-    let chunks = state.store.load_active_chunks(id).await?;
-    let vectors: Vec<Vec<f32>> = chunks.iter().map(|c| c.embedding.clone()).collect();
+    // Score the vectors alone, then read the text of the hits only.
+    let chunks = state.store.load_chunk_vectors(id).await?;
     let top_k = body.top_k.unwrap_or(settings.top_k) as usize;
     let scored = score_against(
         &query_vec,
-        vectors.iter().map(|v| v.as_slice()),
+        chunks.iter().map(|c| c.embedding.as_slice()),
         top_k,
         settings.min_score,
     );
+    let hit_ids: Vec<Uuid> = scored.iter().map(|s| chunks[s.index].id).collect();
+    let mut texts = state.store.chunk_texts(&hit_ids).await?;
 
     // Mirror the boon's packing so `would_inject` tells the truth about what
     // would actually be injected, not merely what scored well: walk hits in
@@ -649,7 +643,7 @@ pub async fn search_collection(
                 document_id: c.document_id,
                 score: s.score,
                 token_count: c.token_count,
-                text: c.text.clone(),
+                text: texts.remove(&c.id).unwrap_or_default(),
                 would_inject: fits,
             }
         })

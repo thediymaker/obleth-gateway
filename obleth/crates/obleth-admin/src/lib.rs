@@ -11429,6 +11429,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{hits}");
         assert_eq!(hits.as_array().unwrap().len(), 1, "{hits}");
+        assert_eq!(hits[0]["text"], serde_json::json!("hello world"), "{hits}");
 
         // One call each from indexing and search, with the endpoint's key.
         assert_eq!(*auth.lock().unwrap(), vec!["Bearer sk-up", "Bearer sk-up"]);
