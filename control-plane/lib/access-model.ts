@@ -318,6 +318,12 @@ export interface KeyRow {
   lastUsedMs: number;
 }
 
+/** Per-key use covers 30 days: long enough for "last used" to mean something for
+ * keys that aren't hit daily, while bounding the ClickHouse scan. */
+export const KEY_USAGE_WINDOW_MS = 30 * 86_400_000;
+/** The Keys page reads use for this many keys, the busiest first. */
+export const KEY_USAGE_LIMIT = 5000;
+
 export function buildKeyRows(keys: ApiKey[], tenants: Pick<Tenant, "id" | "name">[], usage: KeyUsageSummary[], budgets: BudgetUsage[], now = new Date()): KeyRow[] {
   const names = new Map(tenants.map((t) => [t.id, t.name]));
   const use = new Map(usage.map((u) => [u.key_id, u]));

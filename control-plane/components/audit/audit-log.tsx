@@ -7,9 +7,11 @@ import { Download, Search, X } from "lucide-react";
 import { Tile } from "@/components/models/ui";
 import { Segmented } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
+import { ListFooter } from "@/components/ui/list-footer";
 import { Select } from "@/components/ui/select";
 import {
   actorLabel,
+  AUDIT_PAGE,
   burstSummary,
   changeLine,
   dayLabel,
@@ -18,7 +20,6 @@ import {
   isPerson,
   KIND_LABEL,
   kindOf,
-  matchesKind,
   paramsFor,
   previousOf,
   queryFor,
@@ -35,8 +36,6 @@ import {
 } from "@/lib/audit-model";
 import type { AuditEntry } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
-
-const PAGE = 500;
 
 function initials(actor: string): string {
   if (!isPerson(actor)) return actor.slice(0, 2);
@@ -146,15 +145,15 @@ export function AuditLog({ entries: initial, filters, names, alive: aliveIds, to
   const router = useRouter();
   const pathname = usePathname();
   const [extra, setExtra] = useState<AuditEntry[]>([]);
-  const [done, setDone] = useState(initial.length < PAGE);
+  const [done, setDone] = useState(initial.length < AUDIT_PAGE);
   const [open, setOpen] = useState<Set<number>>(new Set());
   const [query, setQuery] = useState(filters.q);
   const [loading, start] = useTransition();
   const alive = useMemo(() => new Set(aliveIds), [aliveIds]);
-  const entries = useMemo(() => [...initial, ...extra].filter((e) => matchesKind(e, filters.kind)), [initial, extra, filters.kind]);
+  const entries = useMemo(() => [...initial, ...extra], [initial, extra]);
   const groups = useMemo(() => groupBursts(entries), [entries]);
 
-  useEffect(() => { setExtra([]); setDone(initial.length < PAGE); setOpen(new Set()); }, [initial]);
+  useEffect(() => { setExtra([]); setDone(initial.length < AUDIT_PAGE); setOpen(new Set()); }, [initial]);
 
   const go = (patch: Partial<AuditFilters>) => router.replace(`${pathname}${paramsFor({ ...filters, ...patch })}`, { scroll: false });
   useEffect(() => {
@@ -164,18 +163,18 @@ export function AuditLog({ entries: initial, filters, names, alive: aliveIds, to
   }, [query]); // eslint-disable-line react-hooks/exhaustive-deps
 
   function older() {
-    const last = [...initial, ...extra].at(-1);
+    const last = entries.at(-1);
     if (!last) return;
     start(async () => {
       const q = queryFor(filters);
       const p = new URLSearchParams();
       Object.entries({ actor: q.actor, entity_type: q.entityType, entity_id: q.entityId, since: q.since, q: q.q }).forEach(([k, v]) => { if (v) p.set(k, v); });
       p.set("before_id", String(last.id));
-      p.set("limit", String(PAGE));
+      p.set("limit", String(AUDIT_PAGE));
       const res = await fetch(`/api/live/audit?${p}`);
       const rows = res.ok ? ((await res.json()) as AuditEntry[]) : [];
       setExtra((x) => [...x, ...rows]);
-      if (rows.length < PAGE) setDone(true);
+      if (rows.length < AUDIT_PAGE) setDone(true);
     });
   }
 
@@ -256,9 +255,10 @@ export function AuditLog({ entries: initial, filters, names, alive: aliveIds, to
             </Fragment>
           );
         })}
+        <ListFooter shown={entries.length} noun="changes" more={!done} loading={loading} onMore={older} />
         <div className="flex flex-wrap justify-between gap-2 border-t border-border px-[18px] py-3 text-[12.5px] text-muted-foreground">
           <span>
-            {done ? (filters.range === "all" ? "That's everything." : <>That&apos;s {RANGE_LABEL[filters.range].toLowerCase()}. <button type="button" onClick={() => go({ range: "all" })} className="text-secondary-foreground underline underline-offset-[3px] hover:text-foreground">Show all</button></>) : <button type="button" disabled={loading} onClick={older} className="text-secondary-foreground underline underline-offset-[3px] hover:text-foreground">{loading ? "Loading…" : "Load older"}</button>}
+            {done && (filters.range === "all" ? "That's everything." : <>That&apos;s {RANGE_LABEL[filters.range].toLowerCase()}. <button type="button" onClick={() => go({ range: "all" })} className="text-secondary-foreground underline underline-offset-[3px] hover:text-foreground">Show all</button></>)}
           </span>
           <span>Dashed avatar: a shared token, not a person</span>
         </div>

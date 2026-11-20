@@ -16,6 +16,7 @@ import {
   buildKeyRows,
   EMPTY_KEY_FILTERS,
   filterKeys,
+  KEY_USAGE_LIMIT,
   lastUsed,
   NEAR_BUDGET,
   sortKeys,
@@ -277,7 +278,9 @@ export function KeysList({
         </div>
         <div className="flex flex-wrap justify-between gap-2 border-t border-border px-[18px] py-3 text-[12.5px] text-muted-foreground">
           <span>{shown.length === keys.length ? `${keys.length} keys` : `${shown.length} of ${keys.length} keys`} · click one to see and change it</span>
-          <span>Use is the last 30 days; budgets count their own period</span>
+          <span>
+            Use is the last 30 days{usage.length >= KEY_USAGE_LIMIT ? ` for the ${KEY_USAGE_LIMIT.toLocaleString()} busiest keys; the rest show none` : ""}; budgets count their own period
+          </span>
         </div>
       </section>
 

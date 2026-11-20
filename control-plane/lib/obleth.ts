@@ -1519,6 +1519,7 @@ function usageQs(filter: UsageFilter) {
 export interface AuditParams {
   limit?: number;
   actor?: string;
+  /** One entity type or several, comma-separated. */
   entityType?: string;
   entityId?: string;
   /** One action or several, comma-separated. */

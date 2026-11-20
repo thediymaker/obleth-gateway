@@ -1531,7 +1531,7 @@ impl Store {
             "select id, ts, actor, action, entity_type, entity_id, detail
              from audit_log
              where ($1::text is null or actor = $1)
-               and ($2::text is null or entity_type = $2)
+               and ($2::text[] is null or entity_type = any($2))
                and ($3::text is null or entity_id = $3)
                and ($4::text[] is null or action = any($4))
                and ($5::timestamptz is null or ts >= $5)
@@ -1542,7 +1542,7 @@ impl Store {
              limit $9",
         )
         .bind(f.actor.as_deref())
-        .bind(f.entity_type.as_deref())
+        .bind(f.entity_types.as_deref())
         .bind(f.entity_id.as_deref())
         .bind(f.actions.as_deref())
         .bind(f.since)
@@ -4015,8 +4015,10 @@ impl Store {
 #[derive(Debug, Clone, Default)]
 pub struct AuditFilter {
     pub actor: Option<String>,
-    pub entity_type: Option<String>,
+    /// Any of these entity types.
+    pub entity_types: Option<Vec<String>>,
     pub entity_id: Option<String>,
+    /// Any of these actions.
     pub actions: Option<Vec<String>>,
     pub since: Option<chrono::DateTime<chrono::Utc>>,
     pub until: Option<chrono::DateTime<chrono::Utc>>,
@@ -5987,10 +5989,16 @@ mod tests {
         assert!(store.list_audit_filtered(&wild).await.unwrap().is_empty());
 
         let other = AuditFilter {
-            entity_type: Some("tenant".into()),
+            entity_types: Some(vec!["tenant".into()]),
             ..base.clone()
         };
         assert!(store.list_audit_filtered(&other).await.unwrap().is_empty());
+        // Any of several types, as the Audit page's Kind filter sends them.
+        let kinds = AuditFilter {
+            entity_types: Some(vec!["tenant".into(), "model".into()]),
+            ..base.clone()
+        };
+        assert_eq!(store.list_audit_filtered(&kinds).await.unwrap().len(), 3);
         let later = AuditFilter {
             since: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
             ..base.clone()

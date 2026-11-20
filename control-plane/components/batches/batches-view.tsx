@@ -3,7 +3,7 @@
 import { useMemo, useState, useTransition } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { useQuery } from "@tanstack/react-query";
+import { useInfiniteQuery } from "@tanstack/react-query";
 import { Search } from "lucide-react";
 import { cancelBatchAction } from "@/app/(dashboard)/batches/batches-actions";
 import { Tile } from "@/components/models/ui";
@@ -28,6 +28,8 @@ import { modelHref } from "@/lib/model-links";
 import type { AdminBatch, AdminBatchList } from "@/lib/obleth";
 import { compact } from "@/lib/overview-model";
 import { cn, getJson } from "@/lib/utils";
+import { ListFooter } from "@/components/ui/list-footer";
+import { ReadNotice } from "@/components/ui/read-state";
 
 const COLS = "grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)_minmax(0,0.9fr)_minmax(220px,1.6fr)_minmax(0,1.3fr)_88px]";
 
@@ -87,23 +89,26 @@ export function BatchesView({ initial, initialFilter }: { initial: AdminBatchLis
   const [cancelling, setCancelling] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const status = BATCH_FILTERS[filter].status;
-  const live = useQuery({
+  // Pages of 100, newest first; "Load older" asks for the page after the last row.
+  const live = useInfiniteQuery({
     queryKey: ["batches", filter],
-    queryFn: () => getJson<AdminBatchList>(`/api/live/batches?limit=100${status ? `&status=${status}` : ""}`),
-    initialData: filter === initialFilter ? initial ?? undefined : undefined,
-    refetchInterval: (q) => (q.state.data?.data.some((b) => isActive(b.status)) ? 3_000 : 15_000),
+    queryFn: ({ pageParam }) => getJson<AdminBatchList>(`/api/live/batches?limit=100${status ? `&status=${status}` : ""}${pageParam ? `&after=${encodeURIComponent(pageParam)}` : ""}`),
+    initialPageParam: "",
+    getNextPageParam: (last) => (last.has_more ? last.data.at(-1)?.id : undefined),
+    initialData: filter === initialFilter && initial ? { pages: [initial], pageParams: [""] } : undefined,
+    refetchInterval: (q) => (q.state.data?.pages.some((p) => p.data.some((b) => isActive(b.status))) ? 3_000 : 15_000),
   });
-  const data = live.data ?? initial;
+  const pages = live.data?.pages ?? (initial ? [initial] : []);
+  const loaded = useMemo(() => pages.flatMap((p) => p.data), [pages]);
   const now = live.dataUpdatedAt || Date.now();
-  const counts = data?.counts ?? {};
+  const counts = pages[0]?.counts ?? {};
   const batches = useMemo(() => {
     const q = query.trim().toLowerCase();
-    const all = data?.data ?? [];
-    if (!q) return all;
-    return all.filter((b) => [b.id, b.model, b.tenant_name, b.key_name, batchName(b)].some((v) => v?.toLowerCase().includes(q)));
-  }, [data, query]);
+    if (!q) return loaded;
+    return loaded.filter((b) => [b.id, b.model, b.tenant_name, b.key_name, batchName(b)].some((v) => v?.toLowerCase().includes(q)));
+  }, [loaded, query]);
 
-  const active = (data?.data ?? []).filter((b) => b.status === "in_progress");
+  const active = loaded.filter((b) => b.status === "in_progress");
   const remaining = active.reduce((n, b) => n + (b.total - doneOf(b)), 0);
   const waiting = active.filter((b) => b.waiting);
   const models = new Set(active.map((b) => b.model));
@@ -136,7 +141,7 @@ export function BatchesView({ initial, initialFilter }: { initial: AdminBatchLis
         </div>
       </div>
 
-      {data == null && <p className="rounded-xl border border-border bg-card px-4 py-3 text-[13px] text-secondary-foreground">The batch list couldn&apos;t be read from the gateway. It retries every few seconds.</p>}
+      <ReadNotice query={live} what="the batch list" />
 
       <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
         <Tile label="Running now" value={counts.in_progress ?? 0} detail={active.length ? `on ${models.size} model${models.size === 1 ? "" : "s"}` : "Nothing running"} />
@@ -222,7 +227,7 @@ export function BatchesView({ initial, initialFilter }: { initial: AdminBatchLis
             })}
           </div>
         </div>
-        {data?.has_more && <p className="border-t border-border px-[18px] py-2.5 text-[12px] text-muted-foreground">Showing the newest 100.</p>}
+        <ListFooter shown={loaded.length} noun="batches" more={live.hasNextPage} loading={live.isFetchingNextPage} onMore={() => live.fetchNextPage()} />
       </section>
     </div>
   );

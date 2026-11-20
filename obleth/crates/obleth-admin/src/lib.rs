@@ -1869,6 +1869,7 @@ pub struct AuditQuery {
     pub limit: Option<i64>,
     /// Exact actor (an email, `admin`, …).
     pub actor: Option<String>,
+    /// One entity type or several, comma-separated.
     pub entity_type: Option<String>,
     pub entity_id: Option<String>,
     /// One action or several, comma-separated.
@@ -10427,18 +10428,21 @@ async fn get_audit(
             .transpose()
     };
     let text = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let list = |v: Option<String>| {
+        text(v).map(|a| {
+            a.split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect::<Vec<_>>()
+        })
+    };
     let filter = obleth_store::AuditFilter {
         since: time(&q.since, "since")?,
         until: time(&q.until, "until")?,
         actor: text(q.actor),
-        entity_type: text(q.entity_type),
+        entity_types: list(q.entity_type),
         entity_id: text(q.entity_id),
-        actions: text(q.action).map(|a| {
-            a.split(',')
-                .map(|x| x.trim().to_string())
-                .filter(|x| !x.is_empty())
-                .collect()
-        }),
+        actions: list(q.action),
         before_id: q.before_id,
         q: text(q.q),
         limit: q.limit.unwrap_or(100),

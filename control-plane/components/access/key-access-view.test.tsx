@@ -48,12 +48,12 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-async function render() {
+async function render(data = initial) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   await act(async () => {
     root.render(
       <QueryClientProvider client={client}>
-        <KeyAccessView tenants={[{ id: "t-1", name: "genomics-lab" }]} initialRange="24h" initialTenant="" initialSearch="" initial={initial} />
+        <KeyAccessView tenants={[{ id: "t-1", name: "genomics-lab" }]} initialRange="24h" initialTenant="" initialSearch="" initial={data} />
       </QueryClientProvider>,
     );
   });
@@ -87,6 +87,21 @@ describe("Key access", () => {
     expect(text).toContain("203.0.113.9");
     expect(text).toContain("Germany");
     expect(text).toContain("python-requests/2.32");
+  });
+
+  it("pages a long refused list instead of cutting it off", async () => {
+    const rejections = Array.from({ length: 250 }, (_, i) => ({ ...rejection, client_ip: `203.0.113.${i}`, count: 250 - i }));
+    const data = { ...initial, rejections };
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => data }) as Response));
+    await render(data);
+    const refusedRows = () => host.querySelectorAll("tbody tr").length;
+    expect(refusedRows()).toBe(100);
+    expect(host.textContent).toContain("100 of 250 refusals shown");
+    const more = [...host.querySelectorAll("button")].find((b) => b.textContent === "Show 100 more")!;
+    await act(async () => more.click());
+    await act(async () => [...host.querySelectorAll("button")].find((b) => b.textContent === "Show 50 more")!.click());
+    expect(refusedRows()).toBe(250);
+    expect(host.textContent).not.toContain("refusals shown");
   });
 
   it("searches by network", async () => {
