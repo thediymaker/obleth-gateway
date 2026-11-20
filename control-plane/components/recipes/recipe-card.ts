@@ -25,9 +25,8 @@ export interface RecipeDeployPreview {
   constraints?: string | null;
   exclude?: string | null;
   logOutputDir?: string;
-  scriptBody: string;
   /** The recipe's raw script body (placeholders/{{variables}} intact), for the
-   *  editable launch textarea. `scriptBody` is the substituted/preview form. */
+   *  editable launch textarea. */
   rawBody: string;
   warnings: string[];
   variables?: RecipeVariable[];

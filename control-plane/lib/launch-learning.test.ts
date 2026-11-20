@@ -5,7 +5,7 @@ import { learnFrom, type LaunchRecord } from "./launch-learning";
 import { EMPTY_CLUSTER } from "./recipe-inputs";
 
 const now = Date.parse("2026-09-28T12:00:00Z");
-const p = { apiModelName: "m", modelType: "chat", engine: "vllm", port: 8000, healthPath: "/health", targetReplicas: 1, maxJobFailures: 2, partition: "gh200", scriptBody: "", rawBody: "", warnings: [], kind: "model", inputs: [] } as RecipeDeployPreview;
+const p = { apiModelName: "m", modelType: "chat", engine: "vllm", port: 8000, healthPath: "/health", targetReplicas: 1, maxJobFailures: 2, partition: "gh200", rawBody: "", warnings: [], kind: "model", inputs: [] } as RecipeDeployPreview;
 const form = setField(baselineForm("r", p, EMPTY_CLUSTER), "slurm.time_limit", "1-00:00:00");
 let n = 0;
 const run = (over: Partial<LaunchRecord>): LaunchRecord => ({ id: String(n++), model_name: "m", recipe_id: "r", partition: "gh200", account: "ai", qos: "normal", time_limit: "1-00:00:00", nodes_requested: 1, nodes: "gh-1", submitted_at: new Date(now - 3_600_000).toISOString(), started_at: null, healthy_at: "x", ended_at: null, end_state: null, queued_secs: 180, load_secs: 4200, ...over });

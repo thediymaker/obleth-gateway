@@ -7,7 +7,7 @@ import type { RecipeCard, RecipeDeployPreview } from "@/components/recipes/recip
 
 vi.mock("@/app/actions", () => ({ lookupHfModelAction: vi.fn(async () => ({ ok: false, error: "Couldn't reach huggingface.co from the dashboard." })) }));
 
-const preview = (engine: string): RecipeDeployPreview => ({ apiModelName: "my-model", modelType: "chat", engine, port: 8000, healthPath: "/health", targetReplicas: 1, maxJobFailures: 2, partition: "", scriptBody: "", rawBody: "", warnings: [], inputs: [], kind: "engine" });
+const preview = (engine: string): RecipeDeployPreview => ({ apiModelName: "my-model", modelType: "chat", engine, port: 8000, healthPath: "/health", targetReplicas: 1, maxJobFailures: 2, partition: "", rawBody: "", warnings: [], inputs: [], kind: "engine" });
 const card = (id: string, engine: string, source: "file" | "db", name: string): RecipeCard => ({ id, valid: true, name, engine, description: `${name} for any model`, warnings: [], source, preview: preview(engine) });
 
 let root: Root;

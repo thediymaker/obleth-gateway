@@ -1,3 +1,4 @@
+import type { DeploymentData } from "@/lib/deployments-data";
 import type { CapacityDiscoveryModelView, ClusterResources, ManagedModelSpec, ModelReplica, ModelRoute, SlurmSettingsView } from "@/lib/obleth";
 
 /**
@@ -356,6 +357,15 @@ export function buildDeploymentRows(
   }
   return rows;
 }
+
+/** One deployment's row from its own reads (its page), or undefined for a
+ *  model obleth neither launches nor watches. */
+export function deploymentRow(d: Pick<DeploymentData, "model" | "spec" | "replicas" | "discovery">): DeploymentRow | undefined {
+  return buildDeploymentRows([d.model], d.spec ? [d.spec] : [], d.replicas, d.discovery?.models ?? [], {})[0];
+}
+
+/** The react-query key a deployment's page polls under. */
+export const deploymentKey = (modelId: string) => ["deployment", modelId] as const;
 
 export type RunsFilter = "all" | "kubernetes" | "slurm" | "attention";
 export type DeploySort = "requests" | "name" | "replicas" | "attention";

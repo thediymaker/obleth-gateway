@@ -2,7 +2,6 @@
 
 import { useState, useTransition } from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
 import { Plus } from "lucide-react";
 import { deleteTemplateAction } from "@/app/actions";
 import { Notice } from "@/components/models/ui";
@@ -25,8 +24,7 @@ export function recipeAsks(c: RecipeCard): string {
   return [p.partition || "any partition", p.gres || null, p.cpusPerTask ? `${p.cpusPerTask} CPU` : null, p.mem || null].filter(Boolean).join(" · ");
 }
 
-export function RecipesTab({ recipes, specs, models }: { recipes: RecipeCard[]; specs: ManagedModelSpec[]; models: ModelRoute[] }) {
-  const router = useRouter();
+export function RecipesTab({ recipes, specs, models, onChanged }: { recipes: RecipeCard[]; specs: ManagedModelSpec[]; models: ModelRoute[]; onChanged: () => void }) {
   const { confirm, confirmElement } = useConfirm();
   const [, start] = useTransition();
   const [editor, setEditor] = useState<{ open: boolean; initial?: { id?: string; name: string; body: string } }>({ open: false });
@@ -41,7 +39,7 @@ export function RecipesTab({ recipes, specs, models }: { recipes: RecipeCard[]; 
       if (!ok || !c.recipeId) return;
       const res = await deleteTemplateAction(c.recipeId);
       if (!res.ok) setNotice(res.error);
-      router.refresh();
+      onChanged();
     });
   }
 
@@ -127,7 +125,7 @@ export function RecipesTab({ recipes, specs, models }: { recipes: RecipeCard[]; 
         open={editor.open}
         onOpenChange={(open) => setEditor((e) => ({ ...e, open }))}
         initial={editor.initial}
-        onSaved={() => router.refresh()}
+        onSaved={onChanged}
       />
     </div>
   );

@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ChangesList, InFlightChart, useModelDay } from "@/components/deployments/detail-ui";
 import { StateMark } from "@/components/deployments/ui";
@@ -8,8 +9,8 @@ import { useFairshareLive } from "@/components/fairshare/hooks";
 import { Tile } from "@/components/models/ui";
 import { Meter, Panel, Pill } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
-import type { DeploymentsData } from "@/lib/deployments-data";
-import { buildDeploymentRows } from "@/lib/deployments-model";
+import type { DeploymentData } from "@/lib/deployments-data";
+import { deploymentKey, deploymentRow } from "@/lib/deployments-model";
 import { logsHref } from "@/lib/log-links";
 import { modelHref } from "@/lib/models-model";
 import type { AuditEntry } from "@/lib/obleth";
@@ -33,12 +34,12 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
 }
 
 /** A model a Kubernetes cluster runs: obleth routes to it and sizes its pool from the Service. */
-export function WatchedPage({ modelId, initial, changes }: { modelId: string; initial: DeploymentsData; changes: AuditEntry[] }) {
-  const live = useQuery({ queryKey: ["deployments"], queryFn: () => getJson<DeploymentsData>("/api/live/deployments"), initialData: initial, refetchInterval: 15_000 });
+export function WatchedPage({ modelId, initial, changes }: { modelId: string; initial: DeploymentData; changes: AuditEntry[] }) {
+  const live = useQuery({ queryKey: deploymentKey(modelId), queryFn: () => getJson<DeploymentData>(`/api/live/deployments/${encodeURIComponent(modelId)}`), initialData: initial, refetchInterval: 15_000 });
   const fairshare = useFairshareLive();
   const data = live.data ?? initial;
-  const row = buildDeploymentRows(data.models, data.specs, data.replicas, data.discovery?.models ?? [], data.requests).find((r) => r.model.id === modelId);
-  const model = row?.model ?? initial.models.find((m) => m.id === modelId)!;
+  const row = useMemo(() => deploymentRow(data), [data]);
+  const model = data.model;
   const day = useModelDay(model.model_name);
   const status = row?.discovery?.status;
   const { inFlight, cap, queued } = poolOccupancy(model.model_name, model, fairshare.data, data.discovery);

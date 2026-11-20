@@ -14,7 +14,7 @@ import { Meter, Pill, Segmented } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
 import { Select } from "@/components/ui/select";
 import type { RecipeCard } from "@/components/recipes/recipe-card";
-import type { DeploymentsData } from "@/lib/deployments-data";
+import type { DeploymentRequests, DeploymentsData } from "@/lib/deployments-data";
 import {
   attentionWords,
   buildDeploymentRows,
@@ -48,7 +48,13 @@ function ago(secs: number | null | undefined): string {
   return `${Math.round(secs / 3600)} h ago`;
 }
 
-export function DeploymentsList({ initial, recipes, tab: initialTab, slurmSheet = false }: { initial: DeploymentsData; recipes: RecipeCard[]; tab: "deployments" | "recipes"; slurmSheet?: boolean }) {
+/** The 24 h request counts come from ClickHouse, so they refresh once a minute
+ *  while the fleet itself refreshes every 15 seconds. */
+export const REQUESTS_POLL_MS = 60_000;
+
+/** `recipes` is passed only when the page opens on the Recipes tab; otherwise
+ *  they load when that tab is first opened. */
+export function DeploymentsList({ initial, recipes: initialRecipes, tab: initialTab, slurmSheet = false }: { initial: DeploymentsData; recipes?: RecipeCard[]; tab: "deployments" | "recipes"; slurmSheet?: boolean }) {
   const router = useRouter();
   const pathname = usePathname();
   const [tab, setTab] = useState(initialTab);
@@ -57,14 +63,23 @@ export function DeploymentsList({ initial, recipes, tab: initialTab, slurmSheet 
   const [runs, setRuns] = useState<RunsFilter>("all");
   const [sort, setSort] = useState<DeploySort>("requests");
   const live = useQuery({ queryKey: ["deployments"], queryFn: () => getJson<DeploymentsData>("/api/live/deployments"), initialData: initial, refetchInterval: 15_000 });
+  const requests = useQuery({ queryKey: ["deployment-requests"], queryFn: () => getJson<DeploymentRequests>("/api/live/deployments/requests"), refetchInterval: REQUESTS_POLL_MS });
+  const recipesQuery = useQuery({
+    queryKey: ["deployment-recipes"],
+    queryFn: () => getJson<RecipeCard[]>("/api/live/deployments/recipes"),
+    initialData: initialRecipes,
+    enabled: tab === "recipes",
+    staleTime: Infinity,
+  });
+  const recipes = recipesQuery.data;
   const fairshare = useFairshareLive();
   const data = live.data ?? initial;
   const slurmOn = !!data.slurm?.enabled;
   const resources = useClusterResources();
 
   const rows = useMemo(
-    () => buildDeploymentRows(data.models, data.specs, data.replicas, data.discovery?.models ?? [], data.requests),
-    [data],
+    () => buildDeploymentRows(data.models, data.specs, data.replicas, data.discovery?.models ?? [], requests.data ?? {}),
+    [data, requests.data],
   );
   const shown = useMemo(() => sortDeployments(filterDeployments(rows, { query, runs }), sort), [rows, query, runs, sort]);
   const k8s = rows.filter((r) => r.kind === "kubernetes");
@@ -95,12 +110,14 @@ export function DeploymentsList({ initial, recipes, tab: initialTab, slurmSheet 
 
   const switchTab = (t: "deployments" | "recipes") => {
     setTab(t);
-    router.replace(t === "recipes" ? `${pathname}?tab=recipes` : pathname, { scroll: false });
+    // Only the address changes: a router navigation would re-render the page
+    // on the server and read the fleet (and the recipes) again.
+    window.history.replaceState(null, "", t === "recipes" ? `${pathname}?tab=recipes` : pathname);
   };
 
   function closeSlurm() {
     setSlurmOpen(false);
-    if (slurmSheet) router.replace(tab === "recipes" ? `${pathname}?tab=recipes` : pathname, { scroll: false });
+    if (slurmSheet) window.history.replaceState(null, "", tab === "recipes" ? `${pathname}?tab=recipes` : pathname);
   }
 
   return (
@@ -115,7 +132,7 @@ export function DeploymentsList({ initial, recipes, tab: initialTab, slurmSheet 
       <div className="flex flex-wrap items-end justify-between gap-4">
         <div className="flex min-w-0 flex-col gap-1.5">
           <h1 className="text-[26px] font-semibold tracking-tight">Deployments</h1>
-          <p className="text-[13px] text-secondary-foreground">{tab === "recipes" ? `${recipes.length} recipe${recipes.length === 1 ? "" : "s"}: ${recipes.filter((r) => r.source === "file").length} shipped as files, ${recipes.filter((r) => r.source === "db").length} saved here` : deploymentsLine(rows)}</p>
+          <p className="text-[13px] text-secondary-foreground">{tab === "recipes" ? (recipes ? `${recipes.length} recipe${recipes.length === 1 ? "" : "s"}: ${recipes.filter((r) => r.source === "file").length} shipped as files, ${recipes.filter((r) => r.source === "db").length} saved here` : "Loading the recipes…") : deploymentsLine(rows)}</p>
         </div>
         <div className="flex gap-2">
           {tab === "deployments" && <Button type="button" variant="outline" size="sm" className="h-9" onClick={() => switchTab("recipes")}>Recipes</Button>}
@@ -133,13 +150,19 @@ export function DeploymentsList({ initial, recipes, tab: initialTab, slurmSheet 
             onClick={() => switchTab(t)}
             className={cn("-mb-px border-b-2 px-3 py-2.5 text-[13.5px]", tab === t ? "border-foreground text-foreground" : "border-transparent text-muted-foreground hover:text-foreground")}
           >
-            {t === "deployments" ? `Deployments · ${rows.length}` : `Recipes · ${recipes.length}`}
+            {t === "deployments" ? `Deployments · ${rows.length}` : recipes ? `Recipes · ${recipes.length}` : "Recipes"}
           </button>
         ))}
       </div>
 
       {tab === "recipes" ? (
-        <RecipesTab recipes={recipes} specs={data.specs} models={data.models} />
+        recipes ? (
+          <RecipesTab recipes={recipes} specs={data.specs} models={data.models} onChanged={() => void recipesQuery.refetch()} />
+        ) : recipesQuery.isError ? (
+          <p role="status" className="text-[13px] text-foreground">obleth couldn&apos;t read the recipes just now. <button type="button" className="underline underline-offset-2" onClick={() => void recipesQuery.refetch()}>Try again</button></p>
+        ) : (
+          <p role="status" className="text-[13px] text-muted-foreground">Loading the recipes…</p>
+        )
       ) : (
         <>
           <div className="grid gap-3 lg:grid-cols-2">
@@ -278,7 +301,9 @@ export function DeploymentsList({ initial, recipes, tab: initialTab, slurmSheet 
                         <span className="font-mono text-[12px]">{cap ? `${inFlight} of ${cap}` : "—"}</span>
                         <Meter value={inFlight} max={cap} strong={cap > 0 && inFlight >= cap} />
                       </span>
-                      {r.requests24h ? (
+                      {!requests.data ? (
+                        <span className="text-right font-mono text-[12px] text-muted-foreground">—</span>
+                      ) : r.requests24h ? (
                         <Link href={logsHref({ model: r.model.model_name, window: "24h" })} title="See these requests" className="text-right font-mono text-[12px] underline decoration-muted-foreground/40 underline-offset-[3px] hover:decoration-foreground">{compact(r.requests24h)}</Link>
                       ) : (
                         <span className="text-right font-mono text-[12px] text-muted-foreground">0</span>

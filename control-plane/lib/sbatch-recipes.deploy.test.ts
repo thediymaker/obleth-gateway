@@ -247,7 +247,6 @@ describe("buildDeployPreview", () => {
       partition: "arm",
       gres: "gpu:1",
     });
-    expect(p?.scriptBody).toContain("llama-server -hf repo:Q4");
   });
 
   it("populates rawBody with the recipe's raw body (placeholders intact, not substituted)", () => {
@@ -268,8 +267,8 @@ describe("buildDeployPreview", () => {
     // rawBody must contain the placeholder, not the substituted value
     expect(p?.rawBody).toContain("{{model}}");
     expect(p?.rawBody).not.toContain("/default.sif");
-    // scriptBody (preview) has the substituted value
-    expect(p?.scriptBody).toContain("/default.sif");
+    // and the preview carries no substituted copy of the script
+    expect(p).not.toHaveProperty("scriptBody");
   });
 
   it("returns undefined for an invalid recipe", () => {

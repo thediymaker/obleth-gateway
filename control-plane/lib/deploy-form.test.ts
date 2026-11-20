@@ -7,7 +7,7 @@ import { parseTimeLimit, walltimeLabel } from "./deployments-model";
 
 const p: RecipeDeployPreview = {
   apiModelName: "nemotron-3-ultra", modelType: "chat", engine: "vllm", port: 8000, healthPath: "/health", targetReplicas: 1, maxJobFailures: 2, partition: "", nodes: 1,
-  scriptBody: "", rawBody: "", warnings: [], kind: "model", nodeOptions: [1, 4, 8], env: { A: "1" },
+  rawBody: "", warnings: [], kind: "model", nodeOptions: [1, 4, 8], env: { A: "1" },
   inputs: [
     { name: "offload_gb", type: "number", default: "270", by_nodes: { "4": "10" }, required: false, min: 0, max: 460 },
     { name: "mtp", type: "flag", default: "true", required: false },
@@ -80,7 +80,7 @@ describe("launch names and model type", () => {
   it("refuses a name the engine or shell would split, and carries a model type from the lookup", async () => {
     const { baselineForm, formProblems, toOverrides } = await import("./deploy-form");
     const { EMPTY_CLUSTER } = await import("./recipe-inputs");
-    const preview = { apiModelName: "m", modelType: "chat", engine: "vllm", port: 8000, healthPath: "/health", targetReplicas: 1, maxJobFailures: 2, partition: "", scriptBody: "", rawBody: "", warnings: [], inputs: [], kind: "engine" as const };
+    const preview = { apiModelName: "m", modelType: "chat", engine: "vllm", port: 8000, healthPath: "/health", targetReplicas: 1, maxJobFailures: 2, partition: "", rawBody: "", warnings: [], inputs: [], kind: "engine" as const };
     const resources = { partitions: [], accounts: [], qos: [] } as unknown as Parameters<typeof formProblems>[2];
     const f = baselineForm("vllm", preview, EMPTY_CLUSTER, { name: "Gemma 4", modelType: "embedding" });
     expect(formProblems(f, preview, resources, []).map((p) => p.path)).toContain("name");

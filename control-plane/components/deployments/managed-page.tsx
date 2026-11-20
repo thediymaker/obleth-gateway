@@ -29,10 +29,11 @@ import { useConfirm } from "@/components/ui/confirm-dialog";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Select } from "@/components/ui/select";
-import type { DeploymentsData } from "@/lib/deployments-data";
+import type { DeploymentData } from "@/lib/deployments-data";
 import {
   accountsFor,
-  buildDeploymentRows,
+  deploymentKey,
+  deploymentRow,
   clockLabel,
   countReplicas,
   duration,
@@ -377,7 +378,7 @@ function RemoveDialog({ open, onClose, name, onRemove, pending }: { open: boolea
 }
 
 /** A model obleth launches on Slurm: its replicas, what they run, and where. */
-export function ManagedPage({ modelId, initial, changes }: { modelId: string; initial: DeploymentsData; changes: AuditEntry[] }) {
+export function ManagedPage({ modelId, initial, changes }: { modelId: string; initial: DeploymentData; changes: AuditEntry[] }) {
   const router = useRouter();
   const queryClient = useQueryClient();
   const { confirm, confirmElement } = useConfirm();
@@ -387,12 +388,12 @@ export function ManagedPage({ modelId, initial, changes }: { modelId: string; in
   const [saveName, setSaveName] = useState<string | null>(null);
   const [dirty, setDirty] = useState<string[]>([]);
   const [active, setActive] = useState("replicas");
-  const live = useQuery({ queryKey: ["deployments"], queryFn: () => getJson<DeploymentsData>("/api/live/deployments"), initialData: initial, refetchInterval: 10_000 });
+  const live = useQuery({ queryKey: deploymentKey(modelId), queryFn: () => getJson<DeploymentData>(`/api/live/deployments/${encodeURIComponent(modelId)}`), initialData: initial, refetchInterval: 10_000 });
   const fairshare = useFairshareLive();
   const data = live.data ?? initial;
-  const row = buildDeploymentRows(data.models, data.specs, data.replicas, data.discovery?.models ?? [], data.requests).find((r) => r.model.id === modelId);
-  const spec = row?.spec ?? initial.specs.find((s) => s.model_id === modelId)!;
-  const model = row?.model ?? initial.models.find((m) => m.id === modelId)!;
+  const row = useMemo(() => deploymentRow(data), [data]);
+  const spec = data.spec ?? initial.spec!;
+  const model = data.model;
   const replicas = row?.replicas ?? [];
   const current = replicas.filter((r) => r.state !== "lost").sort((a, b) => a.created_at.localeCompare(b.created_at));
   const lost = replicas.filter((r) => r.state === "lost").sort((a, b) => b.updated_at.localeCompare(a.updated_at));
@@ -415,7 +416,7 @@ export function ManagedPage({ modelId, initial, changes }: { modelId: string; in
   const staged = (model.effective_status ?? model.lifecycle?.status) === "staged";
 
   const refresh = useCallback(async () => {
-    await queryClient.invalidateQueries({ queryKey: ["deployments"] });
+    await queryClient.invalidateQueries({ queryKey: deploymentKey(modelId) });
     router.refresh();
   }, [queryClient, router]);
 

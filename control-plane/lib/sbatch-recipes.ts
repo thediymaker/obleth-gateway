@@ -683,7 +683,6 @@ export function buildDeployPreview(recipe: ParsedRecipe): RecipeDeployPreview | 
     constraints: m.constraints,
     exclude: m.exclude,
     logOutputDir: m.log_output_dir,
-    scriptBody: m.script_body ?? "",
     rawBody: recipe.body ?? "",
     warnings: recipe.warnings,
     variables: recipe.header.variables,

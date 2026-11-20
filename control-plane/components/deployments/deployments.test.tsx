@@ -8,7 +8,7 @@ import { DeploymentsList } from "./deployments-list";
 import { ManagedPage } from "./managed-page";
 import { NewDeployment } from "./new-deployment";
 import type { RecipeCard } from "@/components/recipes/recipe-card";
-import type { DeploymentsData } from "@/lib/deployments-data";
+import type { DeploymentData, DeploymentsData } from "@/lib/deployments-data";
 import type { ManagedModelSpec, ModelReplica, ModelRoute } from "@/lib/obleth";
 
 vi.mock("@/app/actions", () => ({
@@ -48,10 +48,15 @@ function data(over: Partial<DeploymentsData> = {}): DeploymentsData {
     specs: [spec()],
     replicas: [replica({ state: "healthy" }), replica({ last_message: "PENDING — Resources" })],
     discovery: { enabled: true, interval_secs: 15, namespaces: ["aibrix-system-llm"], default_service: "", replicas: 3, models: [{ model_id: "m2", model_name: "glm-5-3-flash", enabled: true, static_max_in_flight: null, enforced_max_in_flight: 160, cluster_in_flight: 38, in_flight: 38, status: { model_name: "glm-5-3-flash", source: "kubernetes", namespaces: [], namespace: "aibrix-system-llm", service: "glm-5-3-flash", ready_replicas: 0, per_replica_max_in_flight: 16, per_replica_source: "configured", headroom: 1, derived_max_in_flight: 0, effective_max_in_flight: 0, state: "discovered", last_refresh: null, last_success: null, reason: null } }] },
-    requests: { "glm-5-3-flash": 16039 },
     slurm: { enabled: true, provisioner_running: true, provisioner_last_seen_secs: 4 } as DeploymentsData["slurm"],
     ...over,
   };
+}
+
+/** One deployment's page data, from the same fixtures as the fleet. */
+function one(over: Partial<DeploymentsData> = {}, id = "m1"): DeploymentData {
+  const d = data(over);
+  return { now: d.now, model: d.models.find((m) => m.id === id)!, spec: d.specs.find((s) => s.model_id === id) ?? null, replicas: d.replicas.filter((r) => r.model_id === id), discovery: d.discovery, slurm: d.slurm, failed: d.failed };
 }
 
 let root: Root;
@@ -79,6 +84,7 @@ afterEach(async () => {
 async function render(node: React.ReactNode) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, enabled: false } } });
   await act(async () => root.render(<QueryClientProvider client={client}>{node}</QueryClientProvider>));
+  return client;
 }
 const button = (text: string) => {
   const b = [...document.querySelectorAll<HTMLButtonElement>("button")].find((x) => x.textContent?.trim() === text || x.getAttribute("aria-label") === text);
@@ -104,6 +110,41 @@ describe("the Deployments list", () => {
     await act(async () => button("Needs you 1").click());
     expect(table.textContent).not.toContain("glm-5.2");
     expect(table.textContent).toContain("No replicas ready");
+  });
+
+  it("polls the 24 h request counts on their own, once a minute", async () => {
+    const client = await render(<DeploymentsList initial={data()} tab="deployments" />);
+    const fleet = client.getQueryCache().find({ queryKey: ["deployments"] })!;
+    const requests = client.getQueryCache().find({ queryKey: ["deployment-requests"] })!;
+    expect((fleet.options as { refetchInterval?: number }).refetchInterval).toBe(15_000);
+    expect((requests.options as { refetchInterval?: number }).refetchInterval).toBe(60_000);
+    // Until the counts arrive the column says so rather than showing 0.
+    const table = host.querySelector('[aria-label="Deployments"][class*="overflow-hidden"]')!;
+    expect(table.textContent).toContain("—");
+    await act(async () => {
+      client.setQueryData(["deployment-requests"], { "glm-5-3-flash": 16039 });
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    expect(table.textContent).toContain("16K");
+  });
+
+  it("loads the recipes only when the Recipes tab is opened", async () => {
+    const card: RecipeCard = { id: "glm", valid: true, name: "GLM on llama.cpp", warnings: [], source: "file" };
+    const fetch = vi.fn(async () => new Response(JSON.stringify([card]), { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", fetch);
+    try {
+      await render(<DeploymentsList initial={data()} tab="deployments" />);
+      expect(fetch).not.toHaveBeenCalled();
+      await act(async () => {
+        button("Recipes").click();
+        for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 0));
+      });
+      expect(fetch).toHaveBeenCalledWith("/api/live/deployments/recipes", undefined);
+      expect(host.textContent).toContain("GLM on llama.cpp");
+      expect(host.textContent).toContain("Recipes · 1");
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
 
@@ -173,8 +214,15 @@ describe("what the Slurm connection reports", () => {
 });
 
 describe("a Slurm deployment's page", () => {
+  it("polls its own deployment, not the fleet", async () => {
+    const client = await render(<ManagedPage modelId="m1" initial={one()} changes={[]} />);
+    expect(client.getQueryCache().find({ queryKey: ["deployments"] })).toBeUndefined();
+    const own = client.getQueryCache().find({ queryKey: ["deployment", "m1"] })!;
+    expect((own.options as { refetchInterval?: number }).refetchInterval).toBe(10_000);
+  });
+
   it("scales and pauses through the spec", async () => {
-    await render(<ManagedPage modelId="m1" initial={data()} changes={[]} />);
+    await render(<ManagedPage modelId="m1" initial={one()} changes={[]} />);
     expect(host.textContent).toContain("Slurm says Resources");
     await act(async () => button("One more replica").click());
     expect(setDeploymentReplicasAction).toHaveBeenCalledWith("m1", 3);
@@ -182,7 +230,7 @@ describe("a Slurm deployment's page", () => {
 
   it("moves #SBATCH lines from the script into Placement, where Slurm reads them", async () => {
     const script = ["#!/bin/bash -l", "#SBATCH --gres=gpu:1", "#SBATCH --cpus-per-task=72", "#SBATCH --mem=500G", "#SBATCH --exclusive", "set -euo pipefail", "vllm serve m"].join("\n");
-    await render(<ManagedPage modelId="m1" initial={data({ specs: [spec({ script_body: script })] })} changes={[]} />);
+    await render(<ManagedPage modelId="m1" initial={one({ specs: [spec({ script_body: script })] })} changes={[]} />);
     const notice = () => [...host.querySelectorAll('[role="status"]')].find((x) => x.textContent?.includes("#SBATCH"));
     expect(notice()?.textContent).toContain("Slurm doesn't read these 4 #SBATCH lines");
     expect(notice()?.textContent).toContain("Placement's memory is 560G; this would make it 500G.");
@@ -196,7 +244,7 @@ describe("a Slurm deployment's page", () => {
   });
 
   it("labels what each node gets", async () => {
-    await render(<ManagedPage modelId="m1" initial={data()} changes={[]} />);
+    await render(<ManagedPage modelId="m1" initial={one()} changes={[]} />);
     const row = host.querySelector("#set-resources")!;
     expect(row.textContent).toContain("On its node");
     for (const label of ["GPUs", "CPUs", "Memory"]) expect([...row.querySelectorAll("label")].some((l) => l.textContent?.startsWith(label))).toBe(true);
@@ -205,7 +253,7 @@ describe("a Slurm deployment's page", () => {
 
   it("says why it stopped after failed launches", async () => {
     const lost = [1, 2, 3].map(() => replica({ state: "lost", last_message: "FAILED — NonZeroExitCode" }));
-    await render(<ManagedPage modelId="m1" initial={data({ replicas: lost })} changes={[]} />);
+    await render(<ManagedPage modelId="m1" initial={one({ replicas: lost })} changes={[]} />);
     const why = host.querySelector('[aria-label="Why it stopped"]')!;
     expect(why.textContent).toContain("3 jobs ended in the last 15 minutes, which reached the limit of 3");
     expect(why.textContent).toContain("FAILED — NonZeroExitCode");
@@ -214,7 +262,7 @@ describe("a Slurm deployment's page", () => {
 
   it("says a job's output stayed on its node when Job logs isn't set", async () => {
     const lost = [1, 2, 3].map(() => replica({ state: "lost", last_message: "FAILED — NonZeroExitCode" }));
-    await render(<ManagedPage modelId="m1" initial={data({ specs: [spec({ log_output_dir: "" })], replicas: lost })} changes={[]} />);
+    await render(<ManagedPage modelId="m1" initial={one({ specs: [spec({ log_output_dir: "" })], replicas: lost })} changes={[]} />);
     expect(host.querySelector('[aria-label="Why it stopped"]')!.textContent).toContain("Job logs isn't set, so job 42's output went to /tmp on gh-007.");
     expect(host.querySelector<HTMLInputElement>('input[name="slurm_log_output_dir"]')!.value).toBe("");
   });
@@ -225,7 +273,7 @@ describe("what a deployment's page reports from a newer gateway", () => {
 
   it("says when launches are paused and offers Try again", async () => {
     const until = new Date(Date.now() + 30 * 60_000).toISOString();
-    await render(<ManagedPage modelId="m1" initial={data({ specs: [newer({ paused_reason: "3 launches in a row failed", paused_until: until })], replicas: [] })} changes={[]} />);
+    await render(<ManagedPage modelId="m1" initial={one({ specs: [newer({ paused_reason: "3 launches in a row failed", paused_until: until })], replicas: [] })} changes={[]} />);
     const why = host.querySelector('[aria-label="Why it stopped"]')!;
     expect(why.textContent).toContain("3 launches in a row failed. obleth tries again at");
     await act(async () => button("Try again").click());
@@ -233,7 +281,7 @@ describe("what a deployment's page reports from a newer gateway", () => {
   });
 
   it("puts a refused submit in a sentence with what to change, never the raw body alone", async () => {
-    await render(<ManagedPage modelId="m1" initial={data({ specs: [newer({ last_provision_error: "Slurm rejected the job: Requested node configuration is not available." })], replicas: [] })} changes={[]} />);
+    await render(<ManagedPage modelId="m1" initial={one({ specs: [newer({ last_provision_error: "Slurm rejected the job: Requested node configuration is not available." })], replicas: [] })} changes={[]} />);
     const why = host.querySelector('[aria-label="Why it stopped"]')!;
     expect(why.textContent).toContain("No node in the partition has what one job asks for");
     expect(host.textContent).not.toContain("No jobs yet");
@@ -245,7 +293,7 @@ describe("what a deployment's page reports from a newer gateway", () => {
       replica({ state: "healthy", last_message: "RUNNING", port: 8003, log_path: "/shared/logs/obleth-glm-42.out", job_ends_at: ends, job_started_at: new Date(Date.now() - 600_000).toISOString() }),
       replica({ state: "pending", slurm_job_id: "43", last_message: "PENDING — BeginTime", job_started_at: new Date().toISOString() }),
     ];
-    await render(<ManagedPage modelId="m1" initial={data({ specs: [newer()], replicas })} changes={[]} />);
+    await render(<ManagedPage modelId="m1" initial={one({ specs: [newer()], replicas })} changes={[]} />);
     const a = host.querySelector('[aria-label="Replica A"]')!;
     expect(a.textContent).toContain("port 8003");
     expect(a.textContent).toContain("Job 42's output is going to /shared/logs/obleth-glm-42.out.");
@@ -254,7 +302,7 @@ describe("what a deployment's page reports from a newer gateway", () => {
   });
 
   it("asks before a scale-down cancels a serving job, and before a restart", async () => {
-    await render(<ManagedPage modelId="m1" initial={data({ specs: [newer()], replicas: [replica({ state: "healthy", last_message: "RUNNING" }), replica({ state: "healthy", last_message: "RUNNING" })] })} changes={[]} />);
+    await render(<ManagedPage modelId="m1" initial={one({ specs: [newer()], replicas: [replica({ state: "healthy", last_message: "RUNNING" }), replica({ state: "healthy", last_message: "RUNNING" })] })} changes={[]} />);
     await act(async () => button("One fewer replica").click());
     expect(document.body.textContent).toContain("which is serving now. Requests move to the others.");
     expect(setDeploymentReplicasAction).not.toHaveBeenCalled();
@@ -264,14 +312,14 @@ describe("what a deployment's page reports from a newer gateway", () => {
 
   it("offers Make it live for a staged model that serves", async () => {
     const staged = model({ effective_status: "staged" } as Partial<ModelRoute>);
-    await render(<ManagedPage modelId="m1" initial={data({ models: [staged], specs: [newer()], replicas: [replica({ state: "healthy", last_message: "RUNNING" })] })} changes={[]} />);
+    await render(<ManagedPage modelId="m1" initial={one({ models: [staged], specs: [newer()], replicas: [replica({ state: "healthy", last_message: "RUNNING" })] })} changes={[]} />);
     expect(host.textContent).toContain("Serving, but not listed yet.");
     await act(async () => button("Make it live").click());
     expect(setModelStatusAction).toHaveBeenCalledWith("m1", { status: "active" });
   });
 
   it("says no provisioner has run yet, and how to start one", async () => {
-    await render(<ManagedPage modelId="m1" initial={data({ slurm: { enabled: true, provisioner_running: false, provisioner_last_seen_secs: null } as DeploymentsData["slurm"], replicas: [] })} changes={[]} />);
+    await render(<ManagedPage modelId="m1" initial={one({ slurm: { enabled: true, provisioner_running: false, provisioner_last_seen_secs: null } as DeploymentsData["slurm"], replicas: [] })} changes={[]} />);
     expect(host.textContent).toContain("No provisioner has run yet, so nothing will be launched.");
     expect(host.textContent).toContain("obleth-provisioner.service");
     expect(host.textContent).not.toContain("next pass");
@@ -281,7 +329,7 @@ describe("what a deployment's page reports from a newer gateway", () => {
 describe("a new deployment", () => {
   const preview = {
     apiModelName: "glm-5.2", modelType: "chat", engine: "llamacpp", port: 8000, healthPath: "/health", targetReplicas: 2, maxJobFailures: 3, partition: "gh200", gres: "gpu:1", cpusPerTask: 72, mem: "560G", timeLimit: "1-00:00:00",
-    scriptBody: "", rawBody: "export LLAMA_CACHE={{cache}}\nllama-server --ctx-size {{context}} {{fa}}", warnings: [], kind: "model" as const,
+    rawBody: "export LLAMA_CACHE={{cache}}\nllama-server --ctx-size {{context}} {{fa}}", warnings: [], kind: "model" as const,
     inputs: [
       { name: "cache", label: "Weight cache", type: "path" as const, default: "{{cluster.cache}}", required: true },
       { name: "context", label: "Context length", type: "choice" as const, options: ["131072", "1048576"], default: "131072", required: false },
