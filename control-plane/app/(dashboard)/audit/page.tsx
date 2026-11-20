@@ -1,7 +1,7 @@
 import { AuditLog } from "@/components/audit/audit-log";
 import { AUDIT_PAGE, buildNames, filtersFromParams, queryFor } from "@/lib/audit-model";
 import { requireAdmin } from "@/lib/auth/roles";
-import { obleth, type ApiKey, type AuditEntry, type KnowledgeCollection, type McpServer, type ModelRoute, type Tenant } from "@/lib/obleth";
+import { obleth, type AuditEntry, type KnowledgeCollection, type McpServer, type ModelRoute, type Tenant } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
 
 export const dynamic = "force-dynamic";
@@ -13,7 +13,7 @@ export default async function AuditPage({ searchParams }: { searchParams: Promis
     safe(obleth.auditQuery({ ...queryFor(filters), limit: AUDIT_PAGE }), [] as AuditEntry[]),
     safe(obleth.listModels(), [] as ModelRoute[]),
     safe(obleth.listTenants(), [] as Tenant[]),
-    safe(obleth.listKeys(), [] as ApiKey[]),
+    safe(obleth.listKeyFields(["id", "name", "key_prefix"] as const), []),
     safe(obleth.listMcpServers(), [] as McpServer[]),
     safe(obleth.listCollections(), [] as KnowledgeCollection[]),
   ]);

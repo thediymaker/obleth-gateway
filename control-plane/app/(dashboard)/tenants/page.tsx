@@ -2,7 +2,7 @@ import { TenantsList } from "@/components/access/tenants-list";
 import { countKeys } from "@/lib/access-model";
 import { requireAdmin } from "@/lib/auth/roles";
 import { listUsers, type AdminUser } from "@/lib/auth/users";
-import { obleth, type ApiKey, type BudgetUsage, type Tenant, type UsageAgg, type UsageDailyRow } from "@/lib/obleth";
+import { obleth, type BudgetUsage, type Tenant, type UsageAgg, type UsageDailyRow } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
 
 export const dynamic = "force-dynamic";
@@ -15,7 +15,7 @@ export default async function TenantsPage() {
   const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString().slice(0, 10);
   const [tenants, keys, users, usage24h, budgets, month] = await Promise.all([
     safe(obleth.listTenants(), [] as Tenant[]),
-    safe(obleth.listKeys(), [] as ApiKey[]),
+    safe(obleth.listKeyFields(["tenant_id", "disabled"] as const), []),
     safe(listUsers(), [] as AdminUser[]),
     safe(obleth.usage({ sinceMs: now.getTime() - DAY_MS }), [] as UsageAgg[]),
     safe(obleth.budgetUsage(), [] as BudgetUsage[]),

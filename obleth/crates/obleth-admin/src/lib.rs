@@ -1887,10 +1887,61 @@ pub struct ListKeysQuery {
     /// Continue after this key (the last id of the previous page).
     #[schema(value_type = Option<String>)]
     pub after: Option<Uuid>,
+    /// Only keys whose name, prefix, description or identity subject contains
+    /// this text, ignoring case.
+    pub q: Option<String>,
+    /// Only these fields of each key, comma-separated (`id,name,key_prefix,tenant_id`
+    /// for a picker). Without it, every field.
+    pub fields: Option<String>,
 }
 
 /// Most keys one page of `GET /keys` returns.
 const KEYS_PAGE_MAX: i64 = 1_000;
+
+/// The fields of an `ApiKey` a `GET /keys?fields=` projection may name.
+const KEY_FIELDS: &[&str] = &[
+    "id",
+    "tenant_id",
+    "name",
+    "description",
+    "key_prefix",
+    "kind",
+    "identity_issuer",
+    "identity_subject",
+    "identity_claims",
+    "budget_tokens",
+    "budget_cost_usd",
+    "budget_period",
+    "budget_started_at",
+    "weight",
+    "max_in_flight",
+    "disabled",
+    "tracing_enabled",
+    "end_user_fairshare",
+    "background",
+    "allowed_networks",
+    "allowed_countries",
+    "created_at",
+    "updated_at",
+];
+
+/// The fields a `fields=` list names, or a 400 naming the first unknown one.
+fn key_projection(fields: &str) -> Result<Vec<&str>> {
+    let names: Vec<&str> = fields
+        .split(',')
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+        .collect();
+    if names.is_empty() {
+        return Err(AdminError::BadRequest("fields names no field".into()));
+    }
+    if let Some(bad) = names.iter().find(|f| !KEY_FIELDS.contains(f)) {
+        return Err(AdminError::BadRequest(format!(
+            "fields: a key has no field {bad:?}"
+        )));
+    }
+    Ok(names)
+}
 
 #[derive(Debug, Deserialize, utoipa::IntoParams, ToSchema)]
 pub struct AuditQuery {
@@ -5227,10 +5278,11 @@ async fn get_budget_usage(
     Ok(Json(out))
 }
 
-/// API keys, oldest first. `tenant_id` and `ids` narrow the list. With
+/// API keys, oldest first. `tenant_id`, `ids` and `q` narrow the list. With
 /// `limit` it comes in pages: pass the last key's id as `after` for the next,
 /// and while more follow the response carries `x-obleth-truncated: true`.
-/// Without `limit`, every matching key in one array.
+/// Without `limit`, every matching key in one array. `fields` sends only the
+/// named fields of each key, for pickers that need names and prefixes.
 #[utoipa::path(
     get, path = "/api/v1/keys", tag = "keys",
     params(ListKeysQuery),
@@ -5244,7 +5296,8 @@ async fn get_budget_usage(
 async fn list_keys(
     State(state): State<AdminState>,
     Query(q): Query<ListKeysQuery>,
-) -> Result<(HeaderMap, Json<Vec<ApiKey>>)> {
+) -> Result<Response> {
+    let projection = q.fields.as_deref().map(key_projection).transpose()?;
     let limit = q.limit.map(|n| n.clamp(1, KEYS_PAGE_MAX));
     let mut keys = state
         .store
@@ -5257,13 +5310,35 @@ async fn list_keys(
             after: q.after,
             // One past the page, to tell whether more follow.
             limit: limit.map(|n| n + 1),
+            q: q.q,
         })
         .await?;
     let more = limit.is_some_and(|n| keys.len() > n as usize);
     if let Some(n) = limit {
         keys.truncate(n as usize);
     }
-    Ok((truncated_header(more), Json(keys)))
+    let headers = truncated_header(more);
+    let Some(fields) = projection else {
+        return Ok(axum::response::IntoResponse::into_response((
+            headers,
+            Json(keys),
+        )));
+    };
+    let projected = keys
+        .into_iter()
+        .map(|key| match serde_json::to_value(key) {
+            Ok(serde_json::Value::Object(mut all)) => Ok(fields
+                .iter()
+                .filter_map(|f| all.remove_entry(*f))
+                .collect::<serde_json::Map<_, _>>()),
+            Ok(_) => Err(AdminError::Internal("a key is not an object".into())),
+            Err(e) => Err(AdminError::Internal(e.to_string())),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(axum::response::IntoResponse::into_response((
+        headers,
+        Json(projected),
+    )))
 }
 
 /// One API key. The reserved control-plane key reads as missing.
@@ -13957,6 +14032,140 @@ mod tests {
             "the total ceiling is reported: {body}"
         );
         assert_eq!(body["default_model_max_in_flight"], serde_json::json!(32));
+    }
+
+    /// `GET /keys?q=` matches name, prefix, description and identity subject
+    /// ignoring case (its `%` and `_` literally) and pages like the full
+    /// list; `fields=` sends only the named fields, and refuses unknown ones.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn keys_search_and_project_fields() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let tenant = t
+            .store
+            .create_tenant(&format!("search-{}", Uuid::new_v4()), 100, 1000, None, None)
+            .await
+            .expect("tenant");
+        let mut ids = Vec::new();
+        for (name, description) in [
+            ("Lab Chatbot", ""),
+            ("batch-jobs", "nightly LAB runs"),
+            ("100%_done", ""),
+            ("other", ""),
+            ("lab-two", ""),
+        ] {
+            let (key, _) = t
+                .store
+                .create_api_key(
+                    tenant.id,
+                    name,
+                    description,
+                    None,
+                    None,
+                    None,
+                    None,
+                    100,
+                    None,
+                    &[],
+                    &[],
+                )
+                .await
+                .expect("key");
+            ids.push(key.id.to_string());
+        }
+        let get = |path: String| {
+            let app = t.app.clone();
+            async move {
+                let req = axum::http::Request::get(&path)
+                    .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                let res = tower::ServiceExt::oneshot(app, req)
+                    .await
+                    .expect("handler ran");
+                let status = res.status();
+                let more = res.headers().get("x-obleth-truncated").is_some();
+                let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let body: serde_json::Value =
+                    serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+                (status, more, body)
+            }
+        };
+        let id_list = |body: &serde_json::Value| -> Vec<String> {
+            body.as_array()
+                .unwrap()
+                .iter()
+                .map(|k| k["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let scope = format!("tenant_id={}", tenant.id);
+
+        // Name or description, any case, in creation order.
+        let (status, _, body) = get(format!("/api/v1/keys?{scope}&q=lab")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            id_list(&body),
+            [ids[0].clone(), ids[1].clone(), ids[4].clone()]
+        );
+        // `%` and `_` are text, not wildcards (every prefix has a `_`).
+        let (_, _, body) = get(format!("/api/v1/keys?{scope}&q=%25_")).await;
+        assert_eq!(id_list(&body), [ids[2].clone()]);
+        let (_, _, body) = get(format!("/api/v1/keys?{scope}&q=%25")).await;
+        assert_eq!(id_list(&body), [ids[2].clone()]);
+        // A blank search is no search.
+        let (_, _, body) = get(format!("/api/v1/keys?{scope}&q=%20")).await;
+        assert_eq!(id_list(&body).len(), 5);
+        // Searches page like the full list.
+        let (_, more, body) = get(format!("/api/v1/keys?{scope}&q=LAB&limit=2")).await;
+        assert_eq!(
+            (id_list(&body), more),
+            (vec![ids[0].clone(), ids[1].clone()], true)
+        );
+        let (_, more, body) = get(format!(
+            "/api/v1/keys?{scope}&q=LAB&limit=2&after={}",
+            ids[1]
+        ))
+        .await;
+        assert_eq!((id_list(&body), more), (vec![ids[4].clone()], false));
+
+        // Only the fields asked for, in every key.
+        let (status, _, body) = get(format!(
+            "/api/v1/keys?{scope}&fields=id,name,key_prefix,tenant_id"
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        for key in body.as_array().unwrap() {
+            let mut names: Vec<&str> = key
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            names.sort_unstable();
+            assert_eq!(names, ["id", "key_prefix", "name", "tenant_id"]);
+        }
+        assert_eq!(id_list(&body), ids);
+        let (status, _, body) = get(format!("/api/v1/keys?{scope}&fields=id,secret_hash")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let (status, _, _) = get(format!("/api/v1/keys?{scope}&fields=")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Every field a key has can be asked for.
+        let (_, _, body) = get(format!("/api/v1/keys?ids={}", ids[0])).await;
+        let mut all: Vec<&str> = body[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut known = KEY_FIELDS.to_vec();
+        all.sort_unstable();
+        known.sort_unstable();
+        assert_eq!(all, known);
     }
 
     /// `GET /keys` narrows by tenant and ids and pages with `limit` and

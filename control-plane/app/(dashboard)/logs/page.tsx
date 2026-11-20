@@ -2,7 +2,7 @@ import { requireAdmin } from "@/lib/auth/roles";
 import { RequestLogs } from "@/components/logs/request-logs";
 import { parseClasses, parseFault } from "@/lib/failure-classes";
 import { linkTime } from "@/lib/log-links";
-import { keyOptions, LOG_WINDOWS, tenantOptions, type LogFilters } from "@/lib/logs-model";
+import { KEY_OPTION_FIELDS, keyOptions, LOG_WINDOWS, tenantOptions, type LogFilters } from "@/lib/logs-model";
 import { obleth } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
 
@@ -19,7 +19,7 @@ export default async function LogsPage({ searchParams }: { searchParams: Promise
   const [tenants, models, keys] = await Promise.all([
     safe(obleth.listTenants(), []),
     safe(obleth.listModels(), []),
-    safe(obleth.listKeys(), []),
+    safe(obleth.listKeyFields(KEY_OPTION_FIELDS), []),
   ]);
   const teamOptions = tenantOptions(tenants);
   const keyChoices = keyOptions(keys);

@@ -24,7 +24,7 @@ export const GET = liveRoute(async (req) => {
       model: strParam(p, "model"),
     }),
     needTenant ? obleth.listTenants().catch(() => []) : Promise.resolve([]),
-    needKey ? obleth.listKeys().catch(() => []) : Promise.resolve([]),
+    needKey ? obleth.listKeyFields(["id", "name", "key_prefix"] as const).catch(() => []) : Promise.resolve([]),
   ]);
 
   const csv = buildUsageCsv(rows, columns, {

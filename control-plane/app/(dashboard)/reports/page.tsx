@@ -3,8 +3,8 @@ import { KeyAccessView } from "@/components/access/key-access-view";
 import { ReportsDashboard } from "@/components/reports/reports-dashboard";
 import { isKeyAccessRange, keyAccessRange, type KeyAccessRange } from "@/lib/key-access-model";
 import { KEY_REJECTION_ROWS, obleth } from "@/lib/obleth";
-import type { ApiKey, KeyRejectionAgg, KeySource, ModelRoute, Tenant } from "@/lib/obleth";
-import { keyOptions, tenantOptions } from "@/lib/logs-model";
+import type { KeyRejectionAgg, KeySource, ModelRoute, Tenant } from "@/lib/obleth";
+import { KEY_OPTION_FIELDS, keyOptions, tenantOptions } from "@/lib/logs-model";
 import { safe } from "@/lib/safe";
 
 export const dynamic = "force-dynamic";
@@ -17,7 +17,7 @@ export default async function ReportsPage({ searchParams }: { searchParams: Prom
   if (q.tab === "key-access") return <KeyAccessTab q={q} />;
   const [tenants, keys, models, retention] = await Promise.all([
     safe(obleth.listTenants(), [] as Tenant[]),
-    safe(obleth.listKeys(), [] as ApiKey[]),
+    safe(obleth.listKeyFields(KEY_OPTION_FIELDS), []),
     safe(obleth.listModels(), [] as ModelRoute[]),
     safe(obleth.getUsageRetention(), null),
   ]);

@@ -1063,6 +1063,8 @@ impl Store {
                and ($3::uuid is null or k.tenant_id <> $3)
                and ($4::uuid is null or (k.created_at, k.id) > (
                    select a.created_at, a.id from api_keys a where a.id = $4))
+               and ($6::text is null or k.name ilike $6 or k.key_prefix ilike $6
+                    or k.description ilike $6 or k.identity_subject ilike $6)
              order by k.created_at, k.id
              limit $5"
         ))
@@ -1071,6 +1073,12 @@ impl Store {
         .bind(f.exclude_tenant)
         .bind(f.after)
         .bind(f.limit)
+        .bind(
+            f.q.as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(contains_pattern),
+        )
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(api_key_from_row).collect()
@@ -1539,13 +1547,7 @@ impl Store {
             f.q.as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .map(|s| {
-                    let escaped = s
-                        .replace('\\', "\\\\")
-                        .replace('%', "\\%")
-                        .replace('_', "\\_");
-                    format!("%{escaped}%")
-                });
+                .map(contains_pattern);
         let rows = sqlx::query(
             "select id, ts, actor, action, entity_type, entity_id, detail
              from audit_log
@@ -4042,6 +4044,24 @@ pub struct KeyListFilter {
     pub after: Option<Uuid>,
     /// At most this many; all when `None`.
     pub limit: Option<i64>,
+    /// Only keys whose name, prefix, description or identity subject
+    /// contains this text, ignoring case.
+    pub q: Option<String>,
+}
+
+/// An `ilike` pattern matching text that contains `q`, its own `%`, `_` and
+/// `\` taken literally (backslash is `ilike`'s default escape).
+fn contains_pattern(q: &str) -> String {
+    let mut out = String::with_capacity(q.len() + 2);
+    out.push('%');
+    for c in q.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('%');
+    out
 }
 
 /// The columns `api_key_from_row` reads, from `api_keys` aliased `k`.

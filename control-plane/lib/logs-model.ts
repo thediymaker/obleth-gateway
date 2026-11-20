@@ -151,7 +151,10 @@ export function tenantOptions(tenants: Tenant[]): Named[] {
 }
 
 /** Keys as a filter picker needs them, by name (or prefix): never their settings. */
-export function keyOptions(keys: ApiKey[]): KeyOption[] {
+/** The key fields {@link keyOptions} reads, for `obleth.listKeyFields`. */
+export const KEY_OPTION_FIELDS = ["id", "name", "key_prefix", "tenant_id"] as const;
+
+export function keyOptions(keys: Pick<ApiKey, (typeof KEY_OPTION_FIELDS)[number]>[]): KeyOption[] {
   return keys
     .map((k) => ({ id: k.id, name: k.name, prefix: k.key_prefix, tenantId: k.tenant_id }))
     .sort((a, b) => (a.name || a.prefix).localeCompare(b.name || b.prefix));

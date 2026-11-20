@@ -45,4 +45,10 @@ describe("Management API paths", () => {
     expect(() => obleth.modelHealthDetail("..")).toThrow();
     expect(calls).toHaveLength(1);
   });
+
+  it("asks for only the key fields a picker needs", async () => {
+    await obleth.listKeyFields(["id", "name", "key_prefix", "tenant_id"]);
+    await obleth.listKeyFields(["tenant_id", "disabled"], "t1");
+    expect(calls).toEqual(["/api/v1/keys?fields=id%2Cname%2Ckey_prefix%2Ctenant_id", "/api/v1/keys?fields=tenant_id%2Cdisabled&tenant_id=t1"]);
+  });
 });

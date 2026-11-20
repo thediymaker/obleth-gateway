@@ -2736,6 +2736,13 @@ export const obleth = {
       headers: auditActorHeaders(options),
     }),
   listKeys: (tenantId?: string) => api<ApiKey[]>(`/keys${qs({ tenant_id: tenantId })}`),
+  /**
+   * Every key (or one tenant's) with only the named fields: what a picker or
+   * a count needs, without each key's settings. An older gateway ignores
+   * `fields` and sends whole keys, which still fit the type.
+   */
+  listKeyFields: <F extends keyof ApiKey>(fields: readonly F[], tenantId?: string) =>
+    api<Pick<ApiKey, F>[]>(`/keys${qs({ fields: fields.join(","), tenant_id: tenantId })}`),
   /** One key, or a 404 `OblethApiError`. */
   getKey: (id: string) => api<ApiKey>(`/keys/${encodeURIComponent(id)}`),
   /** The keys with these ids that exist, oldest first; 200 ids per call at most. */
