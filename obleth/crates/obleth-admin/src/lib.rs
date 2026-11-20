@@ -81,9 +81,12 @@ pub(crate) fn audit_actor(headers: &HeaderMap) -> String {
         .unwrap_or_else(|| "admin".to_string())
 }
 
-/// Serde helper for a patch field that tells "absent" (keep) from `null`
-/// (clear): use with `#[serde(default, deserialize_with = "nullable")]` on an
-/// `Option<Option<T>>`.
+/// Update bodies follow one rule: an omitted field keeps its stored value,
+/// and `null` clears a field that can be empty. A plain `Option<T>` with
+/// `#[serde(default)]` gives the first half; this helper gives both halves
+/// on an `Option<Option<T>>` with `#[serde(default, deserialize_with =
+/// "nullable")]` (and `#[schema(value_type = Option<T>)]`). An update body
+/// never fills an omitted field with a default of its own.
 fn nullable<'de, D, T>(d: D) -> std::result::Result<Option<Option<T>>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -692,40 +695,50 @@ pub struct CreateKey {
     pub allowed_countries: Vec<String>,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+/// Body of `PUT /api/v1/keys/{id}`. An omitted field keeps its stored value;
+/// `null` clears a cap, a budget or an allowlist.
+#[derive(Debug, Default, Deserialize, ToSchema)]
 pub struct UpdateKey {
-    pub name: String,
     #[serde(default)]
-    pub description: String,
+    pub name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
     /// Cumulative token ceiling for the current key term. `null` clears the cap.
-    #[serde(default)]
-    pub budget_tokens: Option<i64>,
+    #[serde(default, deserialize_with = "nullable")]
+    #[schema(value_type = Option<i64>)]
+    pub budget_tokens: Option<Option<i64>>,
     /// Cumulative USD-cost ceiling for the current key term. `null` clears the cap.
-    #[serde(default)]
-    pub budget_cost_usd: Option<f64>,
+    #[serde(default, deserialize_with = "nullable")]
+    #[schema(value_type = Option<f64>)]
+    pub budget_cost_usd: Option<Option<f64>>,
     /// Reset period: `lifetime`, `monthly`, or `term`. `null` = lifetime.
-    #[serde(default)]
-    pub budget_period: Option<String>,
+    #[serde(default, deserialize_with = "nullable")]
+    #[schema(value_type = Option<String>)]
+    pub budget_period: Option<Option<String>>,
     /// When the current key term began.
+    #[serde(default, deserialize_with = "nullable")]
+    #[schema(value_type = Option<chrono::DateTime<chrono::Utc>>)]
+    pub budget_started_at: Option<Option<chrono::DateTime<chrono::Utc>>>,
+    /// Fairshare weight among the tenant's keys, at least 1.
     #[serde(default)]
-    pub budget_started_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// Fairshare weight among the tenant's keys. Default 100, minimum 1.
-    #[serde(default = "obleth_config::default_key_weight")]
-    pub weight: i64,
+    pub weight: Option<i64>,
     /// Per-model in-flight ceiling for this key. `null` clears the cap.
-    #[serde(default)]
-    pub max_in_flight: Option<i64>,
+    #[serde(default, deserialize_with = "nullable")]
+    #[schema(value_type = Option<i64>)]
+    pub max_in_flight: Option<Option<i64>>,
     /// Networks the key may be used from (see `CreateKey::allowed_networks`).
-    /// Unlike the fields above, leaving it out (or sending `null`) keeps the
-    /// key's current list, so an edit that does not mention it never opens a
-    /// limited key to every network. Send `[]` to allow any network again.
-    #[serde(default)]
-    pub allowed_networks: Option<Vec<String>>,
+    /// Left out, the key keeps its list, so an edit that does not mention it
+    /// never opens a limited key to every network; `[]` or `null` allows any
+    /// network again.
+    #[serde(default, deserialize_with = "nullable")]
+    #[schema(value_type = Option<Vec<String>>)]
+    pub allowed_networks: Option<Option<Vec<String>>>,
     /// Countries the key may be used from (see
-    /// `CreateKey::allowed_countries`). Leaving it out (or sending `null`)
-    /// keeps the key's current list; send `[]` to clear it.
-    #[serde(default)]
-    pub allowed_countries: Option<Vec<String>>,
+    /// `CreateKey::allowed_countries`). Left out, the key keeps its list;
+    /// `[]` or `null` clears it.
+    #[serde(default, deserialize_with = "nullable")]
+    #[schema(value_type = Option<Vec<String>>)]
+    pub allowed_countries: Option<Option<Vec<String>>>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1250,7 +1263,10 @@ pub struct UpdateModel {
     pub cost_per_video: Option<f64>,
     pub context_window: Option<i64>,
     pub admission_weight: Option<i64>,
-    pub max_in_flight: Option<i64>,
+    /// The model-wide in-flight cap; `null` lifts it.
+    #[serde(default, deserialize_with = "nullable")]
+    #[schema(value_type = Option<i64>)]
+    pub max_in_flight: Option<Option<i64>>,
     /// `static`, `tuned` or `discovered`; omitted leaves it unchanged.
     #[serde(default)]
     pub capacity_mode: Option<String>,
@@ -1328,28 +1344,23 @@ pub struct SetModelCache {
     pub cache_ttl_secs: Option<i64>,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+/// Body of `PUT /api/v1/models/{id}/reliability`. An omitted field keeps
+/// its stored value.
+#[derive(Debug, Default, Deserialize, ToSchema)]
 pub struct SetModelReliability {
     /// Per-request upstream timeout in seconds. `null` defers to the global
     /// default.
+    #[serde(default, deserialize_with = "nullable")]
+    #[schema(value_type = Option<i64>)]
+    pub request_timeout_secs: Option<Option<i64>>,
     #[serde(default)]
-    pub request_timeout_secs: Option<i64>,
+    pub max_retries: Option<i64>,
     #[serde(default)]
-    pub max_retries: i64,
-    #[serde(default = "default_retry_backoff_ms_dto")]
-    pub retry_backoff_ms: i64,
-    #[serde(default = "default_selection_mode_dto")]
-    pub endpoint_selection_mode: String,
+    pub retry_backoff_ms: Option<i64>,
     #[serde(default)]
-    pub debug_diagnostics: bool,
-}
-
-fn default_retry_backoff_ms_dto() -> i64 {
-    obleth_config::DEFAULT_RETRY_BACKOFF_MS
-}
-
-fn default_selection_mode_dto() -> String {
-    obleth_config::DEFAULT_ENDPOINT_SELECTION_MODE.to_string()
+    pub endpoint_selection_mode: Option<String>,
+    #[serde(default)]
+    pub debug_diagnostics: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1371,20 +1382,25 @@ pub struct CreateModelEndpoint {
     pub max_in_flight: Option<i64>,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+/// Body of `PUT /api/v1/models/{id}/endpoints/{endpoint_id}`. An omitted
+/// field keeps its stored value; `null` clears the key or the cap.
+#[derive(Debug, Default, Deserialize, ToSchema)]
 pub struct UpdateModelEndpoint {
-    pub name: String,
-    pub api_base: String,
-    /// Omit to keep the stored key; empty string clears it.
     #[serde(default)]
-    pub api_key: Option<String>,
-    #[serde(default = "default_endpoint_priority")]
-    pub priority: i64,
-    #[serde(default = "default_endpoint_weight")]
-    pub weight: i64,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// Omitted keeps the stored value; `null` clears it.
+    pub name: Option<String>,
+    #[serde(default)]
+    pub api_base: Option<String>,
+    /// Write-only. `null` or an empty string clears the stored key.
+    #[serde(default, deserialize_with = "nullable")]
+    #[schema(value_type = Option<String>)]
+    pub api_key: Option<Option<String>>,
+    #[serde(default)]
+    pub priority: Option<i64>,
+    #[serde(default)]
+    pub weight: Option<i64>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// `null` lifts the endpoint's own cap.
     #[serde(default, deserialize_with = "nullable")]
     #[schema(value_type = Option<i64>)]
     pub max_in_flight: Option<Option<i64>>,
@@ -5203,36 +5219,58 @@ async fn update_key(
     headers: HeaderMap,
     Json(body): Json<UpdateKey>,
 ) -> Result<Json<ApiKey>> {
-    let name = body.name.trim().to_string();
+    let existing = state
+        .store
+        .keys_by_ids(&[id])
+        .await?
+        .into_iter()
+        .next()
+        .ok_or(obleth_store::StoreError::NotFound)?;
+    let name = body
+        .name
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or(&existing.name)
+        .to_string();
     if name.is_empty() {
         return Err(AdminError::BadRequest("key name is required".into()));
     }
-    if body.weight < 1 {
+    let weight = body.weight.unwrap_or(existing.weight);
+    if weight < 1 {
         return Err(AdminError::BadRequest("weight must be >= 1".into()));
     }
-    if matches!(body.max_in_flight, Some(c) if c < 1) {
+    let max_in_flight = body.max_in_flight.unwrap_or(existing.max_in_flight);
+    if matches!(max_in_flight, Some(c) if c < 1) {
         return Err(AdminError::BadRequest("max_in_flight must be >= 1".into()));
     }
-    let description = body.description.trim().to_string();
+    let description = body
+        .description
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or(&existing.description)
+        .to_string();
+    let budget_tokens = body.budget_tokens.unwrap_or(existing.budget_tokens);
+    let budget_cost_usd = body.budget_cost_usd.unwrap_or(existing.budget_cost_usd);
+    let budget_period = body
+        .budget_period
+        .unwrap_or_else(|| existing.budget_period.clone());
     let (period, started_at) = normalize_budget_fields(
-        body.budget_tokens,
-        body.budget_cost_usd,
-        body.budget_period.as_deref(),
-        body.budget_started_at,
+        budget_tokens,
+        budget_cost_usd,
+        budget_period.as_deref(),
+        body.budget_started_at.unwrap_or(existing.budget_started_at),
         "budget_tokens",
         "budget_cost_usd",
         "budget_period",
     )?;
     let allowed_networks = body
         .allowed_networks
-        .as_deref()
-        .map(obleth_config::network::normalize_allowed_networks)
+        .map(|list| obleth_config::network::normalize_allowed_networks(&list.unwrap_or_default()))
         .transpose()
         .map_err(AdminError::BadRequest)?;
     let allowed_countries = body
         .allowed_countries
-        .as_deref()
-        .map(obleth_config::network::normalize_allowed_countries)
+        .map(|list| obleth_config::network::normalize_allowed_countries(&list.unwrap_or_default()))
         .transpose()
         .map_err(AdminError::BadRequest)?;
     let (hash, key, resolved) = state
@@ -5241,12 +5279,12 @@ async fn update_key(
             id,
             &name,
             &description,
-            body.budget_tokens,
-            body.budget_cost_usd,
+            budget_tokens,
+            budget_cost_usd,
             period.as_deref(),
             started_at,
-            body.weight,
-            body.max_in_flight,
+            weight,
+            max_in_flight,
             allowed_networks.as_deref(),
             allowed_countries.as_deref(),
         )
@@ -8391,7 +8429,7 @@ async fn update_model(
                     cost_per_video: body.cost_per_video.unwrap_or(existing.cost_per_video),
                     context_window: body.context_window.unwrap_or(existing.context_window),
                     admission_weight: body.admission_weight.unwrap_or(existing.admission_weight),
-                    max_in_flight: body.max_in_flight.or(existing.max_in_flight),
+                    max_in_flight: body.max_in_flight.unwrap_or(existing.max_in_flight),
                     supports_function_calling: body
                         .supports_function_calling
                         .unwrap_or(existing.supports_function_calling),
@@ -9190,15 +9228,21 @@ async fn set_model_reliability(
     headers: HeaderMap,
     Json(body): Json<SetModelReliability>,
 ) -> Result<Json<ModelRouteView>> {
+    let existing = state.store.get_model(id).await?;
+    let selection_mode = match body.endpoint_selection_mode.as_deref() {
+        Some(mode) => validate_endpoint_selection_mode(mode)?,
+        None => existing.endpoint_selection_mode.clone(),
+    };
     let model = state
         .store
         .update_model_reliability(
             id,
-            body.request_timeout_secs,
-            body.max_retries,
-            body.retry_backoff_ms,
-            &validate_endpoint_selection_mode(&body.endpoint_selection_mode)?,
-            body.debug_diagnostics,
+            body.request_timeout_secs
+                .unwrap_or(existing.request_timeout_secs),
+            body.max_retries.unwrap_or(existing.max_retries),
+            body.retry_backoff_ms.unwrap_or(existing.retry_backoff_ms),
+            &selection_mode,
+            body.debug_diagnostics.unwrap_or(existing.debug_diagnostics),
         )
         .await?;
     sync_model(&state, &model).await?;
@@ -9310,34 +9354,35 @@ async fn update_model_endpoint(
     headers: HeaderMap,
     Json(body): Json<UpdateModelEndpoint>,
 ) -> Result<Json<ModelEndpointView>> {
-    state.ssrf.validate(&body.api_base).await?;
     let model = state.store.get_model(id).await?;
-    let max_in_flight = match body.max_in_flight {
-        Some(v) => v,
-        // Omitted keeps the stored value. An id outside this model finds
-        // nothing here and is refused by the scoped update below.
-        None => state
-            .store
-            .list_model_endpoints(model.id)
-            .await?
-            .into_iter()
-            .find(|e| e.id == endpoint_id)
-            .and_then(|e| e.max_in_flight),
-    };
+    // An id outside this model finds nothing here: a 404, like the scoped
+    // update below would give.
+    let existing = state
+        .store
+        .list_model_endpoints(model.id)
+        .await?
+        .into_iter()
+        .find(|e| e.id == endpoint_id)
+        .ok_or(obleth_store::StoreError::NotFound)?;
+    let api_base = body.api_base.unwrap_or(existing.api_base);
+    state.ssrf.validate(&api_base).await?;
+    let max_in_flight = body.max_in_flight.unwrap_or(existing.max_in_flight);
     validate_endpoint_max_in_flight(max_in_flight)?;
     validate_endpoint_write(&state, &model, Some(endpoint_id), max_in_flight).await?;
+    // The store keeps the secret on `None` and clears it on an empty string.
+    let api_key = body.api_key.map(Option::unwrap_or_default);
     let endpoint = state
         .store
         // Scoped to the path model: another model's endpoint id is a 404.
         .update_model_endpoint(
             model.id,
             endpoint_id,
-            &body.name,
-            &body.api_base,
-            body.api_key.as_deref(),
-            body.priority,
-            body.weight,
-            body.enabled,
+            body.name.as_deref().unwrap_or(&existing.name),
+            &api_base,
+            api_key.as_deref(),
+            body.priority.unwrap_or(existing.priority),
+            body.weight.unwrap_or(existing.weight),
+            body.enabled.unwrap_or(existing.enabled),
             max_in_flight,
         )
         .await?;
@@ -13037,8 +13082,207 @@ mod tests {
         assert_eq!(cleared["allowed_networks"], serde_json::json!([]));
     }
 
+    /// One rule for update bodies: an omitted field keeps the stored value,
+    /// `null` clears it, a value sets it. Checked on the bodies that used to
+    /// reset what they were not sent: keys, reliability, endpoints and the
+    /// model-wide cap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn update_bodies_keep_omitted_fields_and_clear_null_ones() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let put =
+            |path: String, body: serde_json::Value| send(&t.app, json_request("PUT", &path, body));
+
+        // -- keys ----------------------------------------------------------
+        let tenant = t
+            .store
+            .create_tenant(&format!("t-{}", Uuid::new_v4()), 100, 1000, None, None)
+            .await
+            .expect("create tenant");
+        let (status, created) = send(
+            &t.app,
+            json_request(
+                "POST",
+                &format!("/api/v1/tenants/{}/keys", tenant.id),
+                serde_json::json!({
+                    "name": "lab", "weight": 300, "max_in_flight": 4,
+                    "budget_tokens": 1000, "allowed_networks": ["192.0.2.0/24"]
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let key_id = created["key"]["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let key_path = format!("/api/v1/keys/{key_id}");
+        let (status, kept) = put(key_path.clone(), serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{kept}");
+        assert_eq!(
+            (
+                kept["name"].as_str(),
+                kept["weight"].as_i64(),
+                kept["max_in_flight"].as_i64(),
+                kept["budget_tokens"].as_i64()
+            ),
+            (Some("lab"), Some(300), Some(4), Some(1000)),
+            "an empty update keeps every field: {kept}"
+        );
+        assert_eq!(
+            kept["allowed_networks"],
+            serde_json::json!(["192.0.2.0/24"])
+        );
+        let (_, cleared) = put(
+            key_path.clone(),
+            serde_json::json!({ "max_in_flight": null, "budget_tokens": null, "description": "edited" }),
+        )
+        .await;
+        assert!(
+            cleared["max_in_flight"].is_null() && cleared["budget_tokens"].is_null(),
+            "{cleared}"
+        );
+        assert_eq!(
+            (cleared["weight"].as_i64(), cleared["description"].as_str()),
+            (Some(300), Some("edited"))
+        );
+        assert_eq!(
+            cleared["allowed_networks"],
+            serde_json::json!(["192.0.2.0/24"])
+        );
+        let (status, _) = put(key_path.clone(), serde_json::json!({ "weight": 0 })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = put(
+            format!("/api/v1/keys/{}", Uuid::new_v4()),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let _ = t.store.delete_tenant(tenant.id).await;
+
+        // -- reliability ---------------------------------------------------
+        let model = fixture_model(&t.store, &format!("m-{}", Uuid::new_v4()), 0.0).await;
+        let reliability = format!("/api/v1/models/{}/reliability", model.id);
+        let (status, set) = put(
+            reliability.clone(),
+            serde_json::json!({ "max_retries": 3, "request_timeout_secs": 30 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{set}");
+        let (_, kept) = put(
+            reliability.clone(),
+            serde_json::json!({ "debug_diagnostics": true }),
+        )
+        .await;
+        assert_eq!(
+            (
+                kept["max_retries"].as_i64(),
+                kept["request_timeout_secs"].as_i64(),
+                kept["debug_diagnostics"].as_bool()
+            ),
+            (Some(3), Some(30), Some(true)),
+            "{kept}"
+        );
+        let (_, cleared) = put(
+            reliability.clone(),
+            serde_json::json!({ "request_timeout_secs": null }),
+        )
+        .await;
+        assert!(cleared["request_timeout_secs"].is_null(), "{cleared}");
+        assert_eq!(cleared["max_retries"].as_i64(), Some(3));
+
+        // -- endpoints -----------------------------------------------------
+        let endpoints = format!("/api/v1/models/{}/endpoints", model.id);
+        let (status, endpoint) = send(
+            &t.app,
+            json_request(
+                "POST",
+                &endpoints,
+                serde_json::json!({
+                    "name": "a", "api_base": "http://127.0.0.1:1/v1", "api_key": "k",
+                    "priority": 5, "weight": 7, "enabled": false, "max_in_flight": 3
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{endpoint}");
+        let endpoint_path = format!(
+            "{endpoints}/{}",
+            endpoint["id"].as_str().unwrap_or_default()
+        );
+        let (status, kept) = put(endpoint_path.clone(), serde_json::json!({ "name": "b" })).await;
+        assert_eq!(status, StatusCode::OK, "{kept}");
+        assert_eq!(
+            (
+                kept["name"].as_str(),
+                kept["priority"].as_i64(),
+                kept["weight"].as_i64(),
+                kept["enabled"].as_bool(),
+                kept["max_in_flight"].as_i64(),
+                kept["api_key_set"].as_bool()
+            ),
+            (
+                Some("b"),
+                Some(5),
+                Some(7),
+                Some(false),
+                Some(3),
+                Some(true)
+            ),
+            "{kept}"
+        );
+        let (_, cleared) = put(
+            endpoint_path.clone(),
+            serde_json::json!({ "max_in_flight": null, "api_key": null, "enabled": true }),
+        )
+        .await;
+        assert!(cleared["max_in_flight"].is_null(), "{cleared}");
+        assert_eq!(
+            (
+                cleared["enabled"].as_bool(),
+                cleared["api_key_set"].as_bool(),
+                cleared["weight"].as_i64()
+            ),
+            (Some(true), Some(false), Some(7))
+        );
+        let (status, _) = put(
+            format!("{endpoints}/{}", Uuid::new_v4()),
+            serde_json::json!({ "name": "c" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // -- the model-wide cap --------------------------------------------
+        let model_path = format!("/api/v1/models/{}", model.id);
+        let base = serde_json::json!({ "upstream_model": model.upstream_model, "api_base": "http://127.0.0.1:1/v1" });
+        let with = |extra: serde_json::Value| {
+            let mut body = base.clone();
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            body
+        };
+        let (status, set) = put(
+            model_path.clone(),
+            with(serde_json::json!({ "max_in_flight": 9 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{set}");
+        let (_, kept) = put(model_path.clone(), base.clone()).await;
+        assert_eq!(kept["max_in_flight"].as_i64(), Some(9), "{kept}");
+        let (_, lifted) = put(
+            model_path.clone(),
+            with(serde_json::json!({ "max_in_flight": null })),
+        )
+        .await;
+        assert!(lifted["max_in_flight"].is_null(), "{lifted}");
+        let _ = t.store.delete_model(model.id).await;
+    }
+
     /// Omitting `allowed_countries` from an update keeps the key's list;
-    /// `[]` clears it. On create it defaults to none.
+    /// `[]` or `null` clears it. On create it defaults to none.
     #[test]
     fn allowed_countries_are_optional_on_create_and_update() {
         let create: CreateKey =
@@ -13049,7 +13293,10 @@ mod tests {
         let clear: UpdateKey =
             serde_json::from_value(serde_json::json!({ "name": "lab", "allowed_countries": [] }))
                 .unwrap();
-        assert_eq!(clear.allowed_countries, Some(Vec::new()));
+        assert_eq!(clear.allowed_countries, Some(Some(Vec::new())));
+        let null: UpdateKey =
+            serde_json::from_value(serde_json::json!({ "allowed_countries": null })).unwrap();
+        assert_eq!(null.allowed_countries, Some(None));
     }
 
     /// Allowed countries are validated and normalised on create and update,

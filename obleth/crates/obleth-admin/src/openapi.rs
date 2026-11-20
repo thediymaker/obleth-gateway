@@ -49,7 +49,7 @@ use obleth_config::{
 #[openapi(
     info(
         title = "obleth Management API",
-        description = "Programmatic control plane: tenants, keys, models, usage, fairshare, and settings."
+        description = "Programmatic control plane: tenants, keys, models, usage, fairshare, and settings. Update bodies follow one rule: an omitted field keeps its stored value, and null clears a field that can be empty."
     ),
     paths(
         // meta
