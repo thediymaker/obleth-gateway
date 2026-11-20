@@ -16,7 +16,11 @@ use crate::classifier::Classifier;
 use crate::metrics::Metrics;
 use crate::router::ModelRegistry;
 
-/// All handles needed on the request hot path. Cheap to clone.
+/// All handles needed on the request hot path. Every field is a handle (an
+/// `Arc`, a moka cache, a connection manager, a channel sender) or a small
+/// value, so a clone copies the struct and bumps a few dozen reference
+/// counts: around a microsecond, done a few times per request (per spawned
+/// task). Not free; keep it out of per-chunk and per-item loops.
 #[derive(Clone)]
 pub struct AppState {
     pub redis: RedisStore,
