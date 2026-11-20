@@ -1964,6 +1964,10 @@ export interface BoonSettingsView {
   speculation_category_gates: SpeculationCategoryGate[];
   speculation_unlisted_categories_speculate: boolean;
   speculation_verify_url_template: string;
+  /** Per-call bound on a verifier call, in milliseconds. */
+  speculation_verify_timeout_ms: number;
+  /** Largest verifier reply read, in bytes. */
+  speculation_verify_reply_max_bytes: number;
   web_search_enabled: boolean;
   web_search_tool: string | null;
   web_search_tool_description: string;
@@ -2034,6 +2038,8 @@ export interface UpdateBoonSettings {
   speculation_category_gates?: SpeculationCategoryGate[];
   speculation_unlisted_categories_speculate?: boolean;
   speculation_verify_url_template?: string;
+  speculation_verify_timeout_ms?: number;
+  speculation_verify_reply_max_bytes?: number;
   web_search_enabled?: boolean;
   web_search_tool?: string | null;
   web_search_tool_description?: string;

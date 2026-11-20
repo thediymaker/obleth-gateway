@@ -2470,7 +2470,10 @@ async fn run_pipeline(
     // settled exactly once, through `term_reconcile` at settlement or
     // `release_term_hold` on a rejection between the two scopes.
     let est_cost = estimated_cost(est, in_cost_rate, out_cost_rate, modality_cost);
-    let reserved = match reserve_budget(&state, &resolved, &model, est, est_cost).await {
+    // Boxed: the reservation's state would otherwise sit inline in this
+    // function's already large future, which a 2 MB worker stack cannot hold
+    // in debug builds.
+    let reserved = match Box::pin(reserve_budget(&state, &resolved, &model, est, est_cost)).await {
         Ok(reserved) => reserved,
         Err(refusal) => {
             drop(permit);

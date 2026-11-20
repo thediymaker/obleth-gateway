@@ -3567,6 +3567,10 @@ pub struct BoonSettingsView {
     pub speculation_category_gates: serde_json::Value,
     pub speculation_unlisted_categories_speculate: bool,
     pub speculation_verify_url_template: String,
+    /// Per-call bound on a verifier call, in milliseconds.
+    pub speculation_verify_timeout_ms: u64,
+    /// Largest verifier reply read, in bytes.
+    pub speculation_verify_reply_max_bytes: usize,
     pub web_search_enabled: bool,
     pub web_search_tool: Option<String>,
     pub web_search_tool_description: String,
@@ -3631,6 +3635,8 @@ impl BoonSettingsView {
                 .unwrap_or_else(|_| serde_json::Value::Array(Vec::new())),
             speculation_unlisted_categories_speculate: s.speculation.unlisted_categories_speculate,
             speculation_verify_url_template: s.speculation.verify_url_template.clone(),
+            speculation_verify_timeout_ms: s.speculation.verify_timeout_ms,
+            speculation_verify_reply_max_bytes: s.speculation.verify_reply_max_bytes,
             web_search_enabled: s.web_search.enabled,
             web_search_tool: s.web_search.search_tool.clone(),
             web_search_tool_description: s.web_search.tool_description.clone(),
@@ -3802,6 +3808,13 @@ pub struct UpdateBoonSettings {
     /// placeholders). Empty string clears; omitted keeps the current value.
     #[serde(default)]
     pub speculation_verify_url_template: Option<String>,
+    /// Per-call bound on a verifier call (tokenize, score), in milliseconds;
+    /// after the commit it is what ends a stalled scorer. Omit to leave unchanged.
+    #[serde(default)]
+    pub speculation_verify_timeout_ms: Option<u64>,
+    /// Largest verifier reply read, in bytes. Omit to leave unchanged.
+    #[serde(default)]
+    pub speculation_verify_reply_max_bytes: Option<usize>,
     /// Enable or disable the web-search boon globally. Omit to leave unchanged.
     #[serde(default)]
     pub web_search_enabled: Option<bool>,
@@ -4223,6 +4236,12 @@ async fn put_boon_settings(
                 .speculation_verify_url_template
                 .map(|t| t.trim().to_string())
                 .unwrap_or_else(|| existing.speculation.verify_url_template.clone()),
+            verify_timeout_ms: body
+                .speculation_verify_timeout_ms
+                .unwrap_or(existing.speculation.verify_timeout_ms),
+            verify_reply_max_bytes: body
+                .speculation_verify_reply_max_bytes
+                .unwrap_or(existing.speculation.verify_reply_max_bytes),
         },
         web_search: obleth_config::WebSearchBoonSettings {
             enabled: body

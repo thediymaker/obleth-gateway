@@ -3118,6 +3118,23 @@ pub struct SpeculationBoonSettings {
     /// own endpoint cannot speculate.
     #[serde(default)]
     pub verify_url_template: String,
+    /// Per-call bound on a verifier call (tokenize, score), in milliseconds.
+    /// Before anything is released the pre-release budget also applies; after
+    /// the commit this is what ends a stalled scorer, so the committed stream
+    /// ends instead of going silent.
+    #[serde(default = "default_spec_verify_timeout_ms")]
+    pub verify_timeout_ms: u64,
+    /// Largest verifier reply read, in bytes. A `prompt_logprobs` answer runs
+    /// to a few hundred bytes per prompt token, so a long prompt is megabytes.
+    #[serde(default = "default_spec_verify_reply_max_bytes")]
+    pub verify_reply_max_bytes: usize,
+}
+
+fn default_spec_verify_timeout_ms() -> u64 {
+    30_000
+}
+fn default_spec_verify_reply_max_bytes() -> usize {
+    64 * 1024 * 1024
 }
 
 fn default_spec_unlisted_speculate() -> bool {
@@ -3166,6 +3183,8 @@ impl Default for SpeculationBoonSettings {
             category_gates: Vec::new(),
             unlisted_categories_speculate: default_spec_unlisted_speculate(),
             verify_url_template: String::new(),
+            verify_timeout_ms: default_spec_verify_timeout_ms(),
+            verify_reply_max_bytes: default_spec_verify_reply_max_bytes(),
         }
     }
 }

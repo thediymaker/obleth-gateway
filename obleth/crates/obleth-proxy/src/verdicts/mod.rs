@@ -1090,7 +1090,11 @@ async fn handler_inner(
     // Reserve-then-reconcile, through the pipeline's own helper: an admitted
     // request holds its estimate against each term cap until settlement.
     let est_cost = proxy::estimated_cost(est, in_cost_rate, out_cost_rate, 0.0);
-    let reserved = match proxy::reserve_budget(&state, &resolved, &model, est, est_cost).await {
+    let reserved = match Box::pin(proxy::reserve_budget(
+        &state, &resolved, &model, est, est_cost,
+    ))
+    .await
+    {
         Ok(reserved) => reserved,
         Err(refusal) => {
             drop(permit);
@@ -2030,9 +2034,10 @@ mod settlement_tests {
         let h = handler();
         assert!(!h.contains("reserve_budget_with_term("), "check-only gate");
         assert!(!h.contains("settle_request("), "unguarded settlement");
-        // The reservation is the pipeline's own, so the two cannot drift.
+        // The reservation is the pipeline's own, so the two cannot drift. (The
+        // call is boxed and may carry rustfmt's trailing comma.)
         let reserve = h
-            .find("proxy::reserve_budget(&state,&resolved,&model,est,est_cost)")
+            .find("proxy::reserve_budget(&state,&resolved,&model,est,est_cost")
             .expect("shared reserve");
         let guard = h
             .find("letmutsettle_guard=accounting.unbilled_guard();")

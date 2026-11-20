@@ -227,11 +227,17 @@ export function BoonsSection({ settings: b, models, knowledge, compressor }: { s
           <Switch name="boons.speculation_unlisted" label="Draft for categories not listed" checked={spec.unlisted} onChange={(unlisted) => setSpec((x) => ({ ...x, unlisted }))}>Try a draft for categories not listed</Switch>
         </Setting>
         <Setting label="Advanced" hint="Where the model scores a draft, the bars to ship or give up, pacing, and extra template arguments for the drafter.">
-          <button type="button" onClick={() => setSpecAdvanced((v) => !v)} className="self-start text-[12.5px] text-secondary-foreground underline underline-offset-[3px] hover:text-foreground">{specAdvanced ? "Hide" : "Show"} 12 more settings</button>
+          <button type="button" onClick={() => setSpecAdvanced((v) => !v)} className="self-start text-[12.5px] text-secondary-foreground underline underline-offset-[3px] hover:text-foreground">{specAdvanced ? "Hide" : "Show"} 14 more settings</button>
         </Setting>
         <div className={cn(!specAdvanced && "hidden")}>
           <Setting label="Scoring endpoint" hint="URL template for the model's own scoring call; {upstream} is its upstream name. Endpoints that don't support prompt log-probabilities fail." fields={["boons.speculation_verify_url_template"]}>
             <TextField name="boons.speculation_verify_url_template" label="Scoring endpoint" defaultValue={b.speculation_verify_url_template ?? ""} mono />
+          </Setting>
+          <Setting label="Scoring call" hint="How long one scoring call may take (after a draft is committed, this is what ends a stalled scorer) and the largest scoring reply read; a long prompt's log-probabilities run to megabytes." fields={["boons.speculation_verify_timeout_ms", "boons.speculation_verify_reply_max_bytes"]}>
+            <div className="flex flex-wrap gap-3">
+              <NumberField name="speculation_verify_timeout_ms" label="Scoring timeout" value={b.speculation_verify_timeout_ms} unit="ms" />
+              <NumberField name="speculation_verify_reply_max_bytes" label="Largest reply" value={b.speculation_verify_reply_max_bytes} unit="bytes" className="w-32" />
+            </div>
           </Setting>
           <Setting label="Ship when" hint="Agreement (0 to 1) and confidence (log-probability, below 0) a draft needs." fields={["boons.speculation_agree_min", "boons.speculation_lp_min"]}>
             <div className="flex flex-wrap gap-3"><SpecNumber k="agree_min" label="Agreement to ship" spec={spec} setSpec={setSpec} /><SpecNumber k="lp_min" label="Confidence to ship" spec={spec} setSpec={setSpec} /></div>

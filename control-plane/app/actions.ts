@@ -1973,6 +1973,7 @@ const BOON_NUMBERS = [
   "web_search_max_results", "web_search_max_searches_per_request", "web_search_timeout_ms",
   "speculation_agree_min", "speculation_lp_min", "speculation_abort_agree", "speculation_abort_lp", "speculation_first_chunk_tokens",
   "speculation_chunk_tokens", "speculation_decide_by_tokens", "speculation_max_draft_tokens", "speculation_pace_ms", "speculation_timeout_ms",
+  "speculation_verify_timeout_ms", "speculation_verify_reply_max_bytes",
   "compression_min_tokens", "compression_max_segments", "compression_max_lossy_segments", "compression_original_ttl_secs", "compression_neural_keep_ratio",
 ] as const;
 /** Model pickers: blank means none. */
