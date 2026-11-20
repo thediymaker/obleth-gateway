@@ -23,12 +23,12 @@ pub(super) fn extract(text: &str) -> Option<String> {
     let mut out = String::with_capacity(text.len());
     let mut last = 0usize;
     let mut changed = false;
-    for (start, end) in spans {
+    for (start, end, value) in spans {
         if start < last {
             continue; // overlap guard
         }
         let original = &text[start..end];
-        if let Some(compacted) = structural_json::compact(original) {
+        if let Some(compacted) = structural_json::compact_value(original, &value) {
             if compacted.len() < original.len() {
                 out.push_str(&text[last..start]);
                 out.push_str(&compacted);
@@ -45,8 +45,8 @@ pub(super) fn extract(text: &str) -> Option<String> {
 }
 
 /// Byte spans of balanced `{...}`/`[...]` that parse as JSON containing at least
-/// one qualifying table array.
-fn find_spans(text: &str) -> Vec<(usize, usize)> {
+/// one qualifying table array, each with its parsed value.
+fn find_spans(text: &str) -> Vec<(usize, usize, Value)> {
     let bytes = text.as_bytes();
     let mut spans = Vec::new();
     let mut i = 0usize;
@@ -60,9 +60,9 @@ fn find_spans(text: &str) -> Vec<(usize, usize)> {
                 break;
             }
             if let Some(end) = match_balanced(bytes, i, &mut budget) {
-                if let Ok(v) = serde_json::from_str::<Value>(&text[i..end]) {
+                if let Some(v) = structural_json::parse(&text[i..end]) {
                     if contains_qualifying_array(&v) {
-                        spans.push((i, end));
+                        spans.push((i, end, v));
                         i = end;
                         continue;
                     }

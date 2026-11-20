@@ -1075,3 +1075,64 @@ fn dedup_leaves_unique_content_untouched() {
         "unique content must be byte-identical after dedup"
     );
 }
+
+/// Every lossless output over the corpus and a fuzzed set, digested. The
+/// compacted text feeds upstream prompt caches, so a speed-up that changes a
+/// single byte of it is a regression: this digest was recorded before the
+/// parse-once rewrite (P2-14) and must not move without a deliberate reason.
+#[test]
+fn lossless_output_is_byte_identical_to_the_recorded_digest() {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    let mut run_one = |content: &str, cfg: &CompressionBoonSettings, code: bool| {
+        let mut body = json!({"messages": [
+            {"role": "user", "content": content},
+            {"role": "user", "content": [{"type": "text", "text": content}]},
+        ]});
+        let stats = compression::apply(cfg, code, &mut body);
+        h.update(body.to_string().as_bytes());
+        h.update(
+            format!(
+                "|{} {} {} {}|",
+                stats.scanned, stats.compressed, stats.tokens_before, stats.tokens_after
+            )
+            .as_bytes(),
+        );
+    };
+    for fix in corpus() {
+        for cfg in [prod_cfg(), aggressive_cfg()] {
+            for code in [false, true] {
+                run_one(&fix.content, &cfg, code);
+            }
+        }
+    }
+    for c in [
+        code_messy(),
+        code_clean(),
+        repetitive_log(),
+        prose_thread(),
+        big_doc(),
+    ] {
+        run_one(&c, &aggressive_cfg(), true);
+    }
+    let cfg = aggressive_cfg();
+    for seed in 1..=400u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let v = gen_root(&mut rng);
+        let compact = serde_json::to_string(&v).unwrap();
+        let pretty = serde_json::to_string_pretty(&v).unwrap();
+        run_one(&compact, &cfg, false);
+        run_one(&pretty, &cfg, seed % 2 == 0);
+        run_one(
+            &format!("Here it is: {pretty} and {compact}, thanks."),
+            &cfg,
+            false,
+        );
+        run_one(&format!("```json\n{pretty}\n```"), &cfg, true);
+    }
+    let digest = hex::encode(h.finalize());
+    assert_eq!(
+        digest,
+        "58f36af8778eea1bceea7e00a8ae16c728fe86623469a1dda08ef33ba83e16d7"
+    );
+}

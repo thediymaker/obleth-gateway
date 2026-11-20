@@ -6,15 +6,31 @@
 //! strictly shorter; otherwise falls back to lossless minify. Fail-open.
 
 use serde_json::{Map, Value};
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 
+/// Parse a segment's text as JSON. On the lossless path this is the only parse
+/// of a segment (or of an embedded span): the `Value` is passed down from here,
+/// and only the deliberate round-trip checks of the compacted text parse again.
+pub(super) fn parse(text: &str) -> Option<Value> {
+    #[cfg(test)]
+    PARSES.with(|n| n.set(n.get() + 1));
+    serde_json::from_str(text.trim()).ok()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Calls to [`parse`] on this thread, so tests can count them.
+    pub(super) static PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// RFC-4180 field escape: quote the field iff it contains a comma, quote, CR, or
-/// LF; double any inner quotes.
-fn csv_escape(field: &str) -> String {
+/// LF; double any inner quotes. Borrows a field that needs neither.
+fn csv_escape(field: &str) -> Cow<'_, str> {
     if field.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"", field.replace('"', "\"\""))
+        Cow::Owned(format!("\"{}\"", field.replace('"', "\"\"")))
     } else {
-        field.to_string()
+        Cow::Borrowed(field)
     }
 }
 
@@ -52,11 +68,11 @@ fn csv_parse_line(line: &str) -> Vec<String> {
 const TABLE_MARKER: &str = "OBLETH_TABLE rows=";
 const BLOCK_PREFIX: &str = "<<OBLETH_TABLE:";
 
-/// Encode an array of >=2 non-empty objects as `header\nrow\nrow...` using the
-/// UNION of keys (sorted). A key absent from an object yields an empty cell; a
-/// present value (including JSON null) yields its compact JSON, CSV-escaped.
-/// Returns `(row_count, body)` or `None` when the array doesn't qualify.
-fn encode_table_body(arr: &[Value]) -> Option<(usize, String)> {
+/// The columns of `arr` as a table: the union of its objects' keys, sorted.
+/// `None` when it does not qualify: fewer than two objects, an empty object or
+/// a non-object, a key with a newline, or a table that could not be shorter.
+/// This is the cheap half of [`encode_table_body`]: it writes nothing.
+fn table_columns(arr: &[Value]) -> Option<Vec<&str>> {
     if arr.len() < 2 {
         return None;
     }
@@ -87,20 +103,39 @@ fn encode_table_body(arr: &[Value]) -> Option<(usize, String)> {
     if cells > key_bytes + 4 * pairs + 2 * arr.len() {
         return None;
     }
+    Some(cols)
+}
+
+/// Encode an array of >=2 non-empty objects as `header\nrow\nrow...` using the
+/// UNION of keys (sorted). A key absent from an object yields an empty cell; a
+/// present value (including JSON null) yields its compact JSON, CSV-escaped.
+/// Returns `(row_count, body)` or `None` when the array doesn't qualify.
+fn encode_table_body(arr: &[Value]) -> Option<(usize, String)> {
+    let cols = table_columns(arr)?;
     let mut out = String::new();
-    let header: Vec<String> = cols.iter().map(|k| csv_escape(k)).collect();
-    out.push_str(&header.join(","));
+    for (i, k) in cols.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&csv_escape(k));
+    }
     out.push('\n');
+    // Each cell's JSON is written into one reused buffer, then escaped into
+    // the table, rather than allocated per cell and again per row.
+    let mut cell: Vec<u8> = Vec::new();
     for item in arr {
-        let obj = item.as_object().expect("checked above");
-        let row: Vec<String> = cols
-            .iter()
-            .map(|k| match obj.get(*k) {
-                Some(v) => csv_escape(&serde_json::to_string(v).unwrap_or_default()),
-                None => String::new(), // absent key -> empty cell
-            })
-            .collect();
-        out.push_str(&row.join(","));
+        let obj = item.as_object().expect("checked by table_columns");
+        for (i, k) in cols.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            // An absent key is an empty cell.
+            if let Some(v) = obj.get(*k) {
+                cell.clear();
+                serde_json::to_writer(&mut cell, v).ok()?;
+                out.push_str(&csv_escape(std::str::from_utf8(&cell).ok()?));
+            }
+        }
         out.push('\n');
     }
     Some((arr.len(), out))
@@ -139,14 +174,14 @@ fn parse_table_body(body: &str, n: usize) -> Option<Vec<Value>> {
     Some(rows)
 }
 
-/// Whether `arr` qualifies as a table (>=2 non-empty objects, encodable).
+/// Whether `arr` qualifies as a table (>=2 non-empty objects, encodable),
+/// without encoding it.
 pub(super) fn is_qualifying_array(arr: &[Value]) -> bool {
-    encode_table_body(arr).is_some()
+    table_columns(arr).is_some()
 }
 
 /// Encode an array as the top-level table form (`OBLETH_TABLE rows=N` + body).
-fn try_encode_table(value: &Value) -> Option<String> {
-    let arr = value.as_array()?;
+fn try_encode_table(arr: &[Value]) -> Option<String> {
     let (n, body) = encode_table_body(arr)?;
     let mut out = String::with_capacity(body.len() + TABLE_MARKER.len() + 8);
     out.push_str(TABLE_MARKER);
@@ -182,9 +217,9 @@ fn collect_tables(value: &mut Value, blocks: &mut Vec<(usize, String)>) {
 
 /// Compact a JSON segment whose qualifying arrays are nested (not the whole
 /// segment), by emitting a valid-JSON skeleton with `<<OBLETH_TABLE:N>>`
-/// placeholders followed by the appended table blocks.
-pub(super) fn compact_recursive(text: &str) -> Option<String> {
-    let original: Value = serde_json::from_str(text.trim()).ok()?;
+/// placeholders followed by the appended table blocks. `original` is `text`
+/// parsed.
+fn compact_recursive(text: &str, original: &Value) -> Option<String> {
     let mut skeleton = original.clone();
     let mut blocks: Vec<(usize, String)> = Vec::new();
     collect_tables(&mut skeleton, &mut blocks);
@@ -202,7 +237,7 @@ pub(super) fn compact_recursive(text: &str) -> Option<String> {
     if out.len() >= text.len() {
         return None;
     }
-    if reconstruct_blocks(&out).as_ref() != Some(&original) {
+    if reconstruct_blocks(&out).as_ref() != Some(original) {
         return None;
     }
     Some(out)
@@ -289,20 +324,24 @@ fn splice_placeholders(value: &mut Value, tables: &[Vec<Value>]) -> Option<()> {
 /// Compact a JSON text segment. Top-level qualifying arrays keep their exact
 /// current `OBLETH_TABLE` form; otherwise nested/wrapped/multiple arrays use the
 /// skeleton+blocks form; otherwise lossless minify; otherwise `None`.
+#[cfg(test)]
 pub(super) fn compact(text: &str) -> Option<String> {
-    if let Ok(value) = serde_json::from_str::<Value>(text.trim()) {
-        if value.is_array() {
-            if let Some(table) = try_encode_table(&value) {
-                if table.len() < text.len() && reconstruct_table(&table).as_ref() == Some(&value) {
-                    return Some(table);
-                }
+    compact_value(text, &parse(text)?)
+}
+
+/// [`compact`] of `text`, already parsed as `value`.
+pub(super) fn compact_value(text: &str, value: &Value) -> Option<String> {
+    if let Some(arr) = value.as_array() {
+        if let Some(table) = try_encode_table(arr) {
+            if table.len() < text.len() && reconstruct_table(&table).as_ref() == Some(value) {
+                return Some(table);
             }
         }
-        if let Some(rec) = compact_recursive(text) {
-            return Some(rec);
-        }
     }
-    super::compression::compact_json(text)
+    if let Some(rec) = compact_recursive(text, value) {
+        return Some(rec);
+    }
+    super::compression::compact_json(text, value)
 }
 
 /// Reconstruct the JSON array from the top-level table form.
@@ -385,7 +424,7 @@ mod tests {
             {"id": 2, "name": "bob", "active": false},
             {"id": 3, "name": "c,d", "active": true}
         ]);
-        let table = try_encode_table(&value).expect("should encode");
+        let table = try_encode_table(value.as_array().unwrap()).expect("should encode");
         // Header line names the columns; marker carries the row count.
         assert!(table.starts_with("OBLETH_TABLE rows=3\n"));
         // Columns are sorted (BTreeMap order), so active,id,name
@@ -400,14 +439,15 @@ mod tests {
             {"k": {"x": 1, "y": 2}, "n": null},
             {"k": {"x": 3, "y": 4}, "n": 5}
         ]);
-        let table = try_encode_table(&value).expect("encode");
+        let table = try_encode_table(value.as_array().unwrap()).expect("encode");
         assert_eq!(reconstruct_table(&table), Some(value));
     }
 
     #[test]
     fn encode_supports_non_uniform_keys() {
         let value = json!([{"a": 1}, {"b": 2}]);
-        let table = try_encode_table(&value).expect("now encodes via union keys");
+        let table =
+            try_encode_table(value.as_array().unwrap()).expect("now encodes via union keys");
         assert_eq!(reconstruct_table(&table), Some(value));
     }
 
@@ -482,9 +522,11 @@ mod tests {
 
     #[test]
     fn encode_rejects_non_object_array_and_singletons() {
-        assert_eq!(try_encode_table(&json!([1, 2, 3])), None);
-        assert_eq!(try_encode_table(&json!([{"a": 1}])), None); // <2 rows
-        assert_eq!(try_encode_table(&json!({"a": 1})), None); // not an array
+        assert_eq!(try_encode_table(json!([1, 2, 3]).as_array().unwrap()), None);
+        assert_eq!(
+            try_encode_table(json!([{"a": 1}]).as_array().unwrap()),
+            None
+        ); // <2 rows
     }
 
     #[test]
@@ -525,7 +567,7 @@ mod tests {
             .collect();
         let value = json!({"results": rows, "meta": {"total": 50}});
         let text = serde_json::to_string(&value).unwrap();
-        let out = compact_recursive(&text).expect("wrapped array compacts");
+        let out = compact_recursive(&text, &parse(&text).unwrap()).expect("wrapped array compacts");
         assert!(out.len() < text.len());
         // Skeleton holds a placeholder; a block carries the rows.
         assert!(out.contains("\"<<OBLETH_TABLE:0>>\""), "out: {out}");
@@ -542,7 +584,7 @@ mod tests {
             .collect();
         let value = json!({"first": a, "second": b});
         let text = serde_json::to_string(&value).unwrap();
-        let out = compact_recursive(&text).expect("two arrays compact");
+        let out = compact_recursive(&text, &parse(&text).unwrap()).expect("two arrays compact");
         assert!(out.contains("<<OBLETH_TABLE:0 rows=20>>"));
         assert!(out.contains("<<OBLETH_TABLE:1 rows=20>>"));
         assert_eq!(reconstruct_blocks(&out), Some(value));
@@ -556,7 +598,7 @@ mod tests {
         let text = serde_json::to_string(&value).unwrap();
         // Either it returns None (fell back) or it returns a form that round-trips
         // to the EXACT original — never corruption.
-        if let Some(out) = compact_recursive(&text) {
+        if let Some(out) = compact_recursive(&text, &parse(&text).unwrap()) {
             assert_eq!(reconstruct_blocks(&out), Some(value));
         }
     }

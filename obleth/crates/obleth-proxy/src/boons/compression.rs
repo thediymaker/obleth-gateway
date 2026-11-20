@@ -33,7 +33,7 @@ pub(crate) fn classify(text: &str) -> ContentKind {
     // Code must win over Prose so the lossy pass never summarizes code away.
     // Valid JSON text cannot produce a line starting with a backtick, so this
     // cannot shadow the Json arm below.
-    if trimmed.lines().any(|l| l.trim_start().starts_with("```")) {
+    if has_fence_line(trimmed) {
         return ContentKind::Code;
     }
     if (trimmed.starts_with('{') && trimmed.ends_with('}'))
@@ -57,6 +57,12 @@ pub(crate) fn classify(text: &str) -> ContentKind {
         }
     }
     ContentKind::Prose
+}
+
+/// Whether any line of `text` opens or closes a code fence: what makes a
+/// segment [`ContentKind::Code`].
+fn has_fence_line(text: &str) -> bool {
+    text.lines().any(|l| l.trim_start().starts_with("```"))
 }
 
 /// Whether a single line looks like a log record: it begins with a timestamp or
@@ -85,17 +91,17 @@ fn line_looks_log(t: &str) -> bool {
         .any(|lvl| t.starts_with(lvl) || t.contains(&format!(" {lvl} ")))
 }
 
-/// Losslessly minify JSON text. Returns `Some(minified)` only when the result
-/// is strictly shorter AND re-parses to a value equal to the original; otherwise `None`.
-pub(crate) fn compact_json(text: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(text.trim()).ok()?;
-    let compact = serde_json::to_string(&value).ok()?;
+/// Losslessly minify JSON text, already parsed as `value`. Returns
+/// `Some(minified)` only when the result is strictly shorter AND re-parses to a
+/// value equal to the original; otherwise `None`.
+pub(crate) fn compact_json(text: &str, value: &Value) -> Option<String> {
+    let compact = serde_json::to_string(value).ok()?;
     if compact.len() >= text.len() {
         return None;
     }
     // Self-enforce the lossless invariant rather than relying on it by construction:
     // only substitute when the compacted text re-parses to a value equal to the original.
-    if serde_json::from_str::<Value>(&compact).ok()? != value {
+    if serde_json::from_str::<Value>(&compact).ok()? != *value {
         return None;
     }
     Some(compact)
@@ -154,6 +160,7 @@ pub(super) fn apply(
 ) -> CompressionStats {
     let tk = HeuristicTokenizer::new();
     let mut stats = CompressionStats::default();
+    let mut scan_budget = LOSSLESS_SCAN_BYTES;
     let Some(messages) = json.get_mut("messages").and_then(|m| m.as_array_mut()) else {
         return stats;
     };
@@ -164,7 +171,7 @@ pub(super) fn apply(
         // Two content shapes: a plain string, or an array of typed parts.
         match msg.get_mut("content") {
             Some(Value::String(s)) => {
-                try_compact_string(cfg, code_compaction, &tk, s, &mut stats);
+                try_compact_string(cfg, code_compaction, &tk, s, &mut stats, &mut scan_budget);
             }
             Some(Value::Array(parts)) => {
                 for part in parts.iter_mut() {
@@ -172,7 +179,14 @@ pub(super) fn apply(
                         break;
                     }
                     if let Some(Value::String(s)) = part.get_mut("text") {
-                        try_compact_string(cfg, code_compaction, &tk, s, &mut stats);
+                        try_compact_string(
+                            cfg,
+                            code_compaction,
+                            &tk,
+                            s,
+                            &mut stats,
+                            &mut scan_budget,
+                        );
                     }
                 }
             }
@@ -182,34 +196,47 @@ pub(super) fn apply(
     stats
 }
 
+/// Bytes of segment text the lossless pass reads per request: parsing,
+/// span-finding and table-building are each linear in it, so this bounds the
+/// pass's work however many segments a request carries, including ones that
+/// cannot shrink (which `max_segments`, a cap on segments rewritten, does not
+/// count). A segment that would cross it is left as it is.
+const LOSSLESS_SCAN_BYTES: usize = 8 << 20;
+
 /// Apply the threshold + structural/embedded compaction pipeline to one string
-/// segment, rewriting it in place and updating `stats`.
+/// segment, rewriting it in place and updating `stats`. `scan_budget` is what
+/// is left of [`LOSSLESS_SCAN_BYTES`].
 fn try_compact_string(
     cfg: &CompressionBoonSettings,
     code_compaction: bool,
     tk: &HeuristicTokenizer,
     s: &mut String,
     stats: &mut CompressionStats,
+    scan_budget: &mut usize,
 ) {
     let before = tk.count_text(s);
     if before < cfg.min_tokens {
         return;
     }
+    let Some(left) = scan_budget.checked_sub(s.len()) else {
+        return;
+    };
+    *scan_budget = left;
     stats.scanned += 1;
 
     // 1. Whole segment is JSON -> structural compaction (recurses into nesting).
     // 2. Otherwise -> compact any JSON arrays embedded in the prose/markdown.
-    let mut compacted = if serde_json::from_str::<Value>(s.trim()).is_ok() {
-        super::structural_json::compact(s)
-    } else {
-        super::embedded_json::extract(s)
+    // Either way the text is parsed once and the value passed down.
+    let mut compacted = match super::structural_json::parse(s) {
+        Some(value) => super::structural_json::compact_value(s, &value),
+        None => super::embedded_json::extract(s),
     };
 
     // 3. Conservative code whitespace compaction (opt-in), on top of the above.
     if code_compaction {
-        let base = compacted.clone().unwrap_or_else(|| s.clone());
-        if matches!(classify(&base), ContentKind::Code) {
-            if let Some(cc) = compact_code(&base) {
+        let base = compacted.as_deref().unwrap_or(s);
+        if has_fence_line(base.trim()) {
+            if let Some(cc) = compact_code(base) {
                 compacted = Some(cc);
             }
         }
@@ -823,6 +850,76 @@ pub(super) fn compact_log(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`compact_json`] of text not yet parsed.
+    fn minify(text: &str) -> Option<String> {
+        compact_json(text, &crate::boons::structural_json::parse(text)?)
+    }
+
+    fn parses_during(f: impl FnOnce()) -> usize {
+        use crate::boons::structural_json::PARSES;
+        let before = PARSES.with(|n| n.get());
+        f();
+        PARSES.with(|n| n.get()) - before
+    }
+
+    fn one_user_turn(content: &str) -> Value {
+        serde_json::json!({ "messages": [{ "role": "user", "content": content }] })
+    }
+
+    /// A JSON segment is parsed once, and prose with a JSON span once for
+    /// the whole text and once for the span: the value is handed down rather
+    /// than parsed again by each step.
+    #[test]
+    fn each_segment_and_span_is_parsed_once() {
+        let cfg = CompressionBoonSettings {
+            enabled: true,
+            min_tokens: 16,
+            ..Default::default()
+        };
+        let rows: Vec<Value> = (0..40)
+            .map(|i| serde_json::json!({ "id": i, "name": format!("user {i}"), "active": i % 2 == 0 }))
+            .collect();
+        let pretty = serde_json::to_string_pretty(&rows).unwrap();
+
+        let mut body = one_user_turn(&pretty);
+        assert_eq!(
+            parses_during(|| assert_eq!(apply(&cfg, true, &mut body).compressed, 1)),
+            1
+        );
+
+        let mut body = one_user_turn(&format!(
+            "Here are the users: {pretty} -- which are active?"
+        ));
+        assert_eq!(
+            parses_during(|| assert_eq!(apply(&cfg, true, &mut body).compressed, 1)),
+            2
+        );
+    }
+
+    /// Segments that cannot shrink are not compacted, so `max_segments` never
+    /// stops them; the byte budget does.
+    #[test]
+    fn the_lossless_pass_stops_at_its_byte_budget() {
+        let cfg = CompressionBoonSettings {
+            enabled: true,
+            min_tokens: 16,
+            ..Default::default()
+        };
+        // Already minified and not a table: parsed, then left as it is.
+        let segment = format!("{{\"k\":\"{}\"}}", "a".repeat(999_992));
+        assert_eq!(segment.len(), 1_000_000);
+        let turns: Vec<Value> = (0..12)
+            .map(|_| serde_json::json!({ "role": "user", "content": segment }))
+            .collect();
+        let mut body = serde_json::json!({ "messages": turns });
+        let mut stats = CompressionStats::default();
+        let parses = parses_during(|| stats = apply(&cfg, false, &mut body));
+        let fit = LOSSLESS_SCAN_BYTES / segment.len();
+        assert_eq!(fit, 8);
+        assert_eq!((stats.scanned as usize, stats.compressed), (fit, 0));
+        assert_eq!(parses, fit);
+    }
     use serde_json::json;
 
     #[test]
@@ -869,7 +966,7 @@ mod tests {
     #[test]
     fn compacts_pretty_json() {
         let pretty = "{\n  \"a\": 1,\n  \"b\": [1, 2, 3]\n}";
-        let out = compact_json(pretty).expect("should compact");
+        let out = minify(pretty).expect("should compact");
         assert!(out.len() < pretty.len());
         // Lossless: re-parses to the same value.
         let a: serde_json::Value = serde_json::from_str(pretty).unwrap();
@@ -879,13 +976,13 @@ mod tests {
 
     #[test]
     fn already_compact_json_returns_none() {
-        assert_eq!(compact_json("{\"a\":1}"), None);
+        assert_eq!(minify("{\"a\":1}"), None);
     }
 
     #[test]
     fn compact_json_is_lossless_despite_key_reordering() {
         let input = "{\n  \"z\": 99,\n  \"a\": 1\n}";
-        let out = compact_json(input).expect("should compact");
+        let out = minify(input).expect("should compact");
         let before: serde_json::Value = serde_json::from_str(input).unwrap();
         let after: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(before, after); // Value equality holds even though keys may reorder
@@ -893,7 +990,7 @@ mod tests {
 
     #[test]
     fn non_json_returns_none() {
-        assert_eq!(compact_json("just some prose"), None);
+        assert_eq!(minify("just some prose"), None);
     }
 
     #[test]
