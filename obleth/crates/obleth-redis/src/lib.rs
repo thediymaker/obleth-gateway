@@ -74,6 +74,9 @@ const CACHE_PREFIX: &str = "obleth:cache:";
 /// Namespace for compression-boon originals stashed for reversibility. Distinct
 /// from the response cache so the two never collide.
 const COMPRESS_PREFIX: &str = "obleth:compress:";
+/// Compression-boon compacted forms, per tenant, so a segment compacts the
+/// same way on every turn and the prompt prefix stays the same.
+const COMPACTED_PREFIX: &str = "obleth:compacted:";
 /// Namespace for cached query vectors (knowledge boon). The key itself is
 /// built here from the hash the proxy supplies (see `query_vector_key`),
 /// mirroring `compress_key`.
@@ -453,21 +456,82 @@ impl RedisStore {
         originals: &[(String, String)],
         ttl_secs: u64,
     ) -> Result<()> {
-        if ttl_secs == 0 || originals.is_empty() {
+        self.set_many(
+            originals
+                .iter()
+                .map(|(hash, content)| (Self::compress_key(tenant, hash), content.as_str())),
+            ttl_secs,
+        )
+        .await
+    }
+
+    /// `SET key value EX ttl_secs` for each pair, pipelined in one round
+    /// trip. Nothing is written for no pairs or a `ttl_secs` of 0.
+    async fn set_many<'a>(
+        &self,
+        pairs: impl Iterator<Item = (String, &'a str)>,
+        ttl_secs: u64,
+    ) -> Result<()> {
+        if ttl_secs == 0 {
             return Ok(());
         }
         let mut pipe = redis::pipe();
-        for (hash, content) in originals {
+        let mut any = false;
+        for (key, value) in pairs {
             pipe.cmd("SET")
-                .arg(Self::compress_key(tenant, hash))
-                .arg(content)
+                .arg(key)
+                .arg(value)
                 .arg("EX")
                 .arg(ttl_secs)
                 .ignore();
+            any = true;
+        }
+        if !any {
+            return Ok(());
         }
         let mut conn = self.conn.clone();
         let _: () = pipe.query_async(&mut conn).await?;
         Ok(())
+    }
+
+    fn compacted_key(tenant: &Uuid, id: &str) -> String {
+        format!("{COMPACTED_PREFIX}{tenant}:{id}")
+    }
+
+    /// A tenant's kept compacted forms for `ids`, in order, `None` where none
+    /// is kept; one round trip.
+    pub async fn compacted_get_many(
+        &self,
+        tenant: &Uuid,
+        ids: &[String],
+    ) -> Result<Vec<Option<String>>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut cmd = redis::cmd("MGET");
+        for id in ids {
+            cmd.arg(Self::compacted_key(tenant, id));
+        }
+        let mut conn = self.conn.clone();
+        let found: Vec<Option<String>> = cmd.query_async(&mut conn).await?;
+        Ok(found)
+    }
+
+    /// Keep compacted forms `(id, text)` for a tenant for `ttl_secs`, in one
+    /// round trip; writing one again restarts its TTL.
+    pub async fn compacted_put_many(
+        &self,
+        tenant: &Uuid,
+        compacted: &[(String, String)],
+        ttl_secs: u64,
+    ) -> Result<()> {
+        self.set_many(
+            compacted
+                .iter()
+                .map(|(id, text)| (Self::compacted_key(tenant, id), text.as_str())),
+            ttl_secs,
+        )
+        .await
     }
 
     /// Fetch a tenant's stashed original by its content hash, or `None` when
@@ -1277,6 +1341,41 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    #[tokio::test]
+    async fn compacted_forms_round_trip_per_tenant() {
+        let Ok(url) = std::env::var("OBLETH_TEST_REDIS_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let store = RedisStore::connect(&url).await.expect("connect");
+        let (tenant, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let ids: Vec<String> = (0..3).map(|n| format!("v1:0.5:h{n}")).collect();
+        assert_eq!(
+            store.compacted_get_many(&tenant, &ids).await.unwrap(),
+            vec![None, None, None]
+        );
+        let kept = vec![
+            (ids[0].clone(), "short 0".to_owned()),
+            (ids[2].clone(), "short 2".to_owned()),
+        ];
+        store.compacted_put_many(&tenant, &kept, 60).await.unwrap();
+        assert_eq!(
+            store.compacted_get_many(&tenant, &ids).await.unwrap(),
+            vec![Some("short 0".to_owned()), None, Some("short 2".to_owned())]
+        );
+        assert_eq!(
+            store.compacted_get_many(&other, &ids[..1]).await.unwrap(),
+            vec![None],
+            "another tenant's forms are not found"
+        );
+        assert!(store
+            .compacted_get_many(&tenant, &[])
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.

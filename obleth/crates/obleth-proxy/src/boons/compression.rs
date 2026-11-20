@@ -321,6 +321,9 @@ pub(super) fn inject_retrieve_original_tool(json: &mut Value, supports_system: b
 #[derive(Debug, Default, Clone, Copy)]
 pub(super) struct LossyStats {
     pub pass: PassStats,
+    /// Of `pass.replaced`, segments given the compacted form kept from an
+    /// earlier turn.
+    pub reused: u32,
     /// How the sidecar call ended, when one was made; `None` means the
     /// heuristic path alone (no sidecar, or nothing worth scoring).
     pub scorer: Option<super::compressor::ScoreOutcome>,
@@ -334,7 +337,7 @@ struct Segment {
     pi: Option<usize>,
     tokens: u32,
     /// Classified the first time a pass asks, then kept.
-    kind: std::cell::OnceCell<ContentKind>,
+    kind: std::sync::OnceLock<ContentKind>,
     /// Rewritten by an earlier pass on this request; later passes leave it.
     taken: bool,
 }
@@ -360,6 +363,8 @@ pub(super) struct TextPasses<'c> {
     segments: Vec<Segment>,
     edits: Vec<(usize, String)>,
     stash: Vec<(String, String)>,
+    /// Lossy forms to keep for later turns, as `(id, text)`.
+    forms: Vec<(String, String)>,
 }
 
 impl<'c> TextPasses<'c> {
@@ -410,6 +415,7 @@ impl<'c> TextPasses<'c> {
             segments,
             edits: Vec::new(),
             stash: Vec::new(),
+            forms: Vec::new(),
         }
     }
 
@@ -434,7 +440,8 @@ impl<'c> TextPasses<'c> {
             .get_or_init(|| classify(self.text(json, i)))
     }
 
-    /// Record `marker` in place of segment `i` when it has fewer tokens.
+    /// Record `marker` in place of segment `i` when it has fewer tokens;
+    /// returns whether it did.
     fn replace(
         &mut self,
         stats: &mut PassStats,
@@ -442,11 +449,11 @@ impl<'c> TextPasses<'c> {
         original: &str,
         hash: String,
         marker: String,
-    ) {
+    ) -> bool {
         let before = self.segments[i].tokens;
         let after = self.tk.count_text(&marker);
         if after >= before {
-            return;
+            return false;
         }
         stats.replaced += 1;
         stats.tokens_before = stats.tokens_before.saturating_add(before);
@@ -456,6 +463,7 @@ impl<'c> TextPasses<'c> {
         if self.keep_originals {
             self.stash.push((hash, original.to_owned()));
         }
+        true
     }
 
     /// Cross-turn exact-duplicate dedup: when a large block appears more than
@@ -512,14 +520,31 @@ impl<'c> TextPasses<'c> {
     /// The lossy pass: long Prose segments are cut to their most salient
     /// sentences (ranked by the compressor sidecar when there is one, by
     /// [`extract_prose`] otherwise) plus a `[ref:HASH]` marker.
-    pub(super) async fn lossy(&mut self, state: &AppState, json: &Value) -> LossyStats {
+    ///
+    /// A segment's compacted form is kept (next to its original, for as
+    /// long) and given again on later turns, so earlier turns read the same
+    /// on every request and the upstream prompt cache keeps matching them.
+    /// Only a segment seen for the first time is compacted, biased toward the
+    /// current question and scored by the sidecar; `max_lossy_segments` caps
+    /// those, as the work, not the reused ones.
+    pub(super) async fn lossy(
+        &mut self,
+        state: &AppState,
+        key: &ResolvedKey,
+        json: &Value,
+    ) -> LossyStats {
         let mut stats = LossyStats::default();
         let order = self.lossy_order(json);
+        let hashes: Vec<String> = order
+            .iter()
+            .map(|&i| obleth_config::content_hash(self.text(json, i)))
+            .collect();
+        let kept = self.kept_forms(state, key, &hashes).await;
         let budget = state
             .compressor
             .as_ref()
             .map_or(0, |kc| kc.sentence_budget());
-        let (scored, batches) = self.scoring_batches(json, &order, budget);
+        let (scored, batches) = self.scoring_batches(json, &order, &kept, budget);
         let mut scores: Vec<Option<Vec<f32>>> = vec![None; order.len()];
         if let Some(kc) = state.compressor.as_ref().filter(|_| !scored.is_empty()) {
             let answer = kc.score(&state.http, &batches).await;
@@ -532,8 +557,39 @@ impl<'c> TextPasses<'c> {
             }
         }
         let terms = latest_user_query_terms(json);
-        stats.pass = self.lossy_rewrite(json, &order, &scores, &terms);
+        (stats.pass, stats.reused) =
+            self.lossy_rewrite(json, &order, &hashes, &kept, &scores, &terms);
         stats
+    }
+
+    /// The id a lossy form is kept under: the original's hash, and what else
+    /// decides the form, so a change to either is a different form.
+    fn form_id(&self, hash: &str) -> String {
+        format!("{LOSSY_FORM_VERSION}:{}:{hash}", self.cfg.neural_keep_ratio)
+    }
+
+    /// The forms kept from earlier turns for the segments hashed `hashes`;
+    /// all `None` when nothing is kept or Redis fails (then each is compacted
+    /// afresh, as before).
+    async fn kept_forms(
+        &self,
+        state: &AppState,
+        key: &ResolvedKey,
+        hashes: &[String],
+    ) -> Vec<Option<String>> {
+        let none = || vec![None; hashes.len()];
+        if self.cfg.original_ttl_secs == 0 || hashes.is_empty() {
+            return none();
+        }
+        let ids: Vec<String> = hashes.iter().map(|h| self.form_id(h)).collect();
+        match state.redis.compacted_get_many(&key.tenant_id, &ids).await {
+            Ok(found) if found.len() == ids.len() => found,
+            Ok(_) => none(),
+            Err(e) => {
+                tracing::debug!(error = %e, "could not read kept compacted forms");
+                none()
+            }
+        }
     }
 
     /// Lossy candidates, largest first: the pass stops after
@@ -566,6 +622,7 @@ impl<'c> TextPasses<'c> {
         &self,
         json: &Value,
         order: &[usize],
+        kept: &[Option<String>],
         max_sentences: usize,
     ) -> (Vec<usize>, Vec<Vec<String>>) {
         let limit = (self.cfg.max_lossy_segments as usize).min(SCORE_MAX_SEGMENTS);
@@ -575,6 +632,9 @@ impl<'c> TextPasses<'c> {
         for (pos, &i) in order.iter().enumerate() {
             if at.len() >= limit {
                 break;
+            }
+            if kept[pos].is_some() {
+                continue; // its form is kept: nothing to score
             }
             let batch = super::compressor::split_sentences(self.text(json, i));
             if sentences + batch.len() > max_sentences {
@@ -587,35 +647,56 @@ impl<'c> TextPasses<'c> {
         (at, batches)
     }
 
-    /// Pure core of the lossy pass: `scores[k]` are the sidecar's scores for
-    /// `order[k]`, when it gave them.
+    /// Pure core of the lossy pass, returning its stats and how many forms
+    /// it reused. For `order[k]`: `hashes[k]` is its content hash, `kept[k]`
+    /// its form kept from an earlier turn, and `scores[k]` the sidecar's
+    /// scores, when there are any.
     fn lossy_rewrite(
         &mut self,
         json: &Value,
         order: &[usize],
+        hashes: &[String],
+        kept: &[Option<String>],
         scores: &[Option<Vec<f32>>],
         terms: &std::collections::HashSet<String>,
-    ) -> PassStats {
+    ) -> (PassStats, u32) {
         let mut stats = PassStats::default();
-        for (&i, scores) in order.iter().zip(scores) {
-            if stats.replaced >= self.cfg.max_lossy_segments {
-                break;
-            }
-            stats.examined += 1;
+        let (mut fresh, mut reused) = (0, 0);
+        for (k, &i) in order.iter().enumerate() {
             let original = self.text(json, i);
-            let Some(compacted) = super::compressor::compact_prose_segment(
-                original,
-                scores.as_deref(),
-                self.cfg.neural_keep_ratio,
-                terms,
-            ) else {
-                continue;
+            let hash = &hashes[k];
+            let marker = match &kept[k] {
+                Some(form) => form.clone(),
+                None => {
+                    if fresh >= self.cfg.max_lossy_segments {
+                        continue;
+                    }
+                    let Some(compacted) = super::compressor::compact_prose_segment(
+                        original,
+                        scores[k].as_deref(),
+                        self.cfg.neural_keep_ratio,
+                        terms,
+                    ) else {
+                        stats.examined += 1;
+                        continue;
+                    };
+                    lossy_marker(&compacted, hash)
+                }
             };
-            let hash = obleth_config::content_hash(original);
-            let marker = lossy_marker(&compacted, &hash);
-            self.replace(&mut stats, i, original, hash, marker);
+            stats.examined += 1;
+            let id = self.form_id(hash);
+            if self.replace(&mut stats, i, original, hash.clone(), marker.clone()) {
+                if kept[k].is_some() {
+                    reused += 1;
+                } else {
+                    fresh += 1;
+                }
+                // Kept again, so the form lives as long as the conversation
+                // keeps sending the segment.
+                self.forms.push((id, marker));
+            }
         }
-        stats
+        (stats, reused)
     }
 
     /// Write every recorded rewrite into the request, returning the originals
@@ -631,19 +712,32 @@ impl<'c> TextPasses<'c> {
     /// Write the rewrites and, when reversible, stash the originals for
     /// `retrieve_original` in one round trip. Best effort: a Redis failure
     /// never fails the request.
-    pub(super) async fn finish(self, state: &AppState, key: &ResolvedKey, json: &mut Value) {
+    pub(super) async fn finish(mut self, state: &AppState, key: &ResolvedKey, json: &mut Value) {
         let (cfg, reversible) = (self.cfg, self.reversible);
+        let forms = std::mem::take(&mut self.forms);
         let originals = self.write(json);
-        if !reversible || originals.is_empty() {
-            return;
-        }
-        if let Err(e) = state
-            .redis
-            .compress_put_many(&key.tenant_id, &originals, cfg.original_ttl_secs)
-            .await
-        {
-            tracing::debug!(error = %e, "could not stash compressed originals");
-        }
+        let ttl = cfg.original_ttl_secs;
+        let stash = async {
+            if reversible {
+                if let Err(e) = state
+                    .redis
+                    .compress_put_many(&key.tenant_id, &originals, ttl)
+                    .await
+                {
+                    tracing::debug!(error = %e, "could not stash compressed originals");
+                }
+            }
+        };
+        let keep = async {
+            if let Err(e) = state
+                .redis
+                .compacted_put_many(&key.tenant_id, &forms, ttl)
+                .await
+            {
+                tracing::debug!(error = %e, "could not keep compacted forms");
+            }
+        };
+        tokio::join!(stash, keep);
     }
 }
 
@@ -657,6 +751,10 @@ fn is_table(text: &str) -> bool {
 /// Hard ceiling on segments sent to the compressor sidecar in one `/score`
 /// call, whatever `max_lossy_segments` says.
 const SCORE_MAX_SEGMENTS: usize = 16;
+
+/// Part of every kept lossy form's id. Raise it when a change to the lossy
+/// pass changes its output, so forms made the old way are not given again.
+const LOSSY_FORM_VERSION: &str = "lossy1";
 
 /// The words of `text` as query terms are made: lowercased, split on
 /// anything not alphanumeric, at least 4 bytes long.
@@ -781,9 +879,20 @@ pub(super) fn lossy_rewrite(
 ) -> (PassStats, Vec<(String, String)>) {
     let mut passes = TextPasses::new(cfg, true, json);
     let order = passes.lossy_order(json);
-    let scores = vec![None; order.len()];
+    let hashes: Vec<String> = order
+        .iter()
+        .map(|&i| obleth_config::content_hash(passes.text(json, i)))
+        .collect();
+    let none = vec![None; order.len()];
     let terms = latest_user_query_terms(json);
-    let stats = passes.lossy_rewrite(json, &order, &scores, &terms);
+    let (stats, _) = passes.lossy_rewrite(
+        json,
+        &order,
+        &hashes,
+        &none,
+        &vec![None; order.len()],
+        &terms,
+    );
     (stats, passes.write(json))
 }
 
@@ -1551,8 +1660,19 @@ mod tests {
         assert_eq!(dedup.replaced, 1);
         let order = passes.lossy_order(&body);
         assert_eq!(order.len(), 2, "the repeat is no longer a candidate");
-        let scores = vec![None; order.len()];
-        let lossy = passes.lossy_rewrite(&body, &order, &scores, &Default::default());
+        let hashes: Vec<String> = order
+            .iter()
+            .map(|&i| obleth_config::content_hash(passes.text(&body, i)))
+            .collect();
+        let none = vec![None; order.len()];
+        let (lossy, _) = passes.lossy_rewrite(
+            &body,
+            &order,
+            &hashes,
+            &none,
+            &vec![None; order.len()],
+            &Default::default(),
+        );
         assert_eq!(lossy.replaced, 2);
         let stash = passes.write(&mut body);
         assert_eq!(stash.len(), 3);
@@ -1560,6 +1680,85 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("[ref:"));
+    }
+
+    /// One turn of the lossy pass with `store` standing in for Redis:
+    /// returns how many forms it reused.
+    fn lossy_turn(
+        cfg: &CompressionBoonSettings,
+        body: &mut Value,
+        store: &mut std::collections::HashMap<String, String>,
+    ) -> u32 {
+        let mut passes = TextPasses::new(cfg, true, body);
+        let order = passes.lossy_order(body);
+        let hashes: Vec<String> = order
+            .iter()
+            .map(|&i| obleth_config::content_hash(passes.text(body, i)))
+            .collect();
+        let kept: Vec<Option<String>> = hashes
+            .iter()
+            .map(|h| store.get(&passes.form_id(h)).cloned())
+            .collect();
+        let terms = latest_user_query_terms(body);
+        let none = vec![None; order.len()];
+        let (_, reused) = passes.lossy_rewrite(body, &order, &hashes, &kept, &none, &terms);
+        store.extend(std::mem::take(&mut passes.forms));
+        passes.write(body);
+        reused
+    }
+
+    /// Earlier turns read the same on every request: a segment is compacted
+    /// once, toward the question of the turn it first appeared in, and that
+    /// form is given again, so the prompt prefix does not move.
+    #[test]
+    fn earlier_turns_keep_their_compacted_form() {
+        const NAMES: [&str; 12] = [
+            "north", "south", "east", "west", "upper", "lower", "inner", "outer", "early", "late",
+            "major", "minor",
+        ];
+        let doc = |topic: &str| -> String {
+            NAMES
+                .iter()
+                .enumerate()
+                .map(|(i, n)| {
+                    let about = if i % 2 == 0 { "alpha" } else { "omega" };
+                    format!("The {n} {topic} report covers {about} findings in plain words.\n")
+                })
+                .collect()
+        };
+        let conversation = |turns: usize| -> Value {
+            let questions = ["what about alpha?", "and omega?", "and the rest?"];
+            let mut messages = vec![json!({ "role": "user", "content": doc("design") })];
+            for t in 0..turns {
+                if t > 0 {
+                    messages.push(json!({ "role": "assistant", "content": doc(["", "answer", "summary"][t]) }));
+                }
+                messages.push(json!({ "role": "user", "content": questions[t] }));
+            }
+            json!({ "messages": messages })
+        };
+        let cfg = lossy_cfg(4);
+        let mut store = std::collections::HashMap::new();
+        let mut turn1 = conversation(1);
+        assert_eq!(lossy_turn(&cfg, &mut turn1, &mut store), 0);
+        let mut turn2 = conversation(2);
+        assert_eq!(lossy_turn(&cfg, &mut turn2, &mut store), 1);
+        let mut turn3 = conversation(3);
+        assert_eq!(lossy_turn(&cfg, &mut turn3, &mut store), 2);
+
+        let first = &turn1["messages"][0]["content"];
+        assert!(first.as_str().unwrap().contains("[ref:"));
+        assert_eq!(&turn2["messages"][0]["content"], first);
+        assert_eq!(&turn3["messages"][0]["content"], first);
+        assert_eq!(
+            turn3["messages"][2]["content"],
+            turn2["messages"][2]["content"]
+        );
+
+        // Without the kept form, the new question would have moved it.
+        let mut fresh = conversation(2);
+        lossy_turn(&cfg, &mut fresh, &mut Default::default());
+        assert_ne!(&fresh["messages"][0]["content"], first);
     }
 
     /// Lossy output on fixed fixtures, digested: whole-word query matching
@@ -1737,7 +1936,21 @@ mod scoring_tests {
         let cfg = lossy_cfg(max_segments);
         let passes = TextPasses::new(&cfg, false, &body);
         let order = passes.lossy_order(&body);
-        passes.scoring_batches(&body, &order, max_sentences)
+        passes.scoring_batches(&body, &order, &vec![None; order.len()], max_sentences)
+    }
+
+    /// A segment whose form is kept from an earlier turn is not scored again:
+    /// the sidecar sees only new segments.
+    #[test]
+    fn kept_forms_are_not_scored_again() {
+        let texts: Vec<String> = (0..4).map(|_| prose(5)).collect();
+        let body = turns(&texts);
+        let cfg = lossy_cfg(3);
+        let passes = TextPasses::new(&cfg, false, &body);
+        let order = passes.lossy_order(&body);
+        let kept = vec![Some("kept".to_owned()), None, Some("kept".to_owned()), None];
+        let (at, batches) = passes.scoring_batches(&body, &order, &kept, 1_000);
+        assert_eq!((at, batches.len()), (vec![1, 3], 2));
     }
 
     #[test]

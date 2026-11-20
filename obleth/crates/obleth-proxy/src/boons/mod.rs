@@ -791,7 +791,7 @@ impl BoonEngine {
                 logs = text_passes.logs(json);
             }
             if lossy_on {
-                lossy = text_passes.lossy(state, json).await;
+                lossy = text_passes.lossy(state, key, json).await;
                 if let Some(outcome) = lossy.scorer {
                     state.metrics.record_compressor_score(outcome.name());
                 }
@@ -855,6 +855,7 @@ impl BoonEngine {
                         "dedup_refs": dedup.replaced,
                         "log_segments": logs.replaced,
                         "lossy_segments": lossy.pass.replaced,
+                        "lossy_reused": lossy.reused,
                         "passes": {
                             "lossless": lossless.to_json(),
                             "dedup": dedup.to_json(),
