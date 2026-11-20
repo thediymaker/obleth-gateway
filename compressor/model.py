@@ -7,11 +7,13 @@ for one importance score PER SENTENCE, so we mean-pool each sentence's content
 tokens (excluding special and padding tokens): a sentence whose tokens the
 compressor wants to keep is information-dense and should rank higher.
 
-Sentences are scored in BATCHES — all sentences in a chunk are padded to a common
-length and run through the model in a single `session.run`, which lets onnxruntime
-parallelize across the batch dimension instead of one inference per sentence.
-Chunk size is bounded (`COMPRESSOR_MAX_BATCH`) so a huge segment can't build one
-giant padded tensor.
+A request's sentences, across all of its segments, are tokenized once, sorted by
+token count and scored in chunks of `COMPRESSOR_MAX_BATCH`: each chunk is padded
+to its longest member and run in a single `session.run`, so short sentences are
+not padded out to a long one and a many-segment request makes few ONNX calls.
+Scores go back to each sentence's segment and position. Between chunks the
+scorer checks the caller's deadline and gives up once it has passed: the
+gateway has stopped waiting by then.
 
 Heavy imports (onnxruntime, tokenizers, numpy) are loaded LAZILY inside __init__
 so that `import model` succeeds in a bare venv (e.g. during tests).
@@ -19,6 +21,21 @@ so that `import model` succeeds in a bare venv (e.g. during tests).
 from __future__ import annotations
 
 import os
+import time
+from typing import Optional, Sequence
+
+
+class DeadlineExceeded(Exception):
+    """The caller's deadline passed before every sentence was scored."""
+
+
+def chunk_order(lengths: Sequence[int], max_batch: int) -> list[list[int]]:
+    """
+    Indices of `lengths`, shortest first, cut into chunks of at most
+    `max_batch`. Ties keep their original order, so the plan is deterministic.
+    """
+    order = sorted(range(len(lengths)), key=lambda i: (lengths[i], i))
+    return [order[i : i + max_batch] for i in range(0, len(order), max_batch)]
 
 
 class Scorer:
@@ -50,11 +67,15 @@ class Scorer:
             sess_options,
             providers=["CPUExecutionProvider"],
         )
-        self._tokenizer = Tokenizer.from_file(tokenizer_path)
-        self._tokenizer.enable_truncation(max_length=512)
-        # Pad each batch to its longest member so encodings stack into one tensor.
-        # Pad positions carry attention_mask=0, so the pad id never affects scores.
-        self._tokenizer.enable_padding()
+        tokenizer = Tokenizer.from_file(tokenizer_path)
+        tokenizer.enable_truncation(max_length=512)
+        # Padding is done per chunk (see `_score_encoded`) with the tokenizer's
+        # own pad id. Pad positions carry attention_mask=0, so the pad id never
+        # affects scores.
+        tokenizer.enable_padding()
+        self._pad_id = int(tokenizer.padding["pad_id"])
+        tokenizer.no_padding()
+        self._tokenizer = tokenizer
         self._np = np
 
         if os.path.isfile(revision_path):
@@ -70,20 +91,28 @@ class Scorer:
         scored = [o.name for o in outputs if "score" in o.name.lower()]
         self._output_name = scored[0] if scored else outputs[0].name
 
-        # Cap sentences per ONNX call so an enormous segment can't allocate one
+        # Cap sentences per ONNX call so an enormous request can't allocate one
         # (huge_N x max_len) tensor. Tunable for perf/memory experiments.
-        self._max_batch = max(1, int(os.environ.get("COMPRESSOR_MAX_BATCH", "32")))
+        self._max_batch = max(1, int(os.environ.get("COMPRESSOR_MAX_BATCH", "8")))
 
     @property
     def revision(self) -> str:
         return self._revision
 
-    def _score_chunk(self, sentences: list[str]) -> list[float]:
-        """Score up to `_max_batch` sentences in one padded ONNX call."""
+    def _score_encoded(self, encs: list) -> list[float]:
+        """Score tokenized sentences in one ONNX call, padded to the longest."""
         np = self._np
-        encs = self._tokenizer.encode_batch(sentences)
-        ids = np.array([e.ids for e in encs], dtype=np.int64)
-        mask = np.array([e.attention_mask for e in encs], dtype=np.int64)
+        width = max(len(e.ids) for e in encs)
+        ids = np.full((len(encs), width), self._pad_id, dtype=np.int64)
+        mask = np.zeros((len(encs), width), dtype=np.int64)
+        content = np.zeros((len(encs), width), dtype=bool)
+        for i, e in enumerate(encs):
+            n = len(e.ids)
+            ids[i, :n] = e.ids
+            mask[i, :n] = e.attention_mask
+            content[i, :n] = np.asarray(e.attention_mask, dtype=bool) & ~np.asarray(
+                e.special_tokens_mask, dtype=bool
+            )
 
         feed: dict[str, object] = {}
         for name in self._input_names:
@@ -112,35 +141,37 @@ class Scorer:
             per_token = 1.0 / (1.0 + np.exp(-per_token))
 
         scores: list[float] = []
-        for i, enc in enumerate(encs):
-            attended = np.asarray(enc.attention_mask, dtype=bool)
-            special = np.asarray(enc.special_tokens_mask, dtype=bool)
-            content = attended & ~special
+        for i, e in enumerate(encs):
             row = per_token[i]
-            if content.any():
-                vals = row[content]
-            elif attended.any():
-                vals = row[attended]
+            if content[i].any():
+                vals = row[content[i]]
+            elif mask[i].any():
+                vals = row[mask[i].astype(bool)]
             else:
-                vals = row
+                vals = row[: len(e.ids)]
             scores.append(float(vals.mean()) if vals.size else 0.0)
         return scores
 
-    def score_batches(self, batches: list[list[str]]) -> list[list[float]]:
+    def score_batches(
+        self, batches: list[list[str]], deadline: Optional[float] = None
+    ) -> list[list[float]]:
         """
         Return one list of floats per input batch, one float per sentence.
 
         Each float is a per-sentence importance in [0, 1] — the mean keep
         probability the token compressor assigns to that sentence's content
-        tokens. Each batch is scored in `_max_batch`-sized ONNX calls.
+        tokens. `deadline` is a `time.monotonic()` value: once it has passed,
+        no further chunk is started and `DeadlineExceeded` is raised.
         """
-        results: list[list[float]] = []
-        for batch in batches:
-            if not batch:
-                results.append([])
-                continue
-            scores: list[float] = []
-            for start in range(0, len(batch), self._max_batch):
-                scores.extend(self._score_chunk(batch[start : start + self._max_batch]))
-            results.append(scores)
+        where = [(seg, pos) for seg, batch in enumerate(batches) for pos in range(len(batch))]
+        results: list[list[float]] = [[0.0] * len(batch) for batch in batches]
+        if not where:
+            return results
+        encs = self._tokenizer.encode_batch([s for batch in batches for s in batch])
+        for chunk in chunk_order([len(e.ids) for e in encs], self._max_batch):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise DeadlineExceeded()
+            for k, score in zip(chunk, self._score_encoded([encs[k] for k in chunk])):
+                seg, pos = where[k]
+                results[seg][pos] = score
         return results

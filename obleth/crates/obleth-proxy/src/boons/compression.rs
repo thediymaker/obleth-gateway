@@ -363,7 +363,11 @@ pub(super) async fn apply_lossy(
     // Exactly one `score` call per request; fails open (None) on any error.
     let n_targets = targets.len();
     let neural_scores: Vec<Option<Vec<f32>>> = {
-        let (prose_indices, batches) = scoring_batches(&targets, cfg.max_lossy_segments);
+        let budget = state
+            .compressor
+            .as_ref()
+            .map_or(0, |kc| kc.sentence_budget());
+        let (prose_indices, batches) = scoring_batches(&targets, cfg.max_lossy_segments, budget);
         // No references to `targets` are held past this point.
         let flat: Option<Vec<Vec<f32>>> = match state.compressor.as_ref() {
             Some(kc) if !prose_indices.is_empty() => {
@@ -431,18 +435,18 @@ pub(super) async fn apply_lossy(
 /// Hard ceiling on segments sent to the compressor sidecar in one `/score`
 /// call, whatever `max_lossy_segments` says.
 const SCORE_MAX_SEGMENTS: usize = 16;
-/// Hard ceiling on sentences sent in one `/score` call. A segment that would
-/// cross it is left unscored and compacts via the heuristic path instead.
-const SCORE_MAX_SENTENCES: usize = 2_048;
-
 /// The prose segments worth scoring and their sentence batches, as
 /// `(target indices, batches)`. `targets` is already in the order the lossy
 /// loop consumes it (largest first), so the first `max_segments` prose
 /// segments are the only ones the loop can use; scoring the whole history
 /// would ship every old turn to the sidecar on every request.
+/// `max_sentences` caps the sentences of one call (see
+/// `CompressorClient::sentence_budget`); a segment that would cross it is
+/// left unscored and compacts via the heuristic path instead.
 fn scoring_batches(
     targets: &[(usize, Option<usize>, String)],
     max_segments: u32,
+    max_sentences: usize,
 ) -> (Vec<usize>, Vec<Vec<String>>) {
     let limit = (max_segments as usize).min(SCORE_MAX_SEGMENTS);
     let mut indices = Vec::new();
@@ -456,7 +460,7 @@ fn scoring_batches(
             continue;
         }
         let batch = super::compressor::split_sentences(text);
-        if sentences + batch.len() > SCORE_MAX_SENTENCES {
+        if sentences + batch.len() > max_sentences {
             continue;
         }
         sentences += batch.len();
@@ -1439,7 +1443,7 @@ mod scoring_tests {
     fn scoring_sends_only_the_segments_the_loop_can_use() {
         let targets: Vec<(usize, Option<usize>, String)> =
             (0..10).map(|i| (i, None, prose(5))).collect();
-        let (indices, batches) = scoring_batches(&targets, 3);
+        let (indices, batches) = scoring_batches(&targets, 3, 1_000);
         assert_eq!(
             indices,
             vec![0, 1, 2],
@@ -1454,10 +1458,10 @@ mod scoring_tests {
         let mut targets: Vec<(usize, Option<usize>, String)> = vec![
             (0, None, "{\"a\": [1, 2, 3]}".to_string()),
             (1, None, format!("OBLETH_TABLE rows=3 {}", prose(5))),
-            (2, None, prose(SCORE_MAX_SENTENCES + 1)),
+            (2, None, prose(25)),
             (3, None, prose(4)),
         ];
-        let (indices, _) = scoring_batches(&targets, 50);
+        let (indices, _) = scoring_batches(&targets, 50, 24);
         assert_eq!(
             indices,
             vec![3],
@@ -1467,7 +1471,7 @@ mod scoring_tests {
         targets = (0..(SCORE_MAX_SEGMENTS + 8))
             .map(|i| (i, None, prose(2)))
             .collect();
-        let (indices, _) = scoring_batches(&targets, u32::MAX);
+        let (indices, _) = scoring_batches(&targets, u32::MAX, 1_000);
         assert_eq!(indices.len(), SCORE_MAX_SEGMENTS);
     }
 }

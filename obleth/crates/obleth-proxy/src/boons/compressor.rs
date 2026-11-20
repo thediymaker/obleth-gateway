@@ -29,6 +29,17 @@ const BREAKER_HOLD: std::time::Duration = std::time::Duration::from_secs(30);
 /// How often a failing sidecar is logged; the counter carries the rest.
 const WARN_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Carries this gateway's timeout for one `/score` call, in milliseconds.
+const TIMEOUT_HEADER: &str = "x-obleth-timeout-ms";
+
+/// Sentences one sidecar scores per second: a 4-core pod on kompress-v2-base
+/// (fp32) scored 30-40 a second of mixed-length prose in chunks of 8 (measured
+/// 2026-11-20). Sizes [`CompressorClient::sentence_budget`].
+const SCORED_SENTENCES_PER_SEC: u64 = 30;
+
+/// The fewest sentences a call may carry, however short the timeout.
+const MIN_SENTENCE_BUDGET: usize = 8;
+
 /// How one `/score` call ended; the span and the
 /// `obleth_compressor_scores_total` counter carry it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,6 +50,10 @@ pub enum ScoreOutcome {
     Timeout,
     /// The sidecar could not be reached, answered an error, or an unreadable body.
     Error,
+    /// The sidecar turned the call away: its queue was full (503) or the
+    /// timeout the gateway sent passed before it finished (504). Load
+    /// shedding, not a fault.
+    Busy,
     /// Not asked: the breaker is open after consecutive timeouts.
     Open,
 }
@@ -49,6 +64,7 @@ impl ScoreOutcome {
             ScoreOutcome::Neural => "neural",
             ScoreOutcome::Timeout => "timeout",
             ScoreOutcome::Error => "error",
+            ScoreOutcome::Busy => "busy",
             ScoreOutcome::Open => "breaker_open",
         }
     }
@@ -91,7 +107,7 @@ impl Breaker {
                     self.consecutive_timeouts.store(0, Ordering::Relaxed);
                 }
             }
-            ScoreOutcome::Neural | ScoreOutcome::Error => {
+            ScoreOutcome::Neural | ScoreOutcome::Error | ScoreOutcome::Busy => {
                 self.consecutive_timeouts.store(0, Ordering::Relaxed);
             }
             ScoreOutcome::Open => {}
@@ -146,6 +162,15 @@ impl CompressorClient {
         )
     }
 
+    /// Most sentences one `/score` call may carry: what the sidecar can score
+    /// within this client's timeout. More would time out (and be stopped by the
+    /// sidecar), so a segment that would cross it compacts by the heuristic
+    /// path instead.
+    pub(super) fn sentence_budget(&self) -> usize {
+        let ms = self.timeout.as_millis() as u64;
+        ((ms * SCORED_SENTENCES_PER_SEC / 1000) as usize).max(MIN_SENTENCE_BUDGET)
+    }
+
     /// POST `batches` to the sidecar's `/score` endpoint and return the
     /// per-sentence scores.
     ///
@@ -168,6 +193,8 @@ impl CompressorClient {
         let answered = http
             .post(&url)
             .json(&body)
+            // The sidecar stops work this call has given up on.
+            .header(TIMEOUT_HEADER, self.timeout.as_millis().to_string())
             .timeout(self.timeout)
             .send()
             .await;
@@ -178,6 +205,18 @@ impl CompressorClient {
                 "did not answer in time".to_owned(),
             ),
             Err(e) => (None, ScoreOutcome::Error, e.without_url().to_string()),
+            Ok(resp)
+                if matches!(
+                    resp.status(),
+                    reqwest::StatusCode::SERVICE_UNAVAILABLE | reqwest::StatusCode::GATEWAY_TIMEOUT
+                ) =>
+            {
+                (
+                    None,
+                    ScoreOutcome::Busy,
+                    format!("answered {}", resp.status()),
+                )
+            }
             Ok(resp) if !resp.status().is_success() => (
                 None,
                 ScoreOutcome::Error,
@@ -201,7 +240,8 @@ impl CompressorClient {
         };
         let now = std::time::Instant::now();
         self.breaker.note(outcome, now);
-        if outcome != ScoreOutcome::Neural && self.breaker.may_warn(now) {
+        let fault = !matches!(outcome, ScoreOutcome::Neural | ScoreOutcome::Busy);
+        if fault && self.breaker.may_warn(now) {
             tracing::warn!(
                 outcome = outcome.name(),
                 elapsed_ms = now.duration_since(started).as_millis() as u64,
@@ -476,6 +516,67 @@ mod tests {
             "the open breaker sends nothing"
         );
     }
+    /// The call carries the gateway's timeout, and a sidecar that sheds it
+    /// (503 when its queue is full, 504 when the timeout passed) reads as
+    /// busy: no scores, no warning, and no step toward the breaker.
+    #[tokio::test]
+    async fn a_shedding_sidecar_is_busy_and_gets_the_timeout() {
+        use axum::{http::HeaderMap, http::StatusCode, routing::post, Router};
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = sent.clone();
+        let app = Router::new().route(
+            "/score",
+            post(move |headers: HeaderMap| {
+                let seen = seen.clone();
+                async move {
+                    let timeout = headers
+                        .get(TIMEOUT_HEADER)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_owned();
+                    let mut seen = seen.lock().unwrap();
+                    seen.push(timeout);
+                    if seen.len() % 2 == 1 {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        StatusCode::GATEWAY_TIMEOUT
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = parse_config(Some(&url), Some("750")).unwrap();
+        let http = reqwest::Client::new();
+        let batches = vec![vec!["one".to_owned()]];
+        for _ in 0..(BREAKER_AFTER + 1) {
+            let scored = client.score(&http, &batches).await;
+            assert_eq!(scored.outcome, ScoreOutcome::Busy);
+            assert_eq!(scored.outcome.name(), "busy");
+            assert!(scored.scores.is_none());
+        }
+        let sent = sent.lock().unwrap();
+        assert_eq!(
+            sent.len(),
+            BREAKER_AFTER as usize + 1,
+            "never short-circuited"
+        );
+        assert!(sent.iter().all(|t| t == "750"), "{sent:?}");
+    }
+
+    #[test]
+    fn the_sentence_budget_follows_the_timeout() {
+        let at = |ms: &str| {
+            parse_config(Some("http://c"), Some(ms))
+                .unwrap()
+                .sentence_budget()
+        };
+        assert_eq!(at("800"), 24);
+        assert_eq!(at("3000"), 90);
+        assert_eq!(at("50"), MIN_SENTENCE_BUDGET);
+    }
+
     use std::collections::HashSet;
 
     #[test]

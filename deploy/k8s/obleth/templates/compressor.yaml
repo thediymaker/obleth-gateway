@@ -38,6 +38,10 @@ spec:
               value: {{ .Values.compressor.numThreads | quote }}
             - name: OMP_NUM_THREADS
               value: {{ .Values.compressor.numThreads | quote }}
+            - name: COMPRESSOR_CONCURRENCY
+              value: {{ .Values.compressor.concurrency | default 1 | quote }}
+            - name: COMPRESSOR_MAX_WAITING
+              value: {{ .Values.compressor.maxWaiting | default 8 | quote }}
           readinessProbe:
             httpGet: { path: /health, port: http }
             initialDelaySeconds: 30

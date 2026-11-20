@@ -36,10 +36,27 @@ def make_payload(n_sentences: int, words_per_sentence: int) -> bytes:
     return json.dumps({"segments": [{"sentences": sents}]}).encode("utf-8")
 
 
-def one_request(url: str, body: bytes, timeout: float) -> tuple[float, bool]:
-    req = urllib.request.Request(
-        url + "/score", data=body, headers={"Content-Type": "application/json"}
-    )
+def make_mixed_payload(n_sentences: int, segments: int) -> bytes:
+    """`n_sentences` spread over `segments`, from 3 to 60 words each in a fixed
+    cycle: the shape of a chat history, where short and long sentences share a
+    request and padding them to one length wastes most of the work."""
+    lengths = [3, 60, 8, 20, 5, 35, 12, 4]
+    sents = [
+        f"Step {i} " + " ".join(["token"] * lengths[i % len(lengths)]) + "."
+        for i in range(n_sentences)
+    ]
+    per = max(1, -(-n_sentences // max(1, segments)))
+    segs = [{"sentences": sents[i : i + per]} for i in range(0, n_sentences, per)]
+    return json.dumps({"segments": segs}).encode("utf-8")
+
+
+def one_request(url: str, body: bytes, timeout: float, deadline_ms: int = 0) -> tuple[float, bool]:
+    headers = {"Content-Type": "application/json"}
+    if deadline_ms > 0:
+        # What the gateway sends: its own timeout, so the sidecar stops work
+        # the gateway has given up on (answering 504, or 503 when busy).
+        headers["x-obleth-timeout-ms"] = str(deadline_ms)
+    req = urllib.request.Request(url + "/score", data=body, headers=headers)
     t0 = time.perf_counter()
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -101,13 +118,21 @@ class CpuSampler:
         return f"{statistics.mean(self.samples):.0f}/{max(self.samples):.0f}"
 
 
-def run_level(url: str, body: bytes, concurrency: int, total: int, timeout: float, container: str | None) -> dict:
+def run_level(
+    url: str,
+    body: bytes,
+    concurrency: int,
+    total: int,
+    timeout: float,
+    container: str | None,
+    deadline_ms: int = 0,
+) -> dict:
     latencies: list[float] = []
     errors = 0
     with CpuSampler(container) as cpu:
         t0 = time.perf_counter()
         with ThreadPoolExecutor(max_workers=concurrency) as ex:
-            futures = [ex.submit(one_request, url, body, timeout) for _ in range(total)]
+            futures = [ex.submit(one_request, url, body, timeout, deadline_ms) for _ in range(total)]
             for fut in as_completed(futures):
                 dur, ok = fut.result()
                 latencies.append(dur)
@@ -138,10 +163,26 @@ def main() -> None:
     ap.add_argument("--timeout", type=float, default=30.0, help="per-request timeout (s)")
     ap.add_argument("--warmup", type=int, default=10, help="warmup requests before measuring")
     ap.add_argument("--docker-name", default=None, help="container name to sample CPU%% via docker stats")
+    ap.add_argument(
+        "--mixed",
+        type=int,
+        default=0,
+        metavar="SEGMENTS",
+        help="mixed-length sentences (3-60 words) over this many segments instead of uniform ones",
+    )
+    ap.add_argument(
+        "--deadline-ms",
+        type=int,
+        default=0,
+        help="send x-obleth-timeout-ms like the gateway; late or shed requests count as err",
+    )
     args = ap.parse_args()
 
     levels = [int(c) for c in args.concurrency.split(",") if c.strip()]
-    body = make_payload(args.sentences, args.words)
+    if args.mixed:
+        body = make_mixed_payload(args.sentences, args.mixed)
+    else:
+        body = make_payload(args.sentences, args.words)
 
     # Health + warmup.
     try:
@@ -153,15 +194,16 @@ def main() -> None:
     for _ in range(args.warmup):
         one_request(args.url, body, args.timeout)
 
+    shape = f"mixed 3-60 words over {args.mixed} segments" if args.mixed else f"~{args.words} words"
     print(
-        f"payload: {args.sentences} sentences x ~{args.words} words | "
+        f"payload: {args.sentences} sentences x {shape} | "
         f"{args.requests} req/level | CPU%% avg/max shown when --docker-name set\n"
     )
     header = f"{'conc':>4} {'req/s':>8} {'sent/s':>9} {'p50 ms':>9} {'p95 ms':>9} {'p99 ms':>9} {'err':>4} {'cpu a/m':>9}"
     print(header)
     print("-" * len(header))
     for c in levels:
-        r = run_level(args.url, body, c, args.requests, args.timeout, args.docker_name)
+        r = run_level(args.url, body, c, args.requests, args.timeout, args.docker_name, args.deadline_ms)
         print(
             f"{r['concurrency']:>4} {r['rps']:>8.1f} {r['rps']*args.sentences:>9.0f} "
             f"{r['p50_ms']:>9.1f} {r['p95_ms']:>9.1f} {r['p99_ms']:>9.1f} "

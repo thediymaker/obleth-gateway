@@ -562,6 +562,12 @@ compressor:
   # onnxruntime intra-op threads per pod. Keep small: a single inference saturates
   # near 4 cores (the default). MUST match resources.limits.cpu below.
   numThreads: 4
+  # Requests one pod scores at once (each already uses every thread), and how
+  # many more may wait for a turn before the pod answers 503 at once. The
+  # gateway sends its timeout with each call, so a waiting request gives up
+  # when the gateway does; a turned-away request is compacted heuristically.
+  concurrency: 1
+  maxWaiting: 8
   image:
     repository: ghcr.io/thediymaker/obleth-gateway/obleth-compressor
     # Empty -> image.tag, like every other component (so "main" or "dev" edge
