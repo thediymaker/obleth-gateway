@@ -1,7 +1,7 @@
 import { notFound, redirect } from "next/navigation";
 import { CollectionPage } from "@/components/knowledge/collection-page";
 import { requireAdmin } from "@/lib/auth/roles";
-import { loadKnowledge } from "@/lib/knowledge-data";
+import { loadCollection } from "@/lib/knowledge-data";
 import { collectionHref } from "@/lib/knowledge-format";
 import { obleth, type AuditEntry } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
@@ -11,11 +11,11 @@ export const dynamic = "force-dynamic";
 export default async function KnowledgeCollectionPage({ params }: { params: Promise<{ name: string }> }) {
   await requireAdmin();
   const name = decodeURIComponent((await params).name);
-  const data = await loadKnowledge();
-  const collection = data.collections.find((c) => c.name === name) ?? data.collections.find((c) => c.id === name);
-  if (!collection) notFound();
+  const data = await loadCollection(name);
+  if (!data) notFound();
+  const { collection } = data;
   if (collection.name !== name) redirect(collectionHref(collection.name));
-  const docIds = new Set((data.documents[collection.id] ?? []).map((d) => d.id));
+  const docIds = new Set(data.documents.map((d) => d.id));
   // The collection's own changes by id, and its documents' from the type's
   // newest 200: both answered from the audit log's entity index.
   const [collectionChanges, documentChanges] = await Promise.all([
@@ -27,7 +27,7 @@ export default async function KnowledgeCollectionPage({ params }: { params: Prom
     <CollectionPage
       key={collection.id}
       collection={collection}
-      initialDocuments={data.documents[collection.id] ?? []}
+      initialDocuments={data.documents}
       settings={data.settings}
       models={data.models}
       usedBy={data.usedBy[collection.id] ?? []}

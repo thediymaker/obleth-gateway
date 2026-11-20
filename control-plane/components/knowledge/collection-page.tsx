@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState, useTransition } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useTransition } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -138,10 +138,14 @@ export function CollectionPage({
   const embedders = [...new Set([collection.embedding_model, ...models.filter((m) => m.model_type === "embedding").map((m) => m.model_name)])].filter(Boolean).sort();
   const [embedder, setEmbedder] = useState(collection.embedding_model);
 
+  // The last document to finish indexing changes the collection's chunk
+  // count: refresh the server data then, once, and not when the page opens.
+  const indexing = docs.some((d) => d.status === "pending" || d.status === "indexing");
+  const wasIndexing = useRef(indexing);
   useEffect(() => {
-    // A document that finished indexing changes the collection's chunk count; refresh the server data once.
-    if (!docsQuery.isFetching && docs.every((d) => d.status === "ready" || d.status === "failed")) router.refresh();
-  }, [docsQuery.dataUpdatedAt]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (wasIndexing.current && !indexing) router.refresh();
+    wasIndexing.current = indexing;
+  }, [indexing, router]);
 
   const refreshDocs = () => queryClient.invalidateQueries({ queryKey: docsKey });
 

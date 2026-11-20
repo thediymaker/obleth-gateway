@@ -14,7 +14,8 @@ vi.mock("@/app/actions", () => ({
   saveRetrievalSettingsAction: vi.fn(async () => ({ ok: true })),
   attachCollectionAction: vi.fn(async () => ({ ok: true })),
 }));
-vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh: vi.fn(), push: vi.fn(), replace: vi.fn() }), usePathname: () => "/knowledge" }));
+const router = vi.hoisted(() => ({ refresh: vi.fn(), push: vi.fn(), replace: vi.fn() }));
+vi.mock("next/navigation", () => ({ useRouter: () => router, usePathname: () => "/knowledge" }));
 
 const collection: KnowledgeCollection = { id: "c1", name: "Supercomputing Data", description: "RC Supercomputing", embedding_model: "qwen3-embedding-4b", indexed_embedding_model: "qwen3-embedding-4b", embedding_dim: 2560, chunk_tokens: 400, chunk_overlap_tokens: 50, needs_reindex: false, chunk_count: 32, estimated_bytes: 371077 };
 const doc = (title: string, over: Partial<KnowledgeDocument> = {}): KnowledgeDocument => ({ id: title, collection_id: "c1", title, filename: title, content_type: "text/markdown", byte_size: 6405, status: "ready", error: null, chunk_count: 5, reindex_requested: false, ...over });
@@ -49,6 +50,32 @@ describe("knowledge", () => {
     expect(row.textContent).toContain("Failed");
     await act(async () => button("Turn retrieval on").click());
     expect(setKnowledgeEnabledAction).toHaveBeenCalledWith(true);
+  });
+
+  it("refreshes the server data when indexing finishes, not when the page opens", async () => {
+    router.refresh.mockClear();
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false, enabled: false } } });
+    const page = () => (
+      <QueryClientProvider client={client}>
+        <CollectionPage collection={collection} initialDocuments={[doc("a.md"), doc("b.md", { status: "indexing" })]} settings={settings} models={models} usedBy={[]} stats={null} changes={[]} />
+      </QueryClientProvider>
+    );
+    await act(async () => root.render(page()));
+    expect(router.refresh).not.toHaveBeenCalled();
+    // The poll finds the last document indexed.
+    // Query updates reach the page on the next tick.
+    const poll = async (docs: KnowledgeDocument[]) =>
+      act(async () => { client.setQueryData(["collection-docs", "c1"], docs); await new Promise((r) => setTimeout(r, 0)); });
+    await poll([doc("a.md"), doc("b.md")]);
+    expect(router.refresh).toHaveBeenCalledTimes(1);
+    await poll([doc("a.md"), doc("b.md", { chunk_count: 6 })]);
+    expect(router.refresh).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens an indexed collection without refreshing it", async () => {
+    router.refresh.mockClear();
+    await render(<CollectionPage collection={collection} initialDocuments={[doc("a.md")]} settings={settings} models={models} usedBy={[]} stats={null} changes={[]} />);
+    expect(router.refresh).not.toHaveBeenCalled();
   });
 
   it("lists a collection's documents, failures first, and attaches it to a model", async () => {
