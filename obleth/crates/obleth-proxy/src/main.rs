@@ -38,7 +38,6 @@ mod client;
 mod diagnostics;
 pub mod tracer;
 
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -578,7 +577,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             let count = models.len();
-            let by_name = models_by_name(models);
+            let by_name = obleth_admin::rewarm::models_by_name(models);
             if let Err(e) = redis.put_resolved_bulk(Resolver::Models, &by_name).await {
                 tracing::warn!(error = %e, "failed to warm models into redis");
             }
@@ -1386,7 +1385,12 @@ fn spawn_redis_rewarm(
 ) {
     tokio::spawn(async move {
         let mut tick = every.map(|period| {
-            let mut t = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+            // Replicas started together would otherwise re-warm together,
+            // each pushing everything at once; up to a tenth of the period,
+            // per replica, spreads them out.
+            let jitter = period.mul_f64(rand::random::<f64>() / 10.0);
+            let first = tokio::time::Instant::now() + period + jitter;
+            let mut t = tokio::time::interval_at(first, period);
             t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             t
         });
@@ -1408,236 +1412,27 @@ fn spawn_redis_rewarm(
     });
 }
 
-/// One re-warm pass: push each resolver namespace from Postgres into Redis,
-/// prune what Postgres no longer lists from all of them in one SCAN, then fix
-/// up anything the prune caught mid-change (see [`settle_pruned`]).
+/// One re-warm pass (see [`obleth_admin::rewarm`]). A real key looked up
+/// while Redis was missing it (after a restart or flush, before this pass
+/// pushed it back) was remembered as unknown; the push publishes no per-key
+/// invalidation, so every miss is forgotten once Redis holds the keys again.
 async fn rewarm_redis(store: &Store, redis: &RedisStore, key_misses: &key_miss::KeyMissCache) {
-    let keys = push_snapshot(redis, Resolver::Keys, store.all_resolved_keys().await).await;
-    let models = push_snapshot(
+    let pass = obleth_admin::rewarm::push_and_prune(
+        store,
         redis,
-        Resolver::Models,
-        store.all_resolved_models().await.map(models_by_name),
+        obleth_admin::rewarm::Reread::WhenPruned,
     )
     .await;
-    let mcp = push_snapshot(
-        redis,
-        Resolver::McpServers,
-        store.all_resolved_mcp_servers().await,
-    )
-    .await;
-    // A real key looked up while Redis was missing it (after a restart or
-    // flush, before this pass pushed it back) was remembered as unknown. The
-    // push publishes no per-key invalidation, so forget every miss now that
-    // Redis holds the keys again.
-    key_misses.clear();
-    let counts = prune_and_settle(
-        redis,
-        (keys, || store.all_resolved_keys()),
-        (models, || async {
-            store.all_resolved_models().await.map(models_by_name)
-        }),
-        (mcp, || store.all_resolved_mcp_servers()),
-    )
-    .await;
-    tracing::debug!(?counts, "redis re-warm pass complete");
-}
-
-/// A namespace's entries as Postgres has them, and how to read them again.
-type Pass<T, F> = (Option<Vec<(String, T)>>, F);
-
-/// Write `loaded` into `resolver`'s namespace, pipelined. `None` (and a
-/// warning) when the load or the push failed: that namespace is then left
-/// out of this pass's prune, and the next pass starts it clean.
-async fn push_snapshot<T: serde::Serialize>(
-    redis: &RedisStore,
-    resolver: Resolver,
-    loaded: std::result::Result<Vec<(String, T)>, obleth_store::StoreError>,
-) -> Option<Vec<(String, T)>> {
-    let entries = match loaded {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::warn!(error = %e, ?resolver, "redis re-warm: load failed");
-            return None;
-        }
-    };
-    if let Err(e) = redis.put_resolved_bulk(resolver, &entries).await {
-        tracing::warn!(error = %e, ?resolver, "redis re-warm: push failed; retrying next pass");
-        return None;
+    if pass.keys.is_ok() {
+        key_misses.clear();
     }
-    Some(entries)
-}
-
-/// Prune every pushed namespace in one SCAN, then settle each. Returns each
-/// namespace's entry count after the pass (`None` where it did not run).
-async fn prune_and_settle<FK, FKF, FM, FMF, FS, FSF>(
-    redis: &RedisStore,
-    keys: Pass<obleth_config::ResolvedKey, FK>,
-    models: Pass<obleth_config::ResolvedModel, FM>,
-    mcp: Pass<obleth_config::ResolvedMcpServer, FS>,
-) -> [Option<usize>; 3]
-where
-    FK: FnOnce() -> FKF,
-    FKF: std::future::Future<Output = Reloaded<obleth_config::ResolvedKey>>,
-    FM: FnOnce() -> FMF,
-    FMF: std::future::Future<Output = Reloaded<obleth_config::ResolvedModel>>,
-    FS: FnOnce() -> FSF,
-    FSF: std::future::Future<Output = Reloaded<obleth_config::ResolvedMcpServer>>,
-{
-    let known = [known_ids(&keys.0), known_ids(&models.0), known_ids(&mcp.0)];
-    let resolvers = [Resolver::Keys, Resolver::Models, Resolver::McpServers];
-    let asked: Vec<(Resolver, &HashSet<String>)> = resolvers
-        .iter()
-        .zip(&known)
-        .filter_map(|(r, k)| k.as_ref().map(|k| (*r, k)))
-        .collect();
-    if asked.is_empty() {
-        return [None; 3];
-    }
-    let mut pruned = match redis.prune_stale_resolved(&asked).await {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(error = %e, "redis re-warm: prune failed; retrying next pass");
-            return [None; 3];
-        }
-    };
-    let [known_keys, known_models, known_mcp] = &known;
-    let mut take = |r: Resolver| pruned.remove(&r).unwrap_or_default();
-    let pruned_keys = take(Resolver::Keys);
-    let pruned_models = take(Resolver::Models);
-    let pruned_mcp = take(Resolver::McpServers);
-    [
-        settle(redis, Resolver::Keys, known_keys, keys, pruned_keys).await,
-        settle(redis, Resolver::Models, known_models, models, pruned_models).await,
-        settle(redis, Resolver::McpServers, known_mcp, mcp, pruned_mcp).await,
-    ]
-}
-
-/// The ids a pushed namespace lists; `None` when it was not pushed.
-fn known_ids<T>(entries: &Option<Vec<(String, T)>>) -> Option<HashSet<String>> {
-    entries
-        .as_ref()
-        .map(|e| e.iter().map(|(id, _)| id.clone()).collect())
-}
-
-type Reloaded<T> = std::result::Result<Vec<(String, T)>, obleth_store::StoreError>;
-
-async fn settle<T, F, Fut>(
-    redis: &RedisStore,
-    resolver: Resolver,
-    known: &Option<HashSet<String>>,
-    (pushed, reload): Pass<T, F>,
-    pruned: Vec<String>,
-) -> Option<usize>
-where
-    T: serde::Serialize,
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Reloaded<T>>,
-{
-    let (known, pushed) = (known.as_ref()?, pushed?);
-    Some(settle_pruned(redis, resolver, known, pruned, pushed.len(), reload).await)
-}
-
-/// After a prune: an entry created between the snapshot load and the SCAN
-/// was not in the snapshot, so the prune deleted it as stale and every
-/// replica would miss it until the next pass. When the prune removed
-/// anything, read Postgres again; restore what it still has, and evict what
-/// it does not (including a `known` entry deleted mid-pass, which the prune
-/// left alone because it still matched). A failed re-read is only logged:
-/// the push and prune already landed, and the next pass repeats this.
-/// Returns the namespace's entry count.
-async fn settle_pruned<T, F, Fut>(
-    redis: &RedisStore,
-    resolver: Resolver,
-    known: &HashSet<String>,
-    pruned: Vec<String>,
-    pushed: usize,
-    reload: F,
-) -> usize
-where
-    T: serde::Serialize,
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Reloaded<T>>,
-{
-    if pruned.is_empty() {
-        return pushed;
-    }
-    let invalidate = |ids: &[String]| -> Vec<obleth_redis::Invalidation> {
-        ids.iter().map(|id| resolver.invalidation(id)).collect()
-    };
-    let fresh = match reload().await {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::warn!(error = %e, ?resolver, "redis re-warm: re-read after prune failed; a wrongly pruned entry may be missing until the next pass");
-            let _ = redis.publish_invalidations(&invalidate(&pruned)).await;
-            return pushed;
-        }
-    };
-    let pruned: HashSet<String> = pruned.into_iter().collect();
-    let fresh_by_id: HashMap<&str, &T> = fresh.iter().map(|(id, v)| (id.as_str(), v)).collect();
-    let fresh_ids: HashSet<&str> = fresh_by_id.keys().copied().collect();
-    let (restore, evict) = restore_and_evict(known, &pruned, &fresh_ids);
-    let restored: Vec<(String, &T)> = restore
-        .into_iter()
-        .filter_map(|id| fresh_by_id.get(id.as_str()).map(|v| (id, *v)))
-        .collect();
-    match redis.put_resolved_bulk(resolver, &restored).await {
-        Ok(()) => {
-            let ids: Vec<String> = restored.into_iter().map(|(id, _)| id).collect();
-            let _ = redis.publish_invalidations(&invalidate(&ids)).await;
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, ?resolver, "redis re-warm: restoring wrongly pruned entries failed")
-        }
-    }
-    let _ = redis.delete_resolved_bulk(resolver, &evict).await;
-    let _ = redis.publish_invalidations(&invalidate(&evict)).await;
-    fresh.len()
-}
-
-/// From a snapshot's `known` identifiers (hashes or names) and what the
-/// SCAN-based prune actually deleted (`pruned`), decide what a fresh
-/// post-prune reload should restore vs. evict. An identifier still present in
-/// `fresh` is restored — the prune deleted a live entry, most likely one
-/// created between the snapshot load and the SCAN (item N1). Anything still
-/// absent is evicted, which covers both a `pruned` identifier confirmed gone
-/// for good and a `known` identifier deleted mid-pass: the prune itself
-/// leaves the latter alone (it still matched `known` at SCAN time), so this
-/// is the only place that catches it. Pure and type-agnostic (keys, models
-/// and MCP servers all key their resolver cache by plain strings), so it's
-/// unit-tested directly instead of only through a live Redis.
-fn restore_and_evict(
-    known: &std::collections::HashSet<String>,
-    pruned: &std::collections::HashSet<String>,
-    fresh: &std::collections::HashSet<&str>,
-) -> (Vec<String>, Vec<String>) {
-    let restore = pruned
-        .iter()
-        .filter(|id| fresh.contains(id.as_str()))
-        .cloned()
-        .collect();
-    let evict = pruned
-        .iter()
-        .chain(known.iter())
-        .filter(|id| !fresh.contains(id.as_str()))
-        .cloned()
-        .collect();
-    (restore, evict)
-}
-
-/// Resolved models keyed by every addressable name (canonical name, aliases and
-/// variants). A variant's key holds its parent's route as is; the proxy adds
-/// the variant's boons per request.
-fn models_by_name(
-    models: Vec<(String, obleth_config::ResolvedModel)>,
-) -> Vec<(String, obleth_config::ResolvedModel)> {
-    models
-        .into_iter()
-        .flat_map(|(_, m)| {
-            m.addressable_names()
-                .map(|n| (n.to_string(), m.clone()))
-                .collect::<Vec<_>>()
-        })
-        .collect()
+    let count = |o: &obleth_admin::rewarm::Outcome| o.as_ref().ok().map(|p| p.ids.len());
+    tracing::debug!(
+        keys = ?count(&pass.keys),
+        models = ?count(&pass.models),
+        mcp = ?count(&pass.mcp),
+        "redis re-warm pass complete"
+    );
 }
 
 /// Initialize logging + (optionally) OTLP trace export. Returns the tracer
@@ -1780,7 +1575,7 @@ mod registry_refresh_tests {
             description: String::new(),
             boons: vec!["speculation".into()],
         }];
-        let keyed = models_by_name(vec![("glm-5-3".into(), parent.clone())]);
+        let keyed = obleth_admin::rewarm::models_by_name(vec![("glm-5-3".into(), parent.clone())]);
         let names: Vec<&str> = keyed.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, vec!["glm-5-3", "glm-5-3-fp8", "glm-5-3-spec"]);
         // The variant's key holds the parent unchanged; its boons are added per
@@ -1965,183 +1760,6 @@ mod shutdown_tests {
             .expect("grace elapsed")
             .unwrap();
         assert!(res.is_ok());
-    }
-
-    /// Pure, always-on coverage of the restore/evict decision itself — the
-    /// actual logic behind both I1 (a revoked key must not come back) and N1
-    /// (a key created mid-pass must not be wrongly evicted). This is the
-    /// primary proof: it needs no Redis and can't leave any shared state
-    /// behind, unlike the SCAN-based prune the integration test below drives
-    /// for real (see that test's doc comment for why it's careful about it).
-    #[test]
-    fn restore_and_evict_keeps_a_mid_pass_create_and_drops_a_genuine_revocation() {
-        use std::collections::HashSet;
-        let known: HashSet<String> = ["kept", "deleted-mid-pass"]
-            .into_iter()
-            .map(String::from)
-            .collect();
-        // `pruned` is what the SCAN removed: `created-mid-pass` (wrongly —
-        // it's not in `known` only because the snapshot predates it) and
-        // `revoked` (correctly — Postgres dropped it before the snapshot).
-        let pruned: HashSet<String> = ["created-mid-pass", "revoked"]
-            .into_iter()
-            .map(String::from)
-            .collect();
-        // The post-prune reload: `kept` still there, `created-mid-pass` now
-        // visible, `deleted-mid-pass` gone (an admin delete that landed after
-        // the snapshot but that the prune couldn't see, since it still
-        // matched `known`), `revoked` still gone.
-        let fresh: HashSet<&str> = ["kept", "created-mid-pass"].into_iter().collect();
-
-        let (mut restore, mut evict) = restore_and_evict(&known, &pruned, &fresh);
-        restore.sort();
-        evict.sort();
-        assert_eq!(restore, vec!["created-mid-pass".to_string()]);
-        assert_eq!(
-            evict,
-            vec!["deleted-mid-pass".to_string(), "revoked".to_string()]
-        );
-    }
-
-    #[test]
-    fn restore_and_evict_is_empty_when_the_prune_removed_nothing() {
-        use std::collections::HashSet;
-        let known: HashSet<String> = ["kept"].into_iter().map(String::from).collect();
-        let pruned: HashSet<String> = HashSet::new();
-        let fresh: HashSet<&str> = ["kept"].into_iter().collect();
-        assert_eq!(
-            restore_and_evict(&known, &pruned, &fresh),
-            (Vec::new(), Vec::new())
-        );
-    }
-
-    /// Integration smoke test for the real Redis plumbing behind both
-    /// scenarios `restore_and_evict_keeps_a_mid_pass_create_and_drops_a_genuine_revocation`
-    /// covers in isolation above.
-    ///
-    /// `prune_and_settle` calls `RedisStore::prune_stale_resolved`, which
-    /// SCANs and deletes across the *entire* `obleth:key3:*` namespace —
-    /// not just the hashes this test creates. Point `OBLETH_TEST_REDIS_URL`
-    /// at an isolated database (e.g. Redis db 15, the project's documented
-    /// test database — never db 0 / a shared or live instance): running this
-    /// against a real deployment's default database deletes its live
-    /// resolved-key cache. Both scenarios are folded into one `#[tokio::test]`
-    /// (rather than two, as originally written) because two such tests
-    /// running in parallel — the default for `cargo test` — race the same
-    /// SCAN and can prune each other's freshly-written keys.
-    #[tokio::test]
-    async fn push_prune_and_settle_keys_integration() {
-        let Ok(url) = std::env::var("OBLETH_TEST_REDIS_URL") else {
-            eprintln!("skipping: set OBLETH_TEST_REDIS_URL to run");
-            return;
-        };
-        let redis = obleth_redis::RedisStore::connect(&url)
-            .await
-            .expect("connect");
-
-        // Scenario 1 (I1): revoked before the snapshot was loaded, absent
-        // from both the snapshot and the post-prune reload — stays evicted.
-        let revoked_hash = format!("test-rewarm-{}", uuid::Uuid::new_v4());
-        redis
-            .put_resolved_key(&revoked_hash, &test_resolved_key())
-            .await
-            .unwrap();
-
-        // Scenario 2 (N1): created between the snapshot load and the SCAN —
-        // already in Redis (the admin create path pushes synchronously) but
-        // missing from the snapshot; the post-prune reload shows it, so it
-        // must be restored.
-        let created_hash = format!("test-rewarm-{}", uuid::Uuid::new_v4());
-        let created_key = test_resolved_key();
-        redis
-            .put_resolved_key(&created_hash, &created_key)
-            .await
-            .unwrap();
-
-        let kept_hash = format!("test-rewarm-{}", uuid::Uuid::new_v4());
-        let kept_key = test_resolved_key();
-        redis.put_resolved_key(&kept_hash, &kept_key).await.unwrap();
-
-        // The pass's own snapshot predates the create: only `kept` and
-        // (already-gone-from-Postgres) nothing for `revoked_hash`.
-        let snapshot = vec![(kept_hash.clone(), kept_key.clone())];
-        // The post-prune reload runs later: Postgres now also has `created`,
-        // and still doesn't have `revoked`.
-        let reread = vec![
-            (kept_hash.clone(), kept_key),
-            (created_hash.clone(), created_key),
-        ];
-
-        let pushed = push_snapshot(&redis, Resolver::Keys, Ok(snapshot)).await;
-        assert!(pushed.is_some());
-        let counts = prune_and_settle(
-            &redis,
-            (pushed, move || async move { Ok(reread) }),
-            (None, || async { Ok(Vec::new()) }),
-            (None, || async { Ok(Vec::new()) }),
-        )
-        .await;
-        assert_eq!(counts, [Some(2), None, None], "only the keys ran");
-        assert!(
-            redis
-                .get_resolved_key(&revoked_hash)
-                .await
-                .unwrap()
-                .is_none(),
-            "a key revoked before the snapshot must stay evicted"
-        );
-        assert!(
-            redis
-                .get_resolved_key(&created_hash)
-                .await
-                .unwrap()
-                .is_some(),
-            "a key created during the pass must survive it"
-        );
-        assert!(redis.get_resolved_key(&kept_hash).await.unwrap().is_some());
-
-        redis.delete_resolved_key(&created_hash).await.unwrap();
-        redis.delete_resolved_key(&kept_hash).await.unwrap();
-    }
-
-    fn test_resolved_key() -> obleth_config::ResolvedKey {
-        obleth_config::ResolvedKey {
-            key_id: uuid::Uuid::new_v4(),
-            tenant_id: uuid::Uuid::new_v4(),
-            tenant_name: "t".into(),
-            key_name: "k".into(),
-            fairshare_group: "default".into(),
-            group_weight: 100,
-            weight: 7,
-            tokens_per_minute: 1000,
-            max_in_flight: None,
-            disabled: false,
-            status: "active".into(),
-            timezone: "UTC".into(),
-            active_from: None,
-            active_until: None,
-            weekly_windows: None,
-            budget_tokens: None,
-            budget_cost_usd: None,
-            budget_period: None,
-            budget_started_at: None,
-            key_budget_tokens: None,
-            key_budget_cost_usd: None,
-            key_budget_period: None,
-            key_budget_started_at: None,
-            key_weight: 100,
-            key_max_in_flight: None,
-            end_user_fairshare: false,
-            background: false,
-            allowed_models: None,
-            internal: false,
-            tracing_enabled: false,
-            guardrails_policy: None,
-            compression_policy: None,
-            synthetic: false,
-            allowed_networks: Vec::new(),
-            allowed_countries: Vec::new(),
-        }
     }
 
     #[test]

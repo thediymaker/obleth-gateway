@@ -22,6 +22,7 @@ mod models_io;
 mod names;
 mod openapi;
 pub mod recipes;
+pub mod rewarm;
 pub mod router_readiness;
 pub mod slurm_resources;
 pub mod slurm_settings;
@@ -7764,146 +7765,41 @@ async fn patch_tenant_group(
     Ok(Json(tenant))
 }
 
-/// Republish every key from Postgres and evict Redis entries with no backing
-/// row (e.g. a delete whose eviction failed). Returns (pushed, pruned).
-async fn resync_all_keys(state: &AdminState) -> Result<(usize, usize)> {
-    let keys = state.store.all_resolved_keys().await?;
-    push_keys_bulk(state, &keys, BulkInvalidation::All).await?;
-    let known: std::collections::HashSet<String> = keys.iter().map(|(h, _)| h.clone()).collect();
-    let pruned: std::collections::HashSet<String> = state
-        .redis
-        .prune_stale_resolved_keys(&known)
-        .await?
-        .into_iter()
-        .collect();
-    // Re-read after the prune: a key inserted after the snapshot but pushed
-    // before the SCAN was pruned wrongly and is restored here, and a key deleted
-    // after the snapshot (and so re-pushed above) is evicted again.
-    let fresh = state.store.all_resolved_keys().await?;
-    let fresh_hashes: std::collections::HashSet<&str> =
-        fresh.iter().map(|(h, _)| h.as_str()).collect();
-    let restore: Vec<(String, ResolvedKey)> = fresh
-        .iter()
-        .filter(|(h, _)| pruned.contains(h))
-        .cloned()
-        .collect();
-    push_keys_bulk(state, &restore, BulkInvalidation::PerKey).await?;
-    let gone: Vec<String> = pruned
-        .iter()
-        .chain(known.iter())
-        .filter(|h| !fresh_hashes.contains(h.as_str()))
-        .cloned()
-        .collect();
-    evict_keys(state, &gone, "stale keys").await?;
-    Ok((fresh.len(), gone.len()))
-}
-
-/// Evict every resolver name among `seen` that no enabled model answers to
-/// any more (`fresh`), and say so to the data plane. Returns how many.
-async fn evict_model_names_gone_since<'a>(
-    redis: &RedisStore,
-    seen: impl Iterator<Item = &'a String>,
-    fresh: &std::collections::HashSet<String>,
-) -> Result<usize> {
-    let gone: std::collections::BTreeSet<&str> = seen
-        .map(String::as_str)
-        .filter(|n| !fresh.contains(*n))
-        .collect();
-    for name in &gone {
-        redis
-            .delete_resolved_model(name)
-            .await
-            .map_err(|e| cache_removal_failed("a model removed during the resync", e))?;
-        redis
-            .publish_invalidation(&Invalidation::Model(name.to_string()))
-            .await?;
+/// Rebuild the data plane's resolver cache from Postgres: the gateways'
+/// periodic re-warm run now (every key, model and MCP server pushed
+/// pipelined, stale entries pruned in one SCAN), then every gateway told to
+/// drop what it holds in process.
+pub(crate) async fn resync_resolvers(state: &AdminState) -> Result<ResyncReport> {
+    let pass = rewarm::push_and_prune(&state.store, &state.redis, rewarm::Reread::Always).await;
+    let failed = |o: &rewarm::Outcome| o.as_ref().err().cloned();
+    if let Some(why) = failed(&pass.keys)
+        .or_else(|| failed(&pass.models))
+        .or_else(|| failed(&pass.mcp))
+    {
+        return Err(AdminError::CacheSync(format!(
+            "the resolver cache was not fully rebuilt ({why}); run {RESYNC_ROUTE} again"
+        )));
     }
-    Ok(gone.len())
-}
-
-/// Republish every model and MCP server from Postgres and evict resolver
-/// entries no enabled row answers to. Returns (models, pruned names, mcp
-/// servers, pruned servers).
-async fn resync_models_and_mcp(state: &AdminState) -> Result<(usize, usize, usize, usize)> {
-    use std::collections::HashSet;
-    fn model_names(models: &[ModelRoute]) -> HashSet<String> {
-        models
-            .iter()
-            .filter(|m| m.enabled)
-            .flat_map(|m| m.addressable_names())
-            .map(str::to_string)
-            .collect()
-    }
-    fn server_names(servers: &[McpServer]) -> HashSet<String> {
-        servers
-            .iter()
-            .filter(|s| s.enabled)
-            .map(|s| s.name.clone())
-            .collect()
-    }
-
-    let models = state.store.list_models().await?;
-    for model in &models {
-        sync_model(state, model).await?;
-    }
-    let listed_names = model_names(&models);
-    let pruned_models = state
-        .redis
-        .prune_stale_resolved_models(&listed_names)
-        .await?;
-    // Same re-read as `resync_all_keys`: restore anything created mid-prune,
-    // and evict a model deleted or disabled after the list, which was just
-    // republished from its old row and so escaped the prune.
-    let fresh_models = state.store.list_models().await?;
-    let fresh_names = model_names(&fresh_models);
-    for model in &fresh_models {
-        if model.enabled
-            && model
-                .addressable_names()
-                .any(|n| pruned_models.iter().any(|p| p == n))
-        {
-            sync_model(state, model).await?;
+    let (keys, models, mcp) = (
+        pass.keys.unwrap_or_default(),
+        pass.models.unwrap_or_default(),
+        pass.mcp.unwrap_or_default(),
+    );
+    // Every gateway drops what it holds in process and reads the new rows.
+    state.redis.publish_invalidation(&Invalidation::All).await?;
+    if let Some(tx) = &state.local_cache_tx {
+        for hash in keys.ids.iter().chain(&keys.evicted) {
+            let _ = tx.send(hash.clone());
         }
     }
-    let gone = evict_model_names_gone_since(
-        &state.redis,
-        listed_names.iter().chain(pruned_models.iter()),
-        &fresh_names,
-    )
-    .await?;
-
-    let servers = state.store.list_mcp_servers().await?;
-    for server in &servers {
-        sync_mcp_server(state, server).await?;
-    }
-    let pruned_servers = state
-        .redis
-        .prune_stale_resolved_mcp_servers(&server_names(&servers))
-        .await?;
-    let fresh_servers = state.store.list_mcp_servers().await?;
-    let fresh_server_names = server_names(&fresh_servers);
-    for server in fresh_servers
-        .iter()
-        .filter(|s| pruned_servers.contains(&s.name))
-    {
-        sync_mcp_server(state, server).await?;
-    }
-    for name in pruned_servers
-        .iter()
-        .filter(|n| !fresh_server_names.contains(*n))
-    {
-        state
-            .redis
-            .publish_invalidation(&Invalidation::Mcp(name.to_string()))
-            .await?;
-    }
-
-    Ok((
-        fresh_models.len(),
-        gone,
-        fresh_servers.len(),
-        pruned_servers.len(),
-    ))
+    Ok(ResyncReport {
+        keys: keys.ids.len(),
+        keys_pruned: keys.evicted.len(),
+        models: models.rows,
+        model_names_pruned: models.evicted.len(),
+        mcp_servers: mcp.ids.len(),
+        mcp_servers_pruned: mcp.evicted.len(),
+    })
 }
 
 /// Outcome of a resolver-cache reconcile.
@@ -7933,17 +7829,7 @@ async fn resync_resolver_cache(
     State(state): State<AdminState>,
     headers: HeaderMap,
 ) -> Result<Json<ResyncReport>> {
-    let (keys, keys_pruned) = resync_all_keys(&state).await?;
-    let (models, model_names_pruned, mcp_servers, mcp_servers_pruned) =
-        resync_models_and_mcp(&state).await?;
-    let report = ResyncReport {
-        keys,
-        keys_pruned,
-        models,
-        model_names_pruned,
-        mcp_servers,
-        mcp_servers_pruned,
-    };
+    let report = resync_resolvers(&state).await?;
     state
         .store
         .record_audit(
@@ -10910,18 +10796,7 @@ async fn sync_mcp_server(state: &AdminState, server: &McpServer) -> Result<()> {
 /// Re-push every key of a tenant after a weight/quota change.
 async fn sync_tenant_keys(state: &AdminState, tenant_id: Uuid) -> Result<()> {
     let keys = state.store.resolved_keys_for_tenant(tenant_id).await?;
-    push_keys_bulk(state, &keys, BulkInvalidation::PerKey).await
-}
-
-/// How a bulk key push tells the gateways to drop their in-process copies.
-#[derive(Clone, Copy)]
-enum BulkInvalidation {
-    /// One message per pushed hash. Used for scoped pushes (a group weight
-    /// change) so gateways keep every unrelated key, model, and MCP entry.
-    PerKey,
-    /// A single `*`, which clears every gateway's key, model, and MCP caches.
-    /// Used only by the full reconcile, which rewrites all of them anyway.
-    All,
+    push_keys_bulk(state, &keys).await
 }
 
 /// Re-push the keys of every tenant in a fairshare group after its weight
@@ -10929,32 +10804,25 @@ enum BulkInvalidation {
 /// untouched; no SCAN or prune runs here (that is `POST /api/v1/resync`).
 async fn sync_group_keys(state: &AdminState, group: &str) -> Result<usize> {
     let keys = state.store.resolved_keys_for_group(group).await?;
-    push_keys_bulk(state, &keys, BulkInvalidation::PerKey).await?;
+    push_keys_bulk(state, &keys).await?;
     Ok(keys.len())
 }
 
 /// Write many resolved keys to Redis, pipelined, then invalidate the
 /// gateways' in-process copies. Every SET completes before any invalidation
 /// is published, so a gateway that refetches on the message reads the new row.
-async fn push_keys_bulk(
-    state: &AdminState,
-    keys: &[(String, ResolvedKey)],
-    invalidation: BulkInvalidation,
-) -> Result<()> {
+async fn push_keys_bulk(state: &AdminState, keys: &[(String, ResolvedKey)]) -> Result<()> {
     if keys.is_empty() {
         return Ok(());
     }
     state.redis.put_resolved_bulk(Resolver::Keys, keys).await?;
-    match invalidation {
-        BulkInvalidation::All => state.redis.publish_invalidation(&Invalidation::All).await?,
-        BulkInvalidation::PerKey => {
-            let targets: Vec<Invalidation> = keys
-                .iter()
-                .map(|(hash, _)| Invalidation::Key(hash.clone()))
-                .collect();
-            state.redis.publish_invalidations(&targets).await?
-        }
-    }
+    // One message per pushed hash, so gateways keep every unrelated key,
+    // model and MCP entry.
+    let targets: Vec<Invalidation> = keys
+        .iter()
+        .map(|(hash, _)| Invalidation::Key(hash.clone()))
+        .collect();
+    state.redis.publish_invalidations(&targets).await?;
     if let Some(tx) = &state.local_cache_tx {
         for (hash, _) in keys {
             let _ = tx.send(hash.clone());
@@ -15472,36 +15340,6 @@ mod tests {
         let mut b = status_body(obleth_config::ModelStatus::Deprecated);
         b.note = Some("x".repeat(obleth_config::MAX_LIFECYCLE_NOTE_CHARS + 1));
         assert!(refused(b, None));
-    }
-
-    /// Integration test; runs only with `OBLETH_TEST_REDIS_URL`. A model that
-    /// was listed when the resync began but is gone (or disabled) on the
-    /// re-read is evicted, not left resolving from its old row.
-    #[tokio::test]
-    async fn a_model_gone_during_a_resync_is_evicted() {
-        let Ok(url) = std::env::var("OBLETH_TEST_REDIS_URL") else {
-            eprintln!("skipping: set OBLETH_TEST_REDIS_URL to run");
-            return;
-        };
-        let redis = RedisStore::connect(&url).await.expect("connect redis");
-        let name = format!("gone-{}", Uuid::new_v4().simple());
-        let kept = format!("kept-{}", Uuid::new_v4().simple());
-        for n in [&name, &kept] {
-            let m = fixture_model_route(n);
-            redis
-                .put_resolved_model(n, &resolved_model_of(&m, Vec::new(), Vec::new()))
-                .await
-                .unwrap();
-        }
-        let seen = [name.clone(), kept.clone()];
-        let fresh: std::collections::HashSet<String> = [kept.clone()].into_iter().collect();
-        let evicted = evict_model_names_gone_since(&redis, seen.iter(), &fresh)
-            .await
-            .unwrap();
-        assert_eq!(evicted, 1);
-        assert!(redis.get_resolved_model(&name).await.unwrap().is_none());
-        assert!(redis.get_resolved_model(&kept).await.unwrap().is_some());
-        redis.delete_resolved_model(&kept).await.unwrap();
     }
 
     #[test]

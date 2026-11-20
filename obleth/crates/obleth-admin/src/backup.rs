@@ -17,7 +17,7 @@ use obleth_config::{
 use obleth_store::CryptoError;
 
 use crate::ssrf::{SsrfPolicy, VERIFY_TEMPLATE_PLACEHOLDERS};
-use crate::{audit_actor, resync_all_keys, AdminError, AdminState, Result};
+use crate::{audit_actor, resync_resolvers, AdminError, AdminState, Result};
 
 #[utoipa::path(
     get, path = "/api/v1/backup/export", tag = "backup",
@@ -130,8 +130,7 @@ pub(crate) async fn restore_backup(
     // Re-sync the Redis hot caches so the data plane sees the restored config
     // without waiting for its periodic refresh: the same pass as
     // POST /api/v1/resync, which also prunes entries the backup no longer has.
-    resync_all_keys(&state).await?;
-    crate::resync_models_and_mcp(&state).await?;
+    resync_resolvers(&state).await?;
     // Alert settings are pushed (not polled); reload them live. Auto-router,
     // boons and retention are picked up by the proxy's poll loop.
     if let Some(settings) = state.store.get_alert_settings().await? {
