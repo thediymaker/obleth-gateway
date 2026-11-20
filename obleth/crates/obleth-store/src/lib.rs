@@ -6726,6 +6726,15 @@ mod tests {
             )
             .await
             .expect("make due");
+        // The test database is shared: other tests' models can be due too, and
+        // the claim takes the longest-overdue first. Put this one first.
+        sqlx::query(
+            "update models set health_next_check_at = now() - interval '1 day' where id = $1",
+        )
+        .bind(model.id)
+        .execute(&store.pool)
+        .await
+        .expect("make most overdue");
         let claims = store
             .claim_due_model_health_checks(10)
             .await
