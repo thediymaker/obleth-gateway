@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { buildChart, change, daysBetween, eachDay, presetRange, previousRange, sortRows, totals } from "./reports-model";
+import { buildChart, change, daysBetween, eachDay, pickedDay, presetRange, previousRange, rangeLabel, sortRows, totals } from "./reports-model";
+import { linkTime } from "./log-links";
 import { timeline } from "./trace-model";
 import type { SpanEntry, UsageDailyRow } from "./obleth";
 
@@ -9,7 +10,7 @@ const row = (over: Partial<UsageDailyRow> = {}): UsageDailyRow => ({
   avg_ttft_ms: 400, avg_total_ms: 2000, cost_usd: 1, energy_wh: 10, energy_cost_usd: 0.1, co2_g: 3, ...over,
 });
 
-const sep27 = new Date(2026, 8, 27, 15, 0);
+const sep27 = new Date(Date.UTC(2026, 8, 27, 15, 0));
 
 describe("date ranges", () => {
   it("counts presets back from today", () => {
@@ -24,6 +25,26 @@ describe("date ranges", () => {
     // March 1–31 so far compares with February, which has fewer days.
     expect(previousRange({ start: "2026-03-01", end: "2026-03-31" }, "month")).toEqual({ start: "2026-02-01", end: "2026-02-28" });
     expect(previousRange({ start: "2026-08-01", end: "2026-08-31" }, "last-month")).toEqual({ start: "2026-07-01", end: "2026-07-31" });
+  });
+
+  it("counts in UTC days wherever the reader is, and says so", () => {
+    const zone = process.env.TZ;
+    try {
+      for (const tz of ["America/Phoenix", "Asia/Tokyo"]) {
+        process.env.TZ = tz;
+        // 23:30Z on Sep 30 is Oct 1 in Tokyo and still Sep 30 in Phoenix: the report's today is Sep 30.
+        const late = new Date(Date.UTC(2026, 8, 30, 23, 30));
+        expect(presetRange("month", late)).toEqual({ start: "2026-09-01", end: "2026-09-30" });
+        expect(presetRange("last-month", late)).toEqual({ start: "2026-08-01", end: "2026-08-31" });
+        // A day picked on the calendar comes back as its local midnight.
+        expect(pickedDay(new Date(2026, 8, 21))).toBe("2026-09-21");
+        // The day's drill-down link spans 00:00Z to 24:00Z.
+        expect(linkTime("2026-09-21", true)! + 1 - linkTime("2026-09-21", false)!).toBe(86_400_000);
+        expect(rangeLabel({ start: "2026-09-01", end: "2026-09-27" })).toBe("Sep 1 – Sep 27, 2026 UTC");
+      }
+    } finally {
+      process.env.TZ = zone;
+    }
   });
 
   it("compares any other range with as many days just before it", () => {

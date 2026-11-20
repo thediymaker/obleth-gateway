@@ -24,21 +24,35 @@ export interface DayRange {
   end: string;
 }
 
-/** `YYYY-MM-DD` in local time: a day is the day the person reading means. */
+/**
+ * `YYYY-MM-DD` of the UTC day `d` falls in. Reports reads the daily rollup,
+ * which cuts days at 00:00 UTC, so every day on the page, and every link to
+ * a day's requests, is a UTC day.
+ */
 export function isoDay(d: Date): string {
+  return d.toISOString().slice(0, 10);
+}
+
+/** `YYYY-MM-DD` of a day picked on the calendar, which hands back the local midnight of the day clicked. */
+export function pickedDay(d: Date): string {
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
 function parseDay(s: string): Date {
   const [y, m, d] = s.split("-").map(Number);
-  return new Date(y, m - 1, d);
+  return new Date(Date.UTC(y, m - 1, d));
 }
 
 function addDays(s: string, n: number): string {
   const d = parseDay(s);
-  d.setDate(d.getDate() + n);
+  d.setUTCDate(d.getUTCDate() + n);
   return isoDay(d);
+}
+
+/** A day's short label ("Sep 3"), read as the UTC day it is. */
+export function dayLabel(day: string, year = false): string {
+  return parseDay(day).toLocaleDateString([], { month: "short", day: "numeric", timeZone: "UTC", ...(year ? { year: "numeric" } : {}) });
 }
 
 export function daysBetween(r: DayRange): number {
@@ -47,12 +61,11 @@ export function daysBetween(r: DayRange): number {
 
 export function presetRange(preset: Exclude<RangePreset, "custom">, today = new Date()): DayRange {
   const t = isoDay(today);
+  const [y, m] = [today.getUTCFullYear(), today.getUTCMonth()];
   if (preset === "7d") return { start: addDays(t, -6), end: t };
   if (preset === "30d") return { start: addDays(t, -29), end: t };
-  if (preset === "month") return { start: isoDay(new Date(today.getFullYear(), today.getMonth(), 1)), end: t };
-  const first = new Date(today.getFullYear(), today.getMonth() - 1, 1);
-  const last = new Date(today.getFullYear(), today.getMonth(), 0);
-  return { start: isoDay(first), end: isoDay(last) };
+  if (preset === "month") return { start: isoDay(new Date(Date.UTC(y, m, 1))), end: t };
+  return { start: isoDay(new Date(Date.UTC(y, m - 1, 1))), end: isoDay(new Date(Date.UTC(y, m, 0))) };
 }
 
 /**
@@ -65,20 +78,20 @@ export function previousRange(r: DayRange, preset: RangePreset): DayRange {
   if (preset === "month" || preset === "last-month") {
     const s = parseDay(r.start);
     const e = parseDay(r.end);
-    const ps = new Date(s.getFullYear(), s.getMonth() - 1, 1);
-    const lastOfPrev = new Date(s.getFullYear(), s.getMonth(), 0).getDate();
+    const ps = new Date(Date.UTC(s.getUTCFullYear(), s.getUTCMonth() - 1, 1));
+    const lastOfPrev = new Date(Date.UTC(s.getUTCFullYear(), s.getUTCMonth(), 0)).getUTCDate();
     const wholeMonth = preset === "last-month";
-    const pe = new Date(ps.getFullYear(), ps.getMonth(), wholeMonth ? lastOfPrev : Math.min(e.getDate(), lastOfPrev));
+    const pe = new Date(Date.UTC(ps.getUTCFullYear(), ps.getUTCMonth(), wholeMonth ? lastOfPrev : Math.min(e.getUTCDate(), lastOfPrev)));
     return { start: isoDay(ps), end: isoDay(pe) };
   }
   const n = daysBetween(r);
   return { start: addDays(r.start, -n), end: addDays(r.start, -1) };
 }
 
+/** "Sep 1 – Sep 27, 2026 UTC": the range's UTC days. */
 export function rangeLabel(r: DayRange): string {
-  const fmt = (s: string, year: boolean) => parseDay(s).toLocaleDateString([], { month: "short", day: "numeric", ...(year ? { year: "numeric" } : {}) });
   const sameYear = r.start.slice(0, 4) === r.end.slice(0, 4);
-  return r.start === r.end ? fmt(r.start, true) : `${fmt(r.start, !sameYear)} – ${fmt(r.end, true)}`;
+  return `${r.start === r.end ? dayLabel(r.start, true) : `${dayLabel(r.start, !sameYear)} – ${dayLabel(r.end, true)}`} UTC`;
 }
 
 /** Every day in the range, oldest first. */

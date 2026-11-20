@@ -36,14 +36,6 @@ const COLUMNS = "grid grid-cols-[minmax(12rem,250px)_76px_104px_84px_minmax(0,1f
 const CHART_W = 1400;
 const CHART_H = 176;
 
-function zone(): string | undefined {
-  try {
-    return Intl.DateTimeFormat().resolvedOptions().timeZone || undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 function useSpeed(range: DayRange | null, filters: { tenantId: string; keyId: string; model: string }, bucket: "none" | SpeedBucket) {
   return useQuery({
     queryKey: ["usage-speed", range?.start, range?.end, filters.tenantId, filters.keyId, filters.model, bucket],
@@ -54,8 +46,7 @@ function useSpeed(range: DayRange | null, filters: { tenantId: string; keyId: st
         until_ms: String(linkTime(range!.end, true)! + 1),
         bucket,
       });
-      const tz = zone();
-      if (tz && bucket !== "none") p.set("tz", tz);
+      // Hours and days are UTC, like the daily rollup the rest of Reports reads (the gateway's default).
       if (filters.tenantId) p.set("tenant_id", filters.tenantId);
       if (filters.keyId) p.set("key_id", filters.keyId);
       if (filters.model) p.set("model", filters.model);

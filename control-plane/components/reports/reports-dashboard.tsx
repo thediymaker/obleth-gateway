@@ -24,7 +24,9 @@ import {
   buildChart,
   change,
   daysBetween,
+  dayLabel,
   isoDay,
+  pickedDay,
   MEASURES,
   presetRange,
   previousRange,
@@ -84,7 +86,7 @@ function ChartTip({ active, payload, label, measure, series }: { active?: boolea
   const row = payload[0].payload;
   return (
     <div className="min-w-48 rounded-lg border border-border bg-[hsl(240_5%_9%)] px-3 py-2 text-xs shadow-xl">
-      <p className="mb-1.5 font-mono text-muted-foreground">{label}</p>
+      <p className="mb-1.5 font-mono text-muted-foreground">{String(row.label ?? label)}</p>
       {series.length ? (
         series.map((s) => (
           <div key={s.id} className="flex justify-between gap-6">
@@ -118,7 +120,7 @@ export function ReportsDashboard({ tenants, keys, models, retentionDays = null, 
 
   const router = useRouter();
   const range: DayRange | null = preset === "custom"
-    ? custom?.from ? { start: isoDay(custom.from), end: isoDay(custom.to ?? custom.from) } : null
+    ? custom?.from ? { start: pickedDay(custom.from), end: pickedDay(custom.to ?? custom.from) } : null
     : presetRange(preset);
   const prev = range ? previousRange(range, preset) : null;
   const filters = { tenantId, keyId, model };
@@ -146,7 +148,9 @@ export function ReportsDashboard({ tenants, keys, models, retentionDays = null, 
 
   const labelFor = (r: UsageDailyRow) => (split === "tenant" ? names.tenantNames.get(r.tenant_id) ?? "Deleted team" : r.model || "(unknown)");
   const chart = range ? buildChart(range, measure, split, days.data ?? [], prev && prevDays.data ? { range: prev, rows: prevDays.data } : null, splitRows.data ?? [], labelFor) : { days: [], series: [] };
-  const chartRows = chart.days.map((d) => ({ label: new Date(`${d.day}T00:00`).toLocaleDateString([], { month: "short", day: "numeric" }), value: d.value, previous: d.previous, ...d.parts }));
+  // The newest day is still filling up until 00:00 UTC.
+  const today = isoDay(new Date());
+  const chartRows = chart.days.map((d) => ({ label: `${dayLabel(d.day)} UTC${d.day === today ? ", so far" : ""}`, tick: dayLabel(d.day), value: d.value, previous: d.previous, ...d.parts }));
   const chartEmpty = chart.days.every((d) => !d.value);
 
   const teamRank = [...(teams.data ?? [])].sort((a, b) => b.cost_usd - a.cost_usd);
@@ -242,7 +246,7 @@ export function ReportsDashboard({ tenants, keys, models, retentionDays = null, 
 
       <Panel
         label="Usage over time"
-        title={`${MEASURES.find((m) => m.value === measure)!.label} per day`}
+        title={`${MEASURES.find((m) => m.value === measure)!.label} per UTC day`}
         subtitle={`${chart.series.length ? `Split by ${split === "tenant" ? "team" : "model"}: the four largest, then the rest` : measure === "ttft" ? "Average per day; the dashed line is the same day in the previous period" : "Bars are this period; the dashed line is the same day in the previous period"} · click a day for its requests`}
         action={
           <div className="flex flex-wrap items-center gap-2">
@@ -270,7 +274,7 @@ export function ReportsDashboard({ tenants, keys, models, retentionDays = null, 
                   }}
                 >
                   <CartesianGrid {...chartGrid} vertical={false} />
-                  <XAxis dataKey="label" tick={axisTick} axisLine={false} tickLine={false} minTickGap={24} height={20} />
+                  <XAxis dataKey="tick" tick={axisTick} axisLine={false} tickLine={false} minTickGap={24} height={20} />
                   <YAxis tick={axisTick} axisLine={false} tickLine={false} width={52} tickFormatter={(v: number) => (measure === "spend" ? `$${compactAxis(v)}` : measure === "ttft" ? formatMs(v) : compactAxis(v))} />
                   <Tooltip cursor={{ fill: "hsl(240 4% 16% / 0.5)" }} content={<ChartTip measure={measure} series={chart.series} />} />
                   {chart.series.length ? (

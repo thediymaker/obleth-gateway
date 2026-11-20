@@ -6,7 +6,7 @@ const point = (over: Partial<ModelSpeedPoint> = {}): ModelSpeedPoint => ({
   bucket_ms: 0, model: "m", requests: 100, rated: 90, gen_tokens_per_sec: 50, slow_tokens_per_sec: 20,
   prompt_tokens_per_sec: 2000, p50_ttft_ms: 300, ...over,
 });
-const day = (d: number) => new Date(2026, 9, d).getTime();
+const day = (d: number) => Date.UTC(2026, 9, d);
 const cell = (d: number, tps: number, usual = 50): SpeedCell => ({ t: day(d), tps, slowTps: tps / 2, rated: 30, ratio: tps / usual });
 
 describe("speedRows", () => {
@@ -66,14 +66,14 @@ describe("buckets", () => {
     expect(speedBucket({ start: "2026-10-17", end: "2026-10-23" })).toBe("day");
   });
 
-  it("starts each day at local midnight and stops hours at now", () => {
+  it("starts each day at 00:00 UTC and stops hours at now", () => {
     expect(bucketStarts({ start: "2026-10-21", end: "2026-10-23" }, "day")).toEqual([day(21), day(22), day(23)]);
-    const now = new Date(2026, 9, 23, 2, 30).getTime();
+    const now = Date.UTC(2026, 9, 23, 2, 30);
     expect(bucketStarts({ start: "2026-10-23", end: "2026-10-23" }, "hour", now)).toHaveLength(3);
   });
 
   it("labels a column where a month starts, and thins labels on long ranges", () => {
-    const labels = columnLabels([new Date(2026, 8, 30).getTime(), day(1), day(2)], "day");
+    const labels = columnLabels([Date.UTC(2026, 8, 30), day(1), day(2)], "day");
     expect(labels[1]).not.toBe("1");
     expect(labels[2]).toBe("2");
     const many = columnLabels(bucketStarts({ start: "2026-09-01", end: "2026-10-31" }, "day"), "day");
