@@ -732,11 +732,6 @@ export interface ModelActivation {
   detail: ModelHealthDetail;
 }
 
-export interface BulkModelHealthResult {
-  checked: ModelHealthDetail[];
-  skipped: number;
-}
-
 export interface ValidateModelBody {
   api_base: string;
   api_key?: string | null;
@@ -2897,11 +2892,6 @@ export const obleth = {
     api<ModelActivation>(`/models/${seg(id)}/health/activate`, {
       method: "POST",
       headers: auditActorHeaders(options),
-    }),
-  checkAllModelHealth: () =>
-    api<BulkModelHealthResult>("/models/health/check", {
-      method: "POST",
-      timeoutMs: API_TIMEOUT_MS.long,
     }),
   setModelHealthConfig: (
     id: string,

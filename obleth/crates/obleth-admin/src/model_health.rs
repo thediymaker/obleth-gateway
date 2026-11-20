@@ -255,7 +255,7 @@ pub async fn activate(
 }
 
 #[utoipa::path(
-    post, path = "/api/v1/models/health/check", tag = "models",
+    post, path = "/api/v1/models/health", tag = "models",
     responses((status = 200, body = BulkModelHealthResult))
 )]
 pub async fn check_all(State(state): State<AdminState>) -> Result<Json<BulkModelHealthResult>> {
