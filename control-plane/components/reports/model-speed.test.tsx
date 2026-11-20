@@ -112,3 +112,12 @@ describe("ModelSpeed", () => {
     expect(host.textContent).toContain("Down to the slowest tenth");
   });
 });
+
+describe("ModelSpeed when the gateway can't be read", () => {
+  it("says it can't read the speed instead of no requests", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: false, status: 502, json: async () => ({}) }) as Response));
+    await render();
+    expect(host.textContent).toContain("Can't read the models' speed right now");
+    expect(host.textContent).not.toContain("No token-producing requests");
+  });
+});

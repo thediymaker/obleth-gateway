@@ -182,3 +182,15 @@ describe("the request log", () => {
     expect([...host.querySelectorAll("button")].some((b) => b.textContent === "Paused")).toBe(true);
   });
 });
+
+describe("when the gateway can't be read", () => {
+  it("says so in the header, the breakdown and the list, instead of 0 requests", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: false, status: 502, json: async () => ({}) }) as Response));
+    await render();
+    expect(host.textContent).toContain("Can't read the request count right now");
+    expect(host.textContent).toContain("Can't read the breakdown right now");
+    expect(host.textContent).toContain("Can't read the request log right now");
+    expect(host.textContent).not.toContain("0 requests");
+    expect(host.textContent).not.toContain("No requests match");
+  });
+});

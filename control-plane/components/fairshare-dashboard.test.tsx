@@ -152,7 +152,7 @@ describe("all pools", () => {
     mocks.view = { algorithm: "fairshare", max_in_flight: 8, global_in_flight: 0, global_queued: 0, groups: [], tenants: [] };
     mocks.isError = true;
     await render();
-    expect(host.querySelector('[role="alert"]')!.textContent).toContain("Showing the last snapshot");
+    expect(host.querySelector('[role="alert"]')!.textContent).toContain("Can't refresh the scheduler state. Last updated");
   });
 });
 

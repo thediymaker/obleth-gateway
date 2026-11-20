@@ -75,11 +75,13 @@ function List({
  * narrow the list to it. Looking at failures, it leads with the status code
  * and model pairs that fail most.
  */
-export function Facets({ facets, filters, onPatch, loading }: { facets: UsageLogFacets | undefined; filters: LogFilters; onPatch: (p: Partial<LogFilters>) => void; loading: boolean }) {
+/** `failed` is what to say when the breakdown could not be read; it replaces an empty box. */
+export function Facets({ facets, filters, onPatch, loading, failed = null }: { facets: UsageLogFacets | undefined; filters: LogFilters; onPatch: (p: Partial<LogFilters>) => void; loading: boolean; failed?: string | null }) {
   const failuresOnly = onlyFailures(filters);
   // Successes come back under the empty class; a gateway too old to classify has no list.
   const classes = facets?.error_classes?.filter((f) => f.value);
   if (!facets) {
+    if (failed) return <p role="alert" className="rounded-xl border border-dashed border-border px-[18px] py-6 text-center text-xs text-muted-foreground">{failed}</p>;
     return <div className={cn("rounded-xl border border-border bg-card", loading && "skeleton h-[168px]")} />;
   }
   const empty = facets.models.length === 0;

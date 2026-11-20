@@ -37,6 +37,7 @@ import { compact } from "@/lib/overview-model";
 import { poolOccupancy } from "@/lib/occupancy";
 import { useClusterResources } from "@/lib/use-cluster-resources";
 import { cn, getJson } from "@/lib/utils";
+import { ReadNotice } from "@/components/ui/read-state";
 
 const COLS = "grid-cols-[minmax(0,1.4fr)_minmax(130px,0.9fr)_150px_minmax(0,1.4fr)_130px_84px_84px]";
 
@@ -105,6 +106,7 @@ export function DeploymentsList({ initial, recipes, tab: initialTab, slurmSheet 
   return (
     <div className="mx-auto flex max-w-[1600px] flex-col gap-[18px]">
       {slurmOpen && data.slurm && <SlurmConnection settings={data.slurm} replicas={queued + slurmReady} onClose={closeSlurm} onSaved={() => { void live.refetch(); router.refresh(); }} />}
+      <ReadNotice query={live} what="the deployments" />
       {!!data.failed?.length && (
         <p role="status" className="rounded-lg border border-foreground/60 px-3 py-2 text-[13px] text-foreground">
           obleth couldn&apos;t read {data.failed.map((f) => ({ models: "the models", specs: "the launch settings", replicas: "the replicas", slurm: "the Slurm settings" })[f] ?? f).join(", ")} just now, so some of this page may be missing. It tries again every 15 seconds.

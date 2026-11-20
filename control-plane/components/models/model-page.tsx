@@ -39,6 +39,7 @@ import {
 import type { McpServer, ModelEndpoint, ModelHealthDetail, ModelHealthSummary, ModelRoute, UsageLogFacet } from "@/lib/obleth";
 import { poolOccupancy } from "@/lib/occupancy";
 import { cn, getJson } from "@/lib/utils";
+import { ReadNotice } from "@/components/ui/read-state";
 
 type NavId = "overview" | SettingsSectionId | "lifecycle" | "activity";
 
@@ -379,7 +380,9 @@ export function ModelPage({
 
         <div className="flex min-w-0 flex-col gap-4">
           <div id="overview" className="scroll-mt-24">
-            <ModelOverview model={model} data={overviewQuery.data} summary={summary} checks={checks} runs={runs} capacity={capacityStatus} load={load} endpoints={endpoints.length} />
+            <ReadNotice query={fairshare} what="the live load" className="mb-2" />
+            <ReadNotice query={detailQuery} what="the health checks" className="mb-2" />
+            <ModelOverview model={model} overview={overviewQuery} summary={summary} checks={checks} runs={runs} capacity={capacityStatus} load={load} endpoints={endpoints.length} />
           </div>
           <ModelSettings
             model={model}

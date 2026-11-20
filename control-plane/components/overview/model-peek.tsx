@@ -10,6 +10,7 @@ import { compact, describeAudit, formatMs, modelTypeLabel, RANGE_BUCKET_MS, RANG
 import { cn, getJson } from "@/lib/utils";
 import { HealthGlyph, Meter, Pill, SectionLabel, Sparkline } from "./ui";
 import { modelHref } from "@/lib/model-links";
+import { readFailed, readProblem } from "@/components/ui/read-state";
 
 const HEALTH_LABEL = { healthy: "Healthy", unhealthy: "Failing", unknown: "No health data", maintenance: "In maintenance" } as const;
 
@@ -100,14 +101,14 @@ export function ModelPeek({ tile, model, usage, audit, range, onClose }: {
 
                 <section className="space-y-2">
                   <div className="flex justify-between"><SectionLabel>Requests · {RANGE_LABEL[range].toLowerCase()}</SectionLabel></div>
-                  {series.isLoading ? <div className="h-16 animate-pulse rounded-lg bg-muted/40" /> : (
+                  {readFailed(series) ? <p className="text-[12.5px] text-muted-foreground">{readProblem(series, "the requests")}</p> : series.isLoading ? <div className="skeleton h-16 rounded-lg" /> : (
                     <Sparkline values={(series.data ?? []).map((p) => Number(p.requests))} className="h-16" label={`${name} requests over the ${RANGE_LABEL[range].toLowerCase()}`} />
                   )}
                 </section>
 
                 <section className="space-y-2">
                   <div className="flex justify-between"><SectionLabel>Health checks · last {checks.length || 30}</SectionLabel>{health.data?.summary.check_interval_secs ? <span className="text-xs text-muted-foreground">every {health.data.summary.check_interval_secs} s</span> : null}</div>
-                  {checks.length === 0 ? <p className="text-[12.5px] text-muted-foreground">{health.isLoading ? "Loading…" : "No checks recorded yet."}</p> : (
+                  {checks.length === 0 ? <p className="text-[12.5px] text-muted-foreground">{readFailed(health) ? readProblem(health, "the health checks") : health.isLoading ? "Loading…" : "No checks recorded yet."}</p> : (
                     <>
                       <div className="flex gap-[3px]" role="img" aria-label={`${checks.filter((c) => c.status === "healthy").length} of ${checks.length} recent checks passed`}>
                         {checks.map((c) => (
@@ -124,7 +125,7 @@ export function ModelPeek({ tile, model, usage, audit, range, onClose }: {
 
                 <section className="space-y-2.5">
                   <SectionLabel>Top tenants on this model</SectionLabel>
-                  {tenants.length === 0 ? <p className="text-[12.5px] text-muted-foreground">{breakdown.isLoading ? "Loading…" : "No traffic in this window."}</p> : tenants.map(([tenant, n]) => (
+                  {tenants.length === 0 ? <p className="text-[12.5px] text-muted-foreground">{readFailed(breakdown) ? readProblem(breakdown, "the tenants") : breakdown.isLoading ? "Loading…" : "No traffic in this window."}</p> : tenants.map(([tenant, n]) => (
                     <div key={tenant} className="grid grid-cols-[minmax(0,9.5rem)_minmax(0,1fr)_3.5rem] items-center gap-3 text-[13px]">
                       <span className="truncate">{tenant}</span><Meter value={n} max={tenants[0][1]} className="h-1" /><span className="text-right font-mono text-xs">{compact(n)}</span>
                     </div>

@@ -38,7 +38,7 @@ function FooterSkeleton() {
       <span className="shrink-0 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">24h</span>
       <div className="flex flex-1 items-center gap-4">
         {Array.from({ length: 6 }).map((_, i) => (
-          <div key={i} className="h-3 w-16 animate-pulse rounded bg-muted/60" />
+          <div key={i} className="skeleton h-3 w-16 rounded" />
         ))}
       </div>
     </footer>

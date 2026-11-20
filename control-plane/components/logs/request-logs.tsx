@@ -43,6 +43,7 @@ import {
 import { classLabel, classSide, failureReason, SIDE_PHRASE } from "@/lib/failure-classes";
 import type { UsageLogEntry, UsageLogFacets, UsageLogHistogram } from "@/lib/obleth";
 import { cn, getJson } from "@/lib/utils";
+import { readFailed, readProblem } from "@/components/ui/read-state";
 
 const PAGE = 50;
 const LIVE_MS = 5_000;
@@ -339,7 +340,7 @@ export function RequestLogs({
         <div className="min-w-0">
           <h1 className="text-[26px] font-semibold tracking-tight">Request logs</h1>
           <p className="mt-1 text-[13px] text-muted-foreground">
-            {histogram.isLoading ? "Counting…" : `${total.toLocaleString()} requests ${winLabel}${total ? ` · ${((failedCount / total) * 100).toFixed(1)}% failed` : ""}${total && failedCount && split ? `, ${((platformCount / total) * 100).toFixed(1)}% ${SIDE_PHRASE.platform}` : ""}`}
+            {readFailed(histogram) ? readProblem(histogram, "the request count") : histogram.isLoading ? "Counting…" : `${total.toLocaleString()} requests ${winLabel}${total ? ` · ${((failedCount / total) * 100).toFixed(1)}% failed` : ""}${total && failedCount && split ? `, ${((platformCount / total) * 100).toFixed(1)}% ${SIDE_PHRASE.platform}` : ""}`}
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -434,7 +435,7 @@ export function RequestLogs({
         onZoom={(since, until) => { setLive(false); patch({ window: "custom", sinceMs: since, untilMs: Math.min(until, Date.now()) }); }}
       />
 
-      <Facets facets={facets.data} filters={filters} onPatch={patch} loading={facets.isLoading} />
+      <Facets facets={facets.data} filters={filters} onPatch={patch} loading={facets.isLoading} failed={readFailed(facets) ? readProblem(facets, "the breakdown") : null} />
 
       <section aria-label="Requests" className="overflow-hidden rounded-xl border border-border bg-card">
         {!live && (newer.data?.length ?? 0) > 0 && (
@@ -465,7 +466,7 @@ export function RequestLogs({
         </div>
         {rows.length === 0 && (
           <div className="flex flex-col items-center gap-3 px-6 py-14 text-center text-[13px] text-muted-foreground">
-            {head.isLoading ? <div className="skeleton h-4 w-48 rounded" /> : head.isError ? "The request log could not be read." : <>No requests match{filtersActive(filters) ? " these filters" : ""} {winLabel}.{filtersActive(filters) && <Button type="button" size="sm" variant="outline" onClick={() => patch({ ...DEFAULT_LOG_FILTERS })}>Clear filters</Button>}</>}
+            {head.isLoading ? <div className="skeleton h-4 w-48 rounded" /> : readFailed(head) ? readProblem(head, "the request log") : <>No requests match{filtersActive(filters) ? " these filters" : ""} {winLabel}.{filtersActive(filters) && <Button type="button" size="sm" variant="outline" onClick={() => patch({ ...DEFAULT_LOG_FILTERS })}>Clear filters</Button>}</>}
           </div>
         )}
         {rows.length > 0 && (
