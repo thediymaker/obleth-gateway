@@ -5,6 +5,7 @@
 //! checks run as atomic Lua so they are correct across many gateway pods.
 
 mod prune;
+mod resolver;
 pub mod scripts;
 mod slots;
 
@@ -20,6 +21,7 @@ pub use obleth_config::config::RedisTimeouts;
 use obleth_config::{CachedResponse, ResolvedKey, ResolvedMcpServer, ResolvedModel};
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use redis::AsyncCommands;
+pub use resolver::{Invalidation, Resolver};
 use uuid::Uuid;
 
 /// Lua scripts are wrapped in `redis::Script` once (constructing one SHA-1
@@ -615,13 +617,6 @@ impl RedisStore {
         let mut conn = self.conn.clone();
         let redis_key = Self::query_vector_key(hash);
         let _: redis::RedisResult<()> = conn.set_ex(redis_key, bytes, ttl_secs).await;
-    }
-
-    /// Publish invalidation for a key hash, model name (`model:<name>`), or `*`.
-    pub async fn publish_invalidation(&self, target: &str) -> Result<()> {
-        let mut conn = self.conn.clone();
-        let _: () = conn.publish(INVALIDATE_CHANNEL, target).await?;
-        Ok(())
     }
 
     /// Atomically reserve `requested` tokens. Returns `(allowed, remaining)`.

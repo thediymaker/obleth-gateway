@@ -56,7 +56,7 @@ use obleth_fairshare::{
     replica_share, FairShare, FairshareHistory, ModelPoolFairshare, PoolKey, SlotMode,
     StaticCapacity, Stats,
 };
-use obleth_redis::RedisStore;
+use obleth_redis::{Invalidation, RedisStore, Resolver};
 use obleth_store::{AuditEntry, Store};
 use obleth_tokenizer::Tokenizer;
 use rand::Rng;
@@ -7584,18 +7584,19 @@ async fn resync_all_keys(state: &AdminState) -> Result<(usize, usize)> {
     let fresh = state.store.all_resolved_keys().await?;
     let fresh_hashes: std::collections::HashSet<&str> =
         fresh.iter().map(|(h, _)| h.as_str()).collect();
-    for (hash, resolved) in fresh.iter().filter(|(h, _)| pruned.contains(h)) {
-        push_key(state, hash, resolved).await?;
-    }
+    let restore: Vec<(String, ResolvedKey)> = fresh
+        .iter()
+        .filter(|(h, _)| pruned.contains(h))
+        .cloned()
+        .collect();
+    push_keys_bulk(state, &restore, BulkInvalidation::PerKey).await?;
     let gone: Vec<String> = pruned
         .iter()
         .chain(known.iter())
         .filter(|h| !fresh_hashes.contains(h.as_str()))
         .cloned()
         .collect();
-    for hash in &gone {
-        evict_key(state, hash).await?;
-    }
+    evict_keys(state, &gone, "stale keys").await?;
     Ok((fresh.len(), gone.len()))
 }
 
@@ -7615,7 +7616,9 @@ async fn evict_model_names_gone_since<'a>(
             .delete_resolved_model(name)
             .await
             .map_err(|e| cache_removal_failed("a model removed during the resync", e))?;
-        redis.publish_invalidation(&format!("model:{name}")).await?;
+        redis
+            .publish_invalidation(&Invalidation::Model(name.to_string()))
+            .await?;
     }
     Ok(gone.len())
 }
@@ -7693,7 +7696,7 @@ async fn resync_models_and_mcp(state: &AdminState) -> Result<(usize, usize, usiz
     {
         state
             .redis
-            .publish_invalidation(&format!("mcp:{name}"))
+            .publish_invalidation(&Invalidation::Mcp(name.to_string()))
             .await?;
     }
 
@@ -10010,7 +10013,7 @@ async fn delete_model(
             state.redis.delete_resolved_model(name).await?;
             state
                 .redis
-                .publish_invalidation(&format!("model:{name}"))
+                .publish_invalidation(&Invalidation::Model(name.to_string()))
                 .await
         }
         .await;
@@ -10180,7 +10183,7 @@ async fn update_mcp_server(
             .map_err(|e| eviction_failed("the MCP server's old name", e))?;
         state
             .redis
-            .publish_invalidation(&format!("mcp:{}", existing.name))
+            .publish_invalidation(&Invalidation::Mcp(existing.name.clone()))
             .await
             .map_err(|e| eviction_failed("the MCP server's old name", e))?;
         for model in &models {
@@ -10227,7 +10230,7 @@ async fn delete_mcp_server(
         state.redis.delete_resolved_mcp_server(&server.name).await?;
         state
             .redis
-            .publish_invalidation(&format!("mcp:{}", server.name))
+            .publish_invalidation(&Invalidation::Mcp(server.name.clone()))
             .await
     }
     .await
@@ -10478,41 +10481,35 @@ fn cache_removal_failed(what: &str, e: obleth_redis::RedisError) -> AdminError {
     ))
 }
 
-/// Evict a deleted key from Redis and every gateway's in-process cache.
-async fn evict_key(
-    state: &AdminState,
-    hash: &str,
-) -> std::result::Result<(), obleth_redis::RedisError> {
-    let result = async {
-        state.redis.delete_resolved_key(hash).await?;
-        state.redis.publish_invalidation(hash).await
-    }
-    .await;
-    // Always drop the local copy: even if the publish failed, this replica
-    // must not keep serving the key from moka for the TTL backstop.
-    if let Some(tx) = &state.local_cache_tx {
-        let _ = tx.send(hash.to_string());
-    }
-    result
-}
-
-/// Evict every hash, attempting all of them before reporting the first failure.
+/// Evict deleted keys from Redis and every gateway's in-process cache,
+/// attempting all of them before reporting the first failure: the deletes
+/// and the invalidations each go out pipelined, and every hash leaves this
+/// replica's in-process cache even if the publish failed, so it never keeps
+/// serving a deleted key from moka for the TTL backstop.
 async fn evict_keys(state: &AdminState, hashes: &[String], what: &str) -> Result<()> {
-    let mut first_err = None;
-    for hash in hashes {
-        if let Err(e) = evict_key(state, hash).await {
-            first_err.get_or_insert(e);
+    let deleted = state
+        .redis
+        .delete_resolved_bulk(Resolver::Keys, hashes)
+        .await;
+    let targets: Vec<Invalidation> = hashes
+        .iter()
+        .map(|h| Invalidation::Key(h.clone()))
+        .collect();
+    let published = state.redis.publish_invalidations(&targets).await;
+    if let Some(tx) = &state.local_cache_tx {
+        for hash in hashes {
+            let _ = tx.send(hash.clone());
         }
     }
-    match first_err {
-        Some(e) => Err(eviction_failed(what, e)),
-        None => Ok(()),
-    }
+    deleted.and(published).map_err(|e| eviction_failed(what, e))
 }
 
 async fn push_key(state: &AdminState, hash: &str, resolved: &ResolvedKey) -> Result<()> {
     state.redis.put_resolved_key(hash, resolved).await?;
-    state.redis.publish_invalidation(hash).await?;
+    state
+        .redis
+        .publish_invalidation(&Invalidation::Key(hash.to_string()))
+        .await?;
     if let Some(tx) = &state.local_cache_tx {
         let _ = tx.send(hash.to_string());
     }
@@ -10639,7 +10636,7 @@ async fn sync_model_from(
                 .map_err(|e| cache_removal_failed("a removed alias or variant", e))?;
             state
                 .redis
-                .publish_invalidation(&format!("model:{stale}"))
+                .publish_invalidation(&Invalidation::Model(stale.to_string()))
                 .await
                 .map_err(|e| cache_removal_failed("a removed alias or variant", e))?;
         }
@@ -10659,7 +10656,7 @@ async fn sync_model_from(
         }
         state
             .redis
-            .publish_invalidation(&format!("model:{name}"))
+            .publish_invalidation(&Invalidation::Model(name.to_string()))
             .await?;
     }
     Ok(())
@@ -10687,22 +10684,16 @@ async fn sync_mcp_server(state: &AdminState, server: &McpServer) -> Result<()> {
     }
     state
         .redis
-        .publish_invalidation(&format!("mcp:{}", server.name))
+        .publish_invalidation(&Invalidation::Mcp(server.name.clone()))
         .await?;
     Ok(())
 }
 
 /// Re-push every key of a tenant after a weight/quota change.
 async fn sync_tenant_keys(state: &AdminState, tenant_id: Uuid) -> Result<()> {
-    for (hash, resolved) in state.store.resolved_keys_for_tenant(tenant_id).await? {
-        push_key(state, &hash, &resolved).await?;
-    }
-    Ok(())
+    let keys = state.store.resolved_keys_for_tenant(tenant_id).await?;
+    push_keys_bulk(state, &keys, BulkInvalidation::PerKey).await
 }
-
-/// In-flight Redis writes for a bulk key push. The connection is multiplexed,
-/// so concurrent SETs pipeline instead of paying one round trip each.
-const BULK_PUSH_CONCURRENCY: usize = 32;
 
 /// How a bulk key push tells the gateways to drop their in-process copies.
 #[derive(Clone, Copy)]
@@ -10719,49 +10710,31 @@ enum BulkInvalidation {
 /// changed. Keys outside the group carry a different `group_weight` and are
 /// untouched; no SCAN or prune runs here (that is `POST /api/v1/resync`).
 async fn sync_group_keys(state: &AdminState, group: &str) -> Result<usize> {
-    let keys = group_keys(state.store.all_resolved_keys().await?, group);
+    let keys = state.store.resolved_keys_for_group(group).await?;
     push_keys_bulk(state, &keys, BulkInvalidation::PerKey).await?;
     Ok(keys.len())
 }
 
-fn group_keys(keys: Vec<(String, ResolvedKey)>, group: &str) -> Vec<(String, ResolvedKey)> {
-    keys.into_iter()
-        .filter(|(_, k)| k.fairshare_group == group)
-        .collect()
-}
-
-/// Write many resolved keys to Redis with bounded concurrency, then invalidate
-/// the gateways' in-process copies. Every SET completes before any invalidation
+/// Write many resolved keys to Redis, pipelined, then invalidate the
+/// gateways' in-process copies. Every SET completes before any invalidation
 /// is published, so a gateway that refetches on the message reads the new row.
 async fn push_keys_bulk(
     state: &AdminState,
     keys: &[(String, ResolvedKey)],
     invalidation: BulkInvalidation,
 ) -> Result<()> {
-    use futures::stream::{self, StreamExt, TryStreamExt};
     if keys.is_empty() {
         return Ok(());
     }
-    // Indexing (rather than mapping over `keys.iter()`) keeps the closure's
-    // argument free of a borrowed lifetime; otherwise the stream is not provably
-    // `Send` for every lifetime and the axum handlers calling this fail to build.
-    let redis = &state.redis;
-    stream::iter(0..keys.len())
-        .map(move |i| {
-            let (hash, resolved) = &keys[i];
-            redis.put_resolved_key(hash, resolved)
-        })
-        .buffer_unordered(BULK_PUSH_CONCURRENCY)
-        .try_for_each(|()| async { Ok(()) })
-        .await?;
+    state.redis.put_resolved_bulk(Resolver::Keys, keys).await?;
     match invalidation {
-        BulkInvalidation::All => state.redis.publish_invalidation("*").await?,
+        BulkInvalidation::All => state.redis.publish_invalidation(&Invalidation::All).await?,
         BulkInvalidation::PerKey => {
-            stream::iter(0..keys.len())
-                .map(move |i| redis.publish_invalidation(&keys[i].0))
-                .buffer_unordered(BULK_PUSH_CONCURRENCY)
-                .try_for_each(|()| async { Ok(()) })
-                .await?
+            let targets: Vec<Invalidation> = keys
+                .iter()
+                .map(|(hash, _)| Invalidation::Key(hash.clone()))
+                .collect();
+            state.redis.publish_invalidations(&targets).await?
         }
     }
     if let Some(tx) = &state.local_cache_tx {
@@ -12950,34 +12923,6 @@ mod tests {
             "a weight patch invalidates exactly the group's keys, never `*`"
         );
         assert!(group_left.is_none(), "fixture group was not cleaned up");
-    }
-
-    #[test]
-    fn group_keys_keeps_only_the_named_group() {
-        let key = |group: &str| {
-            let k: ResolvedKey = serde_json::from_value(serde_json::json!({
-                "key_id": Uuid::nil(),
-                "tenant_id": Uuid::nil(),
-                "tenant_name": "t",
-                "fairshare_group": group,
-                "group_weight": 1,
-                "weight": 1,
-                "tokens_per_minute": 1,
-                "disabled": false,
-            }))
-            .expect("resolved key");
-            k
-        };
-        let keys = vec![
-            ("a".to_string(), key("research")),
-            ("b".to_string(), key("default")),
-            ("c".to_string(), key("research")),
-        ];
-        let hashes: Vec<String> = group_keys(keys, "research")
-            .into_iter()
-            .map(|(h, _)| h)
-            .collect();
-        assert_eq!(hashes, ["a", "c"]);
     }
 
     /// Per-end-user fairshare is set through its own route, reaches the key

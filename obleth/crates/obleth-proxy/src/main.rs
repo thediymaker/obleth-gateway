@@ -38,6 +38,7 @@ mod client;
 mod diagnostics;
 pub mod tracer;
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -49,7 +50,7 @@ use obleth_config::Config;
 use obleth_fairshare::{
     FairShare, FairshareHistory, StaticCapacity, FAIRSHARE_HISTORY_INTERVAL_MS,
 };
-use obleth_redis::RedisStore;
+use obleth_redis::{RedisStore, Resolver};
 use obleth_store::Store;
 use obleth_telemetry::{TelemetrySink, TelemetryStats};
 use obleth_tokenizer::HeuristicTokenizer;
@@ -117,14 +118,10 @@ async fn main() -> anyhow::Result<()> {
 
     // ---- warm the hot cache from the source of truth ----
     match store.all_resolved_keys().await {
-        Ok(keys) => {
-            for (hash, resolved) in &keys {
-                if let Err(e) = redis.put_resolved_key(hash, resolved).await {
-                    tracing::warn!(error = %e, "failed to warm key into redis");
-                }
-            }
-            tracing::info!(count = keys.len(), "warmed key cache");
-        }
+        Ok(keys) => match redis.put_resolved_bulk(Resolver::Keys, &keys).await {
+            Ok(()) => tracing::info!(count = keys.len(), "warmed key cache"),
+            Err(e) => tracing::warn!(error = %e, "failed to warm keys into redis"),
+        },
         Err(e) => tracing::warn!(error = %e, "failed to load keys for warming"),
     }
 
@@ -565,20 +562,22 @@ async fn main() -> anyhow::Result<()> {
 
     match store.all_resolved_models().await {
         Ok(models) => {
+            // One key per addressable name: the canonical `model_name` plus
+            // every alias and variant. Resolution stays a single lookup on
+            // whatever name the client sent, so an alias costs nothing per
+            // request.
             for (_, resolved) in &models {
-                // One key per addressable name: the canonical `model_name` plus
-                // every alias and variant. Resolution stays a single lookup on
-                // whatever name the client sent, so an alias costs nothing per
-                // request.
                 let shared = Arc::new(resolved.clone());
                 for name in resolved.addressable_names() {
-                    if let Err(e) = redis.put_resolved_model(name, resolved).await {
-                        tracing::warn!(error = %e, "failed to warm model into redis");
-                    }
                     model_cache.insert(name.to_string(), shared.clone()).await;
                 }
             }
-            tracing::info!(count = models.len(), "warmed model cache");
+            let count = models.len();
+            let by_name = models_by_name(models);
+            if let Err(e) = redis.put_resolved_bulk(Resolver::Models, &by_name).await {
+                tracing::warn!(error = %e, "failed to warm models into redis");
+            }
+            tracing::info!(count, "warmed model cache");
             let tier_source = classifier.settings().tier_source;
             install_candidates(&model_registry, store.build_candidates(tier_source).await);
         }
@@ -628,10 +627,13 @@ async fn main() -> anyhow::Result<()> {
 
     match store.all_resolved_mcp_servers().await {
         Ok(servers) => {
+            if let Err(e) = redis
+                .put_resolved_bulk(Resolver::McpServers, &servers)
+                .await
+            {
+                tracing::warn!(error = %e, "failed to warm mcp servers into redis");
+            }
             for (name, resolved) in &servers {
-                if let Err(e) = redis.put_resolved_mcp_server(name, resolved).await {
-                    tracing::warn!(error = %e, "failed to warm mcp server into redis");
-                }
                 mcp_cache
                     .insert(name.clone(), Arc::new(resolved.clone()))
                     .await;
@@ -1291,17 +1293,17 @@ impl InvalidationCaches {
         self.mcp.invalidate_all();
     }
 
-    async fn apply(&self, target: &str) {
-        if target == "*" {
-            self.invalidate_all();
-        } else if let Some(name) = target.strip_prefix("model:") {
-            self.models.invalidate(name).await;
-        } else if let Some(name) = target.strip_prefix("mcp:") {
-            self.mcp.invalidate(name).await;
-        } else {
-            self.keys.invalidate(target).await;
-            // A key with this hash may have just been created or restored.
-            self.key_misses.forget(target).await;
+    async fn apply(&self, target: obleth_redis::Invalidation) {
+        use obleth_redis::Invalidation;
+        match target {
+            Invalidation::All => self.invalidate_all(),
+            Invalidation::Model(name) => self.models.invalidate(&name).await,
+            Invalidation::Mcp(name) => self.mcp.invalidate(&name).await,
+            Invalidation::Key(hash) => {
+                self.keys.invalidate(&hash).await;
+                // A key with this hash may have just been created or restored.
+                self.key_misses.forget(&hash).await;
+            }
         }
     }
 }
@@ -1316,7 +1318,11 @@ fn spawn_invalidation_listener(
             let caches = caches.clone();
             move |target: String| {
                 let caches = caches.clone();
-                tokio::spawn(async move { caches.apply(&target).await });
+                tokio::spawn(async move {
+                    caches
+                        .apply(obleth_redis::Invalidation::parse(&target))
+                        .await
+                });
             }
         };
         let on_subscribed = move |resubscribed: bool| {
@@ -1390,16 +1396,190 @@ fn spawn_redis_rewarm(
     });
 }
 
+/// One re-warm pass: push each resolver namespace from Postgres into Redis,
+/// prune what Postgres no longer lists from all of them in one SCAN, then fix
+/// up anything the prune caught mid-change (see [`settle_pruned`]).
 async fn rewarm_redis(store: &Store, redis: &RedisStore, key_misses: &key_miss::KeyMissCache) {
-    let keys = rewarm_keys(store, redis).await;
+    let keys = push_snapshot(redis, Resolver::Keys, store.all_resolved_keys().await).await;
+    let models = push_snapshot(
+        redis,
+        Resolver::Models,
+        store.all_resolved_models().await.map(models_by_name),
+    )
+    .await;
+    let mcp = push_snapshot(
+        redis,
+        Resolver::McpServers,
+        store.all_resolved_mcp_servers().await,
+    )
+    .await;
     // A real key looked up while Redis was missing it (after a restart or
     // flush, before this pass pushed it back) was remembered as unknown. The
     // push publishes no per-key invalidation, so forget every miss now that
     // Redis holds the keys again.
     key_misses.clear();
-    let models = rewarm_models(store, redis).await;
-    let mcp = rewarm_mcp_servers(store, redis).await;
-    tracing::debug!(?keys, ?models, ?mcp, "redis re-warm pass complete");
+    let counts = prune_and_settle(
+        redis,
+        (keys, || store.all_resolved_keys()),
+        (models, || async {
+            store.all_resolved_models().await.map(models_by_name)
+        }),
+        (mcp, || store.all_resolved_mcp_servers()),
+    )
+    .await;
+    tracing::debug!(?counts, "redis re-warm pass complete");
+}
+
+/// A namespace's entries as Postgres has them, and how to read them again.
+type Pass<T, F> = (Option<Vec<(String, T)>>, F);
+
+/// Write `loaded` into `resolver`'s namespace, pipelined. `None` (and a
+/// warning) when the load or the push failed: that namespace is then left
+/// out of this pass's prune, and the next pass starts it clean.
+async fn push_snapshot<T: serde::Serialize>(
+    redis: &RedisStore,
+    resolver: Resolver,
+    loaded: std::result::Result<Vec<(String, T)>, obleth_store::StoreError>,
+) -> Option<Vec<(String, T)>> {
+    let entries = match loaded {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(error = %e, ?resolver, "redis re-warm: load failed");
+            return None;
+        }
+    };
+    if let Err(e) = redis.put_resolved_bulk(resolver, &entries).await {
+        tracing::warn!(error = %e, ?resolver, "redis re-warm: push failed; retrying next pass");
+        return None;
+    }
+    Some(entries)
+}
+
+/// Prune every pushed namespace in one SCAN, then settle each. Returns each
+/// namespace's entry count after the pass (`None` where it did not run).
+async fn prune_and_settle<FK, FKF, FM, FMF, FS, FSF>(
+    redis: &RedisStore,
+    keys: Pass<obleth_config::ResolvedKey, FK>,
+    models: Pass<obleth_config::ResolvedModel, FM>,
+    mcp: Pass<obleth_config::ResolvedMcpServer, FS>,
+) -> [Option<usize>; 3]
+where
+    FK: FnOnce() -> FKF,
+    FKF: std::future::Future<Output = Reloaded<obleth_config::ResolvedKey>>,
+    FM: FnOnce() -> FMF,
+    FMF: std::future::Future<Output = Reloaded<obleth_config::ResolvedModel>>,
+    FS: FnOnce() -> FSF,
+    FSF: std::future::Future<Output = Reloaded<obleth_config::ResolvedMcpServer>>,
+{
+    let known = [known_ids(&keys.0), known_ids(&models.0), known_ids(&mcp.0)];
+    let resolvers = [Resolver::Keys, Resolver::Models, Resolver::McpServers];
+    let asked: Vec<(Resolver, &HashSet<String>)> = resolvers
+        .iter()
+        .zip(&known)
+        .filter_map(|(r, k)| k.as_ref().map(|k| (*r, k)))
+        .collect();
+    if asked.is_empty() {
+        return [None; 3];
+    }
+    let mut pruned = match redis.prune_stale_resolved(&asked).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "redis re-warm: prune failed; retrying next pass");
+            return [None; 3];
+        }
+    };
+    let [known_keys, known_models, known_mcp] = &known;
+    let mut take = |r: Resolver| pruned.remove(&r).unwrap_or_default();
+    let pruned_keys = take(Resolver::Keys);
+    let pruned_models = take(Resolver::Models);
+    let pruned_mcp = take(Resolver::McpServers);
+    [
+        settle(redis, Resolver::Keys, known_keys, keys, pruned_keys).await,
+        settle(redis, Resolver::Models, known_models, models, pruned_models).await,
+        settle(redis, Resolver::McpServers, known_mcp, mcp, pruned_mcp).await,
+    ]
+}
+
+/// The ids a pushed namespace lists; `None` when it was not pushed.
+fn known_ids<T>(entries: &Option<Vec<(String, T)>>) -> Option<HashSet<String>> {
+    entries
+        .as_ref()
+        .map(|e| e.iter().map(|(id, _)| id.clone()).collect())
+}
+
+type Reloaded<T> = std::result::Result<Vec<(String, T)>, obleth_store::StoreError>;
+
+async fn settle<T, F, Fut>(
+    redis: &RedisStore,
+    resolver: Resolver,
+    known: &Option<HashSet<String>>,
+    (pushed, reload): Pass<T, F>,
+    pruned: Vec<String>,
+) -> Option<usize>
+where
+    T: serde::Serialize,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Reloaded<T>>,
+{
+    let (known, pushed) = (known.as_ref()?, pushed?);
+    Some(settle_pruned(redis, resolver, known, pruned, pushed.len(), reload).await)
+}
+
+/// After a prune: an entry created between the snapshot load and the SCAN
+/// was not in the snapshot, so the prune deleted it as stale and every
+/// replica would miss it until the next pass. When the prune removed
+/// anything, read Postgres again; restore what it still has, and evict what
+/// it does not (including a `known` entry deleted mid-pass, which the prune
+/// left alone because it still matched). A failed re-read is only logged:
+/// the push and prune already landed, and the next pass repeats this.
+/// Returns the namespace's entry count.
+async fn settle_pruned<T, F, Fut>(
+    redis: &RedisStore,
+    resolver: Resolver,
+    known: &HashSet<String>,
+    pruned: Vec<String>,
+    pushed: usize,
+    reload: F,
+) -> usize
+where
+    T: serde::Serialize,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Reloaded<T>>,
+{
+    if pruned.is_empty() {
+        return pushed;
+    }
+    let invalidate = |ids: &[String]| -> Vec<obleth_redis::Invalidation> {
+        ids.iter().map(|id| resolver.invalidation(id)).collect()
+    };
+    let fresh = match reload().await {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(error = %e, ?resolver, "redis re-warm: re-read after prune failed; a wrongly pruned entry may be missing until the next pass");
+            let _ = redis.publish_invalidations(&invalidate(&pruned)).await;
+            return pushed;
+        }
+    };
+    let pruned: HashSet<String> = pruned.into_iter().collect();
+    let fresh_by_id: HashMap<&str, &T> = fresh.iter().map(|(id, v)| (id.as_str(), v)).collect();
+    let fresh_ids: HashSet<&str> = fresh_by_id.keys().copied().collect();
+    let (restore, evict) = restore_and_evict(known, &pruned, &fresh_ids);
+    let restored: Vec<(String, &T)> = restore
+        .into_iter()
+        .filter_map(|id| fresh_by_id.get(id.as_str()).map(|v| (id, *v)))
+        .collect();
+    match redis.put_resolved_bulk(resolver, &restored).await {
+        Ok(()) => {
+            let ids: Vec<String> = restored.into_iter().map(|(id, _)| id).collect();
+            let _ = redis.publish_invalidations(&invalidate(&ids)).await;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, ?resolver, "redis re-warm: restoring wrongly pruned entries failed")
+        }
+    }
+    let _ = redis.delete_resolved_bulk(resolver, &evict).await;
+    let _ = redis.publish_invalidations(&invalidate(&evict)).await;
+    fresh.len()
 }
 
 /// From a snapshot's `known` identifiers (hashes or names) and what the
@@ -1432,107 +1612,6 @@ fn restore_and_evict(
     (restore, evict)
 }
 
-/// Push a Postgres snapshot into Redis, then delete any `obleth:key3:*` entry
-/// Redis holds that the snapshot doesn't list — the same SCAN-based prune
-/// `POST /api/v1/resync` uses (`obleth-redis/src/prune.rs`). A key revoked
-/// before this snapshot was taken has no entry here, so the prune removes it
-/// on this pass; a key revoked mid-pass survives until the next pass, which
-/// repeats the full push + prune and removes it then. Any failure (a push or
-/// the prune itself) ends the pass with a warn and nothing is written further
-/// — the next pass 300s later starts clean rather than patching over a
-/// partial one, so a revoked key is never left resurrected for good.
-///
-/// A key an admin *creates* between the snapshot load above and the SCAN is
-/// the opposite problem: it isn't in `snapshot`, so the prune deletes it as
-/// if it were stale and every replica 401s it until the next pass (up to
-/// 300s). When the prune actually removed something, re-read Postgres once
-/// more (same fix-up `POST /api/v1/resync`'s `resync_all_keys` applies) and
-/// restore anything that reload shows still exists; anything that's still
-/// gone — including a `known` entry deleted mid-pass, which the prune above
-/// left alone because it still matched `known` — is evicted so Redis matches
-/// the source of truth either way. A failure here is only logged: the pushed
-/// entries and the prune already landed, so the pass has already done useful
-/// work, and the next pass repeats this fix-up too.
-///
-/// `reload` is `Store::all_resolved_keys` in production; taking it as a
-/// closure (rather than `&Store` directly) keeps the restore/evict logic
-/// testable against Redis alone, with no Postgres in the loop.
-async fn push_and_prune_keys<F, Fut>(
-    redis: &RedisStore,
-    snapshot: &[(String, obleth_config::ResolvedKey)],
-    reload: F,
-) -> Option<usize>
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<
-        Output = std::result::Result<
-            Vec<(String, obleth_config::ResolvedKey)>,
-            obleth_store::StoreError,
-        >,
-    >,
-{
-    for (hash, key) in snapshot {
-        if let Err(e) = redis.put_resolved_key(hash, key).await {
-            tracing::warn!(error = %e, "redis re-warm: key push failed; retrying next pass");
-            return None;
-        }
-    }
-    let known: std::collections::HashSet<String> =
-        snapshot.iter().map(|(hash, _)| hash.clone()).collect();
-    let pruned: std::collections::HashSet<String> =
-        match redis.prune_stale_resolved_keys(&known).await {
-            Ok(p) => p.into_iter().collect(),
-            Err(e) => {
-                tracing::warn!(error = %e, "redis re-warm: key prune failed; retrying next pass");
-                return None;
-            }
-        };
-    if pruned.is_empty() {
-        return Some(snapshot.len());
-    }
-    let fresh = match reload().await {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::warn!(error = %e, "redis re-warm: key re-read after prune failed; a wrongly pruned key may 401 until the next pass");
-            for hash in &pruned {
-                let _ = redis.publish_invalidation(hash).await;
-            }
-            return Some(snapshot.len());
-        }
-    };
-    let fresh_hashes: std::collections::HashSet<&str> =
-        fresh.iter().map(|(h, _)| h.as_str()).collect();
-    let fresh_by_hash: std::collections::HashMap<&str, &obleth_config::ResolvedKey> =
-        fresh.iter().map(|(h, k)| (h.as_str(), k)).collect();
-    let (restore, evict) = restore_and_evict(&known, &pruned, &fresh_hashes);
-    for hash in &restore {
-        let Some(key) = fresh_by_hash.get(hash.as_str()) else {
-            continue;
-        };
-        if let Err(e) = redis.put_resolved_key(hash, key).await {
-            tracing::warn!(error = %e, id = %hash, "redis re-warm: restoring a wrongly pruned key failed");
-            continue;
-        }
-        let _ = redis.publish_invalidation(hash).await;
-    }
-    for hash in &evict {
-        let _ = redis.delete_resolved_key(hash).await;
-        let _ = redis.publish_invalidation(hash).await;
-    }
-    Some(fresh.len())
-}
-
-async fn rewarm_keys(store: &Store, redis: &RedisStore) -> Option<usize> {
-    let snapshot = match store.all_resolved_keys().await {
-        Ok(k) => k,
-        Err(e) => {
-            tracing::warn!(error = %e, "redis re-warm: key load failed");
-            return None;
-        }
-    };
-    push_and_prune_keys(redis, &snapshot, || store.all_resolved_keys()).await
-}
-
 /// Resolved models keyed by every addressable name (canonical name, aliases and
 /// variants). A variant's key holds its parent's route as is; the proxy adds
 /// the variant's boons per request.
@@ -1547,173 +1626,6 @@ fn models_by_name(
                 .collect::<Vec<_>>()
         })
         .collect()
-}
-
-/// Same push-then-prune contract as [`push_and_prune_keys`], for the
-/// `obleth:model:*` namespace, including the same post-prune restore/evict
-/// fix-up for a model created (or renamed to a new alias) between the
-/// snapshot load and the SCAN. `snapshot` is keyed by every addressable name
-/// ([`models_by_name`]), which is also what the prune treats as known. See
-/// [`push_and_prune_keys`] for why `reload` is a closure rather than `&Store`.
-async fn push_and_prune_models<F, Fut>(
-    redis: &RedisStore,
-    snapshot: &[(String, obleth_config::ResolvedModel)],
-    reload: F,
-) -> Option<usize>
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<
-        Output = std::result::Result<
-            Vec<(String, obleth_config::ResolvedModel)>,
-            obleth_store::StoreError,
-        >,
-    >,
-{
-    for (name, model) in snapshot {
-        if let Err(e) = redis.put_resolved_model(name, model).await {
-            tracing::warn!(error = %e, "redis re-warm: model push failed; retrying next pass");
-            return None;
-        }
-    }
-    let known: std::collections::HashSet<String> =
-        snapshot.iter().map(|(name, _)| name.clone()).collect();
-    let pruned: std::collections::HashSet<String> =
-        match redis.prune_stale_resolved_models(&known).await {
-            Ok(p) => p.into_iter().collect(),
-            Err(e) => {
-                tracing::warn!(error = %e, "redis re-warm: model prune failed; retrying next pass");
-                return None;
-            }
-        };
-    if pruned.is_empty() {
-        return Some(snapshot.len());
-    }
-    let fresh = match reload().await {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::warn!(error = %e, "redis re-warm: model re-read after prune failed; a wrongly pruned model may 404 until the next pass");
-            for name in &pruned {
-                let _ = redis.publish_invalidation(&format!("model:{name}")).await;
-            }
-            return Some(snapshot.len());
-        }
-    };
-    let fresh_names: std::collections::HashSet<&str> =
-        fresh.iter().map(|(n, _)| n.as_str()).collect();
-    let fresh_by_name: std::collections::HashMap<&str, &obleth_config::ResolvedModel> =
-        fresh.iter().map(|(n, m)| (n.as_str(), m)).collect();
-    let (restore, evict) = restore_and_evict(&known, &pruned, &fresh_names);
-    for name in &restore {
-        let Some(model) = fresh_by_name.get(name.as_str()) else {
-            continue;
-        };
-        if let Err(e) = redis.put_resolved_model(name, model).await {
-            tracing::warn!(error = %e, id = %name, "redis re-warm: restoring a wrongly pruned model failed");
-            continue;
-        }
-        let _ = redis.publish_invalidation(&format!("model:{name}")).await;
-    }
-    for name in &evict {
-        let _ = redis.delete_resolved_model(name).await;
-        let _ = redis.publish_invalidation(&format!("model:{name}")).await;
-    }
-    Some(fresh.len())
-}
-
-async fn rewarm_models(store: &Store, redis: &RedisStore) -> Option<usize> {
-    let snapshot = match store.all_resolved_models().await {
-        Ok(m) => models_by_name(m),
-        Err(e) => {
-            tracing::warn!(error = %e, "redis re-warm: model load failed");
-            return None;
-        }
-    };
-    push_and_prune_models(redis, &snapshot, || async {
-        store.all_resolved_models().await.map(models_by_name)
-    })
-    .await
-}
-
-/// Same push-then-prune contract as [`push_and_prune_keys`], for the
-/// `obleth:mcp:*` namespace, including the same post-prune restore/evict
-/// fix-up for an MCP server registered between the snapshot load and the SCAN.
-/// See [`push_and_prune_keys`] for why `reload` is a closure rather than `&Store`.
-async fn push_and_prune_mcp_servers<F, Fut>(
-    redis: &RedisStore,
-    snapshot: &[(String, obleth_config::ResolvedMcpServer)],
-    reload: F,
-) -> Option<usize>
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<
-        Output = std::result::Result<
-            Vec<(String, obleth_config::ResolvedMcpServer)>,
-            obleth_store::StoreError,
-        >,
-    >,
-{
-    for (name, server) in snapshot {
-        if let Err(e) = redis.put_resolved_mcp_server(name, server).await {
-            tracing::warn!(error = %e, "redis re-warm: mcp server push failed; retrying next pass");
-            return None;
-        }
-    }
-    let known: std::collections::HashSet<String> =
-        snapshot.iter().map(|(name, _)| name.clone()).collect();
-    let pruned: std::collections::HashSet<String> = match redis
-        .prune_stale_resolved_mcp_servers(&known)
-        .await
-    {
-        Ok(p) => p.into_iter().collect(),
-        Err(e) => {
-            tracing::warn!(error = %e, "redis re-warm: mcp server prune failed; retrying next pass");
-            return None;
-        }
-    };
-    if pruned.is_empty() {
-        return Some(snapshot.len());
-    }
-    let fresh = match reload().await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(error = %e, "redis re-warm: mcp server re-read after prune failed; a wrongly pruned server may be unusable until the next pass");
-            for name in &pruned {
-                let _ = redis.publish_invalidation(&format!("mcp:{name}")).await;
-            }
-            return Some(snapshot.len());
-        }
-    };
-    let fresh_names: std::collections::HashSet<&str> =
-        fresh.iter().map(|(n, _)| n.as_str()).collect();
-    let fresh_by_name: std::collections::HashMap<&str, &obleth_config::ResolvedMcpServer> =
-        fresh.iter().map(|(n, s)| (n.as_str(), s)).collect();
-    let (restore, evict) = restore_and_evict(&known, &pruned, &fresh_names);
-    for name in &restore {
-        let Some(server) = fresh_by_name.get(name.as_str()) else {
-            continue;
-        };
-        if let Err(e) = redis.put_resolved_mcp_server(name, server).await {
-            tracing::warn!(error = %e, id = %name, "redis re-warm: restoring a wrongly pruned mcp server failed");
-            continue;
-        }
-        let _ = redis.publish_invalidation(&format!("mcp:{name}")).await;
-    }
-    for name in &evict {
-        let _ = redis.delete_resolved_mcp_server(name).await;
-        let _ = redis.publish_invalidation(&format!("mcp:{name}")).await;
-    }
-    Some(fresh.len())
-}
-
-async fn rewarm_mcp_servers(store: &Store, redis: &RedisStore) -> Option<usize> {
-    let snapshot = match store.all_resolved_mcp_servers().await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(error = %e, "redis re-warm: mcp server load failed");
-            return None;
-        }
-    };
-    push_and_prune_mcp_servers(redis, &snapshot, || store.all_resolved_mcp_servers()).await
 }
 
 /// Initialize logging + (optionally) OTLP trace export. Returns the tracer
@@ -2095,8 +2007,8 @@ mod shutdown_tests {
     /// scenarios `restore_and_evict_keeps_a_mid_pass_create_and_drops_a_genuine_revocation`
     /// covers in isolation above.
     ///
-    /// `push_and_prune_keys` calls `RedisStore::prune_stale_resolved_keys`,
-    /// which SCANs and deletes across the *entire* `obleth:key3:*` namespace —
+    /// `prune_and_settle` calls `RedisStore::prune_stale_resolved`, which
+    /// SCANs and deletes across the *entire* `obleth:key3:*` namespace —
     /// not just the hashes this test creates. Point `OBLETH_TEST_REDIS_URL`
     /// at an isolated database (e.g. Redis db 15, the project's documented
     /// test database — never db 0 / a shared or live instance): running this
@@ -2106,7 +2018,7 @@ mod shutdown_tests {
     /// running in parallel — the default for `cargo test` — race the same
     /// SCAN and can prune each other's freshly-written keys.
     #[tokio::test]
-    async fn push_and_prune_keys_integration() {
+    async fn push_prune_and_settle_keys_integration() {
         let Ok(url) = std::env::var("OBLETH_TEST_REDIS_URL") else {
             eprintln!("skipping: set OBLETH_TEST_REDIS_URL to run");
             return;
@@ -2148,9 +2060,16 @@ mod shutdown_tests {
             (created_hash.clone(), created_key),
         ];
 
-        let pushed =
-            push_and_prune_keys(&redis, &snapshot, move || async move { Ok(reread) }).await;
-        assert_eq!(pushed, Some(2));
+        let pushed = push_snapshot(&redis, Resolver::Keys, Ok(snapshot)).await;
+        assert!(pushed.is_some());
+        let counts = prune_and_settle(
+            &redis,
+            (pushed, move || async move { Ok(reread) }),
+            (None, || async { Ok(Vec::new()) }),
+            (None, || async { Ok(Vec::new()) }),
+        )
+        .await;
+        assert_eq!(counts, [Some(2), None, None], "only the keys ran");
         assert!(
             redis
                 .get_resolved_key(&revoked_hash)

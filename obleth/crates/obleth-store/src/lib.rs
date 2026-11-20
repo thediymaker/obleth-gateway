@@ -1455,65 +1455,45 @@ impl Store {
 
     /// All (hash, resolved-key) pairs, for warming/refreshing the Redis cache.
     pub async fn all_resolved_keys(&self) -> Result<Vec<(String, ResolvedKey)>> {
-        let rows = sqlx::query(
-            "select k.key_hash, k.id as key_id, k.tenant_id, k.disabled,
-                    k.name as key_name, t.name as tenant_name, t.fairshare_group, g.weight as group_weight,
-                    t.weight, t.tokens_per_minute, t.max_in_flight, t.status,
-                    t.timezone, t.active_from, t.active_until, t.weekly_windows,
-                    t.budget_tokens, t.budget_cost_usd, t.budget_period, t.budget_started_at,
-                    k.budget_tokens as key_budget_tokens,
-                    k.budget_cost_usd as key_budget_cost_usd,
-                    k.budget_period as key_budget_period,
-                    k.budget_started_at as key_budget_started_at,
-                    k.weight as key_weight, k.max_in_flight as key_max_in_flight,
-                    k.end_user_fairshare, k.background, k.allowed_networks, k.allowed_countries,
-                    t.allowed_models,
-                    (k.tracing_enabled OR t.tracing_enabled) AS tracing_enabled,
-                    t.guardrails_policy,
-                    t.compression_policy,
-                    t.synthetic
-             from api_keys k
-             join tenants t on t.id = k.tenant_id
-             join fairshare_groups g on g.name = t.fairshare_group",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        rows.iter()
-            .map(|r| Ok((r.try_get::<String, _>("key_hash")?, resolved_from_row(r)?)))
-            .collect()
+        self.resolved_keys_where(KeyScope::All).await
     }
 
-    /// All keys belonging to a tenant, as (hash, resolved). Used to re-sync the
-    /// cache after a weight/quota change touches every key of a tenant.
+    /// The resolved keys of one tenant, for re-pushing after a tenant edit.
     pub async fn resolved_keys_for_tenant(
         &self,
         tenant_id: Uuid,
     ) -> Result<Vec<(String, ResolvedKey)>> {
-        let rows = sqlx::query(
-            "select k.key_hash, k.id as key_id, k.tenant_id, k.disabled,
-                    k.name as key_name, t.name as tenant_name, t.fairshare_group, g.weight as group_weight,
-                    t.weight, t.tokens_per_minute, t.max_in_flight, t.status,
-                    t.timezone, t.active_from, t.active_until, t.weekly_windows,
-                    t.budget_tokens, t.budget_cost_usd, t.budget_period, t.budget_started_at,
-                    k.budget_tokens as key_budget_tokens,
-                    k.budget_cost_usd as key_budget_cost_usd,
-                    k.budget_period as key_budget_period,
-                    k.budget_started_at as key_budget_started_at,
-                    k.weight as key_weight, k.max_in_flight as key_max_in_flight,
-                    k.end_user_fairshare, k.background, k.allowed_networks, k.allowed_countries,
-                    t.allowed_models,
-                    (k.tracing_enabled OR t.tracing_enabled) AS tracing_enabled,
-                    t.guardrails_policy,
-                    t.compression_policy,
-                    t.synthetic
-             from api_keys k
-             join tenants t on t.id = k.tenant_id
-             join fairshare_groups g on g.name = t.fairshare_group
-             where k.tenant_id = $1",
-        )
-        .bind(tenant_id)
-        .fetch_all(&self.pool)
-        .await?;
+        self.resolved_keys_where(KeyScope::Tenant(tenant_id)).await
+    }
+
+    /// The resolved keys of every tenant in fairshare `group`, for re-pushing
+    /// after the group's weight changed.
+    pub async fn resolved_keys_for_group(&self, group: &str) -> Result<Vec<(String, ResolvedKey)>> {
+        self.resolved_keys_where(KeyScope::Group(group)).await
+    }
+
+    async fn resolved_keys_where(&self, scope: KeyScope<'_>) -> Result<Vec<(String, ResolvedKey)>> {
+        let rows = match scope {
+            KeyScope::All => {
+                sqlx::query(RESOLVED_KEY_SELECT)
+                    .fetch_all(&self.pool)
+                    .await?
+            }
+            KeyScope::Tenant(id) => {
+                sqlx::query(&format!("{RESOLVED_KEY_SELECT} where k.tenant_id = $1"))
+                    .bind(id)
+                    .fetch_all(&self.pool)
+                    .await?
+            }
+            KeyScope::Group(group) => {
+                sqlx::query(&format!(
+                    "{RESOLVED_KEY_SELECT} where t.fairshare_group = $1"
+                ))
+                .bind(group)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
         rows.iter()
             .map(|r| Ok((r.try_get::<String, _>("key_hash")?, resolved_from_row(r)?)))
             .collect()
@@ -4102,6 +4082,34 @@ pub struct ModelHealthRecordOutcome {
 /// and `returning` list splices this in, so a write can never hand back a row
 /// the mapper only half-fills (tracing_enabled and synthetic used to go
 /// missing from every write and read as false).
+/// Which keys a resolved-key read returns.
+enum KeyScope<'a> {
+    All,
+    Tenant(Uuid),
+    Group(&'a str),
+}
+
+/// A key as the data plane sees it: the key, its tenant and its group.
+const RESOLVED_KEY_SELECT: &str = "select k.key_hash, k.id as key_id, k.tenant_id, k.disabled,
+                    k.name as key_name, t.name as tenant_name, t.fairshare_group, g.weight as group_weight,
+                    t.weight, t.tokens_per_minute, t.max_in_flight, t.status,
+                    t.timezone, t.active_from, t.active_until, t.weekly_windows,
+                    t.budget_tokens, t.budget_cost_usd, t.budget_period, t.budget_started_at,
+                    k.budget_tokens as key_budget_tokens,
+                    k.budget_cost_usd as key_budget_cost_usd,
+                    k.budget_period as key_budget_period,
+                    k.budget_started_at as key_budget_started_at,
+                    k.weight as key_weight, k.max_in_flight as key_max_in_flight,
+                    k.end_user_fairshare, k.background, k.allowed_networks, k.allowed_countries,
+                    t.allowed_models,
+                    (k.tracing_enabled OR t.tracing_enabled) AS tracing_enabled,
+                    t.guardrails_policy,
+                    t.compression_policy,
+                    t.synthetic
+             from api_keys k
+             join tenants t on t.id = k.tenant_id
+             join fairshare_groups g on g.name = t.fairshare_group";
+
 const SCHEMA_MIGRATIONS_TABLE: &str = "create table if not exists schema_migrations (
     version    text primary key,
     applied_at timestamptz not null default now()
