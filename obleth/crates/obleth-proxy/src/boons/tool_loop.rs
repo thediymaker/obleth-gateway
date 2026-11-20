@@ -307,33 +307,44 @@ impl<S> Default for Sessions<S> {
 }
 
 impl<S> Sessions<S> {
-    /// The open session for `server`, opening it on first use. A server whose
-    /// open already failed on this request fails again immediately with the
-    /// original error.
-    async fn get_or_open<F, Fut>(&mut self, server: &str, open: F) -> Result<&S, String>
+    /// Open a session on each of `servers` not yet tried on this request, all
+    /// at once. A server whose open fails is not tried again on this request.
+    async fn open_all<'s, F, Fut>(&mut self, servers: impl IntoIterator<Item = &'s str>, open: F)
     where
-        F: FnOnce() -> Fut,
+        F: Fn(&'s str) -> Fut,
         Fut: std::future::Future<Output = anyhow::Result<S>>,
     {
-        if let Some(err) = self.failed.get(server) {
-            return Err(err.clone());
+        let mut wanted: Vec<&str> = Vec::new();
+        for server in servers {
+            if !self.open.contains_key(server)
+                && !self.failed.contains_key(server)
+                && !wanted.contains(&server)
+            {
+                wanted.push(server);
+            }
         }
-        if !self.open.contains_key(server) {
-            match open().await {
+        let opened = futures_util::future::join_all(wanted.iter().map(|server| open(server))).await;
+        for (server, result) in wanted.into_iter().zip(opened) {
+            match result {
                 Ok(session) => {
                     self.open.insert(server.to_string(), session);
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, server = %server, "mcp session open failed");
-                    let msg = e.to_string();
-                    self.failed.insert(server.to_string(), msg.clone());
-                    return Err(msg);
+                    self.failed.insert(server.to_string(), e.to_string());
                 }
             }
         }
+    }
+
+    /// The open session for `server`, or why it could not be opened.
+    fn get(&self, server: &str) -> Result<&S, String> {
+        if let Some(err) = self.failed.get(server) {
+            return Err(err.clone());
+        }
         self.open
             .get(server)
-            .ok_or_else(|| "session missing after open".to_string())
+            .ok_or_else(|| "no session was opened".to_string())
     }
 }
 
@@ -608,20 +619,19 @@ pub async fn run(
             push_message(&mut request, message.clone());
         }
         let tool_exec_start = crate::tracer::now_ms();
-        for (index, call) in calls.iter().enumerate() {
-            let result_text = run_one_call(
-                state,
-                &key.tenant_id,
-                &loop_plan.tool_servers,
-                &mut sessions,
-                image_ctx.as_mut(),
-                search_ctx.as_mut(),
-                call,
-                index,
-                &deadline,
-                tool_timeout,
-            )
-            .await;
+        let results = run_turn(
+            state,
+            &key.tenant_id,
+            &loop_plan.tool_servers,
+            &mut sessions,
+            image_ctx.as_mut(),
+            search_ctx.as_mut(),
+            &calls,
+            &deadline,
+            tool_timeout,
+        )
+        .await;
+        for (call, result_text) in calls.iter().zip(results) {
             tracing::debug!(
                 tool = %call.name,
                 turn,
@@ -864,39 +874,262 @@ async fn dispatch_follow_up(
     super::chat_call_completion_on(http, target, request, timeout).await
 }
 
-/// Execute call number `index` of one turn, honoring the per-turn call cap and
-/// the loop's time budget. Both limits answer with a tool result the model can
-/// read instead of failing the loop.
+/// Most gateway tool calls of one turn that run at once.
+const TURN_CONCURRENCY: usize = 8;
+
+/// Most calls of one turn that run at once against one MCP server, which may
+/// not take more from a single client.
+const SERVER_CONCURRENCY: usize = 4;
+
+/// How one call of a turn will run, decided in call order before any runs.
+#[derive(Debug, PartialEq)]
+pub(super) enum Planned {
+    /// Answered without running: a cap, the deadline, or no such tool.
+    Done(String),
+    Retrieve,
+    /// `budget` images reserved for it.
+    Image {
+        budget: u32,
+        timeout: Duration,
+    },
+    /// `left` searches the request had before it, reserved for it.
+    Search {
+        left: u32,
+        timeout: Duration,
+    },
+    Mcp {
+        server: String,
+        timeout: Duration,
+    },
+}
+
+/// Plan a turn's calls in order: the per-turn call cap and the loop's time
+/// budget answer a call outright, and the image and search budgets are
+/// reserved call by call, so the calls can then run at once and the excess
+/// ones are refused exactly as when they ran one after another.
+/// `images` is the boon's settings and the images made so far; `searches`
+/// the boon's settings and the searches run so far.
+pub(super) fn plan_turn(
+    calls: &[PendingCall],
+    tool_servers: &HashMap<String, String>,
+    images: Option<(&obleth_config::ImageGenerationBoonSettings, usize)>,
+    searches: Option<(&obleth_config::WebSearchBoonSettings, u32)>,
+    deadline: &LoopDeadline,
+    tool_timeout: Duration,
+) -> Vec<Planned> {
+    let mut images_left = images.map(|(cfg, made)| super::image_gen::images_remaining(cfg, made));
+    let mut searches_reserved = 0u32;
+    calls
+        .iter()
+        .enumerate()
+        .map(|(index, call)| {
+            if let Err(refusal) = call_timeout(&call.name, index, deadline, tool_timeout) {
+                return Planned::Done(refusal);
+            }
+            let timeout = deadline.bound(tool_timeout).unwrap_or(tool_timeout);
+            if call.name == RETRIEVE_ORIGINAL_TOOL {
+                return Planned::Retrieve;
+            }
+            if call.name == super::image_gen::GENERATE_IMAGE_TOOL {
+                let (Some((cfg, _)), Some(left)) = (images, images_left.as_mut()) else {
+                    return Planned::Done(super::image_gen::failure_receipt(
+                        "image generation is not configured",
+                    ));
+                };
+                let Some(timeout) = super::image_gen::call_timeout(cfg, deadline) else {
+                    return Planned::Done(deadline_result(&call.name));
+                };
+                // A call without a prompt fails before generating anything.
+                let budget = if super::image_gen::prompt_arg(&call.arguments).is_some() {
+                    let n = super::image_gen::clamp_n(cfg, &call.arguments).min(*left);
+                    *left -= n;
+                    n
+                } else {
+                    0
+                };
+                return Planned::Image { budget, timeout };
+            }
+            if call.name == super::web_search::WEB_SEARCH_TOOL {
+                // Without the boon the name belongs to someone else (a granted
+                // MCP server's `web_search`, say), so it falls through below.
+                if let Some((cfg, used)) = searches {
+                    let Some(timeout) = super::web_search::call_timeout(cfg, deadline) else {
+                        return Planned::Done(deadline_result(&call.name));
+                    };
+                    let left =
+                        super::web_search::reserve(cfg, used, searches_reserved, &call.arguments);
+                    if left.is_some_and(|left| left > 0) {
+                        searches_reserved += 1;
+                    }
+                    // A call without a query fails before searching.
+                    return Planned::Search {
+                        left: left.unwrap_or(1),
+                        timeout,
+                    };
+                }
+            }
+            match tool_servers.get(&call.name) {
+                Some(server) => Planned::Mcp {
+                    server: server.clone(),
+                    timeout,
+                },
+                None => Planned::Done(format!("Error: tool `{}` is not available.", call.name)),
+            }
+        })
+        .collect()
+}
+
+/// What one call of a turn produced, merged in call order.
+enum CallOutput {
+    Text(String),
+    Image(super::image_gen::ImageCall),
+    Search(super::web_search::SearchCall),
+}
+
+/// Run `jobs` at most `limit` at once; their outputs in the jobs' order.
+pub(super) async fn run_in_order<T, Fut>(jobs: Vec<Fut>, limit: usize) -> Vec<T>
+where
+    Fut: std::future::Future<Output = T>,
+{
+    use futures_util::StreamExt;
+    let mut done: Vec<(usize, T)> = futures_util::stream::iter(
+        jobs.into_iter()
+            .enumerate()
+            .map(|(index, job)| async move { (index, job.await) }),
+    )
+    .buffer_unordered(limit.max(1))
+    .collect()
+    .await;
+    done.sort_unstable_by_key(|(index, _)| *index);
+    done.into_iter().map(|(_, output)| output).collect()
+}
+
+/// Execute one turn's gateway tool calls, at most [`TURN_CONCURRENCY`] at
+/// once and [`SERVER_CONCURRENCY`] against one MCP server, and return their
+/// results in call order. The MCP sessions the turn needs are opened first,
+/// all at once, and reused by later turns. Errors become a text result the
+/// model can read and recover from (fail-open inside the loop). `tenant`
+/// scopes `retrieve_original` to the caller's own stashed originals.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn run_one_call(
+pub(super) async fn run_turn(
     state: &AppState,
     tenant: &uuid::Uuid,
     tool_servers: &HashMap<String, String>,
     sessions: &mut Sessions,
-    image: Option<&mut super::image_gen::ImageCtx<'_>>,
-    search: Option<&mut super::web_search::SearchCtx<'_>>,
-    call: &PendingCall,
-    index: usize,
+    mut image: Option<&mut super::image_gen::ImageCtx<'_>>,
+    mut search: Option<&mut super::web_search::SearchCtx<'_>>,
+    calls: &[PendingCall],
     deadline: &LoopDeadline,
     tool_timeout: Duration,
-) -> String {
-    match call_timeout(&call.name, index, deadline, tool_timeout) {
-        Ok(timeout) => {
-            execute_call(
-                state,
-                tenant,
-                tool_servers,
-                sessions,
-                image,
-                search,
-                call,
-                timeout,
-                deadline,
-            )
-            .await
+) -> Vec<String> {
+    let plans = plan_turn(
+        calls,
+        tool_servers,
+        image.as_deref().map(|c| (c.cfg, c.images.len())),
+        search.as_deref().map(|c| (c.cfg, c.searches)),
+        deadline,
+        tool_timeout,
+    );
+
+    // The MCP servers this turn calls, resolved and opened up front; each
+    // opens within the timeout of its first call.
+    let mut servers: HashMap<String, (Option<Arc<obleth_config::ResolvedMcpServer>>, Duration)> =
+        HashMap::new();
+    for plan in &plans {
+        if let Planned::Mcp { server, timeout } = plan {
+            if !servers.contains_key(server) {
+                let resolved = crate::mcp::resolve_mcp(state, server).await;
+                servers.insert(server.clone(), (resolved, *timeout));
+            }
         }
-        Err(refusal) => refusal,
     }
+    let open_started = std::time::Instant::now();
+    sessions
+        .open_all(
+            servers
+                .iter()
+                .filter(|(_, (resolved, _))| resolved.is_some())
+                .map(|(name, _)| name.as_str()),
+            |name| {
+                let (resolved, timeout) = &servers[name];
+                let server = resolved.as_ref().expect("filtered to resolved servers");
+                mcp_tools::open_session(state, server, *timeout)
+            },
+        )
+        .await;
+    let open_ms = open_started.elapsed().as_millis() as u64;
+    let limits: HashMap<&str, tokio::sync::Semaphore> = servers
+        .keys()
+        .map(|name| {
+            (
+                name.as_str(),
+                tokio::sync::Semaphore::new(SERVER_CONCURRENCY),
+            )
+        })
+        .collect();
+
+    let outputs = {
+        let (image, search, sessions) = (image.as_deref(), search.as_deref(), &*sessions);
+        let (servers, limits) = (&servers, &limits);
+        let jobs: Vec<_> = calls
+            .iter()
+            .zip(plans)
+            .map(|(call, plan)| async move {
+                match plan {
+                    Planned::Done(text) => CallOutput::Text(text),
+                    Planned::Retrieve => CallOutput::Text(retrieve(state, tenant, call).await),
+                    Planned::Image { budget, timeout } => match image {
+                        Some(ctx) => CallOutput::Image(
+                            super::image_gen::execute(state, ctx, &call.arguments, budget, timeout)
+                                .await,
+                        ),
+                        None => CallOutput::Text(String::new()),
+                    },
+                    Planned::Search { left, timeout } => match search {
+                        Some(ctx) => CallOutput::Search(
+                            super::web_search::execute(state, ctx, &call.arguments, left, timeout)
+                                .await,
+                        ),
+                        None => CallOutput::Text(String::new()),
+                    },
+                    Planned::Mcp { server, timeout } => {
+                        if servers[server.as_str()].0.is_none() {
+                            return CallOutput::Text(format!(
+                                "Error: tool server `{server}` is unavailable."
+                            ));
+                        }
+                        let session = match sessions.get(&server) {
+                            Ok(session) => session,
+                            Err(e) => {
+                                crate::mcp::record_call(state, &server, true, false, open_ms);
+                                return CallOutput::Text(format!(
+                                    "Error: could not reach tool server `{server}`: {e}"
+                                ));
+                            }
+                        };
+                        let _turn = limits[server.as_str()].acquire().await;
+                        CallOutput::Text(call_mcp(state, session, &server, call, timeout).await)
+                    }
+                }
+            })
+            .collect();
+        run_in_order(jobs, TURN_CONCURRENCY).await
+    };
+
+    outputs
+        .into_iter()
+        .map(|output| match output {
+            CallOutput::Text(text) => text,
+            CallOutput::Image(call) => image
+                .as_deref_mut()
+                .map(|ctx| ctx.absorb(call))
+                .unwrap_or_default(),
+            CallOutput::Search(call) => search
+                .as_deref_mut()
+                .map(|ctx| ctx.absorb(call))
+                .unwrap_or_default(),
+        })
+        .collect()
 }
 
 /// The timeout for call number `index` of a turn, or the tool result to
@@ -955,88 +1188,32 @@ fn extract_tool_calls(body: &Value) -> Vec<PendingCall> {
         .collect()
 }
 
-/// Execute one call against its MCP server, reusing the per-request session.
-/// Errors become a text result the model can read and recover from (fail-open
-/// inside the loop). `tenant` scopes `retrieve_original` to the caller's own
-/// stashed originals.
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn execute_call(
+/// The gateway-executed compression tool: resolved from Redis, never an MCP
+/// server.
+async fn retrieve(state: &AppState, tenant: &uuid::Uuid, call: &PendingCall) -> String {
+    let reference = call.arguments.get("ref").and_then(|v| v.as_str());
+    let content = match reference {
+        Some(r) => match state.redis.compress_get(tenant, r).await {
+            Ok(found) => found,
+            Err(e) => {
+                tracing::warn!(error = %e, "compress_get failed for retrieve_original");
+                None
+            }
+        },
+        None => None,
+    };
+    format_retrieve_result(reference, content)
+}
+
+/// One call on an open MCP session, its result capped for the model.
+async fn call_mcp(
     state: &AppState,
-    tenant: &uuid::Uuid,
-    tool_servers: &HashMap<String, String>,
-    sessions: &mut Sessions,
-    image: Option<&mut super::image_gen::ImageCtx<'_>>,
-    search: Option<&mut super::web_search::SearchCtx<'_>>,
+    session: &mcp_tools::Session,
+    server_name: &str,
     call: &PendingCall,
     timeout: Duration,
-    deadline: &LoopDeadline,
 ) -> String {
-    // Gateway-executed compression tool: resolve from Redis, never an MCP server.
-    if call.name == RETRIEVE_ORIGINAL_TOOL {
-        let reference = call.arguments.get("ref").and_then(|v| v.as_str());
-        let content = match reference {
-            Some(r) => match state.redis.compress_get(tenant, r).await {
-                Ok(found) => found,
-                Err(e) => {
-                    tracing::warn!(error = %e, "compress_get failed for retrieve_original");
-                    None
-                }
-            },
-            None => None,
-        };
-        return format_retrieve_result(reference, content);
-    }
-
-    // Gateway-executed image generation: a POST to the configured image model,
-    // never an MCP server. The returned receipt is what the model reads; the
-    // image itself lands in `ctx.images`.
-    if call.name == super::image_gen::GENERATE_IMAGE_TOOL {
-        let Some(ctx) = image else {
-            return super::image_gen::failure_receipt("image generation is not configured");
-        };
-        let Some(image_timeout) = super::image_gen::call_timeout(ctx.cfg, deadline) else {
-            return deadline_result(&call.name);
-        };
-        return super::image_gen::execute(state, ctx, &call.arguments, image_timeout).await;
-    }
-
-    // Gateway-executed web search, when this boon armed the loop. Without a
-    // context the name belongs to someone else (a granted MCP server's
-    // `web_search`, say), so it falls through to the normal lookup below.
-    if call.name == super::web_search::WEB_SEARCH_TOOL {
-        if let Some(ctx) = search {
-            let Some(search_timeout) = super::web_search::call_timeout(ctx.cfg, deadline) else {
-                return deadline_result(&call.name);
-            };
-            return super::web_search::execute(state, ctx, &call.arguments, search_timeout).await;
-        }
-    }
-
-    let Some(server_name) = tool_servers.get(&call.name) else {
-        return format!("Error: tool `{}` is not available.", call.name);
-    };
-    let Some(server) = crate::mcp::resolve_mcp(state, server_name).await else {
-        return format!("Error: tool server `{server_name}` is unavailable.");
-    };
     let started = std::time::Instant::now();
-    let session = match sessions
-        .get_or_open(server_name, || {
-            mcp_tools::open_session(state, &server, timeout)
-        })
-        .await
-    {
-        Ok(session) => session,
-        Err(e) => {
-            crate::mcp::record_call(
-                state,
-                server_name,
-                true,
-                false,
-                started.elapsed().as_millis() as u64,
-            );
-            return format!("Error: could not reach tool server `{server_name}`: {e}");
-        }
-    };
     let result =
         mcp_tools::call_tool_in(state, session, &call.name, call.arguments.clone(), timeout).await;
     crate::mcp::record_call(
@@ -1222,29 +1399,144 @@ mod tests {
     async fn a_failed_session_open_is_not_retried_within_the_request() {
         let opens = AtomicUsize::new(0);
         let mut sessions: Sessions<()> = Sessions::default();
-        for _ in 0..3 {
-            let err = sessions
-                .get_or_open("dead", || async {
-                    opens.fetch_add(1, Ordering::SeqCst);
-                    anyhow::bail!("connection refused")
-                })
-                .await
-                .expect_err("dead server");
-            assert!(err.contains("connection refused"));
-        }
-        assert_eq!(opens.load(Ordering::SeqCst), 1);
-
-        // A healthy server opens once and is reused.
+        // One turn calls a dead and a live server twice each: each opens once.
         for _ in 0..3 {
             sessions
-                .get_or_open("live", || async {
-                    opens.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
+                .open_all(["dead", "live", "dead", "live"], |server| {
+                    let opens = &opens;
+                    async move {
+                        opens.fetch_add(1, Ordering::SeqCst);
+                        if server == "dead" {
+                            anyhow::bail!("connection refused")
+                        }
+                        Ok(())
+                    }
                 })
-                .await
-                .unwrap();
+                .await;
+            let err = sessions.get("dead").expect_err("dead server");
+            assert!(err.contains("connection refused"));
+            sessions.get("live").expect("live server");
         }
         assert_eq!(opens.load(Ordering::SeqCst), 2);
+        assert!(sessions.get("never").is_err());
+    }
+
+    #[tokio::test]
+    async fn a_turns_calls_run_at_once_and_answer_in_call_order() {
+        let started = std::time::Instant::now();
+        let jobs: Vec<_> = [300u64, 100, 200]
+            .into_iter()
+            .map(|ms| async move {
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                ms
+            })
+            .collect();
+        assert_eq!(
+            run_in_order(jobs, TURN_CONCURRENCY).await,
+            vec![300, 100, 200]
+        );
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_millis(550),
+            "ran one after another: {took:?}"
+        );
+        // The cap holds: four 100 ms jobs, two at a time, take two rounds.
+        let started = std::time::Instant::now();
+        let jobs: Vec<_> = (0..4)
+            .map(|i| async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                i
+            })
+            .collect();
+        assert_eq!(run_in_order(jobs, 2).await, vec![0, 1, 2, 3]);
+        assert!(started.elapsed() >= Duration::from_millis(200));
+    }
+
+    fn call(name: &str, arguments: Value) -> PendingCall {
+        PendingCall {
+            id: format!("call-{name}"),
+            name: name.into(),
+            arguments,
+        }
+    }
+
+    #[test]
+    fn a_turn_past_the_search_budget_refuses_the_excess_calls_in_order() {
+        let cfg = obleth_config::WebSearchBoonSettings {
+            enabled: true,
+            search_tool: Some("web".into()),
+            max_searches_per_request: 3,
+            ..Default::default()
+        };
+        let search = |q: &str| {
+            call(
+                super::super::web_search::WEB_SEARCH_TOOL,
+                json!({ "query": q }),
+            )
+        };
+        let calls = vec![
+            search("a"),
+            call(super::super::web_search::WEB_SEARCH_TOOL, json!({})),
+            search("b"),
+            search("c"),
+        ];
+        let deadline = LoopDeadline::after(Duration::from_secs(60));
+        // One search already ran on an earlier turn: two are left.
+        let plans = plan_turn(
+            &calls,
+            &HashMap::new(),
+            None,
+            Some((&cfg, 1)),
+            &deadline,
+            Duration::from_secs(5),
+        );
+        let lefts: Vec<u32> = plans
+            .iter()
+            .map(|p| match p {
+                Planned::Search { left, .. } => *left,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        // The query-less call reserves nothing; the fourth search is refused.
+        assert_eq!(lefts, vec![2, 1, 1, 0]);
+    }
+
+    #[test]
+    fn a_turns_image_calls_share_the_request_image_budget_in_order() {
+        let cfg = obleth_config::ImageGenerationBoonSettings {
+            enabled: true,
+            image_model: Some("img".into()),
+            max_images_per_request: 3,
+            ..Default::default()
+        };
+        let image = |n: u64| {
+            call(
+                super::super::image_gen::GENERATE_IMAGE_TOOL,
+                json!({ "prompt": "a cat", "n": n }),
+            )
+        };
+        let calls = vec![image(2), image(2), image(1), call("missing", json!({}))];
+        let deadline = LoopDeadline::after(Duration::from_secs(60));
+        let plans = plan_turn(
+            &calls,
+            &HashMap::new(),
+            Some((&cfg, 0)),
+            None,
+            &deadline,
+            Duration::from_secs(5),
+        );
+        let budgets: Vec<Option<u32>> = plans
+            .iter()
+            .map(|p| match p {
+                Planned::Image { budget, .. } => Some(*budget),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(budgets, vec![Some(2), Some(1), Some(0), None]);
+        assert_eq!(
+            plans[3],
+            Planned::Done("Error: tool `missing` is not available.".into())
+        );
     }
 
     fn tool_cache(ttl: Duration) -> ToolCache {

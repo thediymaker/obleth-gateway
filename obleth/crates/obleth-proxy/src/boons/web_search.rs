@@ -309,21 +309,70 @@ pub(super) fn call_timeout(
     deadline.bound(Duration::from_millis(cfg.timeout_ms.max(1)))
 }
 
-/// Execute one `web_search` call: check the limit, resolve the search route,
-/// apply the tenant's input guardrails to the query (it leaves for the open
-/// web), run the search, record it, and return the text the model will read.
+/// What one `web_search` call produced. The tool loop runs a turn's calls at
+/// once and merges each into the request's [`SearchCtx`], in call order, with
+/// [`SearchCtx::absorb`].
+pub(super) struct SearchCall {
+    result: String,
+    event: Option<SearchEvent>,
+}
+
+impl SearchCall {
+    fn failed(reason: &str) -> Self {
+        Self {
+            result: failure_result(reason),
+            event: None,
+        }
+    }
+}
+
+impl SearchCtx<'_> {
+    /// Take in one call's search; the text the model reads. A call that ran
+    /// a search counts toward the limit.
+    pub(super) fn absorb(&mut self, call: SearchCall) -> String {
+        if let Some(event) = call.event {
+            self.searches += 1;
+            self.events.push(event);
+        }
+        call.result
+    }
+}
+
+/// The searches a call may still run, when the turn is planned: `None` for a
+/// call with no query (it fails without one), `Some(0)` once the request's
+/// limit is spent. `reserved` is the searches already given to earlier calls
+/// of the turn.
+pub(super) fn reserve(
+    cfg: &WebSearchBoonSettings,
+    used: u32,
+    reserved: u32,
+    args: &Value,
+) -> Option<u32> {
+    query_arg(args)?;
+    Some(max_searches(cfg).saturating_sub(used.saturating_add(reserved)))
+}
+
+/// Execute one `web_search` call: resolve the search route, apply the
+/// tenant's input guardrails to the query (it leaves for the open web), run
+/// the search, record it, and return the text the model will read. `left` is
+/// how many searches the request had before this one, reserved when the turn
+/// was planned; 0 means the limit is already spent.
 pub(super) async fn execute(
     state: &AppState,
-    ctx: &mut SearchCtx<'_>,
+    ctx: &SearchCtx<'_>,
     args: &Value,
+    left: u32,
     timeout: Duration,
-) -> String {
+) -> SearchCall {
     let Some(query) = query_arg(args) else {
-        return failure_result("no query was supplied");
+        return SearchCall::failed("no query was supplied");
     };
     let limit = max_searches(ctx.cfg);
-    if ctx.searches >= limit {
-        return limit_result(limit);
+    if left == 0 {
+        return SearchCall {
+            result: limit_result(limit),
+            event: None,
+        };
     }
     let Some(tool_name) = ctx
         .cfg
@@ -332,14 +381,14 @@ pub(super) async fn execute(
         .map(str::trim)
         .filter(|t| !t.is_empty())
     else {
-        return failure_result("no search tool is configured");
+        return SearchCall::failed("no search tool is configured");
     };
     let Some(route) = crate::proxy::resolve_model(state, tool_name).await else {
         tracing::warn!(
             tool = %tool_name,
             "web-search boon target is not registered; no search run"
         );
-        return failure_result("the search tool is not available");
+        return SearchCall::failed("the search tool is not available");
     };
     if !route.enabled || route.model_type != SEARCH_MODEL_TYPE {
         tracing::warn!(
@@ -348,7 +397,7 @@ pub(super) async fn execute(
             enabled = route.enabled,
             "web-search boon target is disabled or not a search route; no search run"
         );
-        return failure_result("the search tool is not available");
+        return SearchCall::failed("the search tool is not available");
     }
 
     // The query leaves for the open web, so the tenant's input policy applies
@@ -367,15 +416,14 @@ pub(super) async fn execute(
         )
         .await
     {
-        Err(_) => return failure_result("the query was blocked by policy"),
+        Err(_) => return SearchCall::failed("the query was blocked by policy"),
         Ok(true) => match scan["messages"][0]["content"].as_str() {
             Some(redacted) => redacted.to_string(),
-            None => return failure_result("the query was blocked by policy"),
+            None => return SearchCall::failed("the query was blocked by policy"),
         },
         Ok(false) => query,
     };
 
-    ctx.searches += 1;
     let domains = domains_arg(args);
     let domain_refs: Vec<&str> = domains.iter().map(String::as_str).collect();
     let started = crate::tracer::now_ms();
@@ -396,11 +444,7 @@ pub(super) async fn execute(
     let (status, result, results) = match outcome {
         Ok(Ok(results)) => {
             let count = results.len() as u32;
-            (
-                200,
-                format_results(&query, &results, limit.saturating_sub(ctx.searches)),
-                count,
-            )
+            (200, format_results(&query, &results, left - 1), count)
         }
         Ok(Err(reason)) => {
             tracing::warn!(
@@ -428,13 +472,15 @@ pub(super) async fn execute(
         status,
         upstream_ms,
     );
-    ctx.events.push(SearchEvent {
-        results,
-        tool: route.model_name.clone(),
-        upstream_ms,
-        ok: status == 200,
-    });
-    result
+    SearchCall {
+        result,
+        event: Some(SearchEvent {
+            results,
+            tool: route.model_name.clone(),
+            upstream_ms,
+            ok: status == 200,
+        }),
+    }
 }
 
 #[cfg(test)]

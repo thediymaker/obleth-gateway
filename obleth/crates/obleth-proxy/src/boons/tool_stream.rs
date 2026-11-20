@@ -411,37 +411,40 @@ pub fn run(
                 &mut request,
                 assistant_message(&content_acc, &calls),
             );
-            for (index, c) in calls.iter().enumerate() {
-                // Emit the "searching…" marker on the reasoning channel, not as
-                // answer content: a coding/agentic client shows it as visible
-                // work (so a 15s search doesn't look like a hang) without it
-                // corrupting the content stream it parses as the real answer.
-                if index < obleth_config::TOOL_LOOP_MAX_CALLS_PER_TURN {
-                    yield Ok(Bytes::from(reasoning_chunk(
-                        &id,
-                        &model_name,
-                        created,
-                        &marker_text(&c.name, &c.arguments),
-                    )));
-                }
-                let pending = super::tool_loop::PendingCall {
+            // Emit the "searching…" markers on the reasoning channel, not as
+            // answer content: a coding/agentic client shows them as visible
+            // work (so a 15s search doesn't look like a hang) without them
+            // corrupting the content stream it parses as the real answer. The
+            // calls then run together.
+            for c in calls.iter().take(obleth_config::TOOL_LOOP_MAX_CALLS_PER_TURN) {
+                yield Ok(Bytes::from(reasoning_chunk(
+                    &id,
+                    &model_name,
+                    created,
+                    &marker_text(&c.name, &c.arguments),
+                )));
+            }
+            let pending: Vec<super::tool_loop::PendingCall> = calls
+                .iter()
+                .map(|c| super::tool_loop::PendingCall {
                     id: c.id.clone(),
                     name: c.name.clone(),
                     arguments: serde_json::from_str(&c.arguments).unwrap_or_else(|_| json!({})),
-                };
-                let result = super::tool_loop::run_one_call(
-                    &state,
-                    &key.tenant_id,
-                    &tool_servers,
-                    &mut sessions,
-                    image_ctx.as_mut(),
-                    search_ctx.as_mut(),
-                    &pending,
-                    index,
-                    &deadline,
-                    tool_timeout,
-                )
-                .await;
+                })
+                .collect();
+            let results = super::tool_loop::run_turn(
+                &state,
+                &key.tenant_id,
+                &tool_servers,
+                &mut sessions,
+                image_ctx.as_mut(),
+                search_ctx.as_mut(),
+                &pending,
+                &deadline,
+                tool_timeout,
+            )
+            .await;
+            for (c, result) in calls.iter().zip(results) {
                 super::tool_loop::push_message(
                     &mut request,
                     json!({

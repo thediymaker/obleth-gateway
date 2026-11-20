@@ -526,46 +526,76 @@ pub(super) struct ImageCtx<'a> {
     pub events: Vec<ImageGenEvent>,
 }
 
+/// What one `generate_image` call produced. The tool loop runs a turn's
+/// calls at once and merges each into the request's [`ImageCtx`], in call
+/// order, with [`ImageCtx::absorb`].
+pub(super) struct ImageCall {
+    receipt: String,
+    images: Vec<GeneratedImage>,
+    event: Option<ImageGenEvent>,
+}
+
+impl ImageCall {
+    fn failed(reason: &str) -> Self {
+        Self {
+            receipt: failure_receipt(reason),
+            images: Vec::new(),
+            event: None,
+        }
+    }
+}
+
+impl ImageCtx<'_> {
+    /// Take in one call's images and event; the receipt the model reads.
+    pub(super) fn absorb(&mut self, call: ImageCall) -> String {
+        self.images.extend(call.images);
+        self.events.extend(call.event);
+        call.receipt
+    }
+}
+
 /// Execute one `generate_image` call: clamp the arguments, POST to the
-/// configured image model, push any images into the accumulator, bill them, and
-/// return the short text receipt the model will read.
+/// configured image model, bill the images, and return them with the short
+/// text receipt the model will read. `budget` is how many images this call
+/// may produce, reserved for it when the turn was planned; 0 means the
+/// request's limit is already spent.
 ///
 /// Fail-open throughout: every failure returns a receipt describing the failure
-/// and leaves the accumulator untouched, so the model answers in prose.
+/// and no images, so the model answers in prose.
 ///
 /// `timeout` bounds the generation call; see [`call_timeout`].
 pub(super) async fn execute(
     state: &AppState,
-    ctx: &mut ImageCtx<'_>,
+    ctx: &ImageCtx<'_>,
     args: &Value,
+    budget: u32,
     timeout: Duration,
-) -> String {
+) -> ImageCall {
     let Some(prompt) = prompt_arg(args) else {
-        return failure_receipt("no prompt was supplied");
+        return ImageCall::failed("no prompt was supplied");
     };
     let Some(model_name) = ctx.cfg.image_model.as_deref().map(str::trim) else {
-        return failure_receipt("no image model is configured");
+        return ImageCall::failed("no image model is configured");
     };
     let Some(image_model) = crate::proxy::resolve_model(state, model_name).await else {
         tracing::warn!(
             model = %model_name,
             "image-generation boon target is not registered; no image produced"
         );
-        return failure_receipt("the image model is not available");
+        return ImageCall::failed("the image model is not available");
     };
     if !image_model.enabled {
         tracing::warn!(
             model = %model_name,
             "image-generation boon target is disabled; no image produced"
         );
-        return failure_receipt("the image model is not available");
+        return ImageCall::failed("the image model is not available");
     }
 
-    let remaining = images_remaining(ctx.cfg, ctx.images.len());
-    if remaining == 0 {
-        return failure_receipt("the image limit for this request was already reached");
+    if budget == 0 {
+        return ImageCall::failed("the image limit for this request was already reached");
     }
-    let n = clamp_n(ctx.cfg, args).min(remaining);
+    let n = clamp_n(ctx.cfg, args).min(budget);
     let size = clamp_size(ctx.cfg, args);
     let body = json!({
         "model": image_model.upstream_model,
@@ -587,25 +617,28 @@ pub(super) async fn execute(
                     model = %model_name,
                     "image-generation boon response carried no image data"
                 );
-                ctx.events.push(ImageGenEvent {
-                    images: 0,
-                    size,
-                    model: image_model.model_name.clone(),
-                    upstream_ms,
-                    ok: false,
-                });
-                return failure_receipt("the image model returned no image");
+                return ImageCall {
+                    event: Some(ImageGenEvent {
+                        images: 0,
+                        size,
+                        model: image_model.model_name.clone(),
+                        upstream_ms,
+                        ok: false,
+                    }),
+                    ..ImageCall::failed("the image model returned no image")
+                };
             }
             // A backend that ignores `n` must not push the request past its cap.
-            let urls: Vec<String> = urls.into_iter().take(n as usize).collect();
-            let count = urls.len();
-            for url in urls {
-                ctx.images.push(GeneratedImage {
+            let images: Vec<GeneratedImage> = urls
+                .into_iter()
+                .take(n as usize)
+                .map(|url| GeneratedImage {
                     url,
                     size: size.clone(),
                     prompt: prompt.clone(),
-                });
-            }
+                })
+                .collect();
+            let count = images.len();
             super::bill_image_generation(
                 state,
                 &image_model,
@@ -614,14 +647,17 @@ pub(super) async fn execute(
                 ctx.request_id,
                 count as u32,
             );
-            ctx.events.push(ImageGenEvent {
-                images: count as u32,
-                size: size.clone(),
-                model: image_model.model_name.clone(),
-                upstream_ms,
-                ok: true,
-            });
-            receipt(count, &size, &prompt)
+            ImageCall {
+                receipt: receipt(count, &size, &prompt),
+                images,
+                event: Some(ImageGenEvent {
+                    images: count as u32,
+                    size,
+                    model: image_model.model_name.clone(),
+                    upstream_ms,
+                    ok: true,
+                }),
+            }
         }
         Err(e) => {
             tracing::warn!(
@@ -629,14 +665,16 @@ pub(super) async fn execute(
                 model = %model_name,
                 "image-generation boon call failed; answering without an image"
             );
-            ctx.events.push(ImageGenEvent {
-                images: 0,
-                size,
-                model: image_model.model_name.clone(),
-                upstream_ms,
-                ok: false,
-            });
-            failure_receipt(&sanitize_generation_error(&e))
+            ImageCall {
+                event: Some(ImageGenEvent {
+                    images: 0,
+                    size,
+                    model: image_model.model_name.clone(),
+                    upstream_ms,
+                    ok: false,
+                }),
+                ..ImageCall::failed(&sanitize_generation_error(&e))
+            }
         }
     }
 }
