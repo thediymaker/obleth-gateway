@@ -400,21 +400,46 @@ pub(super) fn select_kept(
 }
 
 /// Choose the prose compaction for one segment: prefer the neural extractive
-/// selection when sidecar `scores` are available and productive, otherwise fall
-/// back to the deterministic `extract_prose` heuristic. Pure; no I/O.
+/// selection when sidecar `scores` are available and productive, otherwise the
+/// deterministic heuristic. Text in 8 or more lines keeps its line structure
+/// ([`extract_prose`](super::compression::extract_prose)); prose in fewer,
+/// longer lines (a paragraph, a pasted answer) is ranked by sentence with the
+/// same heuristic, as the sidecar's scores would be. Pure; no I/O.
 pub(super) fn compact_prose_segment(
     original: &str,
     neural_scores: Option<&[f32]>,
     keep_ratio: f32,
     query_terms: &std::collections::HashSet<String>,
 ) -> Option<String> {
+    let sentences = split_sentences(original);
     if let Some(scores) = neural_scores {
-        let sentences = split_sentences(original);
         if let Some(out) = select_kept(&sentences, scores, keep_ratio, query_terms) {
             return Some(out);
         }
     }
-    super::compression::extract_prose(original, query_terms, keep_ratio)
+    super::compression::extract_prose(original, query_terms, keep_ratio).or_else(|| {
+        let scores = heuristic_scores(&sentences, query_terms);
+        select_kept(&sentences, &scores, keep_ratio, query_terms)
+    })
+}
+
+/// The heuristic's score for each sentence; a near-duplicate of an earlier
+/// sentence scores 0, so it is the first to go.
+fn heuristic_scores(
+    sentences: &[String],
+    query_terms: &std::collections::HashSet<String>,
+) -> Vec<f32> {
+    let mut seen = std::collections::HashSet::new();
+    sentences
+        .iter()
+        .map(|s| {
+            if seen.insert(super::compression::dedup_key(s)) {
+                super::compression::salience(s, query_terms)
+            } else {
+                0.0
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -659,6 +684,42 @@ mod tests {
         let sents: Vec<String> = (0..8).map(|i| format!("s{i}")).collect();
         let scores: Vec<f32> = (0..8).map(|i| i as f32).collect();
         assert!(select_kept(&sents, &scores, 1.0, &HashSet::new()).is_none());
+    }
+
+    #[test]
+    fn a_paragraph_without_sidecar_scores_is_ranked_by_sentence() {
+        // One line of ten sentences: too few lines for the line heuristic, so
+        // before this it was never shortened without the sidecar.
+        let text = "The queue drained overnight. Node seven rebooted twice. \
+                    Storage stayed at sixty percent. The scheduler restarted once. \
+                    Network latency was flat. A user asked about quotas. \
+                    Backups finished on time. The login node was busy. \
+                    Node seven rebooted twice. Nothing else changed.";
+        let terms: HashSet<String> = ["quotas".to_string()].into_iter().collect();
+        let out = compact_prose_segment(text, None, 0.5, &terms).expect("a paragraph compacts");
+        assert!(out.ends_with("sentences omitted]"), "{out}");
+        assert!(out.len() < text.len());
+        assert!(out.contains("A user asked about quotas."), "query match kept: {out}");
+        assert_eq!(
+            out.matches("Node seven rebooted twice.").count(),
+            1,
+            "a repeated sentence goes first: {out}"
+        );
+    }
+
+    #[test]
+    fn many_lines_without_scores_keep_the_line_heuristic() {
+        let text: String = (0..12)
+            .map(|i| format!("Line {i} reports a distinct observation about subsystem {i}.\n"))
+            .collect();
+        let out = compact_prose_segment(&text, None, 0.5, &HashSet::new()).expect("compacts");
+        assert!(out.contains("lines omitted]"), "{out}");
+    }
+
+    #[test]
+    fn three_sentences_are_left_alone() {
+        let text = "One short thing. Another short thing. A third.";
+        assert_eq!(compact_prose_segment(text, None, 0.5, &HashSet::new()), None);
     }
 
     #[test]

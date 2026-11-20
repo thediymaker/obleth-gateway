@@ -897,12 +897,23 @@ pub(super) fn lossy_rewrite(
 }
 
 /// Normalize a line for near-duplicate detection: trim + lowercase + collapse digits.
-fn dedup_key(line: &str) -> String {
+pub(super) fn dedup_key(line: &str) -> String {
     line.trim()
         .to_lowercase()
         .chars()
         .map(|c| if c.is_ascii_digit() { '#' } else { c })
         .collect()
+}
+
+/// What the heuristic thinks a line or sentence is worth keeping: its length
+/// as a density proxy (capped at 120 bytes), plus 2 when it mentions one of the
+/// request's query terms.
+pub(super) fn salience(text: &str, query_terms: &std::collections::HashSet<String>) -> f32 {
+    let mut score = (text.len().min(120) as f32) / 120.0;
+    if mentions_any(text, query_terms) {
+        score += 2.0;
+    }
+    score
 }
 
 /// Deterministic extractive compaction of prose/log-ish text: score each line by
@@ -929,11 +940,7 @@ pub(super) fn extract_prose(
         if !seen.insert(dedup_key(line)) {
             continue; // near-duplicate
         }
-        let mut score = (trimmed.len().min(120) as f32) / 120.0; // density proxy
-        if mentions_any(trimmed, query_terms) {
-            score += 2.0; // relevance to the request
-        }
-        scored.push((i, score));
+        scored.push((i, salience(trimmed, query_terms)));
     }
     if scored.is_empty() {
         return None;
