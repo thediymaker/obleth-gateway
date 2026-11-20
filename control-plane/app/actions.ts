@@ -669,6 +669,9 @@ export interface BulkKeyResult {
   failed: { name: string; error: string }[];
 }
 
+/** Most ids one `keysByIds` read takes. */
+const KEY_IDS_PER_READ = 200;
+
 /**
  * Run `task` over the chosen keys, a few at a time, collecting failures by
  * name. The pages refresh whatever happened, even when a run fails partway.
@@ -677,8 +680,10 @@ async function eachKey(ids: string[], task: (key: ApiKey) => Promise<void>): Pro
   const failed: BulkKeyResult["failed"] = [];
   let done = 0;
   try {
-    const wanted = new Set(ids);
-    const keys = (await obleth.listKeys()).filter((k) => wanted.has(k.id));
+    const keys: ApiKey[] = [];
+    for (let i = 0; i < ids.length; i += KEY_IDS_PER_READ) {
+      keys.push(...(await obleth.keysByIds(ids.slice(i, i + KEY_IDS_PER_READ))));
+    }
     for (let i = 0; i < keys.length; i += 8) {
       await Promise.all(
         keys.slice(i, i + 8).map(async (key) => {
@@ -793,7 +798,10 @@ export async function moveKeysAction(ids: string[], target: MoveTarget): Promise
 export async function replaceKeyAction(id: string): Promise<{ ok: true; secret: string; key: ApiKey } | { ok: false; error: string }> {
   const session = await requireAdmin();
   try {
-    const old = (await obleth.listKeys()).find((k) => k.id === id);
+    const old = await obleth.getKey(id).catch((e) => {
+      if (e instanceof OblethApiError && e.status === 404) return null;
+      throw e;
+    });
     if (!old) return { ok: false, error: "Key not found." };
     if (old.kind === "identity") return { ok: false, error: "An identity key has no secret to replace." };
     const created = await obleth.createKey(old.tenant_id, {

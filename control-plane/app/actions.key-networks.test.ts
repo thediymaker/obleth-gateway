@@ -58,7 +58,7 @@ describe("allowed networks on a key", () => {
   });
 
   it("are left alone by an edit that doesn't show them", async () => {
-    const obleth = mockObleth({ listKeys: vi.fn().mockResolvedValue([oldKey]) });
+    const obleth = mockObleth({ listKeys: vi.fn().mockResolvedValue([oldKey]), keysByIds: vi.fn().mockResolvedValue([oldKey]) });
     const { setKeysBudgetAction, updateKeyAction } = await import("./actions");
     const fd = new FormData();
     fd.set("id", "k1");
@@ -69,7 +69,7 @@ describe("allowed networks on a key", () => {
   });
 
   it("are kept when the key is replaced", async () => {
-    const obleth = mockObleth({ listKeys: vi.fn().mockResolvedValue([oldKey]) });
+    const obleth = mockObleth({ getKey: vi.fn().mockResolvedValue(oldKey) });
     const { replaceKeyAction } = await import("./actions");
     expect((await replaceKeyAction("k1")).ok).toBe(true);
     expect(obleth.createKey.mock.calls[0][1].allowed_networks).toEqual(["203.0.113.0/24"]);
@@ -101,7 +101,7 @@ describe("allowed countries on a key", () => {
   });
 
   it("are left alone by an edit that doesn't show them", async () => {
-    const obleth = mockObleth({ listKeys: vi.fn().mockResolvedValue([oldKey]) });
+    const obleth = mockObleth({ listKeys: vi.fn().mockResolvedValue([oldKey]), keysByIds: vi.fn().mockResolvedValue([oldKey]) });
     const { setKeysBudgetAction, updateKeyAction } = await import("./actions");
     const fd = new FormData();
     fd.set("id", "k1");
@@ -112,7 +112,7 @@ describe("allowed countries on a key", () => {
   });
 
   it("are kept when the key is replaced", async () => {
-    const obleth = mockObleth({ listKeys: vi.fn().mockResolvedValue([{ ...oldKey, allowed_countries: ["US"] }]) });
+    const obleth = mockObleth({ getKey: vi.fn().mockResolvedValue({ ...oldKey, allowed_countries: ["US"] }) });
     const { replaceKeyAction } = await import("./actions");
     expect((await replaceKeyAction("k1")).ok).toBe(true);
     expect(obleth.createKey.mock.calls[0][1].allowed_countries).toEqual(["US"]);

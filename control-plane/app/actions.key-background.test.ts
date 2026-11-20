@@ -66,7 +66,7 @@ describe("background priority on a key", () => {
 
   it("is kept when the key is replaced", async () => {
     const obleth = mockObleth({
-      listKeys: vi.fn().mockResolvedValue([oldKey]),
+      getKey: vi.fn().mockResolvedValue(oldKey),
       createKey: vi.fn().mockResolvedValue({ secret: "sk-new", key: { ...oldKey, id: "k2", background: false } }),
     });
     const { replaceKeyAction } = await import("./actions");

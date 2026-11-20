@@ -164,7 +164,7 @@ pub const MAX_LOG_FILTER_VALUES: usize = 200;
 /// `key_id` of the key-watching reads: like [`comma_list`], except a value
 /// that is present but names no key (`key_id=`, `key_id=,`) is an error. An
 /// empty list would otherwise drop the key filter and return every key's rows.
-fn key_id_list<'de, D>(de: D) -> Result<Vec<Uuid>, D::Error>
+pub(crate) fn key_id_list<'de, D>(de: D) -> Result<Vec<Uuid>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -636,7 +636,7 @@ fn usage_log_select() -> String {
 pub async fn query_usage_logs(
     client: &clickhouse::Client,
     q: UsageLogQuery,
-) -> Result<Vec<UsageLogRow>, clickhouse::error::Error> {
+) -> Result<LogPage, clickhouse::error::Error> {
     let since = window_start(q.since_ms, q.until_ms);
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
     let filter = log_filter_sql(&q, since);
@@ -649,21 +649,32 @@ pub async fn query_usage_logs(
     } else if q.before_ms.is_some() {
         page_sql.push_str(" and ts_ms < ?");
     }
-    page_sql.push_str(&format!(" {LOG_ORDER} limit {limit}"));
+    // One past the page, to tell whether more follow.
+    page_sql.push_str(&format!(" {LOG_ORDER} limit {}", limit + 1));
     let mut page = filter.bind(client.query(&page_sql));
     if let (Some(before_ms), Some(before_id)) = (q.before_ms, q.before_request_id) {
         page = page.bind(before_ms).bind(before_id.to_string());
     } else if let Some(before_ms) = q.before_ms {
         page = page.bind(before_ms);
     }
-    let page = page.fetch_all::<LogPageEntry>().await?;
+    let mut page = page.fetch_all::<LogPageEntry>().await?;
+    let more = page.len() > limit as usize;
+    page.truncate(limit as usize);
     let Some(rows_sql) = usage_log_rows_sql(filter.sql(), &page) else {
-        return Ok(Vec::new());
+        return Ok(LogPage::default());
     };
-    filter
+    let rows = filter
         .bind(client.query(&rows_sql))
         .fetch_all::<UsageLogRow>()
-        .await
+        .await?;
+    Ok(LogPage { rows, more })
+}
+
+/// A page of the request log, and whether rows past it match too.
+#[derive(Debug, Default)]
+pub struct LogPage {
+    pub rows: Vec<UsageLogRow>,
+    pub more: bool,
 }
 
 /// Newest first. Ties on the millisecond order by the expression the keyset
@@ -767,15 +778,6 @@ pub async fn query_usage_log_histogram(
 
 /// Most values a facet lists.
 const LOG_FACET_LIMIT: u64 = 12;
-
-/// What one facet of the log counts: the dimension's value, how many requests
-/// had it, and how many of those failed.
-#[derive(Debug, Clone, Row, Serialize, Deserialize)]
-pub struct UsageLogFacetRow {
-    pub facet: String,
-    pub requests: u64,
-    pub errors: u64,
-}
 
 /// One value of a facet. `label` is the tenant's or key's name, resolved by
 /// the handler; the other facets leave it empty.
@@ -3949,6 +3951,14 @@ mod clickhouse_tests {
             .ok();
     }
 
+    /// A row of the one-facet-per-query read the single scan replaced.
+    #[derive(Debug, Row, Deserialize)]
+    struct UsageLogFacetRow {
+        facet: String,
+        requests: u64,
+        errors: u64,
+    }
+
     /// The one-scan facets read returns what one query per facet (and one
     /// for failures) returned.
     #[tokio::test]
@@ -4122,9 +4132,15 @@ mod clickhouse_tests {
         let mut cursor = None;
         let mut seen = 0;
         loop {
-            let got = query_usage_logs(&client, query(cursor)).await.unwrap();
+            let page = query_usage_logs(&client, query(cursor)).await.unwrap();
+            let got = page.rows;
             let want = single(cursor).await;
             assert_eq!(json(&got), json(&want));
+            assert_eq!(
+                page.more,
+                seen + got.len() < 30,
+                "more follow until the last page"
+            );
             seen += got.len();
             let Some(last) = got.last() else { break };
             cursor = Some((last.ts_ms, last.request_id));
@@ -4291,8 +4307,8 @@ mod clickhouse_tests {
             )
             .unwrap()
         };
-        let rows = query_usage_logs(&client, log()).await.unwrap();
-        assert_eq!(rows.len(), 1);
+        let page = query_usage_logs(&client, log()).await.unwrap();
+        assert_eq!((page.rows.len(), page.more), (1, false));
         let (_, buckets) = query_usage_log_histogram(&client, log()).await.unwrap();
         assert_eq!(buckets.iter().map(|b| b.errors).sum::<u64>(), 1);
         let facets = query_usage_log_facets(&client, log()).await.unwrap();

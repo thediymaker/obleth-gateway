@@ -20,7 +20,7 @@ export default async function TenantDetailPage({ params }: { params: Promise<{ n
   const [keys, users, budgets, models] = await Promise.all([
     safe(obleth.listKeys(tenant.id), [] as ApiKey[]),
     safe(listUsers(), [] as AdminUser[]),
-    safe(obleth.budgetUsage(), [] as BudgetUsage[]),
+    safe(obleth.budgetUsage(tenant.id), [] as BudgetUsage[]),
     safe(obleth.listModels(), [] as ModelRoute[]),
   ]);
 

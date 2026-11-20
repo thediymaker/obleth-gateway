@@ -75,6 +75,7 @@ use obleth_config::{
         // keys
         crate::create_key,
         crate::list_keys,
+        crate::get_key,
         crate::update_key,
         crate::move_key,
         crate::get_budget_usage,
@@ -280,6 +281,7 @@ use obleth_config::{
         CreatedKey,
         SetDisabled,
         ListKeysQuery,
+        crate::BudgetUsageQuery,
         UsageQuery,
         UsageSeriesQuery,
         UsageSpeedQuery,

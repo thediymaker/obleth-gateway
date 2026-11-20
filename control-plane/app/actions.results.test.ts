@@ -58,16 +58,18 @@ describe("bulk key delete", () => {
     const deleteKey = vi.fn(async (id: string) => {
       if (id === "b") throw new OblethApiError(409, "key is in use by a batch", "/keys/b");
     });
-    const { revalidatePath } = setup({ listKeys: vi.fn().mockResolvedValue(keys), deleteKey });
+    const keysByIds = vi.fn().mockResolvedValue(keys);
+    const { revalidatePath } = setup({ keysByIds, deleteKey });
     const { deleteKeysAction } = await import("./actions");
     const result = await deleteKeysAction(["a", "b", "c"]);
+    expect(keysByIds).toHaveBeenCalledWith(["a", "b", "c"]);
     expect(result).toEqual({ done: 2, failed: [{ name: "key-b", error: "key is in use by a batch" }] });
     expect(deleteKey).toHaveBeenCalledTimes(3);
     expect(revalidatePath).toHaveBeenCalledWith("/keys");
   });
 
   it("refreshes the pages even when the key list cannot be read", async () => {
-    const { revalidatePath } = setup({ listKeys: vi.fn().mockRejectedValue(new Error("gateway down")), deleteKey: vi.fn() });
+    const { revalidatePath } = setup({ keysByIds: vi.fn().mockRejectedValue(new Error("gateway down")), deleteKey: vi.fn() });
     const { deleteKeysAction } = await import("./actions");
     expect(await deleteKeysAction(["a"])).toEqual({ done: 0, failed: [{ name: "all", error: "gateway down" }] });
     expect(revalidatePath).toHaveBeenCalledWith("/keys");

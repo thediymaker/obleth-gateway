@@ -2656,6 +2656,10 @@ export const obleth = {
       headers: auditActorHeaders(options),
     }),
   listKeys: (tenantId?: string) => api<ApiKey[]>(`/keys${qs({ tenant_id: tenantId })}`),
+  /** One key, or a 404 `OblethApiError`. */
+  getKey: (id: string) => api<ApiKey>(`/keys/${encodeURIComponent(id)}`),
+  /** The keys with these ids that exist, oldest first; 200 ids per call at most. */
+  keysByIds: (ids: string[]) => api<ApiKey[]>(`/keys${qs({ ids: ids.join(",") })}`),
   createKey: (
     tenantId: string,
     body: {
@@ -2710,7 +2714,8 @@ export const obleth = {
       body: JSON.stringify({ tenant_id }),
     }),
   /** Every capped tenant and key budget, with its current period's use from the enforcement counters. */
-  budgetUsage: () => api<BudgetUsage[]>("/budgets/usage"),
+  /** Every capped budget, or one tenant's own and its keys'. */
+  budgetUsage: (tenantId?: string) => api<BudgetUsage[]>(`/budgets/usage${qs({ tenant_id: tenantId })}`),
   setKeyDisabled: (id: string, disabled: boolean, options?: AuditOptions) =>
     api<void>(`/keys/${seg(id)}/disabled`, {
       method: "PUT",

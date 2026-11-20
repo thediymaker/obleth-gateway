@@ -216,7 +216,10 @@ pub fn router(state: AdminState) -> Router {
         .route("/api/v1/keys", get(list_keys))
         .route("/api/v1/budgets/usage", get(get_budget_usage))
         .route("/api/v1/resync", post(resync_resolver_cache))
-        .route("/api/v1/keys/:id", put(update_key).delete(delete_key))
+        .route(
+            "/api/v1/keys/:id",
+            get(get_key).put(update_key).delete(delete_key),
+        )
         .route("/api/v1/keys/:id/disabled", put(set_key_disabled))
         .route("/api/v1/keys/:id/tenant", put(move_key))
         .route("/api/v1/keys/:id/tracing", put(set_key_tracing_handler))
@@ -1872,7 +1875,20 @@ fn validate_mcp_server_name(name: &str) -> Result<()> {
 pub struct ListKeysQuery {
     #[schema(value_type = Option<String>)]
     pub tenant_id: Option<Uuid>,
+    /// Only these keys: one id or up to 200 joined by commas.
+    #[serde(default, deserialize_with = "usage::key_id_list")]
+    #[param(value_type = Option<String>)]
+    #[schema(value_type = Option<String>)]
+    pub ids: Vec<Uuid>,
+    /// Page size, 1 to 1,000. Without it every matching key comes back.
+    pub limit: Option<i64>,
+    /// Continue after this key (the last id of the previous page).
+    #[schema(value_type = Option<String>)]
+    pub after: Option<Uuid>,
 }
+
+/// Most keys one page of `GET /keys` returns.
+const KEYS_PAGE_MAX: i64 = 1_000;
 
 #[derive(Debug, Deserialize, utoipa::IntoParams, ToSchema)]
 pub struct AuditQuery {
@@ -5098,16 +5114,33 @@ pub struct BudgetUsage {
     pub resets_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// Every tenant and key budget with a cap, and how much of its current period
-/// it has used. Reads the enforcement counters without changing them, so a
-/// period that has rolled over reads as zero until its first request.
+/// Filters of `GET /budgets/usage`.
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetUsageQuery {
+    /// One tenant: its own budget and its keys'.
+    #[schema(value_type = Option<String>)]
+    pub tenant_id: Option<Uuid>,
+}
+
+/// Every tenant and key budget with a cap, or one tenant's, and how much of
+/// its current period it has used. Reads the enforcement counters without
+/// changing them, so a period that has rolled over reads as zero until its
+/// first request.
 #[utoipa::path(
     get, path = "/api/v1/budgets/usage", tag = "keys",
+    params(BudgetUsageQuery),
     responses((status = 200, body = [BudgetUsage]))
 )]
-async fn get_budget_usage(State(state): State<AdminState>) -> Result<Json<Vec<BudgetUsage>>> {
+async fn get_budget_usage(
+    State(state): State<AdminState>,
+    Query(q): Query<BudgetUsageQuery>,
+) -> Result<Json<Vec<BudgetUsage>>> {
     let now = chrono::Utc::now();
-    let tenants = state.store.list_tenants().await?;
+    let tenants = match q.tenant_id {
+        Some(id) => vec![state.store.get_tenant(id).await?],
+        None => state.store.list_tenants().await?,
+    };
     let zones: std::collections::HashMap<Uuid, String> =
         tenants.iter().map(|t| (t.id, t.timezone.clone())).collect();
     let mut wanted = Vec::new();
@@ -5136,7 +5169,7 @@ async fn get_budget_usage(State(state): State<AdminState>) -> Result<Json<Vec<Bu
             ));
         }
     }
-    for k in state.store.list_keys(None).await? {
+    for k in state.store.keys_with_budget(q.tenant_id).await? {
         if k.tenant_id == Store::CONTROL_PLANE_TENANT_ID {
             continue;
         }
@@ -5192,19 +5225,60 @@ async fn get_budget_usage(State(state): State<AdminState>) -> Result<Json<Vec<Bu
     Ok(Json(out))
 }
 
+/// API keys, oldest first. `tenant_id` and `ids` narrow the list. With
+/// `limit` it comes in pages: pass the last key's id as `after` for the next,
+/// and while more follow the response carries `x-obleth-truncated: true`.
+/// Without `limit`, every matching key in one array.
 #[utoipa::path(
     get, path = "/api/v1/keys", tag = "keys",
     params(ListKeysQuery),
-    responses((status = 200, body = [ApiKey]))
+    responses(
+        (status = 200, body = [ApiKey], headers(
+            ("x-obleth-truncated" = String, description = "`true` when keys past this page match")
+        )),
+        (status = 400)
+    )
 )]
 async fn list_keys(
     State(state): State<AdminState>,
     Query(q): Query<ListKeysQuery>,
-) -> Result<Json<Vec<ApiKey>>> {
-    let mut keys = state.store.list_keys(q.tenant_id).await?;
-    // Hide the reserved control-plane key (Charo's) from the management surface.
-    keys.retain(|k| k.tenant_id != Store::CONTROL_PLANE_TENANT_ID);
-    Ok(Json(keys))
+) -> Result<(HeaderMap, Json<Vec<ApiKey>>)> {
+    let limit = q.limit.map(|n| n.clamp(1, KEYS_PAGE_MAX));
+    let mut keys = state
+        .store
+        .list_keys_where(&obleth_store::KeyListFilter {
+            tenant_id: q.tenant_id,
+            ids: (!q.ids.is_empty()).then_some(q.ids),
+            // The reserved control-plane key (Charo's) stays off the
+            // management surface.
+            exclude_tenant: Some(Store::CONTROL_PLANE_TENANT_ID),
+            after: q.after,
+            // One past the page, to tell whether more follow.
+            limit: limit.map(|n| n + 1),
+        })
+        .await?;
+    let more = limit.is_some_and(|n| keys.len() > n as usize);
+    if let Some(n) = limit {
+        keys.truncate(n as usize);
+    }
+    Ok((truncated_header(more), Json(keys)))
+}
+
+/// One API key. The reserved control-plane key reads as missing.
+#[utoipa::path(
+    get, path = "/api/v1/keys/{id}", tag = "keys",
+    params(("id" = Uuid, Path, description = "API key id")),
+    responses((status = 200, body = ApiKey), (status = 404))
+)]
+async fn get_key(State(state): State<AdminState>, Path(id): Path<Uuid>) -> Result<Json<ApiKey>> {
+    state
+        .store
+        .keys_by_ids(&[id])
+        .await?
+        .into_iter()
+        .find(|k| k.tenant_id != Store::CONTROL_PLANE_TENANT_ID)
+        .map(Json)
+        .ok_or(AdminError::NotFound)
 }
 
 #[derive(Serialize)]
@@ -5906,18 +5980,21 @@ pub struct UsageLogEntry {
 /// Newest-first feed of individual requests for the live log view. ClickHouse
 /// stores only UUIDs, so the page's tenant/key ids are resolved to names in a
 /// pair of bounded Postgres lookups (tenants are few; keys are fetched by the
-/// exact ids on the page rather than the full fleet).
+/// exact ids on the page rather than the full fleet). When rows past the page
+/// match, the response carries `x-obleth-truncated: true`; the next page
+/// starts at the last row's `before_ms` and `before_request_id`.
 #[utoipa::path(
     get, path = "/api/v1/usage/logs", tag = "usage",
     params(usage::UsageLogQuery),
     responses((status = 200, body = [usage::UsageLogRow],
-        description = "Each row also includes tenant_name, key_name, and key_prefix resolved from Postgres"))
+        description = "Each row also includes tenant_name, key_name, and key_prefix resolved from Postgres",
+        headers(("x-obleth-truncated" = String, description = "`true` when rows past this page match"))))
 )]
 async fn get_usage_logs(
     State(state): State<AdminState>,
     Query(q): Query<usage::UsageLogQuery>,
-) -> Result<Json<Vec<UsageLogEntry>>> {
-    let rows = usage::query_usage_logs(&state.clickhouse, q).await?;
+) -> Result<(HeaderMap, Json<Vec<UsageLogEntry>>)> {
+    let usage::LogPage { rows, more } = usage::query_usage_logs(&state.clickhouse, q).await?;
     let known = names::resolve_names(
         &state,
         rows.iter().map(|r| r.tenant_id),
@@ -5957,7 +6034,7 @@ async fn get_usage_logs(
         })
         .collect();
 
-    Ok(Json(entries))
+    Ok((truncated_header(more), Json(entries)))
 }
 
 /// What the requests matching the log's filters are made of: the busiest
@@ -10493,7 +10570,11 @@ async fn get_daily_stats(
 async fn get_audit(
     State(state): State<AdminState>,
     Query(q): Query<AuditQuery>,
-) -> Result<Json<Vec<AuditEntry>>> {
+) -> Result<(HeaderMap, Json<Vec<AuditEntry>>)> {
+    let limit = q
+        .limit
+        .unwrap_or(100)
+        .clamp(1, obleth_store::AUDIT_PAGE_MAX);
     let time = |v: &Option<String>, name: &str| -> Result<Option<chrono::DateTime<chrono::Utc>>> {
         v.as_deref()
             .filter(|s| !s.trim().is_empty())
@@ -10522,9 +10603,13 @@ async fn get_audit(
         actions: list(q.action),
         before_id: q.before_id,
         q: text(q.q),
-        limit: q.limit.unwrap_or(100),
+        // One past the page, to tell whether more follow.
+        limit: limit + 1,
     };
-    Ok(Json(state.store.list_audit_filtered(&filter).await?))
+    let mut rows = state.store.list_audit_filtered(&filter).await?;
+    let more = rows.len() > limit as usize;
+    rows.truncate(limit as usize);
+    Ok((truncated_header(more), Json(rows)))
 }
 
 #[utoipa::path(
@@ -13916,6 +14001,149 @@ mod tests {
             "the total ceiling is reported: {body}"
         );
         assert_eq!(body["default_model_max_in_flight"], serde_json::json!(32));
+    }
+
+    /// `GET /keys` narrows by tenant and ids and pages with `limit` and
+    /// `after`, flagging every page but the last; `GET /keys/{id}` reads one
+    /// key and hides the control plane's; `/budgets/usage` reads one tenant.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn keys_read_one_by_id_by_ids_and_in_pages() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let tenant = t
+            .store
+            .create_tenant(&format!("paging-{}", Uuid::new_v4()), 100, 1000, None, None)
+            .await
+            .expect("tenant");
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            let budget = (i == 0).then_some(1_000);
+            let (key, _) = t
+                .store
+                .create_api_key(
+                    tenant.id,
+                    &format!("k{i}"),
+                    "",
+                    budget,
+                    None,
+                    None,
+                    None,
+                    100,
+                    None,
+                    &[],
+                    &[],
+                )
+                .await
+                .expect("key");
+            ids.push(key.id.to_string());
+        }
+        let get = |path: String| {
+            let app = t.app.clone();
+            async move {
+                let req = axum::http::Request::get(&path)
+                    .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                let res = tower::ServiceExt::oneshot(app, req)
+                    .await
+                    .expect("handler ran");
+                let status = res.status();
+                let more = res.headers().get("x-obleth-truncated").is_some();
+                let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let body: serde_json::Value =
+                    serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+                (status, more, body)
+            }
+        };
+        let id_list = |body: &serde_json::Value| -> Vec<String> {
+            body.as_array()
+                .unwrap()
+                .iter()
+                .map(|k| k["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        // Two pages of two and one of one, in creation order.
+        let mut paged = Vec::new();
+        let mut after = String::new();
+        let mut flags = Vec::new();
+        loop {
+            let (status, more, body) = get(format!(
+                "/api/v1/keys?tenant_id={}&limit=2{after}",
+                tenant.id
+            ))
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let page = id_list(&body);
+            flags.push(more);
+            let last = page.last().cloned();
+            paged.extend(page);
+            match last {
+                Some(id) if more => after = format!("&after={id}"),
+                _ => break,
+            }
+        }
+        assert_eq!(paged, ids);
+        assert_eq!(flags, [true, true, false]);
+
+        // Without `limit`, every key and no flag.
+        let (_, more, body) = get(format!("/api/v1/keys?tenant_id={}", tenant.id)).await;
+        assert_eq!((id_list(&body), more), (ids.clone(), false));
+
+        let (status, _, body) = get(format!("/api/v1/keys?ids={},{}", ids[3], ids[1])).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(id_list(&body), [ids[1].clone(), ids[3].clone()]);
+        let (status, _, _) = get("/api/v1/keys?ids=".into()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, _, body) = get(format!("/api/v1/keys/{}", ids[2])).await;
+        assert_eq!(
+            (status, body["name"].as_str()),
+            (StatusCode::OK, Some("k2"))
+        );
+        let (status, _, _) = get(format!("/api/v1/keys/{}", Uuid::new_v4())).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let control = t
+            .store
+            .list_keys(Some(Store::CONTROL_PLANE_TENANT_ID))
+            .await
+            .unwrap();
+        if let Some(control) = control.first() {
+            let (status, _, _) = get(format!("/api/v1/keys/{}", control.id)).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        }
+
+        let (status, _, body) = get(format!("/api/v1/budgets/usage?tenant_id={}", tenant.id)).await;
+        assert_eq!(status, StatusCode::OK);
+        let budgets = body.as_array().unwrap();
+        assert_eq!(budgets.len(), 1, "only the capped key: {body}");
+        assert_eq!(budgets[0]["id"].as_str(), Some(ids[0].as_str()));
+
+        // Audit pages say whether more follow too.
+        for id in ids.iter().take(3) {
+            t.store
+                .record_audit(
+                    "paging-test",
+                    "update_key",
+                    "api_key",
+                    id,
+                    serde_json::json!({}),
+                )
+                .await
+                .unwrap();
+        }
+        let (_, more, body) = get(format!(
+            "/api/v1/audit?actor=paging-test&limit=2&entity_id={}",
+            ids[0]
+        ))
+        .await;
+        assert_eq!((body.as_array().unwrap().len(), more), (1, false));
+        let (_, more, body) = get("/api/v1/audit?actor=paging-test&limit=2".into()).await;
+        assert_eq!((body.as_array().unwrap().len(), more), (2, true));
     }
 
     /// The live view names a pool's tenant and key from the narrow name

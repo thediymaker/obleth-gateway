@@ -1044,36 +1044,49 @@ impl Store {
         Ok(())
     }
 
+    /// Every key, or one tenant's, oldest first.
     pub async fn list_keys(&self, tenant_id: Option<Uuid>) -> Result<Vec<ApiKey>> {
-        let rows = match tenant_id {
-            Some(t) => {
-                sqlx::query(
-                    "select id, tenant_id, name, description, key_prefix,
-                            budget_tokens, budget_cost_usd, budget_period, budget_started_at,
-                            disabled, tracing_enabled, end_user_fairshare, background, allowed_networks, allowed_countries,
-                    created_at, updated_at,
-                            kind, identity_issuer, identity_subject, identity_claims,
-                            weight, max_in_flight
-                     from api_keys where tenant_id = $1 order by created_at",
-                )
-                .bind(t)
-                .fetch_all(&self.pool)
-                .await?
-            }
-            None => {
-                sqlx::query(
-                    "select id, tenant_id, name, description, key_prefix,
-                            budget_tokens, budget_cost_usd, budget_period, budget_started_at,
-                            disabled, tracing_enabled, end_user_fairshare, background, allowed_networks, allowed_countries,
-                    created_at, updated_at,
-                            kind, identity_issuer, identity_subject, identity_claims,
-                            weight, max_in_flight
-                     from api_keys order by created_at",
-                )
-                .fetch_all(&self.pool)
-                .await?
-            }
-        };
+        self.list_keys_where(&KeyListFilter {
+            tenant_id,
+            ..Default::default()
+        })
+        .await
+    }
+
+    /// Keys matching `f`, oldest first (`created_at`, then `id`), so a page
+    /// continues after its last key with `after`.
+    pub async fn list_keys_where(&self, f: &KeyListFilter) -> Result<Vec<ApiKey>> {
+        let rows = sqlx::query(&format!(
+            "select {KEY_COLS} from api_keys k
+             where ($1::uuid is null or k.tenant_id = $1)
+               and ($2::uuid[] is null or k.id = any($2))
+               and ($3::uuid is null or k.tenant_id <> $3)
+               and ($4::uuid is null or (k.created_at, k.id) > (
+                   select a.created_at, a.id from api_keys a where a.id = $4))
+             order by k.created_at, k.id
+             limit $5"
+        ))
+        .bind(f.tenant_id)
+        .bind(f.ids.as_deref())
+        .bind(f.exclude_tenant)
+        .bind(f.after)
+        .bind(f.limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(api_key_from_row).collect()
+    }
+
+    /// Keys with a token or cost cap, every tenant's or one's.
+    pub async fn keys_with_budget(&self, tenant_id: Option<Uuid>) -> Result<Vec<ApiKey>> {
+        let rows = sqlx::query(&format!(
+            "select {KEY_COLS} from api_keys k
+             where (k.budget_tokens is not null or k.budget_cost_usd is not null)
+               and ($1::uuid is null or k.tenant_id = $1)
+             order by k.created_at, k.id"
+        ))
+        .bind(tenant_id)
+        .fetch_all(&self.pool)
+        .await?;
         rows.iter().map(api_key_from_row).collect()
     }
 
@@ -1126,15 +1139,9 @@ impl Store {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let rows = sqlx::query(
-            "select id, tenant_id, name, description, key_prefix,
-                    budget_tokens, budget_cost_usd, budget_period, budget_started_at,
-                    disabled, tracing_enabled, end_user_fairshare, background, allowed_networks, allowed_countries,
-                    created_at, updated_at,
-                    kind, identity_issuer, identity_subject, identity_claims,
-                    weight, max_in_flight
-             from api_keys where id = any($1)",
-        )
+        let rows = sqlx::query(&format!(
+            "select {KEY_COLS} from api_keys k where k.id = any($1)"
+        ))
         .bind(ids)
         .fetch_all(&self.pool)
         .await?;
@@ -1561,7 +1568,7 @@ impl Store {
         .bind(f.until)
         .bind(f.before_id)
         .bind(q)
-        .bind(f.limit.clamp(1, 1000))
+        .bind(f.limit.clamp(1, AUDIT_PAGE_MAX + 1))
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(audit_from_row).collect()
@@ -4023,6 +4030,32 @@ impl Store {
 }
 
 /// A single audit-log entry.
+/// What `list_keys_where` narrows to; every field is optional.
+#[derive(Debug, Clone, Default)]
+pub struct KeyListFilter {
+    pub tenant_id: Option<Uuid>,
+    /// Only these keys.
+    pub ids: Option<Vec<Uuid>>,
+    /// Leave out this tenant's keys (the control plane's own).
+    pub exclude_tenant: Option<Uuid>,
+    /// Start after this key, in list order.
+    pub after: Option<Uuid>,
+    /// At most this many; all when `None`.
+    pub limit: Option<i64>,
+}
+
+/// The columns `api_key_from_row` reads, from `api_keys` aliased `k`.
+const KEY_COLS: &str = "k.id, k.tenant_id, k.name, k.description, k.key_prefix,
+    k.budget_tokens, k.budget_cost_usd, k.budget_period, k.budget_started_at,
+    k.disabled, k.tracing_enabled, k.end_user_fairshare, k.background,
+    k.allowed_networks, k.allowed_countries, k.created_at, k.updated_at,
+    k.kind, k.identity_issuer, k.identity_subject, k.identity_claims,
+    k.weight, k.max_in_flight";
+
+/// Most audit rows one page returns. `list_audit_filtered` reads one more on
+/// request, so a caller can tell whether more follow.
+pub const AUDIT_PAGE_MAX: i64 = 1000;
+
 /// What `list_audit_filtered` narrows to; every field is optional but `limit`.
 #[derive(Debug, Clone, Default)]
 pub struct AuditFilter {
