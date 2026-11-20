@@ -58,6 +58,13 @@ const CLIENT_IP_TTL_META: &str = "client_ip_ttl_days";
 /// `usage_meta` key recording that `key_network_seen` has been seeded from
 /// the addresses the ledger still holds.
 const KEY_NETWORK_SEEN_MARKER: &str = "key_network_seen_v1";
+
+/// `usage_meta` key recording that `key_rejections` has its table TTL.
+const KEY_REJECTIONS_TTL_MARKER: &str = "key_rejections_ttl_v1";
+
+/// How long refused key uses are kept: above the longest window any reader
+/// asks for (31 days).
+const KEY_REJECTIONS_TTL_DAYS: u32 = 35;
 /// Refused uses of one key from one address for one reason are folded into
 /// one `key_rejections` row per window of this length.
 pub const REJECTION_WINDOW: Duration = Duration::from_secs(10);
@@ -1290,7 +1297,16 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
             ) ENGINE = MergeTree()
             PARTITION BY toYYYYMMDD(fromUnixTimestamp64Milli(start_ms))
             ORDER BY (request_id, start_ms)
-            TTL toDate(fromUnixTimestamp64Milli(start_ms)) + INTERVAL 14 DAY DELETE"
+            TTL toDate(fromUnixTimestamp64Milli(start_ms)) + INTERVAL 14 DAY DELETE
+            SETTINGS ttl_only_drop_parts = 1"
+        ))
+        .execute()
+        .await?;
+    // Tables created before the setting: a day's partition expires whole, so
+    // drop its parts instead of rewriting them row by row. Metadata only.
+    client
+        .query(&format!(
+            "ALTER TABLE {database}.spans MODIFY SETTING ttl_only_drop_parts = 1"
         ))
         .execute()
         .await?;
@@ -1618,10 +1634,31 @@ async fn ensure_key_watch(
                 ts DateTime64(3) MATERIALIZED fromUnixTimestamp64Milli(ts_ms)
             ) ENGINE = MergeTree()
             PARTITION BY toYYYYMM(ts)
-            ORDER BY (key_id, ts_ms)"
+            ORDER BY (key_id, ts_ms)
+            {}
+            SETTINGS ttl_only_drop_parts = 1",
+            key_rejections_ttl()
         ))
         .execute()
         .await?;
+    // Tables created before the TTL get it once. Setting a TTL rewrites the
+    // table's parts in the background (a mutation); the table is small.
+    if meta_count(client, database, KEY_REJECTIONS_TTL_MARKER).await? == 0 {
+        client
+            .query(&format!(
+                "ALTER TABLE {database}.key_rejections MODIFY SETTING ttl_only_drop_parts = 1"
+            ))
+            .execute()
+            .await?;
+        client
+            .query(&format!(
+                "ALTER TABLE {database}.key_rejections MODIFY {}",
+                key_rejections_ttl()
+            ))
+            .execute()
+            .await?;
+        meta_put(client, database, KEY_REJECTIONS_TTL_MARKER, "1").await?;
+    }
     client
         .query(&format!(
             "CREATE TABLE IF NOT EXISTS {database}.key_country_seen (
@@ -1693,27 +1730,16 @@ async fn ensure_key_watch(
 
     // The TTL a column was created with is the retention in force when it
     // was added, recorded here the first time. A later change is applied with
-    // one MODIFY per column; ClickHouse then re-evaluates the TTL on existing
-    // parts in the background.
+    // one ALTER per table; ClickHouse then re-evaluates the TTL on existing
+    // parts in the background (one mutation per table).
     let applied = meta_latest(client, database, CLIENT_IP_TTL_META).await?;
     let wanted = ip_days.to_string();
     match applied {
         Some(days) if days == wanted => {}
         None => meta_put(client, database, CLIENT_IP_TTL_META, &wanted).await?,
         Some(previous) => {
-            for (table, column) in [
-                ("usage", "client_ip"),
-                ("usage", "client_network"),
-                ("usage", "user_agent"),
-                ("key_rejections", "client_ip"),
-                ("key_rejections", "user_agent"),
-            ] {
-                client
-                    .query(&format!(
-                        "ALTER TABLE {database}.{table} MODIFY COLUMN {column} String DEFAULT '' {ip_ttl}"
-                    ))
-                    .execute()
-                    .await?;
+            for statement in client_address_ttl_alters(database, &ip_ttl) {
+                client.query(&statement).execute().await?;
             }
             client
                 .query(&format!(
@@ -1726,11 +1752,39 @@ async fn ensure_key_watch(
             tracing::info!(
                 from_days = %previous,
                 to_days = ip_days,
-                "client address retention changed; column TTLs updated"
+                "client address retention changed; column TTLs updated \
+                 (ClickHouse re-applies them to stored rows in the background)"
             );
         }
     }
     Ok(())
+}
+
+/// The client-identifying columns of each table that keeps them.
+const CLIENT_ADDRESS_COLUMNS: &[(&str, &[&str])] = &[
+    ("usage", &["client_ip", "client_network", "user_agent"]),
+    ("key_rejections", &["client_ip", "user_agent"]),
+];
+
+/// One `ALTER` per table moving all its client-identifying columns to
+/// `ip_ttl`, so a retention change queues one mutation per table.
+fn client_address_ttl_alters(database: &str, ip_ttl: &str) -> Vec<String> {
+    CLIENT_ADDRESS_COLUMNS
+        .iter()
+        .map(|(table, columns)| {
+            let clauses = columns
+                .iter()
+                .map(|c| format!("MODIFY COLUMN {c} String DEFAULT '' {ip_ttl}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("ALTER TABLE {database}.{table} {clauses}")
+        })
+        .collect()
+}
+
+/// The table TTL of `key_rejections`.
+fn key_rejections_ttl() -> String {
+    format!("TTL toDate(fromUnixTimestamp64Milli(ts_ms)) + INTERVAL {KEY_REJECTIONS_TTL_DAYS} DAY")
 }
 
 /// The most recently written value under `key` in `usage_meta`, if any.
@@ -2583,8 +2637,9 @@ mod clickhouse_tests {
             window: std::sync::Mutex::new(RejectionWindow::default()),
             stats: Arc::default(),
         };
+        // Recent, or the table TTL drops it.
         let mut r = KeyRejection {
-            ts_ms: 1_750_000_000_000,
+            ts_ms: rec_now_ms(),
             key_id: Uuid::from_u128(7),
             key_name: "k".into(),
             tenant_id: Uuid::nil(),
@@ -2605,6 +2660,34 @@ mod clickhouse_tests {
         assert_eq!(scalar(&client, &rows).await, 1);
         assert_eq!(scalar(&client, &total).await, 2);
 
+        // Refused uses expire whole parts after 35 days, and so do spans
+        // after 14.
+        let create_of = |table: &'static str| {
+            let client = client.clone();
+            let database = database.clone();
+            async move {
+                client
+                    .query("SELECT create_table_query FROM system.tables WHERE database = ? AND name = ?")
+                    .bind(&database)
+                    .bind(table)
+                    .fetch_one::<String>()
+                    .await
+                    .unwrap()
+            }
+        };
+        let rejections_ddl = create_of("key_rejections").await;
+        assert!(
+            rejections_ddl.contains("INTERVAL 35 DAY")
+                || rejections_ddl.contains("toIntervalDay(35)"),
+            "{rejections_ddl}"
+        );
+        assert!(
+            rejections_ddl.contains("ttl_only_drop_parts = 1"),
+            "{rejections_ddl}"
+        );
+        let spans_ddl = create_of("spans").await;
+        assert!(spans_ddl.contains("ttl_only_drop_parts = 1"), "{spans_ddl}");
+
         // A changed retention is applied to the columns once.
         meta_put(&client, &database, CLIENT_IP_TTL_META, "30")
             .await
@@ -2619,6 +2702,55 @@ mod clickhouse_tests {
             Some("90")
         );
         drop_database(&client, &database).await;
+    }
+
+    fn rec_now_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+    }
+
+    /// A key_rejections table made before its TTL gets it at the next start.
+    #[tokio::test]
+    async fn an_old_key_rejections_table_gets_its_ttl() {
+        let Some((client, database)) = fixture() else {
+            return;
+        };
+        ensure_schema(&client, &database).await.unwrap();
+        for sql in [
+            format!("ALTER TABLE {database}.key_rejections REMOVE TTL"),
+            format!("ALTER TABLE {database}.usage_meta DELETE WHERE key = '{KEY_REJECTIONS_TTL_MARKER}' SETTINGS mutations_sync = 2"),
+        ] {
+            client.query(&sql).execute().await.unwrap();
+        }
+        ensure_key_watch(&client, &database, 90).await.unwrap();
+        let ddl: String = client
+            .query("SELECT create_table_query FROM system.tables WHERE database = ? AND name = 'key_rejections'")
+            .bind(&database)
+            .fetch_one()
+            .await
+            .unwrap();
+        assert!(
+            ddl.contains("INTERVAL 35 DAY") || ddl.contains("toIntervalDay(35)"),
+            "{ddl}"
+        );
+        drop_database(&client, &database).await;
+    }
+
+    #[test]
+    fn a_retention_change_is_one_alter_per_table() {
+        let alters = client_address_ttl_alters("db", "TTL x");
+        assert_eq!(
+            alters,
+            vec![
+                "ALTER TABLE db.usage MODIFY COLUMN client_ip String DEFAULT '' TTL x, \
+                 MODIFY COLUMN client_network String DEFAULT '' TTL x, \
+                 MODIFY COLUMN user_agent String DEFAULT '' TTL x",
+                "ALTER TABLE db.key_rejections MODIFY COLUMN client_ip String DEFAULT '' TTL x, \
+                 MODIFY COLUMN user_agent String DEFAULT '' TTL x",
+            ]
+        );
     }
 
     #[tokio::test]

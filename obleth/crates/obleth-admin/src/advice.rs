@@ -1274,13 +1274,15 @@ struct OutputRow {
 pub async fn read_windowed_output(
     client: &clickhouse::Client,
 ) -> std::result::Result<HashMap<String, WindowedOutput>, clickhouse::error::Error> {
-    let rows = client
-        .query(
-            "select model, avg(toFloat64(output_tokens)) as mean, count() as answers \
-             from usage where ts_ms >= ? and status_code = 200 and output_tokens > 0 \
-             and request_type = 'chat' group by model",
-        )
-        .bind(now_ms() - WINDOW_MS)
+    let window = usage::Filter::window(now_ms() - WINDOW_MS, None);
+    let sql = format!(
+        "select model, avg(toFloat64(output_tokens)) as mean, count() as answers \
+         from usage{} and status_code = 200 and output_tokens > 0 \
+         and request_type = 'chat' group by model",
+        window.sql()
+    );
+    let rows = window
+        .bind(client.query(&sql))
         .fetch_all::<OutputRow>()
         .await?;
     Ok(rows

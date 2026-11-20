@@ -725,13 +725,15 @@ async fn recent_traffic(
     window_secs: i64,
 ) -> Option<RecentTraffic> {
     let since = Utc::now().timestamp_millis() - window_secs.max(1) * 1000;
-    let sql = "select countIf(status_code >= 200 and status_code < 300) as successes \
-               from usage where model = ? and ts_ms >= ?";
-    match state
-        .clickhouse
-        .query(sql)
+    let window = crate::usage::Filter::window(since, None);
+    let sql = format!(
+        "select countIf(status_code >= 200 and status_code < 300) as successes \
+         from usage{} and model = ?",
+        window.sql()
+    );
+    match window
+        .bind(state.clickhouse.query(&sql))
         .bind(model_name)
-        .bind(since)
         .fetch_one::<RecentTraffic>()
         .await
     {
