@@ -1087,6 +1087,17 @@ impl Store {
         )
         .execute(&self.pool)
         .await?;
+        // A cancelled batch runs nothing more. Cancelling cancels what is
+        // pending then, but an item running at that moment can come back to
+        // pending later (a retry, or a lapsed lease), and would keep the
+        // batch from ever finishing.
+        sqlx::query(
+            "update batch_items i set status = 'cancelled', finished_at = now()
+             from batches b
+             where b.id = i.batch_id and b.status = 'cancelling' and i.status = 'pending'",
+        )
+        .execute(&self.pool)
+        .await?;
         self.refresh_batch_counts().await?;
 
         let candidates = sqlx::query(
@@ -1766,6 +1777,31 @@ mod tests {
         assert_eq!(again.iter().map(|i| i.line).collect::<Vec<_>>(), vec![0]);
         let b = store.get_batch(&batch.id, owner).await.unwrap().unwrap();
         assert_eq!(b.failed, 1);
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_cancelled_batch_ends_when_a_running_item_comes_back_to_pending() {
+        let _g = serial().lock().await;
+        let Some(store) = store().await else {
+            return;
+        };
+        let owner = JobOwner::key(Uuid::new_v4(), Uuid::new_v4());
+        let batch = make_batch(&store, owner, 2, Utc::now() + chrono::Duration::hours(1)).await;
+        let running = store
+            .claim_batch_items(&batch.id, "gw", 1, 60)
+            .await
+            .unwrap();
+        store.cancel_batch(&batch.id, owner).await.unwrap().unwrap();
+        // The request running at the cancel is retried: back to pending.
+        store
+            .retry_batch_item(&batch.id, running[0].line, "gw", 0.0, "{}", false)
+            .await
+            .unwrap();
+        let done = store.advance_batches(&|| uid("file")).await.unwrap();
+        assert!(done
+            .iter()
+            .any(|d| d.id == batch.id && d.status == "cancelled"));
     }
 
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
