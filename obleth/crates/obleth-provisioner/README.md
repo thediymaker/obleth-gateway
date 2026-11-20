@@ -24,7 +24,11 @@ this service's environment (below).
 
 ## How it works
 
-Every tick (`OBLETH_PROVISIONER_INTERVAL_SECS`, default 15 s):
+Ticks start at a fixed rate (`OBLETH_PROVISIONER_INTERVAL_SECS`, default
+15 s): each starts one interval after the last one started, however long that
+one ran. A tick that runs longer than the interval is followed at once, and the
+provisioner logs a warning once, since anything counted in ticks then takes
+longer in wall time. Every tick:
 
 1. **Read the Slurm settings.** If Slurm is not configured or switched off, the
    tick idles: nothing is submitted, cancelled or drained, and running jobs are
@@ -35,7 +39,8 @@ Every tick (`OBLETH_PROVISIONER_INTERVAL_SECS`, default 15 s):
    A pinned version the server doesn't serve falls back to the newest one it
    does serve, with a warning; a pin that works is kept.
 2. **Look up the tracked jobs by id**: only the jobs the replica rows point at,
-   never a listing of the whole controller. A clean "not found" means the job
+   never a listing of the whole controller, `OBLETH_PROVISIONER_LOOKUP_CONCURRENCY`
+   (default 8) at a time. A clean "not found" means the job
    is gone. A transport error, or a rejected token, holds the whole tick with no
    destructive action. When every tracked job is missing at once, the
    accounting database is asked before any of them is believed gone.
@@ -43,7 +48,11 @@ Every tick (`OBLETH_PROVISIONER_INTERVAL_SECS`, default 15 s):
    its comment (`obleth-port=<port>`), or else every port of the replica's
    window. A port passes when the model's `health_path` answers 2xx and the
    server's `GET /v1/models`, when it lists models, includes the model's
-   upstream name.
+   upstream name. Every replica and port is probed at once (up to 64 replicas),
+   so probing takes about one `OBLETH_PROVISIONER_HEALTH_TIMEOUT_SECS`. A
+   probe result is logged at info when it changes; the same result again is
+   logged at debug. Then every model's endpoints, with the gateway's health
+   verdicts, are read in one call (`GET /api/v1/endpoints`).
 4. **Plan and apply** per model:
    - **Submit** when fewer replicas are live than `target_replicas` and the
      model isn't paused. Each replica gets a port window
@@ -65,7 +74,7 @@ Every tick (`OBLETH_PROVISIONER_INTERVAL_SECS`, default 15 s):
      drained once enough replicas serve without them.
    - **Self-heal.** A serving replica whose probe has failed for
      `OBLETH_PROVISIONER_RESTART_AFTER_FAILURES` net ticks (the counter decays
-     on a pass) is cancelled when another replica serves, at most one per model
+     on a pass; 20 ticks is 5 minutes at the default interval) is cancelled when another replica serves, at most one per model
      per tick. One the gateway's own inference check has failed twice in the
      last 30 minutes is replaced surge-first. When every probed replica fails
      at once, nothing restarts and the tick warns about the network path.
@@ -77,7 +86,8 @@ Every tick (`OBLETH_PROVISIONER_INTERVAL_SECS`, default 15 s):
      reaching it, or a submit Slurm rejects, pauses submits for 5, 15, 30, 60
      minutes, then hourly. A launch that serves resets it.
 5. **Drain models that left the managed set** (paused or removed): their jobs
-   are drained and cancelled and their rows cleaned up.
+   are drained and cancelled and their rows cleaned up. The drain is logged
+   when it starts.
 
 **Lost submit answers.** When a submit times out or slurmrestd fails
 mid-answer, the model's submits wait up to 3 minutes while the accounting
@@ -96,12 +106,13 @@ The dashboard shows them on the Slurm connection, and the gateway raises
 |---|---|---|---|
 | `OBLETH_ADMIN_TOKEN` | **required** | | Bearer token for the obleth Management API |
 | `OBLETH_ADMIN_BASE_URL` | optional | `http://localhost:9180` | obleth Management API base URL |
-| `OBLETH_PROVISIONER_INTERVAL_SECS` | optional | `15` | reconcile tick interval |
+| `OBLETH_PROVISIONER_INTERVAL_SECS` | optional | `15` | reconcile tick interval (fixed rate) |
 | `OBLETH_PROVISIONER_HEALTH_TIMEOUT_SECS` | optional | `5` | per-port health probe timeout |
 | `OBLETH_PROVISIONER_WARMUP_TIMEOUT_SECS` | optional | `600` | budget for the post-promotion warm-up request; `0` turns warm-up off |
 | `OBLETH_PROVISIONER_LOST_RETENTION_SECS` | optional | `900` | how long `lost` replica rows are kept after they end |
 | `OBLETH_PROVISIONER_RESTART_AFTER_FAILURES` | optional | `20` | net failing probes before a serving replica is replaced (about 5 minutes at the default interval); `0` turns self-heal off |
 | `OBLETH_PORT_SPAN` | optional | `8` | width of each replica's port window |
+| `OBLETH_PROVISIONER_LOOKUP_CONCURRENCY` | optional | `8` | Slurm job lookups a tick runs at once; lower it to spare a busy slurmrestd |
 | `OBLETH_PROVISIONER_JOB_PREFIX` | optional | `obleth-` | job-name prefix of this gateway's jobs |
 
 **Slurm connection settings** are set under Deployments › Set up Slurm, not in

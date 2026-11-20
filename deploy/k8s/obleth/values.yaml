@@ -526,7 +526,9 @@ provisioner:
   # mass-cancelling them. Keep in sync with the binary default in
   # crates/obleth-provisioner/src/config.rs.
   restartAfterFailures: 20
-  logLevel: "info,obleth_provisioner=debug"
+  # Probe results and drains are logged at info when they change; the
+  # per-tick repeats are debug ("info,obleth_provisioner=debug" shows them).
+  logLevel: "info"
   resources:
     requests: { cpu: "50m", memory: "64Mi" }
     limits: { cpu: "500m", memory: "256Mi" }

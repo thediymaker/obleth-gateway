@@ -105,6 +105,11 @@ pub trait OblethClient: Send + Sync {
         &self,
         model_id: Uuid,
     ) -> anyhow::Result<Vec<crate::domain::EndpointView>>;
+    /// Every model's endpoints in one read, by model id (a model with none is
+    /// absent), with the same health verdicts as `list_endpoints`.
+    async fn list_all_endpoints(
+        &self,
+    ) -> anyhow::Result<HashMap<Uuid, Vec<crate::domain::EndpointView>>>;
     async fn delete_endpoint(&self, model_id: Uuid, endpoint_id: Uuid) -> anyhow::Result<()>;
     /// Rewrite an endpoint's `api_base` (used to migrate a name-based endpoint to
     /// its resolved IP), preserving the endpoint's other fields.
@@ -123,6 +128,31 @@ pub trait OblethClient: Send + Sync {
         model_id: Uuid,
         backoff: &ManagedBackoff,
     ) -> anyhow::Result<()>;
+}
+
+/// One endpoint row (`ModelEndpointView`) as the provisioner sees it; `None`
+/// for a row without a valid `id`.
+fn endpoint_view_from_json(
+    e: &serde_json::Value,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<crate::domain::EndpointView> {
+    let str_of = |k: &str| e.get(k).and_then(|x| x.as_str());
+    Some(crate::domain::EndpointView {
+        id: str_of("id")?.parse().ok()?,
+        name: str_of("name").unwrap_or_default().to_string(),
+        api_base: str_of("api_base").unwrap_or_default().to_string(),
+        priority: e.get("priority").and_then(|x| x.as_i64()).unwrap_or(100),
+        weight: e.get("weight").and_then(|x| x.as_i64()).unwrap_or(100),
+        enabled: e.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true),
+        health_status: str_of("health_status").map(str::to_string),
+        consecutive_failures: e
+            .get("consecutive_failures")
+            .and_then(|x| x.as_i64())
+            .unwrap_or(0),
+        checked_secs_ago: str_of("last_checked_at")
+            .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok())
+            .map(|t| (now - t).num_seconds()),
+    })
 }
 
 /// Map a JSON array of replica rows (`ModelReplica`) into `ReplicaView`s. Rows
@@ -469,43 +499,25 @@ impl OblethClient for HttpObleth {
             .get_array(&format!("/models/{model_id}/endpoints"))
             .await?;
         let now = chrono::Utc::now();
-        let mut out = Vec::new();
-        for e in rows {
-            let id = e
-                .get("id")
+        Ok(rows
+            .iter()
+            .filter_map(|e| endpoint_view_from_json(e, now))
+            .collect())
+    }
+
+    async fn list_all_endpoints(
+        &self,
+    ) -> anyhow::Result<HashMap<Uuid, Vec<crate::domain::EndpointView>>> {
+        let rows = self.get_array("/endpoints").await?;
+        let now = chrono::Utc::now();
+        let mut out: HashMap<Uuid, Vec<crate::domain::EndpointView>> = HashMap::new();
+        for e in &rows {
+            let model_id = e
+                .get("model_id")
                 .and_then(|x| x.as_str())
                 .and_then(|s| s.parse().ok());
-            let name = e
-                .get("name")
-                .and_then(|x| x.as_str())
-                .unwrap_or_default()
-                .to_string();
-            if let Some(id) = id {
-                out.push(crate::domain::EndpointView {
-                    id,
-                    name,
-                    api_base: e
-                        .get("api_base")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                    priority: e.get("priority").and_then(|x| x.as_i64()).unwrap_or(100),
-                    weight: e.get("weight").and_then(|x| x.as_i64()).unwrap_or(100),
-                    enabled: e.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true),
-                    health_status: e
-                        .get("health_status")
-                        .and_then(|x| x.as_str())
-                        .map(str::to_string),
-                    consecutive_failures: e
-                        .get("consecutive_failures")
-                        .and_then(|x| x.as_i64())
-                        .unwrap_or(0),
-                    checked_secs_ago: e
-                        .get("last_checked_at")
-                        .and_then(|x| x.as_str())
-                        .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok())
-                        .map(|t| (now - t).num_seconds()),
-                });
+            if let (Some(model_id), Some(view)) = (model_id, endpoint_view_from_json(e, now)) {
+                out.entry(model_id).or_default().push(view);
             }
         }
         Ok(out)
@@ -693,6 +705,7 @@ mod tests {
             lost_retention_secs: 900,
             restart_after_failures: 0,
             port_span: 8,
+            lookup_concurrency: 8,
             job_name_prefix: "obleth-".into(),
         };
         HttpObleth::new(&cfg, reqwest::Client::new())
@@ -847,6 +860,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn all_endpoints_are_read_at_once_and_grouped_by_model() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let (e1, e2, e3) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let body = serde_json::json!([
+            {"id": e1, "model_id": a, "name": "x", "api_base": "http://n1:8000/v1",
+             "health_status": "healthy", "consecutive_failures": 0},
+            {"id": e2, "model_id": a, "name": "y", "api_base": "http://n2:8000/v1"},
+            {"id": e3, "model_id": b, "name": "z", "api_base": "http://n3:8000/v1",
+             "health_status": "unhealthy", "consecutive_failures": 2},
+            {"id": "not-a-uuid", "model_id": b},
+            {"id": Uuid::new_v4(), "name": "no model"},
+        ])
+        .to_string();
+        let c = admin_stub(200, Box::leak(body.into_boxed_str())).await;
+        let all = c.list_all_endpoints().await.unwrap();
+        assert_eq!(all.len(), 2);
+        let ids = |m: &Uuid| all[m].iter().map(|e| e.id).collect::<Vec<_>>();
+        assert_eq!(ids(&a), vec![e1, e2]);
+        assert_eq!(ids(&b), vec![e3]);
+        assert_eq!(all[&b][0].consecutive_failures, 2);
+        assert_eq!(all[&a][1].health_status, None);
+        let c = admin_stub(500, "[]").await;
+        assert!(c.list_all_endpoints().await.is_err(), "500 must be Err");
+    }
+
+    #[tokio::test]
     async fn non_array_error_body_is_truncated() {
         let long = format!(r#"{{"error":"{}"}}"#, "x".repeat(5_000));
         let c = admin_stub(200, Box::leak(long.into_boxed_str())).await;
@@ -986,6 +1025,21 @@ impl OblethClient for MockObleth {
         // Canned endpoints (none by default): each test promote then creates
         // exactly one endpoint.
         Ok(self.endpoints.lock().unwrap().clone())
+    }
+    async fn list_all_endpoints(
+        &self,
+    ) -> anyhow::Result<HashMap<Uuid, Vec<crate::domain::EndpointView>>> {
+        // The canned endpoints, for every model the fake knows.
+        let endpoints = self.endpoints.lock().unwrap().clone();
+        let models = self
+            .managed
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|m| m.model_id)
+            .chain(self.replicas.lock().unwrap().iter().map(|r| r.model_id))
+            .collect::<Vec<_>>();
+        Ok(models.into_iter().map(|m| (m, endpoints.clone())).collect())
     }
     async fn delete_endpoint(&self, _model_id: Uuid, endpoint_id: Uuid) -> anyhow::Result<()> {
         if self

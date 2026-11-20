@@ -142,6 +142,7 @@ use obleth_config::{
         crate::knowledge::get_model_collections,
         crate::knowledge::set_model_collections,
         crate::list_model_endpoints,
+        crate::list_all_endpoints,
         crate::create_model_endpoint,
         crate::update_model_endpoint,
         crate::delete_model_endpoint,

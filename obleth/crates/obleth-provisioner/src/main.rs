@@ -14,7 +14,8 @@ pub(crate) use obleth_provisioner::{domain, slurm};
 
 use chrono::{DateTime, Utc};
 use config::ProvisionerConfig;
-use domain::{Action, JobInfo, JobState, ReplicaState, ReplicaView};
+use domain::{Action, EndpointView, JobInfo, JobState, ReplicaState, ReplicaView};
+use futures::stream::{self, StreamExt};
 use obleth_client::{HttpObleth, ModelIdentity, OblethClient, ReplicaPatch, TickReport};
 use obleth_config::{ManagedBackoff, ManagedModelSpec};
 use obleth_provisioner::slurm::{SlurmClient, SlurmErrorKind, Slurmrestd};
@@ -43,6 +44,12 @@ const NODE_ADDR_REFRESH: Duration = Duration::from_secs(600);
 /// within seconds of accepting it.
 const UNCERTAIN_SUBMIT_SECS: i64 = 180;
 
+/// Replicas a tick probes at once. Each probes its port window concurrently,
+/// so this bounds a tick's open connections, not its length: with every
+/// replica answering within the probe timeout, a tick probes in about one
+/// timeout.
+const PROBE_REPLICAS_AT_ONCE: usize = 64;
+
 /// What the reconcile loop remembers between ticks. In memory on purpose: the
 /// provisioner is a singleton, and a restart only resets these streaks and
 /// clocks (worst case: a remedy waits one more window).
@@ -59,6 +66,64 @@ struct Memory {
     uncertain: HashMap<Uuid, Vec<UncertainSubmit>>,
     /// When Slurm's node addresses were last read.
     node_addrs_read: Option<std::time::Instant>,
+    /// What each probed replica's last probe found, so a probe is logged at
+    /// info only when its result changes.
+    probe_seen: HashMap<Uuid, ProbeResult>,
+    /// Unmanaged models whose drain was logged, so it is logged once.
+    draining: HashSet<Uuid>,
+}
+
+/// What a tick's probe of one running replica found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProbeResult {
+    /// The port serves this model.
+    Healthy(u16),
+    /// Another model's server answers on the port.
+    OtherModel(u16, Vec<String>),
+    /// No port answers yet.
+    NotYet,
+    /// Slurm reports the job running on no node, so there is nothing to probe.
+    NoHost,
+}
+
+/// One replica's probe, with what its log line names.
+struct ReplicaProbe {
+    /// The model's index in the tick's work list.
+    work: usize,
+    replica_id: Uuid,
+    job_id: String,
+    port_base: i64,
+    reported_port: Option<i64>,
+    result: ProbeResult,
+}
+
+/// Record a probe result; true when it differs from the replica's last one
+/// (or the replica was not probed last tick).
+fn probe_changed(seen: &mut HashMap<Uuid, ProbeResult>, id: Uuid, result: &ProbeResult) -> bool {
+    seen.insert(id, result.clone()).as_ref() != Some(result)
+}
+
+/// Log a probe: at info (warn for a fault) when its result changed, else at
+/// debug, so a steady fleet logs nothing per tick.
+fn log_probe(p: &ReplicaProbe, changed: bool) {
+    macro_rules! at {
+        ($level:ident, $($rest:tt)*) => {
+            if changed { tracing::$level!($($rest)*) } else { tracing::debug!($($rest)*) }
+        };
+    }
+    let (replica_id, job_id) = (p.replica_id, p.job_id.as_str());
+    match &p.result {
+        ProbeResult::Healthy(port) => {
+            at!(info, %replica_id, job_id, port, "health probe: healthy")
+        }
+        ProbeResult::OtherModel(port, served) => at!(warn, %replica_id, job_id, port, ?served,
+            "health probe: another model answers on the port"),
+        ProbeResult::NotYet => at!(info, %replica_id, job_id, port_base = p.port_base,
+            reported_port = ?p.reported_port, "health probe: not yet healthy"),
+        ProbeResult::NoHost => at!(warn, %replica_id, job_id,
+            "job is RUNNING but slurmrestd returned no nodes; \
+             cannot probe health — check slurmrestd response"),
+    }
 }
 
 /// A submit whose answer was lost: Slurm may or may not have the job.
@@ -99,7 +164,11 @@ async fn main() -> anyhow::Result<()> {
         wait_for_signal().await;
         let _ = shutdown_tx.send(true);
     });
+    let mut ticks = tick_interval(Duration::from_secs(cfg.interval_secs));
+    ticks.tick().await; // the first tick is immediate
+    let mut overran = false;
     loop {
+        let started = std::time::Instant::now();
         match run_once(&cfg, &obleth, &http, &resolver, &mut mem).await {
             Ok(Tick::Ran(warnings)) => {
                 obleth.set_last_tick(TickReport::ok().with_warnings(warnings));
@@ -122,25 +191,50 @@ async fn main() -> anyhow::Result<()> {
                 tracing::warn!(error = %e, "tick failed; holding (no destructive action)");
             }
         }
+        // Ticks start at a fixed rate, so the self-heal window counted in
+        // ticks is wall time. A tick longer than the interval delays the next
+        // one and stretches that window: say so once, not every tick.
+        let took = started.elapsed();
+        if (took > ticks.period()) != overran {
+            overran = !overran;
+            if overran {
+                tracing::warn!(
+                    took_secs = took.as_secs_f64(),
+                    interval_secs = cfg.interval_secs,
+                    "a tick took longer than the interval; ticks run back to back until they fit"
+                );
+            } else {
+                tracing::info!("ticks fit the interval again");
+            }
+        }
         // The tick above is never interrupted: stopping mid-tick could leave
         // a submitted job unrecorded. A signal only cuts the idle wait short.
-        if !sleep_unless_shutdown(Duration::from_secs(cfg.interval_secs), &mut shutdown).await {
+        if !wait_next_tick(&mut ticks, &mut shutdown).await {
             tracing::info!("shutdown signal received; exiting after the completed tick");
             return Ok(());
         }
     }
 }
 
-/// Sleep for `period`; returns `false` as soon as shutdown is requested
+/// A fixed-rate tick schedule: each tick starts one `period` after the last
+/// one started, however long it ran. A tick that overruns the period is
+/// followed at once by the next, never by a burst of missed ones.
+fn tick_interval(period: Duration) -> tokio::time::Interval {
+    let mut ticks = tokio::time::interval(period.max(Duration::from_secs(1)));
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticks
+}
+
+/// Wait for the next tick; returns `false` as soon as shutdown is requested
 /// (including a request that arrived during the previous tick).
-async fn sleep_unless_shutdown(
-    period: Duration,
+async fn wait_next_tick(
+    ticks: &mut tokio::time::Interval,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
 ) -> bool {
     tokio::select! {
         biased;
         _ = shutdown.wait_for(|stop| *stop) => false,
-        _ = tokio::time::sleep(period) => true,
+        _ = ticks.tick() => true,
     }
 }
 
@@ -356,18 +450,28 @@ async fn tick(
     // "not found" leaves a job out of the map, which the planner reads as gone;
     // a transport/HTTP error bails the whole tick so an unreachable Slurm is
     // never mistaken for a fleet of dead jobs (no destructive action while held).
+    // The lookups run `lookup_concurrency` at a time; any error still holds
+    // the tick.
     let mut jobs: HashMap<String, JobInfo> = HashMap::new();
     // Lost rows only age out, so their jobs are not looked up: a lookup
     // error on a long-gone job must not hold every model's tick.
-    for id in all_replicas
+    let mut to_look_up: Vec<&String> = Vec::new();
+    let mut seen_ids: HashSet<&str> = HashSet::new();
+    for r in all_replicas
         .iter()
         .filter(|r| r.state != ReplicaState::Lost)
-        .map(|r| &r.slurm_job_id)
     {
-        if id.is_empty() || jobs.contains_key(id) {
-            continue;
+        if !r.slurm_job_id.is_empty() && seen_ids.insert(&r.slurm_job_id) {
+            to_look_up.push(&r.slurm_job_id);
         }
-        match slurm.get_job(id).await {
+    }
+    let looked_up: Vec<_> = stream::iter(to_look_up)
+        .map(|id| async move { (id, slurm.get_job(id).await) })
+        .buffered(cfg.lookup_concurrency.max(1))
+        .collect()
+        .await;
+    for (id, found) in looked_up {
+        match found {
             Ok(Some(info)) => {
                 jobs.insert(id.clone(), info);
             }
@@ -381,8 +485,13 @@ async fn tick(
         // as it is (and keeps its slot) until Slurm knows it again or the
         // operator stops that replica.
         let mut held = Vec::new();
-        for id in &ids {
-            match slurm.accounting_job(id).await {
+        let answers: Vec<_> = stream::iter(&ids)
+            .map(|id| async move { (id, slurm.accounting_job(id).await) })
+            .buffered(cfg.lookup_concurrency.max(1))
+            .collect()
+            .await;
+        for (id, answer) in answers {
+            match answer {
                 Ok(Some(info)) if info.state == JobState::Gone => {
                     jobs.insert(id.clone(), info);
                 }
@@ -519,17 +628,65 @@ async fn tick(
             &mut warnings,
         )
         .await;
-        let (health, notes) =
-            probe_model(cfg, http, resolver, spec, &identity, &replicas, &jobs).await;
         work.push(ModelWork {
             spec,
             identity,
             replicas,
-            health,
-            notes,
+            health: HashMap::new(),
+            notes: HashMap::new(),
             hold_submits,
         });
     }
+
+    // Probe every running replica of every model at once (bounded), so the
+    // probes take about one probe timeout however many replicas there are.
+    let probes: Vec<ReplicaProbe> = stream::iter(
+        work.iter()
+            .enumerate()
+            .flat_map(|(i, w)| w.replicas.iter().map(move |r| (i, w, r))),
+    )
+    .map(|(i, w, r)| probe_replica(cfg, http, resolver, i, w, r, &jobs))
+    .buffer_unordered(PROBE_REPLICAS_AT_ONCE)
+    .filter_map(|p| async move { p })
+    .collect()
+    .await;
+    let probed: HashSet<Uuid> = probes.iter().map(|p| p.replica_id).collect();
+    mem.probe_seen.retain(|id, _| probed.contains(id));
+    for p in probes {
+        log_probe(
+            &p,
+            probe_changed(&mut mem.probe_seen, p.replica_id, &p.result),
+        );
+        let w = &mut work[p.work];
+        match p.result {
+            ProbeResult::Healthy(port) => {
+                w.health.insert(p.replica_id, port);
+            }
+            ProbeResult::OtherModel(port, served) => {
+                w.notes.insert(
+                    p.replica_id,
+                    probe::other_model_detail(port, &served, w.identity.expected()),
+                );
+            }
+            ProbeResult::NotYet | ProbeResult::NoHost => {}
+        }
+    }
+
+    // Every model's endpoints in one read. Best-effort: without them the
+    // probe signal still works, and the phantom sweep waits for a good
+    // snapshot.
+    let all_endpoints = if work.is_empty() {
+        Some(HashMap::new())
+    } else {
+        match obleth.list_all_endpoints().await {
+            Ok(e) => Some(e),
+            Err(e) => {
+                tracing::warn!(error = %e,
+                    "endpoint lookup failed; self-heal using probe signal only");
+                None
+            }
+        }
+    };
 
     // Fleet guard: when every probed healthy replica of every model failed at
     // once, the fault is almost certainly on the provisioner's own path to
@@ -558,17 +715,10 @@ async fn tick(
             plan::update_probe_failures(&w.replicas, &jobs, &w.health, &mut mem.probe_failures);
         }
         // The gateway's endpoint verdicts (its check is a real inference, so
-        // it catches zombies whose metadata GET still answers). Best-effort:
-        // without them the probe signal still works, and the phantom sweep
-        // waits for a good snapshot.
-        let endpoints = match obleth.list_endpoints(spec.model_id).await {
-            Ok(e) => Some(e),
-            Err(e) => {
-                tracing::warn!(model_id = %spec.model_id, error = %e,
-                    "endpoint lookup failed; self-heal using probe signal only");
-                None
-            }
-        };
+        // it catches zombies whose metadata GET still answers).
+        let endpoints: Option<Vec<EndpointView>> = all_endpoints
+            .as_ref()
+            .map(|all| all.get(&spec.model_id).cloned().unwrap_or_default());
         let heal = if path_down.is_some() {
             plan::SelfHeal::default()
         } else {
@@ -750,6 +900,7 @@ async fn tick(
         removed: true,
         ..Default::default()
     };
+    mem.draining.retain(|m| by_model.contains_key(m));
     for (model_id, replicas) in by_model {
         let model_name = match identities.get(&model_id) {
             Some(i) => i.name.clone(),
@@ -759,7 +910,11 @@ async fn tick(
                 .map(|i| i.name)
                 .unwrap_or_default(),
         };
-        tracing::info!(%model_id, replicas = replicas.len(), "draining replicas for unmanaged model");
+        if mem.draining.insert(model_id) {
+            tracing::info!(%model_id, replicas = replicas.len(), "draining replicas for unmanaged model");
+        } else {
+            tracing::debug!(%model_id, replicas = replicas.len(), "draining replicas for unmanaged model");
+        }
         let actions = plan::plan(&plan::PlanInput {
             spec: &drain_view,
             replicas: &replicas,
@@ -944,106 +1099,87 @@ async fn adopt_lost_submits(
     hold
 }
 
-/// Probe every replica of a model whose job runs: the port the job reported
-/// in its comment when it did, else every port of its window. A port passes
-/// when the health path answers and the server lists this model (or lists
-/// none). Returns the passing port per replica, and a note for a replica
-/// whose port answers for another model.
-async fn probe_model(
+/// Probe one replica of a model if its job runs: the port the job reported
+/// in its comment when it did, else every port of its window, all at once. A
+/// port passes when the health path answers and the server lists this model
+/// (or lists none). `None` for a replica with nothing to probe.
+async fn probe_replica(
     cfg: &ProvisionerConfig,
     http: &reqwest::Client,
     resolver: &resolve::HostResolver,
-    spec: &ManagedModelSpec,
-    identity: &ModelIdentity,
-    replicas: &[ReplicaView],
+    work: usize,
+    w: &ModelWork<'_>,
+    r: &ReplicaView,
     jobs: &HashMap<String, JobInfo>,
-) -> (HashMap<Uuid, u16>, HashMap<Uuid, String>) {
-    let mut health = HashMap::new();
-    let mut notes = HashMap::new();
-    let expected = identity.served_names();
-    for r in replicas {
-        if !r.state.is_live() {
-            continue;
-        }
-        let Some(job) = jobs
-            .get(&r.slurm_job_id)
-            .filter(|j| j.state == JobState::Running)
-        else {
-            continue;
-        };
-        // The batch host runs the server; for a multi-node job the node list
-        // alone does not say which one.
-        let Some(node) = job.probe_host() else {
-            tracing::warn!(
-                replica_id = %r.id,
-                job_id = %r.slurm_job_id,
-                "job is RUNNING but slurmrestd returned no nodes; \
-                 cannot probe health — check slurmrestd response"
-            );
-            continue;
-        };
-        // Resolve the node name to an address once per tick (cached across
-        // ticks) and probe by that address, so a flaky resolver can't make a
-        // live replica flap unhealthy. Falls back to the name on a miss.
-        let host = resolver
-            .resolve(node)
-            .await
-            .unwrap_or_else(|| node.to_string());
-        let ports: Vec<i64> = match job.reported_port {
-            Some(p) => vec![p],
-            None => (r.port_base..r.port_base + cfg.port_span).collect(),
-        };
-        // Probe the ports concurrently: a not-yet-up replica otherwise costs
-        // port_span * health_timeout of serial waits every tick.
-        let mut set = tokio::task::JoinSet::new();
-        for p in ports
-            .into_iter()
-            .filter(|p| (1..=u16::MAX as i64).contains(p))
-        {
-            let http = http.clone();
-            let host = host.clone();
-            let health_path = spec.health_path.clone();
-            let expected = expected.clone();
-            let timeout = cfg.health_timeout_secs;
-            set.spawn(async move {
-                let p = p as u16;
-                let res =
-                    probe::probe_port(&http, &host, p, &health_path, &expected, timeout).await;
-                (p, res)
-            });
-        }
-        let mut serving: Option<u16> = None;
-        let mut other: Option<(u16, Vec<String>)> = None;
-        while let Some(res) = set.join_next().await {
-            match res {
-                Ok((p, probe::PortProbe::Serving)) => {
-                    serving = Some(serving.map_or(p, |cur| cur.min(p)));
-                }
-                Ok((p, probe::PortProbe::OtherModel(list)))
-                    if other.as_ref().is_none_or(|(cur, _)| p < *cur) =>
-                {
-                    other = Some((p, list));
-                }
-                _ => {}
-            }
-        }
-        if let Some(p) = serving {
-            tracing::info!(replica_id = %r.id, job_id = %r.slurm_job_id, port = p, "health probe: healthy");
-            health.insert(r.id, p);
-        } else if let Some((p, list)) = other {
-            tracing::warn!(replica_id = %r.id, port = p, served = ?list,
-                "health probe: another model answers on the port");
-            notes.insert(
-                r.id,
-                probe::other_model_detail(p, &list, identity.expected()),
-            );
-        } else {
-            tracing::info!(replica_id = %r.id, job_id = %r.slurm_job_id,
-                port_base = r.port_base, reported_port = ?job.reported_port,
-                "health probe: not yet healthy");
-        }
+) -> Option<ReplicaProbe> {
+    if !r.state.is_live() {
+        return None;
     }
-    (health, notes)
+    let job = jobs
+        .get(&r.slurm_job_id)
+        .filter(|j| j.state == JobState::Running)?;
+    let probe = |result| ReplicaProbe {
+        work,
+        replica_id: r.id,
+        job_id: r.slurm_job_id.clone(),
+        port_base: r.port_base,
+        reported_port: job.reported_port,
+        result,
+    };
+    // The batch host runs the server; for a multi-node job the node list
+    // alone does not say which one.
+    let Some(node) = job.probe_host() else {
+        return Some(probe(ProbeResult::NoHost));
+    };
+    // Resolve the node name to an address once per tick (cached across
+    // ticks) and probe by that address, so a flaky resolver can't make a
+    // live replica flap unhealthy. Falls back to the name on a miss.
+    let host = resolver
+        .resolve(node)
+        .await
+        .unwrap_or_else(|| node.to_string());
+    let ports: Vec<u16> = match job.reported_port {
+        Some(p) => vec![p],
+        None => (r.port_base..r.port_base + cfg.port_span).collect(),
+    }
+    .into_iter()
+    .filter_map(|p| u16::try_from(p).ok().filter(|p| *p > 0))
+    .collect();
+    let expected = w.identity.served_names();
+    let answers = futures::future::join_all(ports.iter().map(|&p| {
+        let (host, expected) = (&host, &expected);
+        async move {
+            let res = probe::probe_port(
+                http,
+                host,
+                p,
+                &w.spec.health_path,
+                expected,
+                cfg.health_timeout_secs,
+            )
+            .await;
+            (p, res)
+        }
+    }))
+    .await;
+    // The lowest serving port wins; else the lowest port another model holds.
+    let serving = answers
+        .iter()
+        .filter(|(_, a)| *a == probe::PortProbe::Serving)
+        .map(|(p, _)| *p)
+        .min();
+    let other = answers
+        .into_iter()
+        .filter_map(|(p, a)| match a {
+            probe::PortProbe::OtherModel(list) => Some((p, list)),
+            _ => None,
+        })
+        .min_by_key(|(p, _)| *p);
+    Some(probe(match (serving, other) {
+        (Some(p), _) => ProbeResult::Healthy(p),
+        (None, Some((p, list))) => ProbeResult::OtherModel(p, list),
+        (None, None) => ProbeResult::NotYet,
+    }))
 }
 
 /// Record the model's failure count and pause state when this tick changed
@@ -1120,7 +1256,39 @@ mod tests {
     #[tokio::test]
     async fn idle_wait_continues_without_a_signal() {
         let (_tx, mut rx) = tokio::sync::watch::channel(false);
-        assert!(sleep_unless_shutdown(Duration::from_millis(10), &mut rx).await);
+        let mut ticks = tick_interval(Duration::from_secs(1));
+        ticks.tick().await;
+        assert!(wait_next_tick(&mut ticks, &mut rx).await);
+    }
+
+    /// Ticks start one interval apart however long each ran, so a window
+    /// counted in ticks is wall time; an overrun starts the next at once.
+    #[tokio::test(start_paused = true)]
+    async fn ticks_start_at_a_fixed_rate() {
+        let (_tx, mut rx) = tokio::sync::watch::channel(false);
+        let t0 = tokio::time::Instant::now();
+        let mut ticks = tick_interval(Duration::from_secs(15));
+        ticks.tick().await;
+        let mut starts = Vec::new();
+        for work in [10, 3, 20, 1] {
+            starts.push((tokio::time::Instant::now() - t0).as_secs());
+            tokio::time::sleep(Duration::from_secs(work)).await;
+            assert!(wait_next_tick(&mut ticks, &mut rx).await);
+        }
+        // 10 s and 3 s of work keep the 15 s rate; 20 s overruns, so the
+        // next starts at once, and the rate resumes from there.
+        assert_eq!(starts, vec![0, 15, 30, 50]);
+    }
+
+    #[test]
+    fn a_probe_is_news_only_when_it_changes() {
+        let mut seen = HashMap::new();
+        let id = Uuid::new_v4();
+        assert!(probe_changed(&mut seen, id, &ProbeResult::NotYet));
+        assert!(!probe_changed(&mut seen, id, &ProbeResult::NotYet));
+        assert!(probe_changed(&mut seen, id, &ProbeResult::Healthy(8000)));
+        assert!(!probe_changed(&mut seen, id, &ProbeResult::Healthy(8000)));
+        assert!(probe_changed(&mut seen, id, &ProbeResult::Healthy(8001)));
     }
 
     #[tokio::test]
@@ -1130,10 +1298,11 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
             let _ = tx.send(true);
         });
-        let stopped = tokio::time::timeout(
-            Duration::from_secs(5),
-            sleep_unless_shutdown(Duration::from_secs(600), &mut rx),
-        )
+        let stopped = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut ticks = tick_interval(Duration::from_secs(600));
+            ticks.tick().await;
+            wait_next_tick(&mut ticks, &mut rx).await
+        })
         .await
         .expect("wait cut short");
         assert!(!stopped);
@@ -1143,7 +1312,9 @@ mod tests {
     async fn signal_during_a_tick_stops_after_it() {
         let (tx, mut rx) = tokio::sync::watch::channel(false);
         tx.send(true).unwrap();
-        assert!(!sleep_unless_shutdown(Duration::from_secs(600), &mut rx).await);
+        let mut ticks = tick_interval(Duration::from_secs(600));
+        ticks.tick().await;
+        assert!(!wait_next_tick(&mut ticks, &mut rx).await);
     }
 
     /// Slurm fake that answers `get_job` from a fixed map (absent = `Ok(None)`)
@@ -1159,6 +1330,8 @@ mod tests {
         submitted: Mutex<Vec<String>>,
         submit_gets_no_answer: AtomicBool,
         cancel_refused: AtomicBool,
+        /// How long each job lookup takes.
+        lookup_delay: Duration,
     }
     #[async_trait::async_trait]
     impl SlurmClient for FakeSlurm {
@@ -1188,6 +1361,7 @@ mod tests {
             Ok(())
         }
         async fn get_job(&self, job_id: &str) -> anyhow::Result<Option<JobInfo>> {
+            tokio::time::sleep(self.lookup_delay).await;
             Ok(self.jobs.get(job_id).cloned())
         }
         async fn discover_resources(&self) -> anyhow::Result<ClusterResources> {
@@ -1214,6 +1388,7 @@ mod tests {
             lost_retention_secs: 900,
             restart_after_failures: 0,
             port_span: 8,
+            lookup_concurrency: 8,
             job_name_prefix: "obleth-".into(),
         }
     }
@@ -1278,6 +1453,34 @@ mod tests {
             obleth.deleted_replicas.lock().unwrap().is_empty(),
             "no delete"
         );
+    }
+
+    /// Job lookups run concurrently: eight queued replicas whose lookups take
+    /// a second each cost a tick about one second, not eight.
+    #[tokio::test(start_paused = true)]
+    async fn a_tick_looks_jobs_up_concurrently() {
+        let spec = managed(8);
+        let mut slurm = FakeSlurm {
+            lookup_delay: Duration::from_secs(1),
+            ..Default::default()
+        };
+        let mut rows = Vec::new();
+        for i in 0..8 {
+            let id = format!("{}", 100 + i);
+            slurm.jobs.insert(id.clone(), pending_job(&id));
+            let mut r = replica(&id, "pending");
+            r.model_id = spec.model_id;
+            r.port_base = 8000 + 10 * i;
+            rows.push(r);
+        }
+        let obleth = MockObleth::default();
+        obleth.managed.lock().unwrap().push(spec);
+        *obleth.replicas.lock().unwrap() = rows;
+        let t0 = tokio::time::Instant::now();
+        run_tick(&slurm, &obleth).await.unwrap();
+        let took = tokio::time::Instant::now() - t0;
+        assert!(took < Duration::from_secs(2), "took {took:?}");
+        nothing_destructive(&slurm, &obleth);
     }
 
     #[tokio::test]

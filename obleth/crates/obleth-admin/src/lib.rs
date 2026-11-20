@@ -408,6 +408,7 @@ pub fn router(state: AdminState) -> Router {
             put(set_managed_backoff),
         )
         .route("/api/v1/replicas", get(list_all_replicas))
+        .route("/api/v1/endpoints", get(list_all_endpoints))
         .route(
             "/api/v1/replicas/:id",
             patch(patch_replica).delete(delete_replica),
@@ -9444,6 +9445,18 @@ async fn list_model_endpoints(
     Ok(Json(views(state.store.list_model_endpoints(id).await?)))
 }
 
+/// Every model's endpoints in one read, with their health, ordered by model
+/// and then priority. The provisioner reads this once a tick.
+#[utoipa::path(
+    get, path = "/api/v1/endpoints", tag = "models",
+    responses((status = 200, body = [ModelEndpointView]))
+)]
+async fn list_all_endpoints(
+    State(state): State<AdminState>,
+) -> Result<Json<Vec<ModelEndpointView>>> {
+    Ok(Json(views(state.store.all_model_endpoints().await?)))
+}
+
 /// An endpoint's own concurrency, when given, has the same bounds as a
 /// model's `per_replica_max_in_flight`.
 fn validate_endpoint_max_in_flight(value: Option<i64>) -> Result<()> {
@@ -11350,6 +11363,69 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// Every model's endpoints come back in one read, each naming its model,
+    /// with the key kept write-only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn all_endpoints_are_read_at_once() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let a =
+            harness::fixture_model(&t.store, &format!("all-eps-a-{}", Uuid::new_v4()), 0.0).await;
+        let b =
+            harness::fixture_model(&t.store, &format!("all-eps-b-{}", Uuid::new_v4()), 0.0).await;
+        for (model, name, key) in [
+            (a.id, "a1", Some("sk-secret")),
+            (a.id, "a2", None),
+            (b.id, "b1", None),
+        ] {
+            t.store
+                .create_model_endpoint(
+                    model,
+                    name,
+                    "http://127.0.0.1:9/v1",
+                    key,
+                    100,
+                    100,
+                    true,
+                    None,
+                )
+                .await
+                .expect("endpoint");
+        }
+        let req = axum::http::Request::get("/api/v1/endpoints")
+            .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let (status, body) = send(&t.app, req).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let names_of = |m: Uuid| {
+            let mut names: Vec<String> = body
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["model_id"] == m.to_string())
+                .map(|e| e["name"].as_str().unwrap().to_string())
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(names_of(a.id), ["a1", "a2"]);
+        assert_eq!(names_of(b.id), ["b1"]);
+        let a1 = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == "a1" && e["model_id"] == a.id.to_string())
+            .unwrap();
+        assert_eq!(a1["api_key_set"], true);
+        assert!(
+            !body.to_string().contains("sk-secret"),
+            "the key is write-only"
+        );
     }
 
     /// A model's endpoints are probed together: four endpoints that each take

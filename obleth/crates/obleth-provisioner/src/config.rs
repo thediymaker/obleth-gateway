@@ -22,8 +22,9 @@ pub struct ProvisionerConfig {
     /// health-probe ticks while its Slurm job still reports RUNNING (a "zombie"
     /// job — allocation alive, inference server dead). The counter *decays* on a
     /// passing probe (see `plan::update_probe_failures`), so this is a sustained
-    /// outage window, not a raw consecutive count: at the default 15s interval,
-    /// 20 ticks is ~5 minutes of the server not answering at all. A single-
+    /// outage window, not a raw consecutive count: ticks start at a fixed rate,
+    /// so at the default 15s interval 20 ticks is ~5 minutes of the server not
+    /// answering at all (a tick that overruns the interval is logged). A single-
     /// threaded server (llama.cpp) that briefly misses a probe while busy and
     /// passes the next never accumulates toward it. `0` disables self-heal
     /// restarts. Restarts are capped at one per model per tick, the last
@@ -34,6 +35,9 @@ pub struct ProvisionerConfig {
     /// `plan::self_heal_candidates`).
     pub restart_after_failures: i64,
     pub port_span: i64,
+    /// Slurm job lookups a tick runs at once. Each is one slurmrestd call;
+    /// the bound keeps a large fleet from flooding slurmrestd.
+    pub lookup_concurrency: usize,
     /// Job-name prefix used to tag and later find this gateway's jobs.
     pub job_name_prefix: String,
 }
@@ -56,6 +60,9 @@ impl ProvisionerConfig {
             restart_after_failures: opt("OBLETH_PROVISIONER_RESTART_AFTER_FAILURES", "20")
                 .parse()?,
             port_span: opt("OBLETH_PORT_SPAN", "8").parse()?,
+            lookup_concurrency: opt("OBLETH_PROVISIONER_LOOKUP_CONCURRENCY", "8")
+                .parse::<usize>()?
+                .max(1),
             job_name_prefix: opt("OBLETH_PROVISIONER_JOB_PREFIX", "obleth-"),
         })
     }
@@ -75,6 +82,7 @@ mod tests {
         assert_eq!(c.warmup_timeout_secs, 600);
         assert_eq!(c.lost_retention_secs, 900);
         assert_eq!(c.restart_after_failures, 20);
+        assert_eq!(c.lookup_concurrency, 8);
         assert_eq!(c.job_name_prefix, "obleth-");
     }
 }

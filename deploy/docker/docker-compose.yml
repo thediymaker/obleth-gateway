@@ -309,7 +309,9 @@ services:
       # job). 0 disables. Keep the fallback in sync with the binary default in
       # crates/obleth-provisioner/src/config.rs.
       OBLETH_PROVISIONER_RESTART_AFTER_FAILURES: ${OBLETH_PROVISIONER_RESTART_AFTER_FAILURES:-20}
-      RUST_LOG: info,obleth_provisioner=debug
+      # Probe results are logged when they change; add
+      # ",obleth_provisioner=debug" to see every tick's.
+      RUST_LOG: info
     # On SIGTERM the provisioner finishes the tick in progress before exiting,
     # so a submitted job is always recorded. A tick can run past Docker's 10 s
     # default (slurmrestd calls, node probes, submits).
