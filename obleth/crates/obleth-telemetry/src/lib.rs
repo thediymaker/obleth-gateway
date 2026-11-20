@@ -361,11 +361,9 @@ impl TelemetrySink {
     /// invalid database name is an error.
     ///
     /// Rows are inserted every `flush_interval`, or sooner once `BATCH_MAX`
-    /// are buffered.
-    ///
-    /// `_fail_open` is ignored: telemetry always spills to the WAL on failure.
+    /// are buffered. A failed insert always spills to the WAL:
     /// `OBLETH_FAIL_OPEN` governs budget admission only, and a ledger outage
-    /// must never cost accounting data. Kept so callers compile unchanged.
+    /// must never cost accounting data.
     pub async fn start(
         url: &str,
         database: &str,
@@ -373,7 +371,6 @@ impl TelemetrySink {
         password: &str,
         wal_path: &str,
         flush_interval: Duration,
-        _fail_open: bool,
     ) -> Result<Self, TelemetryError> {
         if !is_valid_identifier(database) {
             return Err(TelemetryError::InvalidDatabase(database.to_string()));
@@ -429,8 +426,22 @@ impl TelemetrySink {
         });
         let (drain, drain_rx) = mpsc::channel(4);
         let (drain_spans, drain_spans_rx) = mpsc::channel(4);
-        tokio::spawn(flusher.run(rx, drain_rx));
-        tokio::spawn(spans_flusher.run(rx_spans, drain_spans_rx));
+        let every = flusher.flush_interval;
+        tokio::spawn(run_batches(
+            flusher,
+            rx,
+            drain_rx,
+            every,
+            Some(REPLAY_INTERVAL),
+        ));
+        let every = spans_flusher.flush_interval;
+        tokio::spawn(run_batches(
+            spans_flusher,
+            rx_spans,
+            drain_spans_rx,
+            every,
+            None,
+        ));
         tokio::spawn(rejections.clone().run());
         Ok(TelemetrySink {
             tx,
@@ -528,61 +539,22 @@ struct Flusher {
     last_schema_warn: Option<tokio::time::Instant>,
 }
 
-impl Flusher {
-    async fn run(
-        mut self,
-        mut rx: mpsc::Receiver<UsageRecord>,
-        mut drain: mpsc::Receiver<oneshot::Sender<()>>,
-    ) {
-        let mut buf: Vec<UsageRecord> = Vec::with_capacity(BATCH_MAX);
-        // The first flush is one interval after boot; replay starts at once so
-        // spill left by a previous run goes back to ClickHouse right away.
-        let mut ticker = tokio::time::interval_at(
-            tokio::time::Instant::now() + self.flush_interval,
-            self.flush_interval,
-        );
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut replay = tokio::time::interval(REPLAY_INTERVAL);
-        replay.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tokio::select! {
-                Some(ack) = drain.recv() => {
-                    // Everything sent before the drain request is already queued.
-                    // Shutdown has a fixed budget: no untimed schema setup
-                    // (claim sleep, backfill) here; spill instead.
-                    while let Ok(rec) = rx.try_recv() {
-                        buf.push(rec);
-                        if buf.len() >= BATCH_MAX {
-                            self.flush(&mut buf, false).await;
-                        }
-                    }
-                    self.flush(&mut buf, false).await;
-                    let _ = ack.send(());
-                }
-                maybe = rx.recv() => {
-                    match maybe {
-                        Some(rec) => {
-                            buf.push(rec);
-                            if buf.len() >= BATCH_MAX {
-                                self.flush(&mut buf, true).await;
-                            }
-                        }
-                        None => {
-                            self.flush(&mut buf, false).await;
-                            break;
-                        }
-                    }
-                }
-                _ = ticker.tick() => {
-                    self.flush(&mut buf, true).await;
-                }
-                _ = replay.tick() => {
-                    self.replay_wal().await;
-                }
-            }
-        }
+impl BatchSink for Flusher {
+    type Item = UsageRecord;
+
+    async fn flush(&mut self, buf: &mut Vec<UsageRecord>, steady: bool) {
+        // Shutdown has a fixed budget: no untimed schema setup (claim sleep,
+        // backfill) then; spill instead.
+        Flusher::flush(self, buf, steady).await;
     }
 
+    async fn side_work(&mut self) {
+        // Spill left by a previous run goes back to ClickHouse.
+        self.replay_wal().await;
+    }
+}
+
+impl Flusher {
     /// Insert, or spill to the WAL on any failure. Records are dropped only
     /// when the WAL itself refuses them (disk/segment cap).
     async fn flush(&mut self, buf: &mut Vec<UsageRecord>, setup_schema: bool) {
@@ -662,22 +634,14 @@ impl Flusher {
     }
 
     async fn insert(&self, batch: &[UsageRecord]) -> Result<(), TelemetryError> {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            let mut insert = self
-                .client
-                .insert("usage")?
-                .with_option("insert_deduplication_token", dedup_token(batch))
-                // Without this the rollup view still fires for a block that
-                // `usage` discarded as a duplicate, double-counting usage_daily.
-                .with_option("deduplicate_blocks_in_dependent_materialized_views", "1");
-            for rec in batch {
-                insert.write(&UsageRow::from(rec)).await?;
-            }
-            insert.end().await?;
-            Ok(())
-        })
-        .await
-        .map_err(|_| TelemetryError::InsertTimeout)?
+        let insert = self
+            .client
+            .insert("usage")?
+            .with_option("insert_deduplication_token", dedup_token(batch))
+            // Without this the rollup view still fires for a block that
+            // `usage` discarded as a duplicate, double-counting usage_daily.
+            .with_option("deduplicate_blocks_in_dependent_materialized_views", "1");
+        insert_rows(insert, batch, UsageRow::from).await
     }
 
     async fn write_wal(&self, batch: &[UsageRecord]) {
@@ -887,21 +851,15 @@ impl RejectionFlusher {
             );
             return;
         }
-        let insert = tokio::time::timeout(Duration::from_secs(5), async {
-            let mut ins = self.client.insert("key_rejections")?;
-            for row in &rows {
-                ins.write(&KeyRejectionRow::from(row)).await?;
-            }
-            ins.end().await?;
-            Ok::<(), clickhouse::error::Error>(())
-        })
-        .await;
-        match insert {
-            Ok(Ok(())) => return,
-            Ok(Err(e)) => {
+        let inserted = match self.client.insert("key_rejections") {
+            Ok(ins) => insert_rows(ins, &rows, KeyRejectionRow::from).await,
+            Err(e) => Err(e.into()),
+        };
+        match inserted {
+            Ok(()) => return,
+            Err(e) => {
                 tracing::warn!(error = %e, count = rows.len(), "key rejections insert failed")
             }
-            Err(_) => tracing::warn!(count = rows.len(), "key rejections insert timed out"),
         }
         self.stats
             .lose(Stream::Rejections, Outcome::Dropped, rows.len() as u64);
@@ -945,47 +903,15 @@ struct SpansFlusher {
     stats: Arc<TelemetryStats>,
 }
 
-impl SpansFlusher {
-    async fn run(
-        self,
-        mut rx: mpsc::Receiver<SpanRecord>,
-        mut drain: mpsc::Receiver<oneshot::Sender<()>>,
-    ) {
-        let mut buf: Vec<SpanRecord> = Vec::with_capacity(BATCH_MAX);
-        let mut ticker = tokio::time::interval(self.flush_interval);
-        loop {
-            tokio::select! {
-                Some(ack) = drain.recv() => {
-                    while let Ok(rec) = rx.try_recv() {
-                        buf.push(rec);
-                        if buf.len() >= BATCH_MAX {
-                            self.flush(&mut buf).await;
-                        }
-                    }
-                    self.flush(&mut buf).await;
-                    let _ = ack.send(());
-                }
-                maybe = rx.recv() => {
-                    match maybe {
-                        Some(rec) => {
-                            buf.push(rec);
-                            if buf.len() >= BATCH_MAX {
-                                self.flush(&mut buf).await;
-                            }
-                        }
-                        None => {
-                            self.flush(&mut buf).await;
-                            break;
-                        }
-                    }
-                }
-                _ = ticker.tick() => {
-                    self.flush(&mut buf).await;
-                }
-            }
-        }
-    }
+impl BatchSink for SpansFlusher {
+    type Item = SpanRecord;
 
+    async fn flush(&mut self, buf: &mut Vec<SpanRecord>, _steady: bool) {
+        SpansFlusher::flush(self, buf).await;
+    }
+}
+
+impl SpansFlusher {
     async fn flush(&self, buf: &mut Vec<SpanRecord>) {
         if buf.is_empty() {
             return;
@@ -1009,16 +935,111 @@ impl SpansFlusher {
     }
 
     async fn insert(&self, batch: &[SpanRecord]) -> Result<(), TelemetryError> {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            let mut ins = self.client.insert("spans")?;
-            for rec in batch {
-                ins.write(&SpanRow::from(rec)).await?;
+        let insert = self.client.insert("spans")?;
+        insert_rows(insert, batch, SpanRow::from).await
+    }
+}
+
+/// How long one batch insert may take before it counts as failed (and, for
+/// usage, spills to the WAL).
+const INSERT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Write each of `items` as `row(item)` through `insert` and finish it,
+/// within [`INSERT_TIMEOUT`].
+async fn insert_rows<'a, R: Sync, T>(
+    mut insert: clickhouse::insert::Insert<T>,
+    items: &'a [R],
+    row: fn(&'a R) -> T,
+) -> Result<(), TelemetryError>
+where
+    T: Row + Serialize,
+{
+    tokio::time::timeout(INSERT_TIMEOUT, async move {
+        for item in items {
+            insert.write(&row(item)).await?;
+        }
+        insert.end().await?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| TelemetryError::InsertTimeout)?
+}
+
+/// A stream of rows written out in batches by [`run_batches`].
+trait BatchSink: Send {
+    type Item: Send;
+
+    /// Write out `buf` (left empty). `steady` is false while draining or
+    /// closing, when a sink must not start slow work.
+    fn flush(
+        &mut self,
+        buf: &mut Vec<Self::Item>,
+        steady: bool,
+    ) -> impl std::future::Future<Output = ()> + Send;
+
+    /// Work on its own timer ([`run_batches`]'s `side_every`); none by default.
+    fn side_work(&mut self) -> impl std::future::Future<Output = ()> + Send {
+        async {}
+    }
+}
+
+/// Collect rows from `rx` and flush them every `flush_every` (the first one
+/// interval after start), or as soon as [`BATCH_MAX`] are buffered. A
+/// message on `drain` flushes everything queued before it and is then
+/// answered; a closed `rx` flushes and ends. With `side_every`, the sink's
+/// side work runs on that timer from the start.
+async fn run_batches<S: BatchSink>(
+    mut sink: S,
+    mut rx: mpsc::Receiver<S::Item>,
+    mut drain: mpsc::Receiver<oneshot::Sender<()>>,
+    flush_every: Duration,
+    side_every: Option<Duration>,
+) {
+    let mut buf: Vec<S::Item> = Vec::with_capacity(BATCH_MAX);
+    let mut ticker =
+        tokio::time::interval_at(tokio::time::Instant::now() + flush_every, flush_every);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut side = side_every.map(|every| {
+        let mut t = tokio::time::interval(every);
+        t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        t
+    });
+    loop {
+        let side_tick = async {
+            match side.as_mut() {
+                Some(t) => {
+                    t.tick().await;
+                }
+                None => std::future::pending::<()>().await,
             }
-            ins.end().await?;
-            Ok(())
-        })
-        .await
-        .map_err(|_| TelemetryError::InsertTimeout)?
+        };
+        tokio::select! {
+            Some(ack) = drain.recv() => {
+                // Everything sent before the drain request is already queued.
+                while let Ok(rec) = rx.try_recv() {
+                    buf.push(rec);
+                    if buf.len() >= BATCH_MAX {
+                        sink.flush(&mut buf, false).await;
+                    }
+                }
+                sink.flush(&mut buf, false).await;
+                let _ = ack.send(());
+            }
+            maybe = rx.recv() => match maybe {
+                Some(rec) => {
+                    buf.push(rec);
+                    if buf.len() >= BATCH_MAX {
+                        sink.flush(&mut buf, true).await;
+                    }
+                }
+                None => {
+                    sink.flush(&mut buf, false).await;
+                    break;
+                }
+            },
+            _ = ticker.tick() => sink.flush(&mut buf, true).await,
+            _ = side_tick => sink.side_work().await,
+        }
     }
 }
 
@@ -1058,216 +1079,6 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
         .await?;
     let ip_days = client_ip_retention_days();
     let ip_ttl = client_ip_ttl(ip_days);
-    let ddl = format!(
-        "CREATE TABLE IF NOT EXISTS {database}.usage (
-            request_id UUID,
-            tenant_id UUID,
-            key_id UUID,
-            model String,
-            admission LowCardinality(String),
-            weight Int64,
-            input_tokens UInt32,
-            output_tokens UInt32,
-            cached_input_tokens UInt32 DEFAULT 0,
-            estimated_tokens UInt32,
-            queue_wait_ms UInt32,
-            ttft_ms UInt32,
-            total_ms UInt32,
-            status_code UInt16,
-            cache_status LowCardinality(String) DEFAULT 'off',
-            cost_usd Float64 DEFAULT 0,
-            energy_wh Float64 DEFAULT 0,
-            energy_cost_usd Float64 DEFAULT 0,
-            co2_g Float64 DEFAULT 0,
-            ts_ms Int64,
-            session_id String DEFAULT '',
-            session_id_source LowCardinality(String) DEFAULT '',
-            request_type LowCardinality(String) DEFAULT '',
-            device_id String DEFAULT '',
-            end_user String DEFAULT '',
-            parent_request_id UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
-            model_variant String DEFAULT '',
-            reasoning_effort LowCardinality(String) DEFAULT '',
-            reasoning_effort_requested LowCardinality(String) DEFAULT '',
-            model_family String DEFAULT '',
-            key_name String DEFAULT '',
-            tenant_name String DEFAULT '',
-            streamed Bool DEFAULT false,
-            error_class LowCardinality(String) DEFAULT '',
-            error_reason String DEFAULT '',
-            client_ip String DEFAULT '' {ip_ttl},
-            client_network String DEFAULT '' {ip_ttl},
-            client_country LowCardinality(String) DEFAULT '',
-            user_agent String DEFAULT '' {ip_ttl},
-            ts DateTime64(3) MATERIALIZED fromUnixTimestamp64Milli(ts_ms),
-            INDEX idx_ts_ms ts_ms TYPE minmax GRANULARITY 4
-        ) ENGINE = MergeTree()
-        PARTITION BY toYYYYMMDD(ts)
-        ORDER BY (tenant_id, ts_ms)"
-    );
-    client.query(&ddl).execute().await?;
-    // The sort key leads with tenant_id, so cross-tenant time-range reads (the
-    // live request log, the usage series) cannot use the primary index. A
-    // minmax skip index on ts_ms lets those queries skip granules outside the
-    // requested window. Idempotent add for tables created before the index
-    // existed; it applies to newly written parts (old parts age out via the
-    // retention worker, so we deliberately skip an expensive MATERIALIZE).
-    client
-        .query(&format!(
-            "ALTER TABLE {database}.usage ADD INDEX IF NOT EXISTS idx_ts_ms ts_ms TYPE minmax GRANULARITY 4"
-        ))
-        .execute()
-        .await?;
-    // Idempotent add for databases created before the cache column existed.
-    client
-        .query(&format!(
-            "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS cache_status LowCardinality(String) DEFAULT 'off'"
-        ))
-        .execute()
-        .await?;
-    // Idempotent add for databases created before per-request cost was frozen.
-    client
-        .query(&format!(
-            "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS cost_usd Float64 DEFAULT 0"
-        ))
-        .execute()
-        .await?;
-    // Idempotent adds for databases created before per-request energy was frozen.
-    for col in [
-        "energy_wh Float64 DEFAULT 0",
-        "energy_cost_usd Float64 DEFAULT 0",
-        "co2_g Float64 DEFAULT 0",
-    ] {
-        client
-            .query(&format!(
-                "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS {col}"
-            ))
-            .execute()
-            .await?;
-    }
-    // Idempotent adds for databases created before the per-request log surfaced
-    // session grouping and request class.
-    client
-        .query(&format!(
-            "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS session_id String DEFAULT ''"
-        ))
-        .execute()
-        .await?;
-    client
-        .query(&format!(
-            "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS session_id_source LowCardinality(String) DEFAULT ''"
-        ))
-        .execute()
-        .await?;
-    client
-        .query(&format!(
-            "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS request_type LowCardinality(String) DEFAULT ''"
-        ))
-        .execute()
-        .await?;
-    // Idempotent add for databases created before per-device attribution.
-    client
-        .query(&format!(
-            "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS device_id String DEFAULT ''"
-        ))
-        .execute()
-        .await?;
-    // Idempotent add for databases created before per-end-user attribution.
-    client
-        .query(&format!(
-            "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS end_user String DEFAULT ''"
-        ))
-        .execute()
-        .await?;
-    // Idempotent add for databases created before upstream prefix-cache hits
-    // were recorded.
-    client
-        .query(&format!(
-            "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS cached_input_tokens UInt32 DEFAULT 0"
-        ))
-        .execute()
-        .await?;
-    // Idempotent adds for databases created before helper-call rows named the
-    // request they served, and before requests recorded the variant they used.
-    client
-        .query(&format!(
-            "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS parent_request_id UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000')"
-        ))
-        .execute()
-        .await?;
-    client
-        .query(&format!(
-            "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS model_variant String DEFAULT ''"
-        ))
-        .execute()
-        .await?;
-    for column in ["reasoning_effort", "reasoning_effort_requested"] {
-        client
-            .query(&format!(
-                "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS {column} LowCardinality(String) DEFAULT ''"
-            ))
-            .execute()
-            .await?;
-    }
-    client
-        .query(&format!(
-            "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS model_family String DEFAULT ''"
-        ))
-        .execute()
-        .await?;
-    for column in ["key_name", "tenant_name"] {
-        client
-            .query(&format!(
-                "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS {column} String DEFAULT ''"
-            ))
-            .execute()
-            .await?;
-    }
-    client
-        .query(&format!(
-            "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS streamed Bool DEFAULT false"
-        ))
-        .execute()
-        .await?;
-    // Why a request failed (see `obleth_config::failure`); empty on older rows,
-    // which readers file by status code instead.
-    for column in [
-        "error_class LowCardinality(String) DEFAULT ''",
-        "error_reason String DEFAULT ''",
-    ] {
-        client
-            .query(&format!(
-                "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS {column}"
-            ))
-            .execute()
-            .await?;
-    }
-    // Where each request came from. The address, its network and the
-    // User-Agent identify a person more than the rest of the row does, so
-    // they expire after the client address retention (column TTL: cleared
-    // to '', the row stays); the country is kept as long as the row.
-    for column in [
-        format!("client_ip String DEFAULT '' {ip_ttl}"),
-        format!("client_network String DEFAULT '' {ip_ttl}"),
-        "client_country LowCardinality(String) DEFAULT ''".to_string(),
-        format!("user_agent String DEFAULT '' {ip_ttl}"),
-    ] {
-        client
-            .query(&format!(
-                "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS {column}"
-            ))
-            .execute()
-            .await?;
-    }
-    // Required for `insert_deduplication_token` on a non-replicated table: an
-    // insert that timed out after committing is replayed from the WAL with the
-    // same token, and ClickHouse discards the duplicate.
-    client
-        .query(&format!(
-            "ALTER TABLE {database}.usage MODIFY SETTING non_replicated_deduplication_window = 10000"
-        ))
-        .execute()
-        .await?;
     // Small key/value ledger for one-time schema actions shared by replicas.
     client
         .query(&format!(
@@ -1280,6 +1091,29 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
         ))
         .execute()
         .await?;
+    client
+        .query(&usage_ddl(database, &ip_ttl))
+        .execute()
+        .await?;
+    // Tables from before a column or the index existed get them in one ALTER,
+    // once per schema version: every boot after that skips it.
+    let usage_marker = format!("usage_schema_v{USAGE_SCHEMA_VERSION}");
+    if meta_count(client, database, &usage_marker).await? == 0 {
+        client
+            .query(&usage_alter(database, &ip_ttl))
+            .execute()
+            .await?;
+        // Required for `insert_deduplication_token` on a non-replicated
+        // table: an insert that timed out after committing is replayed from
+        // the WAL with the same token, and ClickHouse discards the duplicate.
+        client
+            .query(&format!(
+                "ALTER TABLE {database}.usage MODIFY SETTING non_replicated_deduplication_window = 10000"
+            ))
+            .execute()
+            .await?;
+        meta_put(client, database, &usage_marker, "1").await?;
+    }
     ensure_daily_rollup(client, database).await?;
     ensure_key_watch(client, database, ip_days).await?;
     client
@@ -1302,28 +1136,135 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
         ))
         .execute()
         .await?;
-    // Tables created before the setting: a day's partition expires whole, so
-    // drop its parts instead of rewriting them row by row. Metadata only.
-    client
-        .query(&format!(
-            "ALTER TABLE {database}.spans MODIFY SETTING ttl_only_drop_parts = 1"
-        ))
-        .execute()
-        .await?;
-    // Idempotent adds for spans tables created before conversation id was tracked.
-    client
-        .query(&format!(
-            "ALTER TABLE {database}.spans ADD COLUMN IF NOT EXISTS session_id String DEFAULT ''"
-        ))
-        .execute()
-        .await?;
-    client
-        .query(&format!(
-            "ALTER TABLE {database}.spans ADD COLUMN IF NOT EXISTS session_id_source LowCardinality(String) DEFAULT ''"
-        ))
-        .execute()
-        .await?;
+    let spans_marker = format!("spans_schema_v{SPANS_SCHEMA_VERSION}");
+    if meta_count(client, database, &spans_marker).await? == 0 {
+        // Tables from before conversation ids were tracked; and, for tables
+        // created before the setting, a day's partition expires whole, so its
+        // parts are dropped instead of rewritten row by row (metadata only).
+        for alter in [
+            format!(
+                "ALTER TABLE {database}.spans \
+                 ADD COLUMN IF NOT EXISTS session_id String DEFAULT '', \
+                 ADD COLUMN IF NOT EXISTS session_id_source LowCardinality(String) DEFAULT ''"
+            ),
+            format!("ALTER TABLE {database}.spans MODIFY SETTING ttl_only_drop_parts = 1"),
+        ] {
+            client.query(&alter).execute().await?;
+        }
+        meta_put(client, database, &spans_marker, "1").await?;
+    }
     Ok(())
+}
+
+/// The `usage` table's columns, in order: name, then type and default.
+/// `{ip_ttl}` stands for the client address retention's column TTL. A column
+/// marked `later` was added after the table's first release, so older tables
+/// get it by `ALTER` (see [`usage_alter`]). Changing this list means raising
+/// [`USAGE_SCHEMA_VERSION`] (a test holds the two together).
+const USAGE_COLUMNS: &[(&str, &str, bool)] = &[
+    ("request_id", "UUID", false),
+    ("tenant_id", "UUID", false),
+    ("key_id", "UUID", false),
+    ("model", "String", false),
+    ("admission", "LowCardinality(String)", false),
+    ("weight", "Int64", false),
+    ("input_tokens", "UInt32", false),
+    ("output_tokens", "UInt32", false),
+    ("cached_input_tokens", "UInt32 DEFAULT 0", true),
+    ("estimated_tokens", "UInt32", false),
+    ("queue_wait_ms", "UInt32", false),
+    ("ttft_ms", "UInt32", false),
+    ("total_ms", "UInt32", false),
+    ("status_code", "UInt16", false),
+    ("cache_status", "LowCardinality(String) DEFAULT 'off'", true),
+    ("cost_usd", "Float64 DEFAULT 0", true),
+    ("energy_wh", "Float64 DEFAULT 0", true),
+    ("energy_cost_usd", "Float64 DEFAULT 0", true),
+    ("co2_g", "Float64 DEFAULT 0", true),
+    ("ts_ms", "Int64", false),
+    ("session_id", "String DEFAULT ''", true),
+    (
+        "session_id_source",
+        "LowCardinality(String) DEFAULT ''",
+        true,
+    ),
+    ("request_type", "LowCardinality(String) DEFAULT ''", true),
+    ("device_id", "String DEFAULT ''", true),
+    ("end_user", "String DEFAULT ''", true),
+    (
+        "parent_request_id",
+        "UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000')",
+        true,
+    ),
+    ("model_variant", "String DEFAULT ''", true),
+    (
+        "reasoning_effort",
+        "LowCardinality(String) DEFAULT ''",
+        true,
+    ),
+    (
+        "reasoning_effort_requested",
+        "LowCardinality(String) DEFAULT ''",
+        true,
+    ),
+    ("model_family", "String DEFAULT ''", true),
+    ("key_name", "String DEFAULT ''", true),
+    ("tenant_name", "String DEFAULT ''", true),
+    ("streamed", "Bool DEFAULT false", true),
+    ("error_class", "LowCardinality(String) DEFAULT ''", true),
+    ("error_reason", "String DEFAULT ''", true),
+    // Where each request came from. The address, its network and the
+    // User-Agent identify a person more than the rest of the row does, so
+    // they expire after the client address retention (column TTL: cleared to
+    // '', the row stays); the country is kept as long as the row.
+    ("client_ip", "String DEFAULT '' {ip_ttl}", true),
+    ("client_network", "String DEFAULT '' {ip_ttl}", true),
+    ("client_country", "LowCardinality(String) DEFAULT ''", true),
+    ("user_agent", "String DEFAULT '' {ip_ttl}", true),
+];
+
+/// Raise with any change to [`USAGE_COLUMNS`] or [`USAGE_TS_INDEX`], so every
+/// database runs the new `ALTER` once.
+const USAGE_SCHEMA_VERSION: u32 = 1;
+
+/// Raise with any change to the `spans` ALTERs in [`ensure_schema`].
+const SPANS_SCHEMA_VERSION: u32 = 1;
+
+/// The sort key leads with tenant_id, so cross-tenant time-range reads (the
+/// live request log, the usage series) cannot use the primary index; this
+/// minmax skip index on ts_ms lets them skip granules outside the window.
+/// Older tables get it for newly written parts only (old parts age out via
+/// the retention worker; no expensive MATERIALIZE).
+const USAGE_TS_INDEX: &str = "idx_ts_ms ts_ms TYPE minmax GRANULARITY 4";
+
+fn usage_column_types(ip_ttl: &str) -> impl Iterator<Item = (&'static str, String, bool)> + '_ {
+    USAGE_COLUMNS
+        .iter()
+        .map(move |(name, ty, later)| (*name, ty.replace("{ip_ttl}", ip_ttl), *later))
+}
+
+fn usage_ddl(database: &str, ip_ttl: &str) -> String {
+    let mut ddl = format!("CREATE TABLE IF NOT EXISTS {database}.usage (\n");
+    for (name, ty, _) in usage_column_types(ip_ttl) {
+        ddl.push_str(&format!("    {name} {ty},\n"));
+    }
+    ddl.push_str(&format!(
+        "    ts DateTime64(3) MATERIALIZED fromUnixTimestamp64Milli(ts_ms),\n    \
+         INDEX {USAGE_TS_INDEX}\n) ENGINE = MergeTree()\nPARTITION BY toYYYYMMDD(ts)\n\
+         ORDER BY (tenant_id, ts_ms)"
+    ));
+    ddl
+}
+
+/// One `ALTER` bringing an older `usage` table up to [`USAGE_COLUMNS`].
+fn usage_alter(database: &str, ip_ttl: &str) -> String {
+    let mut actions = vec![format!("ADD INDEX IF NOT EXISTS {USAGE_TS_INDEX}")];
+    actions.extend(
+        usage_column_types(ip_ttl)
+            .filter(|(_, _, later)| *later)
+            .map(|(name, ty, _)| format!("ADD COLUMN IF NOT EXISTS {name} {ty}")),
+    );
+    format!("ALTER TABLE {database}.usage {}", actions.join(", "))
 }
 
 /// Permanent daily rollup of the per-request `usage` ledger.
@@ -1945,7 +1886,6 @@ mod conv_tests {
             "",
             wal_path.to_str().unwrap(),
             Duration::from_millis(100),
-            true,
         )
         .await
         .expect("sink must start while ClickHouse is unreachable");
@@ -1975,7 +1915,6 @@ mod conv_tests {
             "",
             wal_path.to_str().unwrap(),
             Duration::from_millis(100),
-            true,
         )
         .await
         .unwrap();
@@ -2008,7 +1947,6 @@ mod conv_tests {
             "",
             wal_path.to_str().unwrap(),
             Duration::from_secs(60),
-            true,
         )
         .await
         .unwrap();
@@ -2024,7 +1962,7 @@ mod conv_tests {
     }
 
     #[tokio::test]
-    async fn spills_even_when_fail_open_is_false() {
+    async fn an_unreachable_ledger_spills_to_the_wal() {
         let directory =
             std::env::temp_dir().join(format!("obleth-sink-test-{}", uuid::Uuid::new_v4()));
         tokio::fs::create_dir(&directory).await.unwrap();
@@ -2036,7 +1974,6 @@ mod conv_tests {
             "",
             wal_path.to_str().unwrap(),
             Duration::from_millis(100),
-            false,
         )
         .await
         .unwrap();
@@ -2059,7 +1996,6 @@ mod conv_tests {
             "",
             "unused",
             Duration::from_millis(100),
-            true,
         )
         .await;
         assert!(matches!(result, Err(TelemetryError::InvalidDatabase(_))));
@@ -2074,7 +2010,6 @@ mod conv_tests {
             "",
             "unused",
             Duration::from_millis(100),
-            true,
         )
         .await
         .unwrap();
@@ -2463,6 +2398,87 @@ mod accounting_tests {
 /// (e.g. `http://127.0.0.1:18123`); without it these return early. Each test
 /// works in its own uniquely named database and drops only that database.
 #[cfg(test)]
+mod schema_tests {
+    use super::*;
+
+    fn normalized(sql: &str) -> String {
+        sql.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .replace("( ", "(")
+            .replace(" )", ")")
+    }
+
+    /// The generated CREATE TABLE is the one written out by hand before the
+    /// column list existed.
+    #[test]
+    fn the_usage_ddl_is_unchanged() {
+        let ip_ttl = client_ip_ttl(90);
+        let before = format!(
+            "CREATE TABLE IF NOT EXISTS db.usage (
+            request_id UUID, tenant_id UUID, key_id UUID, model String,
+            admission LowCardinality(String), weight Int64, input_tokens UInt32,
+            output_tokens UInt32, cached_input_tokens UInt32 DEFAULT 0,
+            estimated_tokens UInt32, queue_wait_ms UInt32, ttft_ms UInt32,
+            total_ms UInt32, status_code UInt16,
+            cache_status LowCardinality(String) DEFAULT 'off',
+            cost_usd Float64 DEFAULT 0, energy_wh Float64 DEFAULT 0,
+            energy_cost_usd Float64 DEFAULT 0, co2_g Float64 DEFAULT 0, ts_ms Int64,
+            session_id String DEFAULT '',
+            session_id_source LowCardinality(String) DEFAULT '',
+            request_type LowCardinality(String) DEFAULT '', device_id String DEFAULT '',
+            end_user String DEFAULT '',
+            parent_request_id UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
+            model_variant String DEFAULT '',
+            reasoning_effort LowCardinality(String) DEFAULT '',
+            reasoning_effort_requested LowCardinality(String) DEFAULT '',
+            model_family String DEFAULT '', key_name String DEFAULT '',
+            tenant_name String DEFAULT '', streamed Bool DEFAULT false,
+            error_class LowCardinality(String) DEFAULT '', error_reason String DEFAULT '',
+            client_ip String DEFAULT '' {ip_ttl}, client_network String DEFAULT '' {ip_ttl},
+            client_country LowCardinality(String) DEFAULT '',
+            user_agent String DEFAULT '' {ip_ttl},
+            ts DateTime64(3) MATERIALIZED fromUnixTimestamp64Milli(ts_ms),
+            INDEX idx_ts_ms ts_ms TYPE minmax GRANULARITY 4
+        ) ENGINE = MergeTree()
+        PARTITION BY toYYYYMMDD(ts)
+        ORDER BY (tenant_id, ts_ms)"
+        );
+        assert_eq!(normalized(&usage_ddl("db", &ip_ttl)), normalized(&before));
+    }
+
+    /// The column list and the version move together: a column change without
+    /// a new version would never reach a database that recorded the old one.
+    /// After changing either, raise [`USAGE_SCHEMA_VERSION`] and record the
+    /// new digest here.
+    #[test]
+    fn a_column_change_raises_the_schema_version() {
+        // FNV-1a: stable, and enough to notice an edit.
+        let mut text = String::new();
+        for (name, ty, later) in USAGE_COLUMNS {
+            text.push_str(&format!("{name}|{ty}|{later}\n"));
+        }
+        text.push_str(USAGE_TS_INDEX);
+        let digest = text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+        });
+        assert_eq!((USAGE_SCHEMA_VERSION, digest), (1, 18303805652280320402));
+    }
+
+    #[test]
+    fn older_tables_are_altered_in_one_statement() {
+        let alter = usage_alter("db", "TTL x");
+        assert!(alter.starts_with("ALTER TABLE db.usage ADD INDEX IF NOT EXISTS idx_ts_ms"));
+        assert_eq!(alter.matches("ADD COLUMN IF NOT EXISTS").count(), 25);
+        assert!(alter.contains("ADD COLUMN IF NOT EXISTS user_agent String DEFAULT '' TTL x"));
+        assert!(
+            !alter.contains(" request_id "),
+            "original columns are not re-added"
+        );
+    }
+}
+
+#[cfg(test)]
 mod clickhouse_tests {
     use super::*;
 
@@ -2474,6 +2490,80 @@ mod clickhouse_tests {
 
     async fn scalar(client: &Client, sql: &str) -> u64 {
         client.query(sql).fetch_one::<u64>().await.unwrap()
+    }
+
+    /// A second boot finds the schema marker and sends no `ALTER` for
+    /// `usage` or `spans`; an older table missing columns gets them in one.
+    #[tokio::test]
+    async fn a_second_boot_sends_no_alters() {
+        let Some((client, database)) = fixture() else {
+            return;
+        };
+        let alters_since = |since: u64| {
+            format!(
+                "SELECT count() FROM system.query_log WHERE type = 'QueryStart' \
+                 AND event_time_microseconds >= fromUnixTimestamp64Milli({since}) \
+                 AND (query LIKE 'ALTER TABLE {database}.usage %' \
+                      OR query LIKE 'ALTER TABLE {database}.spans %')"
+            )
+        };
+        let now = "SELECT toUInt64(toUnixTimestamp64Milli(now64(3)))";
+        let first = scalar(&client, now).await;
+        ensure_schema(&client, &database).await.unwrap();
+        client.query("SYSTEM FLUSH LOGS").execute().await.unwrap();
+        assert!(
+            scalar(&client, &alters_since(first)).await > 0,
+            "the first boot is seen"
+        );
+        let columns = scalar(
+            &client,
+            &format!("SELECT count() FROM system.columns WHERE database = '{database}' AND table = 'usage'"),
+        )
+        .await;
+        assert_eq!(
+            columns as usize,
+            USAGE_COLUMNS.len() + 1,
+            "every column plus ts"
+        );
+
+        let started = scalar(&client, now).await;
+        ensure_schema(&client, &database).await.unwrap();
+        client.query("SYSTEM FLUSH LOGS").execute().await.unwrap();
+        let alters = scalar(&client, &alters_since(started)).await;
+        assert_eq!(alters, 0, "the second boot altered nothing");
+
+        // A table from before the newer columns, with no marker: one ALTER
+        // brings it up to date.
+        client
+            .query(&format!(
+                "ALTER TABLE {database}.usage DROP COLUMN user_agent, DROP COLUMN device_id"
+            ))
+            .execute()
+            .await
+            .unwrap();
+        client
+            .query(&format!(
+                "ALTER TABLE {database}.usage_meta DELETE WHERE key = 'usage_schema_v{USAGE_SCHEMA_VERSION}' \
+                 SETTINGS mutations_sync = 2"
+            ))
+            .execute()
+            .await
+            .unwrap();
+        ensure_schema(&client, &database).await.unwrap();
+        let restored = scalar(
+            &client,
+            &format!(
+                "SELECT count() FROM system.columns WHERE database = '{database}' \
+                 AND table = 'usage' AND name IN ('user_agent', 'device_id')"
+            ),
+        )
+        .await;
+        assert_eq!(restored, 2);
+        client
+            .query(&format!("DROP DATABASE {database}"))
+            .execute()
+            .await
+            .unwrap();
     }
 
     async fn view_mtime(client: &Client, database: &str) -> String {
@@ -2847,7 +2937,6 @@ mod clickhouse_tests {
             "",
             wal_path.to_str().unwrap(),
             Duration::from_millis(100),
-            true,
         )
         .await
         .unwrap();

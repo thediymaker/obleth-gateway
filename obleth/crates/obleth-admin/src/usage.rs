@@ -3604,7 +3604,6 @@ mod clickhouse_tests {
             "",
             dir.join("usage.wal").to_str().unwrap(),
             std::time::Duration::from_millis(50),
-            true,
         )
         .await
         .expect("sink");
@@ -3726,7 +3725,6 @@ mod clickhouse_tests {
             "",
             dir.join("usage.wal").to_str().unwrap(),
             std::time::Duration::from_millis(50),
-            true,
         )
         .await
         .expect("sink");
@@ -3841,7 +3839,6 @@ mod clickhouse_tests {
             "",
             dir.join("usage.wal").to_str().unwrap(),
             std::time::Duration::from_millis(50),
-            true,
         )
         .await
         .expect("sink");
@@ -3977,7 +3974,6 @@ mod clickhouse_tests {
             "",
             dir.join("usage.wal").to_str().unwrap(),
             std::time::Duration::from_millis(50),
-            true,
         )
         .await
         .expect("sink");
@@ -4086,7 +4082,6 @@ mod clickhouse_tests {
             "",
             dir.join("usage.wal").to_str().unwrap(),
             std::time::Duration::from_millis(50),
-            true,
         )
         .await
         .expect("sink");
@@ -4171,7 +4166,6 @@ mod clickhouse_tests {
             "",
             dir.join("usage.wal").to_str().unwrap(),
             std::time::Duration::from_millis(50),
-            true,
         )
         .await
         .expect("sink");

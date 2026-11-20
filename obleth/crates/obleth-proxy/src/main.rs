@@ -104,7 +104,6 @@ async fn main() -> anyhow::Result<()> {
         &cfg.clickhouse_password,
         &cfg.wal_path,
         cfg.telemetry_flush_interval,
-        cfg.fail_open,
     )
     .await?;
     if telemetry.schema_ready() {

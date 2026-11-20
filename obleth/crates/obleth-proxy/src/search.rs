@@ -1150,7 +1150,6 @@ mod pipeline_tests {
             "",
             wal_dir.join("usage.wal").to_str().unwrap(),
             Duration::from_millis(100),
-            true,
         )
         .await
         .expect("telemetry sink");

@@ -138,7 +138,6 @@ mod tests {
             "",
             wal.join("usage.wal").to_str().unwrap(),
             Duration::from_millis(50),
-            true,
         )
         .await
         .expect("sink");
