@@ -1,10 +1,10 @@
 "use client";
 
-import { useMemo } from "react";
+import { memo, useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { useFairshareHistory } from "@/components/fairshare/hooks";
-import { Panel } from "@/components/overview/ui";
-import type { AuditEntry, UsageLogHistogram } from "@/lib/obleth";
+import { useFairshareHistory, usePoolLoad } from "@/components/fairshare/hooks";
+import { Meter, Panel } from "@/components/overview/ui";
+import type { AuditEntry, ModelRoute, UsageLogHistogram } from "@/lib/obleth";
 import { getJson } from "@/lib/utils";
 
 const DAY_MS = 86_400_000;
@@ -26,7 +26,25 @@ export function useModelDay(model: string) {
 }
 
 /** In flight and waiting over the last hour, from the scheduler's own samples of this model's pool. */
-export function InFlightChart({ model, cap }: { model: string; cap: number }) {
+/** The "Pool now" tile, reading the live load itself so a poll re-renders only it. */
+export function PoolNowTile({ model }: { model: ModelRoute }) {
+  const { load: { inFlight, cap, queued } } = usePoolLoad(model);
+  return (
+    <div className="flex min-w-0 flex-col gap-1 rounded-xl border border-border bg-card px-4 py-3">
+      <span className="text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">Pool now</span>
+      <span className="text-[24px] font-semibold leading-tight tabular-nums">{inFlight} <span className="text-[13px] font-normal text-muted-foreground">{cap ? `of ${cap}` : "in flight"}</span></span>
+      <Meter value={inFlight} max={cap} strong={cap > 0 && inFlight >= cap} />
+      <span className="text-xs text-muted-foreground">{queued ? `${queued} waiting` : "none waiting"}</span>
+    </div>
+  );
+}
+
+/** The last hour's load against the pool's size now. */
+export function PoolChart({ model }: { model: ModelRoute }) {
+  return <InFlightChart model={model.model_name} cap={usePoolLoad(model).load.cap} />;
+}
+
+export const InFlightChart = memo(function InFlightChart({ model, cap }: { model: string; cap: number }) {
   const history = useFairshareHistory(model);
   const bars = useMemo(() => {
     const pts = history.history ?? [];
@@ -67,7 +85,7 @@ export function InFlightChart({ model, cap }: { model: string; cap: number }) {
       </div>
     </Panel>
   );
-}
+});
 
 const ACTION_WORDS: Record<string, string> = {
   put_managed_model: "Launch settings saved",

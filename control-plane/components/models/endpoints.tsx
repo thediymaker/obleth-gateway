@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState, useTransition } from "react";
+import { memo, useRef, useState, useTransition } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Plus, Trash2 } from "lucide-react";
 import { createModelEndpointAction, deleteModelEndpointAction, restartReplicaAction, updateModelEndpointAction, type ActionResult } from "@/app/actions";
@@ -15,7 +15,7 @@ import { cn } from "@/lib/utils";
  * here applies at once: an endpoint is a row of its own, not a field of the
  * model.
  */
-export function EndpointsSection({ model, endpoints, onChanged }: { model: ModelRoute; endpoints: ModelEndpoint[]; onChanged: () => void }) {
+export const EndpointsSection = memo(function EndpointsSection({ model, endpoints, onChanged }: { model: ModelRoute; endpoints: ModelEndpoint[]; onChanged: () => void }) {
   const [busy, start] = useTransition();
   const [error, setError] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
@@ -153,4 +153,4 @@ export function EndpointsSection({ model, endpoints, onChanged }: { model: Model
       )}
     </section>
   );
-}
+});

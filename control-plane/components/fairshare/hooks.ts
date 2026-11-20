@@ -1,9 +1,10 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import type { CapacityDiscoveryView, FairshareHistoryPoint, FairshareLiveView, ModelRoute } from "@/lib/obleth";
 import { appendHistoryTail, buildHistoryChart, fetchHistory } from "@/lib/fairshare-model";
+import { discoveredPool, occupancyOf, type Occupancy } from "@/lib/occupancy";
 
 /** How often the Fairshare pages poll the scheduler: the gateway samples every 2 s. */
 export const FAIRSHARE_POLL_MS = 2000;
@@ -48,7 +49,7 @@ export function useModelRoutes() {
 }
 
 /** Pool sizes and cluster-wide counts for models the answering gateway has not served yet. */
-export function useCapacityDiscovery() {
+export function useCapacityDiscovery<T = CapacityDiscoveryView>({ select }: { select?: (view: CapacityDiscoveryView) => T } = {}) {
   return useQuery({
     queryKey: ["capacity-discovery"],
     queryFn: async () => {
@@ -58,7 +59,23 @@ export function useCapacityDiscovery() {
     },
     refetchInterval: DISCOVERY_POLL_MS,
     retry: false,
+    select,
   });
+}
+
+/**
+ * One model's pool load now, for a small live cell. It watches only this
+ * model's numbers in the fair-share view and capacity discovery, so a poll
+ * re-renders the cell only when they change, and never the row, form or page
+ * around it. `query` is the fair-share read, for "can't read the live load".
+ */
+export function usePoolLoad(model: ModelRoute): { load: Occupancy; query: ReturnType<typeof useFairshareLive<Occupancy>> } {
+  const name = model.model_name;
+  const pickDiscovered = useCallback((view: CapacityDiscoveryView) => discoveredPool(name, view), [name]);
+  const discovered = useCapacityDiscovery({ select: pickDiscovered }).data ?? null;
+  const select = useCallback((view: FairshareLiveView) => occupancyOf(name, model, view, discovered), [name, model, discovered]);
+  const query = useFairshareLive({ select });
+  return { load: query.data ?? occupancyOf(name, model, undefined, discovered), query };
 }
 
 export interface TenantSeriesRow {

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useTransition } from "react";
+import { memo, useState, useTransition } from "react";
 import { setModelReasoningAction } from "@/app/actions";
 import { SelectField, Setting, TextArea } from "@/components/models/fields";
 import { Button } from "@/components/ui/button";
@@ -60,7 +60,7 @@ function previewMap(draft: ReasoningDraft): ModelReasoning {
  * whatever fields this model's server understands. Saved on its own, at
  * once, like the lifecycle: the map has its own write.
  */
-export function ReasoningSection({ model, onChanged }: { model: ModelRoute; onChanged: () => void }) {
+export const ReasoningSection = memo(function ReasoningSection({ model, onChanged }: { model: ModelRoute; onChanged: () => void }) {
   const [draft, setDraft] = useState<ReasoningDraft>(() => reasoningDraft(model));
   const [error, setError] = useState<string | null>(null);
   const [busy, start] = useTransition();
@@ -177,7 +177,7 @@ export function ReasoningSection({ model, onChanged }: { model: ModelRoute; onCh
       </Setting>
     </section>
   );
-}
+});
 
 function LevelRow({ level, row, others, onPreset, onChange }: {
   level: ReasoningLevel;

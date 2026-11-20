@@ -2,8 +2,9 @@ import type { CapacityDiscoveryView, ManagedModelSpec, ModelReplica, ModelRoute,
 import { obleth } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
 
+// No read time in these: a poll that changed nothing keeps the same data
+// (react-query shares unchanged structure), so memoised rows and forms skip it.
 export interface DeploymentsData {
-  now: number;
   models: ModelRoute[];
   specs: ManagedModelSpec[];
   replicas: ModelReplica[];
@@ -16,7 +17,6 @@ export interface DeploymentsData {
 
 /** One deployment's own reads, for its page. */
 export interface DeploymentData {
-  now: number;
   model: ModelRoute;
   spec: ManagedModelSpec | null;
   replicas: ModelReplica[];
@@ -32,7 +32,7 @@ export type DeploymentRequests = Record<string, number>;
 /** The Deployments list's fleet reads: models, launch settings, replicas and
  *  discovery. The 24 h request counts are a separate, slower read
  *  ({@link loadDeploymentRequests}) because they come from ClickHouse. */
-export async function loadDeployments(now = Date.now()): Promise<DeploymentsData> {
+export async function loadDeployments(): Promise<DeploymentsData> {
   const failed: string[] = [];
   const note = <T>(what: string, p: Promise<T>): Promise<T> => p.catch((e) => { failed.push(what); throw e; });
   const [models, specs, replicas, discovery, slurm] = await Promise.all([
@@ -44,7 +44,7 @@ export async function loadDeployments(now = Date.now()): Promise<DeploymentsData
     safe<CapacityDiscoveryView | null>(obleth.capacityDiscovery(), null),
     safe<SlurmSettingsView | null>(note("slurm", obleth.getSlurmSettings()), null),
   ]);
-  return { now, models, specs, replicas, discovery, slurm, failed };
+  return { models, specs, replicas, discovery, slurm, failed };
 }
 
 /** Every model's requests in the last 24 hours. */
@@ -56,7 +56,7 @@ export async function loadDeploymentRequests(now = Date.now()): Promise<Deployme
 /** One deployment's launch settings, replicas and either the Slurm settings
  *  (a model obleth launches) or capacity discovery (one a cluster runs), read
  *  through the per-model endpoints rather than the whole fleet. */
-export async function loadDeployment(model: ModelRoute, now = Date.now()): Promise<DeploymentData> {
+export async function loadDeployment(model: ModelRoute): Promise<DeploymentData> {
   const failed: string[] = [];
   const note = <T>(what: string, p: Promise<T>): Promise<T> => p.catch((e) => { failed.push(what); throw e; });
   const watched = model.capacity_source === "kubernetes";
@@ -66,7 +66,7 @@ export async function loadDeployment(model: ModelRoute, now = Date.now()): Promi
     safe<SlurmSettingsView | null>(note("slurm", obleth.getSlurmSettings()), null),
     watched ? safe<CapacityDiscoveryView | null>(obleth.capacityDiscovery(), null) : Promise.resolve(null),
   ]);
-  return { now, model, spec, replicas, discovery, slurm, failed };
+  return { model, spec, replicas, discovery, slurm, failed };
 }
 
 /** {@link loadDeployment} by model id, for the page's live poll. */

@@ -1,12 +1,12 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState, useTransition } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, useTransition } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { MoreHorizontal, Search } from "lucide-react";
 import { activateModelAction, checkModelHealthAction, deleteModelAction, setModelEnabledAction } from "@/app/actions";
-import { useCapacityDiscovery, useFairshareLive } from "@/components/fairshare/hooks";
+import { useCapacityDiscovery, usePoolLoad } from "@/components/fairshare/hooks";
 import { EndpointsSection } from "@/components/models/endpoints";
 import { Switch } from "@/components/models/fields";
 import { LifecycleSection, type LifecycleCandidate } from "@/components/models/lifecycle";
@@ -36,12 +36,27 @@ import {
   type SettingEntry,
   type SettingsSectionId,
 } from "@/lib/models-model";
-import type { McpServer, ModelEndpoint, ModelHealthDetail, ModelHealthSummary, ModelRoute, UsageLogFacet } from "@/lib/obleth";
-import { poolOccupancy } from "@/lib/occupancy";
+import type { CapacityDiscoveryView, McpServer, ModelEndpoint, ModelHealthCheck, ModelHealthDetail, ModelHealthSummary, ModelRoute, UsageLogFacet } from "@/lib/obleth";
 import { cn, getJson } from "@/lib/utils";
 import { ReadNotice } from "@/components/ui/read-state";
 
 type NavId = "overview" | SettingsSectionId | "lifecycle" | "activity";
+
+const NO_CHECKS: ModelHealthCheck[] = [];
+const NO_ENDPOINTS: ModelEndpoint[] = [];
+const NO_CANDIDATES: LifecycleCandidate[] = [];
+
+/** The Capacity count in the section list, read live in this leaf. */
+function CapacityCount({ model }: { model: ModelRoute }) {
+  const { load } = usePoolLoad(model);
+  return <>{load.cap || null}</>;
+}
+
+/** "Can't read the live load", from the same narrowed read as the load cells. */
+function LoadReadNotice({ model }: { model: ModelRoute }) {
+  const { query } = usePoolLoad(model);
+  return <ReadNotice query={query} what="the live load" className="mb-2" />;
+}
 
 function flash(el: HTMLElement) {
   el.classList.remove("setting-flash");
@@ -152,7 +167,7 @@ export function ModelPage({
   mcpServers,
   modelNames,
   boonBlockers,
-  lifecycleModels = [],
+  lifecycleModels = NO_CANDIDATES,
   callers = null,
 }: {
   model: ModelRoute;
@@ -189,16 +204,16 @@ export function ModelPage({
     queryFn: () => getJson<ModelOverviewData>(`/api/live/models/${model.id}/overview?name=${encodeURIComponent(model.model_name)}`),
     refetchInterval: 60_000,
   });
-  const fairshare = useFairshareLive();
-  const discovery = useCapacityDiscovery();
+  // Only this model's discovery status, so the page doesn't re-render on
+  // every discovery poll; the live load is read by the leaves that show it.
+  const pickCapacity = useCallback((view: CapacityDiscoveryView) => view.models.find((m) => m.model_id === model.id)?.status ?? null, [model.id]);
+  const capacityStatus = useCapacityDiscovery({ select: pickCapacity }).data ?? undefined;
 
   const summary = detailQuery.data?.summary ?? initialSummary;
-  const checks = detailQuery.data?.checks ?? [];
-  const endpoints = endpointsQuery.data ?? [];
+  const checks = detailQuery.data?.checks ?? NO_CHECKS;
+  const endpoints = endpointsQuery.data ?? NO_ENDPOINTS;
   const status = modelStatus(model, summary);
   const runs = runsOn(model, managed);
-  const load = poolOccupancy(model.model_name, model, fairshare.data, discovery.data);
-  const capacityStatus = discovery.data?.models.find((m) => m.model_id === model.id)?.status;
   const first = awaitingFirstPass(checks);
   const chat = model.model_type === "chat";
   const textual = chat || model.model_type === "embedding";
@@ -276,14 +291,14 @@ export function ModelPage({
 
   const tagCount = (model.tags ?? []).length;
   const nativeOn = [model.supports_function_calling, model.supports_tool_choice, model.supports_response_schema, model.supports_system_messages].filter(Boolean).length;
-  const nav: { id: NavId; label: string; count?: string | number; show?: boolean }[] = [
+  const nav: { id: NavId; label: string; count?: React.ReactNode; show?: boolean }[] = [
     { id: "overview", label: "Overview" },
     { id: "general", label: "General" },
     { id: "connection", label: "Connection" },
     { id: "routing", label: "Routing", count: tagCount ? `${tagCount} tag${tagCount === 1 ? "" : "s"}` : undefined, show: chat },
     { id: "capabilities", label: "Capabilities", count: chat ? `${nativeOn} on` : undefined, show: textual },
     { id: "pricing", label: "Pricing" },
-    { id: "capacity", label: "Capacity", count: load.cap || undefined },
+    { id: "capacity", label: "Capacity", count: <CapacityCount model={model} /> },
     { id: "health", label: "Health" },
     { id: "reasoning", label: "Reasoning", count: reasoningNavCount(model), show: chat },
     { id: "endpoints", label: "Endpoints", count: endpoints.length || undefined },
@@ -291,6 +306,7 @@ export function ModelPage({
     { id: "lifecycle", label: "Lifecycle", count: lifecycleStatus(model) === "active" ? undefined : lifecycleStatus(model) },
   ];
   const onSettings = useCallback((s: SettingsState) => setSettings(s), []);
+  const refresh = useCallback(() => router.refresh(), [router]);
 
   return (
     <div className="mx-auto flex max-w-[1600px] flex-col gap-5">
@@ -380,9 +396,9 @@ export function ModelPage({
 
         <div className="flex min-w-0 flex-col gap-4">
           <div id="overview" className="scroll-mt-24">
-            <ReadNotice query={fairshare} what="the live load" className="mb-2" />
+            <LoadReadNotice model={model} />
             <ReadNotice query={detailQuery} what="the health checks" className="mb-2" />
-            <ModelOverview model={model} overview={overviewQuery} summary={summary} checks={checks} runs={runs} capacity={capacityStatus} load={load} endpoints={endpoints.length} />
+            <ModelOverview model={model} overview={overviewQuery} summary={summary} checks={checks} runs={runs} capacity={capacityStatus} endpoints={endpoints.length} />
           </div>
           <ModelSettings
             model={model}
@@ -391,20 +407,19 @@ export function ModelPage({
             mcpServers={mcpServers}
             modelNames={modelNames}
             boonBlockers={boonBlockers}
-            load={load}
             onStateChange={onSettings}
           />
-          {chat && <ReasoningSection model={model} onChanged={() => router.refresh()} />}
-          <EndpointsSection model={model} endpoints={endpoints} onChanged={() => router.refresh()} />
+          {chat && <ReasoningSection model={model} onChanged={refresh} />}
+          <EndpointsSection model={model} endpoints={endpoints} onChanged={refresh} />
           <DeploymentSection model={model} managed={managed} runs={runs} />
-          <LifecycleSection model={model} models={lifecycleModels} callers={callers} onChanged={() => router.refresh()} />
+          <LifecycleSection model={model} models={lifecycleModels} callers={callers} onChanged={refresh} />
         </div>
       </div>
     </div>
   );
 }
 
-function DeploymentSection({ model, managed, runs }: { model: ModelRoute; managed: boolean; runs: ReturnType<typeof runsOn> }) {
+const DeploymentSection = memo(function DeploymentSection({ model, managed, runs }: { model: ModelRoute; managed: boolean; runs: ReturnType<typeof runsOn> }) {
   const watched = runs === "kubernetes";
   return (
     <section id="deployment" data-section="deployment" aria-label="Deployment" className="scroll-mt-24 rounded-xl border border-border bg-card">
@@ -433,4 +448,4 @@ function DeploymentSection({ model, managed, runs }: { model: ModelRoute; manage
       </div>
     </section>
   );
-}
+});

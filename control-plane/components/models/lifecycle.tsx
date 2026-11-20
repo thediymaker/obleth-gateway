@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useTransition } from "react";
+import { memo, useState, useTransition } from "react";
 import Link from "next/link";
 import { setModelStatusAction } from "@/app/actions";
 import { SelectField, Setting, Switch, TextArea } from "@/components/models/fields";
@@ -49,7 +49,7 @@ export function replacementOptions(model: Pick<ModelRoute, "model_name" | "model
  * that called it in the last 30 days. Saved on its own, at once, like the
  * endpoints below it: a status is not one of the model's settings.
  */
-export function LifecycleSection({
+export const LifecycleSection = memo(function LifecycleSection({
   model,
   models,
   callers,
@@ -245,4 +245,4 @@ export function LifecycleSection({
       </Setting>
     </section>
   );
-}
+});

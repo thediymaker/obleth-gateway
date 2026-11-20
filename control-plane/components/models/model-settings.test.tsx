@@ -44,7 +44,7 @@ async function render(m: ModelRoute = model) {
   await act(async () => {
     root.render(
       <QueryClientProvider client={client}>
-        <ModelSettings model={m} summary={summary} checks={[]} mcpServers={[]} modelNames={["m"]} boonBlockers={{}} load={{ inFlight: 3, cap: 16, queued: 0 }} onStateChange={() => {}} />
+        <ModelSettings model={m} summary={summary} checks={[]} mcpServers={[]} modelNames={["m"]} boonBlockers={{}} onStateChange={() => {}} />
       </QueryClientProvider>,
     );
   });

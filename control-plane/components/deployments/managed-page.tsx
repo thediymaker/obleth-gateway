@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState, useTransition } from "react";
+import { memo, useCallback, useEffect, useMemo, useState, useTransition } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -18,12 +18,11 @@ import {
 } from "@/app/actions";
 import { SettingsForm } from "@/components/access/settings-form";
 import { SettingsCard } from "@/components/access/ui";
-import { ChangesList, InFlightChart, useModelDay } from "@/components/deployments/detail-ui";
+import { ChangesList, PoolChart, PoolNowTile, useModelDay } from "@/components/deployments/detail-ui";
 import { Glyph, StateMark } from "@/components/deployments/ui";
-import { useFairshareLive } from "@/components/fairshare/hooks";
 import { Setting, TextArea, TextField } from "@/components/models/fields";
 import { Notice, Tile } from "@/components/models/ui";
-import { Meter, Pill } from "@/components/overview/ui";
+import { Pill } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -63,9 +62,9 @@ import { modelHref } from "@/lib/models-model";
 import type { AuditEntry, ManagedModelSpec, ModelReplica } from "@/lib/obleth";
 import { PORT_WINDOW } from "@/lib/managed-model-schema";
 import { compact } from "@/lib/overview-model";
-import { poolOccupancy } from "@/lib/occupancy";
 import { sbatchLines, stripSbatchDirectives, type PlacementKey, type SbatchLine } from "@/lib/sbatch-directives";
 import { useClusterResources } from "@/lib/use-cluster-resources";
+import { useLatestCallback } from "@/lib/use-latest-callback";
 import { cn, getJson } from "@/lib/utils";
 
 type Card = "script" | "placement" | "service";
@@ -377,6 +376,70 @@ function RemoveDialog({ open, onClose, name, onRemove, pending }: { open: boolea
   );
 }
 
+const labelOfField = (n: string) => LABELS[n] ?? n;
+
+/**
+ * The launch settings form. Memoised with stable callbacks, so the page's
+ * 10-second poll and the live load don't re-render it while someone edits;
+ * it re-renders when the saved spec itself changes.
+ */
+const DeploymentSettings = memo(function DeploymentSettings({ modelId, name, spec, onSaved, onDirty }: {
+  modelId: string;
+  name: string;
+  spec: ManagedModelSpec;
+  onSaved: () => void;
+  onDirty: (sections: string[]) => void;
+}) {
+  const resources = useClusterResources();
+  const surge = spec.startup_timeout_mins !== undefined;
+  const validate = useCallback((d: FormData): string | null => {
+    const partition = String(d.get("slurm_partition") ?? "");
+    const max = Number(resources.partitions.find((p) => p.name === partition)?.max_time ?? 0);
+    const mins = parseTimeLimit(String(d.get("slurm_time_limit") ?? ""));
+    return max > 0 && mins && mins > max ? `The walltime is over ${partition}'s ${walltimeLabel(max)} limit, so Slurm would hold the job and never start it. Pick ${walltimeLabel(max)} or less.` : null;
+  }, [resources]);
+  return (
+    <SettingsForm
+      id={modelId}
+      sectionOf={cardOf}
+      labelOf={labelOfField}
+      save={saveDeploymentSettingsAction}
+      validate={validate}
+      onSaved={onSaved}
+      onDirtyChange={onDirty}
+      className="flex flex-col gap-4"
+      ariaLabel={`${name} launch settings`}
+    >
+      <input type="hidden" name="slurm_target_replicas" value={String(spec.target_replicas)} />
+      <ScriptAndPlacement spec={spec} />
+      <SettingsCard id="service" title="Service" description="How obleth checks a replica, and when it gives up.">
+        <Setting id="set-port" label="Port and health path" hint={`obleth gives each replica ${PORT_WINDOW} ports starting near this one and passes a free one to the job as $OBLETH_SERVING_PORT. The server must listen on $OBLETH_SERVING_PORT, not on a fixed port. obleth checks the health path on that port until it answers.`} fields={["slurm_serving_port", "slurm_health_path"]}>
+          <div className="flex gap-2">
+            <TextField name="slurm_serving_port" label="Port" inputMode="numeric" required defaultValue={spec.serving_port} mono className="w-24" />
+            <TextField name="slurm_health_path" label="Health path" defaultValue={spec.health_path} mono className="w-40" />
+          </div>
+        </Setting>
+        <Setting id="set-min" label="Healthy when" hint={`Models calls it healthy once this many replicas answer, and degraded below that. Requests go to every healthy replica either way. The replica count (${spec.target_replicas}) is set at the top.`} fields={["slurm_min_replicas"]} was={{ field: "slurm_min_replicas" }}>
+          <TextField name="slurm_min_replicas" label="Healthy when" inputMode="numeric" required defaultValue={Math.max(1, spec.min_replicas)} mono className="w-20" />
+        </Setting>
+        <Setting id="set-failures" label="Stop after failed launches" hint={surge ? "After this many launches in a row fail (a job that ends, or doesn't answer, before it ever serves), obleth waits longer and longer before trying again, and shows it here. A job that served and then hit its walltime or was preempted doesn't count. Set 0 to never stop." : "obleth stops submitting once this many jobs have ended in the last 15 minutes, and waits for you. Set 0 to never stop."} fields={["slurm_max_job_failures"]} was={{ field: "slurm_max_job_failures" }}>
+          <TextField name="slurm_max_job_failures" label="Stop after failed launches" inputMode="numeric" required defaultValue={spec.max_job_failures} mono className="w-20" />
+        </Setting>
+        {spec.startup_timeout_mins !== undefined && (
+          <Setting id="set-startup" label="Give up loading after" hint="Minutes a running job may take to answer on its health path before obleth cancels it and counts a failed launch. Set 0 to wait forever." fields={["slurm_startup_timeout_mins"]} was={{ field: "slurm_startup_timeout_mins" }}>
+            <TextField name="slurm_startup_timeout_mins" label="Give up loading after" inputMode="numeric" defaultValue={spec.startup_timeout_mins} mono className="w-20" />
+          </Setting>
+        )}
+        {spec.handoff_mins !== undefined && (
+          <Setting id="set-handoff" label="Start a replacement" hint="Minutes before a serving job's time limit that obleth starts its replacement; the old job stops once the new one serves. Set 0 to turn this off." fields={["slurm_handoff_mins"]} was={{ field: "slurm_handoff_mins" }}>
+            <TextField name="slurm_handoff_mins" label="Start a replacement" inputMode="numeric" defaultValue={spec.handoff_mins} mono className="w-20" />
+          </Setting>
+        )}
+      </SettingsCard>
+    </SettingsForm>
+  );
+});
+
 /** A model obleth launches on Slurm: its replicas, what they run, and where. */
 export function ManagedPage({ modelId, initial, changes }: { modelId: string; initial: DeploymentData; changes: AuditEntry[] }) {
   const router = useRouter();
@@ -389,7 +452,6 @@ export function ManagedPage({ modelId, initial, changes }: { modelId: string; in
   const [dirty, setDirty] = useState<string[]>([]);
   const [active, setActive] = useState("replicas");
   const live = useQuery({ queryKey: deploymentKey(modelId), queryFn: () => getJson<DeploymentData>(`/api/live/deployments/${encodeURIComponent(modelId)}`), initialData: initial, refetchInterval: 10_000 });
-  const fairshare = useFairshareLive();
   const data = live.data ?? initial;
   const row = useMemo(() => deploymentRow(data), [data]);
   const spec = data.spec ?? initial.spec!;
@@ -399,7 +461,6 @@ export function ManagedPage({ modelId, initial, changes }: { modelId: string; in
   const lost = replicas.filter((r) => r.state === "lost").sort((a, b) => b.updated_at.localeCompare(a.updated_at));
   const counts = countReplicas(replicas);
   const day = useModelDay(model.model_name);
-  const { inFlight, cap, queued } = poolOccupancy(model.model_name, model, fairshare.data, data.discovery);
   const engine = typeof spec.launcher_spec?.name === "string" ? (spec.launcher_spec.name as string) : null;
   const fromRecipe = typeof spec.launcher_spec?.recipe_id === "string";
   // Launches from this version on record a digest of the script they sent, so
@@ -521,14 +582,10 @@ export function ManagedPage({ modelId, initial, changes }: { modelId: string; in
   }, []);
 
   const onDirty = useCallback((sections: string[]) => setDirty(sections), []);
-  const resources = useClusterResources();
-  const overLimit = useCallback((partition: string, time: string): string | null => {
-    const max = Number(resources.partitions.find((p) => p.name === partition)?.max_time ?? 0);
-    const mins = parseTimeLimit(time);
-    return max > 0 && mins && mins > max ? `The walltime is over ${partition}'s ${walltimeLabel(max)} limit, so Slurm would hold the job and never start it. Pick ${walltimeLabel(max)} or less.` : null;
-  }, [resources]);
-  const sectionOf = useCallback((n: string) => cardOf(n), []);
-  const labelOf = useCallback((n: string) => LABELS[n] ?? n, []);
+  const onSaved = useLatestCallback(() => {
+    setNotice({ text: surge && current.length ? "Saved. New jobs use it. Use Apply to running replicas under More actions to replace the running ones one at a time, without an outage." : "Saved. Replicas started from now use it; restart the running ones to pick it up now." });
+    void refresh();
+  });
   const stopped = row?.view.state === "stopped";
   const needsYou = stopped || row?.view.state === "blocked" || !!pause_ || !!refusal;
   const nav: { id: string; label: string; count?: string | number }[] = [
@@ -667,12 +724,7 @@ export function ManagedPage({ modelId, initial, changes }: { modelId: string; in
         <div className="flex min-w-0 flex-col gap-4">
           <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
             <Tile label="Serving" value={`${counts.healthy} of ${spec.enabled ? spec.target_replicas : 0}`} detail={[counts.queued ? `${counts.queued} queued` : null, counts.running ? `${counts.running} loading` : null, `healthy at ${Math.max(1, spec.min_replicas)}`].filter(Boolean).join(", ")} />
-            <div className="flex min-w-0 flex-col gap-1 rounded-xl border border-border bg-card px-4 py-3">
-              <span className="text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">Pool now</span>
-              <span className="text-[24px] font-semibold leading-tight tabular-nums">{inFlight} <span className="text-[13px] font-normal text-muted-foreground">{cap ? `of ${cap}` : "in flight"}</span></span>
-              <Meter value={inFlight} max={cap} strong={cap > 0 && inFlight >= cap} />
-              <span className="text-xs text-muted-foreground">{queued ? `${queued} waiting` : "none waiting"}</span>
-            </div>
+            <PoolNowTile model={model} />
             <Tile label="Requests · 24h" value={day.data ? compact(day.data.requests) : "—"} href={day.data?.requests ? logsHref({ model: model.model_name, window: "24h" }) : undefined} detail={day.data?.requests ? "see them" : null} />
             <Tile label="Failed · 24h" value={day.data ? compact(day.data.errors) : "—"} href={day.data?.errors ? logsHref({ model: model.model_name, window: "24h", status: "error" }) : undefined} detail={day.data?.errors && day.data.requests ? `${((day.data.errors / day.data.requests) * 100).toFixed(1)}% of requests` : day.data ? "none" : null} />
           </div>
@@ -709,46 +761,9 @@ export function ManagedPage({ modelId, initial, changes }: { modelId: string; in
             )}
           </section>
 
-          <InFlightChart model={model.model_name} cap={cap} />
+          <PoolChart model={model} />
 
-          <SettingsForm
-            id={modelId}
-            sectionOf={sectionOf}
-            labelOf={labelOf}
-            save={saveDeploymentSettingsAction}
-            validate={(d) => overLimit(String(d.get("slurm_partition") ?? ""), String(d.get("slurm_time_limit") ?? ""))}
-            onSaved={() => { setNotice({ text: surge && current.length ? "Saved. New jobs use it. Use Apply to running replicas under More actions to replace the running ones one at a time, without an outage." : "Saved. Replicas started from now use it; restart the running ones to pick it up now." }); void refresh(); }}
-            onDirtyChange={onDirty}
-            className="flex flex-col gap-4"
-            ariaLabel={`${model.model_name} launch settings`}
-          >
-            <input type="hidden" name="slurm_target_replicas" value={String(spec.target_replicas)} />
-            <ScriptAndPlacement spec={spec} />
-            <SettingsCard id="service" title="Service" description="How obleth checks a replica, and when it gives up.">
-              <Setting id="set-port" label="Port and health path" hint={`obleth gives each replica ${PORT_WINDOW} ports starting near this one and passes a free one to the job as $OBLETH_SERVING_PORT. The server must listen on $OBLETH_SERVING_PORT, not on a fixed port. obleth checks the health path on that port until it answers.`} fields={["slurm_serving_port", "slurm_health_path"]}>
-                <div className="flex gap-2">
-                  <TextField name="slurm_serving_port" label="Port" inputMode="numeric" required defaultValue={spec.serving_port} mono className="w-24" />
-                  <TextField name="slurm_health_path" label="Health path" defaultValue={spec.health_path} mono className="w-40" />
-                </div>
-              </Setting>
-              <Setting id="set-min" label="Healthy when" hint={`Models calls it healthy once this many replicas answer, and degraded below that. Requests go to every healthy replica either way. The replica count (${spec.target_replicas}) is set at the top.`} fields={["slurm_min_replicas"]} was={{ field: "slurm_min_replicas" }}>
-                <TextField name="slurm_min_replicas" label="Healthy when" inputMode="numeric" required defaultValue={Math.max(1, spec.min_replicas)} mono className="w-20" />
-              </Setting>
-              <Setting id="set-failures" label="Stop after failed launches" hint={surge ? "After this many launches in a row fail (a job that ends, or doesn't answer, before it ever serves), obleth waits longer and longer before trying again, and shows it here. A job that served and then hit its walltime or was preempted doesn't count. Set 0 to never stop." : "obleth stops submitting once this many jobs have ended in the last 15 minutes, and waits for you. Set 0 to never stop."} fields={["slurm_max_job_failures"]} was={{ field: "slurm_max_job_failures" }}>
-                <TextField name="slurm_max_job_failures" label="Stop after failed launches" inputMode="numeric" required defaultValue={spec.max_job_failures} mono className="w-20" />
-              </Setting>
-              {spec.startup_timeout_mins !== undefined && (
-                <Setting id="set-startup" label="Give up loading after" hint="Minutes a running job may take to answer on its health path before obleth cancels it and counts a failed launch. Set 0 to wait forever." fields={["slurm_startup_timeout_mins"]} was={{ field: "slurm_startup_timeout_mins" }}>
-                  <TextField name="slurm_startup_timeout_mins" label="Give up loading after" inputMode="numeric" defaultValue={spec.startup_timeout_mins} mono className="w-20" />
-                </Setting>
-              )}
-              {spec.handoff_mins !== undefined && (
-                <Setting id="set-handoff" label="Start a replacement" hint="Minutes before a serving job's time limit that obleth starts its replacement; the old job stops once the new one serves. Set 0 to turn this off." fields={["slurm_handoff_mins"]} was={{ field: "slurm_handoff_mins" }}>
-                  <TextField name="slurm_handoff_mins" label="Start a replacement" inputMode="numeric" defaultValue={spec.handoff_mins} mono className="w-20" />
-                </Setting>
-              )}
-            </SettingsCard>
-          </SettingsForm>
+          <DeploymentSettings modelId={modelId} name={model.model_name} spec={spec} onSaved={onSaved} onDirty={onDirty} />
 
           <ChangesList changes={changes} />
         </div>

@@ -1,8 +1,9 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState, useTransition, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, useTransition, type ReactNode } from "react";
 import { useRouter } from "next/navigation";
 import { saveModelSettingsAction } from "@/app/actions";
+import { usePoolLoad } from "@/components/fairshare/hooks";
 import { AutotuneButton, CapacityDiscoveryFields, capacityMode, CapacityModeToggle, type CapacityMode } from "@/components/models/capacity";
 import {
   ALIASES_HINT,
@@ -112,14 +113,17 @@ export interface SettingsState {
   count: number;
 }
 
-export function ModelSettings({
+/**
+ * Every settings card on a model's page, as one form. Memoised, with the live
+ * load read in a leaf (CapacityNow), so a poll never re-renders the form.
+ */
+export const ModelSettings = memo(function ModelSettings({
   model,
   summary,
   checks,
   mcpServers,
   modelNames,
   boonBlockers,
-  load,
   onStateChange,
 }: {
   model: ModelRoute;
@@ -128,7 +132,6 @@ export function ModelSettings({
   mcpServers: McpServer[];
   modelNames: string[];
   boonBlockers: BoonBlockers;
-  load: { inFlight: number; cap: number; queued: number };
   onStateChange: (state: SettingsState) => void;
 }) {
   const router = useRouter();
@@ -414,7 +417,7 @@ export function ModelSettings({
           </Setting>
         </Section>
 
-        <Section id="capacity" title="Capacity" description={model.enabled ? (load.cap > 0 ? `${load.inFlight} of ${load.cap} slots in use${load.queued ? `, ${load.queued} waiting` : ""} right now.` : `${load.inFlight} in flight, no cap.`) : "Off: takes no requests."}>
+        <Section id="capacity" title="Capacity" description={<CapacityNow model={model} />}>
           <Setting
             id="set-capacity-mode"
             label="Capacity mode"
@@ -545,6 +548,13 @@ export function ModelSettings({
       )}
     </ChangesContext.Provider>
   );
+});
+
+/** The Capacity card's "3 of 16 slots in use right now", read live in this leaf. */
+function CapacityNow({ model }: { model: ModelRoute }) {
+  const { load } = usePoolLoad(model);
+  if (!model.enabled) return <>Off: takes no requests.</>;
+  return <>{load.cap > 0 ? `${load.inFlight} of ${load.cap} slots in use${load.queued ? `, ${load.queued} waiting` : ""} right now.` : `${load.inFlight} in flight, no cap.`}</>;
 }
 
 function RecentChecks({ checks }: { checks: ModelHealthCheck[] }) {

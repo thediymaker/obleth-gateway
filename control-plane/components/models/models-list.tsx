@@ -1,12 +1,12 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState, useTransition } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, useTransition } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
 import { Check, ChevronDown, Download, Plus, Search, Upload, X } from "lucide-react";
 import { checkModelsHealthAction, deleteModelsAction, setModelsEnabledAction, type BulkModelResult } from "@/app/actions";
-import { useCapacityDiscovery, useFairshareLive } from "@/components/fairshare/hooks";
+import { useCapacityDiscovery, useFairshareLive, usePoolLoad } from "@/components/fairshare/hooks";
 import { AddModelSheet, type AddMode } from "@/components/models/add-model";
 import { FamiliesSection } from "@/components/models/families";
 import { Notice, ProviderMark, StatusMark, Tile } from "@/components/models/ui";
@@ -134,7 +134,9 @@ export function ModelsList({
   const visibleIds = shown.map((r) => r.id);
   const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selected.has(id));
 
-  const toggle = (id: string) => setSelected((prev) => { const next = new Set(prev); if (next.has(id)) next.delete(id); else next.add(id); return next; });
+  const toggle = useCallback((id: string) => setSelected((prev) => { const next = new Set(prev); if (next.has(id)) next.delete(id); else next.add(id); return next; }), []);
+  const open = useCallback((name: string) => router.push(modelHref(name)), [router]);
+  const requestsUnread = readFailed(usageQuery);
   const toggleAll = () => setSelected((prev) => (allVisibleSelected ? new Set([...prev].filter((id) => !visibleIds.includes(id))) : new Set([...prev, ...visibleIds])));
 
   function report(verb: string, result: BulkModelResult) {
@@ -306,7 +308,7 @@ export function ModelsList({
             </thead>
             <tbody>
               {shown.map((row) => (
-                <Row key={row.id} row={row} unread={{ load: readFailed(fairshare), requests: readFailed(usageQuery) }} selected={selected.has(row.id)} onToggle={() => toggle(row.id)} onOpen={() => router.push(modelHref(row.name))} />
+                <Row key={row.id} model={row.model} status={row.status} requests={row.requests} p50TtftMs={row.p50TtftMs} price={row.price} requestsUnread={requestsUnread} selected={selected.has(row.id)} onToggle={toggle} onOpen={open} />
               ))}
             </tbody>
           </table>
@@ -357,27 +359,41 @@ export function ModelsList({
   );
 }
 
-/** `unread` marks the columns whose live read never answered: they show a dash, not zero. */
-function Row({ row, unread, selected, onToggle, onOpen }: { row: ModelRow; unread: { load: boolean; requests: boolean }; selected: boolean; onToggle: () => void; onOpen: () => void }) {
-  const m = row.model;
-  const off = row.status === "off";
+/**
+ * One model's row. It takes the row's fields rather than the row, whose load
+ * changes on every fair-share poll, so a poll re-renders only its LoadCell.
+ * `requestsUnread` marks a usage read that never answered: a dash, not zero.
+ */
+const Row = memo(function Row({ model: m, status, requests, p50TtftMs, price, requestsUnread, selected, onToggle, onOpen }: {
+  model: ModelRoute;
+  status: ModelRow["status"];
+  requests: number;
+  p50TtftMs: number;
+  price: string | null;
+  requestsUnread: boolean;
+  selected: boolean;
+  onToggle: (id: string) => void;
+  onOpen: (name: string) => void;
+}) {
+  const name = m.model_name;
+  const off = status === "off";
   const tags = tagLabels(m.tags);
   const textual = m.model_type === "chat" || m.model_type === "embedding";
   return (
     <tr
-      onClick={onOpen}
+      onClick={() => onOpen(name)}
       className={cn("cursor-pointer border-b border-border/70 transition-colors last:border-b-0 hover:bg-muted/30", selected && "bg-muted/40", off && "text-muted-foreground")}
     >
       <td className="py-2.5 pl-4" onClick={(e) => e.stopPropagation()}>
-        <input type="checkbox" aria-label={`Select ${row.name}`} checked={selected} onChange={onToggle} className="h-3.5 w-3.5 accent-foreground" />
+        <input type="checkbox" aria-label={`Select ${name}`} checked={selected} onChange={() => onToggle(m.id)} className="h-3.5 w-3.5 accent-foreground" />
       </td>
       <td className="max-w-[24rem] py-2.5 pr-3">
         <div className="flex min-w-0 items-center gap-2.5">
-          <ProviderMark name={row.name} upstream={m.upstream_model} className={cn(off && "opacity-50")} />
+          <ProviderMark name={name} upstream={m.upstream_model} className={cn(off && "opacity-50")} />
           <div className="min-w-0">
             <span className="flex min-w-0 items-center gap-1.5">
-              <Link href={modelHref(row.name)} onClick={(e) => e.stopPropagation()} className={cn("truncate font-medium hover:underline", off ? "text-secondary-foreground" : "text-foreground")}>
-                {row.name}
+              <Link href={modelHref(name)} onClick={(e) => e.stopPropagation()} className={cn("truncate font-medium hover:underline", off ? "text-secondary-foreground" : "text-foreground")}>
+                {name}
               </Link>
               {lifecycleStatus(m) !== "active" && (
                 <span title={lifecycleLabel(m) ?? undefined} className={cn("shrink-0 rounded-full border px-1.5 text-[10.5px] leading-[16px]", lifecycleStatus(m) === "retired" ? "border-foreground bg-foreground text-background" : "border-border text-muted-foreground")}>
@@ -392,33 +408,41 @@ function Row({ row, unread, selected, onToggle, onOpen }: { row: ModelRow; unrea
         </div>
       </td>
       <td className="whitespace-nowrap py-2.5 pr-3 text-secondary-foreground">{MODEL_TYPE_NAMES[m.model_type] ?? m.model_type}</td>
-      <td className="whitespace-nowrap py-2.5 pr-3"><StatusMark status={row.status} /></td>
+      <td className="whitespace-nowrap py-2.5 pr-3"><StatusMark status={status} /></td>
       <td className="py-2.5 pr-3">
-        {off || unread.load ? (
-          <span className="text-muted-foreground" title={unread.load ? "Can't read the live load" : undefined}>—</span>
-        ) : row.cap > 0 ? (
-          <div className="flex items-center gap-2">
-            <Meter value={row.inFlight} max={row.cap} strong={row.queued > 0} className="w-16" />
-            <span className="whitespace-nowrap font-mono text-[12px] tabular-nums">{row.inFlight}/{row.cap}</span>
-            {row.queued > 0 && <span className="whitespace-nowrap rounded-full bg-foreground px-1.5 text-[10.5px] font-semibold text-background">{row.queued} waiting</span>}
-          </div>
-        ) : (
-          <span className="font-mono text-[12px] tabular-nums text-muted-foreground">{row.inFlight > 0 ? `${row.inFlight} in flight` : "no cap"}</span>
-        )}
+        <LoadCell model={m} off={off} />
       </td>
       <td className="py-2.5 pr-3 text-right font-mono text-[12px] tabular-nums">
-        {unread.requests ? (
+        {requestsUnread ? (
           <span className="text-muted-foreground" title="Can't read the last day's requests">—</span>
-        ) : row.requests ? (
-          <Link href={logsHref({ model: row.name, window: "24h" })} onClick={(e) => e.stopPropagation()} title="See these requests" className="underline-offset-2 hover:underline">{compact(row.requests)}</Link>
+        ) : requests ? (
+          <Link href={logsHref({ model: name, window: "24h" })} onClick={(e) => e.stopPropagation()} title="See these requests" className="underline-offset-2 hover:underline">{compact(requests)}</Link>
         ) : "—"}
       </td>
-      <td className="py-2.5 pr-3 text-right font-mono text-[12px] tabular-nums">{row.p50TtftMs ? formatMs(row.p50TtftMs) : "—"}</td>
-      <td className="whitespace-nowrap py-2.5 pr-3 font-mono text-[12px]">{row.price ?? <span className="text-muted-foreground">not set</span>}</td>
+      <td className="py-2.5 pr-3 text-right font-mono text-[12px] tabular-nums">{p50TtftMs ? formatMs(p50TtftMs) : "—"}</td>
+      <td className="whitespace-nowrap py-2.5 pr-3 font-mono text-[12px]">{price ?? <span className="text-muted-foreground">not set</span>}</td>
       <td className="py-2.5 pr-3 text-right font-mono text-[12px] tabular-nums">{textual ? contextLabel(m.context_window) : "—"}</td>
       <td className="max-w-[16rem] truncate py-2.5 pr-4 text-[12.5px] text-secondary-foreground" title={tags.join(" · ")}>{tags.length ? tags.join(" · ") : <span className="text-muted-foreground">—</span>}</td>
     </tr>
   );
+});
+
+/** A row's load now. It reads the live view itself, so a fair-share poll
+ *  re-renders only these cells, and only the ones whose numbers changed. */
+export function LoadCell({ model, off }: { model: ModelRoute; off: boolean }) {
+  const { load, query } = usePoolLoad(model);
+  const unread = readFailed(query);
+  if (off || unread) return <span className="text-muted-foreground" title={unread ? "Can't read the live load" : undefined}>—</span>;
+  if (load.cap > 0) {
+    return (
+      <div className="flex items-center gap-2">
+        <Meter value={load.inFlight} max={load.cap} strong={load.queued > 0} className="w-16" />
+        <span className="whitespace-nowrap font-mono text-[12px] tabular-nums">{load.inFlight}/{load.cap}</span>
+        {load.queued > 0 && <span className="whitespace-nowrap rounded-full bg-foreground px-1.5 text-[10.5px] font-semibold text-background">{load.queued} waiting</span>}
+      </div>
+    );
+  }
+  return <span className="font-mono text-[12px] tabular-nums text-muted-foreground">{load.inFlight > 0 ? `${load.inFlight} in flight` : "no cap"}</span>;
 }
 
 function Choice<T extends string>({ label, value, options, onChange, prefix = "" }: {

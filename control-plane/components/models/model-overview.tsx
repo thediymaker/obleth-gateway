@@ -6,6 +6,7 @@ import Link from "next/link";
 import { Area, ComposedChart, Line, ResponsiveContainer, Tooltip, XAxis, YAxis, CartesianGrid } from "recharts";
 import { axisTick, chartGrid, compactAxis, timeCursor } from "@/components/chart-tooltip";
 import { Meter, Panel, Segmented } from "@/components/overview/ui";
+import { usePoolLoad } from "@/components/fairshare/hooks";
 import { Tile } from "@/components/models/ui";
 import { MODEL_SERIES_BUCKET_MS, priceLabel, RUNS_LABELS, tagLabels, type ModelOverviewData, type RunsOn } from "@/lib/models-model";
 import type { ModelCapacityStatus, ModelHealthCheck, ModelHealthSummary, ModelRoute, UsageLogHistogram } from "@/lib/obleth";
@@ -219,6 +220,19 @@ function SetupRow({ label, href, children }: { label: string; href: string; chil
   );
 }
 
+/** The live load tile: it reads the pool itself, so a fair-share poll re-renders only it. */
+function LoadTile({ model }: { model: ModelRoute }) {
+  const { load } = usePoolLoad(model);
+  return (
+    <Tile
+      label="Load now"
+      value={model.enabled ? (load.cap > 0 ? <>{load.inFlight} <span className="text-[13px] font-normal text-muted-foreground">of {load.cap}</span></> : load.inFlight) : "Off"}
+      detail={!model.enabled ? "Takes no requests" : load.queued > 0 ? `${load.queued} waiting` : load.cap > 0 ? `${Math.round((load.inFlight / load.cap) * 100)}% of the pool` : "No slot cap"}
+      emphasis={load.queued > 0}
+    />
+  );
+}
+
 export function ModelOverview({
   model,
   overview,
@@ -226,7 +240,6 @@ export function ModelOverview({
   checks,
   runs,
   capacity,
-  load,
   endpoints,
 }: {
   model: ModelRoute;
@@ -235,7 +248,6 @@ export function ModelOverview({
   checks: ModelHealthCheck[];
   runs: RunsOn;
   capacity?: ModelCapacityStatus;
-  load: { inFlight: number; cap: number; queued: number };
   endpoints: number;
 }) {
   const data = overview.data;
@@ -262,12 +274,7 @@ export function ModelOverview({
   return (
     <div className="flex flex-col gap-4">
       <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-5">
-        <Tile
-          label="Load now"
-          value={model.enabled ? (load.cap > 0 ? <>{load.inFlight} <span className="text-[13px] font-normal text-muted-foreground">of {load.cap}</span></> : load.inFlight) : "Off"}
-          detail={!model.enabled ? "Takes no requests" : load.queued > 0 ? `${load.queued} waiting` : load.cap > 0 ? `${Math.round((load.inFlight / load.cap) * 100)}% of the pool` : "No slot cap"}
-          emphasis={load.queued > 0}
-        />
+        <LoadTile model={model} />
         <Tile label="Requests · 24h" href={u?.requests ? logsHref({ model: model.model_name, window: "24h" }) : undefined} value={u ? compact(u.requests) : data ? "0" : "—"} detail={data && data.previousRequests !== null ? changeLabel(Number(u?.requests ?? 0), data.previousRequests, "yesterday") : null} />
         <Tile
           label="Failed · 24h"

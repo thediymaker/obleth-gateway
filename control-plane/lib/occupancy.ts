@@ -18,6 +18,24 @@ export interface Occupancy {
  * Deployments and the model and deployment pages agree.
  */
 export function poolOccupancy(name: string, model: ModelRoute, fairshare?: FairshareLiveView, discovery?: CapacityDiscoveryView | null): Occupancy {
+  return occupancyOf(name, model, fairshare, discoveredPool(name, discovery));
+}
+
+/** The pool capacity discovery enforces for a model, when it does. */
+export interface DiscoveredPool {
+  inFlight: number;
+  cap: number;
+}
+
+/** Just the numbers {@link poolOccupancy} reads from capacity discovery, so a
+ *  live cell can watch them without the rest of the view. */
+export function discoveredPool(name: string, discovery?: CapacityDiscoveryView | null): DiscoveredPool | null {
+  const found = discovery?.models.find((d) => d.model_name === name && d.enforced_max_in_flight > 0);
+  return found ? { inFlight: found.cluster_in_flight ?? found.in_flight, cap: found.enforced_max_in_flight } : null;
+}
+
+/** {@link poolOccupancy} with the discovered pool already picked out. */
+export function occupancyOf(name: string, model: ModelRoute, fairshare: FairshareLiveView | undefined, discovered: DiscoveredPool | null): Occupancy {
   if (!model.enabled) return { inFlight: 0, cap: 0, queued: 0 };
   const shared = fairshare?.mode === "shared";
   const pool = fairshare?.pools?.find((p) => p.model === name);
@@ -28,14 +46,7 @@ export function poolOccupancy(name: string, model: ModelRoute, fairshare?: Fairs
       queued: pool.queued,
     };
   }
-  const found = discovery?.models.find((d) => d.model_name === name && d.enforced_max_in_flight > 0);
-  if (found) {
-    return {
-      inFlight: found.cluster_in_flight ?? found.in_flight,
-      cap: found.enforced_max_in_flight,
-      queued: fairshare?.model_queued?.[name] ?? 0,
-    };
-  }
+  if (discovered) return { ...discovered, queued: fairshare?.model_queued?.[name] ?? 0 };
   return {
     inFlight: fairshare?.model_in_flight?.[name] ?? 0,
     cap: model.max_in_flight ?? fairshare?.default_model_max_in_flight ?? 0,

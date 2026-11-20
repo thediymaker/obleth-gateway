@@ -43,7 +43,6 @@ const replica = (over: Partial<ModelReplica>): ModelReplica => ({ id: Math.rando
 
 function data(over: Partial<DeploymentsData> = {}): DeploymentsData {
   return {
-    now: Date.now(),
     models: [model({}), model({ id: "m2", model_name: "glm-5-3-flash", capacity_source: "kubernetes" }), model({ id: "m3", model_name: "static-proxy" })],
     specs: [spec()],
     replicas: [replica({ state: "healthy" }), replica({ last_message: "PENDING — Resources" })],
@@ -56,7 +55,7 @@ function data(over: Partial<DeploymentsData> = {}): DeploymentsData {
 /** One deployment's page data, from the same fixtures as the fleet. */
 function one(over: Partial<DeploymentsData> = {}, id = "m1"): DeploymentData {
   const d = data(over);
-  return { now: d.now, model: d.models.find((m) => m.id === id)!, spec: d.specs.find((s) => s.model_id === id) ?? null, replicas: d.replicas.filter((r) => r.model_id === id), discovery: d.discovery, slurm: d.slurm, failed: d.failed };
+  return { model: d.models.find((m) => m.id === id)!, spec: d.specs.find((s) => s.model_id === id) ?? null, replicas: d.replicas.filter((r) => r.model_id === id), discovery: d.discovery, slurm: d.slurm, failed: d.failed };
 }
 
 let root: Root;
@@ -214,6 +213,21 @@ describe("what the Slurm connection reports", () => {
 });
 
 describe("a Slurm deployment's page", () => {
+  it("keeps an unsaved edit across its polls, and shows the live load", async () => {
+    const client = await render(<ManagedPage modelId="m1" initial={one()} changes={[]} />);
+    const port = () => host.querySelector<HTMLInputElement>('input[name="slurm_serving_port"]')!;
+    await type(port(), "9000");
+    await act(async () => {
+      await new Promise((r) => requestAnimationFrame(() => r(null)));
+      client.setQueryData(["deployment", "m1"], one({ replicas: [replica({ state: "healthy", last_message: "RUNNING" })] }));
+      client.setQueryData(["fairshare-live"], { model_in_flight: { "glm-5.2": 6 }, model_queued: {}, pools: [] });
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    expect(port().value).toBe("9000");
+    expect(host.querySelector('[aria-label="Unsaved changes"]')).not.toBeNull();
+    expect(host.textContent).toContain("6 of 8");
+  });
+
   it("polls its own deployment, not the fleet", async () => {
     const client = await render(<ManagedPage modelId="m1" initial={one()} changes={[]} />);
     expect(client.getQueryCache().find({ queryKey: ["deployments"] })).toBeUndefined();
