@@ -89,6 +89,18 @@ const AUTO_TURN_PREFIX: &str = "obleth:auto:";
 /// Crash-guard strikes: how many model-server engine deaths one request (by
 /// fingerprint) was being answered at, per model. A hash (`n`, `last`).
 const CRASH_PREFIX: &str = "obleth:crashguard:";
+/// Models with a crash-guard strike record still alive: a sorted set of
+/// model names scored by when their newest record expires (Unix ms). Every
+/// read drops the expired members, so the set stays as small as the list of
+/// models struck recently.
+const CRASH_RECENT_KEY: &str = "obleth:crashrecent";
+
+/// Now, as Unix milliseconds.
+fn unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
+}
 const INVALIDATE_CHANNEL: &str = "obleth:invalidate";
 /// Per-day request counters (see `daily_stats_key`).
 const DAILY_STATS_PREFIX: &str = "obleth:daily:";
@@ -633,7 +645,46 @@ impl RedisStore {
             .arg(ttl.as_secs() as i64)
             .invoke_async(&mut conn)
             .await?;
+        // The model has a live strike record until `ttl` from now.
+        let until = unix_ms() + ttl.as_millis() as i64;
+        let _: () = redis::pipe()
+            .cmd("ZADD")
+            .arg(CRASH_RECENT_KEY)
+            .arg(until)
+            .arg(model)
+            .ignore()
+            .query_async(&mut conn)
+            .await?;
         Ok(n)
+    }
+
+    /// Models that may have live strike records, with how long until their
+    /// newest one expires; one command. Expired members are dropped.
+    pub async fn crash_recent_models(&self) -> Result<Vec<(String, std::time::Duration)>> {
+        let now = unix_ms();
+        let mut conn = self.conn.clone();
+        let (found,): (Vec<(String, i64)>,) = redis::pipe()
+            .cmd("ZRANGEBYSCORE")
+            .arg(CRASH_RECENT_KEY)
+            .arg(now)
+            .arg("+inf")
+            .arg("WITHSCORES")
+            .cmd("ZREMRANGEBYSCORE")
+            .arg(CRASH_RECENT_KEY)
+            .arg("-inf")
+            .arg(format!("({now}"))
+            .ignore()
+            .query_async(&mut conn)
+            .await?;
+        Ok(found
+            .into_iter()
+            .map(|(m, until)| {
+                (
+                    m,
+                    std::time::Duration::from_millis((until - now).max(0) as u64),
+                )
+            })
+            .collect())
     }
 
     fn query_vector_key(hash: &str) -> String {
@@ -1341,6 +1392,40 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    #[tokio::test]
+    async fn a_strike_lists_its_model_until_the_record_expires() {
+        let Ok(url) = std::env::var("OBLETH_TEST_REDIS_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let store = RedisStore::connect(&url).await.expect("connect");
+        let (lasting, brief) = (
+            format!("m-{}", Uuid::new_v4().simple()),
+            format!("m-{}", Uuid::new_v4().simple()),
+        );
+        let window = std::time::Duration::from_secs(3600);
+        store
+            .crash_strike(&lasting, "fp", window, std::time::Duration::from_secs(600))
+            .await
+            .unwrap();
+        store
+            .crash_strike(&brief, "fp", window, std::time::Duration::from_millis(1))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let recent = store.crash_recent_models().await.unwrap();
+        let left = recent.iter().find(|(m, _)| *m == lasting).map(|(_, l)| *l);
+        assert!(
+            left.is_some_and(|l| l > std::time::Duration::from_secs(590)),
+            "{recent:?}"
+        );
+        assert!(
+            !recent.iter().any(|(m, _)| *m == brief),
+            "an expired record is not listed"
+        );
     }
 
     /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.

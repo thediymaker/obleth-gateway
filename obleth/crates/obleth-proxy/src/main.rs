@@ -656,6 +656,8 @@ async fn main() -> anyhow::Result<()> {
 
     // ---- pub/sub cache invalidation listener + Redis re-warm ----
     let redis_reconnected = Arc::new(tokio::sync::Notify::new());
+    // Which models' requests the crash guard looks strikes up for.
+    app_state.crash_guard.spawn_refresh(redis.clone());
     spawn_invalidation_listener(
         redis.clone(),
         InvalidationCaches {
@@ -664,6 +666,7 @@ async fn main() -> anyhow::Result<()> {
             models: model_cache.clone(),
             variants: variant_cache.clone(),
             mcp: mcp_cache.clone(),
+            crash_guard: app_state.crash_guard.clone(),
         },
         redis_reconnected.clone(),
     );
@@ -1290,6 +1293,7 @@ struct InvalidationCaches {
     models: Cache<String, Arc<obleth_config::ResolvedModel>>,
     variants: Cache<String, Arc<obleth_config::ResolvedModel>>,
     mcp: Cache<String, Arc<obleth_config::ResolvedMcpServer>>,
+    crash_guard: crash_guard::CrashGuard,
 }
 
 impl InvalidationCaches {
@@ -1310,6 +1314,9 @@ impl InvalidationCaches {
                 self.variants.invalidate(&name).await;
             }
             Invalidation::Mcp(name) => self.mcp.invalidate(&name).await,
+            Invalidation::CrashStrike(model) => self
+                .crash_guard
+                .note_strike(&model, crash_guard::STRIKE_TTL),
             Invalidation::Key(hash) => {
                 self.keys.invalidate(&hash).await;
                 // A key with this hash may have just been created or restored.

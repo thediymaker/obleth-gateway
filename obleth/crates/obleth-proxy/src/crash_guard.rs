@@ -93,6 +93,17 @@ pub(crate) fn is_engine_death(reason: &str) -> bool {
 /// The fingerprint of a request from API key `key` to `model`: a hash of
 /// the key, the model name and the body without [`VOLATILE_FIELDS`].
 pub(crate) fn fingerprint(key: &uuid::Uuid, model: &str, body: &Value) -> String {
+    /// Serialized JSON goes straight into the hash, not into a copy first.
+    struct Hashing<'a>(&'a mut Sha256);
+    impl std::io::Write for Hashing<'_> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.update(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
     let mut h = Sha256::new();
     h.update(key.as_bytes());
     h.update(model.as_bytes());
@@ -107,11 +118,13 @@ pub(crate) fn fingerprint(key: &uuid::Uuid, model: &str, body: &Value) -> String
             for k in keys {
                 h.update(k.as_bytes());
                 h.update([0u8]);
-                h.update(serde_json::to_vec(&map[k.as_str()]).unwrap_or_default());
+                let _ = serde_json::to_writer(Hashing(&mut h), &map[k.as_str()]);
                 h.update([0u8]);
             }
         }
-        other => h.update(serde_json::to_vec(other).unwrap_or_default()),
+        other => {
+            let _ = serde_json::to_writer(Hashing(&mut h), other);
+        }
     }
     let digest = h.finalize();
     digest[..16].iter().map(|b| format!("{b:02x}")).collect()
@@ -153,7 +166,19 @@ pub struct CrashGuard {
     enabled: bool,
     discovery: Option<CapacityDiscovery>,
     peaks: Arc<Mutex<HashMap<String, (usize, Instant)>>>,
+    /// Models that may have live strike records, and until when. Only their
+    /// requests' strikes are looked up in Redis: a model without one has
+    /// none to find.
+    recent: Arc<Mutex<HashMap<String, Instant>>>,
+    /// Whether `recent` is complete: false until the first read of Redis,
+    /// and again after a failed one, when every request's strikes are
+    /// looked up.
+    known: Arc<std::sync::atomic::AtomicBool>,
 }
+
+/// How often each replica reads which models have strike records, in case it
+/// missed the message a strike sends (it was starting, or disconnected).
+pub(crate) const RECENT_REFRESH: Duration = Duration::from_secs(60);
 
 impl CrashGuard {
     pub fn new(discovery: Option<CapacityDiscovery>) -> Self {
@@ -165,6 +190,8 @@ impl CrashGuard {
             enabled,
             discovery,
             peaks: Arc::default(),
+            recent: Arc::default(),
+            known: Arc::default(),
         }
     }
 
@@ -174,7 +201,63 @@ impl CrashGuard {
             enabled: false,
             discovery: None,
             peaks: Arc::default(),
+            recent: Arc::default(),
+            known: Arc::default(),
         }
+    }
+
+    /// Note that `model` may have strike records for `left` from now.
+    pub(crate) fn note_strike(&self, model: &str, left: Duration) {
+        let until = Instant::now() + left;
+        let mut recent = self.recent.lock().unwrap_or_else(|e| e.into_inner());
+        match recent.get_mut(model) {
+            Some(at) => *at = (*at).max(until),
+            None => {
+                recent.insert(model.to_string(), until);
+            }
+        }
+    }
+
+    fn may_have_strikes(&self, model: &str) -> bool {
+        if !self.known.load(std::sync::atomic::Ordering::Relaxed) {
+            return true;
+        }
+        let now = Instant::now();
+        let mut recent = self.recent.lock().unwrap_or_else(|e| e.into_inner());
+        recent.retain(|_, until| *until > now);
+        recent.contains_key(model)
+    }
+
+    /// Keep [`Self::recent`] in step with Redis every [`RECENT_REFRESH`],
+    /// from the first moment on.
+    pub(crate) fn spawn_refresh(&self, redis: RedisStore) {
+        if !self.enabled {
+            return;
+        }
+        let guard = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(RECENT_REFRESH);
+            loop {
+                tick.tick().await;
+                match redis.crash_recent_models().await {
+                    Ok(models) => {
+                        for (model, left) in models {
+                            guard.note_strike(&model, left);
+                        }
+                        guard
+                            .known
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        // Until a read works, look strikes up for every model.
+                        tracing::warn!(error = %e, "crash guard: could not read which models have strikes");
+                        guard
+                            .known
+                            .store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        });
     }
 
     pub(crate) fn enabled(&self) -> bool {
@@ -194,8 +277,14 @@ impl CrashGuard {
         };
         let now = Instant::now();
         let mut peaks = self.peaks.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = peaks.entry(model.to_string()).or_insert((ready, now));
-        (Some(ready), Some(update_peak(entry, ready, now)))
+        let peak = match peaks.get_mut(model) {
+            Some(entry) => update_peak(entry, ready, now),
+            None => {
+                peaks.insert(model.to_string(), (ready, now));
+                ready
+            }
+        };
+        (Some(ready), Some(peak))
     }
 
     /// The verdict for a request to `model` with fingerprint `fp`.
@@ -204,6 +293,9 @@ impl CrashGuard {
             return Verdict::Pass;
         }
         let (ready, usual) = self.strength(model);
+        if !self.may_have_strikes(model) {
+            return Verdict::Pass;
+        }
         let strikes = match redis.crash_strikes(model, fp).await {
             Ok(n) => n,
             Err(e) => {
@@ -243,12 +335,21 @@ impl CrashGuard {
             .crash_strike(model, fp, STRIKE_WINDOW, STRIKE_TTL)
             .await
         {
-            Ok(n) => tracing::warn!(
-                model,
-                fingerprint = fp,
-                strikes = n,
-                "crash guard: request was in flight when the model server's engine died"
-            ),
+            Ok(n) => {
+                tracing::warn!(
+                    model,
+                    fingerprint = fp,
+                    strikes = n,
+                    "crash guard: request was in flight when the model server's engine died"
+                );
+                // This replica checks the model's requests at once; the
+                // others when the message arrives.
+                self.note_strike(model, STRIKE_TTL);
+                let notice = obleth_redis::Invalidation::CrashStrike(model.to_string());
+                if let Err(e) = redis.publish_invalidation(&notice).await {
+                    tracing::warn!(error = %e, model, "crash guard: other replicas not told of the strike; they read it within a minute");
+                }
+            }
             Err(e) => tracing::warn!(error = %e, model, "crash guard: strike not recorded"),
         }
     }
@@ -314,6 +415,86 @@ mod tests {
         assert!(!is_engine_death(
             "could not reach the model server: Connection refused (os error 111)"
         ));
+    }
+
+    /// Hashed without copying, a fingerprint is the one recorded before, so
+    /// strikes already in Redis still match.
+    #[test]
+    fn fingerprints_are_unchanged() {
+        let key = uuid::Uuid::from_u128(7);
+        let body = json!({
+            "model": "m", "stream": true,
+            "messages": [{"role": "user", "content": "hi \u{e9}"}],
+            "temperature": 0.25,
+        });
+        let mut h = Sha256::new();
+        h.update(key.as_bytes());
+        h.update(b"m");
+        h.update([0u8]);
+        for k in ["messages", "model", "temperature"] {
+            h.update(k.as_bytes());
+            h.update([0u8]);
+            h.update(serde_json::to_vec(&body[k]).unwrap());
+            h.update([0u8]);
+        }
+        let old: String = h.finalize()[..16]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(fingerprint(&key, "m", &body), old);
+    }
+
+    /// A model with no strike record on any replica costs no Redis lookup;
+    /// once a strike is noted (here or by message), its requests are checked
+    /// again. Integration test; runs only with `OBLETH_TEST_REDIS_URL`.
+    #[tokio::test]
+    async fn only_models_with_strikes_are_looked_up() {
+        let Ok(url) = std::env::var("OBLETH_TEST_REDIS_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let redis = RedisStore::connect(&url).await.expect("connect");
+        let model = format!("crash-test-{}", uuid::Uuid::new_v4().simple());
+        let guard = CrashGuard {
+            enabled: true,
+            ..CrashGuard::disabled()
+        };
+        guard
+            .known
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        for _ in 0..2 {
+            redis
+                .crash_strike(&model, "fp", STRIKE_WINDOW, Duration::from_secs(60))
+                .await
+                .unwrap();
+        }
+        // Struck in Redis, but this replica has not heard: no lookup.
+        assert_eq!(guard.check(&redis, &model, "fp").await, Verdict::Pass);
+        // The refresh finds it.
+        let recent = redis.crash_recent_models().await.unwrap();
+        let (_, left) = recent.iter().find(|(m, _)| *m == model).expect("listed");
+        guard.note_strike(&model, *left);
+        assert_eq!(
+            guard.check(&redis, &model, "fp").await,
+            Verdict::Refuse { strikes: 2 }
+        );
+        // Not knowing which models have strikes means looking every one up.
+        let other = format!("crash-test-{}", uuid::Uuid::new_v4().simple());
+        redis
+            .crash_strike(&other, "fp", STRIKE_WINDOW, Duration::from_secs(60))
+            .await
+            .unwrap();
+        redis
+            .crash_strike(&other, "fp", STRIKE_WINDOW, Duration::from_secs(60))
+            .await
+            .unwrap();
+        guard
+            .known
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            guard.check(&redis, &other, "fp").await,
+            Verdict::Refuse { strikes: 2 }
+        );
     }
 
     #[test]

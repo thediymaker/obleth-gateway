@@ -63,6 +63,10 @@ pub enum Invalidation {
     Model(String),
     Mcp(String),
     All,
+    /// A crash-guard strike was just recorded for this model: replicas check
+    /// its requests' strikes from now on (see `crash_recent_models`). Not a
+    /// cache entry; older releases read it as an unknown key hash.
+    CrashStrike(String),
 }
 
 impl Invalidation {
@@ -72,6 +76,7 @@ impl Invalidation {
             Invalidation::Model(name) => format!("model:{name}"),
             Invalidation::Mcp(name) => format!("mcp:{name}"),
             Invalidation::All => "*".to_string(),
+            Invalidation::CrashStrike(model) => format!("crash:{model}"),
         }
     }
 
@@ -84,6 +89,8 @@ impl Invalidation {
             Invalidation::Model(name.to_string())
         } else if let Some(name) = message.strip_prefix("mcp:") {
             Invalidation::Mcp(name.to_string())
+        } else if let Some(model) = message.strip_prefix("crash:") {
+            Invalidation::CrashStrike(model.to_string())
         } else {
             Invalidation::Key(message.to_string())
         }
