@@ -699,7 +699,10 @@ mod tests {
         let out = compact_prose_segment(text, None, 0.5, &terms).expect("a paragraph compacts");
         assert!(out.ends_with("sentences omitted]"), "{out}");
         assert!(out.len() < text.len());
-        assert!(out.contains("A user asked about quotas."), "query match kept: {out}");
+        assert!(
+            out.contains("A user asked about quotas."),
+            "query match kept: {out}"
+        );
         assert_eq!(
             out.matches("Node seven rebooted twice.").count(),
             1,
@@ -719,7 +722,10 @@ mod tests {
     #[test]
     fn three_sentences_are_left_alone() {
         let text = "One short thing. Another short thing. A third.";
-        assert_eq!(compact_prose_segment(text, None, 0.5, &HashSet::new()), None);
+        assert_eq!(
+            compact_prose_segment(text, None, 0.5, &HashSet::new()),
+            None
+        );
     }
 
     #[test]
