@@ -167,7 +167,7 @@ function unknownKeys(raw: unknown): string[] {
 const yesNo = z.union([
   z.boolean(),
   z.enum(["true", "false", "yes", "no", "on", "off", "True", "False", "Yes", "No"]).transform((v) => ["true", "yes", "on"].includes(v.toLowerCase())),
-], { errorMap: () => ({ message: "must be true or false" }) });
+], { error: "must be true or false" });
 
 const VariableSchema = z.object({
   name: z.string().regex(/^[a-zA-Z_][a-zA-Z0-9_]*$/, "invalid variable name"),
@@ -188,7 +188,7 @@ const TestSchema = z.object({
   result: z.string().optional(),
 });
 
-const capabilityList = z.array(z.enum(MODEL_CAPABILITIES, { errorMap: () => ({ message: `must be one of ${MODEL_CAPABILITIES.join(", ")}` }) }));
+const capabilityList = z.array(z.enum(MODEL_CAPABILITIES, { error: `must be one of ${MODEL_CAPABILITIES.join(", ")}` }));
 
 const InputSchema = z.object({
   name: z.string().regex(/^[a-zA-Z_][a-zA-Z0-9_]*$/, "invalid input name"),

@@ -264,7 +264,7 @@ export function ReportsDashboard({ tenants, keys, models, retentionDays = null, 
                   margin={{ top: 8, right: 4, left: 0, bottom: 0 }}
                   barCategoryGap="18%"
                   className="cursor-pointer"
-                  onClick={(e: { activeTooltipIndex?: number | string }) => {
+                  onClick={(e) => {
                     const d = chart.days[Number(e?.activeTooltipIndex)];
                     if (d) router.push(logsFor({}, { start: d.day, end: d.day }));
                   }}

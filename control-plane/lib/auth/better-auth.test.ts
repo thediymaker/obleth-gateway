@@ -30,7 +30,7 @@ async function addUser(
   fields: { role: string; status: string },
 ): Promise<string> {
   const ctx = await auth.$context;
-  const user = await ctx.internalAdapter.createUser({ email, name: email, emailVerified: true, ...fields });
+  const user = await ctx.internalAdapter.createUser({ email, name: email, emailVerified: true, ...fields }, { method: "admin" });
   await ctx.internalAdapter.linkAccount({
     userId: user.id,
     providerId: "credential",
@@ -132,7 +132,7 @@ describe("built-in admin endpoints respect the admin-removal guard", { timeout: 
         emailVerified: true,
         role: "user",
         status: "active",
-      });
+      }, { method: "admin" });
     }
     await addUser(auth, "caller@example.com", { role: "admin", status: "active" });
     const headers = await signedIn(auth, "caller@example.com");

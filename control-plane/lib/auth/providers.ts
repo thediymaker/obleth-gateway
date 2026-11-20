@@ -143,6 +143,11 @@ export function oidcProviderLabels(): OidcProviderLabel[] {
   return parsed.map((p) => ({ providerId: p.providerId, displayName: p.displayName }));
 }
 
+/** The dashboard's browser-facing URL, as better-auth is configured with it. */
+function authBaseUrl(): string {
+  return (process.env.BETTER_AUTH_URL ?? "http://localhost:3000").replace(/\/+$/, "");
+}
+
 /** Parse OIDC_PROVIDERS (JSON array) into better-auth genericOAuth configs. */
 export function oidcProviders(): GenericOAuthConfig[] {
   const raw = process.env.OIDC_PROVIDERS;
@@ -193,6 +198,10 @@ export function oidcProviders(): GenericOAuthConfig[] {
       authentication: p.authentication,
       pkce: p.pkce,
       mapProfileToUser: buildProfileMapper(p.claims),
+      // The callback every IdP registration names. better-auth 1.7 moved its
+      // own default to /api/auth/callback/<id>; lib/auth/legacy-callback.ts maps
+      // this path onto it, so existing registrations keep working.
+      redirectURI: `${authBaseUrl()}/api/auth/oauth2/callback/${p.providerId}`,
       overrideUserInfo: p.overrideUserInfo,
     };
   });

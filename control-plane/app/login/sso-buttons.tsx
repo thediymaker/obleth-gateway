@@ -19,7 +19,7 @@ export function SsoButtons({ providers }: SsoButtonsProps) {
           variant="outline"
           className="w-full"
           onClick={() =>
-            authClient.signIn.oauth2({ providerId: p.providerId, callbackURL: "/" })
+            authClient.signIn.social({ provider: p.providerId, callbackURL: "/" })
           }
         >
           Sign in with {p.displayName}
