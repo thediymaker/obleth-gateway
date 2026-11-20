@@ -185,12 +185,10 @@ impl CrashGuard {
     /// number from this reading. Every guarded request reads it, so a busy
     /// model's usual number is known before its first suspect arrives.
     fn strength(&self, model: &str) -> (Option<usize>, Option<usize>) {
-        let ready = self.discovery.as_ref().and_then(|d| {
-            d.statuses()
-                .into_iter()
-                .find(|s| s.model_name == model)
-                .and_then(|s| s.ready_replicas)
-        });
+        let ready = self
+            .discovery
+            .as_ref()
+            .and_then(|d| d.ready_replicas(model));
         let Some(ready) = ready else {
             return (None, None);
         };
@@ -219,13 +217,10 @@ impl CrashGuard {
     /// Whether capacity discovery saw one of `model`'s servers being shut
     /// down (a rollout or scale-down) on its last pass.
     fn shutting_down(&self, model: &str) -> bool {
-        self.discovery.as_ref().is_some_and(|d| {
-            d.statuses()
-                .into_iter()
-                .find(|s| s.model_name == model)
-                .and_then(|s| s.terminating_replicas)
-                .is_some_and(|n| n > 0)
-        })
+        self.discovery
+            .as_ref()
+            .and_then(|d| d.terminating_replicas(model))
+            .is_some_and(|n| n > 0)
     }
 
     /// Record that a request with fingerprint `fp` was in flight when one of

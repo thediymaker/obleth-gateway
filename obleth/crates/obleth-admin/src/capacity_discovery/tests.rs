@@ -1277,3 +1277,71 @@ async fn the_service_listing_says_why_it_is_empty() {
         Some("no allowed namespace could be listed")
     );
 }
+
+/// Two models whose Services share a namespace cost one list of the
+/// namespace, split by Service: each model counts only its own slices, and
+/// a Service with no slices there reads as absent, as its own list would.
+#[tokio::test]
+async fn services_sharing_a_namespace_share_one_list_call() {
+    let (client, api) = fake_api().await;
+    answer_namespace(
+        &api,
+        "inference",
+        vec![
+            slice_of("a-served", "a1", vec![ready("a", "10.0.0.1")]),
+            slice_of(
+                "b-served",
+                "b1",
+                vec![ready("b", "10.0.0.2"), ready("c", "10.0.0.3")],
+            ),
+            slice_of("unrelated", "u1", vec![ready("u", "10.0.0.9")]),
+        ],
+    );
+    let handle = settings(&["inference"], TEMPLATE);
+    let mut d = Discoverer::new(Some(Ok(client)), fairshare(), 32);
+    let targets: Vec<DiscoveryTarget> = ["a", "b", "gone"].into_iter().map(kube_target).collect();
+
+    d.pass(&handle, targets).await;
+
+    assert_eq!(
+        asked(&api),
+        vec![("inference".to_string(), String::new())],
+        "one list of the namespace for three Services"
+    );
+    assert_eq!(status(&handle, "a").ready_replicas, Some(1));
+    assert_eq!(status(&handle, "a").effective_max_in_flight, 8);
+    assert_eq!(status(&handle, "b").ready_replicas, Some(2));
+    assert_eq!(status(&handle, "b").effective_max_in_flight, 16);
+    let gone = status(&handle, "gone");
+    assert_eq!(gone.state, STATE_FALLBACK, "{gone:?}");
+    assert_eq!(gone.namespace, None);
+    // The keyed accessors read the same numbers without copying statuses.
+    assert_eq!(handle.ready_replicas("b"), Some(2));
+    assert_eq!(handle.terminating_replicas("b"), Some(0));
+    assert_eq!(handle.ready_replicas("not-discovered"), None);
+    assert_eq!(handle.terminating_replicas("not-discovered"), None);
+    assert_eq!(
+        handle.state_counts(),
+        [(STATE_DISCOVERED, 2), (STATE_STALE, 0), (STATE_FALLBACK, 1)]
+    );
+    assert_only_endpoint_slices(&api);
+}
+
+/// A namespace list that fails is every wanted Service's failure there.
+#[tokio::test]
+async fn a_failed_namespace_list_fails_every_service_in_it() {
+    let (client, api) = fake_api().await;
+    fail(&api, "inference", "", 403);
+    let handle = settings(&["inference"], TEMPLATE);
+    let mut d = Discoverer::new(Some(Ok(client)), fairshare(), 32);
+
+    d.pass(&handle, vec![kube_target("a"), kube_target("b")])
+        .await;
+
+    for m in ["a", "b"] {
+        let s = status(&handle, m);
+        assert_eq!(s.state, STATE_FALLBACK, "{s:?}");
+        assert!(s.reason.unwrap_or_default().contains("HTTP 403"));
+    }
+    assert_eq!(asked(&api).len(), 1);
+}

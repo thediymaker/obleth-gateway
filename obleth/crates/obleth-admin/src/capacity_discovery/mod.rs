@@ -365,15 +365,35 @@ impl CapacityDiscovery {
             .unwrap_or_default()
     }
 
+    /// Ready servers of `model` on the last pass: `None` when the model is
+    /// not discovered or its count was not read. Reads one number under the
+    /// lock; the request path calls this, so it copies no status.
+    pub fn ready_replicas(&self, model: &str) -> Option<usize> {
+        self.inner.status.read().ok()?.get(model)?.ready_replicas
+    }
+
+    /// Servers of `model` being shut down on the last pass (see
+    /// [`ready_replicas`](Self::ready_replicas)).
+    pub fn terminating_replicas(&self, model: &str) -> Option<usize> {
+        self.inner
+            .status
+            .read()
+            .ok()?
+            .get(model)?
+            .terminating_replicas
+    }
+
     /// Discovered models per state, for metrics.
     pub fn state_counts(&self) -> [(&'static str, usize); 3] {
-        let statuses = self.statuses();
-        let count = |state: &str| statuses.iter().filter(|s| s.state == state).count();
-        [
-            (STATE_DISCOVERED, count(STATE_DISCOVERED)),
-            (STATE_STALE, count(STATE_STALE)),
-            (STATE_FALLBACK, count(STATE_FALLBACK)),
-        ]
+        let mut counts = [(STATE_DISCOVERED, 0), (STATE_STALE, 0), (STATE_FALLBACK, 0)];
+        if let Ok(m) = self.inner.status.read() {
+            for status in m.values() {
+                if let Some(c) = counts.iter_mut().find(|(state, _)| *state == status.state) {
+                    c.1 += 1;
+                }
+            }
+        }
+        counts
     }
 
     fn publish(&self, statuses: BTreeMap<String, ModelCapacityStatus>) {
@@ -793,10 +813,10 @@ fn next_lookup(plan: &KubePlan, lookups: &Lookups) -> Option<(String, String)> {
 }
 
 /// Read the EndpointSlices every plan needs, one round per namespace depth:
-/// each round lists, concurrently and once per distinct namespace and
-/// Service, the next namespace of every plan whose Service has not been
-/// found yet. A plan pinned to one namespace takes one round, and a later
-/// namespace is only read when the earlier ones do not have the Service.
+/// each round lists, concurrently, the next namespace of every plan whose
+/// Service has not been found yet, once per namespace (see [`list_wanted`]).
+/// A plan pinned to one namespace takes one round, and a later namespace is
+/// only read when the earlier ones do not have the Service.
 async fn lookup_services<'a>(
     client: &KubeClient,
     plans: impl Iterator<Item = &'a KubePlan> + Clone,
@@ -810,17 +830,54 @@ async fn lookup_services<'a>(
         if wanted.is_empty() {
             return lookups;
         }
-        let answers: Vec<_> = stream::iter(wanted.into_iter().map(|(ns, svc)| {
+        let mut by_namespace: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (ns, svc) in wanted {
+            by_namespace.entry(ns).or_default().push(svc);
+        }
+        let answers: Vec<_> = stream::iter(by_namespace.into_iter().map(|(ns, services)| {
             let client = client.clone();
-            async move {
-                let res = client.list_endpoint_slices(&ns, &svc).await;
-                ((ns, svc), res)
-            }
+            async move { list_wanted(&client, ns, services).await }
         }))
         .buffer_unordered(LIST_CONCURRENCY)
         .collect()
         .await;
-        lookups.extend(answers);
+        lookups.extend(answers.into_iter().flatten());
+    }
+}
+
+/// The slices of each of `services` in `namespace`: a list of that Service
+/// alone when there is one, else one list of every Service in the namespace
+/// split by Service, rather than one list per Service. A Service with no
+/// slices gets an empty list, as its own list would return; a failed list
+/// is every Service's error.
+async fn list_wanted(
+    client: &KubeClient,
+    namespace: String,
+    services: Vec<String>,
+) -> Vec<((String, String), Result<Vec<kube::EndpointSlice>, String>)> {
+    if let [service] = services.as_slice() {
+        let res = client.list_endpoint_slices(&namespace, service).await;
+        return vec![((namespace, service.clone()), res)];
+    }
+    match client.list_service_endpoint_slices(&namespace).await {
+        Ok(slices) => {
+            let mut by_service: HashMap<String, Vec<kube::EndpointSlice>> =
+                services.into_iter().map(|s| (s, Vec::new())).collect();
+            for slice in slices {
+                let owner = slice.service().map(str::to_string);
+                if let Some(list) = owner.and_then(|s| by_service.get_mut(&s)) {
+                    list.push(slice);
+                }
+            }
+            by_service
+                .into_iter()
+                .map(|(svc, slices)| ((namespace.clone(), svc), Ok(slices)))
+                .collect()
+        }
+        Err(e) => services
+            .into_iter()
+            .map(|svc| ((namespace.clone(), svc), Err(e.clone())))
+            .collect(),
     }
 }
 
