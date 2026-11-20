@@ -106,6 +106,7 @@ use obleth_config::{
         crate::compact_usage,
         crate::get_costs,
         crate::get_stats,
+        crate::get_overview,
         crate::get_overview_summary,
         // fairshare
         crate::get_fairshare_live,
@@ -311,6 +312,9 @@ use obleth_config::{
         CostAgg,
         LiveStats,
         OverviewSummaryView,
+        crate::OverviewView,
+        crate::usage::OverviewTenantUsage,
+        crate::usage::OverviewQuery,
         FairshareLiveView,
         CapacityDiscoveryView,
         CapacityDiscoveryModelView,

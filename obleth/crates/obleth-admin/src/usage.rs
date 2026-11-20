@@ -509,7 +509,7 @@ impl Filter {
 
 /// A read's window `[since, until)`: `since` defaults to a day before
 /// `until`, or before now when the window is open-ended.
-fn window_start(since_ms: Option<i64>, until_ms: Option<i64>) -> i64 {
+pub(crate) fn window_start(since_ms: Option<i64>, until_ms: Option<i64>) -> i64 {
     since_ms.unwrap_or_else(|| until_ms.unwrap_or_else(now_ms) - 86_400_000)
 }
 
@@ -1051,9 +1051,14 @@ pub struct UsageTotals {
 /// `total_tokens` expression into an aggregate of an aggregate and fail the
 /// whole read (which the summary then reports as zeros).
 fn usage_totals_sql(filter: &str) -> String {
+    format!("select {} from usage{filter}", usage_totals_columns())
+}
+
+/// The columns of [`UsageTotals`], in field order.
+fn usage_totals_columns() -> String {
     let (avg_ttft, p50_ttft) = (avg_ttft_sql(), p50_ttft_sql());
     format!(
-        "select count() as requests, \
+        "count() as requests, \
          sum(input_tokens) + sum(output_tokens) as total_tokens, \
          sum(cost_usd) as cost_usd, \
          uniqExact(tenant_id) as active_tenants, \
@@ -1062,8 +1067,7 @@ fn usage_totals_sql(filter: &str) -> String {
          {p50_ttft} as p50_ttft_ms, \
          {avg_ttft} as avg_ttft_ms, \
          sum(energy_wh) as energy_wh, sum(energy_cost_usd) as energy_cost_usd, sum(co2_g) as co2_g, \
-         countIf({class} in {platform}) as platform_errors \
-         from usage{filter}",
+         countIf({class} in {platform}) as platform_errors",
         class = obleth_config::EFFECTIVE_CLASS_SQL,
         platform = obleth_config::PLATFORM_CLASSES_SQL,
     )
@@ -1078,6 +1082,283 @@ pub async fn query_usage_totals(
         .bind(client.query(&usage_totals_sql(filter.sql())))
         .fetch_one::<UsageTotals>()
         .await
+}
+
+/// Query of `GET /overview`: one window and the one before it.
+#[derive(Debug, Default, Deserialize, IntoParams, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OverviewQuery {
+    /// Inclusive start of the window, unix epoch millis. Defaults to a day
+    /// before `until_ms` (or now).
+    pub since_ms: Option<i64>,
+    /// Exclusive end of the window, unix epoch millis. Open-ended (now) by
+    /// default.
+    pub until_ms: Option<i64>,
+    /// Width of the series buckets, which span both windows: default 5
+    /// minutes, at least 1 minute, widened so the series fits in
+    /// 5,000 buckets.
+    pub bucket_ms: Option<i64>,
+    /// When true, include internal traffic (health probes, benchmark runs).
+    pub include_internal: Option<bool>,
+}
+
+/// Usage of one tenant in the Overview window.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct OverviewTenantUsage {
+    #[schema(value_type = String)]
+    pub tenant_id: Uuid,
+    /// The tenant's name; `null` once the tenant is deleted.
+    pub name: Option<String>,
+    pub requests: u64,
+    pub total_tokens: u64,
+    /// Sum of each request's frozen `cost_usd`.
+    pub cost_usd: f64,
+}
+
+/// What the Overview reads from the usage ledger, from two scans: totals of
+/// the window and of the one before it, cache counts and the series over
+/// both; then per-model and per-tenant rows of the window.
+#[derive(Debug, Clone, Default)]
+pub struct OverviewUsage {
+    pub since_ms: i64,
+    pub until_ms: i64,
+    pub previous_since_ms: i64,
+    pub bucket_ms: i64,
+    pub current: UsageTotals,
+    pub previous: UsageTotals,
+    pub cache: CacheStats,
+    pub series: Vec<UsageTimePoint>,
+    /// Busiest (most tokens) first.
+    pub models: Vec<UsageModelAgg>,
+    /// Busiest (most requests) first, without names.
+    pub tenants: Vec<(Uuid, u64, u64, f64)>,
+}
+
+/// A row of the first Overview scan: a period's totals (`by_bucket` 0,
+/// `period` 1 for the previous window and 2 for this one) or a series bucket
+/// (`by_bucket` 1). Read positionally; see [`overview_periods_sql`].
+#[derive(Debug, Row, Deserialize)]
+struct OverviewPeriodRow {
+    by_bucket: u64,
+    period: u8,
+    bucket_ms: i64,
+    requests: u64,
+    total_tokens: u64,
+    cost_usd: f64,
+    active_tenants: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    errors: u64,
+    p50_ttft_ms: f64,
+    avg_ttft_ms: f64,
+    energy_wh: f64,
+    energy_cost_usd: f64,
+    co2_g: f64,
+    platform_errors: u64,
+    hits: u64,
+    misses: u64,
+    tokens_saved: u64,
+}
+
+impl OverviewPeriodRow {
+    fn totals(&self) -> UsageTotals {
+        UsageTotals {
+            requests: self.requests,
+            total_tokens: self.total_tokens,
+            cost_usd: self.cost_usd,
+            active_tenants: self.active_tenants,
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            errors: self.errors,
+            p50_ttft_ms: self.p50_ttft_ms,
+            avg_ttft_ms: self.avg_ttft_ms,
+            energy_wh: self.energy_wh,
+            energy_cost_usd: self.energy_cost_usd,
+            co2_g: self.co2_g,
+            platform_errors: self.platform_errors,
+        }
+    }
+
+    fn point(&self) -> UsageTimePoint {
+        UsageTimePoint {
+            bucket_ms: self.bucket_ms,
+            requests: self.requests,
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            total_tokens: self.total_tokens,
+            energy_wh: self.energy_wh,
+            errors: self.errors,
+            cost_usd: self.cost_usd,
+            p50_ttft_ms: self.p50_ttft_ms,
+            avg_ttft_ms: self.avg_ttft_ms,
+            platform_errors: self.platform_errors,
+        }
+    }
+}
+
+/// A row of the second Overview scan: a model's aggregate (`by_tenant` 0)
+/// or a tenant's (`by_tenant` 1, where only the counts and cost are read).
+#[derive(Debug, Row, Deserialize)]
+struct OverviewBreakdownRow {
+    by_tenant: u64,
+    model: String,
+    #[serde(with = "clickhouse::serde::uuid")]
+    tenant_id: Uuid,
+    requests: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+    gen_tokens_per_sec: f64,
+    agg_tokens_per_sec: f64,
+    avg_ttft_ms: f64,
+    avg_total_ms: f64,
+    p50_ttft_ms: f64,
+    p50_total_ms: f64,
+    avg_prompt_tokens: f64,
+    avg_gen_tokens: f64,
+    users: u64,
+    energy_wh: f64,
+    energy_cost_usd: f64,
+    co2_g: f64,
+    cost_usd: f64,
+}
+
+/// Totals of each window, cache counts and the series, in one scan of
+/// `[previous_since, until)`: `period` splits the windows at `since`, and
+/// grouping sets give one row per period and one per bucket.
+fn overview_periods_sql(since: i64, bucket: i64, filter: &str) -> String {
+    format!(
+        "select grouping(period) as by_bucket, \
+         if(ts_ms >= {since}, 2, 1) as period, \
+         intDiv(ts_ms, {bucket}) * {bucket} as bucket_ms, \
+         {}, \
+         countIf(cache_status = 'hit') as hits, \
+         countIf(cache_status = 'miss') as misses, \
+         sumIf(input_tokens + output_tokens, cache_status = 'hit') as tokens_saved \
+         from usage{filter} \
+         group by grouping sets ((period), (bucket_ms)) \
+         order by by_bucket, period, bucket_ms",
+        usage_totals_columns(),
+    )
+}
+
+/// Per-model and per-tenant rows of the window in one scan.
+fn overview_breakdown_sql(filter: &str) -> String {
+    format!(
+        "select grouping(model) as by_tenant, model, tenant_id, {}, \
+         sum(cost_usd) as cost \
+         from usage{filter} \
+         group by grouping sets ((model), (tenant_id))",
+        usage_model_columns(),
+    )
+}
+
+/// Everything the Overview reads from the ledger for `q`, in two scans run
+/// together. The previous window is as long as this one and ends where it
+/// starts.
+pub async fn query_overview(
+    client: &clickhouse::Client,
+    q: &OverviewQuery,
+) -> Result<OverviewUsage, clickhouse::error::Error> {
+    let since = window_start(q.since_ms, q.until_ms);
+    let until = q.until_ms.unwrap_or_else(now_ms);
+    let previous_since = since - until.saturating_sub(since).max(0);
+    let bucket = series_bucket_ms(previous_since, q.bucket_ms, 60_000, until);
+    let both = UsageQuery {
+        since_ms: Some(previous_since),
+        until_ms: q.until_ms,
+        include_internal: q.include_internal,
+        ..Default::default()
+    };
+    let window = UsageQuery {
+        since_ms: Some(since),
+        until_ms: q.until_ms,
+        include_internal: q.include_internal,
+        ..Default::default()
+    };
+    let (both, window) = (usage_filter(&both), usage_filter(&window));
+    let (periods, breakdown) = tokio::try_join!(
+        both.bind(client.query(&overview_periods_sql(since, bucket, both.sql())))
+            .fetch_all::<OverviewPeriodRow>(),
+        window
+            .bind(client.query(&overview_breakdown_sql(window.sql())))
+            .fetch_all::<OverviewBreakdownRow>(),
+    )?;
+    Ok(assemble_overview(
+        since,
+        until,
+        previous_since,
+        bucket,
+        periods,
+        breakdown,
+    ))
+}
+
+fn assemble_overview(
+    since: i64,
+    until: i64,
+    previous_since: i64,
+    bucket: i64,
+    periods: Vec<OverviewPeriodRow>,
+    breakdown: Vec<OverviewBreakdownRow>,
+) -> OverviewUsage {
+    let mut out = OverviewUsage {
+        since_ms: since,
+        until_ms: until,
+        previous_since_ms: previous_since,
+        bucket_ms: bucket,
+        ..Default::default()
+    };
+    for row in periods {
+        match (row.by_bucket, row.period) {
+            (0, 2) => {
+                out.current = row.totals();
+                out.cache = CacheStats {
+                    hits: row.hits,
+                    misses: row.misses,
+                    tokens_saved: row.tokens_saved,
+                };
+            }
+            (0, _) => out.previous = row.totals(),
+            _ => out.series.push(row.point()),
+        }
+    }
+    for row in breakdown {
+        if row.by_tenant == 1 {
+            out.tenants
+                .push((row.tenant_id, row.requests, row.total_tokens, row.cost_usd));
+        } else {
+            out.models.push(UsageModelAgg {
+                model: row.model,
+                requests: row.requests,
+                input_tokens: row.input_tokens,
+                output_tokens: row.output_tokens,
+                total_tokens: row.total_tokens,
+                gen_tokens_per_sec: row.gen_tokens_per_sec,
+                agg_tokens_per_sec: row.agg_tokens_per_sec,
+                avg_ttft_ms: row.avg_ttft_ms,
+                avg_total_ms: row.avg_total_ms,
+                p50_ttft_ms: row.p50_ttft_ms,
+                p50_total_ms: row.p50_total_ms,
+                avg_prompt_tokens: row.avg_prompt_tokens,
+                avg_gen_tokens: row.avg_gen_tokens,
+                users: row.users,
+                energy_wh: row.energy_wh,
+                energy_cost_usd: row.energy_cost_usd,
+                co2_g: row.co2_g,
+            });
+        }
+    }
+    out.models.sort_by(|a, b| {
+        b.total_tokens
+            .cmp(&a.total_tokens)
+            .then_with(|| a.model.cmp(&b.model))
+    });
+    out.models.truncate(GROUPED_ROWS_DEFAULT as usize);
+    out.tenants
+        .sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out.tenants.truncate(GROUPED_ROWS_MAX as usize);
+    out
 }
 
 /// Per-tenant usage aggregate.
@@ -1230,7 +1511,7 @@ pub struct UsageKeyModelBreakdown {
 }
 
 /// Response-cache effectiveness over the window.
-#[derive(Debug, Clone, Row, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Default, Row, Serialize, Deserialize, ToSchema)]
 pub struct CacheStats {
     pub hits: u64,
     pub misses: u64,
@@ -1840,9 +2121,18 @@ pub async fn query_usage_by_model(
 }
 
 fn usage_by_model_sql(q: &UsageQuery, filter: &str) -> String {
+    format!(
+        "select model, {} from usage{filter} group by model order by total_tok desc limit {}",
+        usage_model_columns(),
+        row_limit(q.limit, GROUPED_ROWS_DEFAULT),
+    )
+}
+
+/// The columns of [`UsageModelAgg`] after `model`, in field order.
+fn usage_model_columns() -> String {
     let (avg_ttft, p50_ttft) = (avg_ttft_sql(), p50_ttft_sql());
     format!(
-        "select model, count() as requests, \
+        "count() as requests, \
          sum(input_tokens) as in_tok, sum(output_tokens) as out_tok, \
          sum(input_tokens) + sum(output_tokens) as total_tok, \
          round(if(countIf(total_ms >= 20 and output_tokens >= 1) > 0, \
@@ -1857,9 +2147,7 @@ fn usage_by_model_sql(q: &UsageQuery, filter: &str) -> String {
          round(avg(input_tokens), 1) as avg_prompt, \
          round(avg(output_tokens), 1) as avg_gen, \
          uniq(key_id) as users, \
-         sum(energy_wh) as energy_wh, sum(energy_cost_usd) as energy_cost_usd, sum(co2_g) as co2_g \
-         from usage{filter} group by model order by total_tok desc limit {}",
-        row_limit(q.limit, GROUPED_ROWS_DEFAULT),
+         sum(energy_wh) as energy_wh, sum(energy_cost_usd) as energy_cost_usd, sum(co2_g) as co2_g"
     )
 }
 
@@ -3427,6 +3715,135 @@ mod clickhouse_tests {
 
     /// Every aggregate read runs against the real schema, reads the window
     /// `[since, until)` with `until` exclusive, and honours its filters.
+    /// The Overview's two scans report what the six reads it replaces
+    /// report: totals of both windows, cache counts, the series, per-model
+    /// and per-tenant rows.
+    #[tokio::test]
+    async fn the_overview_read_matches_the_reads_it_replaces() {
+        let Ok(url) = std::env::var("OBLETH_TEST_CLICKHOUSE_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_CLICKHOUSE_URL to run");
+            return;
+        };
+        let database = format!("obleth_test_{}", Uuid::new_v4().simple());
+        let dir = std::env::temp_dir().join(format!("obleth-overview-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sink = obleth_telemetry::TelemetrySink::start(
+            &url,
+            &database,
+            "default",
+            "",
+            dir.join("usage.wal").to_str().unwrap(),
+            std::time::Duration::from_millis(50),
+            true,
+        )
+        .await
+        .expect("sink");
+        let minute = 60_000;
+        let now = now_ms();
+        let tenants = [Uuid::new_v4(), Uuid::new_v4(), Uuid::nil()];
+        // Five hours of traffic: the window is the last two, the previous
+        // window the two before, and the first hour is outside both.
+        for i in 0..60i64 {
+            let mut rec = usage(
+                Uuid::new_v4(),
+                now - 300 * minute + i * 5 * minute,
+                "",
+                "",
+                "",
+            );
+            rec.tenant_id = tenants[(i % 3) as usize];
+            rec.model = ["a", "b", "c", "d"][(i % 4) as usize].into();
+            rec.input_tokens = 10 + i as u32;
+            rec.output_tokens = 5 + (i % 7) as u32;
+            rec.ttft_ms = (40 + i * 3) as u32;
+            rec.total_ms = (200 + i * 11) as u32;
+            // Binary fractions, so sums are exact in any order.
+            rec.cost_usd = i as f64 / 4.0;
+            rec.energy_wh = i as f64 / 8.0;
+            rec.status_code = if i % 9 == 0 {
+                502
+            } else if i % 11 == 0 {
+                400
+            } else {
+                200
+            };
+            rec.cache_status = ["hit", "miss", "off"][(i % 3) as usize].into();
+            sink.record(rec);
+        }
+        sink.shutdown().await;
+        let client = clickhouse::Client::default()
+            .with_url(&url)
+            .with_database(&database);
+
+        let (since, until, bucket) = (now - 120 * minute, now, 10 * minute);
+        let ov = query_overview(
+            &client,
+            &OverviewQuery {
+                since_ms: Some(since),
+                until_ms: Some(until),
+                bucket_ms: Some(bucket),
+                include_internal: None,
+            },
+        )
+        .await
+        .expect("overview");
+        assert_eq!(ov.previous_since_ms, now - 240 * minute);
+        let window = || UsageQuery {
+            since_ms: Some(since),
+            until_ms: Some(until),
+            ..Default::default()
+        };
+        let before = UsageQuery {
+            since_ms: Some(ov.previous_since_ms),
+            until_ms: Some(since),
+            ..Default::default()
+        };
+        fn json<T: Serialize>(v: &T) -> serde_json::Value {
+            serde_json::to_value(v).unwrap()
+        }
+        let current = query_usage_totals(&client, &window()).await.unwrap();
+        let previous = query_usage_totals(&client, &before).await.unwrap();
+        assert!(current.requests > 0 && previous.requests > 0);
+        assert_eq!(json(&ov.current), json(&current));
+        assert_eq!(json(&ov.previous), json(&previous));
+        let cache = query_cache_stats(&client, window()).await.unwrap();
+        assert_eq!(json(&ov.cache), json(&cache));
+        let series = query_usage_series(
+            &client,
+            UsageSeriesQuery {
+                since_ms: Some(ov.previous_since_ms),
+                until_ms: Some(until),
+                bucket_ms: Some(bucket),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(ov.bucket_ms, bucket);
+        assert_eq!(json(&ov.series), json(&series));
+        let models = query_usage_by_model(&client, window()).await.unwrap();
+        assert_eq!(json(&ov.models), json(&models));
+        let mut per_tenant: Vec<_> = query_usage(&client, window())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| (t.tenant_id, t.requests, t.total_tokens, t.cost_usd))
+            .collect();
+        per_tenant.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        assert_eq!(ov.tenants, per_tenant);
+        assert!(
+            ov.tenants.iter().any(|t| t.0 == Uuid::nil()),
+            "the nil tenant is a tenant row"
+        );
+
+        clickhouse::Client::default()
+            .with_url(&url)
+            .query(&format!("drop database if exists {database}"))
+            .execute()
+            .await
+            .ok();
+    }
+
     #[tokio::test]
     async fn usage_reads_run_on_clickhouse_and_honour_the_window() {
         let Ok(url) = std::env::var("OBLETH_TEST_CLICKHOUSE_URL") else {

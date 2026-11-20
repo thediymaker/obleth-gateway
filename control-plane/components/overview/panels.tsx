@@ -105,9 +105,8 @@ function Watching({ watching, standalone }: { watching: string[]; standalone?: b
 export function TopTenants({ window, live }: { window: OverviewWindow; live: Map<string, TenantFairshareView> }) {
   const rows = window.tenants;
   const top = rows[0]?.requests ?? 0;
-  const hasCost = rows.some((r) => r.cost !== null);
-  const cols = hasCost ? "grid-cols-[minmax(0,1fr)_4.5rem_4rem_4.5rem_3.5rem]" : "grid-cols-[minmax(0,1fr)_4.5rem_4rem_3.5rem]";
-  const money = (v: number | null) => (v === null ? "—" : `$${v >= 100 ? v.toFixed(0) : v.toFixed(2)}`);
+  const cols = "grid-cols-[minmax(0,1fr)_4.5rem_4rem_4.5rem_3.5rem]";
+  const money = (v: number) => `$${v >= 100 ? v.toFixed(0) : v.toFixed(2)}`;
   const line = (r: Pick<OverviewTenantRow, "requests" | "tokens" | "cost">, now: number | string, name: React.ReactNode, key: string, muted = false, tenantId?: string) => (
     <div key={key} className={cn("grid items-center gap-3 border-t border-border px-[18px] py-[9px] text-[13px]", cols, muted && "text-muted-foreground")}>
       {name}
@@ -117,7 +116,7 @@ export function TopTenants({ window, live }: { window: OverviewWindow; live: Map
         <span className="text-right font-mono text-xs tabular-nums">{compact(r.requests)}</span>
       )}
       <span className="text-right font-mono text-xs tabular-nums">{compact(r.tokens)}</span>
-      {hasCost && <span className="text-right font-mono text-xs tabular-nums">{money(r.cost)}</span>}
+      <span className="text-right font-mono text-xs tabular-nums">{money(r.cost)}</span>
       <span className="text-right font-mono text-xs tabular-nums">{now}</span>
     </div>
   );
@@ -129,7 +128,7 @@ export function TopTenants({ window, live }: { window: OverviewWindow; live: Map
         ) : (
           <>
             <div className={cn("grid gap-3 border-t border-border px-[18px] py-2 text-[11.5px] text-muted-foreground", cols)}>
-              <span>Tenant</span><span className="text-right">Requests</span><span className="text-right">Tokens</span>{hasCost && <span className="text-right">Spend</span>}<span className="text-right" title="Requests in flight right now">Now</span>
+              <span>Tenant</span><span className="text-right">Requests</span><span className="text-right">Tokens</span><span className="text-right">Spend</span><span className="text-right" title="Requests in flight right now">Now</span>
             </div>
             {rows.map((r) => line(r, live.get(r.id)?.in_flight ?? 0, (
               <span className="flex min-w-0 flex-col gap-1.5"><span className="truncate" title={r.name}>{r.name}</span><Meter value={r.requests} max={top} className="h-[3px]" /></span>

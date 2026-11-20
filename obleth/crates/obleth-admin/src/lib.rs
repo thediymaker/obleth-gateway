@@ -27,6 +27,7 @@ pub mod slurm_resources;
 pub mod slurm_settings;
 pub mod ssrf;
 mod usage;
+pub mod usage_cache;
 pub mod usage_retention;
 
 use std::sync::Arc;
@@ -153,6 +154,9 @@ pub struct AdminState {
     /// Models and endpoints for `/fairshare/live`, re-read at most every
     /// [`live_catalog::LIVE_CATALOG_TTL`].
     pub live_catalog: Arc<live_catalog::LiveCatalog>,
+    /// The footer totals and the Overview's usage, re-read at most every
+    /// [`usage_cache::USAGE_CACHE_TTL`].
+    pub usage_cache: Arc<usage_cache::UsageCache>,
 }
 
 /// A boxed call into the data plane's classifier: `(prompt, available_tags)`
@@ -255,6 +259,7 @@ pub fn router(state: AdminState) -> Router {
         .route("/api/v1/usage/compact", post(compact_usage))
         .route("/api/v1/costs", get(get_costs))
         .route("/api/v1/stats", get(get_stats))
+        .route("/api/v1/overview", get(get_overview))
         .route("/api/v1/overview/summary", get(get_overview_summary))
         .route("/api/v1/fairshare/live", get(get_fairshare_live))
         .route("/api/v1/capacity/discovery", get(get_capacity_discovery))
@@ -6415,14 +6420,26 @@ async fn get_overview_summary(
     let counts = state.store.overview_counts().await?;
     // ClickHouse being down degrades the usage totals to zero rather than
     // failing the whole summary — the config counts are still useful and this
-    // read backs a poll on every dashboard page.
-    let totals = usage::query_usage_totals(&state.clickhouse, &q)
-        .await
+    // read backs a poll on every dashboard page. That poll's unfiltered read
+    // is shared for a few seconds (see `usage_cache`).
+    let read = usage::query_usage_totals(&state.clickhouse, &q);
+    let totals =
+        match usage_cache::TotalsKey::of(&q, usage::window_start(q.since_ms, q.until_ms)) {
+            Some(key) => state.usage_cache.totals.get_or_load(key, || read).await,
+            None => read.await,
+        }
         .unwrap_or_default();
+    Ok(Json(overview_summary(&counts, &totals)))
+}
+
+fn overview_summary(
+    counts: &obleth_store::OverviewCounts,
+    totals: &usage::UsageTotals,
+) -> OverviewSummaryView {
     // The ledger keeps rows for since-deleted tenants; clamp so the summary
     // can never report more active tenants than currently exist.
     let active_tenants = totals.active_tenants.min(counts.tenant_count.max(0) as u64);
-    Ok(Json(OverviewSummaryView {
+    OverviewSummaryView {
         requests: totals.requests,
         tokens: totals.total_tokens,
         cost: totals.cost_usd,
@@ -6441,6 +6458,88 @@ async fn get_overview_summary(
         energy_wh: totals.energy_wh,
         energy_cost_usd: totals.energy_cost_usd,
         co2_g: totals.co2_g,
+    }
+}
+
+/// Everything on the dashboard Overview that follows its range control.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct OverviewView {
+    /// The window, `[since_ms, until_ms)`; `until_ms` is the read's "now"
+    /// when the query left it open.
+    pub since_ms: i64,
+    pub until_ms: i64,
+    /// Start of the previous window, which ends at `since_ms`.
+    pub previous_since_ms: i64,
+    /// Width of the series buckets.
+    pub bucket_ms: i64,
+    /// Totals of the window, with the gateway's counts.
+    pub summary: OverviewSummaryView,
+    /// Totals of the previous window (counts as in `summary`).
+    pub previous: OverviewSummaryView,
+    /// Buckets over both windows, oldest first.
+    pub series: Vec<usage::UsageTimePoint>,
+    /// Per-model usage of the window, most tokens first.
+    pub models: Vec<usage::UsageModelAgg>,
+    /// Per-tenant usage of the window, most requests first.
+    pub tenants: Vec<usage::OverviewTenantUsage>,
+    pub cache: usage::CacheStats,
+}
+
+/// The Overview in one read: totals of the window and the one before it,
+/// the series over both, per-model and per-tenant usage and cache counts,
+/// from two ledger scans. The usage part is shared for a few seconds (see
+/// `usage_cache`); counts and tenant names are read fresh. With ClickHouse
+/// down the usage reads as zero and the counts are still returned.
+#[utoipa::path(
+    get, path = "/api/v1/overview", tag = "usage",
+    params(usage::OverviewQuery),
+    responses((status = 200, body = OverviewView))
+)]
+async fn get_overview(
+    State(state): State<AdminState>,
+    Query(q): Query<usage::OverviewQuery>,
+) -> Result<Json<OverviewView>> {
+    let key = usage_cache::OverviewKey {
+        since: usage_cache::bucketed(usage::window_start(q.since_ms, q.until_ms)),
+        until: q.until_ms.map(usage_cache::bucketed),
+        bucket_ms: q.bucket_ms,
+        include_internal: q.include_internal.unwrap_or(false),
+    };
+    let usage = state.usage_cache.overview.get_or_load(key, || async {
+        usage::query_overview(&state.clickhouse, &q)
+            .await
+            .map(Arc::new)
+    });
+    let (counts, usage) = tokio::join!(state.store.overview_counts(), usage);
+    let counts = counts?;
+    let usage = usage.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "overview usage read failed; reporting zero usage");
+        Arc::new(usage::OverviewUsage::default())
+    });
+    let names = names::resolve_names(&state, usage.tenants.iter().map(|t| t.0), []).await?;
+    Ok(Json(OverviewView {
+        since_ms: usage.since_ms,
+        until_ms: usage.until_ms,
+        previous_since_ms: usage.previous_since_ms,
+        bucket_ms: usage.bucket_ms,
+        summary: overview_summary(&counts, &usage.current),
+        previous: overview_summary(&counts, &usage.previous),
+        series: usage.series.clone(),
+        models: usage.models.clone(),
+        tenants: usage
+            .tenants
+            .iter()
+            .map(
+                |&(tenant_id, requests, total_tokens, cost_usd)| usage::OverviewTenantUsage {
+                    tenant_id,
+                    name: names.tenant_name(&tenant_id).map(str::to_owned),
+                    requests,
+                    total_tokens,
+                    cost_usd,
+                },
+            )
+            .collect(),
+        cache: usage.cache.clone(),
     }))
 }
 
@@ -10918,6 +11017,7 @@ mod tests {
                 capacity_discovery,
                 judge: None,
                 live_catalog: Default::default(),
+                usage_cache: Default::default(),
                 health: ModelHealthRuntime {
                     scheduled_enabled: false,
                     default_interval_secs: 60,

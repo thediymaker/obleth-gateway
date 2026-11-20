@@ -1282,6 +1282,32 @@ export interface LiveStats {
 export type FairshareSlotMode = "local" | "split" | "shared" | "fallback";
 
 /** Wire shape of GET /overview/summary (config counts + windowed usage totals). */
+/** One tenant's usage in the Overview window. */
+export interface OverviewTenantUsage {
+  tenant_id: string;
+  /** Null once the tenant is deleted. */
+  name: string | null;
+  requests: number;
+  total_tokens: number;
+  cost_usd: number;
+}
+
+/** `GET /overview`: everything on the Overview that follows its range control. */
+export interface OverviewView {
+  since_ms: number;
+  until_ms: number;
+  previous_since_ms: number;
+  bucket_ms: number;
+  summary: OverviewSummaryView;
+  previous: OverviewSummaryView;
+  /** Buckets over the previous window and this one. */
+  series: UsageTimePoint[];
+  models: UsageModelAgg[];
+  /** Most requests first. */
+  tenants: OverviewTenantUsage[];
+  cache: CacheStats;
+}
+
 export interface OverviewSummaryView {
   requests: number;
   tokens: number;
@@ -3225,6 +3251,9 @@ export const obleth = {
       headers: auditActorHeaders(options),
     }),
   stats: () => api<LiveStats>("/stats"),
+  /** The Overview's window, the one before it, series and breakdowns, in one read. */
+  overview: (sinceMs: number, bucketMs: number) =>
+    api<OverviewView>(`/overview${qs({ since_ms: sinceMs, bucket_ms: bucketMs })}`),
   overviewSummary: (sinceMs?: number, untilMs?: number) =>
     api<OverviewSummaryView>(`/overview/summary${qs({ since_ms: sinceMs, until_ms: untilMs })}`),
   fairshareLive: () => api<FairshareLiveView>("/fairshare/live"),

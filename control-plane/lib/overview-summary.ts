@@ -75,11 +75,9 @@ export function toOverviewSummary(view: OverviewSummaryView): OverviewSummary {
   };
 }
 
-/** One admin round-trip for the overview strip and status footer. The admin
- *  API aggregates counts and usage totals server-side, so this no longer
- *  deserializes the full tenant/key/model lists per poll. `sinceMs` defaults
- *  to the gateway's own 24-hour window. */
-/** The summary of `[sinceMs, untilMs)`; open-ended without `untilMs`. */
-export async function fetchOverviewSummary(sinceMs?: number, untilMs?: number): Promise<OverviewSummary> {
-  return toOverviewSummary(await obleth.overviewSummary(sinceMs, untilMs));
+/** The status footer's totals over the gateway's default window (the last
+ *  24 hours): counts and usage totals aggregated server-side, and shared
+ *  across polls for a few seconds by the gateway. */
+export async function fetchOverviewSummary(): Promise<OverviewSummary> {
+  return toOverviewSummary(await obleth.overviewSummary());
 }

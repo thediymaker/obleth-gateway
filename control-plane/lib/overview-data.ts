@@ -1,5 +1,5 @@
-import { obleth, type AuditEntry, type CacheStats, type RouterReadinessView, type UsageModelAgg, type UsageTimePoint } from "@/lib/obleth";
-import { EMPTY_OVERVIEW_SUMMARY, fetchOverviewSummary, type OverviewSummary } from "@/lib/overview-summary";
+import { obleth, type AuditEntry, type CacheStats, type OverviewView, type RouterReadinessView, type UsageModelAgg, type UsageTimePoint } from "@/lib/obleth";
+import { EMPTY_OVERVIEW_SUMMARY, toOverviewSummary, type OverviewSummary } from "@/lib/overview-summary";
 import { RANGE_BUCKET_MS, RANGE_MS, type OverviewRange } from "@/lib/overview-model";
 import { safe } from "@/lib/safe";
 
@@ -10,8 +10,7 @@ export interface OverviewTenantRow {
   name: string;
   requests: number;
   tokens: number;
-  /** Null when the gateway predates per-tenant cost. */
-  cost: number | null;
+  cost: number;
 }
 
 /** Everything on the Overview that follows the range control. */
@@ -21,12 +20,12 @@ export interface OverviewWindow {
   summary: OverviewSummary;
   /** The window before, for the "vs yesterday" comparisons. Null when the read failed. */
   previous: OverviewSummary | null;
-  /** One read spanning the current and the previous window, split client-side. */
+  /** Buckets over the previous window and this one, split client-side. */
   series: UsageTimePoint[];
   models: UsageModelAgg[];
   tenants: OverviewTenantRow[];
   /** Everything past the top rows, summed, so the table still adds up. */
-  otherTenants: { count: number; requests: number; tokens: number; cost: number | null };
+  otherTenants: { count: number; requests: number; tokens: number; cost: number };
   cache: CacheStats | null;
 }
 
@@ -38,44 +37,46 @@ export interface OverviewContext {
 }
 
 export async function loadOverviewWindow(range: OverviewRange, now = Date.now()): Promise<OverviewWindow> {
-  const since = now - RANGE_MS[range];
-  const twoWindows = now - 2 * RANGE_MS[range];
-  const [summary, previous, series, models, usage, tenants, cache] = await Promise.all([
-    safe(fetchOverviewSummary(since), EMPTY_OVERVIEW_SUMMARY),
-    safe(fetchOverviewSummary(twoWindows, since).then((s) => s as OverviewSummary | null), null),
-    safe(obleth.usageSeries(RANGE_BUCKET_MS[range], twoWindows), []),
-    safe(obleth.usageByModel({ sinceMs: since }), []),
-    safe(obleth.usage({ sinceMs: since }), []),
-    safe(obleth.listTenants(), []),
-    safe(obleth.cacheStats(since).then((c) => c as CacheStats | null), null),
-  ]);
-  const names = new Map(tenants.map((t) => [t.id, t.name]));
-  const hasCost = usage.some((u) => u.cost_usd !== undefined);
-  const rows = usage
-    .map<OverviewTenantRow>((u) => ({
-      id: u.tenant_id,
-      name: names.get(u.tenant_id) ?? "Deleted tenant",
-      requests: Number(u.requests),
-      tokens: Number(u.total_tokens),
-      cost: hasCost ? Number(u.cost_usd ?? 0) : null,
-    }))
-    .sort((a, b) => b.requests - a.requests);
+  const view = await safe(
+    obleth.overview(now - RANGE_MS[range], RANGE_BUCKET_MS[range]).then((v) => v as OverviewView | null),
+    null,
+  );
+  if (!view) {
+    return {
+      range,
+      now,
+      summary: EMPTY_OVERVIEW_SUMMARY,
+      previous: null,
+      series: [],
+      models: [],
+      tenants: [],
+      otherTenants: { count: 0, requests: 0, tokens: 0, cost: 0 },
+      cache: null,
+    };
+  }
+  const rows = view.tenants.map<OverviewTenantRow>((t) => ({
+    id: t.tenant_id,
+    name: t.name ?? "Deleted tenant",
+    requests: Number(t.requests),
+    tokens: Number(t.total_tokens),
+    cost: Number(t.cost_usd),
+  }));
   const rest = rows.slice(TOP_TENANTS);
   return {
     range,
     now,
-    summary,
-    previous,
-    series,
-    models,
+    summary: toOverviewSummary(view.summary),
+    previous: toOverviewSummary(view.previous),
+    series: view.series,
+    models: view.models,
     tenants: rows.slice(0, TOP_TENANTS),
     otherTenants: {
       count: rest.length,
       requests: rest.reduce((n, r) => n + r.requests, 0),
       tokens: rest.reduce((n, r) => n + r.tokens, 0),
-      cost: hasCost ? rest.reduce((n, r) => n + (r.cost ?? 0), 0) : null,
+      cost: rest.reduce((n, r) => n + r.cost, 0),
     },
-    cache,
+    cache: view.cache,
   };
 }
 
