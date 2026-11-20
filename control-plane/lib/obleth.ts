@@ -958,6 +958,8 @@ export interface UsageDailyRow {
   co2_g: number;
   /** The part of `error_requests` that were the platform's failures, not the caller's. Absent from older gateways. */
   platform_error_requests?: number;
+  /** The requests `avg_ttft_ms` averages over, for weighting several rows. Absent from older gateways. */
+  ttft_requests?: number;
 }
 
 /**

@@ -1330,7 +1330,8 @@ async fn ensure_daily_rollup(client: &Client, database: &str) -> Result<(), Tele
             energy_wh_sum Float64,
             energy_cost_usd_sum Float64,
             co2_g_sum Float64,
-            platform_error_requests UInt64
+            platform_error_requests UInt64,
+            ttft_requests UInt64
         ) ENGINE = SummingMergeTree()
         PARTITION BY toYYYYMM(day)
         ORDER BY (day, tenant_id, key_id, model)"
@@ -1348,9 +1349,10 @@ async fn ensure_daily_rollup(client: &Client, database: &str) -> Result<(), Tele
         "energy_wh_sum Float64 DEFAULT 0",
         "energy_cost_usd_sum Float64 DEFAULT 0",
         "co2_g_sum Float64 DEFAULT 0",
-        // Added after the others, so it stays last, in step with the
-        // positional backfill below.
+        // Added after the others, in this order, so the columns stay in
+        // step with the positional backfill below.
         "platform_error_requests UInt64 DEFAULT 0",
+        "ttft_requests UInt64 DEFAULT 0",
     ] {
         client
             .query(&format!(
@@ -1371,10 +1373,12 @@ async fn ensure_daily_rollup(client: &Client, database: &str) -> Result<(), Tele
 
     // The aggregation projection shared by the materialized view and the
     // backfill, so both compute identical columns from the raw ledger.
-    // Latency sums (`ttft_ms_sum`/`total_ms_sum`) are accumulated over
-    // successful (2xx/3xx) requests only, so timeouts and upstream errors don't
-    // distort the average TTFT / total-time reported per day. The read side
-    // divides these by `success_requests` to match. `platform_error_requests`
+    // `total_ms_sum` is accumulated over successful (2xx/3xx) requests only,
+    // so timeouts and upstream errors don't distort the average total time
+    // reported per day; the read side divides it by `success_requests`.
+    // `ttft_ms_sum` and `ttft_requests` cover the requests every first-token
+    // figure averages over (`TTFT_OK_SQL`), and the read divides one by the
+    // other, so the daily average matches the raw reads. `platform_error_requests`
     // counts the failures that were the platform's, not the caller's (see
     // `obleth_config::failure`).
     let rollup_select = format!(
@@ -1391,15 +1395,17 @@ async fn ensure_daily_rollup(client: &Client, database: &str) -> Result<(), Tele
         sum(estimated_tokens) AS estimated_tokens,
         countIf(cache_status = 'hit') AS cache_hits,
         countIf(cache_status = 'miss') AS cache_misses,
-        sumIf(ttft_ms, status_code >= 200 AND status_code < 400) AS ttft_ms_sum,
+        sumIf(ttft_ms, {ttft_ok}) AS ttft_ms_sum,
         sumIf(total_ms, status_code >= 200 AND status_code < 400) AS total_ms_sum,
         sum(cost_usd) AS cost_usd_sum,
         sum(energy_wh) AS energy_wh_sum,
         sum(energy_cost_usd) AS energy_cost_usd_sum,
         sum(co2_g) AS co2_g_sum,
-        countIf({class} IN {platform}) AS platform_error_requests",
+        countIf({class} IN {platform}) AS platform_error_requests,
+        countIf({ttft_ok}) AS ttft_requests",
         class = obleth_config::EFFECTIVE_CLASS_SQL,
         platform = obleth_config::PLATFORM_CLASSES_SQL,
+        ttft_ok = obleth_config::TTFT_OK_SQL,
     );
 
     // Benchmark traffic (synthetic tenants) never enters the permanent rollup:

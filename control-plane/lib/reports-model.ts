@@ -105,7 +105,7 @@ export interface Totals {
   energyWh: number;
   energyCost: number;
   co2G: number;
-  /** Mean first token over succeeded requests (the rollup keeps per-row averages). */
+  /** Mean first token over the requests that had one (the rollup keeps per-row averages). */
   avgTtftMs: number;
   avgTotalMs: number;
   estimatedTokens: number;
@@ -114,6 +114,7 @@ export interface Totals {
 export function totals(rows: UsageDailyRow[]): Totals {
   const t: Totals = { requests: 0, failed: 0, succeeded: 0, inputTokens: 0, outputTokens: 0, tokens: 0, cost: 0, cacheHits: 0, cacheMisses: 0, energyWh: 0, energyCost: 0, co2G: 0, avgTtftMs: 0, avgTotalMs: 0, estimatedTokens: 0 };
   let ttft = 0;
+  let ttftRequests = 0;
   let total = 0;
   for (const r of rows) {
     t.requests += r.requests;
@@ -129,10 +130,13 @@ export function totals(rows: UsageDailyRow[]): Totals {
     t.energyCost += r.energy_cost_usd;
     t.co2G += r.co2_g;
     t.estimatedTokens += r.estimated_tokens;
-    ttft += r.avg_ttft_ms * r.success_requests;
+    // Older gateways average first token over every succeeded request.
+    const firstTokens = r.ttft_requests ?? r.success_requests;
+    ttft += r.avg_ttft_ms * firstTokens;
+    ttftRequests += firstTokens;
     total += r.avg_total_ms * r.success_requests;
   }
-  t.avgTtftMs = t.succeeded ? ttft / t.succeeded : 0;
+  t.avgTtftMs = ttftRequests ? ttft / ttftRequests : 0;
   t.avgTotalMs = t.succeeded ? total / t.succeeded : 0;
   return t;
 }

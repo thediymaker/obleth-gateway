@@ -1,6 +1,7 @@
 //! Usage/cost reads from the ClickHouse ledger.
 
 use clickhouse::Row;
+use obleth_config::{DECODE_MS_SQL, TTFT_OK_SQL};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
@@ -27,29 +28,23 @@ pub(crate) fn internal_filter(include_internal: Option<bool>) -> String {
     format!(" and request_type not in ({list})")
 }
 
-/// A row's first-token time marks a real first token. Streamed rows always
-/// qualify. Rows written before the gateway recorded `streamed` carry a
-/// first-byte time even for buffered replies, whose first byte arrives with
-/// the whole body, so the rest of the reply takes a few milliseconds. Their
-/// time counts only when at least a twentieth of the request came after it,
-/// as it does for a streamed reply. A buffered reply recorded since has no
-/// first-token time at all.
-macro_rules! real_ttft {
-    () => {
-        "(streamed or (total_ms - ttft_ms) * 20 >= total_ms - queue_wait_ms)"
-    };
+/// Mean first-token time of the [`TTFT_OK_SQL`] requests, 0 when there are
+/// none.
+fn avg_ttft_sql() -> String {
+    format!("round(if(countIf({TTFT_OK_SQL}) > 0, avgIf(ttft_ms, {TTFT_OK_SQL}), 0), 1)")
 }
-const REAL_TTFT: &str = real_ttft!();
 
-/// Milliseconds a reply spent generating: the decode window (total less first
-/// token) when the first token is real, else the upstream time (total less
-/// queue). Measuring a buffered reply from its first byte would leave only the
-/// body's transfer time and a speed in the tens of thousands.
-const DECODE_MS: &str = concat!(
-    "if(ttft_ms > 0 and total_ms - ttft_ms >= 20 and ",
-    real_ttft!(),
-    ", total_ms - ttft_ms, total_ms - queue_wait_ms)"
-);
+/// Median first-token time of the [`TTFT_OK_SQL`] requests, 0 when there are
+/// none.
+fn p50_ttft_sql() -> String {
+    format!("round(if(countIf({TTFT_OK_SQL}) > 0, quantileIf(0.5)(ttft_ms, {TTFT_OK_SQL}), 0), 1)")
+}
+
+/// The requests a prefill rate is read from: a real first token (see
+/// [`TTFT_OK_SQL`]) late enough to time, and a prompt.
+fn prefill_rated_sql() -> String {
+    format!("{TTFT_OK_SQL} and ttft_ms >= 20 and input_tokens >= 1")
+}
 
 /// Filters of the aggregate usage reads (`/usage`, `/usage/keys`,
 /// `/usage/models`, `/usage/cache`, `/costs`, `/overview/summary`). Every
@@ -1001,7 +996,8 @@ pub struct UsageDailyRow {
     pub estimated_tokens: u64,
     pub cache_hits: u64,
     pub cache_misses: u64,
-    /// Average time-to-first-token in ms across the grouped rows.
+    /// Average time to first token in ms across the grouped rows, over
+    /// answered requests that streamed a first token, cache hits left out.
     pub avg_ttft_ms: f64,
     /// Average end-to-end latency in ms across the grouped rows.
     pub avg_total_ms: f64,
@@ -1017,6 +1013,10 @@ pub struct UsageDailyRow {
     /// The part of `error_requests` that were the platform's failures, not
     /// the caller's.
     pub platform_error_requests: u64,
+    /// The requests `avg_ttft_ms` averages over, so averages of several rows
+    /// can be weighted by it. Days rolled up before v2.13 did not count them
+    /// and report their answered requests instead.
+    pub ttft_requests: u64,
 }
 
 /// Whole-gateway usage totals for the overview strip: one aggregate row over
@@ -1034,7 +1034,7 @@ pub struct UsageTotals {
     pub output_tokens: u64,
     /// Requests that ended with an HTTP status of 400 or above.
     pub errors: u64,
-    /// Median time to first token over requests that produced one; 0 when none did.
+    /// Median time to first token over answered requests that streamed a first token, cache hits left out; 0 when there were none.
     pub p50_ttft_ms: f64,
     pub avg_ttft_ms: f64,
     pub energy_wh: f64,
@@ -1051,6 +1051,7 @@ pub struct UsageTotals {
 /// `total_tokens` expression into an aggregate of an aggregate and fail the
 /// whole read (which the summary then reports as zeros).
 fn usage_totals_sql(filter: &str) -> String {
+    let (avg_ttft, p50_ttft) = (avg_ttft_sql(), p50_ttft_sql());
     format!(
         "select count() as requests, \
          sum(input_tokens) + sum(output_tokens) as total_tokens, \
@@ -1058,8 +1059,8 @@ fn usage_totals_sql(filter: &str) -> String {
          uniqExact(tenant_id) as active_tenants, \
          sum(input_tokens) as in_tok, sum(output_tokens) as out_tok, \
          countIf(status_code >= 400) as errors, \
-         round(if(countIf(ttft_ms > 0) > 0, quantileIf(0.5)(ttft_ms, ttft_ms > 0), 0), 1) as p50_ttft_ms, \
-         round(if(countIf(ttft_ms > 0) > 0, avgIf(ttft_ms, ttft_ms > 0), 0), 1) as avg_ttft_ms, \
+         {p50_ttft} as p50_ttft_ms, \
+         {avg_ttft} as avg_ttft_ms, \
          sum(energy_wh) as energy_wh, sum(energy_cost_usd) as energy_cost_usd, sum(co2_g) as co2_g, \
          countIf({class} in {platform}) as platform_errors \
          from usage{filter}",
@@ -1130,11 +1131,11 @@ pub struct UsageModelAgg {
     /// Aggregate generation throughput: sum of per-request rates across the
     /// window (combined model output rate across all connections).
     pub agg_tokens_per_sec: f64,
-    /// Average time-to-first-token in milliseconds.
+    /// Average time to first token in milliseconds, over answered requests that streamed a first token, cache hits left out.
     pub avg_ttft_ms: f64,
     /// Average end-to-end latency in milliseconds.
     pub avg_total_ms: f64,
-    /// Median (p50) time-to-first-token in milliseconds.
+    /// Median (p50) time to first token in milliseconds, over answered requests that streamed a first token, cache hits left out.
     pub p50_ttft_ms: f64,
     /// Median (p50) end-to-end latency in milliseconds.
     pub p50_total_ms: f64,
@@ -1162,7 +1163,8 @@ pub struct UsageTimePoint {
     pub errors: u64,
     /// Sum of each request's frozen `cost_usd`.
     pub cost_usd: f64,
-    /// Median time to first token in the bucket; 0 when no request produced one.
+    /// Median time to first token in the bucket, over answered requests that streamed a first token, cache hits left out; 0 when there
+    /// were none.
     pub p50_ttft_ms: f64,
     pub avg_ttft_ms: f64,
     /// The part of `errors` that were the platform's failures, not the
@@ -1195,9 +1197,11 @@ pub struct ModelUsageTimePoint {
     pub gen_tokens_per_sec: f64,
     /// Median per-stream prefill rate: input tokens / ttft.
     pub prompt_tokens_per_sec: f64,
-    /// Average time-to-first-token in milliseconds over the bucket.
+    /// Average time to first token in milliseconds over the bucket, over
+    /// answered requests that streamed a first token, cache hits left out.
     pub avg_ttft_ms: f64,
-    /// Median (p50) time-to-first-token in milliseconds over the bucket.
+    /// Median (p50) time to first token in milliseconds over the bucket, over
+    /// answered requests that streamed a first token, cache hits left out.
     pub p50_ttft_ms: f64,
     /// Average end-to-end latency in milliseconds over the bucket.
     pub avg_total_ms: f64,
@@ -1836,18 +1840,19 @@ pub async fn query_usage_by_model(
 }
 
 fn usage_by_model_sql(q: &UsageQuery, filter: &str) -> String {
+    let (avg_ttft, p50_ttft) = (avg_ttft_sql(), p50_ttft_sql());
     format!(
         "select model, count() as requests, \
          sum(input_tokens) as in_tok, sum(output_tokens) as out_tok, \
          sum(input_tokens) + sum(output_tokens) as total_tok, \
          round(if(countIf(total_ms >= 20 and output_tokens >= 1) > 0, \
-         quantileIf(0.5)(output_tokens / (greatest({DECODE_MS}, 1) / 1000.), \
+         quantileIf(0.5)(output_tokens / (greatest({DECODE_MS_SQL}, 1) / 1000.), \
          total_ms >= 20 and output_tokens >= 1), 0), 1) as gen_tps, \
-         round(sumIf(output_tokens / (greatest({DECODE_MS}, 1) / 1000.), \
+         round(sumIf(output_tokens / (greatest({DECODE_MS_SQL}, 1) / 1000.), \
          total_ms >= 20 and output_tokens >= 1), 1) as agg_tps, \
-         round(if(countIf(ttft_ms > 0 and {REAL_TTFT}) > 0, avgIf(ttft_ms, ttft_ms > 0 and {REAL_TTFT}), 0), 1) as avg_ttft, \
+         {avg_ttft} as avg_ttft, \
          round(if(countIf(total_ms > 0) > 0, avgIf(total_ms, total_ms > 0), 0), 1) as avg_total, \
-         round(if(countIf(ttft_ms > 0 and {REAL_TTFT}) > 0, quantileIf(0.5)(ttft_ms, ttft_ms > 0 and {REAL_TTFT}), 0), 1) as p50_ttft, \
+         {p50_ttft} as p50_ttft, \
          round(if(countIf(total_ms > 0) > 0, quantileIf(0.5)(total_ms, total_ms > 0), 0), 1) as p50_total, \
          round(avg(input_tokens), 1) as avg_prompt, \
          round(avg(output_tokens), 1) as avg_gen, \
@@ -1860,6 +1865,7 @@ fn usage_by_model_sql(q: &UsageQuery, filter: &str) -> String {
 
 /// Aliases stay clear of the column names the query reads; see [`usage_totals_sql`].
 fn usage_series_sql(bucket: i64, filter: &str) -> String {
+    let (avg_ttft, p50_ttft) = (avg_ttft_sql(), p50_ttft_sql());
     format!(
         "select intDiv(ts_ms, {bucket}) * {bucket} as bucket_ms, \
          count() as requests, \
@@ -1868,8 +1874,8 @@ fn usage_series_sql(bucket: i64, filter: &str) -> String {
          sum(energy_wh) as energy_wh, \
          countIf(status_code >= 400) as errors, \
          sum(cost_usd) as cost_usd, \
-         round(if(countIf(ttft_ms > 0) > 0, quantileIf(0.5)(ttft_ms, ttft_ms > 0), 0), 1) as p50_ttft_ms, \
-         round(if(countIf(ttft_ms > 0) > 0, avgIf(ttft_ms, ttft_ms > 0), 0), 1) as avg_ttft_ms, \
+         {p50_ttft} as p50_ttft_ms, \
+         {avg_ttft} as avg_ttft_ms, \
          countIf({class} in {platform}) as platform_errors \
          from usage{filter} group by bucket_ms order by bucket_ms",
         class = obleth_config::EFFECTIVE_CLASS_SQL,
@@ -1937,17 +1943,18 @@ pub async fn query_usage_series_by_model(
     // (prompt tokens over ttft, since prefill completes by the first byte). This
     // makes the chart comparable to the upstream engine's reported throughput
     // instead of collapsing toward zero on sparse, bursty traffic.
+    let (avg_ttft, p50_ttft) = (avg_ttft_sql(), p50_ttft_sql());
+    let prefill = prefill_rated_sql();
     let sql = format!(
         "select intDiv(ts_ms, {bucket}) * {bucket} as bucket_ms, \
          count() as requests, \
          round(if(countIf(total_ms >= 20 and output_tokens >= 1) > 0, \
-         quantileIf(0.5)(output_tokens / (greatest({DECODE_MS}, 1) / 1000.), \
+         quantileIf(0.5)(output_tokens / (greatest({DECODE_MS_SQL}, 1) / 1000.), \
          total_ms >= 20 and output_tokens >= 1), 0), 1) as gen_tps, \
-         round(if(countIf(ttft_ms >= 20 and input_tokens >= 1 and {REAL_TTFT}) > 0, \
-         quantileIf(0.5)(input_tokens / (greatest(ttft_ms, 1) / 1000.), \
-         ttft_ms >= 20 and input_tokens >= 1 and {REAL_TTFT}), 0), 1) as prompt_tps, \
-         round(if(countIf(ttft_ms > 0 and {REAL_TTFT}) > 0, avgIf(ttft_ms, ttft_ms > 0 and {REAL_TTFT}), 0), 1) as avg_ttft, \
-         round(if(countIf(ttft_ms > 0 and {REAL_TTFT}) > 0, quantileIf(0.5)(ttft_ms, ttft_ms > 0 and {REAL_TTFT}), 0), 1) as p50_ttft, \
+         round(if(countIf({prefill}) > 0, \
+         quantileIf(0.5)(input_tokens / (greatest(ttft_ms, 1) / 1000.), {prefill}), 0), 1) as prompt_tps, \
+         {avg_ttft} as avg_ttft, \
+         {p50_ttft} as p50_ttft, \
          round(if(countIf(total_ms > 0) > 0, avgIf(total_ms, total_ms > 0), 0), 1) as avg_total, \
          round(if(countIf(total_ms > 0) > 0, quantileIf(0.5)(total_ms, total_ms > 0), 0), 1) as p50_total, \
          sum(energy_wh) as energy_wh \
@@ -1977,7 +1984,7 @@ pub async fn query_usage_breakdown_by_model(
         "select key_id, tenant_id, count() as requests, \
          sum(input_tokens) + sum(output_tokens) as total_tokens, \
          round(if(countIf(total_ms >= 20 and output_tokens >= 1) > 0, \
-         quantileIf(0.5)(output_tokens / (greatest({DECODE_MS}, 1) / 1000.), \
+         quantileIf(0.5)(output_tokens / (greatest({DECODE_MS_SQL}, 1) / 1000.), \
          total_ms >= 20 and output_tokens >= 1), 0), 1) as gen_tps, \
          sum(energy_wh) as energy_wh, sum(energy_cost_usd) as energy_cost_usd, sum(co2_g) as co2_g \
          from usage{} \
@@ -2010,7 +2017,7 @@ pub struct ModelSpeedPoint {
     pub slow_tokens_per_sec: f64,
     /// Median prefill rate: prompt tokens over time to first token.
     pub prompt_tokens_per_sec: f64,
-    /// Median time to first token in milliseconds.
+    /// Median time to first token in milliseconds, over answered requests that streamed a first token, cache hits left out.
     pub p50_ttft_ms: f64,
 }
 
@@ -2034,9 +2041,9 @@ fn speed_bucket_sql(bucket: &str, span_ms: i64) -> (&'static str, bool) {
 fn usage_speed_sql(bucket_expr: &str, filter: &str) -> String {
     let rated =
         "status_code < 400 and cache_status != 'hit' and total_ms >= 20 and output_tokens >= 16";
-    let rate = format!("output_tokens / (greatest({DECODE_MS}, 1) / 1000.)");
-    let prefill =
-        format!("status_code < 400 and cache_status != 'hit' and ttft_ms >= 20 and input_tokens >= 1 and {REAL_TTFT}");
+    let rate = format!("output_tokens / (greatest({DECODE_MS_SQL}, 1) / 1000.)");
+    let prefill = prefill_rated_sql();
+    let p50_ttft = p50_ttft_sql();
     format!(
         "select {bucket_expr} as bucket_ms, model as model_name, \
          count() as reqs, \
@@ -2044,7 +2051,7 @@ fn usage_speed_sql(bucket_expr: &str, filter: &str) -> String {
          round(if(countIf({rated}) > 0, quantileIf(0.5)({rate}, {rated}), 0), 1) as gen_tps, \
          round(if(countIf({rated}) > 0, quantileIf(0.1)({rate}, {rated}), 0), 1) as slow_tps, \
          round(if(countIf({prefill}) > 0, quantileIf(0.5)(input_tokens / (greatest(ttft_ms, 1) / 1000.), {prefill}), 0), 1) as prompt_tps, \
-         round(if(countIf({rated} and ttft_ms > 0 and {REAL_TTFT}) > 0, quantileIf(0.5)(ttft_ms, {rated} and ttft_ms > 0 and {REAL_TTFT}), 0), 1) as p50_ttft \
+         {p50_ttft} as p50_ttft \
          from usage{filter} \
          group by bucket_ms, model_name order by bucket_ms, rated_reqs desc"
     )
@@ -2253,13 +2260,14 @@ pub async fn query_usage_daily(
          sum(estimated_tokens), \
          sum(cache_hits), \
          sum(cache_misses), \
-         round(sum(ttft_ms_sum) / greatest(sum(success_requests), 1), 1) as avg_ttft_ms, \
+         round(sum(ttft_ms_sum) / greatest(sum({DAILY_TTFT_REQUESTS}), 1), 1) as avg_ttft_ms, \
          round(sum(total_ms_sum) / greatest(sum(success_requests), 1), 1) as avg_total_ms, \
          round(sum(cost_usd_sum), 6) as cost_usd, \
          round(sum(energy_wh_sum), 6) as energy_wh, \
          round(sum(energy_cost_usd_sum), 6) as energy_cost_usd, \
          round(sum(co2_g_sum), 6) as co2_g, \
-         sum(platform_error_requests) \
+         sum(platform_error_requests), \
+         sum({DAILY_TTFT_REQUESTS}) \
          from (select * from usage_daily{}) {group_clause}",
         inner.sql()
     );
@@ -2268,6 +2276,15 @@ pub async fn query_usage_daily(
         .fetch_all::<UsageDailyRow>()
         .await
 }
+
+/// A daily rollup row's first-token request count. Rows rolled up before
+/// v2.13 summed first-token times over every answered request and counted
+/// none, so they divide by their answered requests, as they were read then.
+/// On the upgrade day a merge can join an old and a new row of one key and
+/// model; that day's average for them leans high, and the days after are
+/// exact.
+const DAILY_TTFT_REQUESTS: &str =
+    "if(ttft_requests = 0 and ttft_ms_sum > 0, success_requests, ttft_requests)";
 
 /// `usage` day-partition ids (`YYYYMMDD`) strictly older than
 /// `cutoff_yyyymmdd`. Used by the retention worker and manual compact to drop
@@ -3158,7 +3175,7 @@ mod alias_tests {
 /// (e.g. `http://127.0.0.1:18123`); without it this returns early. Works in
 /// its own uniquely named database and drops only that database.
 #[cfg(test)]
-mod key_watch_clickhouse_tests {
+mod clickhouse_tests {
     use super::*;
     use obleth_config::{KeyRejection, KeyRejectionReason, UsageRecord};
 
@@ -3286,6 +3303,119 @@ mod key_watch_clickhouse_tests {
         assert_eq!(rejections[0].count, 3);
         assert_eq!(rejections[0].reason, "ip_not_allowed");
         assert_eq!(rejections[0].sample_user_agent, "bot/1");
+
+        client
+            .query(&format!("DROP DATABASE IF EXISTS {database}"))
+            .execute()
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Streamed, buffered, failed and cached replies of one model: the
+    /// Overview totals, the model reads and the daily rollup all average
+    /// first token over the same two requests.
+    #[tokio::test]
+    async fn every_first_token_average_counts_the_same_requests() {
+        let Ok(url) = std::env::var("OBLETH_TEST_CLICKHOUSE_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_CLICKHOUSE_URL to run");
+            return;
+        };
+        let database = format!("obleth_test_{}", Uuid::new_v4().simple());
+        let dir = std::env::temp_dir().join(format!("obleth-ttft-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sink = obleth_telemetry::TelemetrySink::start(
+            &url,
+            &database,
+            "default",
+            "",
+            dir.join("usage.wal").to_str().unwrap(),
+            std::time::Duration::from_millis(50),
+            true,
+        )
+        .await
+        .expect("sink");
+        let key = Uuid::new_v4();
+        let now = now_ms();
+        let reply = |ttft_ms: u32, streamed: bool, status_code: u16, cache: &str| {
+            let mut rec = usage(key, now - 60_000, "203.0.113.9", "203.0.113.0/24", "DE");
+            rec.model = "t".into();
+            rec.ttft_ms = ttft_ms;
+            rec.total_ms = 2_000;
+            rec.streamed = streamed;
+            rec.status_code = status_code;
+            rec.cache_status = cache.into();
+            rec
+        };
+        // Counted: two streamed answers.
+        sink.record(reply(200, true, 200, "miss"));
+        sink.record(reply(400, true, 200, "miss"));
+        // Not counted: a buffered answer, a failure and a cache hit.
+        sink.record(reply(0, false, 200, "miss"));
+        sink.record(reply(1_500, true, 502, "miss"));
+        sink.record(reply(5, true, 200, "hit"));
+        sink.shutdown().await;
+        let client = clickhouse::Client::default()
+            .with_url(&url)
+            .with_database(&database);
+
+        let q = |extra: serde_json::Value| -> UsageQuery {
+            let mut v = serde_json::json!({ "since_ms": now - 3_600_000, "model": "t" });
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(v).unwrap()
+        };
+        let totals = query_usage_totals(&client, &q(serde_json::json!({})))
+            .await
+            .unwrap();
+        assert_eq!(totals.requests, 5);
+        assert_eq!(totals.avg_ttft_ms, 300.0);
+        assert_eq!(totals.p50_ttft_ms, 300.0);
+        let model = query_usage_by_model(&client, q(serde_json::json!({})))
+            .await
+            .unwrap();
+        assert_eq!(model[0].avg_ttft_ms, 300.0);
+        let series: UsageSeriesQuery = serde_json::from_value(serde_json::json!({
+            "since_ms": now - 3_600_000, "model": "t", "bucket_ms": 3_600_000,
+        }))
+        .unwrap();
+        let series = query_usage_series_by_model(&client, series).await.unwrap();
+        let avg: Vec<f64> = series
+            .iter()
+            .filter(|p| p.requests > 0)
+            .map(|p| p.avg_ttft_ms)
+            .collect();
+        assert_eq!(avg, vec![300.0]);
+        let today = chrono::Utc::now().date_naive();
+        let daily: UsageDailyQuery = serde_json::from_value(serde_json::json!({
+            "start_day": (today - chrono::Days::new(1)).to_string(),
+            "end_day": today.to_string(),
+            "group_by": "model",
+        }))
+        .unwrap();
+        let daily = query_usage_daily(&client, daily).await.unwrap();
+        assert_eq!(daily.len(), 1, "{daily:?}");
+        assert_eq!((daily[0].avg_ttft_ms, daily[0].ttft_requests), (300.0, 2));
+
+        // A day rolled up before the count existed divides by its answered
+        // requests, as it was read then.
+        client
+            .query(
+                "insert into usage_daily (day, tenant_id, key_id, model, requests, \
+                 success_requests, ttft_ms_sum) values (toDate('2026-01-01'), \
+                 toUUID('00000000-0000-0000-0000-000000000000'), toUUID(?), 'old', 4, 4, 2000)",
+            )
+            .bind(key.to_string())
+            .execute()
+            .await
+            .unwrap();
+        let old: UsageDailyQuery = serde_json::from_value(serde_json::json!({
+            "start_day": "2026-01-01", "end_day": "2026-01-01", "group_by": "model",
+        }))
+        .unwrap();
+        let old = query_usage_daily(&client, old).await.unwrap();
+        assert_eq!((old[0].avg_ttft_ms, old[0].ttft_requests), (500.0, 4));
 
         client
             .query(&format!("DROP DATABASE IF EXISTS {database}"))

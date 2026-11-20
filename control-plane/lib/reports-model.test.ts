@@ -40,6 +40,13 @@ describe("totals", () => {
     expect(t.avgTtftMs).toBe(500);
   });
 
+  it("weights first token by the requests that had one, when the gateway counts them", () => {
+    // Nine succeeded but only one streamed a first token: buffered replies have none.
+    const t = totals([row({ ttft_requests: 1, avg_ttft_ms: 400 }), row({ ttft_requests: 3, avg_ttft_ms: 800 })]);
+    expect(t.avgTtftMs).toBe(700);
+    expect(totals([row({ ttft_requests: 0, avg_ttft_ms: 0 })]).avgTtftMs).toBe(0);
+  });
+
   it("words a change against the period before", () => {
     expect(change(118, 100, "before")).toBe("▲ 18% vs before");
     expect(change(95, 100, "before")).toBe("▼ 5.0% vs before");
