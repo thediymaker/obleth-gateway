@@ -38,6 +38,7 @@
 //!   reasoning-until-`</think>` state and mislabel all of it.
 
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1475,6 +1476,228 @@ async fn precommit_stream(
     }
 }
 
+/// Most verified spans waiting for the stream to release them; past this the
+/// verification task waits, and so stops reading the draft.
+const VERIFIED_SPANS_BUFFERED: usize = 4;
+
+/// What the verification task sends the stream.
+enum Verified<S> {
+    /// The next verified deltas, in order.
+    Span(Vec<String>),
+    /// How the draft ended; nothing follows.
+    End(Box<Ended<S>>),
+}
+
+/// How a committed draft ended, with what the stream needs to finish.
+struct Ended<S> {
+    /// The complete draft passed its final verify: ship it, releasing `tail`
+    /// after the spans already sent. `None`: escalate.
+    ship: Option<Score>,
+    tail: Vec<String>,
+    /// The drafter's reported usage.
+    usage: Option<UpstreamUsage>,
+    /// Deltas the drafter wrote, for billing a draft that reported no usage.
+    drafted: usize,
+    scorer: S,
+}
+
+/// Where the committed draft stands when the task takes it over.
+struct SpanPlan {
+    gate: Gate,
+    chunk_tokens: usize,
+    /// Delta count at the last verification.
+    last_check: usize,
+    /// Deltas already handed to the stream.
+    sent: usize,
+}
+
+/// A draft being read: [`DraftReader`], or a stand-in in tests.
+trait DraftSource: Send {
+    /// Read at least one more event; false once the stream is exhausted.
+    fn advance(&mut self) -> impl std::future::Future<Output = anyhow::Result<bool>> + Send;
+    fn deltas(&self) -> &[String];
+    fn done(&self) -> bool;
+    /// The drafter finished its answer (`finish_reason: stop`).
+    fn stopped(&self) -> bool;
+    fn usage(&self) -> Option<UpstreamUsage>;
+}
+
+impl DraftSource for DraftReader {
+    fn advance(&mut self) -> impl std::future::Future<Output = anyhow::Result<bool>> + Send {
+        DraftReader::advance(self)
+    }
+    fn deltas(&self) -> &[String] {
+        &self.deltas
+    }
+    fn done(&self) -> bool {
+        self.done
+    }
+    fn stopped(&self) -> bool {
+        self.finish.as_deref() == Some("stop")
+    }
+    fn usage(&self) -> Option<UpstreamUsage> {
+        self.usage
+    }
+}
+
+/// Scores a draft's text: [`Scoring`], or a stand-in in tests.
+trait SpanScorer: Send {
+    fn score(
+        &mut self,
+        text: &str,
+    ) -> impl std::future::Future<Output = anyhow::Result<Score>> + Send;
+}
+
+/// The verifier with what its calls need, owned by the verification task.
+struct Scoring {
+    verifier: Verifier,
+    state: AppState,
+    messages: Value,
+}
+
+impl SpanScorer for Scoring {
+    fn score(
+        &mut self,
+        text: &str,
+    ) -> impl std::future::Future<Output = anyhow::Result<Score>> + Send {
+        self.verifier.score(&self.state, &self.messages, text)
+    }
+}
+
+/// Aborts a spawned task when dropped, so a stream the client abandoned
+/// leaves no work running.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// The committed draft's verification: keep reading the draft, score it at
+/// each chunk boundary, and send each span that passes; then verify the
+/// complete draft and send how it ended. A span that aborts, a failed read or
+/// score, or a final verify that fails ends it with an escalation. The draft
+/// stream is dropped before the end is sent, which stops the drafter.
+async fn verify_spans<D: DraftSource, S: SpanScorer>(
+    mut draft: D,
+    mut scorer: S,
+    plan: SpanPlan,
+    draft_done: Arc<AtomicBool>,
+    tx: tokio::sync::mpsc::Sender<Verified<S>>,
+) {
+    let SpanPlan {
+        gate,
+        chunk_tokens,
+        mut last_check,
+        mut sent,
+    } = plan;
+    let mut gate_dead = false;
+    while !draft.done() && !gate_dead {
+        if let Err(e) = draft.advance().await {
+            tracing::info!(error = %e, "speculation draft stream failed mid-release");
+            gate_dead = true;
+            break;
+        }
+        if draft.done() {
+            draft_done.store(true, Ordering::Relaxed);
+        }
+        let drafted = draft.deltas().len();
+        let boundary = drafted - last_check >= chunk_tokens.max(1);
+        if !boundary && !draft.done() {
+            continue;
+        }
+        if drafted == last_check {
+            continue; // done, nothing new since the last score
+        }
+        last_check = drafted;
+        if draft.done() {
+            break; // the final verify below handles the complete draft
+        }
+        let text: String = draft.deltas().concat();
+        match scorer.score(&text).await {
+            Ok(score) => match zone(&gate, score.agree, score.mean_lp) {
+                Zone::Pass => {
+                    let span = draft.deltas()[sent..last_check].to_vec();
+                    sent = last_check;
+                    if tx.send(Verified::Span(span)).await.is_err() {
+                        return; // the stream is gone
+                    }
+                }
+                Zone::Abort => {
+                    tracing::info!(
+                        agree = score.agree,
+                        mean_lp = score.mean_lp,
+                        n = score.n_draft,
+                        "speculation chunk abort mid-stream"
+                    );
+                    gate_dead = true;
+                }
+                // Post-release defers just wait for the draft to grow: the
+                // final verify decides.
+                Zone::Defer => {}
+            },
+            Err(e) => {
+                tracing::info!(error = %e, "speculation verify failed mid-stream");
+                gate_dead = true;
+            }
+        }
+    }
+
+    // Final verify over the complete draft. A COMPLETE draft above the abort
+    // floors with content already released is SHIPPED ("soft ship"): handing
+    // the target a finished document to continue because it missed the gate
+    // by a hair makes it ramble corrections.
+    let mut ship = None;
+    if !gate_dead {
+        let text: String = draft.deltas().concat();
+        if !text.trim().is_empty() && draft.stopped() {
+            match scorer.score(&text).await {
+                Ok(score) => {
+                    let pass = score.agree >= gate.agree_min && score.mean_lp >= gate.lp_min;
+                    let soft = sent > 0
+                        && score.agree >= gate.abort_agree
+                        && score.mean_lp >= gate.abort_lp;
+                    if pass || soft {
+                        if soft && !pass {
+                            tracing::info!(
+                                agree = score.agree,
+                                mean_lp = score.mean_lp,
+                                n = score.n_draft,
+                                "speculation soft ship"
+                            );
+                        }
+                        ship = Some(score);
+                    } else {
+                        tracing::info!(
+                            agree = score.agree,
+                            mean_lp = score.mean_lp,
+                            n = score.n_draft,
+                            "speculation final gate fail"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::info!(error = %e, "speculation final verify failed");
+                }
+            }
+        }
+    }
+    let ended = Ended {
+        tail: if ship.is_some() {
+            draft.deltas()[sent..].to_vec()
+        } else {
+            Vec::new()
+        },
+        ship,
+        usage: draft.usage(),
+        drafted: draft.deltas().len(),
+        scorer,
+    };
+    drop(draft); // disconnect aborts any still-running draft generation
+    let _ = tx.send(Verified::End(Box::new(ended))).await;
+}
+
 /// The committed streaming driver: release verified spans paced, keep
 /// verifying the growing draft, soft-ship or escalate mid-stream at the end.
 fn drive_stream(
@@ -1482,7 +1705,7 @@ fn drive_stream(
     plan: SpeculationPlan,
     gate: Gate,
     drafter: Arc<ResolvedModel>,
-    mut verifier: Verifier,
+    verifier: Verifier,
     committed: Committed,
     stats: Arc<Mutex<SpecStats>>,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
@@ -1496,7 +1719,7 @@ fn drive_stream(
 
     Box::pin(async_stream::stream! {
         let s = plan.settings.clone();
-        let Committed { mut reader, mut last_check, release_upto } = committed;
+        let Committed { reader, last_check, release_upto } = committed;
         let id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
         let created = crate::tracer::now_ms() / 1000;
         let model_name = route.model_name.clone();
@@ -1525,159 +1748,116 @@ fn drive_stream(
             })
         )));
 
-        // Paced release of buffered deltas — `yield` cannot live inside a
-        // nested macro (async_stream rewrites yields before macro expansion),
-        // so the release loop is inlined at each site.
-        while released < release_upto {
-            let d = reader.deltas[released].clone();
-            released += 1;
-            if !ttft_set {
-                ttft_set = true;
-                if let Ok(mut st) = stats.lock() {
-                    st.ttft_ms = started.elapsed().as_millis() as u32;
+        // Drafting and verification run in their own task, which sends each
+        // verified span here as it passes; this stream only paces them out,
+        // so verifying the next span overlaps releasing this one. Dropping
+        // the stream (the client went away) aborts the task.
+        let draft_done = Arc::new(AtomicBool::new(reader.done));
+        let mut pending: std::collections::VecDeque<String> =
+            reader.deltas[..release_upto].iter().cloned().collect();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(VERIFIED_SPANS_BUFFERED);
+        let _worker = AbortOnDrop(tokio::spawn(verify_spans(
+            reader,
+            Scoring {
+                verifier,
+                state: state.clone(),
+                messages: plan.messages.clone(),
+            },
+            SpanPlan {
+                gate,
+                chunk_tokens: s.chunk_tokens as usize,
+                last_check,
+                sent: release_upto,
+            },
+            draft_done.clone(),
+            tx,
+        )));
+        let mut released_text = String::new();
+        // Paced release — `yield` cannot live inside a nested macro or a
+        // helper (async_stream rewrites yields before macro expansion), so
+        // the release loop is written out at each site.
+        let ended = loop {
+            while let Some(d) = pending.pop_front() {
+                released += 1;
+                if !ttft_set {
+                    ttft_set = true;
+                    if let Ok(mut st) = stats.lock() {
+                        st.ttft_ms = started.elapsed().as_millis() as u32;
+                    }
+                }
+                yield Ok(Bytes::from(content_chunk(&id, &model_name, created, &d)));
+                released_text.push_str(&d);
+                let pace = if draft_done.load(Ordering::Relaxed) { s.pace_ms / 3 } else { s.pace_ms };
+                if pace > 0 {
+                    tokio::time::sleep(Duration::from_millis(pace)).await;
                 }
             }
-            yield Ok(Bytes::from(content_chunk(&id, &model_name, created, &d)));
-            let pace = if reader.done { s.pace_ms / 3 } else { s.pace_ms };
-            if pace > 0 {
-                tokio::time::sleep(Duration::from_millis(pace)).await;
+            match rx.recv().await {
+                Some(Verified::Span(span)) => pending.extend(span),
+                Some(Verified::End(ended)) => break Some(*ended),
+                None => break None,
             }
-        }
+        };
+        let Some(Ended { ship, tail, usage: draft_usage, drafted, scorer }) = ended else {
+            // The task ended without an outcome (it panicked): the answer
+            // stops short, as a broken-off continuation does.
+            tracing::warn!(model = %model_name, "speculation verification ended without an outcome");
+            if let Ok(mut st) = stats.lock() {
+                st.usage = UpstreamUsage::uncached(0, released as u32);
+                st.final_set = true;
+                st.failure = Some(DEFAULT_FAILURE_STATUS);
+            }
+            yield Err(stream_cut_error());
+            return;
+        };
+        let verifier = scorer.verifier;
 
-        // Continue drafting + verifying until the draft completes or dies.
-        let mut gate_dead = false;
-        while !reader.done && !gate_dead {
-            match reader.advance().await {
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::info!(error = %e, "speculation draft stream failed mid-release");
-                    gate_dead = true;
-                    break;
+        // The complete draft passed its final verify (or, with content
+        // already released, cleared the abort floors: a "soft ship"): send
+        // the rest of it and close.
+        if let Some(score) = ship {
+            for d in tail {
+                yield Ok(Bytes::from(content_chunk(&id, &model_name, created, &d)));
+                if s.pace_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(s.pace_ms / 3)).await;
                 }
             }
-            let boundary = reader.deltas.len() - last_check >= (s.chunk_tokens as usize).max(1);
-            if !boundary && !reader.done {
-                continue;
+            let input = verifier.prefix_len();
+            let output = score.n_draft as u32;
+            tracing::info!(
+                agree = score.agree, mean_lp = score.mean_lp, n = score.n_draft,
+                t_ms = started.elapsed().as_millis() as u64,
+                model = %model_name,
+                "speculation shipped (stream)"
+            );
+            bill_draft(&breq, &drafter, draft_usage);
+            bill_verify(&breq, &verifier);
+            yield Ok(Bytes::from(finish_chunk(&id, &model_name, created, None)));
+            let usage = UpstreamUsage::uncached(input, output);
+            if plan.include_usage {
+                yield Ok(Bytes::from(usage_chunk(&id, &model_name, created, usage)));
             }
-            if reader.deltas.len() == last_check {
-                continue; // done, nothing new since the last score
+            yield Ok(Bytes::from(done()));
+            if let Ok(mut st) = stats.lock() {
+                st.usage = usage;
+                st.final_set = true;
             }
-            last_check = reader.deltas.len();
-            if reader.done {
-                break; // the final verify below handles the complete draft
-            }
-            let text: String = reader.deltas.concat();
-            match verifier.score(&state, &plan.messages, &text).await {
-                Ok(score) => match zone(&gate, score.agree, score.mean_lp) {
-                    Zone::Pass => {
-                        while released < last_check {
-                            let d = reader.deltas[released].clone();
-                            released += 1;
-                            yield Ok(Bytes::from(content_chunk(&id, &model_name, created, &d)));
-                            let pace = if reader.done { s.pace_ms / 3 } else { s.pace_ms };
-                            if pace > 0 {
-                                tokio::time::sleep(Duration::from_millis(pace)).await;
-                            }
-                        }
-                    }
-                    Zone::Abort => {
-                        tracing::info!(
-                            agree = score.agree, mean_lp = score.mean_lp, n = score.n_draft,
-                            "speculation chunk abort mid-stream"
-                        );
-                        gate_dead = true;
-                    }
-                    // Post-release defers just wait for the draft to grow: the
-                    // final verify decides.
-                    Zone::Defer => {}
-                },
-                Err(e) => {
-                    tracing::info!(error = %e, "speculation verify failed mid-stream");
-                    gate_dead = true;
-                }
-            }
+            return;
         }
-
-        // Final verify over the complete draft. A COMPLETE draft above the
-        // abort floors with content already released is SHIPPED ("soft ship"):
-        // handing the target a finished document to continue because it missed
-        // the gate by a hair makes it ramble corrections.
-        if !gate_dead {
-            let text: String = reader.deltas.concat();
-            if !text.trim().is_empty() && reader.finish.as_deref() == Some("stop") {
-                match verifier.score(&state, &plan.messages, &text).await {
-                    Ok(score) => {
-                        let pass = score.agree >= gate.agree_min && score.mean_lp >= gate.lp_min;
-                        let soft = released > 0
-                            && score.agree >= gate.abort_agree
-                            && score.mean_lp >= gate.abort_lp;
-                        if pass || soft {
-                            if soft && !pass {
-                                tracing::info!(
-                                    agree = score.agree, mean_lp = score.mean_lp, n = score.n_draft,
-                                    "speculation soft ship"
-                                );
-                            }
-                            while released < reader.deltas.len() {
-                                let d = reader.deltas[released].clone();
-                                released += 1;
-                                yield Ok(Bytes::from(content_chunk(&id, &model_name, created, &d)));
-                                if s.pace_ms > 0 {
-                                    tokio::time::sleep(Duration::from_millis(s.pace_ms / 3)).await;
-                                }
-                            }
-                            let input = verifier.prefix_len();
-                            let output = score.n_draft as u32;
-                            tracing::info!(
-                                agree = score.agree, mean_lp = score.mean_lp, n = score.n_draft,
-                                t_ms = started.elapsed().as_millis() as u64,
-                                model = %model_name,
-                                "speculation shipped (stream)"
-                            );
-                            bill_draft(&breq, &drafter, reader.usage);
-                            bill_verify(&breq, &verifier);
-                            yield Ok(Bytes::from(finish_chunk(&id, &model_name, created, None)));
-                            let usage = UpstreamUsage::uncached(input, output);
-                            if plan.include_usage {
-                                yield Ok(Bytes::from(usage_chunk(&id, &model_name, created, usage)));
-                            }
-                            yield Ok(Bytes::from(done()));
-                            if let Ok(mut st) = stats.lock() {
-                                st.usage = usage;
-                                st.final_set = true;
-                            }
-                            return;
-                        }
-                        tracing::info!(
-                            agree = score.agree, mean_lp = score.mean_lp, n = score.n_draft,
-                            "speculation final gate fail"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::info!(error = %e, "speculation final verify failed");
-                    }
-                }
-            }
-            gate_dead = true;
-        }
-        let _ = gate_dead;
 
         // --- mid-stream escalation -----------------------------------------
         // Content is already on the wire, so the target model CONTINUES the
         // released verified prefix through its chat template. The template
         // renders the continued message after a CLOSED think block, but
         // streaming reasoning parsers mislabel the continuation as reasoning —
-        // remap those deltas to content deterministically.
+        // remap those deltas to content deterministically. The task already
+        // dropped the draft stream, which aborts the drafter's generation.
         bill_draft(
             &breq,
             &drafter,
-            reader
-                .usage
-                .or(Some(UpstreamUsage::uncached(0, reader.deltas.len() as u32))),
+            draft_usage.or(Some(UpstreamUsage::uncached(0, drafted as u32))),
         );
         bill_verify(&breq, &verifier);
-        let released_text: String = reader.deltas[..released].concat();
-        drop(reader); // disconnect aborts any still-running draft generation
         tracing::info!(
             released_chars = released_text.len(),
             model = %model_name,
@@ -1983,6 +2163,207 @@ mod tests {
             draft_model: Some("drafter".into()),
             ..Default::default()
         }
+    }
+
+    /// A drafter writing one delta per millisecond.
+    struct FakeDraft {
+        deltas: Vec<String>,
+        total: usize,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl DraftSource for FakeDraft {
+        async fn advance(&mut self) -> anyhow::Result<bool> {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            if self.deltas.len() < self.total {
+                self.deltas.push(format!("t{} ", self.deltas.len()));
+            }
+            Ok(true)
+        }
+        fn deltas(&self) -> &[String] {
+            &self.deltas
+        }
+        fn done(&self) -> bool {
+            self.deltas.len() >= self.total
+        }
+        fn stopped(&self) -> bool {
+            true
+        }
+        fn usage(&self) -> Option<UpstreamUsage> {
+            Some(UpstreamUsage::uncached(10, self.deltas.len() as u32))
+        }
+    }
+
+    impl Drop for FakeDraft {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A scorer that takes `ms` per call and answers `(agree, mean_lp)` for
+    /// each call in turn, then the last one.
+    struct FakeScorer {
+        ms: u64,
+        answers: Vec<(f64, f64)>,
+        calls: usize,
+    }
+
+    impl SpanScorer for FakeScorer {
+        fn score(
+            &mut self,
+            text: &str,
+        ) -> impl std::future::Future<Output = anyhow::Result<Score>> + Send {
+            let (agree, mean_lp) = self.answers[self.calls.min(self.answers.len() - 1)];
+            self.calls += 1;
+            let n_draft = text.split_whitespace().count();
+            let ms = self.ms;
+            async move {
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                Ok(Score {
+                    agree,
+                    mean_lp,
+                    n_draft,
+                })
+            }
+        }
+    }
+
+    /// Run the verification task over a committed draft of `total` deltas
+    /// (the first 50 already verified) and release what it sends at `pace`
+    /// ms a delta, as the stream does. Returns the released deltas, the
+    /// longest gap between two releases, and how it ended.
+    async fn pipeline(
+        total: usize,
+        answers: Vec<(f64, f64)>,
+        pace: u64,
+    ) -> (
+        Vec<String>,
+        Duration,
+        Option<Ended<FakeScorer>>,
+        Arc<AtomicBool>,
+    ) {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let draft = FakeDraft {
+            deltas: (0..50).map(|i| format!("t{i} ")).collect(),
+            total,
+            dropped: dropped.clone(),
+        };
+        let mut pending: std::collections::VecDeque<String> =
+            draft.deltas.iter().cloned().collect();
+        let draft_done = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(VERIFIED_SPANS_BUFFERED);
+        let _worker = AbortOnDrop(tokio::spawn(verify_spans(
+            draft,
+            FakeScorer {
+                ms: 300,
+                answers,
+                calls: 0,
+            },
+            SpanPlan {
+                gate: Gate::global(&settings()),
+                chunk_tokens: 50,
+                last_check: 50,
+                sent: 50,
+            },
+            draft_done.clone(),
+            tx,
+        )));
+        let (mut released, mut gap, mut last) =
+            (Vec::new(), Duration::ZERO, tokio::time::Instant::now());
+        let ended = loop {
+            while let Some(d) = pending.pop_front() {
+                gap = gap.max(last.elapsed());
+                last = tokio::time::Instant::now();
+                released.push(d);
+                let pace = if draft_done.load(Ordering::Relaxed) {
+                    pace / 3
+                } else {
+                    pace
+                };
+                tokio::time::sleep(Duration::from_millis(pace)).await;
+            }
+            match rx.recv().await {
+                Some(Verified::Span(span)) => pending.extend(span),
+                Some(Verified::End(ended)) => break Some(*ended),
+                None => break None,
+            }
+        };
+        (released, gap, ended, dropped)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn verification_of_the_next_span_overlaps_releasing_this_one() {
+        // 300 ms a score, 9 ms a delta: one span of 50 takes 450 ms to send,
+        // so the next is verified before the stream needs it.
+        let (released, gap, ended, dropped) = pipeline(200, vec![(0.9, -0.2)], 9).await;
+        let ended = ended.expect("an outcome");
+        assert!(ended.ship.is_some(), "a passing draft ships");
+        assert_eq!(released.len(), 150, "every verified span went out");
+        assert_eq!(ended.tail.len(), 50);
+        assert_eq!(ended.drafted, 200);
+        // Scored at 100 and 150 deltas, then the complete draft.
+        assert_eq!(ended.scorer.calls, 3);
+        assert!(
+            gap < Duration::from_millis(50),
+            "a release waited on verification: {gap:?}"
+        );
+        assert!(dropped.load(Ordering::SeqCst), "the draft stream is closed");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_abort_escalates_after_the_spans_that_passed() {
+        // The first span after the commit passes, the second aborts.
+        let (released, _, ended, _) = pipeline(400, vec![(0.9, -0.2), (0.1, -5.0)], 9).await;
+        let ended = ended.expect("an outcome");
+        assert!(ended.ship.is_none(), "an abort escalates");
+        assert!(ended.tail.is_empty());
+        assert_eq!(
+            released.len(),
+            100,
+            "the committed span and the one that passed"
+        );
+        assert_eq!(ended.scorer.calls, 2);
+        // A complete draft below the ship gate but above the abort floors
+        // ships softly, as content is already out.
+        let gate = Gate::global(&settings());
+        let soft = ((gate.agree_min + gate.abort_agree) / 2.0, gate.lp_min);
+        let (_, _, ended, _) = pipeline(60, vec![soft], 9).await;
+        assert!(ended.expect("an outcome").ship.is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_the_stream_stops_the_verification_task() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = tokio::sync::mpsc::channel(VERIFIED_SPANS_BUFFERED);
+        let worker = AbortOnDrop(tokio::spawn(verify_spans(
+            FakeDraft {
+                deltas: vec!["t ".into(); 50],
+                total: 100_000,
+                dropped: dropped.clone(),
+            },
+            FakeScorer {
+                ms: 300,
+                answers: vec![(0.9, -0.2)],
+                calls: 0,
+            },
+            SpanPlan {
+                gate: Gate::global(&settings()),
+                chunk_tokens: 50,
+                last_check: 50,
+                sent: 50,
+            },
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        )));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!dropped.load(Ordering::SeqCst), "still drafting");
+        drop(rx);
+        drop(worker);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the task ended and closed the draft"
+        );
     }
 
     #[test]
