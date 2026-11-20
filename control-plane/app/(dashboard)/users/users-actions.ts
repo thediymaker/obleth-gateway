@@ -4,7 +4,7 @@ import { revalidatePath } from "next/cache";
 import { z } from "zod";
 import { requireAdmin } from "@/lib/auth/roles";
 import { assignUser, setUserStatus, type UserChangeResult } from "@/lib/auth/users";
-import type { ActionResult } from "@/app/actions";
+import { actionError, type ActionResult } from "@/lib/action-result";
 
 const assignSchema = z.object({
   id: z.string().min(1),
@@ -27,31 +27,31 @@ function changeResult(result: UserChangeResult): ActionResult {
   return { ok: true };
 }
 
-export async function assignUserAction(formData: FormData): Promise<ActionResult> {
+const statusSchema = z.object({
+  id: z.string().trim().min(1, "Missing user id"),
+  status: z.enum(["active", "pending"]),
+});
+
+/** Give a user a role and a tenant ("" for none). */
+export async function assignUserAction(input: { id: string; role: string; tenantId: string }): Promise<ActionResult> {
   const caller = await requireAdmin();
   try {
-    const p = assignSchema.parse({
-      id: formData.get("id"),
-      role: formData.get("role"),
-      tenantId: formData.get("tenantId") ?? "",
-    });
+    const p = assignSchema.parse(input);
     if (p.role !== "admin" && p.id === caller.id) return { ok: false, error: SELF_REFUSAL };
     return changeResult(await assignUser(p.id, p.role, p.tenantId));
   } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : "Unexpected error" };
+    return actionError(e);
   }
 }
 
-export async function setUserStatusAction(formData: FormData): Promise<ActionResult> {
+/** Approve a user, or send them back to waiting for approval. */
+export async function setUserStatusAction(id: string, status: "active" | "pending"): Promise<ActionResult> {
   const caller = await requireAdmin();
   try {
-    const id = String(formData.get("id") ?? "").trim();
-    if (!id) return { ok: false, error: "Missing user id" };
-    const raw = String(formData.get("status") ?? "");
-    const status = raw === "active" ? "active" : "pending";
-    if (status !== "active" && id === caller.id) return { ok: false, error: SELF_REFUSAL };
-    return changeResult(await setUserStatus(id, status));
+    const p = statusSchema.parse({ id, status });
+    if (p.status !== "active" && p.id === caller.id) return { ok: false, error: SELF_REFUSAL };
+    return changeResult(await setUserStatus(p.id, p.status));
   } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : "Unexpected error" };
+    return actionError(e);
   }
 }

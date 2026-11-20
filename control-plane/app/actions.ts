@@ -52,18 +52,9 @@ import { countryCodes, networkLines } from "@/lib/key-networks";
 import { keyPrefixProblem } from "@/lib/key-prefix";
 import { cleanNamedNetworks, namedNetworksProblem, parseNamedNetworksField } from "@/lib/named-networks";
 import { tagsInclude } from "@/lib/utils";
+import { actionError, type ActionResult } from "@/lib/action-result";
 
-export type ActionResult =
-  | { ok: true; warnings?: string[] }
-  | { ok: false; error: string };
-
-function actionError(e: unknown): { ok: false; error: string } {
-  if (e instanceof OblethApiError) return { ok: false, error: e.message };
-  return {
-    ok: false,
-    error: e instanceof Error ? e.message : "Unexpected error",
-  };
-}
+export type { ActionResult } from "@/lib/action-result";
 
 /**
  * Run a delete and revalidate whether or not it succeeded: the Management API
@@ -415,12 +406,17 @@ export async function deleteTenantAction(id: string): Promise<ActionResult> {
   );
 }
 
-export async function setWeightAction(id: string, weight: number) {
+export async function setWeightAction(id: string, weight: number): Promise<ActionResult> {
   const session = await requireAdmin();
-  await obleth.setWeight(id, weight, { auditActor: session.email });
+  try {
+    await obleth.setWeight(id, weight, { auditActor: session.email });
+  } catch (e) {
+    return actionError(e);
+  }
   revalidatePath("/tenants");
   revalidatePath("/fairshare");
   revalidatePath("/");
+  return { ok: true };
 }
 
 /** A fairshare group's weight: its share of a full pool against the other active groups. */
@@ -752,27 +748,35 @@ export interface BulkKeyResult {
   failed: { name: string; error: string }[];
 }
 
-/** Run `task` over the chosen keys, a few at a time, collecting failures by name. */
+/**
+ * Run `task` over the chosen keys, a few at a time, collecting failures by
+ * name. The pages refresh whatever happened, even when a run fails partway.
+ */
 async function eachKey(ids: string[], task: (key: ApiKey) => Promise<void>): Promise<BulkKeyResult> {
-  const wanted = new Set(ids);
-  const keys = (await obleth.listKeys()).filter((k) => wanted.has(k.id));
   const failed: BulkKeyResult["failed"] = [];
   let done = 0;
-  for (let i = 0; i < keys.length; i += 8) {
-    await Promise.all(
-      keys.slice(i, i + 8).map(async (key) => {
-        try {
-          await task(key);
-          done += 1;
-        } catch (e) {
-          failed.push({ name: key.name || key.key_prefix, error: actionError(e).error });
-        }
-      }),
-    );
+  try {
+    const wanted = new Set(ids);
+    const keys = (await obleth.listKeys()).filter((k) => wanted.has(k.id));
+    for (let i = 0; i < keys.length; i += 8) {
+      await Promise.all(
+        keys.slice(i, i + 8).map(async (key) => {
+          try {
+            await task(key);
+            done += 1;
+          } catch (e) {
+            failed.push({ name: key.name || key.key_prefix, error: actionError(e).error });
+          }
+        }),
+      );
+    }
+  } catch (e) {
+    failed.push({ name: "all", error: actionError(e).error });
+  } finally {
+    revalidatePath("/keys");
+    revalidatePath("/tenants");
+    revalidatePath("/");
   }
-  revalidatePath("/keys");
-  revalidatePath("/tenants");
-  revalidatePath("/");
   return { done, failed };
 }
 
@@ -904,22 +908,9 @@ export async function deleteKeyAction(id: string): Promise<ActionResult> {
   );
 }
 
-export async function deleteKeysAction(
-  ids: string[],
-): Promise<{ deleted: number; failed: number }> {
+export async function deleteKeysAction(ids: string[]): Promise<BulkKeyResult> {
   const session = await requireAdmin();
-  const uniqueIds = [...new Set(ids.map((id) => String(id)).filter(Boolean))];
-  const result = await deleteKeys(uniqueIds, session.email);
-  revalidatePath("/keys");
-  revalidatePath("/");
-  return result;
-}
-
-export async function setCapacityAction(max: number) {
-  const session = await requireAdmin();
-  await obleth.setCapacity(max, { auditActor: session.email });
-  revalidatePath("/");
-  revalidatePath("/fairshare");
+  return eachKey(ids, (key) => obleth.deleteKey(key.id, { auditActor: session.email }));
 }
 
 export type CreateModelResult =
@@ -1116,21 +1107,30 @@ export async function autotuneModelAction(
     latency_headroom?: number;
     replicas?: number;
   },
-): Promise<AutotuneReport> {
+): Promise<{ ok: true; report: AutotuneReport } | { ok: false; error: string }> {
   const session = await requireAdmin();
   // Recommend-only: drives a live probe against the upstream and returns the
   // suggested capacity. Nothing is persisted here.
-  return obleth.autotuneModel(id, opts, { auditActor: session.email });
+  try {
+    return { ok: true, report: await obleth.autotuneModel(id, opts, { auditActor: session.email }) };
+  } catch (e) {
+    return actionError(e);
+  }
 }
 
 export async function applyAutotuneCapacityAction(
   id: string,
   max_in_flight: number,
-) {
+): Promise<ActionResult> {
   const session = await requireAdmin();
-  await obleth.applyAutotuneCapacity(id, max_in_flight, { auditActor: session.email });
+  try {
+    await obleth.applyAutotuneCapacity(id, max_in_flight, { auditActor: session.email });
+  } catch (e) {
+    return actionError(e);
+  }
   revalidatePath("/models");
   revalidatePath("/fairshare");
+  return { ok: true };
 }
 
 export async function deleteModelAction(id: string): Promise<ActionResult> {
@@ -1742,8 +1742,7 @@ export async function restoreBackupAction(
     revalidatePath("/settings");
     return { ok: true, report };
   } catch (e) {
-    const err = actionError(e);
-    return err.ok ? { ok: false, error: "Unexpected error" } : err;
+    return actionError(e);
   }
 }
 
@@ -1842,8 +1841,7 @@ export async function applyModelManifestAction(
     }
     return { ok: true, report };
   } catch (e) {
-    const err = actionError(e);
-    return err.ok ? { ok: false, error: "Unexpected error" } : err;
+    return actionError(e);
   }
 }
 
@@ -2421,26 +2419,6 @@ export async function testAlertAction(): Promise<
   } catch (e) {
     return actionError(e);
   }
-}
-
-async function deleteKeys(
-  ids: string[],
-  auditActor: string,
-): Promise<{ deleted: number; failed: number }> {
-  let deleted = 0;
-  let failed = 0;
-  const chunkSize = 25;
-  for (let i = 0; i < ids.length; i += chunkSize) {
-    const chunk = ids.slice(i, i + chunkSize);
-    const results = await Promise.allSettled(
-      chunk.map((id) => obleth.deleteKey(id, { auditActor })),
-    );
-    for (const result of results) {
-      if (result.status === "fulfilled") deleted += 1;
-      else failed += 1;
-    }
-  }
-  return { deleted, failed };
 }
 
 function numOr(v: FormDataEntryValue | null, fallback: number): number {

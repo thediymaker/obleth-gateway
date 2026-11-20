@@ -48,8 +48,7 @@ describe("users", () => {
     await act(async () => root.render(<UsersList users={users} tenants={[{ id: "t1", name: "rcusers" }]} me="me" />));
     const approve = [...host.querySelectorAll("button")].find((b) => b.textContent === "Approve")!;
     await act(async () => approve.click());
-    const fd = vi.mocked(assignUserAction).mock.calls[0][0];
-    expect([fd.get("id"), fd.get("role"), fd.get("tenantId")]).toEqual(["u4", "user", ""]);
+    expect(assignUserAction).toHaveBeenCalledWith({ id: "u4", role: "user", tenantId: "" });
     await act(async () => [...host.querySelectorAll("button")].find((b) => b.textContent === "Not now")!.click());
     expect(host.querySelector('[aria-label="Waiting for approval"]')!.textContent).not.toContain("kchen18@asu.edu");
   });

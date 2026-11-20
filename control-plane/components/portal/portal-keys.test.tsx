@@ -75,9 +75,7 @@ it("turns the key off once confirmed", async () => {
   await act(async () => button("Disable")!.click());
   await act(async () => button("Turn off")!.click());
   expect(disablePortalKey).toHaveBeenCalledTimes(1);
-  const data = vi.mocked(disablePortalKey).mock.calls[0][0];
-  expect(data.get("id")).toBe("k1");
-  expect(data.get("disabled")).toBe("true");
+  expect(disablePortalKey).toHaveBeenCalledWith("k1");
 });
 
 it("shows the action's error on the key's row", async () => {

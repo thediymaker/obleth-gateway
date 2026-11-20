@@ -2,7 +2,9 @@ import { act, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { applyAutotuneCapacityAction, autotuneModelAction } from "@/app/actions";
 import {
+  AutotuneButton,
   CapacityDiscoveryFields,
   CapacityDiscoveryStatus,
   capacityInFlight,
@@ -325,5 +327,29 @@ describe("the discovered capacity mode", () => {
     expect(host.textContent).toContain("stale");
     expect(host.textContent).toContain("keeping the last discovered value");
     expect(host.textContent).not.toContain("gateways");
+  });
+});
+
+describe("auto-tune", () => {
+  it("shows a refused apply in the dialog instead of throwing", async () => {
+    vi.mocked(autotuneModelAction).mockResolvedValue({
+      ok: true,
+      report: {
+        recommended_max_in_flight: 12, recommended_throughput_rps: 4, baseline_p99_ms: 900,
+        latency_ceiling_ms: 3600, latency_headroom: 4, knee_reason: "plateau", steps: [],
+      } as never,
+    });
+    vi.mocked(applyAutotuneCapacityAction).mockResolvedValue({ ok: false, error: "max_in_flight is above the model's ceiling" });
+    await act(async () => root.render(<AutotuneButton model={model()} />));
+    const click = async (text: string) => {
+      const b = [...document.body.querySelectorAll("button")].find((x) => x.textContent?.includes(text));
+      await act(async () => b!.click());
+    };
+    await click("Auto-tune");
+    await click("Run probe");
+    await click("Apply 12 slots");
+    expect(applyAutotuneCapacityAction).toHaveBeenCalledWith("u", 12);
+    expect(document.body.textContent).toContain("max_in_flight is above the model's ceiling");
+    expect(document.body.textContent).toContain("Apply 12 slots");
   });
 });

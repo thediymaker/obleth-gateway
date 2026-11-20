@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useState, useTransition } from "react"
 import { usePathname, useRouter } from "next/navigation";
 import { Plus, Search } from "lucide-react";
 import { deleteKeysAction, setKeysDisabledAction } from "@/app/actions";
-import { BudgetDialog, MoveDialog, NewKeySheet } from "@/components/access/key-dialogs";
+import { BudgetDialog, bulkFailures, MoveDialog, NewKeySheet } from "@/components/access/key-dialogs";
 import { KeyPanel } from "@/components/access/key-panel";
 import { BudgetBar, SecretBanner, StateDot } from "@/components/access/ui";
 import { Notice, Tile } from "@/components/models/ui";
@@ -124,7 +124,7 @@ export function KeysList({
         if (!ok) return;
       }
       const res = await setKeysDisabledAction([...selected], disabled);
-      setNotice(`Turned ${disabled ? "off" : "on"} ${res.done} key${res.done === 1 ? "" : "s"}.${res.failed.length ? ` ${res.failed.length} failed: ${res.failed.map((f) => f.name).join(", ")}` : ""}`);
+      setNotice(`Turned ${disabled ? "off" : "on"} ${res.done} key${res.done === 1 ? "" : "s"}.${bulkFailures(res)}`);
       refresh();
     });
   }
@@ -138,7 +138,7 @@ export function KeysList({
       });
       if (!ok) return;
       const res = await deleteKeysAction([...selected]);
-      setNotice(`Deleted ${res.deleted} key${res.deleted === 1 ? "" : "s"}.${res.failed ? ` ${res.failed} failed.` : ""}`);
+      setNotice(`Deleted ${res.done} key${res.done === 1 ? "" : "s"}.${bulkFailures(res)}`);
       setSelected(new Set());
       refresh();
     });

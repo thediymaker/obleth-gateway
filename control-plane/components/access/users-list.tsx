@@ -37,14 +37,6 @@ function signedIn(at: AdminUser["createdAt"]): string {
   return Number.isNaN(ms) ? "" : `signed in ${lastUsed(ms)}`;
 }
 
-function assign(id: string, role: string, tenantId: string) {
-  const fd = new FormData();
-  fd.set("id", id);
-  fd.set("role", role);
-  fd.set("tenantId", tenantId);
-  return assignUserAction(fd);
-}
-
 /** One waiting account: pick a role and a tenant, then approve. "Not now" leaves it waiting. */
 function Approval({ user, tenants, onDone }: { user: AdminUser; tenants: { id: string; name: string }[]; onDone: (text: string | null, error?: boolean) => void }) {
   const [role, setRole] = useState<string>(user.role);
@@ -68,7 +60,7 @@ function Approval({ user, tenants, onDone }: { user: AdminUser; tenants: { id: s
         disabled={pending}
         title={noTenant ? "Without a tenant they can sign in but reach nothing" : undefined}
         onClick={() => start(async () => {
-          const res = await assign(user.id, role, tenantId);
+          const res = await assignUserAction({ id: user.id, role, tenantId });
           onDone(res.ok ? `Approved ${user.email}${noTenant ? ". They have no tenant yet, so they can't reach anything." : "."}` : res.error, !res.ok);
         })}
       >
@@ -110,7 +102,7 @@ function ChangeDialog({ user, tenants, onClose, onDone }: { user: AdminUser; ten
             type="button"
             disabled={pending}
             onClick={() => start(async () => {
-              const res = await assign(user.id, role, tenantId);
+              const res = await assignUserAction({ id: user.id, role, tenantId });
               if (!res.ok) return setError(res.error);
               onDone(`Saved ${user.email}.`);
               onClose();
@@ -160,10 +152,7 @@ export function UsersList({ users, tenants, me }: { users: AdminUser[]; tenants:
         confirmLabel: "Take access away",
       });
       if (!ok) return;
-      const fd = new FormData();
-      fd.set("id", u.id);
-      fd.set("status", "pending");
-      const res = await setUserStatusAction(fd);
+      const res = await setUserStatusAction(u.id, "pending");
       done(res.ok ? `${u.email} is back to waiting for approval.` : res.error, !res.ok);
     });
   }

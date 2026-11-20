@@ -3261,13 +3261,6 @@ export const obleth = {
     ),
   /** Daily counters the proxy keeps: MCP calls per server, knowledge searches per collection. */
   dailyStats: (kind: "mcp" | "knowledge", days = 7) => api<DailyStatsView>(`/stats/daily${qs({ kind, days })}`),
-  getCapacity: () => api<{ max_in_flight: number }>("/capacity"),
-  setCapacity: (max_in_flight: number, options?: AuditOptions) =>
-    api<{ max_in_flight: number }>("/capacity", {
-      method: "PUT",
-      headers: auditActorHeaders(options),
-      body: JSON.stringify({ max_in_flight }),
-    }),
   getAlertSettings: reactCache(() => api<AlertSettingsView>("/settings/alerts")),
   setAlertSettings: (body: UpdateAlertSettings, options?: AuditOptions) =>
     api<AlertSettingsView>("/settings/alerts", {

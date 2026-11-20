@@ -21,7 +21,8 @@ export const PERIOD_OPTIONS = [
   { value: "lifetime", label: "in total" },
 ];
 
-function failures(r: BulkKeyResult): string {
+/** " 2 failed: a (why); b (why)" after a bulk key action's count, or "" when none did. */
+export function bulkFailures(r: BulkKeyResult): string {
   return r.failed.length ? ` ${r.failed.length} failed: ${r.failed.map((f) => `${f.name} (${f.error})`).join("; ")}` : "";
 }
 
@@ -63,7 +64,7 @@ export function MoveDialog({
       const res = await moveKeysAction(keys.map((k) => k.id), mode === "existing" ? { tenantId: target } : { newTenant: { name: name.trim(), copyFrom: copyFrom || undefined } });
       if (res.error) return setError(res.error);
       const dest = mode === "existing" ? tenants.find((t) => t.id === target)?.name ?? "the tenant" : name.trim();
-      onDone(`Moved ${res.done} key${res.done === 1 ? "" : "s"} to ${dest}.${failures(res)}`);
+      onDone(`Moved ${res.done} key${res.done === 1 ? "" : "s"} to ${dest}.${bulkFailures(res)}`);
       if (mode === "new" && res.tenantId) setMade({ id: res.tenantId, name: name.trim() });
       else onClose();
     });
@@ -130,7 +131,7 @@ export function BudgetDialog({ open, onClose, keys, onDone }: { open: boolean; o
     if ((c !== null && !(c >= 0)) || (t !== null && !(Number.isInteger(t) && t >= 0))) return setError("Caps are numbers of 0 or more, or blank for none.");
     start(async () => {
       const res = await setKeysBudgetAction(keys.map((k) => k.id), { budget_cost_usd: c, budget_tokens: t, budget_period: period });
-      onDone(`${c === null && t === null ? "Took the budget off" : "Set the budget on"} ${res.done} key${res.done === 1 ? "" : "s"}.${failures(res)}`);
+      onDone(`${c === null && t === null ? "Took the budget off" : "Set the budget on"} ${res.done} key${res.done === 1 ? "" : "s"}.${bulkFailures(res)}`);
       onClose();
     });
   }

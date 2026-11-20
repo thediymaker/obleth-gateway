@@ -64,7 +64,7 @@ beforeEach(() => {
   mocks.tail = undefined;
   mocks.queryKeys = [];
   mocks.routes = [route("llama")];
-  mocks.save.mockReset().mockResolvedValue(undefined);
+  mocks.save.mockReset().mockResolvedValue({ ok: true });
   mocks.cap.mockReset().mockResolvedValue({ ok: true });
   mocks.invalidate.mockReset().mockResolvedValue(undefined);
   mocks.replace.mockReset();
@@ -317,7 +317,7 @@ describe("tenant panel", () => {
     const input = await type("Fairshare weight", "300");
     expect(panel()!.textContent).toContain("llama");
     expect(panel()!.textContent).toContain("over-share");
-    mocks.save.mockRejectedValueOnce(new Error("offline"));
+    mocks.save.mockResolvedValueOnce({ ok: false, error: "offline" });
     await click("Apply weight");
     expect(mocks.save).toHaveBeenCalledWith("below-share", 300);
     expect(panel()!.textContent).toContain("Could not save weight: offline");

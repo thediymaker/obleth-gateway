@@ -76,13 +76,9 @@ function Body({ tenant, view, keys, series }: { tenant: TenantFairshareView; vie
   const peers = [...new Set(moved.flatMap((p) => p.groupPeers))];
 
   const saveWeight = () => start(async () => {
-    try {
-      await setWeightAction(tenant.tenant_id, weight);
-      setStatus({ kind: "weight", ok: true, text: `Weight saved: ${weight}.` });
-      await queryClient.invalidateQueries({ queryKey: ["fairshare-live"] });
-    } catch (e) {
-      setStatus({ kind: "weight", ok: false, text: `Could not save weight: ${e instanceof Error ? e.message : String(e)}` });
-    }
+    const result = await setWeightAction(tenant.tenant_id, weight);
+    setStatus(result.ok ? { kind: "weight", ok: true, text: `Weight saved: ${weight}.` } : { kind: "weight", ok: false, text: `Could not save weight: ${result.error}` });
+    if (result.ok) await queryClient.invalidateQueries({ queryKey: ["fairshare-live"] });
   });
   const capValue = capDraft.trim() === "" ? null : Number(capDraft);
   const validCap = capValue === null || (Number.isInteger(capValue) && capValue >= 1);
