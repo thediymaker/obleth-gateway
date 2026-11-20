@@ -446,10 +446,14 @@ export function mbLabel(mb: number | null | undefined): string {
   return mb >= 1024 ? `${Math.round(mb / 1024)}G` : `${mb}M`;
 }
 
-/** Slurm walltime to minutes: minutes, MM:SS, HH:MM:SS, D-HH, D-HH:MM, D-HH:MM:SS. */
+/**
+ * Slurm walltime to minutes: minutes, MM:SS, HH:MM:SS, D-HH, D-HH:MM,
+ * D-HH:MM:SS, or UNLIMITED/INFINITE as Infinity.
+ */
 export function parseTimeLimit(raw: string | null | undefined): number | null {
   const s = (raw ?? "").trim();
   if (!s) return null;
+  if (/^(?:UNLIMITED|INFINITE)$/i.test(s)) return Infinity;
   let days = 0;
   let rest = s;
   const dash = s.indexOf("-");
@@ -479,7 +483,7 @@ export function formatTimeLimit(minutes: number): string {
 
 /** "4 hours", "1 day", "2 days 12 hours". */
 export function walltimeLabel(minutes: number | null | undefined): string {
-  if (!minutes) return "no limit";
+  if (!minutes || !Number.isFinite(minutes)) return "no limit";
   const d = Math.floor(minutes / 1440);
   const h = Math.floor((minutes % 1440) / 60);
   const m = minutes % 60;

@@ -5,7 +5,7 @@ import { Document, isMap, isScalar, LineCounter, parseDocument, type Node as Yam
 import type { RecipeDeployPreview } from "@/components/recipes/recipe-card";
 import { accountsFor, gresCount, memToMb, partitionFits, parseTimeLimit, walltimeLabel } from "@/lib/deployments-model";
 import type { ClusterResources } from "@/lib/obleth";
-import { GRES_RE } from "@/lib/managed-model-schema";
+import { CPUS_RE, CPUS_RULE, GRES_RE, GRES_RULE, MEM_RE, MEM_RULE, SLURM_TIME_LIMIT_RE, TIME_LIMIT_RULE } from "@/lib/managed-model-schema";
 import { inputDefaults, inputProblem, MODEL_NAME_RE, MODEL_NAME_RULE, type ClusterValues } from "@/lib/recipe-inputs";
 import type { DeployOverrides } from "@/lib/sbatch-recipes";
 
@@ -163,14 +163,14 @@ export function formProblems(form: DeployForm, p: RecipeDeployPreview, resources
   else if (s.account && takes && !takes.includes(s.account)) out.push({ path: "slurm.account", message: takes.length ? `${s.partition} doesn't take ${s.account}. It takes ${takes.join(", ")}.` : `${s.partition} doesn't take any of your accounts.` });
   if (s.qos && resources.qos.length && !resources.qos.includes(s.qos)) out.push({ path: "slurm.qos", message: `There's no QoS called ${s.qos} on this cluster${suggest(s.qos, resources.qos)}` });
   const minutes = parseTimeLimit(s.time_limit);
-  if (s.time_limit.trim() && minutes == null) out.push({ path: "slurm.time_limit", message: "Walltime should look like D-HH:MM:SS" });
+  if (s.time_limit.trim() && !SLURM_TIME_LIMIT_RE.test(s.time_limit.trim())) out.push({ path: "slurm.time_limit", message: TIME_LIMIT_RULE });
   const fit = partitionFits(resources, { gpus: gresCount(s.gres), cpus: s.cpus_per_task ? Number(s.cpus_per_task) : null, memMb: memToMb(s.mem) }).find((f) => f.name === s.partition);
   if (fit && !fit.fits) out.push({ path: "slurm.partition", message: `One replica doesn't fit a ${fit.name} node: ${fit.reason}` });
   if (fit && minutes && fit.maxMinutes && minutes > fit.maxMinutes) out.push({ path: "slurm.time_limit", message: `${walltimeLabel(minutes)} is over ${fit.name}'s ${walltimeLabel(fit.maxMinutes)} limit, so Slurm would hold the job and never start it` });
   if (!Number.isInteger(s.nodes) || s.nodes < 1) out.push({ path: "slurm.nodes", message: "Nodes must be a whole number, 1 or more" });
-  if (s.cpus_per_task.trim() && !(Number(s.cpus_per_task) > 0)) out.push({ path: "slurm.cpus_per_task", message: "CPUs must be a number" });
-  if (s.mem.trim() && s.mem.trim() !== "0" && memToMb(s.mem) == null) out.push({ path: "slurm.mem", message: "Memory should look like 560G, or 0 for all of it" });
-  if (s.gres.trim() && !GRES_RE.test(s.gres.trim())) out.push({ path: "slurm.gres", message: "Write GPUs as Slurm gres, such as gpu:1, gpu:h100:2 or gpu:1,shard:1" });
+  if (s.cpus_per_task.trim() && !CPUS_RE.test(s.cpus_per_task.trim())) out.push({ path: "slurm.cpus_per_task", message: CPUS_RULE });
+  if (s.mem.trim() && !MEM_RE.test(s.mem.trim())) out.push({ path: "slurm.mem", message: MEM_RULE });
+  if (s.gres.trim() && !GRES_RE.test(s.gres.trim())) out.push({ path: "slurm.gres", message: GRES_RULE });
   const logs = s.log_output_dir.trim();
   if (logs && !logs.startsWith("/") && !logs.includes("{{")) out.push({ path: "slurm.log_output_dir", message: "Job logs must be a full path starting with /. A relative folder would end up under /tmp on the node" });
   for (const k of Object.keys(form.env)) if (k && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) out.push({ path: `env.${k}`, message: `${k} isn't a valid variable name` });
