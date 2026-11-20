@@ -901,7 +901,7 @@ async fn handler_inner(
                     );
                 }
                 model = chosen.model_name.clone();
-                Some(Arc::new(chosen))
+                Some(chosen)
             }
             None => {
                 return error_json(
@@ -2283,6 +2283,7 @@ mod model_choice_tests {
             key_cache: Cache::builder().build(),
             key_misses: Default::default(),
             model_cache: Cache::builder().build(),
+            variant_cache: Cache::builder().build(),
             mcp_cache: Cache::builder().build(),
             model_registry: crate::router::ModelRegistry::new(),
             families: crate::reasoning::FamilyRegistry::new(),

@@ -91,7 +91,7 @@ impl LoadReporter {
                 &self.fairshare,
                 &self.settings,
                 &self.discovery,
-                routes.iter().map(|c| &c.model),
+                routes.iter().map(|c| &*c.model),
             )
             .await?,
         );
@@ -428,7 +428,7 @@ mod tests {
 
     fn candidate(model: ResolvedModel) -> Candidate {
         Candidate {
-            model,
+            model: Arc::new(model),
             healthy: true,
             levels: Vec::new(),
         }
@@ -709,6 +709,7 @@ mod tests {
             key_cache: moka::future::Cache::builder().build(),
             key_misses: Default::default(),
             model_cache: moka::future::Cache::builder().build(),
+            variant_cache: moka::future::Cache::builder().build(),
             mcp_cache: moka::future::Cache::builder().build(),
             model_registry: sources.1.clone(),
             families: sources.2.clone(),

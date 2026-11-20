@@ -39,6 +39,7 @@ pub mod sticky;
 use std::collections::HashMap;
 
 use crate::ResolvedModel;
+use std::sync::Arc;
 
 /// Reserved client-facing model name that triggers auto selection.
 pub const AUTO_MODEL_NAME: &str = "auto";
@@ -95,7 +96,9 @@ impl Default for RouterWeights {
 /// router needs that is not part of [`ResolvedModel`].
 #[derive(Debug, Clone)]
 pub struct Candidate {
-    pub model: ResolvedModel,
+    /// Shared with every request routed between registry refreshes: the
+    /// router hands out this `Arc`, never a copy of the model.
+    pub model: Arc<ResolvedModel>,
     /// `false` when the model is reported down or is inside a maintenance
     /// window. Unhealthy candidates are filtered out before scoring.
     pub healthy: bool,
@@ -397,7 +400,7 @@ impl OutputStats {
 }
 
 /// One scored survivor, holding a borrow of its candidate so [`select_model`]
-/// can clone the winning [`ResolvedModel`] without re-running anything.
+/// can hand out the winning model's `Arc` without re-running anything.
 struct ScoredRef<'a> {
     cand: &'a Candidate,
     level: u8,
@@ -802,7 +805,7 @@ pub fn select_model(
     weights: &RouterWeights,
     uniform: f64,
     difficulty: u8,
-) -> Option<ResolvedModel> {
+) -> Option<Arc<ResolvedModel>> {
     let ev = evaluate(
         candidates,
         features,
@@ -847,7 +850,7 @@ pub fn route(
     weights: &RouterWeights,
     uniform: f64,
     intent: &Intent,
-) -> (Option<ResolvedModel>, route_explain::RouteExplain) {
+) -> (Option<Arc<ResolvedModel>>, route_explain::RouteExplain) {
     let ev = evaluate(
         candidates,
         features,
@@ -1463,7 +1466,7 @@ mod tests {
 
     pub(super) fn healthy(m: ResolvedModel) -> Candidate {
         Candidate {
-            model: m,
+            model: Arc::new(m),
             healthy: true,
             levels: Vec::new(),
         }
@@ -1761,14 +1764,39 @@ mod tests {
         assert_eq!(chosen.model_name, "tools");
     }
 
+    /// Between registry refreshes every request gets the candidate's own
+    /// `Arc`, not a copy of the model.
+    #[test]
+    fn the_pick_is_the_candidates_own_arc() {
+        let candidates = vec![healthy(model("solo"))];
+        let pick = || {
+            select_model(
+                &candidates,
+                &RequestFeatures::default(),
+                &HashMap::new(),
+                &HashMap::new(),
+                None,
+                &[],
+                BoonGrants::default(),
+                &RouterWeights::default(),
+                0.0,
+                0,
+            )
+            .expect("picked")
+        };
+        let (a, b) = (pick(), pick());
+        assert!(Arc::ptr_eq(&a, &candidates[0].model));
+        assert!(Arc::ptr_eq(&a, &b));
+    }
+
     #[test]
     fn unhealthy_candidates_are_skipped() {
         let mut down = Candidate {
-            model: model("down"),
+            model: Arc::new(model("down")),
             healthy: false,
             levels: Vec::new(),
         };
-        down.model.input_cost_per_token = 0.0; // would otherwise be cheapest
+        Arc::make_mut(&mut down.model).input_cost_per_token = 0.0; // would otherwise be cheapest
         let up = healthy(model("up"));
         let candidates = vec![down, up];
         let chosen = select_model(
@@ -2877,8 +2905,8 @@ mod tests {
         // outcome).
         let mut specialist = tiered("specialist", 0.000_050, &[("coding", 3), ("math", 1)]);
         let mut shallow = tiered("shallow", 0.000_001, &[("coding", 1)]);
-        specialist.model.tags = vec!["coding".to_string(), "math".to_string()];
-        shallow.model.tags = vec!["coding".to_string(), "math".to_string()];
+        Arc::make_mut(&mut specialist.model).tags = vec!["coding".to_string(), "math".to_string()];
+        Arc::make_mut(&mut shallow.model).tags = vec!["coding".to_string(), "math".to_string()];
         let cands = vec![specialist, shallow];
         let desired = vec!["coding".to_string(), "math".to_string()];
         let chosen = select_model(
@@ -2930,9 +2958,9 @@ mod tests {
         mid.levels.push((GENERAL_DOMAIN.to_string(), 2));
         let mut dear = tiered("dear", 0.000_100, &[("coding", 3), ("math", 3)]);
         dear.levels.push((GENERAL_DOMAIN.to_string(), 3));
-        dear.model.route_bias = 1.4;
+        Arc::make_mut(&mut dear.model).route_bias = 1.4;
         let mut plain = healthy(model("plain"));
-        plain.model.input_cost_per_token = 0.000_050;
+        Arc::make_mut(&mut plain.model).input_cost_per_token = 0.000_050;
         plain.levels = vec![(GENERAL_DOMAIN.to_string(), 2)];
         vec![cheap, mid, dear, plain]
     }
@@ -3112,8 +3140,8 @@ mod tests {
                 k.difficulty,
             );
             assert_eq!(
-                picked.map(|m| m.model_name),
-                alone.map(|m| m.model_name),
+                picked.map(|m| m.model_name.clone()),
+                alone.map(|m| m.model_name.clone()),
                 "route must serve exactly what select_model would"
             );
         }
@@ -3383,7 +3411,7 @@ mod tests {
         broken.context_window = 10;
         let cands = vec![
             Candidate {
-                model: broken,
+                model: Arc::new(broken),
                 healthy: false,
                 levels: Vec::new(),
             },

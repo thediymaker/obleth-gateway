@@ -927,7 +927,9 @@ mod tests {
         top.levels = vec![("coding".into(), 3)];
         let all = vec![low, mid, top];
         let names = |pool: Vec<Candidate>| -> Vec<String> {
-            pool.into_iter().map(|c| c.model.model_name).collect()
+            pool.into_iter()
+                .map(|c| c.model.model_name.clone())
+                .collect()
         };
         let coding = vec!["coding".to_string()];
         assert_eq!(names(floor_pool(&all, &coding, 2, None)), ["mid", "top"]);

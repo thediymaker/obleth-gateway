@@ -2212,7 +2212,7 @@ impl Store {
                     None => true,
                 };
                 obleth_config::routing::Candidate {
-                    model,
+                    model: std::sync::Arc::new(model),
                     healthy,
                     levels: Vec::new(),
                 }

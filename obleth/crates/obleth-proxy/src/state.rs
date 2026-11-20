@@ -36,6 +36,11 @@ pub struct AppState {
     /// deleted key skips Redis for a minute.
     pub key_misses: crate::key_miss::KeyMissCache,
     pub model_cache: Cache<String, Arc<ResolvedModel>>,
+    /// Variant names to their parent's route with the variant's boons added
+    /// (see `proxy::serve_variant`), so a variant request does not copy the
+    /// route each time. Cleared with `model_cache`: the admin invalidates a
+    /// model under every name it answers to, variants included.
+    pub variant_cache: Cache<String, Arc<ResolvedModel>>,
     pub mcp_cache: Cache<String, Arc<ResolvedMcpServer>>,
     /// Enumerable list of candidate models for `auto` selection. Kept fresh by
     /// a background refresh task; the `model_cache` above is not enumerable.

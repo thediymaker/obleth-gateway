@@ -355,7 +355,7 @@ mod tests {
         let mut model = crate::boons::test_support::test_route();
         model.model_name = name.to_string();
         Candidate {
-            model,
+            model: std::sync::Arc::new(model),
             healthy: true,
             levels: vec![("coding".into(), level)],
         }

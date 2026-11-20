@@ -1201,6 +1201,24 @@ pub(crate) fn serve_as(
     }
 }
 
+/// [`serve_as`], with the variant's route kept in `cache` (the gateway's
+/// `variant_cache`) under the variant's name, so it is built once.
+pub(crate) async fn serve_variant(
+    cache: &moka::future::Cache<String, Arc<ResolvedModel>>,
+    route: Arc<ResolvedModel>,
+    requested: &str,
+) -> (Arc<ResolvedModel>, Option<String>) {
+    if route.variant(requested).is_none() {
+        return (route, None);
+    }
+    if let Some(served) = cache.get(requested).await {
+        return (served, Some(requested.to_string()));
+    }
+    let (served, variant) = serve_as(route, requested);
+    cache.insert(requested.to_string(), served.clone()).await;
+    (served, variant)
+}
+
 /// How a request is admitted as background work: the share of the model's
 /// slots it may fill and the longest it waits for one.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1798,7 +1816,7 @@ async fn run_pipeline(
                 });
                 model = chosen.model_name.clone();
                 // Candidates are real models only, never variants.
-                (Some(Arc::new(chosen)), None)
+                (Some(chosen), None)
             }
             None => {
                 return error_json(
@@ -1812,7 +1830,7 @@ async fn run_pipeline(
         // added (`serve_as`); an alias to the parent's route as it is.
         let (route, variant) = match resolve_model(&state, &model).await {
             Some(r) => {
-                let (r, variant) = serve_as(r, &model);
+                let (r, variant) = serve_variant(&state.variant_cache, r, &model).await;
                 (Some(r), variant)
             }
             // A family answers with the member its level picks, recorded
@@ -5597,7 +5615,7 @@ fn listed_families<'a>(
                     && c.model.enabled
                     && c.model.lifecycle.status_at(now).listed()
             })?;
-            Some((f.as_ref(), &member.model))
+            Some((f.as_ref(), &*member.model))
         })
         .collect()
 }
@@ -5784,7 +5802,7 @@ fn listed_routes<'a>(
 ) -> Vec<(&'a ResolvedModel, Option<&'a obleth_config::ModelVariant>)> {
     candidates
         .iter()
-        .map(|c| &c.model)
+        .map(|c| &*c.model)
         // An unlisted model (and its variants) is served by name only.
         .filter(|m| m.enabled && m.listed && is_listed_model_type(&m.model_type))
         .filter(|m| m.lifecycle.status_at(now).listed())
@@ -6264,7 +6282,7 @@ fn registered_model_entry(
         let member = candidates
             .iter()
             .find(|c| c.model.model_name == family.members.get(family.default_level))
-            .map(|c| &c.model);
+            .map(|c| &*c.model);
         return Some(Ok(family_entry(&family, member, &boons)));
     };
     if !facts.answers_by_id(allowed) {
@@ -7930,6 +7948,7 @@ mod tests {
     use obleth_admin::{session_hash_order, weighted_order};
     use obleth_config::{ResolvedEndpoint, ResolvedKey, ResolvedModel, WeeklyWindow};
     use std::collections::HashMap;
+    use std::sync::Arc;
     use std::time::Duration;
     use uuid::Uuid;
 
@@ -8560,7 +8579,7 @@ mod tests {
         model.aliases = aliases.iter().map(|a| a.to_string()).collect();
         model.tags = tags.iter().map(|t| t.to_string()).collect();
         obleth_config::routing::Candidate {
-            model,
+            model: Arc::new(model),
             healthy: true,
             levels: Vec::new(),
         }
@@ -8570,7 +8589,7 @@ mod tests {
     fn models_listing_is_the_registry_under_client_facing_names() {
         use super::registry_models_list;
         let mut disabled = candidate("retired", "retired", "chat", "none", &[], &[]);
-        disabled.model.enabled = false;
+        Arc::make_mut(&mut disabled.model).enabled = false;
         let candidates = vec![
             // A backend that knows itself only by its quantized name, with an
             // old spelling kept as an alias. Whether or not that backend
@@ -8731,20 +8750,20 @@ mod tests {
         use super::{model_entry, model_facts_index, model_info_entry, registry_models_list};
         let now = chrono::Utc::now();
         let mut old = candidate("glm-4-5v", "glm-4.5v", "chat", "fp8", &[], &[]);
-        old.model.lifecycle = obleth_config::ModelLifecycle {
+        Arc::make_mut(&mut old.model).lifecycle = obleth_config::ModelLifecycle {
             status: obleth_config::ModelStatus::Deprecated,
             replacement: "gemma4-31b-it".into(),
             retire_at: Some(now + chrono::Duration::days(14)),
             ..Default::default()
         };
         let mut gone = candidate("llama2-70b", "llama2", "chat", "fp16", &[], &[]);
-        gone.model.lifecycle.status = obleth_config::ModelStatus::Retired;
-        gone.model.variants = vec![obleth_config::ModelVariant {
+        Arc::make_mut(&mut gone.model).lifecycle.status = obleth_config::ModelStatus::Retired;
+        Arc::make_mut(&mut gone.model).variants = vec![obleth_config::ModelVariant {
             name: "llama2-70b-spec".into(),
             ..Default::default()
         }];
         let mut overdue = candidate("old-overdue", "x", "chat", "fp8", &[], &[]);
-        overdue.model.lifecycle = obleth_config::ModelLifecycle {
+        Arc::make_mut(&mut overdue.model).lifecycle = obleth_config::ModelLifecycle {
             status: obleth_config::ModelStatus::Deprecated,
             retire_at: Some(now - chrono::Duration::hours(1)),
             ..Default::default()
@@ -8781,16 +8800,16 @@ mod tests {
     fn the_load_listing_names_what_the_models_listing_lists() {
         use super::{family_entries, listed_pools, registry_models_list};
         let mut glm = candidate("glm", "glm-fp8", "chat", "fp8", &["glm-old"], &[]);
-        glm.model.variants = vec![obleth_config::ModelVariant {
+        Arc::make_mut(&mut glm.model).variants = vec![obleth_config::ModelVariant {
             name: "glm-search".into(),
             ..Default::default()
         }];
         let mut staged = candidate("staged", "staged", "chat", "fp8", &[], &[]);
-        staged.model.lifecycle.status = obleth_config::ModelStatus::Staged;
+        Arc::make_mut(&mut staged.model).lifecycle.status = obleth_config::ModelStatus::Staged;
         let mut retired = candidate("retired", "retired", "chat", "fp8", &[], &[]);
-        retired.model.lifecycle.status = obleth_config::ModelStatus::Retired;
+        Arc::make_mut(&mut retired.model).lifecycle.status = obleth_config::ModelStatus::Retired;
         let mut unlisted = candidate("unlisted", "unlisted", "chat", "fp8", &[], &[]);
-        unlisted.model.listed = false;
+        Arc::make_mut(&mut unlisted.model).listed = false;
         let search = candidate(
             "web",
             "searxng",
@@ -8872,8 +8891,8 @@ mod tests {
     fn staged_models_are_served_by_name_but_never_advertised() {
         use super::{model_facts_index, registry_model_info, registry_models_list};
         let mut staged = candidate("qwen4-72b", "qwen4", "chat", "fp8", &["qwen4"], &[]);
-        staged.model.lifecycle.status = obleth_config::ModelStatus::Staged;
-        staged.model.variants = vec![obleth_config::ModelVariant {
+        Arc::make_mut(&mut staged.model).lifecycle.status = obleth_config::ModelStatus::Staged;
+        Arc::make_mut(&mut staged.model).variants = vec![obleth_config::ModelVariant {
             name: "qwen4-72b-spec".into(),
             ..Default::default()
         }];
@@ -8917,9 +8936,9 @@ mod tests {
             &["acme-instruct-2507"],
             &[],
         );
-        instruct.model.listed = false;
+        Arc::make_mut(&mut instruct.model).listed = false;
         let mut think = candidate("acme-think", "acme-t", "chat", "fp8", &[], &[]);
-        think.model.listed = false;
+        Arc::make_mut(&mut think.model).listed = false;
         let other = candidate("gemma4-31b-it", "gemma", "chat", "bf16", &[], &[]);
         let candidates = vec![instruct, think, other];
 
@@ -9042,8 +9061,8 @@ mod tests {
     fn with_variants(
         mut c: obleth_config::routing::Candidate,
     ) -> obleth_config::routing::Candidate {
-        c.model.boons = vec!["vision".into()];
-        c.model.variants = vec![obleth_config::ModelVariant {
+        Arc::make_mut(&mut c.model).boons = vec!["vision".into()];
+        Arc::make_mut(&mut c.model).variants = vec![obleth_config::ModelVariant {
             name: "glm-5-3-spec".into(),
             description: "Drafted by a small model, verified by this one".into(),
             boons: vec!["speculation".into()],
@@ -9172,7 +9191,7 @@ mod tests {
         // description read back, which the model alone does not reproduce.
         use super::{model_entry, model_facts_index, registry_model_info};
         let mut c = candidate("text-only", "text-only", "chat", "none", &[], &[]);
-        c.model.boons = vec!["vision".into()];
+        Arc::make_mut(&mut c.model).boons = vec!["vision".into()];
         let candidates = vec![c];
         let s = boons_configured();
         let detail = model_entry(&model_facts_index(&candidates, &s)["text-only"]);
@@ -9206,7 +9225,7 @@ mod tests {
         use super::boon_details;
         use serde_json::json;
         let s = boons_configured();
-        let mut model = candidate("m", "m", "chat", "none", &[], &[]).model;
+        let mut model = Arc::unwrap_or_clone(candidate("m", "m", "chat", "none", &[], &[]).model);
         model.boons = [
             "vision",
             "structured_output",
@@ -9267,7 +9286,7 @@ mod tests {
         use super::boon_details;
         use serde_json::json;
         let s = boons_configured();
-        let mut model = candidate("m", "m", "chat", "none", &[], &[]).model;
+        let mut model = Arc::unwrap_or_clone(candidate("m", "m", "chat", "none", &[], &[]).model);
         model.boons = [
             "structured_output",
             "image_generation",
@@ -9313,7 +9332,7 @@ mod tests {
     fn a_variant_details_the_boons_it_adds() {
         use super::{model_entry, model_facts_index};
         let mut c = with_variants(candidate("glm-5-3", "glm-5-3", "chat", "none", &[], &[]));
-        c.model.verify_api_base = "http://scorer:8000/v1".into();
+        Arc::make_mut(&mut c.model).verify_api_base = "http://scorer:8000/v1".into();
         let candidates = vec![c];
         let s = boons_configured();
         let index = model_facts_index(&candidates, &s);
@@ -9332,20 +9351,47 @@ mod tests {
         );
     }
 
+    /// A variant's route is built once and then shared; the parent and
+    /// unknown names pass through untouched.
+    #[tokio::test]
+    async fn a_variant_route_is_built_once_and_shared() {
+        use super::serve_variant;
+        let parent = with_variants(candidate(
+            "glm-5-3",
+            "glm-5-3-mxfp4",
+            "chat",
+            "mxfp4",
+            &[],
+            &[],
+        ))
+        .model;
+        let cache = moka::future::Cache::builder().build();
+        let (first, variant) = serve_variant(&cache, parent.clone(), "glm-5-3-spec").await;
+        assert_eq!(variant.as_deref(), Some("glm-5-3-spec"));
+        assert!(!Arc::ptr_eq(&first, &parent), "the variant adds its boons");
+        let (again, _) = serve_variant(&cache, parent.clone(), "glm-5-3-spec").await;
+        assert!(Arc::ptr_eq(&first, &again), "served from the cache");
+        let (own, none) = serve_variant(&cache, parent.clone(), "glm-5-3").await;
+        assert!(Arc::ptr_eq(&own, &parent) && none.is_none());
+        // Invalidating the variant's name (as the admin does on any change to
+        // the model) builds it afresh.
+        cache.invalidate("glm-5-3-spec").await;
+        let (rebuilt, _) = serve_variant(&cache, parent.clone(), "glm-5-3-spec").await;
+        assert!(!Arc::ptr_eq(&first, &rebuilt));
+    }
+
     #[test]
     fn a_variant_is_served_by_its_parent_with_its_boons_added() {
         use super::{admission_pool, serve_as};
-        let parent = std::sync::Arc::new(
-            with_variants(candidate(
-                "glm-5-3",
-                "glm-5-3-mxfp4",
-                "chat",
-                "mxfp4",
-                &[],
-                &[],
-            ))
-            .model,
-        );
+        let parent = with_variants(candidate(
+            "glm-5-3",
+            "glm-5-3-mxfp4",
+            "chat",
+            "mxfp4",
+            &[],
+            &[],
+        ))
+        .model;
 
         let (served, variant) = serve_as(parent.clone(), "glm-5-3-spec");
         assert_eq!(variant.as_deref(), Some("glm-5-3-spec"));
@@ -10710,7 +10756,7 @@ mod tests {
     #[test]
     fn auto_route_explanation_serializes_with_dashboard_keys() {
         let candidates = vec![Candidate {
-            model: minimal_model("solo"),
+            model: Arc::new(minimal_model("solo")),
             healthy: true,
             levels: Vec::new(),
         }];
@@ -10726,7 +10772,10 @@ mod tests {
             0.0,
             &Intent::default(),
         );
-        assert_eq!(picked.map(|m| m.model_name), Some("solo".to_string()));
+        assert_eq!(
+            picked.map(|m| m.model_name.clone()),
+            Some("solo".to_string())
+        );
         // Mirrors the overwrite the data plane performs before recording the
         // span (see the `auto` branch of `proxy_handler_inner`).
         explain.classifier_ms = 7;
@@ -11174,7 +11223,9 @@ mod lifecycle_tests {
     #[test]
     fn a_variant_is_admitted_to_its_parents_pool() {
         let h = squash(handler());
-        let serve = h.find("serve_as(r,&model)").expect("variant resolution");
+        let serve = h
+            .find("serve_variant(&state.variant_cache,r,&model)")
+            .expect("variant resolution");
         let adopt = h
             .find("model=r.model_name.clone();")
             .expect("parent name adopted");
@@ -11193,7 +11244,9 @@ mod lifecycle_tests {
     #[test]
     fn the_lifecycle_gate_runs_after_resolution_and_before_the_allowlist() {
         let h = squash(handler());
-        let serve = h.find("serve_as(r,&model)").expect("variant resolution");
+        let serve = h
+            .find("serve_variant(&state.variant_cache,r,&model)")
+            .expect("variant resolution");
         let gate = h.find("crate::lifecycle::gate(").expect("lifecycle gate");
         let allow = h.find("modelnotpermittedfortenant").expect("allowlist");
         let pool = h

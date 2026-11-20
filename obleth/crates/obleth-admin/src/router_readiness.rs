@@ -299,7 +299,7 @@ mod tests {
 
     fn cand(m: ResolvedModel) -> Candidate {
         Candidate {
-            model: m,
+            model: std::sync::Arc::new(m),
             healthy: true,
             levels: Vec::new(),
         }

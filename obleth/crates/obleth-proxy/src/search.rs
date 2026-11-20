@@ -969,7 +969,7 @@ mod tests {
         model.model_type = model_type.to_string();
         model.enabled = enabled;
         Candidate {
-            model,
+            model: Arc::new(model),
             healthy: true,
             levels: Vec::new(),
         }
@@ -991,7 +991,7 @@ mod tests {
     #[test]
     fn a_staged_tool_is_neither_listed_nor_the_default() {
         let mut staged = search_candidate("beta", "search", true);
-        staged.model.lifecycle.status = obleth_config::ModelStatus::Staged;
+        Arc::make_mut(&mut staged.model).lifecycle.status = obleth_config::ModelStatus::Staged;
         let candidates = vec![search_candidate("web", "search", true), staged];
         // With "beta" listed there would be two tools and no default.
         assert_eq!(tool_names(&candidates, None), vec!["web"]);
@@ -1170,6 +1170,7 @@ mod pipeline_tests {
             key_cache: Cache::builder().build(),
             key_misses: Default::default(),
             model_cache: Cache::builder().build(),
+            variant_cache: Cache::builder().build(),
             mcp_cache: Cache::builder().build(),
             model_registry: crate::router::ModelRegistry::new(),
             families: crate::reasoning::FamilyRegistry::new(),
@@ -1327,7 +1328,7 @@ mod pipeline_tests {
         let (fake, base) = spawn_searxng().await;
         let route = search_route("web-search", &base);
         gw.state.model_registry.store(vec![Candidate {
-            model: route.clone(),
+            model: Arc::new(route.clone()),
             healthy: true,
             levels: Vec::new(),
         }]);

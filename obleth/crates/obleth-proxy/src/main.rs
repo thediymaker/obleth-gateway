@@ -255,6 +255,10 @@ async fn main() -> anyhow::Result<()> {
         .time_to_live(Duration::from_secs(300))
         .max_capacity(10_000)
         .build();
+    let variant_cache: Cache<String, Arc<obleth_config::ResolvedModel>> = Cache::builder()
+        .time_to_live(Duration::from_secs(300))
+        .max_capacity(10_000)
+        .build();
     let mcp_cache: Cache<String, Arc<obleth_config::ResolvedMcpServer>> = Cache::builder()
         .time_to_live(Duration::from_secs(300))
         .max_capacity(10_000)
@@ -504,6 +508,7 @@ async fn main() -> anyhow::Result<()> {
         key_cache: key_cache.clone(),
         key_misses: key_misses.clone(),
         model_cache: model_cache.clone(),
+        variant_cache: variant_cache.clone(),
         mcp_cache: mcp_cache.clone(),
         tool_cache,
         model_registry: model_registry.clone(),
@@ -658,6 +663,7 @@ async fn main() -> anyhow::Result<()> {
             keys: key_cache.clone(),
             key_misses: key_misses.clone(),
             models: model_cache.clone(),
+            variants: variant_cache.clone(),
             mcp: mcp_cache.clone(),
         },
         redis_reconnected.clone(),
@@ -1283,6 +1289,7 @@ struct InvalidationCaches {
     keys: Cache<String, Arc<obleth_config::ResolvedKey>>,
     key_misses: key_miss::KeyMissCache,
     models: Cache<String, Arc<obleth_config::ResolvedModel>>,
+    variants: Cache<String, Arc<obleth_config::ResolvedModel>>,
     mcp: Cache<String, Arc<obleth_config::ResolvedMcpServer>>,
 }
 
@@ -1291,6 +1298,7 @@ impl InvalidationCaches {
         self.keys.invalidate_all();
         self.key_misses.clear();
         self.models.invalidate_all();
+        self.variants.invalidate_all();
         self.mcp.invalidate_all();
     }
 
@@ -1298,7 +1306,10 @@ impl InvalidationCaches {
         use obleth_redis::Invalidation;
         match target {
             Invalidation::All => self.invalidate_all(),
-            Invalidation::Model(name) => self.models.invalidate(&name).await,
+            Invalidation::Model(name) => {
+                self.models.invalidate(&name).await;
+                self.variants.invalidate(&name).await;
+            }
             Invalidation::Mcp(name) => self.mcp.invalidate(&name).await,
             Invalidation::Key(hash) => {
                 self.keys.invalidate(&hash).await;
@@ -1839,7 +1850,7 @@ mod registry_refresh_tests {
 
     fn candidate(name: &str, request_timeout_secs: Option<i64>) -> router::Candidate {
         router::Candidate {
-            model: model(name, request_timeout_secs),
+            model: Arc::new(model(name, request_timeout_secs)),
             healthy: true,
             levels: Vec::new(),
         }
