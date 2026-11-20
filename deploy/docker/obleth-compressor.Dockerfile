@@ -16,7 +16,8 @@ WORKDIR /build
 RUN pip install --no-cache-dir --upgrade pip
 ARG COMPRESSOR_SOURCE=onnx
 ARG MODEL_ID=chopratejas/kompress-v2-base
-# For source=onnx: swap to onnx/kompress-int8-wo.onnx for a smaller/faster image.
+# For source=onnx: onnx/kompress-int8-wo.onnx halves memory (474 vs 934 MiB peak)
+# but scored 30% slower on 4 cores, so fp32 stays the default (compressor/README.md).
 ARG ONNX_FILE=onnx/kompress-fp32.onnx
 # Install only the deps the chosen source needs (export drags in a CPU torch).
 RUN if [ "$COMPRESSOR_SOURCE" = "export" ]; then \

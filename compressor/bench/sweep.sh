@@ -3,11 +3,11 @@
 #
 # For every value, this starts a container with the env override, waits for
 # /health, runs loadtest.py against it, then tears it down — so you can compare
-# COMPRESSOR_MAX_BATCH (or ONNX thread counts) head-to-head on identical load.
+# COMPRESSOR_MAX_BATCH (or COMPRESSOR_NUM_THREADS) head-to-head on identical load.
 #
 # Usage:
 #   ./sweep.sh                                   # sweep COMPRESSOR_MAX_BATCH=1,8,32,128
-#   IMAGE=... KNOB=OMP_NUM_THREADS VALUES="1 2 4 8" ./sweep.sh
+#   IMAGE=... KNOB=COMPRESSOR_NUM_THREADS VALUES="1 2 4 8" ./sweep.sh
 #
 # Env:
 #   IMAGE   container image (default: ghcr.io/thediymaker/obleth-gateway/obleth-compressor:latest)
