@@ -15,7 +15,7 @@ pub const INTERNAL_REQUEST_TYPES: &[&str] = &[
 
 /// SQL fragment excluding internal traffic unless explicitly included. The
 /// labels are compile-time constants, so inlining them is injection-safe.
-fn internal_filter(include_internal: Option<bool>) -> String {
+pub(crate) fn internal_filter(include_internal: Option<bool>) -> String {
     if include_internal == Some(true) {
         return String::new();
     }
@@ -809,8 +809,11 @@ fn failure_counts_sql(filter: &str) -> String {
     )
 }
 
-/// Aliases stay clear of the columns the query reads; see [`usage_totals_sql`].
-fn failure_groups_sql(filter: &str) -> String {
+/// The failures matching `filter` (a `where` clause) grouped into repeats of
+/// at least `min_failures`, largest first, at most `limit` groups. Read by the
+/// request log and by Advice. Aliases stay clear of the columns the query
+/// reads; see [`usage_totals_sql`].
+pub(crate) fn failure_groups_sql(filter: &str, min_failures: u64, limit: u64) -> String {
     format!(
         "select {class} as filed_class, filed_class in {platform} as is_platform, \
          tenant_id, any(tenant_name) as recorded_tenant, key_id, any(key_name) as recorded_key, \
@@ -819,7 +822,8 @@ fn failure_groups_sql(filter: &str) -> String {
          from usage{filter} and status_code >= 400 \
          group by filed_class, tenant_id, key_id, model, status_code, \
          replaceRegexpAll(error_reason, '[0-9]+', 'N') \
-         order by failed desc, last_at desc limit {FAILURE_GROUP_LIMIT}",
+         having failed >= {min_failures} \
+         order by failed desc, last_at desc limit {limit}",
         class = obleth_config::EFFECTIVE_CLASS_SQL,
         platform = obleth_config::PLATFORM_CLASSES_SQL,
     )
@@ -834,7 +838,7 @@ pub async fn query_usage_failure_groups(
     let since = q.since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
     let (filter, binds) = log_filter_sql(&q, since);
     let counts_sql = failure_counts_sql(&filter);
-    let groups_sql = failure_groups_sql(&filter);
+    let groups_sql = failure_groups_sql(&filter, 1, FAILURE_GROUP_LIMIT);
     let (counts, groups) = tokio::try_join!(
         bind_log_filters(client.query(&counts_sql), binds.clone()).fetch_one::<FailureCounts>(),
         bind_log_filters(client.query(&groups_sql), binds).fetch_all::<UsageFailureGroup>(),
@@ -2987,8 +2991,10 @@ mod alias_tests {
         let counts = failure_counts_sql(" where ts_ms >= ?");
         assert_no_shadowing(&counts);
         assert_eq!(select_items(&counts).len(), 3);
-        let groups = failure_groups_sql(" where ts_ms >= ?");
+        let groups = failure_groups_sql(" where ts_ms >= ?", 1, FAILURE_GROUP_LIMIT);
         assert!(groups.contains(" and status_code >= 400 group by"));
+        assert!(groups.contains(" having failed >= 1 order by"));
+        assert!(groups.ends_with("limit 50"));
         assert!(groups.contains(obleth_config::EFFECTIVE_CLASS_SQL));
         assert!(!groups.contains(" as error_class"));
         assert_eq!(groups.matches('?').count(), 1);

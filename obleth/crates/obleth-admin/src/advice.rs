@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use crate::usage::{self, UsageFailureGroup};
 use crate::{audit_actor, AdminError, AdminState, Result};
 
 /// The window every check reads.
@@ -43,6 +44,8 @@ const JUDGE_BUDGET: Duration = Duration::from_secs(90);
 
 /// Failure groups smaller than this are noise, not a pattern.
 const MIN_GROUP_FAILURES: u64 = 20;
+/// Most failure groups one Advice run reads.
+const GROUP_LIMIT: u64 = 200;
 /// A caller repeating one failure at least this often, over at least an hour,
 /// is reported on its own.
 const REPEAT_MIN_FAILURES: u64 = 500;
@@ -626,26 +629,6 @@ pub fn rank(findings: &mut [AdviceFinding]) {
 // Ledger reads
 // ---------------------------------------------------------------------------
 
-/// The same failure over and over: one caller, one model, one status, one
-/// class, one reason once its numbers are set aside.
-#[derive(Debug, Clone, Row, Deserialize)]
-pub struct FailureGroup {
-    pub class: String,
-    pub platform: bool,
-    #[serde(with = "clickhouse::serde::uuid")]
-    pub tenant_id: Uuid,
-    pub tenant_name: String,
-    #[serde(with = "clickhouse::serde::uuid")]
-    pub key_id: Uuid,
-    pub key_name: String,
-    pub model: String,
-    pub status_code: u16,
-    pub reason: String,
-    pub failures: u64,
-    pub first_ms: i64,
-    pub last_ms: i64,
-}
-
 /// One model's day in the ledger.
 #[derive(Debug, Clone, Row, Deserialize)]
 pub struct ModelTotals {
@@ -658,21 +641,10 @@ pub struct ModelTotals {
     pub mean_output: f64,
 }
 
-fn failure_groups_sql() -> String {
-    // Aliases stay clear of the column names the query reads.
-    format!(
-        "select {class} as filed_class, filed_class in {platform} as is_platform, \
-         tenant_id, any(tenant_name) as tn, key_id, any(key_name) as kn, model, status_code, \
-         any(error_reason) as sample_reason, count() as failed, \
-         min(ts_ms) as first_at, max(ts_ms) as last_at \
-         from usage where ts_ms >= ? and status_code >= 400 \
-         group by filed_class, tenant_id, key_id, model, status_code, \
-         replaceRegexpAll(error_reason, '[0-9]+', 'N') \
-         having failed >= {MIN_GROUP_FAILURES} \
-         order by failed desc limit 200",
-        class = obleth_config::EFFECTIVE_CLASS_SQL,
-        platform = obleth_config::PLATFORM_CLASSES_SQL,
-    )
+/// Advice reads the same ledger the request log shows: the window back to
+/// the bound start, without the probe and benchmark traffic the log hides.
+fn ledger_window() -> String {
+    format!(" where ts_ms >= ?{}", usage::internal_filter(None))
 }
 
 fn model_totals_sql() -> String {
@@ -684,7 +656,8 @@ fn model_totals_sql() -> String {
          countIf(status_code = 200 and output_tokens > 0 and request_type = 'chat') as answered, \
          ifNotFinite(avgIf(toFloat64(output_tokens), \
              status_code = 200 and output_tokens > 0 and request_type = 'chat'), 0) as mean_out \
-         from usage where ts_ms >= ? group by model",
+         from usage{window} group by model",
+        window = ledger_window(),
         class = obleth_config::EFFECTIVE_CLASS_SQL,
         platform = obleth_config::PLATFORM_CLASSES_SQL,
     )
@@ -693,11 +666,15 @@ fn model_totals_sql() -> String {
 async fn query_failure_groups(
     client: &clickhouse::Client,
     since_ms: i64,
-) -> std::result::Result<Vec<FailureGroup>, clickhouse::error::Error> {
+) -> std::result::Result<Vec<UsageFailureGroup>, clickhouse::error::Error> {
     client
-        .query(&failure_groups_sql())
+        .query(&usage::failure_groups_sql(
+            &ledger_window(),
+            MIN_GROUP_FAILURES,
+            GROUP_LIMIT,
+        ))
         .bind(since_ms)
-        .fetch_all::<FailureGroup>()
+        .fetch_all::<UsageFailureGroup>()
         .await
 }
 
@@ -717,7 +694,7 @@ async fn query_model_totals(
 // ---------------------------------------------------------------------------
 
 pub struct Inputs<'a> {
-    pub groups: &'a [FailureGroup],
+    pub groups: &'a [UsageFailureGroup],
     pub totals: &'a [ModelTotals],
     pub models: &'a [ModelRoute],
     /// The vision boon's describer, when the boon is on and has one.
@@ -870,7 +847,7 @@ fn fmt_ago(now_ms: i64, at_ms: i64) -> String {
     }
 }
 
-fn caller(g: &FailureGroup) -> String {
+fn caller(g: &UsageFailureGroup) -> String {
     let key = if g.key_name.is_empty() {
         g.key_id.to_string()[..8].to_string()
     } else {
@@ -889,7 +866,7 @@ fn images_refused(inp: &Inputs<'_>, out: &mut Vec<AdviceFinding>, covered: &mut 
     // model -> (failures, last_ms, callers)
     let mut by_model: BTreeMap<String, (u64, i64, BTreeMap<String, u64>)> = BTreeMap::new();
     for (i, g) in inp.groups.iter().enumerate() {
-        if g.class != "client_input" || !is_image_refusal(&g.reason) {
+        if g.error_class != "client_input" || !is_image_refusal(&g.reason) {
             continue;
         }
         let Some(m) = model(inp, &g.model) else {
@@ -905,9 +882,9 @@ fn images_refused(inp: &Inputs<'_>, out: &mut Vec<AdviceFinding>, covered: &mut 
             continue;
         }
         let e = by_model.entry(g.model.clone()).or_default();
-        e.0 += g.failures;
+        e.0 += g.requests;
         e.1 = e.1.max(g.last_ms);
-        *e.2.entry(caller(g)).or_default() += g.failures;
+        *e.2.entry(caller(g)).or_default() += g.requests;
     }
     if by_model.is_empty() {
         return;
@@ -1027,8 +1004,8 @@ fn repeating_failures(inp: &Inputs<'_>, covered: &[usize], out: &mut Vec<AdviceF
         }
         if covered.contains(&i)
             || g.platform
-            || !matches!(g.class.as_str(), "client_input" | "limit" | "retired")
-            || g.failures < REPEAT_MIN_FAILURES
+            || !matches!(g.error_class.as_str(), "client_input" | "limit" | "retired")
+            || g.requests < REPEAT_MIN_FAILURES
             || g.last_ms - g.first_ms < REPEAT_MIN_SPAN_MS
         {
             continue;
@@ -1038,7 +1015,7 @@ fn repeating_failures(inp: &Inputs<'_>, covered: &[usize], out: &mut Vec<AdviceF
         let mut evidence = vec![
             AdviceEvidence {
                 label: "Failures".into(),
-                value: format!("{} ({})", fmt_count(g.failures), g.status_code),
+                value: format!("{} ({})", fmt_count(g.requests), g.status_code),
             },
             AdviceEvidence {
                 label: "Between".into(),
@@ -1055,7 +1032,7 @@ fn repeating_failures(inp: &Inputs<'_>, covered: &[usize], out: &mut Vec<AdviceF
                 value: g.reason.chars().take(160).collect(),
             });
         }
-        let detail = match (g.class.as_str(), overflow_length(&g.reason)) {
+        let detail = match (g.error_class.as_str(), overflow_length(&g.reason)) {
             ("client_input", Some(len)) => {
                 let mut fits: Vec<&ModelRoute> = inp
                     .models
@@ -1113,7 +1090,7 @@ fn repeating_failures(inp: &Inputs<'_>, covered: &[usize], out: &mut Vec<AdviceF
                 error_class: None,
             }),
             judgment: None,
-            weight: g.failures,
+            weight: g.requests,
         });
     }
 }
@@ -1131,8 +1108,8 @@ fn platform_failures(inp: &Inputs<'_>, out: &mut Vec<AdviceFinding>) {
         let top = inp
             .groups
             .iter()
-            .filter(|g| g.model == t.model && g.platform && g.class != "capacity")
-            .max_by_key(|g| g.failures);
+            .filter(|g| g.model == t.model && g.platform && g.error_class != "capacity")
+            .max_by_key(|g| g.requests);
         let mut evidence = vec![AdviceEvidence {
             label: "Failed".into(),
             value: format!(
@@ -1377,9 +1354,9 @@ mod tests {
         reason: &str,
         n: u64,
         span_h: i64,
-    ) -> FailureGroup {
-        FailureGroup {
-            class: class.into(),
+    ) -> UsageFailureGroup {
+        UsageFailureGroup {
+            error_class: class.into(),
             platform: matches!(
                 class,
                 "upstream_error" | "upstream_timeout" | "network" | "capacity"
@@ -1391,10 +1368,24 @@ mod tests {
             model: model.into(),
             status_code: status,
             reason: reason.into(),
-            failures: n,
+            requests: n,
             first_ms: 1_000_000_000 - span_h * 3_600_000,
             last_ms: 1_000_000_000,
         }
+    }
+
+    #[test]
+    fn advice_reads_leave_internal_traffic_out_like_the_request_log() {
+        let hidden = " and request_type not in ('health_probe', 'benchmark')";
+        let groups = usage::failure_groups_sql(&ledger_window(), MIN_GROUP_FAILURES, GROUP_LIMIT);
+        assert!(groups.contains(hidden), "{groups}");
+        assert!(groups.contains("having failed >= 20"), "{groups}");
+        assert!(groups.contains("limit 200"), "{groups}");
+        assert!(
+            model_totals_sql().contains(hidden),
+            "{}",
+            model_totals_sql()
+        );
     }
 
     fn totals(model: &str, requests: u64) -> ModelTotals {
@@ -1410,7 +1401,7 @@ mod tests {
     }
 
     fn inputs<'a>(
-        groups: &'a [FailureGroup],
+        groups: &'a [UsageFailureGroup],
         totals: &'a [ModelTotals],
         models: &'a [ModelRoute],
         describer: Option<&'a str>,
