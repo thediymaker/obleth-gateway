@@ -75,5 +75,7 @@ describe("filters", () => {
     expect(q).toMatchObject({ actor: "jlee379@asu.edu", entityType: "api_key", q: "comfy", since: "2026-08-29T00:00:00.000Z" });
     expect(filtersFromParams({ entity: "model:m1" })).toMatchObject({ range: "all", entity: "model:m1" });
     expect(queryFor(filtersFromParams({ entity: "model:m1" }))).toMatchObject({ entityType: "model", entityId: "m1", since: undefined });
+    // A kind of several entity types asks the gateway for all of them, so paging stays within the kind.
+    expect(queryFor(filtersFromParams({ kind: "deployments" })).entityType).toBe("managed_model,model_replica,recipe");
   });
 });

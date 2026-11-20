@@ -14,6 +14,7 @@ import { logsHref } from "@/lib/log-links";
 import { modelHref } from "@/lib/models-model";
 import type { AuditEntry } from "@/lib/obleth";
 import { compact } from "@/lib/overview-model";
+import { poolOccupancy } from "@/lib/occupancy";
 import { getJson } from "@/lib/utils";
 
 function secsAgo(iso: string | null | undefined): string {
@@ -40,9 +41,7 @@ export function WatchedPage({ modelId, initial, changes }: { modelId: string; in
   const model = row?.model ?? initial.models.find((m) => m.id === modelId)!;
   const day = useModelDay(model.model_name);
   const status = row?.discovery?.status;
-  const inFlight = row?.discovery?.cluster_in_flight ?? row?.discovery?.in_flight ?? 0;
-  const queued = fairshare.data?.model_queued?.[model.model_name] ?? 0;
-  const cap = row?.poolCap ?? 0;
+  const { inFlight, cap, queued } = poolOccupancy(model.model_name, model, fairshare.data, data.discovery);
   const failShare = day.data?.requests ? day.data.errors / day.data.requests : 0;
 
   return (
@@ -102,7 +101,7 @@ export function WatchedPage({ modelId, initial, changes }: { modelId: string; in
             <Row label="Ready endpoints">{status?.ready_replicas ?? 0}, read {secsAgo(status?.last_success)}</Row>
             <Row label="Per replica">{status?.per_replica_max_in_flight ?? "differs by replica"} at once{status?.per_replica_source ? ` (${status.per_replica_source})` : ""}</Row>
             <Row label="Headroom">× {status?.headroom ?? model.capacity_headroom ?? 1}</Row>
-            <Row label="Pool"><b className="font-medium text-foreground">{status?.ready_replicas != null && status.per_replica_max_in_flight != null ? `${status.ready_replicas} × ${status.per_replica_max_in_flight}${status.headroom !== 1 ? ` × ${status.headroom}` : ""} = ` : ""}{cap} slots</b></Row>
+            <Row label="Pool"><b className="font-medium text-foreground">{status?.ready_replicas != null && status.per_replica_max_in_flight != null ? `${status.ready_replicas} × ${status.per_replica_max_in_flight}${status.headroom !== 1 ? ` × ${status.headroom}` : ""} = ` : ""}{status?.effective_max_in_flight ?? cap} slots</b></Row>
             {status?.reason && <Row label="Note">{status.reason}</Row>}
           </div>
           <p className="border-t border-border px-[18px] py-2.5 text-xs text-muted-foreground">If the Service has no ready endpoints, the pool keeps its last size (or the model's own max in flight) and requests fail until a replica is ready.</p>

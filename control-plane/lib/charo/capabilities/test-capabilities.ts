@@ -1,7 +1,7 @@
 import type { CharoTool, ToolCtx, ToolProgress } from "@/lib/charo/tools/types";
 import type { ChatMessage } from "@/lib/charo/gateway";
-import { assembleTrace, type TraceSummary } from "@/lib/charo/trace";
-import { obleth } from "@/lib/obleth";
+import type { TraceSummary } from "@/lib/charo/trace";
+import { lookupTrace } from "@/lib/charo/trace-lookup";
 import { TEST_CATALOG, FIXTURE_IMAGE_DATA_URL, evaluateTest } from "./catalog";
 import type { TestId, CapabilityResult, TestOutcome } from "./types";
 
@@ -28,11 +28,8 @@ function contentOf(body: unknown): string {
 async function fetchTrace(requestId: string, signal: AbortSignal): Promise<TraceSummary | null> {
   for (let i = 0; i < 4; i++) {
     if (signal.aborted) return null;
-    const [spans, logs] = await Promise.all([
-      obleth.getRequestSpans(requestId).catch(() => []),
-      obleth.usageLogs({ requestId, limit: 1 }).catch(() => []),
-    ]);
-    if (spans.length > 0 || logs.length > 0) return assembleTrace(logs[0] ?? null, spans);
+    const trace = await lookupTrace(requestId);
+    if (trace) return trace;
     if (signal.aborted) return null;
     await new Promise((r) => setTimeout(r, 800));
   }

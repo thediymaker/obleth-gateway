@@ -385,23 +385,24 @@ export function AutotuneButton({ model, disabled }: { model: ModelRoute; disable
     setRunning(true);
     setError(null);
     setReport(null);
-    try {
-      setReport(await autotuneModelAction(model.id, {
-        latency_headroom: Math.max(1.5, Number(headroom) || 4),
-        replicas: Math.max(1, Math.round(Number(replicas) || 1)),
-        workload,
-      }));
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Auto-tune failed");
-    } finally {
-      setRunning(false);
-    }
+    const result = await autotuneModelAction(model.id, {
+      latency_headroom: Math.max(1.5, Number(headroom) || 4),
+      replicas: Math.max(1, Math.round(Number(replicas) || 1)),
+      workload,
+    });
+    if (result.ok) setReport(result.report);
+    else setError(result.error);
+    setRunning(false);
   };
 
   const apply = () => {
     if (!report) return;
     start(async () => {
-      await applyAutotuneCapacityAction(model.id, report.recommended_max_in_flight);
+      const result = await applyAutotuneCapacityAction(model.id, report.recommended_max_in_flight);
+      if (!result.ok) {
+        setError(result.error);
+        return;
+      }
       setOpen(false);
       reset();
     });

@@ -1001,6 +1001,7 @@ fn model_backup_from_row(row: &PgRow) -> Result<ModelBackup> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ModelFields, NewModel};
     use aes_gcm::aead::KeyInit;
     use aes_gcm::{Aes256Gcm, Key};
 
@@ -1125,55 +1126,38 @@ mod tests {
         // the neutral 1.0.
         let variant_name = format!("m-{}-spec", uuid::Uuid::new_v4());
         let model = store
-            .create_model(
-                &format!("m-{}", uuid::Uuid::new_v4()),
-                "backup test model",
-                "upstream-model",
-                "http://127.0.0.1:8081",
-                None,
-                "chat",
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                8192,
-                100,
-                None,
-                false,
-                true,
-                false,
-                false,
-                false,
-                &["coding:3".to_string()],
-                &[],
-                &[],
-                0,
-                2.5,
-                // Excluded from auto, so the export/restore assertions below
-                // distinguish a carried value from the eligible default.
-                false,
-                "",
-                "",
-                "",
-                &[],
-                "",
-                &Default::default(),
-                0.0,
-                "discovered",
-                &obleth_config::capacity::DiscoveryFields {
-                    source: "kubernetes".into(),
-                    namespace: Some("inference".into()),
-                    service: Some("upstream-model".into()),
-                    per_replica_max_in_flight: Some(8),
-                    headroom: 1.5,
+            .create_model(&NewModel::new(
+                format!("m-{}", uuid::Uuid::new_v4()),
+                ModelFields {
+                    description: "backup test model".into(),
+                    upstream_model: "upstream-model".into(),
+                    api_base: "http://127.0.0.1:8081".into(),
+                    model_type: "chat".into(),
+                    context_window: 8192,
+                    admission_weight: 100,
+                    supports_system_messages: true,
+                    tags: vec!["coding:3".into()],
+                    route_bias: 2.5,
+                    // Excluded from auto, so the export/restore assertions
+                    // below distinguish a carried value from the eligible
+                    // default.
+                    auto_eligible: false,
+                    capacity_mode: "discovered".into(),
+                    discovery: obleth_config::capacity::DiscoveryFields {
+                        source: "kubernetes".into(),
+                        namespace: Some("inference".into()),
+                        service: Some("upstream-model".into()),
+                        per_replica_max_in_flight: Some(8),
+                        headroom: 1.5,
+                    },
+                    variants: vec![obleth_config::ModelVariant {
+                        name: variant_name.clone(),
+                        description: "the model with speculation".into(),
+                        boons: vec!["speculation".into()],
+                    }],
+                    ..Default::default()
                 },
-                &[obleth_config::ModelVariant {
-                    name: variant_name.clone(),
-                    description: "the model with speculation".into(),
-                    boons: vec!["speculation".into()],
-                }],
-            )
+            ))
             .await
             .expect("create model");
         fixtures.track_model(model.id);
@@ -1257,14 +1241,13 @@ mod tests {
             .await
             .expect("link endpoint");
         let recipe = store
-            .upsert_recipe(crate::UpsertRecipe {
-                id: None,
+            .create_recipe(crate::NewRecipe {
                 name: format!("r-{}", uuid::Uuid::new_v4()),
                 body: "#!/bin/bash\nserve\n".into(),
                 author: "test".into(),
             })
             .await
-            .expect("upsert recipe");
+            .expect("create recipe");
 
         // Export carries the stored hash and the tenant config.
         let data = store.export_backup_data().await.expect("export");

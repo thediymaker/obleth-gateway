@@ -14,6 +14,7 @@ import { changeLabel, compact, describeAudit, formatMs } from "@/lib/overview-mo
 import { cn, getJson } from "@/lib/utils";
 import { auditHref } from "@/lib/audit-model";
 import { boonsWaitingOnFunctionCalling } from "@/lib/boon-availability";
+import { readFailed, ReadFailedNote, type LiveRead } from "@/components/ui/read-state";
 
 const DAY_MS = 86_400_000;
 const CURRENT = "hsl(240 5% 90%)";
@@ -67,7 +68,11 @@ function ChartTip({ active, payload, measure }: { active?: boolean; payload?: { 
   );
 }
 
-function TrafficChart({ data }: { data: ModelOverviewData | undefined }) {
+/** The model page's overview read: its data, and whether it answered. */
+type OverviewRead = LiveRead & { data?: ModelOverviewData };
+
+function TrafficChart({ overview }: { overview: OverviewRead }) {
+  const data = overview.data;
   const [measure, setMeasure] = useState<Measure>("requests");
   const rows = useMemo(() => (data ? buildRows(data, measure) : []), [data, measure]);
   const empty = rows.every((r) => !r.cur && !r.prev);
@@ -87,7 +92,9 @@ function TrafficChart({ data }: { data: ModelOverviewData | undefined }) {
       }
     >
       <div className="px-[18px] pb-4 pt-3">
-        {!data ? (
+        {readFailed(overview) ? (
+          <ReadFailedNote query={overview} what="this model's traffic" className="flex h-[220px] items-center justify-center" />
+        ) : !data ? (
           <div className="skeleton h-[220px] rounded-lg" />
         ) : empty ? (
           <div className="flex h-[220px] items-center justify-center rounded-lg border border-dashed border-border text-sm text-muted-foreground">No traffic in the last two days</div>
@@ -178,12 +185,15 @@ function WhereItRuns({ model, runs, capacity, endpoints }: { model: ModelRoute; 
   );
 }
 
-function TopTenants({ data }: { data: ModelOverviewData | undefined }) {
+function TopTenants({ overview }: { overview: OverviewRead }) {
+  const data = overview.data;
   const max = Math.max(1, ...(data?.tenants ?? []).map((t) => t.requests));
   return (
     <section aria-label="Top tenants" className="flex flex-col gap-1 rounded-xl border border-border bg-card px-[18px] pb-2.5 pt-4">
       <h2 className="pb-1.5 text-sm font-semibold">Top tenants · 24h</h2>
-      {!data ? (
+      {readFailed(overview) ? (
+        <ReadFailedNote query={overview} what="the top tenants" className="mb-2 p-3 text-xs" />
+      ) : !data ? (
         <div className="space-y-2 pb-2"><div className="skeleton h-4" /><div className="skeleton h-4" /><div className="skeleton h-4" /></div>
       ) : data.tenants.length === 0 ? (
         <p className="pb-2 text-xs text-muted-foreground">No requests in the last 24 hours.</p>
@@ -211,7 +221,7 @@ function SetupRow({ label, href, children }: { label: string; href: string; chil
 
 export function ModelOverview({
   model,
-  data,
+  overview,
   summary,
   checks,
   runs,
@@ -220,7 +230,7 @@ export function ModelOverview({
   endpoints,
 }: {
   model: ModelRoute;
-  data: ModelOverviewData | undefined;
+  overview: OverviewRead;
   summary: ModelHealthSummary;
   checks: ModelHealthCheck[];
   runs: RunsOn;
@@ -228,6 +238,7 @@ export function ModelOverview({
   load: { inFlight: number; cap: number; queued: number };
   endpoints: number;
 }) {
+  const data = overview.data;
   const u = data?.usage;
   // Failures come from the raw log, which the rollup's per-model read lacks.
   const { data: hist } = useQuery({
@@ -270,11 +281,11 @@ export function ModelOverview({
       </div>
 
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_340px]">
-        <TrafficChart data={data} />
+        <TrafficChart overview={overview} />
         <div className="flex flex-col gap-4">
           <HealthTicks checks={checks} summary={summary} />
           <WhereItRuns model={model} runs={runs} capacity={capacity} endpoints={endpoints} />
-          <TopTenants data={data} />
+          <TopTenants overview={overview} />
         </div>
       </div>
 
@@ -296,7 +307,9 @@ export function ModelOverview({
             <h2 className="text-sm font-semibold">Recent changes</h2>
             <Link href={auditHref("model", model.id)} className="text-[12.5px] text-secondary-foreground hover:text-foreground">Audit log ›</Link>
           </div>
-          {!data ? (
+          {readFailed(overview) ? (
+            <ReadFailedNote query={overview} what="the recent changes" className="mb-2 p-3 text-xs" />
+          ) : !data ? (
             <div className="space-y-2 pb-2"><div className="skeleton h-4" /><div className="skeleton h-4" /></div>
           ) : data.audit.length === 0 ? (
             <p className="pb-2 text-xs text-muted-foreground">No recorded changes.</p>

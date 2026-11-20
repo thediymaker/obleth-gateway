@@ -316,7 +316,7 @@ pub fn plan(input: &PlanInput) -> Vec<Action> {
 
     for r in input.replicas {
         let job = jobs.get(&r.slurm_job_id);
-        if r.state == "lost" {
+        if r.state == ReplicaState::Lost {
             // Aged from when it was lost, not created: a launch that failed
             // after a long queue or load stays visible for the full retention.
             if r.updated_secs >= input.lost_retention_secs {
@@ -324,7 +324,7 @@ pub fn plan(input: &PlanInput) -> Vec<Action> {
             }
             continue;
         }
-        if r.state == "draining" {
+        if r.state == ReplicaState::Draining {
             // Cancelled on purpose. Once the job is gone, delete the row (not
             // MarkLost: a drain is not a failure). While it still runs, the
             // grace period lets in-flight requests finish, then the job is
@@ -369,14 +369,14 @@ pub fn plan(input: &PlanInput) -> Vec<Action> {
             actions.push(cancel(
                 r,
                 CancelReason::OperatorRestart,
-                r.state != "healthy",
+                r.state != ReplicaState::Healthy,
             ));
             leaving.insert(r.id);
             continue;
         }
         match job.state {
             JobState::Pending => {
-                if r.state == "healthy" {
+                if r.state == ReplicaState::Healthy {
                     // Requeued or suspended: it no longer serves where it was
                     // registered. Out of rotation now; promoted again when it
                     // serves.
@@ -423,7 +423,7 @@ pub fn plan(input: &PlanInput) -> Vec<Action> {
                         ends_at.insert(r.id, end);
                     }
                 }
-                if r.state == "healthy" {
+                if r.state == ReplicaState::Healthy {
                     if restarted_elsewhere(r, job) {
                         actions.push(Action::Demote {
                             replica_id: r.id,
@@ -523,7 +523,7 @@ pub fn plan(input: &PlanInput) -> Vec<Action> {
         .count() as i64;
     let served_now = actions.iter().any(|a| {
         matches!(a, Action::Promote { replica_id, .. }
-            if input.replicas.iter().any(|r| r.id == *replica_id && r.state != "healthy"))
+            if input.replicas.iter().any(|r| r.id == *replica_id && r.state != ReplicaState::Healthy))
     });
     let counted = if served_now { 0 } else { spec.failed_launches };
     let limit_reached = spec.max_job_failures > 0
@@ -670,7 +670,7 @@ pub fn plan(input: &PlanInput) -> Vec<Action> {
             let keep = promoting.contains(&rid)
                 || input.replicas.iter().any(|r| {
                     r.id == rid
-                        && r.state == "healthy"
+                        && r.state == ReplicaState::Healthy
                         && !leaving.contains(&r.id)
                         && r.endpoint_id.is_none_or(|e| e == ep.id)
                 });
@@ -781,7 +781,7 @@ fn probed_healthy_job<'a>(
     r: &ReplicaView,
     jobs: &'a HashMap<String, JobInfo>,
 ) -> Option<&'a JobInfo> {
-    if r.state != "healthy" {
+    if r.state != ReplicaState::Healthy {
         return None;
     }
     jobs.get(&r.slurm_job_id)
@@ -841,7 +841,7 @@ pub fn self_heal_candidates(
     if probe_threshold <= 0 {
         return out;
     }
-    for r in replicas.iter().filter(|r| r.state == "healthy") {
+    for r in replicas.iter().filter(|r| r.state == ReplicaState::Healthy) {
         let fresh = r
             .endpoint_id
             .and_then(|id| endpoints.iter().find(|e| e.id == id))
@@ -986,7 +986,7 @@ mod tests {
         ReplicaView {
             id: Uuid::new_v4(),
             slurm_job_id: job.into(),
-            state: state.into(),
+            state: ReplicaState::parse(state).expect("a replica state"),
             endpoint_id: ep,
             age_secs: age,
             updated_secs: age,
@@ -1284,7 +1284,7 @@ mod tests {
     fn a_demoted_replica_is_promoted_again_when_it_serves() {
         let mut c = Case::new(spec(1));
         let mut r = served("1", None, "n1", mins_ago(30));
-        r.state = "pending".into();
+        r.state = ReplicaState::Pending;
         r.state_detail = Some(REQUEUED_DETAIL.into());
         c.replicas = vec![r];
         c.jobs = HashMap::from([running("1", "n2", mins_ago(1))]);
@@ -1500,7 +1500,7 @@ mod tests {
     fn a_requeued_replica_that_served_is_not_a_failed_launch_on_timeout() {
         let mut c = Case::new(spec(1));
         let mut r = served("1", None, "n1", mins_ago(500));
-        r.state = "pending".into();
+        r.state = ReplicaState::Pending;
         c.replicas = vec![r];
         c.jobs = HashMap::from([running("1", "n2", mins_ago(61))]);
         let a = c.plan();

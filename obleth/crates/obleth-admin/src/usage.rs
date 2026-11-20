@@ -1,6 +1,7 @@
 //! Usage/cost reads from the ClickHouse ledger.
 
 use clickhouse::Row;
+use obleth_config::{DECODE_MS_SQL, TTFT_OK_SQL};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
@@ -15,7 +16,7 @@ pub const INTERNAL_REQUEST_TYPES: &[&str] = &[
 
 /// SQL fragment excluding internal traffic unless explicitly included. The
 /// labels are compile-time constants, so inlining them is injection-safe.
-fn internal_filter(include_internal: Option<bool>) -> String {
+pub(crate) fn internal_filter(include_internal: Option<bool>) -> String {
     if include_internal == Some(true) {
         return String::new();
     }
@@ -27,57 +28,61 @@ fn internal_filter(include_internal: Option<bool>) -> String {
     format!(" and request_type not in ({list})")
 }
 
-/// A row's first-token time marks a real first token. Streamed rows always
-/// qualify. Rows written before the gateway recorded `streamed` carry a
-/// first-byte time even for buffered replies, whose first byte arrives with
-/// the whole body, so the rest of the reply takes a few milliseconds. Their
-/// time counts only when at least a twentieth of the request came after it,
-/// as it does for a streamed reply. A buffered reply recorded since has no
-/// first-token time at all.
-macro_rules! real_ttft {
-    () => {
-        "(streamed or (total_ms - ttft_ms) * 20 >= total_ms - queue_wait_ms)"
-    };
+/// Mean first-token time of the [`TTFT_OK_SQL`] requests, 0 when there are
+/// none.
+fn avg_ttft_sql() -> String {
+    format!("round(if(countIf({TTFT_OK_SQL}) > 0, avgIf(ttft_ms, {TTFT_OK_SQL}), 0), 1)")
 }
-const REAL_TTFT: &str = real_ttft!();
 
-/// Milliseconds a reply spent generating: the decode window (total less first
-/// token) when the first token is real, else the upstream time (total less
-/// queue). Measuring a buffered reply from its first byte would leave only the
-/// body's transfer time and a speed in the tens of thousands.
-const DECODE_MS: &str = concat!(
-    "if(ttft_ms > 0 and total_ms - ttft_ms >= 20 and ",
-    real_ttft!(),
-    ", total_ms - ttft_ms, total_ms - queue_wait_ms)"
-);
+/// Median first-token time of the [`TTFT_OK_SQL`] requests, 0 when there are
+/// none.
+fn p50_ttft_sql() -> String {
+    format!("round(if(countIf({TTFT_OK_SQL}) > 0, quantileIf(0.5)(ttft_ms, {TTFT_OK_SQL}), 0), 1)")
+}
 
-#[derive(Debug, Deserialize, IntoParams, ToSchema)]
+/// The requests a prefill rate is read from: a real first token (see
+/// [`TTFT_OK_SQL`]) late enough to time, and a prompt.
+fn prefill_rated_sql() -> String {
+    format!("{TTFT_OK_SQL} and ttft_ms >= 20 and input_tokens >= 1")
+}
+
+/// Filters of the aggregate usage reads (`/usage`, `/usage/keys`,
+/// `/usage/models`, `/usage/cache`, `/costs`, `/overview/summary`). Every
+/// read honours every field; an unknown parameter is refused.
+#[derive(Debug, Default, Deserialize, IntoParams, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UsageQuery {
     #[schema(value_type = Option<String>)]
     pub tenant_id: Option<Uuid>,
     #[schema(value_type = Option<String>)]
     pub key_id: Option<Uuid>,
     pub model: Option<String>,
-    /// Lower bound, unix epoch millis. Defaults to the last 24h.
+    /// Inclusive lower bound, unix epoch millis. Defaults to a day before
+    /// `until_ms` (or now).
     pub since_ms: Option<i64>,
-    /// Aggregate dimension: `tenant` (default), `key`, or `model`.
-    pub group_by: Option<String>,
-    /// Cap the number of returned rows (highest-volume first). Critical for
-    /// per-key reads where a tenant fleet can hold 100k+ keys.
+    /// Exclusive upper bound, unix epoch millis. Open-ended by default, so a
+    /// previous period is one bounded read.
+    pub until_ms: Option<i64>,
+    /// Most rows a grouped read returns, busiest first: default 1,000, at
+    /// most 10,000. Single-row reads return their one row.
     pub limit: Option<u64>,
     /// When true, include internal traffic (health probes, benchmark runs)
     /// that is excluded from this read by default.
     pub include_internal: Option<bool>,
 }
 
-#[derive(Debug, Deserialize, IntoParams, ToSchema)]
+#[derive(Debug, Default, Deserialize, IntoParams, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UsageSeriesQuery {
     #[schema(value_type = Option<String>)]
     pub tenant_id: Option<Uuid>,
-    /// Restrict the series to a single model. Required by the per-model series
-    /// endpoint; ignored by the global/tenant series readers.
+    /// Restrict the series to one model. Required by the per-model series.
     pub model: Option<String>,
+    /// Inclusive lower bound, unix epoch millis. Defaults to a day before
+    /// `until_ms` (or now).
     pub since_ms: Option<i64>,
+    /// Exclusive upper bound, unix epoch millis. Open-ended by default.
+    pub until_ms: Option<i64>,
     /// Bucket width in milliseconds. Default 300_000 (5 minutes).
     pub bucket_ms: Option<i64>,
     /// When true, include internal traffic (health probes, benchmark runs)
@@ -89,12 +94,16 @@ pub struct UsageSeriesQuery {
 /// (`GET /api/v1/usage/breakdown`). Scoped to a single model so the expanded
 /// model card can show which tenants/keys are driving its load.
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UsageBreakdownQuery {
     /// Model to break down (required).
     pub model: String,
-    /// Lower bound, unix epoch millis. Defaults to the last 24h.
+    /// Inclusive lower bound, unix epoch millis. Defaults to a day before
+    /// `until_ms` (or now).
     pub since_ms: Option<i64>,
-    /// Cap on rows returned (busiest tenant/key pairs first).
+    /// Exclusive upper bound, unix epoch millis. Open-ended by default.
+    pub until_ms: Option<i64>,
+    /// Most rows, busiest tenant/key pairs first: default 100, at most 10,000.
     pub limit: Option<u64>,
     /// When true, include internal traffic (health probes, benchmark runs)
     /// that is excluded from this read by default.
@@ -104,6 +113,7 @@ pub struct UsageBreakdownQuery {
 /// Filters for `GET /api/v1/usage/speed`: how fast each model answered over a
 /// window, as one row per model or one per model per hour or day.
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UsageSpeedQuery {
     /// Inclusive lower bound, unix epoch millis. Defaults to the last 24h.
     pub since_ms: Option<i64>,
@@ -126,6 +136,7 @@ pub struct UsageSpeedQuery {
 
 /// Date-range read against the permanent daily rollup (`usage_daily`).
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UsageDailyQuery {
     /// Inclusive lower bound, `YYYY-MM-DD`. Defaults to 7 days ago.
     pub start_day: Option<String>,
@@ -133,31 +144,18 @@ pub struct UsageDailyQuery {
     pub end_day: Option<String>,
     #[schema(value_type = Option<String>)]
     pub tenant_id: Option<Uuid>,
-    /// One or more key ids. Accepts a single UUID or a comma-separated list
-    /// (`key_id=a,b,c`) so a caller can fetch spend across all of a user's
-    /// rotated keys in one request.
-    pub key_id: Option<String>,
+    /// One key id, or up to 200 joined by commas (`key_id=a,b,c`), so a
+    /// caller can fetch spend across all of a user's rotated keys in one
+    /// request.
+    #[serde(default, deserialize_with = "comma_list")]
+    #[schema(value_type = Option<String>)]
+    #[param(value_type = Option<String>)]
+    pub key_id: Vec<Uuid>,
     pub model: Option<String>,
     /// Aggregate dimension: `day` (default), `tenant`, `key`, `model`,
     /// `key_model` (one row per key+model across the whole range), or one of
     /// the per-day splits `day_tenant`, `day_model` and `day_key_model`.
     pub group_by: Option<String>,
-}
-
-/// Parse the `key_id` query value, which may be a single UUID or a
-/// comma-separated list (`a,b,c`). Empty entries are ignored so a trailing
-/// comma is harmless. Returns the first parse error so the handler can map it
-/// to a 400.
-pub fn parse_key_ids(raw: Option<&str>) -> Result<Vec<Uuid>, uuid::Error> {
-    match raw {
-        Some(s) => s
-            .split(',')
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-            .map(Uuid::parse_str)
-            .collect(),
-        None => Ok(Vec::new()),
-    }
 }
 
 /// Most values one request-log filter takes as a comma-separated list.
@@ -224,6 +222,7 @@ where
 /// the only read that returns individual `usage` rows rather than an aggregate,
 /// and it powers the live request-log view in the control plane.
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UsageLogQuery {
     /// One tenant id, or several joined by commas.
     #[serde(default, deserialize_with = "comma_list")]
@@ -274,7 +273,7 @@ pub struct UsageLogQuery {
     pub parent_request_id: Option<Uuid>,
     /// Inclusive lower bound, unix epoch millis. Defaults to the last 24h.
     pub since_ms: Option<i64>,
-    /// Inclusive upper bound, unix epoch millis. Open-ended by default.
+    /// Exclusive upper bound, unix epoch millis. Open-ended by default.
     pub until_ms: Option<i64>,
     /// Keyset cursor for "older" pages: return rows strictly before this
     /// timestamp. Paired with `before_request_id` to break ties at the same ms.
@@ -375,137 +374,240 @@ pub struct UsageLogRow {
     pub user_agent: String,
 }
 
-/// A bind value for the request-log filters, in placeholder order.
-#[derive(Clone)]
-enum LogBind {
+/// A value bound to a placeholder. The ClickHouse client binds positionally,
+/// so a [`Filter`] keeps its values in placeholder order.
+#[derive(Clone, Debug, PartialEq)]
+enum Bind {
     Int(i64),
     Text(String),
 }
 
-/// The `where` clause the request log and its histogram share: every filter
-/// the log offers, with its bind values in placeholder order (the ClickHouse
-/// client binds positionally). The keyset cursor is the log's alone.
-fn log_filter_sql(q: &UsageLogQuery, since: i64) -> (String, Vec<LogBind>) {
-    let mut sql = String::from(" where ts_ms >= ?");
-    let mut binds = vec![LogBind::Int(since)];
-    if let Some(until) = q.until_ms {
-        sql.push_str(" and ts_ms <= ?");
-        binds.push(LogBind::Int(until));
+/// The `where` clause of a ledger read and the values it binds, built
+/// together so a placeholder and its value cannot drift apart. Every usage
+/// read builds its filters here.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Filter {
+    sql: String,
+    binds: Vec<Bind>,
+}
+
+impl Filter {
+    /// `where` the `usage` (or `key_rejections`) window `[since, until)`. The
+    /// bounds are stated on `ts` too, the partition key, so ClickHouse skips
+    /// whole days outside the window instead of checking each part's index.
+    pub(crate) fn window(since: i64, until: Option<i64>) -> Self {
+        let mut f = Filter {
+            sql: " where ts >= fromUnixTimestamp64Milli(toInt64(?)) and ts_ms >= ?".into(),
+            binds: vec![Bind::Int(since), Bind::Int(since)],
+        };
+        if let Some(until) = until {
+            f.sql
+                .push_str(" and ts < fromUnixTimestamp64Milli(toInt64(?)) and ts_ms < ?");
+            f.binds.extend([Bind::Int(until), Bind::Int(until)]);
+        }
+        f
     }
-    let tenants: Vec<String> = q.tenant_id.iter().map(Uuid::to_string).collect();
-    let keys: Vec<String> = q.key_id.iter().map(Uuid::to_string).collect();
-    any_of(&mut sql, &mut binds, "tenant_id", "toUUID(?)", &tenants);
-    any_of(&mut sql, &mut binds, "key_id", "toUUID(?)", &keys);
-    any_of(&mut sql, &mut binds, "model", "?", &q.model);
-    if let Some(rt) = &q.request_type {
-        sql.push_str(" and request_type = ?");
-        binds.push(LogBind::Text(rt.clone()));
+
+    /// `where` an opening predicate of a table without a `ts` window.
+    fn from(predicate: &str, binds: Vec<Bind>) -> Self {
+        Filter {
+            sql: format!(" where {predicate}"),
+            binds,
+        }
     }
-    if let Some(sid) = &q.session_id {
-        sql.push_str(" and session_id = ?");
-        binds.push(LogBind::Text(sid.clone()));
+
+    /// A constant predicate (`and ...`), with nothing to bind.
+    fn and(&mut self, predicate: &str) -> &mut Self {
+        self.sql.push_str(predicate);
+        self
     }
-    if let Some(d) = &q.device_id {
-        sql.push_str(" and device_id = ?");
-        binds.push(LogBind::Text(d.clone()));
+
+    /// `and {predicate}` with its one value.
+    fn and_bound(&mut self, predicate: &str, value: Bind) -> &mut Self {
+        self.sql.push_str(" and ");
+        self.sql.push_str(predicate);
+        self.binds.push(value);
+        self
     }
-    sql.push_str(&internal_filter(q.include_internal));
+
+    /// `and {column} = toUUID(?)` when there is an id.
+    fn uuid(&mut self, column: &str, id: Option<Uuid>) -> &mut Self {
+        if let Some(id) = id {
+            self.and_bound(&format!("{column} = toUUID(?)"), Bind::Text(id.to_string()));
+        }
+        self
+    }
+
+    /// `and {column} = ?` when there is a value.
+    fn text(&mut self, column: &str, value: Option<&str>) -> &mut Self {
+        if let Some(v) = value {
+            self.and_bound(&format!("{column} = ?"), Bind::Text(v.to_string()));
+        }
+        self
+    }
+
+    /// `and {column} = …` for one id, `in (…)` for several, nothing for none.
+    fn uuids(&mut self, column: &str, ids: &[Uuid]) -> &mut Self {
+        let ids: Vec<String> = ids.iter().map(Uuid::to_string).collect();
+        self.any_of(column, "toUUID(?)", &ids)
+    }
+
+    /// `and {column} = …` for one value, `and {column} in (…)` for several,
+    /// nothing for none; `placeholder` is how each bound value is read.
+    fn any_of(&mut self, column: &str, placeholder: &str, values: &[String]) -> &mut Self {
+        match values {
+            [] => {}
+            [one] => {
+                self.and_bound(
+                    &format!("{column} = {placeholder}"),
+                    Bind::Text(one.clone()),
+                );
+            }
+            many => {
+                let list = vec![placeholder; many.len()].join(", ");
+                self.sql.push_str(&format!(" and {column} in ({list})"));
+                self.binds.extend(many.iter().cloned().map(Bind::Text));
+            }
+        }
+        self
+    }
+
+    /// Leave out internal traffic unless it is asked for.
+    pub(crate) fn internal(&mut self, include_internal: Option<bool>) -> &mut Self {
+        self.and(&internal_filter(include_internal))
+    }
+
+    pub(crate) fn sql(&self) -> &str {
+        &self.sql
+    }
+
+    /// Bind this filter's values onto `query`, after any bound before it.
+    pub(crate) fn bind(&self, mut query: clickhouse::query::Query) -> clickhouse::query::Query {
+        for b in &self.binds {
+            query = match b {
+                Bind::Int(v) => query.bind(*v),
+                Bind::Text(v) => query.bind(v.as_str()),
+            };
+        }
+        query
+    }
+}
+
+#[cfg(test)]
+impl Filter {
+    /// The text values bound, in order; the window's numbers left out.
+    fn texts(&self) -> Vec<String> {
+        self.binds
+            .iter()
+            .filter_map(|b| match b {
+                Bind::Text(t) => Some(t.clone()),
+                Bind::Int(_) => None,
+            })
+            .collect()
+    }
+}
+
+/// A read's window `[since, until)`: `since` defaults to a day before
+/// `until`, or before now when the window is open-ended.
+fn window_start(since_ms: Option<i64>, until_ms: Option<i64>) -> i64 {
+    since_ms.unwrap_or_else(|| until_ms.unwrap_or_else(now_ms) - 86_400_000)
+}
+
+/// Default rows of a grouped read, busiest first, when no `limit` is given.
+const GROUPED_ROWS_DEFAULT: u64 = 1_000;
+
+/// Most rows any grouped read returns.
+pub const GROUPED_ROWS_MAX: u64 = 10_000;
+
+/// A grouped read's row limit: `limit`, or `default`, within
+/// 1..=[`GROUPED_ROWS_MAX`].
+fn row_limit(limit: Option<u64>, default: u64) -> u64 {
+    limit.unwrap_or(default).clamp(1, GROUPED_ROWS_MAX)
+}
+
+/// Seconds ClickHouse may spend on one Management API read before it gives
+/// up. Set once on the admin read client, so a wide window or a slow plan
+/// cannot hold a server thread; a read may ask for less.
+pub const READ_MAX_EXECUTION_SECS: u64 = 30;
+
+/// The `where` clause the request log, its histogram, facets and failure
+/// groups share: every filter the log offers. The keyset cursor is the log's
+/// alone.
+fn log_filter_sql(q: &UsageLogQuery, since: i64) -> Filter {
+    let mut f = Filter::window(since, q.until_ms);
+    f.uuids("tenant_id", &q.tenant_id)
+        .uuids("key_id", &q.key_id)
+        .any_of("model", "?", &q.model)
+        .text("request_type", q.request_type.as_deref())
+        .text("session_id", q.session_id.as_deref())
+        .text("device_id", q.device_id.as_deref())
+        .internal(q.include_internal);
     match q.status.as_deref() {
-        Some("success") => sql.push_str(" and status_code >= 200 and status_code < 400"),
-        Some("error") => sql.push_str(" and status_code >= 400"),
+        Some("success") => {
+            f.and(" and status_code >= 200 and status_code < 400");
+        }
+        Some("error") => {
+            f.and(" and status_code >= 400");
+        }
         _ => {}
     }
     if let Some(code) = q.status_code {
         // A u16 prints as digits only, so it is safe to inline.
-        sql.push_str(&format!(" and status_code = {code}"));
+        f.and(&format!(" and status_code = {code}"));
     }
     let class = obleth_config::EFFECTIVE_CLASS_SQL;
     let platform = obleth_config::PLATFORM_CLASSES_SQL;
     match q.fault.as_deref() {
-        Some("platform") => sql.push_str(&format!(" and {class} in {platform}")),
-        Some("client") => sql.push_str(&format!(
-            " and status_code >= 400 and {class} not in {platform}"
-        )),
+        Some("platform") => {
+            f.and(&format!(" and {class} in {platform}"));
+        }
+        Some("client") => {
+            f.and(&format!(
+                " and status_code >= 400 and {class} not in {platform}"
+            ));
+        }
         _ => {}
     }
-    any_of(&mut sql, &mut binds, class, "?", &q.error_class);
+    f.any_of(class, "?", &q.error_class);
     if let Some(rid) = &q.request_id {
-        sql.push_str(" and startsWith(lower(toString(request_id)), lower(?))");
-        binds.push(LogBind::Text(rid.clone()));
+        f.and_bound(
+            "startsWith(lower(toString(request_id)), lower(?))",
+            Bind::Text(rid.clone()),
+        );
     }
     if let Some(raw) = q.client_ip.as_deref() {
-        client_ip_filter(&mut sql, &mut binds, raw);
+        client_ip_filter(&mut f, raw);
     }
-    if let Some(parent) = q.parent_request_id {
-        sql.push_str(" and parent_request_id = toUUID(?)");
-        binds.push(LogBind::Text(parent.to_string()));
-    }
+    f.uuid("parent_request_id", q.parent_request_id);
     if q.traced_only == Some(true) {
-        sql.push_str(&traced_only_filter(since, q.until_ms));
+        f.and(&traced_only_filter(since, q.until_ms));
     }
-    (sql, binds)
+    f
 }
 
 /// `client_ip` matching one address or a range. Addresses are stored in
 /// canonical text, so one address is an exact match; a range compares the
 /// parsed address against the range's ends with the `OrNull` parsers, which
 /// never throw on a row whose address is empty.
-fn client_ip_filter(sql: &mut String, binds: &mut Vec<LogBind>, raw: &str) {
+fn client_ip_filter(f: &mut Filter, raw: &str) {
     use ipnet::IpNet;
     let Some(net) = obleth_config::network::parse_network(raw) else {
-        sql.push_str(" and 0");
+        f.and(" and 0");
         return;
     };
     if net.prefix_len() == net.max_prefix_len() {
-        sql.push_str(" and client_ip = ?");
-        binds.push(LogBind::Text(net.addr().to_string()));
+        f.and_bound("client_ip = ?", Bind::Text(net.addr().to_string()));
         return;
     }
     let parse = match net {
         IpNet::V4(_) => "toIPv4OrNull",
         IpNet::V6(_) => "toIPv6OrNull",
     };
-    sql.push_str(&format!(
-        " and {parse}(client_ip) between {parse}(?) and {parse}(?)"
-    ));
-    binds.push(LogBind::Text(net.network().to_string()));
-    binds.push(LogBind::Text(net.broadcast().to_string()));
-}
-
-/// `and {column} = …` for one value, `and {column} in (…)` for several,
-/// nothing for none; `placeholder` is how each bound value is read.
-fn any_of(
-    sql: &mut String,
-    binds: &mut Vec<LogBind>,
-    column: &str,
-    placeholder: &str,
-    values: &[String],
-) {
-    match values {
-        [] => {}
-        [one] => {
-            sql.push_str(&format!(" and {column} = {placeholder}"));
-            binds.push(LogBind::Text(one.clone()));
-        }
-        many => {
-            let list = vec![placeholder; many.len()].join(", ");
-            sql.push_str(&format!(" and {column} in ({list})"));
-            binds.extend(many.iter().cloned().map(LogBind::Text));
-        }
-    }
-}
-
-fn bind_log_filters(
-    mut query: clickhouse::query::Query,
-    binds: Vec<LogBind>,
-) -> clickhouse::query::Query {
-    for b in binds {
-        query = match b {
-            LogBind::Int(v) => query.bind(v),
-            LogBind::Text(v) => query.bind(v),
-        };
-    }
-    query
+    f.and_bound(
+        &format!("{parse}(client_ip) between {parse}(?) and {parse}(?)"),
+        Bind::Text(net.network().to_string()),
+    );
+    f.binds.push(Bind::Text(net.broadcast().to_string()));
 }
 
 /// The request log's columns, in [`UsageLogRow`] field order: rows are read
@@ -533,12 +635,12 @@ pub async fn query_usage_logs(
     client: &clickhouse::Client,
     q: UsageLogQuery,
 ) -> Result<Vec<UsageLogRow>, clickhouse::error::Error> {
-    let since = q.since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
+    let since = window_start(q.since_ms, q.until_ms);
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
-    let (filter, binds) = log_filter_sql(&q, since);
+    let filter = log_filter_sql(&q, since);
 
     let mut sql = usage_log_select();
-    sql.push_str(&filter);
+    sql.push_str(filter.sql());
     // Keyset cursor: (ts_ms, request_id) tuple strictly less than the cursor.
     // Tuple comparison matches the `order by` below for stable paging.
     if q.before_ms.is_some() && q.before_request_id.is_some() {
@@ -553,7 +655,7 @@ pub async fn query_usage_logs(
         " order by ts_ms desc, toString(request_id) desc limit {limit}"
     ));
 
-    let mut query = bind_log_filters(client.query(&sql), binds);
+    let mut query = filter.bind(client.query(&sql));
     if let (Some(before_ms), Some(before_id)) = (q.before_ms, q.before_request_id) {
         query = query.bind(before_ms).bind(before_id.to_string());
     } else if let Some(before_ms) = q.before_ms {
@@ -614,13 +716,13 @@ pub async fn query_usage_log_histogram(
     client: &clickhouse::Client,
     q: UsageLogQuery,
 ) -> Result<(i64, Vec<UsageLogBucket>), clickhouse::error::Error> {
-    let now = now_ms();
-    let since = q.since_ms.unwrap_or(now - 86_400_000);
-    let until = q.until_ms.unwrap_or(now);
+    let since = window_start(q.since_ms, q.until_ms);
+    let until = q.until_ms.unwrap_or_else(now_ms);
     let bucket = log_histogram_bucket_ms(since, until, q.bucket_ms);
-    let (filter, binds) = log_filter_sql(&q, since);
-    let sql = usage_log_histogram_sql(bucket, &filter);
-    let rows = bind_log_filters(client.query(&sql), binds)
+    let filter = log_filter_sql(&q, since);
+    let sql = usage_log_histogram_sql(bucket, filter.sql());
+    let rows = filter
+        .bind(client.query(&sql))
         .fetch_all::<UsageLogBucket>()
         .await?;
     Ok((bucket, rows))
@@ -704,11 +806,11 @@ pub async fn query_usage_log_facets(
     client: &clickhouse::Client,
     q: UsageLogQuery,
 ) -> Result<UsageLogFacets, clickhouse::error::Error> {
-    let since = q.since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
-    let (filter, binds) = log_filter_sql(&q, since);
+    let since = window_start(q.since_ms, q.until_ms);
+    let filter = log_filter_sql(&q, since);
     let facet = |expr: &str| {
-        let sql = usage_log_facet_sql(expr, &filter);
-        let query = bind_log_filters(client.query(&sql), binds.clone());
+        let sql = usage_log_facet_sql(expr, filter.sql());
+        let query = filter.bind(client.query(&sql));
         async move {
             let rows = query.fetch_all::<UsageLogFacetRow>().await?;
             Ok::<_, clickhouse::error::Error>(
@@ -723,9 +825,10 @@ pub async fn query_usage_log_facets(
             )
         }
     };
-    let failures_sql = usage_log_failures_sql(&filter);
-    let failures =
-        bind_log_filters(client.query(&failures_sql), binds.clone()).fetch_all::<UsageLogFailure>();
+    let failures_sql = usage_log_failures_sql(filter.sql());
+    let failures = filter
+        .bind(client.query(&failures_sql))
+        .fetch_all::<UsageLogFailure>();
     let dims = LOG_FACET_DIMENSIONS;
     let (status_codes, models, tenants, keys, request_types, error_classes, failures) = tokio::try_join!(
         facet(dims[0].1),
@@ -809,8 +912,11 @@ fn failure_counts_sql(filter: &str) -> String {
     )
 }
 
-/// Aliases stay clear of the columns the query reads; see [`usage_totals_sql`].
-fn failure_groups_sql(filter: &str) -> String {
+/// The failures matching `filter` (a `where` clause) grouped into repeats of
+/// at least `min_failures`, largest first, at most `limit` groups. Read by the
+/// request log and by Advice. Aliases stay clear of the columns the query
+/// reads; see [`usage_totals_sql`].
+pub(crate) fn failure_groups_sql(filter: &str, min_failures: u64, limit: u64) -> String {
     format!(
         "select {class} as filed_class, filed_class in {platform} as is_platform, \
          tenant_id, any(tenant_name) as recorded_tenant, key_id, any(key_name) as recorded_key, \
@@ -819,7 +925,8 @@ fn failure_groups_sql(filter: &str) -> String {
          from usage{filter} and status_code >= 400 \
          group by filed_class, tenant_id, key_id, model, status_code, \
          replaceRegexpAll(error_reason, '[0-9]+', 'N') \
-         order by failed desc, last_at desc limit {FAILURE_GROUP_LIMIT}",
+         having failed >= {min_failures} \
+         order by failed desc, last_at desc limit {limit}",
         class = obleth_config::EFFECTIVE_CLASS_SQL,
         platform = obleth_config::PLATFORM_CLASSES_SQL,
     )
@@ -831,13 +938,17 @@ pub async fn query_usage_failure_groups(
     client: &clickhouse::Client,
     q: UsageLogQuery,
 ) -> Result<UsageFailureGroups, clickhouse::error::Error> {
-    let since = q.since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
-    let (filter, binds) = log_filter_sql(&q, since);
-    let counts_sql = failure_counts_sql(&filter);
-    let groups_sql = failure_groups_sql(&filter);
+    let since = window_start(q.since_ms, q.until_ms);
+    let filter = log_filter_sql(&q, since);
+    let counts_sql = failure_counts_sql(filter.sql());
+    let groups_sql = failure_groups_sql(filter.sql(), 1, FAILURE_GROUP_LIMIT);
     let (counts, groups) = tokio::try_join!(
-        bind_log_filters(client.query(&counts_sql), binds.clone()).fetch_one::<FailureCounts>(),
-        bind_log_filters(client.query(&groups_sql), binds).fetch_all::<UsageFailureGroup>(),
+        filter
+            .bind(client.query(&counts_sql))
+            .fetch_one::<FailureCounts>(),
+        filter
+            .bind(client.query(&groups_sql))
+            .fetch_all::<UsageFailureGroup>(),
     )?;
     Ok(UsageFailureGroups {
         requests: counts.requests,
@@ -859,7 +970,7 @@ fn traced_only_filter(since: i64, until_ms: Option<i64>) -> String {
     // making `format!` the correct approach for subquery literals.
     format!(
         " AND request_id IN (SELECT DISTINCT request_id FROM spans \
-          WHERE start_ms >= {since} AND start_ms <= {until})"
+          WHERE start_ms >= {since} AND start_ms < {until})"
     )
 }
 
@@ -885,7 +996,8 @@ pub struct UsageDailyRow {
     pub estimated_tokens: u64,
     pub cache_hits: u64,
     pub cache_misses: u64,
-    /// Average time-to-first-token in ms across the grouped rows.
+    /// Average time to first token in ms across the grouped rows, over
+    /// answered requests that streamed a first token, cache hits left out.
     pub avg_ttft_ms: f64,
     /// Average end-to-end latency in ms across the grouped rows.
     pub avg_total_ms: f64,
@@ -901,6 +1013,10 @@ pub struct UsageDailyRow {
     /// The part of `error_requests` that were the platform's failures, not
     /// the caller's.
     pub platform_error_requests: u64,
+    /// The requests `avg_ttft_ms` averages over, so averages of several rows
+    /// can be weighted by it. Days rolled up before v2.13 did not count them
+    /// and report their answered requests instead.
+    pub ttft_requests: u64,
 }
 
 /// Whole-gateway usage totals for the overview strip: one aggregate row over
@@ -918,7 +1034,7 @@ pub struct UsageTotals {
     pub output_tokens: u64,
     /// Requests that ended with an HTTP status of 400 or above.
     pub errors: u64,
-    /// Median time to first token over requests that produced one; 0 when none did.
+    /// Median time to first token over answered requests that streamed a first token, cache hits left out; 0 when there were none.
     pub p50_ttft_ms: f64,
     pub avg_ttft_ms: f64,
     pub energy_wh: f64,
@@ -935,6 +1051,7 @@ pub struct UsageTotals {
 /// `total_tokens` expression into an aggregate of an aggregate and fail the
 /// whole read (which the summary then reports as zeros).
 fn usage_totals_sql(filter: &str) -> String {
+    let (avg_ttft, p50_ttft) = (avg_ttft_sql(), p50_ttft_sql());
     format!(
         "select count() as requests, \
          sum(input_tokens) + sum(output_tokens) as total_tokens, \
@@ -942,11 +1059,11 @@ fn usage_totals_sql(filter: &str) -> String {
          uniqExact(tenant_id) as active_tenants, \
          sum(input_tokens) as in_tok, sum(output_tokens) as out_tok, \
          countIf(status_code >= 400) as errors, \
-         round(if(countIf(ttft_ms > 0) > 0, quantileIf(0.5)(ttft_ms, ttft_ms > 0), 0), 1) as p50_ttft_ms, \
-         round(if(countIf(ttft_ms > 0) > 0, avgIf(ttft_ms, ttft_ms > 0), 0), 1) as avg_ttft_ms, \
+         {p50_ttft} as p50_ttft_ms, \
+         {avg_ttft} as avg_ttft_ms, \
          sum(energy_wh) as energy_wh, sum(energy_cost_usd) as energy_cost_usd, sum(co2_g) as co2_g, \
          countIf({class} in {platform}) as platform_errors \
-         from usage where ts_ms >= ?{filter}",
+         from usage{filter}",
         class = obleth_config::EFFECTIVE_CLASS_SQL,
         platform = obleth_config::PLATFORM_CLASSES_SQL,
     )
@@ -954,14 +1071,11 @@ fn usage_totals_sql(filter: &str) -> String {
 
 pub async fn query_usage_totals(
     client: &clickhouse::Client,
-    since_ms: Option<i64>,
-    include_internal: Option<bool>,
+    q: &UsageQuery,
 ) -> Result<UsageTotals, clickhouse::error::Error> {
-    let since = since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
-    let sql = usage_totals_sql(&internal_filter(include_internal));
-    client
-        .query(&sql)
-        .bind(since)
+    let filter = usage_filter(q);
+    filter
+        .bind(client.query(&usage_totals_sql(filter.sql())))
         .fetch_one::<UsageTotals>()
         .await
 }
@@ -1017,11 +1131,11 @@ pub struct UsageModelAgg {
     /// Aggregate generation throughput: sum of per-request rates across the
     /// window (combined model output rate across all connections).
     pub agg_tokens_per_sec: f64,
-    /// Average time-to-first-token in milliseconds.
+    /// Average time to first token in milliseconds, over answered requests that streamed a first token, cache hits left out.
     pub avg_ttft_ms: f64,
     /// Average end-to-end latency in milliseconds.
     pub avg_total_ms: f64,
-    /// Median (p50) time-to-first-token in milliseconds.
+    /// Median (p50) time to first token in milliseconds, over answered requests that streamed a first token, cache hits left out.
     pub p50_ttft_ms: f64,
     /// Median (p50) end-to-end latency in milliseconds.
     pub p50_total_ms: f64,
@@ -1049,7 +1163,8 @@ pub struct UsageTimePoint {
     pub errors: u64,
     /// Sum of each request's frozen `cost_usd`.
     pub cost_usd: f64,
-    /// Median time to first token in the bucket; 0 when no request produced one.
+    /// Median time to first token in the bucket, over answered requests that streamed a first token, cache hits left out; 0 when there
+    /// were none.
     pub p50_ttft_ms: f64,
     pub avg_ttft_ms: f64,
     /// The part of `errors` that were the platform's failures, not the
@@ -1082,9 +1197,11 @@ pub struct ModelUsageTimePoint {
     pub gen_tokens_per_sec: f64,
     /// Median per-stream prefill rate: input tokens / ttft.
     pub prompt_tokens_per_sec: f64,
-    /// Average time-to-first-token in milliseconds over the bucket.
+    /// Average time to first token in milliseconds over the bucket, over
+    /// answered requests that streamed a first token, cache hits left out.
     pub avg_ttft_ms: f64,
-    /// Median (p50) time-to-first-token in milliseconds over the bucket.
+    /// Median (p50) time to first token in milliseconds over the bucket, over
+    /// answered requests that streamed a first token, cache hits left out.
     pub p50_ttft_ms: f64,
     /// Average end-to-end latency in milliseconds over the bucket.
     pub avg_total_ms: f64,
@@ -1132,63 +1249,54 @@ pub struct CostAgg {
     pub total_cost: f64,
 }
 
+/// Usage per tenant, busiest first.
 pub async fn query_usage(
     client: &clickhouse::Client,
     q: UsageQuery,
 ) -> Result<Vec<UsageAgg>, clickhouse::error::Error> {
-    let since = q.since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
-    let group = q.group_by.as_deref().unwrap_or("tenant");
-    match group {
-        "key" | "model" => Ok(vec![]),
-        _ => {
-            let mut sql = String::from(
-                "select tenant_id, count() as requests, \
-                 sum(input_tokens) as in_tok, sum(output_tokens) as out_tok, \
-                 sum(input_tokens) + sum(output_tokens) as total_tok, \
-                 sum(energy_wh) as energy_wh, sum(energy_cost_usd) as energy_cost_usd, sum(co2_g) as co2_g, \
-                 sum(cost_usd) as cost_usd \
-                 from usage where ts_ms >= ?",
-            );
-            sql.push_str(&usage_filter_sql(&q));
-            sql.push_str(&internal_filter(q.include_internal));
-            sql.push_str(" group by tenant_id");
-            bind_usage_filters(client.query(&sql).bind(since), &q)
-                .fetch_all::<UsageAgg>()
-                .await
-        }
-    }
+    let filter = usage_filter(&q);
+    let sql = format!(
+        "select tenant_id, count() as requests, \
+         sum(input_tokens) as in_tok, sum(output_tokens) as out_tok, \
+         sum(input_tokens) + sum(output_tokens) as total_tok, \
+         sum(energy_wh) as energy_wh, sum(energy_cost_usd) as energy_cost_usd, sum(co2_g) as co2_g, \
+         sum(cost_usd) as cost_usd \
+         from usage{} group by tenant_id order by total_tok desc limit {}",
+        filter.sql(),
+        row_limit(q.limit, GROUPED_ROWS_DEFAULT),
+    );
+    filter
+        .bind(client.query(&sql))
+        .fetch_all::<UsageAgg>()
+        .await
 }
 
 pub async fn query_usage_by_key(
     client: &clickhouse::Client,
     q: UsageQuery,
 ) -> Result<Vec<UsageKeyAgg>, clickhouse::error::Error> {
-    let since = q.since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
-    bind_usage_filters(client.query(&usage_by_key_sql(&q)).bind(since), &q)
+    let filter = usage_filter(&q);
+    filter
+        .bind(client.query(&usage_by_key_sql(&q, filter.sql())))
         .fetch_all::<UsageKeyAgg>()
         .await
 }
 
-fn usage_by_key_sql(q: &UsageQuery) -> String {
-    let mut sql = String::from(
+fn usage_by_key_sql(q: &UsageQuery, filter: &str) -> String {
+    format!(
         "select key_id, tenant_id, count() as requests, \
          sum(input_tokens) as in_tok, sum(output_tokens) as out_tok, \
          sum(input_tokens) + sum(output_tokens) as total_tok, \
          sum(energy_wh) as energy_wh, sum(energy_cost_usd) as energy_cost_usd, sum(co2_g) as co2_g \
-         from usage where ts_ms >= ?",
-    );
-    sql.push_str(&usage_filter_sql(q));
-    sql.push_str(&internal_filter(q.include_internal));
-    sql.push_str(" group by key_id, tenant_id order by total_tok desc");
-    if let Some(limit) = q.limit {
-        sql.push_str(&format!(" limit {}", limit.min(10_000)));
-    }
-    sql
+         from usage{filter} group by key_id, tenant_id order by total_tok desc limit {}",
+        row_limit(q.limit, GROUPED_ROWS_DEFAULT),
+    )
 }
 
 /// Filters for the per-key usage summary feeds (`/keys/{id}/usage` and
 /// `/usage/keys/summary`).
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct KeyUsageSummaryQuery {
     /// Restrict the bulk feed to one tenant (UUID). Ignored by the single-key
     /// endpoint, which is already scoped to one key.
@@ -1199,7 +1307,12 @@ pub struct KeyUsageSummaryQuery {
     /// the single-key endpoint (which reports the true last use within the
     /// ledger retention window); it does for the bulk endpoint.
     pub since_ms: Option<i64>,
-    /// Cap on rows returned by the bulk feed (busiest keys first).
+    /// Exclusive upper bound of the bulk feed's window, unix epoch millis.
+    /// Open-ended by default; the single-key endpoint ignores it like
+    /// `tenant_id`.
+    pub until_ms: Option<i64>,
+    /// Most rows of the bulk feed, busiest keys first: default 1,000, at
+    /// most 10,000.
     pub limit: Option<u64>,
     /// When true, include internal traffic (health probes, benchmark runs)
     /// that is excluded from this read by default.
@@ -1342,9 +1455,13 @@ pub async fn query_keys_usage_summary(
     client: &clickhouse::Client,
     q: KeyUsageSummaryQuery,
 ) -> Result<Vec<KeyUsageSummary>, clickhouse::error::Error> {
-    let since = q.since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
-    let limit = q.limit.unwrap_or(1000).min(10_000);
-    let mut sql = String::from(
+    let limit = row_limit(q.limit, GROUPED_ROWS_DEFAULT);
+    let mut filter = Filter::window(window_start(q.since_ms, q.until_ms), q.until_ms);
+    // Qualified so the SELECT alias `tenant_id` cannot shadow the column.
+    filter
+        .uuid("usage.tenant_id", q.tenant_id)
+        .internal(q.include_internal);
+    let sql = format!(
         "select \
          key_id, \
          any(tenant_id) as tenant_id, \
@@ -1359,21 +1476,13 @@ pub async fn query_keys_usage_summary(
          sum(energy_wh) as e_wh, \
          sum(energy_cost_usd) as e_cost_usd, \
          sum(co2_g) as e_co2_g \
-         from usage where ts_ms >= ?",
+         from usage{} group by key_id order by total_tok desc limit {limit}",
+        filter.sql()
     );
-    if q.tenant_id.is_some() {
-        // Qualify the raw column so the SELECT alias `tenant_id` cannot shadow it.
-        sql.push_str(" and usage.tenant_id = toUUID(?)");
-    }
-    sql.push_str(&internal_filter(q.include_internal));
-    sql.push_str(&format!(
-        " group by key_id order by total_tok desc limit {limit}"
-    ));
-    let mut query = client.query(&sql).bind(since);
-    if let Some(tid) = q.tenant_id {
-        query = query.bind(tid.to_string());
-    }
-    let rows = query.fetch_all::<KeyUsageSummaryRow>().await?;
+    let rows = filter
+        .bind(client.query(&sql))
+        .fetch_all::<KeyUsageSummaryRow>()
+        .await?;
     Ok(rows.into_iter().map(KeyUsageSummary::from).collect())
 }
 
@@ -1396,6 +1505,7 @@ const KEY_REJECTIONS_MAX_EXECUTION_SECS: u32 = 10;
 /// Filters for the endpoints an account system polls to watch where its keys
 /// are used from (`/usage/key-sources`, `/usage/key-rejections`).
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct KeyWatchQuery {
     /// Window start, unix epoch millis. Defaults to 24 hours before
     /// `until_ms`.
@@ -1435,31 +1545,13 @@ impl KeyWatchQuery {
         Ok((since, until))
     }
 
-    /// SQL predicates for the tenant and key filters on `table`, and the
-    /// values to bind for them, in order.
-    fn filters(&self, table: &str) -> (String, Vec<String>) {
-        let mut sql = String::new();
-        let mut binds = Vec::new();
-        if let Some(t) = self.tenant_id {
-            // Qualified so a SELECT alias can never shadow the column.
-            sql.push_str(&format!(" and {table}.tenant_id = toUUID(?)"));
-            binds.push(t.to_string());
-        }
-        match self.key_id.as_slice() {
-            [] => {}
-            [k] => {
-                sql.push_str(&format!(" and {table}.key_id = toUUID(?)"));
-                binds.push(k.to_string());
-            }
-            keys => {
-                // `key_id` leads the sort key of both tables, so an IN list
-                // still reads only those keys' granules.
-                let marks = vec!["toUUID(?)"; keys.len()].join(", ");
-                sql.push_str(&format!(" and {table}.key_id in ({marks})"));
-                binds.extend(keys.iter().map(Uuid::to_string));
-            }
-        }
-        (sql, binds)
+    /// The tenant and key filters on `table`, added to `f`. Columns are
+    /// qualified so a SELECT alias can never shadow them; `key_id` leads the
+    /// sort key of both tables, so an `in` list still reads only those keys'
+    /// granules.
+    fn key_filters<'f>(&self, f: &'f mut Filter, table: &str) -> &'f mut Filter {
+        f.uuid(&format!("{table}.tenant_id"), self.tenant_id)
+            .uuids(&format!("{table}.key_id"), &self.key_id)
     }
 
     /// Rows `key-rejections` returns: `limit` clamped to 1..=10,000,
@@ -1549,28 +1641,24 @@ impl From<KeySourceRow> for KeySource {
     }
 }
 
-/// The `key-sources` query, with the values to bind for the window's
-/// tenant/key filters (bound twice: once for the window, once for the
-/// first-seen scan) and for the country table's key filter. Bind order:
-/// since, until, filters, scan start, filters, country filters.
-fn key_sources_sql(q: &KeyWatchQuery) -> (String, Vec<String>, Vec<String>) {
-    let (usage_filters, usage_binds) = q.filters("usage");
+/// The `key-sources` query and its filters, in bind order: the window's,
+/// the first-seen scan's (from `scan_from`), and the country table's.
+fn key_sources_sql(
+    q: &KeyWatchQuery,
+    since: i64,
+    until: i64,
+    scan_from: i64,
+) -> (String, [Filter; 3]) {
+    let mut window = Filter::window(since, Some(until));
+    window.and(" and client_ip != '' and client_network != ''");
+    q.key_filters(&mut window, "usage");
+    let mut scan = Filter::window(scan_from, None);
+    scan.and(" and client_network != ''");
+    q.key_filters(&mut scan, "usage");
     // `key_country_seen` has no tenant column; its rows only join to the
     // window's keys, which are already filtered by tenant.
-    let (seen_filters, seen_binds) = match q.key_id.as_slice() {
-        [] => (String::new(), Vec::new()),
-        [k] => (
-            " and key_country_seen.key_id = toUUID(?)".to_string(),
-            vec![k.to_string()],
-        ),
-        keys => (
-            format!(
-                " and key_country_seen.key_id in ({})",
-                vec!["toUUID(?)"; keys.len()].join(", ")
-            ),
-            keys.iter().map(Uuid::to_string).collect(),
-        ),
-    };
+    let mut seen = Filter::from("client_country != ''", Vec::new());
+    seen.uuids("key_country_seen.key_id", &q.key_id);
     let sql = format!(
         "select w.key_id as key_id, w.kname as key_name, w.tid as tenant_id, \
          w.tname as tenant_name, w.net as network, w.country as client_country, \
@@ -1581,26 +1669,26 @@ fn key_sources_sql(q: &KeyWatchQuery) -> (String, Vec<String>, Vec<String>) {
                   argMax(key_name, ts_ms) as kname, argMax(tenant_name, ts_ms) as tname, \
                   client_network as net, client_country as country, \
                   count() as reqs, uniqExact(client_ip) as ips, max(ts_ms) as last_ms \
-           from usage \
-           where ts_ms >= ? and ts_ms < ? and client_ip != '' and client_network != ''{usage_filters} \
+           from usage{} \
            group by key_id, net, country \
          ) as w \
          left join ( \
            select key_id, client_network as net, min(ts_ms) as first_ms \
-           from usage \
-           where ts_ms >= ? and client_network != ''{usage_filters} \
+           from usage{} \
            group by key_id, net \
          ) as n on w.key_id = n.key_id and w.net = n.net \
          left join ( \
            select key_id, client_country as country, min(first_seen_ms) as first_ms \
-           from key_country_seen \
-           where client_country != ''{seen_filters} \
+           from key_country_seen{} \
            group by key_id, country \
          ) as c on w.key_id = c.key_id and w.country = c.country \
          order by key_id, requests desc \
-         limit {KEY_WATCH_MAX_ROWS}"
+         limit {KEY_WATCH_MAX_ROWS}",
+        window.sql(),
+        scan.sql(),
+        seen.sql(),
     );
-    (sql, usage_binds, seen_binds)
+    (sql, [window, scan, seen])
 }
 
 /// Each key with traffic in the window, one row per network and country it
@@ -1614,18 +1702,13 @@ pub async fn query_key_sources(
     until: i64,
     ip_retention_days: u32,
 ) -> Result<Vec<KeySource>, clickhouse::error::Error> {
-    let (sql, usage_binds, seen_binds) = key_sources_sql(q);
     // Addresses older than their retention are blank, so the first-seen scan
     // stops there instead of reading the whole ledger.
     let scan_from = (until - i64::from(ip_retention_days + 1) * 86_400_000).min(since);
-    let mut query = client.query(&sql).bind(since).bind(until);
-    for b in &usage_binds {
-        query = query.bind(b.as_str());
-    }
-    query = query.bind(scan_from);
-    for b in usage_binds.iter().chain(&seen_binds) {
-        query = query.bind(b.as_str());
-    }
+    let (sql, filters) = key_sources_sql(q, since, until, scan_from);
+    let query = filters
+        .iter()
+        .fold(client.query(&sql), |query, f| f.bind(query));
     let rows = query.fetch_all::<KeySourceRow>().await?;
     Ok(rows.into_iter().map(KeySource::from).collect())
 }
@@ -1674,8 +1757,9 @@ struct KeyRejectionAggRow {
     sample_ua: String,
 }
 
-fn key_rejections_sql(q: &KeyWatchQuery) -> (String, Vec<String>) {
-    let (filters, binds) = q.filters("key_rejections");
+fn key_rejections_sql(q: &KeyWatchQuery, since: i64, until: i64) -> (String, Filter) {
+    let mut filter = Filter::window(since, Some(until));
+    q.key_filters(&mut filter, "key_rejections");
     let per_key = q
         .rejection_per_key()
         .map(|n| format!(" limit {n} by key_id"))
@@ -1689,14 +1773,14 @@ fn key_rejections_sql(q: &KeyWatchQuery) -> (String, Vec<String>) {
          reason as why, client_ip as ip, client_country as cc, \
          sum(count) as total, min(ts_ms) as first_ms, max(ts_ms) as last_ms, \
          argMax(user_agent, ts_ms) as sample_ua \
-         from key_rejections \
-         where ts_ms >= ? and ts_ms < ?{filters} \
+         from key_rejections{} \
          group by key_id, reason, client_ip, client_country \
          order by last_ms desc{per_key} \
          limit {fetch} \
-         settings max_execution_time = {KEY_REJECTIONS_MAX_EXECUTION_SECS}"
+         settings max_execution_time = {KEY_REJECTIONS_MAX_EXECUTION_SECS}",
+        filter.sql()
     );
-    (sql, binds)
+    (sql, filter)
 }
 
 /// What `key-rejections` read: the rows, and whether more matched than
@@ -1716,12 +1800,11 @@ pub async fn query_key_rejections(
     since: i64,
     until: i64,
 ) -> Result<KeyRejections, clickhouse::error::Error> {
-    let (sql, binds) = key_rejections_sql(q);
-    let mut query = client.query(&sql).bind(since).bind(until);
-    for b in binds {
-        query = query.bind(b);
-    }
-    let mut rows = query.fetch_all::<KeyRejectionAggRow>().await?;
+    let (sql, filter) = key_rejections_sql(q, since, until);
+    let mut rows = filter
+        .bind(client.query(&sql))
+        .fetch_all::<KeyRejectionAggRow>()
+        .await?;
     let limit = q.rejection_limit() as usize;
     let truncated = rows.len() > limit;
     rows.truncate(limit);
@@ -1749,40 +1832,40 @@ pub async fn query_usage_by_model(
     client: &clickhouse::Client,
     q: UsageQuery,
 ) -> Result<Vec<UsageModelAgg>, clickhouse::error::Error> {
-    let since = q.since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
-    bind_usage_filters(client.query(&usage_by_model_sql(&q)).bind(since), &q)
+    let filter = usage_filter(&q);
+    filter
+        .bind(client.query(&usage_by_model_sql(&q, filter.sql())))
         .fetch_all::<UsageModelAgg>()
         .await
 }
 
-fn usage_by_model_sql(q: &UsageQuery) -> String {
-    let mut sql = format!(
+fn usage_by_model_sql(q: &UsageQuery, filter: &str) -> String {
+    let (avg_ttft, p50_ttft) = (avg_ttft_sql(), p50_ttft_sql());
+    format!(
         "select model, count() as requests, \
          sum(input_tokens) as in_tok, sum(output_tokens) as out_tok, \
          sum(input_tokens) + sum(output_tokens) as total_tok, \
          round(if(countIf(total_ms >= 20 and output_tokens >= 1) > 0, \
-         quantileIf(0.5)(output_tokens / (greatest({DECODE_MS}, 1) / 1000.), \
+         quantileIf(0.5)(output_tokens / (greatest({DECODE_MS_SQL}, 1) / 1000.), \
          total_ms >= 20 and output_tokens >= 1), 0), 1) as gen_tps, \
-         round(sumIf(output_tokens / (greatest({DECODE_MS}, 1) / 1000.), \
+         round(sumIf(output_tokens / (greatest({DECODE_MS_SQL}, 1) / 1000.), \
          total_ms >= 20 and output_tokens >= 1), 1) as agg_tps, \
-         round(if(countIf(ttft_ms > 0 and {REAL_TTFT}) > 0, avgIf(ttft_ms, ttft_ms > 0 and {REAL_TTFT}), 0), 1) as avg_ttft, \
+         {avg_ttft} as avg_ttft, \
          round(if(countIf(total_ms > 0) > 0, avgIf(total_ms, total_ms > 0), 0), 1) as avg_total, \
-         round(if(countIf(ttft_ms > 0 and {REAL_TTFT}) > 0, quantileIf(0.5)(ttft_ms, ttft_ms > 0 and {REAL_TTFT}), 0), 1) as p50_ttft, \
+         {p50_ttft} as p50_ttft, \
          round(if(countIf(total_ms > 0) > 0, quantileIf(0.5)(total_ms, total_ms > 0), 0), 1) as p50_total, \
          round(avg(input_tokens), 1) as avg_prompt, \
          round(avg(output_tokens), 1) as avg_gen, \
          uniq(key_id) as users, \
          sum(energy_wh) as energy_wh, sum(energy_cost_usd) as energy_cost_usd, sum(co2_g) as co2_g \
-         from usage where ts_ms >= ?",
-    );
-    sql.push_str(&usage_filter_sql(q));
-    sql.push_str(&internal_filter(q.include_internal));
-    sql.push_str(" group by model order by total_tok desc");
-    sql
+         from usage{filter} group by model order by total_tok desc limit {}",
+        row_limit(q.limit, GROUPED_ROWS_DEFAULT),
+    )
 }
 
 /// Aliases stay clear of the column names the query reads; see [`usage_totals_sql`].
-fn usage_series_sql(bucket: i64) -> String {
+fn usage_series_sql(bucket: i64, filter: &str) -> String {
+    let (avg_ttft, p50_ttft) = (avg_ttft_sql(), p50_ttft_sql());
     format!(
         "select intDiv(ts_ms, {bucket}) * {bucket} as bucket_ms, \
          count() as requests, \
@@ -1791,10 +1874,10 @@ fn usage_series_sql(bucket: i64) -> String {
          sum(energy_wh) as energy_wh, \
          countIf(status_code >= 400) as errors, \
          sum(cost_usd) as cost_usd, \
-         round(if(countIf(ttft_ms > 0) > 0, quantileIf(0.5)(ttft_ms, ttft_ms > 0), 0), 1) as p50_ttft_ms, \
-         round(if(countIf(ttft_ms > 0) > 0, avgIf(ttft_ms, ttft_ms > 0), 0), 1) as avg_ttft_ms, \
+         {p50_ttft} as p50_ttft_ms, \
+         {avg_ttft} as avg_ttft_ms, \
          countIf({class} in {platform}) as platform_errors \
-         from usage where ts_ms >= ?",
+         from usage{filter} group by bucket_ms order by bucket_ms",
         class = obleth_config::EFFECTIVE_CLASS_SQL,
         platform = obleth_config::PLATFORM_CLASSES_SQL,
     )
@@ -1804,39 +1887,35 @@ pub async fn query_usage_series(
     client: &clickhouse::Client,
     q: UsageSeriesQuery,
 ) -> Result<Vec<UsageTimePoint>, clickhouse::error::Error> {
-    let since = q.since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
-    let bucket = series_bucket_ms(since, q.bucket_ms, 60_000, now_ms());
-    let mut sql = usage_series_sql(bucket);
-    if q.tenant_id.is_some() {
-        sql.push_str(" and tenant_id = toUUID(?)");
-    }
-    sql.push_str(&internal_filter(q.include_internal));
-    sql.push_str(" group by bucket_ms order by bucket_ms");
-    let mut query = client.query(&sql).bind(since);
-    if let Some(tid) = q.tenant_id {
-        query = query.bind(tid.to_string());
-    }
-    query.fetch_all::<UsageTimePoint>().await
+    let since = window_start(q.since_ms, q.until_ms);
+    let until = q.until_ms.unwrap_or_else(now_ms);
+    let bucket = series_bucket_ms(since, q.bucket_ms, 60_000, until);
+    let filter = series_filter(&q, since);
+    filter
+        .bind(client.query(&usage_series_sql(bucket, filter.sql())))
+        .fetch_all::<UsageTimePoint>()
+        .await
 }
 
 pub async fn query_usage_series_by_tenant(
     client: &clickhouse::Client,
     q: UsageSeriesQuery,
 ) -> Result<Vec<TenantUsageTimePoint>, clickhouse::error::Error> {
-    let since = q.since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
-    let bucket = series_bucket_ms(since, q.bucket_ms, 10_000, now_ms());
-    let filter = internal_filter(q.include_internal);
+    let since = window_start(q.since_ms, q.until_ms);
+    let until = q.until_ms.unwrap_or_else(now_ms);
+    let bucket = series_bucket_ms(since, q.bucket_ms, 10_000, until);
+    let filter = series_filter(&q, since);
     let sql = format!(
         "select tenant_id, intDiv(ts_ms, {bucket}) * {bucket} as bucket_ms, \
          count() as requests, \
          sum(input_tokens) + sum(output_tokens) as total_tokens, \
          sum(energy_wh) as energy_wh \
-         from usage where ts_ms >= ?{filter} \
-         group by tenant_id, bucket_ms order by bucket_ms, tenant_id"
+         from usage{} \
+         group by tenant_id, bucket_ms order by bucket_ms, tenant_id",
+        filter.sql()
     );
-    client
-        .query(&sql)
-        .bind(since)
+    filter
+        .bind(client.query(&sql))
         .fetch_all::<TenantUsageTimePoint>()
         .await
 }
@@ -1850,9 +1929,13 @@ pub async fn query_usage_series_by_model(
     client: &clickhouse::Client,
     q: UsageSeriesQuery,
 ) -> Result<Vec<ModelUsageTimePoint>, clickhouse::error::Error> {
-    let since = q.since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
-    let bucket = series_bucket_ms(since, q.bucket_ms, 10_000, now_ms());
-    let filter = internal_filter(q.include_internal);
+    if q.model.is_none() {
+        return Ok(Vec::new());
+    }
+    let since = window_start(q.since_ms, q.until_ms);
+    let until = q.until_ms.unwrap_or_else(now_ms);
+    let bucket = series_bucket_ms(since, q.bucket_ms, 10_000, until);
+    let filter = series_filter(&q, since);
     // Per-stream engine rates, NOT volume-over-wall-clock. `gen_tps` is the
     // median decode rate (output tokens over the decode window = total - ttft,
     // falling back to total - queue when the response wasn't streamed), the same
@@ -1860,28 +1943,27 @@ pub async fn query_usage_series_by_model(
     // (prompt tokens over ttft, since prefill completes by the first byte). This
     // makes the chart comparable to the upstream engine's reported throughput
     // instead of collapsing toward zero on sparse, bursty traffic.
+    let (avg_ttft, p50_ttft) = (avg_ttft_sql(), p50_ttft_sql());
+    let prefill = prefill_rated_sql();
     let sql = format!(
         "select intDiv(ts_ms, {bucket}) * {bucket} as bucket_ms, \
          count() as requests, \
          round(if(countIf(total_ms >= 20 and output_tokens >= 1) > 0, \
-         quantileIf(0.5)(output_tokens / (greatest({DECODE_MS}, 1) / 1000.), \
+         quantileIf(0.5)(output_tokens / (greatest({DECODE_MS_SQL}, 1) / 1000.), \
          total_ms >= 20 and output_tokens >= 1), 0), 1) as gen_tps, \
-         round(if(countIf(ttft_ms >= 20 and input_tokens >= 1 and {REAL_TTFT}) > 0, \
-         quantileIf(0.5)(input_tokens / (greatest(ttft_ms, 1) / 1000.), \
-         ttft_ms >= 20 and input_tokens >= 1 and {REAL_TTFT}), 0), 1) as prompt_tps, \
-         round(if(countIf(ttft_ms > 0 and {REAL_TTFT}) > 0, avgIf(ttft_ms, ttft_ms > 0 and {REAL_TTFT}), 0), 1) as avg_ttft, \
-         round(if(countIf(ttft_ms > 0 and {REAL_TTFT}) > 0, quantileIf(0.5)(ttft_ms, ttft_ms > 0 and {REAL_TTFT}), 0), 1) as p50_ttft, \
+         round(if(countIf({prefill}) > 0, \
+         quantileIf(0.5)(input_tokens / (greatest(ttft_ms, 1) / 1000.), {prefill}), 0), 1) as prompt_tps, \
+         {avg_ttft} as avg_ttft, \
+         {p50_ttft} as p50_ttft, \
          round(if(countIf(total_ms > 0) > 0, avgIf(total_ms, total_ms > 0), 0), 1) as avg_total, \
          round(if(countIf(total_ms > 0) > 0, quantileIf(0.5)(total_ms, total_ms > 0), 0), 1) as p50_total, \
          sum(energy_wh) as energy_wh \
-         from usage where ts_ms >= ? and model = ?{filter} \
-         group by bucket_ms order by bucket_ms"
+         from usage{} \
+         group by bucket_ms order by bucket_ms",
+        filter.sql()
     );
-    let model = q.model.unwrap_or_default();
-    client
-        .query(&sql)
-        .bind(since)
-        .bind(model)
+    filter
+        .bind(client.query(&sql))
         .fetch_all::<ModelUsageTimePoint>()
         .await
 }
@@ -1891,28 +1973,26 @@ pub async fn query_usage_series_by_model(
 /// a single model, so the expanded model card can show who is driving load.
 pub async fn query_usage_breakdown_by_model(
     client: &clickhouse::Client,
-    model: &str,
-    since_ms: Option<i64>,
-    limit: Option<u64>,
-    include_internal: Option<bool>,
+    q: &UsageBreakdownQuery,
 ) -> Result<Vec<UsageKeyModelBreakdown>, clickhouse::error::Error> {
-    let since = since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
-    let limit = limit.unwrap_or(100).min(1000);
-    let filter = internal_filter(include_internal);
+    let limit = row_limit(q.limit, 100);
+    let mut filter = Filter::window(window_start(q.since_ms, q.until_ms), q.until_ms);
+    filter
+        .text("model", Some(&q.model))
+        .internal(q.include_internal);
     let sql = format!(
         "select key_id, tenant_id, count() as requests, \
          sum(input_tokens) + sum(output_tokens) as total_tokens, \
          round(if(countIf(total_ms >= 20 and output_tokens >= 1) > 0, \
-         quantileIf(0.5)(output_tokens / (greatest({DECODE_MS}, 1) / 1000.), \
+         quantileIf(0.5)(output_tokens / (greatest({DECODE_MS_SQL}, 1) / 1000.), \
          total_ms >= 20 and output_tokens >= 1), 0), 1) as gen_tps, \
          sum(energy_wh) as energy_wh, sum(energy_cost_usd) as energy_cost_usd, sum(co2_g) as co2_g \
-         from usage where ts_ms >= ? and model = ?{filter} \
-         group by key_id, tenant_id order by total_tokens desc limit {limit}"
+         from usage{} \
+         group by key_id, tenant_id order by total_tokens desc limit {limit}",
+        filter.sql()
     );
-    client
-        .query(&sql)
-        .bind(since)
-        .bind(model.to_string())
+    filter
+        .bind(client.query(&sql))
         .fetch_all::<UsageKeyModelBreakdown>()
         .await
 }
@@ -1937,7 +2017,7 @@ pub struct ModelSpeedPoint {
     pub slow_tokens_per_sec: f64,
     /// Median prefill rate: prompt tokens over time to first token.
     pub prompt_tokens_per_sec: f64,
-    /// Median time to first token in milliseconds.
+    /// Median time to first token in milliseconds, over answered requests that streamed a first token, cache hits left out.
     pub p50_ttft_ms: f64,
 }
 
@@ -1958,34 +2038,34 @@ fn speed_bucket_sql(bucket: &str, span_ms: i64) -> (&'static str, bool) {
 }
 
 /// Aliases stay clear of the column names the query reads; see [`usage_totals_sql`].
-fn usage_speed_sql(bucket_expr: &str, q: &UsageSpeedQuery) -> String {
+fn usage_speed_sql(bucket_expr: &str, filter: &str) -> String {
     let rated =
         "status_code < 400 and cache_status != 'hit' and total_ms >= 20 and output_tokens >= 16";
-    let rate = format!("output_tokens / (greatest({DECODE_MS}, 1) / 1000.)");
-    let prefill =
-        format!("status_code < 400 and cache_status != 'hit' and ttft_ms >= 20 and input_tokens >= 1 and {REAL_TTFT}");
-    let mut sql = format!(
+    let rate = format!("output_tokens / (greatest({DECODE_MS_SQL}, 1) / 1000.)");
+    let prefill = prefill_rated_sql();
+    let p50_ttft = p50_ttft_sql();
+    format!(
         "select {bucket_expr} as bucket_ms, model as model_name, \
          count() as reqs, \
          countIf({rated}) as rated_reqs, \
          round(if(countIf({rated}) > 0, quantileIf(0.5)({rate}, {rated}), 0), 1) as gen_tps, \
          round(if(countIf({rated}) > 0, quantileIf(0.1)({rate}, {rated}), 0), 1) as slow_tps, \
          round(if(countIf({prefill}) > 0, quantileIf(0.5)(input_tokens / (greatest(ttft_ms, 1) / 1000.), {prefill}), 0), 1) as prompt_tps, \
-         round(if(countIf({rated} and ttft_ms > 0 and {REAL_TTFT}) > 0, quantileIf(0.5)(ttft_ms, {rated} and ttft_ms > 0 and {REAL_TTFT}), 0), 1) as p50_ttft \
-         from usage where ts_ms >= ? and ts_ms < ?"
-    );
-    if q.tenant_id.is_some() {
-        sql.push_str(" and tenant_id = toUUID(?)");
-    }
-    if q.key_id.is_some() {
-        sql.push_str(" and key_id = toUUID(?)");
-    }
-    if q.model.is_some() {
-        sql.push_str(" and model = ?");
-    }
-    sql.push_str(&internal_filter(q.include_internal));
-    sql.push_str(" group by bucket_ms, model_name order by bucket_ms, rated_reqs desc");
-    sql
+         {p50_ttft} as p50_ttft \
+         from usage{filter} \
+         group by bucket_ms, model_name order by bucket_ms, rated_reqs desc"
+    )
+}
+
+/// The `where` clause of the speed read: [`UsageSpeedQuery`]'s filters over
+/// `[since, until)`.
+fn speed_filter(q: &UsageSpeedQuery, since: i64, until: i64) -> Filter {
+    let mut f = Filter::window(since, Some(until));
+    f.uuid("tenant_id", q.tenant_id)
+        .uuid("key_id", q.key_id)
+        .text("model", q.model.as_deref())
+        .internal(q.include_internal);
+    f
 }
 
 /// Per-model speed for the Reports page. `tz` must already be a valid IANA
@@ -1998,50 +2078,32 @@ pub async fn query_usage_speed(
     let since = q.since_ms.unwrap_or(until - 86_400_000);
     let (bucket_expr, binds_tz) =
         speed_bucket_sql(q.bucket.as_deref().unwrap_or("none"), until - since);
-    let sql = usage_speed_sql(bucket_expr, &q);
+    let filter = speed_filter(&q, since, until);
+    let sql = usage_speed_sql(bucket_expr, filter.sql());
     let mut query = client.query(&sql);
+    // The bucket's time zone is in the select list, ahead of the filter.
     if binds_tz {
         query = query.bind(q.tz.clone().unwrap_or_else(|| "UTC".to_string()));
     }
-    query = query.bind(since).bind(until);
-    if let Some(tid) = q.tenant_id {
-        query = query.bind(tid.to_string());
-    }
-    if let Some(kid) = q.key_id {
-        query = query.bind(kid.to_string());
-    }
-    if let Some(model) = &q.model {
-        query = query.bind(model.clone());
-    }
-    query.fetch_all::<ModelSpeedPoint>().await
+    filter.bind(query).fetch_all::<ModelSpeedPoint>().await
 }
 
 pub async fn query_cache_stats(
     client: &clickhouse::Client,
     q: UsageQuery,
 ) -> Result<CacheStats, clickhouse::error::Error> {
-    let since = q.since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
-    let mut sql = String::from(
+    let filter = usage_filter(&q);
+    let sql = format!(
         "select countIf(cache_status = 'hit') as hits, \
          countIf(cache_status = 'miss') as misses, \
          sumIf(input_tokens + output_tokens, cache_status = 'hit') as tokens_saved \
-         from usage where ts_ms >= ?",
+         from usage{}",
+        filter.sql()
     );
-    if q.tenant_id.is_some() {
-        sql.push_str(" and tenant_id = toUUID(?)");
-    }
-    if q.model.is_some() {
-        sql.push_str(" and model = ?");
-    }
-    sql.push_str(&internal_filter(q.include_internal));
-    let mut query = client.query(&sql).bind(since);
-    if let Some(tid) = q.tenant_id {
-        query = query.bind(tid.to_string());
-    }
-    if let Some(model) = &q.model {
-        query = query.bind(model.clone());
-    }
-    let rows = query.fetch_all::<CacheStats>().await?;
+    let rows = filter
+        .bind(client.query(&sql))
+        .fetch_all::<CacheStats>()
+        .await?;
     Ok(rows.into_iter().next().unwrap_or(CacheStats {
         hits: 0,
         misses: 0,
@@ -2051,8 +2113,7 @@ pub async fn query_cache_stats(
 
 pub async fn query_costs(
     client: &clickhouse::Client,
-    since_ms: Option<i64>,
-    include_internal: Option<bool>,
+    q: &UsageQuery,
     model_costs: &[(String, f64, f64)],
 ) -> Result<Vec<CostAgg>, clickhouse::error::Error> {
     // One row per model from the raw ledger, carrying the authoritative spend
@@ -2067,17 +2128,17 @@ pub async fn query_costs(
         output_tokens: u64,
         total_cost: f64,
     }
-    let since = since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
-    let filter = internal_filter(include_internal);
+    let filter = usage_filter(q);
     let sql = format!(
         "select model, count() as requests, \
          sum(input_tokens) as input_tokens, sum(output_tokens) as output_tokens, \
          sum(cost_usd) as total_cost \
-         from usage where ts_ms >= ?{filter} group by model order by total_cost desc"
+         from usage{} group by model order by total_cost desc limit {}",
+        filter.sql(),
+        row_limit(q.limit, GROUPED_ROWS_DEFAULT),
     );
-    let rows = client
-        .query(&sql)
-        .bind(since)
+    let rows = filter
+        .bind(client.query(&sql))
         .fetch_all::<CostRawRow>()
         .await?;
     let cost_map: std::collections::HashMap<String, (f64, f64)> = model_costs
@@ -2109,7 +2170,6 @@ pub async fn query_costs(
 pub async fn query_usage_daily(
     client: &clickhouse::Client,
     q: UsageDailyQuery,
-    key_ids: &[Uuid],
 ) -> Result<Vec<UsageDailyRow>, clickhouse::error::Error> {
     let group = q.group_by.as_deref().unwrap_or("day");
     // Identity columns selected per grouping; the rest are zeroed so the row
@@ -2178,21 +2238,18 @@ pub async fn query_usage_daily(
     // replaces some of them with literal placeholders (e.g. `'' as day`), and
     // ClickHouse's analyzer makes SELECT aliases visible in WHERE — so applying
     // the predicates here would otherwise try to parse `''` as a Date.
-    let mut inner_where = String::from("where day >= toDate(?) and day <= toDate(?)");
-    if q.tenant_id.is_some() {
-        inner_where.push_str(" and tenant_id = toUUID(?)");
-    }
-    if !key_ids.is_empty() {
-        let placeholders = std::iter::repeat_n("toUUID(?)", key_ids.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        inner_where.push_str(&format!(" and key_id in ({placeholders})"));
-    }
-    if q.model.is_some() {
-        inner_where.push_str(" and model = ?");
-    }
+    let start = q.start_day.clone().unwrap_or_else(default_start_day);
+    let end = q.end_day.clone().unwrap_or_else(today_day);
+    let mut inner = Filter::from(
+        "day >= toDate(?) and day <= toDate(?)",
+        vec![Bind::Text(start), Bind::Text(end)],
+    );
+    inner
+        .uuid("tenant_id", q.tenant_id)
+        .uuids("key_id", &q.key_id)
+        .text("model", q.model.as_deref());
 
-    let mut sql = format!(
+    let sql = format!(
         "select {day_col}, {tenant_col}, {key_col}, {model_col}, \
          sum(requests), \
          sum(success_requests), \
@@ -2203,31 +2260,31 @@ pub async fn query_usage_daily(
          sum(estimated_tokens), \
          sum(cache_hits), \
          sum(cache_misses), \
-         round(sum(ttft_ms_sum) / greatest(sum(success_requests), 1), 1) as avg_ttft_ms, \
+         round(sum(ttft_ms_sum) / greatest(sum({DAILY_TTFT_REQUESTS}), 1), 1) as avg_ttft_ms, \
          round(sum(total_ms_sum) / greatest(sum(success_requests), 1), 1) as avg_total_ms, \
          round(sum(cost_usd_sum), 6) as cost_usd, \
          round(sum(energy_wh_sum), 6) as energy_wh, \
          round(sum(energy_cost_usd_sum), 6) as energy_cost_usd, \
          round(sum(co2_g_sum), 6) as co2_g, \
-         sum(platform_error_requests) \
-         from (select * from usage_daily {inner_where}) "
+         sum(platform_error_requests), \
+         sum({DAILY_TTFT_REQUESTS}) \
+         from (select * from usage_daily{}) {group_clause}",
+        inner.sql()
     );
-    sql.push_str(group_clause);
-
-    let start = q.start_day.clone().unwrap_or_else(default_start_day);
-    let end = q.end_day.clone().unwrap_or_else(today_day);
-    let mut query = client.query(&sql).bind(start).bind(end);
-    if let Some(tid) = q.tenant_id {
-        query = query.bind(tid.to_string());
-    }
-    for kid in key_ids {
-        query = query.bind(kid.to_string());
-    }
-    if let Some(model) = &q.model {
-        query = query.bind(model.clone());
-    }
-    query.fetch_all::<UsageDailyRow>().await
+    inner
+        .bind(client.query(&sql))
+        .fetch_all::<UsageDailyRow>()
+        .await
 }
+
+/// A daily rollup row's first-token request count. Rows rolled up before
+/// v2.13 summed first-token times over every answered request and counted
+/// none, so they divide by their answered requests, as they were read then.
+/// On the upgrade day a merge can join an old and a new row of one key and
+/// model; that day's average for them leans high, and the days after are
+/// exact.
+const DAILY_TTFT_REQUESTS: &str =
+    "if(ttft_requests = 0 and ttft_ms_sum > 0, success_requests, ttft_requests)";
 
 /// `usage` day-partition ids (`YYYYMMDD`) strictly older than
 /// `cutoff_yyyymmdd`. Used by the retention worker and manual compact to drop
@@ -2274,46 +2331,25 @@ fn today_day() -> String {
     chrono::Utc::now().format("%Y-%m-%d").to_string()
 }
 
-/// The `where` fragment for the optional [`UsageQuery`] filters. Paired with
-/// [`bind_usage_filters`]: both walk tenant → key → model in the same order, so
-/// every query that uses one must use the other or the placeholder and bind
-/// counts diverge (ClickHouse rejects the query).
-fn usage_filter_sql(q: &UsageQuery) -> String {
-    let mut sql = String::new();
-    if q.tenant_id.is_some() {
-        sql.push_str(" and tenant_id = toUUID(?)");
-    }
-    if q.key_id.is_some() {
-        sql.push_str(" and key_id = toUUID(?)");
-    }
-    if q.model.is_some() {
-        sql.push_str(" and model = ?");
-    }
-    sql
+/// The `where` clause of the aggregate reads: [`UsageQuery`]'s window and
+/// filters.
+fn usage_filter(q: &UsageQuery) -> Filter {
+    let mut f = Filter::window(window_start(q.since_ms, q.until_ms), q.until_ms);
+    f.uuid("tenant_id", q.tenant_id)
+        .uuid("key_id", q.key_id)
+        .text("model", q.model.as_deref())
+        .internal(q.include_internal);
+    f
 }
 
-fn bind_usage_filters(
-    mut query: clickhouse::query::Query,
-    q: &UsageQuery,
-) -> clickhouse::query::Query {
-    if let Some(tid) = q.tenant_id {
-        query = query.bind(tid.to_string());
-    }
-    if let Some(kid) = q.key_id {
-        query = query.bind(kid.to_string());
-    }
-    if let Some(model) = &q.model {
-        query = query.bind(model.clone());
-    }
-    query
-}
-
-/// How many values [`bind_usage_filters`] binds for `q`.
-#[cfg(test)]
-fn usage_filter_bind_count(q: &UsageQuery) -> usize {
-    usize::from(q.tenant_id.is_some())
-        + usize::from(q.key_id.is_some())
-        + usize::from(q.model.is_some())
+/// The `where` clause of the series reads: [`UsageSeriesQuery`]'s window and
+/// filters.
+fn series_filter(q: &UsageSeriesQuery, since: i64) -> Filter {
+    let mut f = Filter::window(since, q.until_ms);
+    f.uuid("tenant_id", q.tenant_id)
+        .text("model", q.model.as_deref())
+        .internal(q.include_internal);
+    f
 }
 
 /// Most buckets a series read may return per series. A wide window with a fine
@@ -2434,7 +2470,7 @@ mod internal_filter_tests {
         assert!(!sql.contains("start_ms >= 0 "), "{sql}");
         let bounded = traced_only_filter(5, Some(9));
         assert!(
-            bounded.contains("start_ms >= 5 AND start_ms <= 9"),
+            bounded.contains("start_ms >= 5 AND start_ms < 9"),
             "{bounded}"
         );
     }
@@ -2483,7 +2519,7 @@ mod internal_filter_tests {
             key_id: key.then(Uuid::new_v4),
             model: model.then(|| "m".to_string()),
             since_ms: None,
-            group_by: None,
+            until_ms: model.then_some(1_750_000_000_000),
             limit: Some(10),
             include_internal: None,
         };
@@ -2491,18 +2527,93 @@ mod internal_filter_tests {
             for key in [false, true] {
                 for model in [false, true] {
                     let q = query(tenant, key, model);
-                    // +1 for `since`, bound ahead of the filters.
-                    let binds = 1 + usage_filter_bind_count(&q);
-                    for sql in [usage_by_key_sql(&q), usage_by_model_sql(&q)] {
+                    let f = usage_filter(&q);
+                    for sql in [
+                        usage_by_key_sql(&q, f.sql()),
+                        usage_by_model_sql(&q, f.sql()),
+                    ] {
                         assert_eq!(
                             sql.matches('?').count(),
-                            binds,
+                            f.binds.len(),
                             "tenant={tenant} key={key} model={model}: {sql}"
                         );
+                        assert!(sql.ends_with(" limit 10"), "{sql}");
                     }
                 }
             }
         }
+        // No limit reads the default, and a huge one is capped.
+        let mut q = query(false, false, false);
+        q.limit = None;
+        assert!(usage_by_key_sql(&q, "").ends_with(" limit 1000"));
+        q.limit = Some(u64::MAX);
+        assert!(usage_by_model_sql(&q, "").ends_with(" limit 10000"));
+    }
+
+    #[test]
+    fn usage_filter_reads_the_partition_window_then_the_filters() {
+        let (tenant, key) = (Uuid::new_v4(), Uuid::new_v4());
+        let q = UsageQuery {
+            tenant_id: Some(tenant),
+            key_id: Some(key),
+            model: Some("m".into()),
+            since_ms: Some(5),
+            until_ms: Some(9),
+            limit: None,
+            include_internal: Some(true),
+        };
+        let f = usage_filter(&q);
+        assert_eq!(
+            f.sql(),
+            " where ts >= fromUnixTimestamp64Milli(toInt64(?)) and ts_ms >= ? \
+             and ts < fromUnixTimestamp64Milli(toInt64(?)) and ts_ms < ? \
+             and tenant_id = toUUID(?) and key_id = toUUID(?) and model = ?"
+        );
+        assert_eq!(
+            f.binds,
+            vec![
+                Bind::Int(5),
+                Bind::Int(5),
+                Bind::Int(9),
+                Bind::Int(9),
+                Bind::Text(tenant.to_string()),
+                Bind::Text(key.to_string()),
+                Bind::Text("m".into()),
+            ]
+        );
+        // `since` defaults to a day before `until`, not before now.
+        let open = usage_filter(&UsageQuery {
+            since_ms: None,
+            ..q
+        });
+        assert_eq!(open.binds[0], Bind::Int(9 - 86_400_000));
+    }
+
+    #[test]
+    fn until_is_exclusive_and_open_ended_by_default() {
+        let bounded = Filter::window(5, Some(9));
+        assert!(
+            bounded.sql().contains(" and ts_ms < ?"),
+            "{}",
+            bounded.sql()
+        );
+        assert!(!bounded.sql().contains("<="), "{}", bounded.sql());
+        let open = Filter::window(5, None);
+        assert_eq!(
+            open.sql(),
+            " where ts >= fromUnixTimestamp64Milli(toInt64(?)) and ts_ms >= ?"
+        );
+        assert_eq!(open.binds, vec![Bind::Int(5), Bind::Int(5)]);
+    }
+
+    #[test]
+    fn usage_reads_refuse_unknown_parameters() {
+        let bad = serde_json::json!({ "group_by": "tenant" });
+        assert!(serde_json::from_value::<UsageQuery>(bad).is_err());
+        let typo = serde_json::json!({ "untill_ms": 5 });
+        assert!(serde_json::from_value::<UsageSeriesQuery>(typo).is_err());
+        let ok = serde_json::json!({ "since_ms": 1, "until_ms": 2 });
+        assert!(serde_json::from_value::<UsageQuery>(ok).is_ok());
     }
 }
 
@@ -2572,14 +2683,14 @@ mod alias_tests {
     fn key_watch_reads_bind_one_value_per_placeholder() {
         for (tenant, key) in [(false, false), (true, false), (false, true), (true, true)] {
             let q = watch_query(tenant, key);
-            let (sql, usage, seen) = key_sources_sql(&q);
+            let (sql, [window, scan, seen]) = key_sources_sql(&q, 1, 2, 0);
             let filters = usize::from(tenant) + usize::from(key);
-            assert_eq!(usage.len(), filters);
-            assert_eq!(seen.len(), usize::from(key));
-            // since, until, filters, scan start, filters, country filters.
+            assert_eq!(window.binds.len(), 4 + filters);
+            assert_eq!(scan.binds.len(), 2 + filters);
+            assert_eq!(seen.binds.len(), usize::from(key));
             assert_eq!(
                 sql.matches('?').count(),
-                3 + 2 * filters + seen.len(),
+                window.binds.len() + scan.binds.len() + seen.binds.len(),
                 "{sql}"
             );
             assert!(
@@ -2587,13 +2698,13 @@ mod alias_tests {
                 "old rows without an address are skipped"
             );
 
-            let (sql, binds) = key_rejections_sql(&q);
-            assert_eq!(binds.len(), filters);
-            assert_eq!(sql.matches('?').count(), 2 + filters, "{sql}");
+            let (sql, filter) = key_rejections_sql(&q, 1, 2);
+            assert_eq!(filter.binds.len(), 4 + filters);
+            assert_eq!(sql.matches('?').count(), filter.binds.len(), "{sql}");
             assert_no_shadowing(&sql);
             assert_eq!(select_items(&sql).len(), 11);
         }
-        let (sql, _, _) = key_sources_sql(&watch_query(true, true));
+        let (sql, _) = key_sources_sql(&watch_query(true, true), 1, 2, 0);
         assert_no_shadowing(&sql);
         assert_eq!(select_items(&sql).len(), 11);
         assert!(sql.contains("usage.tenant_id = toUUID(?)"));
@@ -2617,18 +2728,17 @@ mod alias_tests {
         }))
         .expect("parses");
         assert_eq!(q.key_id, keys);
-        let (sql, binds) = key_rejections_sql(&q);
+        let (sql, filter) = key_rejections_sql(&q, 1, 2);
         assert!(
             sql.contains(" and key_rejections.key_id in (toUUID(?), toUUID(?), toUUID(?))"),
             "{sql}"
         );
-        assert!(sql.contains("where ts_ms >= ? and ts_ms < ?"));
-        assert_eq!(binds.len(), 4);
+        assert!(sql.contains(Filter::window(1, Some(2)).sql()), "{sql}");
         assert_eq!(
-            binds[1..],
+            filter.texts()[1..],
             keys.iter().map(Uuid::to_string).collect::<Vec<_>>()[..]
         );
-        assert_eq!(sql.matches('?').count(), 2 + binds.len());
+        assert_eq!(sql.matches('?').count(), filter.binds.len());
         assert!(
             sql.contains("order by last_ms desc limit 5 by key_id limit 51 settings"),
             "{sql}"
@@ -2637,16 +2747,19 @@ mod alias_tests {
         assert_no_shadowing(&sql);
 
         // key-sources reads the same list from both of its tables.
-        let (sql, usage, seen) = key_sources_sql(&q);
-        assert_eq!((usage.len(), seen.len()), (4, 3));
+        let (sql, [window, scan, seen]) = key_sources_sql(&q, 1, 2, 0);
+        assert_eq!((window.texts().len(), seen.texts().len()), (4, 3));
         assert!(sql.contains("key_country_seen.key_id in (toUUID(?), toUUID(?), toUUID(?))"));
-        assert_eq!(sql.matches('?').count(), 3 + 2 * usage.len() + seen.len());
+        assert_eq!(
+            sql.matches('?').count(),
+            window.binds.len() + scan.binds.len() + seen.binds.len()
+        );
 
         // A single key reads exactly as before; limits default and clamp.
         let one = watch_query(false, true);
-        let (sql, binds) = key_rejections_sql(&one);
+        let (sql, filter) = key_rejections_sql(&one, 1, 2);
         assert!(sql.contains(" and key_rejections.key_id = toUUID(?)"));
-        assert_eq!(binds.len(), 1);
+        assert_eq!(filter.texts().len(), 1);
         assert!(
             sql.contains("order by last_ms desc limit 10001 settings"),
             "{sql}"
@@ -2654,10 +2767,10 @@ mod alias_tests {
         let mut big = watch_query(false, false);
         big.limit = Some(50_000);
         big.per_key = Some(0);
-        let (sql, _) = key_rejections_sql(&big);
+        let (sql, _) = key_rejections_sql(&big, 1, 2);
         assert!(sql.contains("limit 1 by key_id limit 10001 "), "{sql}");
         big.limit = Some(0);
-        assert!(key_rejections_sql(&big)
+        assert!(key_rejections_sql(&big, 1, 2)
             .0
             .contains("limit 1 by key_id limit 2 "));
 
@@ -2740,8 +2853,8 @@ mod alias_tests {
 
     #[test]
     fn series_aliases_do_not_shadow_columns() {
-        assert_no_shadowing(&usage_series_sql(60_000));
-        assert_eq!(select_items(&usage_series_sql(60_000)).len(), 11);
+        assert_no_shadowing(&usage_series_sql(60_000, ""));
+        assert_eq!(select_items(&usage_series_sql(60_000, "")).len(), 11);
     }
 
     fn speed_query(filters: bool) -> UsageSpeedQuery {
@@ -2760,7 +2873,7 @@ mod alias_tests {
     #[test]
     fn speed_aliases_do_not_shadow_columns() {
         let (expr, _) = speed_bucket_sql("day", 86_400_000);
-        let sql = usage_speed_sql(expr, &speed_query(false));
+        let sql = usage_speed_sql(expr, speed_filter(&speed_query(false), 0, 1).sql());
         assert_no_shadowing(&sql);
         assert_eq!(select_items(&sql).len(), 8);
     }
@@ -2770,9 +2883,11 @@ mod alias_tests {
         for bucket in ["none", "hour", "day", "week"] {
             for filters in [false, true] {
                 let (expr, tz) = speed_bucket_sql(bucket, 86_400_000);
-                let sql = usage_speed_sql(expr, &speed_query(filters));
-                // tz, then since and until, then one per filter.
-                let binds = usize::from(tz) + 2 + if filters { 3 } else { 0 };
+                let f = speed_filter(&speed_query(filters), 0, 86_400_000);
+                let sql = usage_speed_sql(expr, f.sql());
+                // tz, in the select list, then the filter's own.
+                let binds = usize::from(tz) + f.binds.len();
+                assert_eq!(f.binds.len(), 4 + if filters { 3 } else { 0 });
                 assert_eq!(sql.matches('?').count(), binds, "{bucket}: {sql}");
             }
         }
@@ -2824,7 +2939,7 @@ mod alias_tests {
 
     #[test]
     fn log_filters_bind_one_value_per_placeholder() {
-        let (sql, binds) = log_filter_sql(&log_query(), 0);
+        let Filter { sql, binds } = log_filter_sql(&log_query(), 0);
         assert_eq!(sql.matches('?').count(), binds.len());
         let full = UsageLogQuery {
             tenant_id: vec![Uuid::nil()],
@@ -2841,9 +2956,10 @@ mod alias_tests {
             traced_only: Some(true),
             ..log_query()
         };
-        let (sql, binds) = log_filter_sql(&full, 0);
+        let Filter { sql, binds } = log_filter_sql(&full, 0);
         assert_eq!(sql.matches('?').count(), binds.len());
-        assert_eq!(binds.len(), 10);
+        // The window's four, then eight filters.
+        assert_eq!(binds.len(), 12);
         assert!(sql.contains("status_code >= 400"));
         assert!(sql.contains("status_code = 502"));
         assert!(sql.contains("FROM spans"));
@@ -2860,30 +2976,28 @@ mod alias_tests {
                 0,
             )
         };
-        let bound = |binds: &[LogBind]| -> Vec<String> {
-            binds
-                .iter()
-                .filter_map(|b| match b {
-                    LogBind::Text(t) => Some(t.clone()),
-                    LogBind::Int(_) => None,
-                })
-                .collect()
+        let bound = |binds: &[Bind]| -> Vec<String> {
+            Filter {
+                sql: String::new(),
+                binds: binds.to_vec(),
+            }
+            .texts()
         };
 
-        let (sql, binds) = with(" 203.0.113.7 ");
+        let Filter { sql, binds } = with(" 203.0.113.7 ");
         assert!(sql.contains(" and client_ip = ?"));
         assert_eq!(bound(&binds), vec!["203.0.113.7"]);
 
-        let (sql, binds) = with("10.1.2.3/8");
+        let Filter { sql, binds } = with("10.1.2.3/8");
         assert!(sql.contains("toIPv4OrNull(client_ip) between toIPv4OrNull(?) and toIPv4OrNull(?)"));
         assert_eq!(bound(&binds), vec!["10.0.0.0", "10.255.255.255"]);
         assert_eq!(sql.matches('?').count(), binds.len());
 
-        let (sql, binds) = with("2001:db8::/48");
+        let Filter { sql, binds } = with("2001:db8::/48");
         assert!(sql.contains("toIPv6OrNull(client_ip) between"));
         assert_eq!(sql.matches('?').count(), binds.len());
 
-        let (sql, binds) = with("not an address");
+        let Filter { sql, binds } = with("not an address");
         assert!(sql.ends_with(" and 0"));
         assert_eq!(sql.matches('?').count(), binds.len());
     }
@@ -2898,7 +3012,7 @@ mod alias_tests {
         .expect("parses");
         assert_eq!(q.key_id, vec![a, b]);
         assert!(q.tenant_id.is_empty());
-        let (sql, binds) = log_filter_sql(&q, 0);
+        let Filter { sql, binds } = log_filter_sql(&q, 0);
         assert!(sql.contains(" and key_id in (toUUID(?), toUUID(?))"));
         assert!(sql.contains(" and model = ?"));
         assert_eq!(sql.matches('?').count(), binds.len());
@@ -2913,7 +3027,7 @@ mod alias_tests {
     #[test]
     fn helper_rows_are_fetched_by_their_parent_request() {
         let parent = Uuid::new_v4();
-        let (sql, binds) = log_filter_sql(
+        let Filter { sql, binds } = log_filter_sql(
             &UsageLogQuery {
                 parent_request_id: Some(parent),
                 ..log_query()
@@ -2922,7 +3036,7 @@ mod alias_tests {
         );
         assert!(sql.contains(" and parent_request_id = toUUID(?)"));
         assert_eq!(sql.matches('?').count(), binds.len());
-        assert!(matches!(binds.last(), Some(LogBind::Text(v)) if v == &parent.to_string()));
+        assert!(matches!(binds.last(), Some(Bind::Text(v)) if v == &parent.to_string()));
     }
 
     #[test]
@@ -2987,8 +3101,10 @@ mod alias_tests {
         let counts = failure_counts_sql(" where ts_ms >= ?");
         assert_no_shadowing(&counts);
         assert_eq!(select_items(&counts).len(), 3);
-        let groups = failure_groups_sql(" where ts_ms >= ?");
+        let groups = failure_groups_sql(" where ts_ms >= ?", 1, FAILURE_GROUP_LIMIT);
         assert!(groups.contains(" and status_code >= 400 group by"));
+        assert!(groups.contains(" having failed >= 1 order by"));
+        assert!(groups.ends_with("limit 50"));
         assert!(groups.contains(obleth_config::EFFECTIVE_CLASS_SQL));
         assert!(!groups.contains(" as error_class"));
         assert_eq!(groups.matches('?').count(), 1);
@@ -2998,17 +3114,17 @@ mod alias_tests {
             error_class: classes.iter().map(|c| c.to_string()).collect(),
             ..log_query()
         };
-        let (sql, binds) = log_filter_sql(&q(Some("platform"), &[]), 0);
+        let Filter { sql, binds } = log_filter_sql(&q(Some("platform"), &[]), 0);
         assert!(sql.ends_with(&format!(
             " and {} in {}",
             obleth_config::EFFECTIVE_CLASS_SQL,
             obleth_config::PLATFORM_CLASSES_SQL
         )));
         assert_eq!(sql.matches('?').count(), binds.len());
-        let (sql, _) = log_filter_sql(&q(Some("client"), &[]), 0);
+        let sql = log_filter_sql(&q(Some("client"), &[]), 0).sql;
         assert!(sql.contains(" and status_code >= 400 and multiIf("));
         assert!(sql.contains(" not in ('capacity'"));
-        let (sql, binds) = log_filter_sql(&q(None, &["capacity", "network"]), 0);
+        let Filter { sql, binds } = log_filter_sql(&q(None, &["capacity", "network"]), 0);
         assert!(sql.ends_with(" in (?, ?)"));
         assert_eq!(sql.matches('?').count(), binds.len());
     }
@@ -3024,7 +3140,7 @@ mod alias_tests {
 
     #[test]
     fn log_failures_count_only_failures_and_keep_the_filters() {
-        let (filter, binds) = log_filter_sql(
+        let Filter { sql: filter, binds } = log_filter_sql(
             &UsageLogQuery {
                 model: vec!["m".into()],
                 ..log_query()
@@ -3059,7 +3175,7 @@ mod alias_tests {
 /// (e.g. `http://127.0.0.1:18123`); without it this returns early. Works in
 /// its own uniquely named database and drops only that database.
 #[cfg(test)]
-mod key_watch_clickhouse_tests {
+mod clickhouse_tests {
     use super::*;
     use obleth_config::{KeyRejection, KeyRejectionReason, UsageRecord};
 
@@ -3187,6 +3303,311 @@ mod key_watch_clickhouse_tests {
         assert_eq!(rejections[0].count, 3);
         assert_eq!(rejections[0].reason, "ip_not_allowed");
         assert_eq!(rejections[0].sample_user_agent, "bot/1");
+
+        client
+            .query(&format!("DROP DATABASE IF EXISTS {database}"))
+            .execute()
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Streamed, buffered, failed and cached replies of one model: the
+    /// Overview totals, the model reads and the daily rollup all average
+    /// first token over the same two requests.
+    #[tokio::test]
+    async fn every_first_token_average_counts_the_same_requests() {
+        let Ok(url) = std::env::var("OBLETH_TEST_CLICKHOUSE_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_CLICKHOUSE_URL to run");
+            return;
+        };
+        let database = format!("obleth_test_{}", Uuid::new_v4().simple());
+        let dir = std::env::temp_dir().join(format!("obleth-ttft-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sink = obleth_telemetry::TelemetrySink::start(
+            &url,
+            &database,
+            "default",
+            "",
+            dir.join("usage.wal").to_str().unwrap(),
+            std::time::Duration::from_millis(50),
+            true,
+        )
+        .await
+        .expect("sink");
+        let key = Uuid::new_v4();
+        let now = now_ms();
+        let reply = |ttft_ms: u32, streamed: bool, status_code: u16, cache: &str| {
+            let mut rec = usage(key, now - 60_000, "203.0.113.9", "203.0.113.0/24", "DE");
+            rec.model = "t".into();
+            rec.ttft_ms = ttft_ms;
+            rec.total_ms = 2_000;
+            rec.streamed = streamed;
+            rec.status_code = status_code;
+            rec.cache_status = cache.into();
+            rec
+        };
+        // Counted: two streamed answers.
+        sink.record(reply(200, true, 200, "miss"));
+        sink.record(reply(400, true, 200, "miss"));
+        // Not counted: a buffered answer, a failure and a cache hit.
+        sink.record(reply(0, false, 200, "miss"));
+        sink.record(reply(1_500, true, 502, "miss"));
+        sink.record(reply(5, true, 200, "hit"));
+        sink.shutdown().await;
+        let client = clickhouse::Client::default()
+            .with_url(&url)
+            .with_database(&database);
+
+        let q = |extra: serde_json::Value| -> UsageQuery {
+            let mut v = serde_json::json!({ "since_ms": now - 3_600_000, "model": "t" });
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(v).unwrap()
+        };
+        let totals = query_usage_totals(&client, &q(serde_json::json!({})))
+            .await
+            .unwrap();
+        assert_eq!(totals.requests, 5);
+        assert_eq!(totals.avg_ttft_ms, 300.0);
+        assert_eq!(totals.p50_ttft_ms, 300.0);
+        let model = query_usage_by_model(&client, q(serde_json::json!({})))
+            .await
+            .unwrap();
+        assert_eq!(model[0].avg_ttft_ms, 300.0);
+        let series: UsageSeriesQuery = serde_json::from_value(serde_json::json!({
+            "since_ms": now - 3_600_000, "model": "t", "bucket_ms": 3_600_000,
+        }))
+        .unwrap();
+        let series = query_usage_series_by_model(&client, series).await.unwrap();
+        let avg: Vec<f64> = series
+            .iter()
+            .filter(|p| p.requests > 0)
+            .map(|p| p.avg_ttft_ms)
+            .collect();
+        assert_eq!(avg, vec![300.0]);
+        let today = chrono::Utc::now().date_naive();
+        let daily: UsageDailyQuery = serde_json::from_value(serde_json::json!({
+            "start_day": (today - chrono::Days::new(1)).to_string(),
+            "end_day": today.to_string(),
+            "group_by": "model",
+        }))
+        .unwrap();
+        let daily = query_usage_daily(&client, daily).await.unwrap();
+        assert_eq!(daily.len(), 1, "{daily:?}");
+        assert_eq!((daily[0].avg_ttft_ms, daily[0].ttft_requests), (300.0, 2));
+
+        // A day rolled up before the count existed divides by its answered
+        // requests, as it was read then.
+        client
+            .query(
+                "insert into usage_daily (day, tenant_id, key_id, model, requests, \
+                 success_requests, ttft_ms_sum) values (toDate('2026-01-01'), \
+                 toUUID('00000000-0000-0000-0000-000000000000'), toUUID(?), 'old', 4, 4, 2000)",
+            )
+            .bind(key.to_string())
+            .execute()
+            .await
+            .unwrap();
+        let old: UsageDailyQuery = serde_json::from_value(serde_json::json!({
+            "start_day": "2026-01-01", "end_day": "2026-01-01", "group_by": "model",
+        }))
+        .unwrap();
+        let old = query_usage_daily(&client, old).await.unwrap();
+        assert_eq!((old[0].avg_ttft_ms, old[0].ttft_requests), (500.0, 4));
+
+        client
+            .query(&format!("DROP DATABASE IF EXISTS {database}"))
+            .execute()
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every aggregate read runs against the real schema, reads the window
+    /// `[since, until)` with `until` exclusive, and honours its filters.
+    #[tokio::test]
+    async fn usage_reads_run_on_clickhouse_and_honour_the_window() {
+        let Ok(url) = std::env::var("OBLETH_TEST_CLICKHOUSE_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_CLICKHOUSE_URL to run");
+            return;
+        };
+        let database = format!("obleth_test_{}", Uuid::new_v4().simple());
+        let dir = std::env::temp_dir().join(format!("obleth-usage-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sink = obleth_telemetry::TelemetrySink::start(
+            &url,
+            &database,
+            "default",
+            "",
+            dir.join("usage.wal").to_str().unwrap(),
+            std::time::Duration::from_millis(50),
+            true,
+        )
+        .await
+        .expect("sink");
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let hour = 3_600_000;
+        let now = now_ms();
+        for at in [now - 3 * hour, now - 2 * hour, now - hour] {
+            sink.record(usage(a, at, "203.0.113.9", "203.0.113.0/24", "DE"));
+        }
+        let mut failed = usage(b, now - hour / 2, "198.51.100.4", "198.51.100.0/24", "NL");
+        failed.model = "n".into();
+        failed.status_code = 500;
+        sink.record(failed);
+        // Ten days back: outside every window below.
+        sink.record(usage(
+            a,
+            now - 240 * hour,
+            "203.0.113.9",
+            "203.0.113.0/24",
+            "DE",
+        ));
+        sink.shutdown().await;
+        let client = clickhouse::Client::default()
+            .with_url(&url)
+            .with_database(&database);
+
+        let since = now - 4 * hour;
+        let until = now - hour;
+        let query = |extra: serde_json::Value| -> UsageQuery {
+            let mut v = serde_json::json!({ "since_ms": since });
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(v).expect("usage query")
+        };
+        let totals = |q: UsageQuery| {
+            let client = client.clone();
+            async move { query_usage_totals(&client, &q).await.expect("totals") }
+        };
+        assert_eq!(totals(query(serde_json::json!({}))).await.requests, 4);
+        // The row at `until` is out: the bound is exclusive.
+        let bounded = query(serde_json::json!({ "until_ms": until }));
+        assert_eq!(totals(bounded).await.requests, 2);
+        let only_a = query(serde_json::json!({ "key_id": a }));
+        assert_eq!(totals(only_a).await.requests, 3);
+        // `since` defaults to a day before `until`, so the old row stays out.
+        let day_before = query(serde_json::json!({ "until_ms": now }));
+        let day_before = UsageQuery {
+            since_ms: None,
+            ..day_before
+        };
+        assert_eq!(totals(day_before).await.requests, 4);
+
+        let tenants = query_usage(&client, query(serde_json::json!({})))
+            .await
+            .unwrap();
+        assert_eq!(tenants.iter().map(|r| r.requests).sum::<u64>(), 4);
+        let keys = query_usage_by_key(&client, query(serde_json::json!({ "limit": 1 })))
+            .await
+            .unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!((keys[0].key_id, keys[0].requests), (a, 3));
+        let models = query_usage_by_model(&client, query(serde_json::json!({ "until_ms": until })))
+            .await
+            .unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!((models[0].model.as_str(), models[0].requests), ("m", 2));
+        let cache = query_cache_stats(&client, query(serde_json::json!({ "key_id": b })))
+            .await
+            .unwrap();
+        assert_eq!(cache.hits, 0);
+        let costs = query_costs(
+            &client,
+            &query(serde_json::json!({ "model": "m" })),
+            &[("m".into(), 1.0, 2.0)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(costs.len(), 1);
+        assert_eq!(costs[0].requests, 3);
+
+        let series = |extra: serde_json::Value| -> UsageSeriesQuery {
+            let mut v = serde_json::json!({ "since_ms": since, "bucket_ms": hour });
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(v).expect("series query")
+        };
+        let sum = |points: &[UsageTimePoint]| points.iter().map(|p| p.requests).sum::<u64>();
+        let all = query_usage_series(&client, series(serde_json::json!({})))
+            .await
+            .unwrap();
+        assert_eq!(sum(&all), 4);
+        let cut = query_usage_series(&client, series(serde_json::json!({ "until_ms": until })))
+            .await
+            .unwrap();
+        assert_eq!(sum(&cut), 2);
+        let by_tenant = query_usage_series_by_tenant(&client, series(serde_json::json!({})))
+            .await
+            .unwrap();
+        assert_eq!(by_tenant.iter().map(|p| p.requests).sum::<u64>(), 4);
+        let by_model =
+            query_usage_series_by_model(&client, series(serde_json::json!({ "model": "n" })))
+                .await
+                .unwrap();
+        assert_eq!(by_model.iter().map(|p| p.requests).sum::<u64>(), 1);
+
+        let breakdown: UsageBreakdownQuery = serde_json::from_value(
+            serde_json::json!({ "model": "m", "since_ms": since, "until_ms": until }),
+        )
+        .unwrap();
+        let breakdown = query_usage_breakdown_by_model(&client, &breakdown)
+            .await
+            .unwrap();
+        assert_eq!(breakdown.iter().map(|r| r.requests).sum::<u64>(), 2);
+
+        let speed: UsageSpeedQuery = serde_json::from_value(serde_json::json!({
+            "since_ms": since, "until_ms": now, "bucket": "hour", "tz": "UTC", "key_id": a,
+        }))
+        .unwrap();
+        let speed = query_usage_speed(&client, speed).await.unwrap();
+        assert_eq!(speed.iter().map(|p| p.requests).sum::<u64>(), 3);
+
+        let summary: KeyUsageSummaryQuery =
+            serde_json::from_value(serde_json::json!({ "since_ms": since, "until_ms": until }))
+                .unwrap();
+        let summary = query_keys_usage_summary(&client, summary).await.unwrap();
+        assert_eq!(summary.iter().map(|r| r.requests).sum::<u64>(), 2);
+
+        let log = || -> UsageLogQuery {
+            serde_json::from_value(
+                serde_json::json!({ "since_ms": since, "until_ms": now, "model": "n" }),
+            )
+            .unwrap()
+        };
+        let rows = query_usage_logs(&client, log()).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let (_, buckets) = query_usage_log_histogram(&client, log()).await.unwrap();
+        assert_eq!(buckets.iter().map(|b| b.errors).sum::<u64>(), 1);
+        let facets = query_usage_log_facets(&client, log()).await.unwrap();
+        assert_eq!(facets.models.len(), 1);
+        let groups = query_usage_failure_groups(&client, log()).await.unwrap();
+        assert_eq!((groups.requests, groups.failures), (1, 1));
+
+        // Advice reads the same ledger through the same window.
+        let advice = crate::advice::query_model_totals(&client, since)
+            .await
+            .unwrap();
+        assert_eq!(advice.iter().map(|t| t.requests).sum::<u64>(), 4);
+        let n = advice.iter().find(|t| t.model == "n").unwrap();
+        assert_eq!(n.platform_failures, 1);
+        crate::advice::query_failure_groups(&client, since)
+            .await
+            .expect("advice failure groups");
+
+        let today = chrono::Utc::now().date_naive();
+        let daily: UsageDailyQuery = serde_json::from_value(serde_json::json!({
+            "start_day": (today - chrono::Days::new(1)).to_string(),
+            "end_day": today.to_string(),
+            "key_id": format!("{a},{b}"),
+        }))
+        .unwrap();
+        let daily = query_usage_daily(&client, daily).await.unwrap();
+        assert_eq!(daily.iter().map(|r| r.requests).sum::<u64>(), 4);
 
         client
             .query(&format!("DROP DATABASE IF EXISTS {database}"))

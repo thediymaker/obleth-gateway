@@ -25,7 +25,7 @@ beforeEach(() => {
   // recharts sizes its chart with a ResizeObserver, which jsdom lacks.
   vi.stubGlobal("ResizeObserver", class { observe() {} unobserve() {} disconnect() {} });
   vi.useFakeTimers({ toFake: ["Date"] });
-  vi.setSystemTime(new Date(2026, 8, 27, 12));
+  vi.setSystemTime(new Date(Date.UTC(2026, 8, 27, 12)));
   vi.stubGlobal("fetch", vi.fn(async (url: string) => {
     calls.push(url);
     const p = new URL(url, "http://x").searchParams;
@@ -68,7 +68,7 @@ async function render() {
 describe("the Reports page", () => {
   it("reads this month so far against the same days last month", async () => {
     await render();
-    expect(host.textContent).toContain("Sep 1 – Sep 27, 2026 · every team · compared with Aug 1 – Aug 27, 2026");
+    expect(host.textContent).toContain("Sep 1 – Sep 27, 2026 UTC · every team · compared with Aug 1 – Aug 27, 2026 UTC");
     expect(calls.some((c) => c.includes("start_day=2026-08-01") && c.includes("end_day=2026-08-27"))).toBe(true);
     expect(host.textContent).toContain("▲ 18% vs the same days last month");
   });
@@ -79,8 +79,9 @@ describe("the Reports page", () => {
     const url = new URL(failed.getAttribute("href")!, "http://x");
     expect(url.pathname).toBe("/logs");
     expect(url.searchParams.get("status")).toBe("error");
-    expect(new Date(Number(url.searchParams.get("since"))).getDate()).toBe(1);
-    expect(new Date(Number(url.searchParams.get("until"))).getDate()).toBe(27);
+    // The range's UTC days, 00:00Z on the first to the end of the last.
+    expect(new Date(Number(url.searchParams.get("since"))).toISOString()).toBe("2026-09-01T00:00:00.000Z");
+    expect(new Date(Number(url.searchParams.get("until"))).toISOString()).toBe("2026-09-27T23:59:59.999Z");
     const row = [...host.querySelectorAll("tbody a")].find((a) => a.getAttribute("title") === "See the failed requests")!;
     expect(row.getAttribute("href")).toContain("team=t1");
     expect(row.getAttribute("href")).toContain("status=error");

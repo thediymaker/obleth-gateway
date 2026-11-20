@@ -44,10 +44,7 @@ pub(super) async fn open_session(
     server: &ResolvedMcpServer,
     timeout: Duration,
 ) -> anyhow::Result<Session> {
-    match tokio::time::timeout(timeout, initialize(state, server)).await {
-        Ok(r) => r,
-        Err(_) => anyhow::bail!("mcp initialize timed out after {timeout:?}"),
-    }
+    super::with_timeout("mcp initialize", timeout, initialize(state, server)).await
 }
 
 /// Execute one tool call on an existing session and return the flattened text
@@ -78,10 +75,7 @@ pub(super) async fn call_tool_in(
         }
         Ok(text)
     };
-    match tokio::time::timeout(timeout, run).await {
-        Ok(r) => r,
-        Err(_) => anyhow::bail!("mcp tools/call `{name}` timed out after {timeout:?}"),
-    }
+    super::with_timeout(format!("mcp tools/call `{name}`"), timeout, run).await
 }
 
 /// List the tools advertised by `server` (uncached; see `cached_tools`).
@@ -116,10 +110,7 @@ pub async fn list_tools(
             })
             .collect())
     };
-    match tokio::time::timeout(timeout, run).await {
-        Ok(r) => r,
-        Err(_) => anyhow::bail!("mcp tools/list timed out after {timeout:?}"),
-    }
+    super::with_timeout("mcp tools/list", timeout, run).await
 }
 
 /// Open a session: `initialize`, capture `mcp-session-id`, then send the

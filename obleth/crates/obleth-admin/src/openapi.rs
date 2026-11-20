@@ -49,7 +49,7 @@ use obleth_config::{
 #[openapi(
     info(
         title = "obleth Management API",
-        description = "Programmatic control plane: tenants, keys, models, usage, fairshare, and settings."
+        description = "Programmatic control plane: tenants, keys, models, usage, fairshare, and settings. Update bodies follow one rule: an omitted field keeps its stored value, and null clears a field that can be empty."
     ),
     paths(
         // meta
@@ -459,6 +459,7 @@ use obleth_config::{
         (name = "fairshare", description = "Live scheduler snapshot and group weights"),
         (name = "models", description = "Model registry, capacity, endpoints, health, and auto-tune"),
         (name = "mcp", description = "MCP server registry"),
+        (name = "recipes", description = "Admin-authored recipe documents"),
         (name = "knowledge", description = "Institutional knowledge base: collections, documents, and re-indexing"),
         (name = "audit", description = "Admin audit log"),
         (name = "batches", description = "Batches across every tenant"),

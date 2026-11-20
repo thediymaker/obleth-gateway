@@ -270,7 +270,6 @@ export interface DeploymentRow {
   /** Kubernetes: namespace / Service. Slurm: partition · gres · mem · walltime. */
   where: string;
   perReplica: number | null;
-  poolCap: number;
   requests24h: number;
   spec?: ManagedModelSpec;
   replicas: ModelReplica[];
@@ -331,7 +330,6 @@ export function buildDeploymentRows(
         wanted: s.enabled ? s.target_replicas : 0,
         where: slurmPlacement(s),
         perReplica: null,
-        poolCap: m.max_in_flight ?? 0,
         requests24h: requests[m.model_name] ?? 0,
         spec: s,
         replicas: mine,
@@ -349,7 +347,6 @@ export function buildDeploymentRows(
         wanted: null,
         where: d?.status?.namespace && d.status.service ? `${d.status.namespace} / ${d.status.service}` : m.capacity_service || "—",
         perReplica: d?.status?.per_replica_max_in_flight ?? m.per_replica_max_in_flight ?? null,
-        poolCap: d?.status?.effective_max_in_flight ?? d?.enforced_max_in_flight ?? m.max_in_flight ?? 0,
         requests24h: requests[m.model_name] ?? 0,
         replicas: [],
         discovery: d,
@@ -449,10 +446,14 @@ export function mbLabel(mb: number | null | undefined): string {
   return mb >= 1024 ? `${Math.round(mb / 1024)}G` : `${mb}M`;
 }
 
-/** Slurm walltime to minutes: minutes, MM:SS, HH:MM:SS, D-HH, D-HH:MM, D-HH:MM:SS. */
+/**
+ * Slurm walltime to minutes: minutes, MM:SS, HH:MM:SS, D-HH, D-HH:MM,
+ * D-HH:MM:SS, or UNLIMITED/INFINITE as Infinity.
+ */
 export function parseTimeLimit(raw: string | null | undefined): number | null {
   const s = (raw ?? "").trim();
   if (!s) return null;
+  if (/^(?:UNLIMITED|INFINITE)$/i.test(s)) return Infinity;
   let days = 0;
   let rest = s;
   const dash = s.indexOf("-");
@@ -482,7 +483,7 @@ export function formatTimeLimit(minutes: number): string {
 
 /** "4 hours", "1 day", "2 days 12 hours". */
 export function walltimeLabel(minutes: number | null | undefined): string {
-  if (!minutes) return "no limit";
+  if (!minutes || !Number.isFinite(minutes)) return "no limit";
   const d = Math.floor(minutes / 1440);
   const h = Math.floor((minutes % 1440) / 60);
   const m = minutes % 60;

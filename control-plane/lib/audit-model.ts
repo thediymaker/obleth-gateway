@@ -316,21 +316,19 @@ export function filtersFromParams(p: Record<string, string | undefined>): AuditF
   return { range, who: p.who ?? "", kind, q: p.q ?? "", entity: p.entity ?? "" };
 }
 
-/** The gateway query for these filters. A kind of several entity types is narrowed client-side. */
+/** Entries the gateway returns per read; a full page means there may be older ones. */
+export const AUDIT_PAGE = 500;
+
+/** The gateway query for these filters. A kind sends all its entity types, so the gateway pages over that kind only. */
 export function queryFor(f: AuditFilters, now = Date.now()) {
   const [entityType, entityId] = f.entity.includes(":") ? f.entity.split(":", 2) : ["", ""];
-  const types = f.kind ? KIND_TYPES[f.kind] : [];
   return {
     actor: f.who || undefined,
-    entityType: entityType || (types.length === 1 ? types[0] : undefined),
+    entityType: entityType || (f.kind ? KIND_TYPES[f.kind].join(",") : undefined),
     entityId: entityId || undefined,
     since: rangeSince(f.range, now),
     q: f.q.trim() || undefined,
   };
-}
-
-export function matchesKind(e: Pick<AuditEntry, "entity_type">, kind: AuditKind | ""): boolean {
-  return !kind || KIND_TYPES[kind].includes(e.entity_type);
 }
 
 export function paramsFor(f: AuditFilters): string {

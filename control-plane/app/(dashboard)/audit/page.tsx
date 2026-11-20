@@ -1,5 +1,5 @@
 import { AuditLog } from "@/components/audit/audit-log";
-import { buildNames, filtersFromParams, queryFor } from "@/lib/audit-model";
+import { AUDIT_PAGE, buildNames, filtersFromParams, queryFor } from "@/lib/audit-model";
 import { requireAdmin } from "@/lib/auth/roles";
 import { obleth, type ApiKey, type AuditEntry, type KnowledgeCollection, type McpServer, type ModelRoute, type Tenant } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
@@ -10,7 +10,7 @@ export default async function AuditPage({ searchParams }: { searchParams: Promis
   await requireAdmin();
   const filters = filtersFromParams(await searchParams);
   const [entries, models, tenants, keys, mcp, collections] = await Promise.all([
-    safe(obleth.auditQuery({ ...queryFor(filters), limit: 500 }), [] as AuditEntry[]),
+    safe(obleth.auditQuery({ ...queryFor(filters), limit: AUDIT_PAGE }), [] as AuditEntry[]),
     safe(obleth.listModels(), [] as ModelRoute[]),
     safe(obleth.listTenants(), [] as Tenant[]),
     safe(obleth.listKeys(), [] as ApiKey[]),

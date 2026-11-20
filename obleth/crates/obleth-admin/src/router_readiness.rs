@@ -48,11 +48,6 @@ pub struct RouterReadiness {
 /// equally — the ranking silently degrades to price and capacity.
 const HEURISTIC_TAGS: [&str; 5] = ["coding", "math", "vision", "long-context", "writing"];
 
-/// A model whose observed average answer runs past this many tokens is worth
-/// a warning when it sits in the auto pool: per-token prices make it look
-/// cheap while per-request it is the slowest thing in the fleet.
-const LONG_OUTPUT_TOKENS: f64 = 4_000.0;
-
 #[utoipa::path(
     get, path = "/api/v1/router/readiness", tag = "settings",
     responses((status = 200, body = RouterReadiness))
@@ -67,25 +62,14 @@ pub(crate) async fn get_router_readiness(
         .unwrap_or_default();
     let mut candidates = state.store.build_candidates(settings.tier_source).await?;
     derive_levels(&mut candidates, settings.tier_source);
-    // Ledger-window means only: the live per-process average is a handful of
-    // recent answers and is not evidence enough to warn on.
-    let stats: std::collections::HashMap<String, f64> = state
-        .output_stats
-        .windowed()
-        .into_iter()
-        .map(|(model, w)| (model, w.mean))
-        .collect();
-    Ok(Json(build_readiness(&settings, &candidates, &stats)))
+    Ok(Json(build_readiness(&settings, &candidates)))
 }
 
 /// Pure so it can be unit-tested against synthetic fleets. The only inputs
-/// are the saved settings, the candidate set the router itself scores over,
-/// and the observed completion-length averages.
-pub fn build_readiness(
-    settings: &AutoRouterSettings,
-    candidates: &[Candidate],
-    output_stats: &std::collections::HashMap<String, f64>,
-) -> RouterReadiness {
+/// are the saved settings and the candidate set the router itself scores
+/// over. Long answers are Advice's finding, read from the ledger with its
+/// evidence, so they are not repeated here.
+pub fn build_readiness(settings: &AutoRouterSettings, candidates: &[Candidate]) -> RouterReadiness {
     let mut findings: Vec<ReadinessFinding> = Vec::new();
 
     // The pool the router actually chooses from (health is a live signal the
@@ -169,29 +153,6 @@ pub fn build_readiness(
             ),
             models: Vec::new(),
         });
-    }
-
-    // -- long-output models in the pool --------------------------------------
-    for c in &pool {
-        if let Some(avg) = output_stats.get(&c.model.model_name) {
-            if *avg >= LONG_OUTPUT_TOKENS {
-                findings.push(ReadinessFinding {
-                    severity: "warn",
-                    code: "long_output_model",
-                    title: format!(
-                        "{} writes long answers: {:.0} tokens on average over the last day",
-                        c.model.model_name, avg
-                    ),
-                    detail: "Auto weighs each model's cost per request, so it already \
-                             expects these answers to be long. If they are long because \
-                             the model thinks at length, requests Auto sends it will be \
-                             slow; take it out of Auto and it still answers when called \
-                             by name."
-                        .to_string(),
-                    models: vec![c.model.model_name.clone()],
-                });
-            }
-        }
     }
 
     // -- price-identical twins ------------------------------------------------
@@ -353,7 +314,7 @@ mod tests {
         let mut coder = model("coder");
         coder.tags = vec!["coding".to_string()];
         let cands = vec![cand(coder)];
-        let r = build_readiness(&AutoRouterSettings::default(), &cands, &Default::default());
+        let r = build_readiness(&AutoRouterSettings::default(), &cands);
         let math = r
             .findings
             .iter()
@@ -370,18 +331,10 @@ mod tests {
     }
 
     #[test]
-    fn long_output_pool_model_is_flagged() {
+    fn long_answers_are_advices_finding_not_readiness() {
         let mut thinker = model("thinker");
         thinker.tags = vec!["reasoning".to_string()];
-        let cands = vec![cand(thinker)];
-        let mut stats = std::collections::HashMap::new();
-        stats.insert("thinker".to_string(), 25_519.0);
-        let r = build_readiness(&AutoRouterSettings::default(), &cands, &stats);
-        assert!(codes(&r).contains(&"long_output_model"));
-        // Auto-excluded models are not in the pool and must not be flagged.
-        let mut excluded = model("thinker");
-        excluded.auto_eligible = false;
-        let r = build_readiness(&AutoRouterSettings::default(), &[cand(excluded)], &stats);
+        let r = build_readiness(&AutoRouterSettings::default(), &[cand(thinker)]);
         assert!(!codes(&r).contains(&"long_output_model"));
     }
 
@@ -392,11 +345,7 @@ mod tests {
         for m in [&mut a, &mut b] {
             m.tags = vec!["coding".to_string()];
         }
-        let r = build_readiness(
-            &AutoRouterSettings::default(),
-            &[cand(a), cand(b)],
-            &Default::default(),
-        );
+        let r = build_readiness(&AutoRouterSettings::default(), &[cand(a), cand(b)]);
         let ties: Vec<_> = r
             .findings
             .iter()
@@ -414,11 +363,7 @@ mod tests {
             m.tags = vec!["coding".to_string()];
         }
         b.route_bias = 1.05;
-        let r = build_readiness(
-            &AutoRouterSettings::default(),
-            &[cand(a), cand(b)],
-            &Default::default(),
-        );
+        let r = build_readiness(&AutoRouterSettings::default(), &[cand(a), cand(b)]);
         assert!(!codes(&r).contains(&"price_tie"));
     }
 
@@ -426,7 +371,7 @@ mod tests {
     fn tiering_findings_track_the_knobs() {
         let cands = vec![cand(model("m"))];
         let off = AutoRouterSettings::default();
-        let r = build_readiness(&off, &cands, &Default::default());
+        let r = build_readiness(&off, &cands);
         assert!(codes(&r).contains(&"tiering_off"));
 
         let declared_no_levels = AutoRouterSettings {
@@ -434,7 +379,7 @@ mod tests {
             tier_source: TierSource::Declared,
             ..Default::default()
         };
-        let r = build_readiness(&declared_no_levels, &cands, &Default::default());
+        let r = build_readiness(&declared_no_levels, &cands);
         assert!(codes(&r).contains(&"tiering_inert"));
 
         // Hybrid derives levels from cost, so no inert warning.
@@ -443,7 +388,7 @@ mod tests {
             tier_source: TierSource::Hybrid,
             ..Default::default()
         };
-        let r = build_readiness(&hybrid, &cands, &Default::default());
+        let r = build_readiness(&hybrid, &cands);
         assert!(!codes(&r).contains(&"tiering_inert"));
     }
 
@@ -451,7 +396,7 @@ mod tests {
     fn classifier_state_findings() {
         let cands = vec![cand(model("m"))];
         let off = AutoRouterSettings::default();
-        let r = build_readiness(&off, &cands, &Default::default());
+        let r = build_readiness(&off, &cands);
         assert!(codes(&r).contains(&"classifier_off"));
 
         let missing = AutoRouterSettings {
@@ -459,7 +404,7 @@ mod tests {
             classifier_model: Some("ghost".to_string()),
             ..Default::default()
         };
-        let r = build_readiness(&missing, &cands, &Default::default());
+        let r = build_readiness(&missing, &cands);
         assert!(codes(&r).contains(&"classifier_missing"));
 
         let is_auto = AutoRouterSettings {
@@ -467,7 +412,7 @@ mod tests {
             classifier_model: Some("auto".to_string()),
             ..Default::default()
         };
-        let r = build_readiness(&is_auto, &cands, &Default::default());
+        let r = build_readiness(&is_auto, &cands);
         assert!(codes(&r).contains(&"classifier_is_auto"));
     }
 }

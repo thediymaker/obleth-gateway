@@ -52,18 +52,9 @@ import { countryCodes, networkLines } from "@/lib/key-networks";
 import { keyPrefixProblem } from "@/lib/key-prefix";
 import { cleanNamedNetworks, namedNetworksProblem, parseNamedNetworksField } from "@/lib/named-networks";
 import { tagsInclude } from "@/lib/utils";
+import { actionError, type ActionResult } from "@/lib/action-result";
 
-export type ActionResult =
-  | { ok: true; warnings?: string[] }
-  | { ok: false; error: string };
-
-function actionError(e: unknown): { ok: false; error: string } {
-  if (e instanceof OblethApiError) return { ok: false, error: e.message };
-  return {
-    ok: false,
-    error: e instanceof Error ? e.message : "Unexpected error",
-  };
-}
+export type { ActionResult } from "@/lib/action-result";
 
 /**
  * Run a delete and revalidate whether or not it succeeded: the Management API
@@ -142,29 +133,11 @@ const positiveIntWithDefault = (def: number) =>
 
 const tenantCreateSchema = z.object({
   name: requiredText("Tenant name is required"),
-  description: optionalText,
   organization: optionalText,
-  contact_email: z.preprocess(
-    blankToUndef,
-    z.string().email("Invalid contact email").optional(),
-  ),
-  status: z.preprocess(
-    blankToUndef,
-    z.enum(["active", "suspended", "archived"]).default("active"),
-  ),
   fairshare_group: optionalText,
   weight: optionalPositiveInt,
   tokens_per_minute: optionalNonNegInt,
   max_in_flight: optionalPositiveInt,
-  timezone: z.preprocess(blankToUndef, z.string().default("UTC")),
-  active_from: z.preprocess(blankToUndef, z.string().datetime().optional()),
-  active_until: z.preprocess(blankToUndef, z.string().datetime().optional()),
-  budget_tokens: optionalNonNegInt,
-  budget_cost_usd: optionalNonNegNumber,
-  budget_period: z.preprocess(
-    blankToUndef,
-    z.enum(["lifetime", "monthly", "term"]).default("lifetime"),
-  ),
 });
 
 const tenantUpdateSchema = z.object({
@@ -289,101 +262,40 @@ function parseWeeklyWindows(value: FormDataEntryValue | null) {
   }
 }
 
-export async function createTenantAction(formData: FormData): Promise<ActionResult> {
+/**
+ * Add a tenant from the Add tenant sheet: name, organization, group, weight
+ * and caps. Its hours, budget, models and policies are set on its page.
+ */
+export async function createTenantAction(formData: FormData): Promise<{ ok: true; tenant: { id: string; name: string } } | { ok: false; error: string }> {
   const session = await requireAdmin();
   const parsed = tenantCreateSchema.safeParse({
     name: formData.get("name"),
-    description: formData.get("description"),
     organization: formData.get("organization"),
-    contact_email: formData.get("contact_email"),
-    status: formData.get("status"),
     fairshare_group: formData.get("fairshare_group"),
     weight: formData.get("weight"),
     tokens_per_minute: formData.get("tokens_per_minute"),
     max_in_flight: formData.get("max_in_flight"),
-    timezone: formData.get("timezone"),
-    active_from: formData.get("active_from"),
-    active_until: formData.get("active_until"),
-    budget_tokens: formData.get("budget_tokens"),
-    budget_cost_usd: formData.get("budget_cost_usd"),
-    budget_period: formData.get("budget_period"),
   });
   if (!parsed.success) return { ok: false, error: firstIssue(parsed.error) };
-  const windows = parseWeeklyWindows(formData.get("weekly_windows"));
-  if (!windows.success) return { ok: false, error: firstIssue(windows.error) };
-  const allowed_models = formData
-    .getAll("allowed_models")
-    .map((value) => trimmed(value))
-    .filter(Boolean);
-
   const data = parsed.data;
-  if (
-    data.active_from &&
-    data.active_until &&
-    new Date(data.active_until) <= new Date(data.active_from)
-  ) {
-    return { ok: false, error: "Active-until must be after active-from." };
-  }
-
   try {
     const tenant = await obleth.createTenant({
       name: data.name,
-      weight: data.weight,
+      weight: data.weight ?? 100,
       tokens_per_minute: data.tokens_per_minute ?? 0,
       max_in_flight: data.max_in_flight,
       fairshare_group: data.fairshare_group || undefined,
     }, { auditActor: session.email });
-
-    if (data.description || data.organization || data.contact_email) {
-      await obleth.updateTenant(tenant.id, {
-        name: data.name,
-        description: data.description,
-        organization: data.organization,
-        contact_email: data.contact_email ?? "",
-      }, { auditActor: session.email });
+    if (data.organization) {
+      await obleth.updateTenant(tenant.id, { name: data.name, organization: data.organization }, { auditActor: session.email });
     }
-
-    if (data.status !== "active") {
-      await obleth.setTenantStatus(tenant.id, data.status, { auditActor: session.email });
-    }
-
-    const hasSchedule =
-      data.timezone !== "UTC" ||
-      data.active_from ||
-      data.active_until ||
-      windows.data.length > 0;
-    if (hasSchedule) {
-      await obleth.setTenantSchedule(tenant.id, {
-        timezone: data.timezone,
-        active_from: data.active_from ?? null,
-        active_until: data.active_until ?? null,
-        weekly_windows: windows.data.length ? windows.data : null,
-      }, { auditActor: session.email });
-    }
-
-    const hasBudget =
-      data.budget_tokens != null ||
-      data.budget_cost_usd != null ||
-      data.budget_period !== "lifetime";
-    if (hasBudget) {
-      await obleth.setTenantBudget(tenant.id, {
-        budget_tokens: data.budget_tokens ?? null,
-        budget_cost_usd: data.budget_cost_usd ?? null,
-        budget_period: data.budget_period,
-      }, { auditActor: session.email });
-    }
-
-    if (allowed_models.length > 0) {
-      await obleth.setTenantAllowlist(tenant.id, allowed_models, { auditActor: session.email });
-    }
+    revalidatePath("/tenants");
+    revalidatePath("/fairshare");
+    revalidatePath("/");
+    return { ok: true, tenant: { id: tenant.id, name: tenant.name } };
   } catch (e) {
     return actionError(e);
   }
-
-  revalidatePath("/tenants");
-  revalidatePath("/fairshare");
-  revalidatePath("/");
-  return { ok: true };
 }
 
 export async function setTenantStatusAction(id: string, status: string): Promise<ActionResult> {
@@ -415,12 +327,17 @@ export async function deleteTenantAction(id: string): Promise<ActionResult> {
   );
 }
 
-export async function setWeightAction(id: string, weight: number) {
+export async function setWeightAction(id: string, weight: number): Promise<ActionResult> {
   const session = await requireAdmin();
-  await obleth.setWeight(id, weight, { auditActor: session.email });
+  try {
+    await obleth.setWeight(id, weight, { auditActor: session.email });
+  } catch (e) {
+    return actionError(e);
+  }
   revalidatePath("/tenants");
   revalidatePath("/fairshare");
   revalidatePath("/");
+  return { ok: true };
 }
 
 /** A fairshare group's weight: its share of a full pool against the other active groups. */
@@ -752,27 +669,35 @@ export interface BulkKeyResult {
   failed: { name: string; error: string }[];
 }
 
-/** Run `task` over the chosen keys, a few at a time, collecting failures by name. */
+/**
+ * Run `task` over the chosen keys, a few at a time, collecting failures by
+ * name. The pages refresh whatever happened, even when a run fails partway.
+ */
 async function eachKey(ids: string[], task: (key: ApiKey) => Promise<void>): Promise<BulkKeyResult> {
-  const wanted = new Set(ids);
-  const keys = (await obleth.listKeys()).filter((k) => wanted.has(k.id));
   const failed: BulkKeyResult["failed"] = [];
   let done = 0;
-  for (let i = 0; i < keys.length; i += 8) {
-    await Promise.all(
-      keys.slice(i, i + 8).map(async (key) => {
-        try {
-          await task(key);
-          done += 1;
-        } catch (e) {
-          failed.push({ name: key.name || key.key_prefix, error: actionError(e).error });
-        }
-      }),
-    );
+  try {
+    const wanted = new Set(ids);
+    const keys = (await obleth.listKeys()).filter((k) => wanted.has(k.id));
+    for (let i = 0; i < keys.length; i += 8) {
+      await Promise.all(
+        keys.slice(i, i + 8).map(async (key) => {
+          try {
+            await task(key);
+            done += 1;
+          } catch (e) {
+            failed.push({ name: key.name || key.key_prefix, error: actionError(e).error });
+          }
+        }),
+      );
+    }
+  } catch (e) {
+    failed.push({ name: "all", error: actionError(e).error });
+  } finally {
+    revalidatePath("/keys");
+    revalidatePath("/tenants");
+    revalidatePath("/");
   }
-  revalidatePath("/keys");
-  revalidatePath("/tenants");
-  revalidatePath("/");
   return { done, failed };
 }
 
@@ -904,22 +829,9 @@ export async function deleteKeyAction(id: string): Promise<ActionResult> {
   );
 }
 
-export async function deleteKeysAction(
-  ids: string[],
-): Promise<{ deleted: number; failed: number }> {
+export async function deleteKeysAction(ids: string[]): Promise<BulkKeyResult> {
   const session = await requireAdmin();
-  const uniqueIds = [...new Set(ids.map((id) => String(id)).filter(Boolean))];
-  const result = await deleteKeys(uniqueIds, session.email);
-  revalidatePath("/keys");
-  revalidatePath("/");
-  return result;
-}
-
-export async function setCapacityAction(max: number) {
-  const session = await requireAdmin();
-  await obleth.setCapacity(max, { auditActor: session.email });
-  revalidatePath("/");
-  revalidatePath("/fairshare");
+  return eachKey(ids, (key) => obleth.deleteKey(key.id, { auditActor: session.email }));
 }
 
 export type CreateModelResult =
@@ -1116,21 +1028,30 @@ export async function autotuneModelAction(
     latency_headroom?: number;
     replicas?: number;
   },
-): Promise<AutotuneReport> {
+): Promise<{ ok: true; report: AutotuneReport } | { ok: false; error: string }> {
   const session = await requireAdmin();
   // Recommend-only: drives a live probe against the upstream and returns the
   // suggested capacity. Nothing is persisted here.
-  return obleth.autotuneModel(id, opts, { auditActor: session.email });
+  try {
+    return { ok: true, report: await obleth.autotuneModel(id, opts, { auditActor: session.email }) };
+  } catch (e) {
+    return actionError(e);
+  }
 }
 
 export async function applyAutotuneCapacityAction(
   id: string,
   max_in_flight: number,
-) {
+): Promise<ActionResult> {
   const session = await requireAdmin();
-  await obleth.applyAutotuneCapacity(id, max_in_flight, { auditActor: session.email });
+  try {
+    await obleth.applyAutotuneCapacity(id, max_in_flight, { auditActor: session.email });
+  } catch (e) {
+    return actionError(e);
+  }
   revalidatePath("/models");
   revalidatePath("/fairshare");
+  return { ok: true };
 }
 
 export async function deleteModelAction(id: string): Promise<ActionResult> {
@@ -1742,8 +1663,7 @@ export async function restoreBackupAction(
     revalidatePath("/settings");
     return { ok: true, report };
   } catch (e) {
-    const err = actionError(e);
-    return err.ok ? { ok: false, error: "Unexpected error" } : err;
+    return actionError(e);
   }
 }
 
@@ -1842,8 +1762,7 @@ export async function applyModelManifestAction(
     }
     return { ok: true, report };
   } catch (e) {
-    const err = actionError(e);
-    return err.ok ? { ok: false, error: "Unexpected error" } : err;
+    return actionError(e);
   }
 }
 
@@ -1973,6 +1892,7 @@ const BOON_NUMBERS = [
   "web_search_max_results", "web_search_max_searches_per_request", "web_search_timeout_ms",
   "speculation_agree_min", "speculation_lp_min", "speculation_abort_agree", "speculation_abort_lp", "speculation_first_chunk_tokens",
   "speculation_chunk_tokens", "speculation_decide_by_tokens", "speculation_max_draft_tokens", "speculation_pace_ms", "speculation_timeout_ms",
+  "speculation_verify_timeout_ms", "speculation_verify_reply_max_bytes",
   "compression_min_tokens", "compression_max_segments", "compression_max_lossy_segments", "compression_original_ttl_secs", "compression_neural_keep_ratio",
 ] as const;
 /** Model pickers: blank means none. */
@@ -2420,26 +2340,6 @@ export async function testAlertAction(): Promise<
   } catch (e) {
     return actionError(e);
   }
-}
-
-async function deleteKeys(
-  ids: string[],
-  auditActor: string,
-): Promise<{ deleted: number; failed: number }> {
-  let deleted = 0;
-  let failed = 0;
-  const chunkSize = 25;
-  for (let i = 0; i < ids.length; i += chunkSize) {
-    const chunk = ids.slice(i, i + chunkSize);
-    const results = await Promise.allSettled(
-      chunk.map((id) => obleth.deleteKey(id, { auditActor })),
-    );
-    for (const result of results) {
-      if (result.status === "fulfilled") deleted += 1;
-      else failed += 1;
-    }
-  }
-  return { deleted, failed };
 }
 
 function numOr(v: FormDataEntryValue | null, fallback: number): number {

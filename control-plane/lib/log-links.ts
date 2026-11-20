@@ -1,8 +1,9 @@
 /**
  * A link to the Request logs page with filters already chosen: the way every
  * other page says "show me these requests". `since` and `until` are epoch
- * millis or `YYYY-MM-DD` days (a day's `until` means the end of that day, in
- * the reader's time).
+ * millis or `YYYY-MM-DD` days. A day is a UTC day, as the daily rollup that
+ * Reports and the team pages count from cuts them, and a day's `until` means
+ * the end of that day.
  */
 export interface LogsLink {
   status?: "error" | "success";
@@ -30,14 +31,12 @@ export function logsHref(link: LogsLink): string {
   return q ? `/logs?${q}` : "/logs";
 }
 
-/** A `since`/`until` value as epoch millis: a day starts at its local midnight, and a day's end is the next midnight less a millisecond. */
+/** A `since`/`until` value as epoch millis: a day starts at 00:00 UTC, and a day's end is the next 00:00 UTC less a millisecond. */
 export function linkTime(value: string | undefined, end: boolean): number | undefined {
   if (!value) return undefined;
   if (/^\d+$/.test(value)) return Number(value);
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
   if (!m) return undefined;
-  const start = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
-  if (!end) return start.getTime();
-  start.setDate(start.getDate() + 1);
-  return start.getTime() - 1;
+  const start = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  return end ? start + 86_400_000 - 1 : start;
 }

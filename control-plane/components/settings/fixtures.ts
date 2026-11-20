@@ -20,7 +20,7 @@ export const boons = (over: Partial<BoonSettingsView> = {}): BoonSettingsView =>
   image_generation_max_images_per_request: 2, image_generation_timeout_ms: 120000,
   speculation_enabled: true, speculation_draft_model: "north-mini-code", speculation_verify_model: null, speculation_classify_model: "olmo3-7b-instruct",
   speculation_agree_min: 0.5, speculation_lp_min: -1, speculation_abort_agree: 0.45, speculation_abort_lp: -1.6, speculation_first_chunk_tokens: 80,
-  speculation_chunk_tokens: 250, speculation_decide_by_tokens: 450, speculation_max_draft_tokens: 2048, speculation_pace_ms: 9, speculation_timeout_ms: 45000,
+  speculation_chunk_tokens: 250, speculation_decide_by_tokens: 450, speculation_max_draft_tokens: 2048, speculation_pace_ms: 9, speculation_timeout_ms: 45000, speculation_verify_timeout_ms: 30000, speculation_verify_reply_max_bytes: 67108864,
   speculation_draft_chat_template_kwargs: { reasoning: false },
   speculation_category_gates: [{ tag: "coding", speculate: true, agree_min: 0.4, lp_min: -1 }],
   speculation_unlisted_categories_speculate: false, speculation_verify_url_template: null,

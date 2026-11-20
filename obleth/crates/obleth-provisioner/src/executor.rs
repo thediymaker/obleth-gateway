@@ -1,5 +1,5 @@
 use crate::domain::*;
-use crate::obleth_client::{OblethClient, ReplicaDetails};
+use crate::obleth_client::{OblethClient, ReplicaPatch};
 use crate::resolve::HostResolver;
 use crate::slurm::{job_submit_from_spec, SlurmClient};
 use obleth_config::ManagedModelSpec;
@@ -63,7 +63,7 @@ pub async fn apply(
             // the cluster for orphans — so cancel it (compensating action).
             let log_path = crate::slurm::job_log_path(&job, &job_id);
             if let Err(e) = obleth
-                .create_replica_with_log(model_id, &job_id, port_base, Some(&log_path))
+                .create_replica(model_id, &job_id, port_base, Some(&log_path))
                 .await
             {
                 match slurm.cancel(&job_id).await {
@@ -113,23 +113,18 @@ pub async fn apply(
                         .await?
                 }
             };
-            let details = ReplicaDetails {
+            let patch = ReplicaPatch {
+                state: Some(ReplicaState::Healthy),
+                message: Some("promoted".into()),
+                nodes: Some(node),
+                endpoint_id: Some(ep),
                 job_started_at: *job_started_at,
                 job_ends_at: *job_ends_at,
                 port: Some(*port),
                 state_detail: Some(String::new()),
                 ..Default::default()
             };
-            obleth
-                .patch_replica_with_details(
-                    *replica_id,
-                    Some("healthy"),
-                    Some(&node),
-                    Some(ep),
-                    Some("promoted"),
-                    &details,
-                )
-                .await?;
+            obleth.patch_replica(*replica_id, &patch).await?;
         }
         Action::Demote {
             replica_id,
@@ -143,20 +138,13 @@ pub async fn apply(
                 obleth.delete_endpoint(model_id, *ep).await?;
             }
             tracing::warn!(%replica_id, model = model_name, %detail, "replica stopped serving where it was registered");
-            let details = ReplicaDetails {
+            let patch = ReplicaPatch {
+                state: Some(ReplicaState::Pending),
+                message: Some("requeued or restarted by Slurm".into()),
                 state_detail: Some(detail.clone()),
                 ..Default::default()
             };
-            obleth
-                .patch_replica_with_details(
-                    *replica_id,
-                    Some("pending"),
-                    None,
-                    None,
-                    Some("requeued or restarted by Slurm"),
-                    &details,
-                )
-                .await?;
+            obleth.patch_replica(*replica_id, &patch).await?;
         }
         Action::MarkLost {
             replica_id,
@@ -168,8 +156,12 @@ pub async fn apply(
             if let Some(ep) = endpoint_id {
                 obleth.delete_endpoint(model_id, *ep).await?;
             }
-            let message = lost_message(raw_state.as_deref(), reason.as_deref());
-            let details = ReplicaDetails {
+            let (end_state, end_reason) = lost_end(raw_state.as_deref(), reason.as_deref());
+            let patch = ReplicaPatch {
+                state: Some(ReplicaState::Lost),
+                message: Some(lost_message(raw_state.as_deref(), reason.as_deref())),
+                end_state: Some(end_state),
+                end_reason,
                 state_detail: Some(lost_detail(
                     raw_state.as_deref(),
                     reason.as_deref(),
@@ -177,16 +169,7 @@ pub async fn apply(
                 )),
                 ..Default::default()
             };
-            obleth
-                .patch_replica_with_details(
-                    *replica_id,
-                    Some("lost"),
-                    None,
-                    None,
-                    Some(&message),
-                    &details,
-                )
-                .await?;
+            obleth.patch_replica(*replica_id, &patch).await?;
         }
         Action::Cancel {
             replica_id,
@@ -212,29 +195,26 @@ pub async fn apply(
             } else {
                 None
             };
-            let details = ReplicaDetails {
+            let patch = ReplicaPatch {
+                state: Some(ReplicaState::Draining),
+                message: Some(reason.message().into()),
+                end_state: Some(reason.end_state().into()),
+                end_reason: Some(reason.message().into()),
                 state_detail: Some(reason.detail().to_string()),
                 ..Default::default()
             };
-            obleth
-                .patch_replica_with_details(
-                    *replica_id,
-                    Some("draining"),
-                    None,
-                    None,
-                    Some(reason.message()),
-                    &details,
-                )
-                .await?;
+            obleth.patch_replica(*replica_id, &patch).await?;
             return Ok(cancel_problem);
         }
         Action::CancelJob { replica_id, job_id } => {
             slurm.cancel(job_id).await?;
             // Recording it restarts the grace clock, so a job that lingers
             // (COMPLETING) is asked again only after another grace period.
-            obleth
-                .patch_replica(*replica_id, None, None, None, Some("cancelled"))
-                .await?;
+            let patch = ReplicaPatch {
+                message: Some("cancelled".into()),
+                ..Default::default()
+            };
+            obleth.patch_replica(*replica_id, &patch).await?;
         }
         Action::Delete { replica_id } => {
             obleth.delete_replica(*replica_id).await?;
@@ -248,12 +228,12 @@ pub async fn apply(
             detail,
             job_ends_at,
         } => {
-            let details = ReplicaDetails {
+            let patch = ReplicaPatch {
                 state_detail: detail.clone(),
                 job_ends_at: *job_ends_at,
                 ..Default::default()
             };
-            obleth.patch_replica_details(*replica_id, &details).await?;
+            obleth.patch_replica(*replica_id, &patch).await?;
         }
     }
     Ok(None)
@@ -517,14 +497,14 @@ mod tests {
             eps[0].2, "http://10.9.9.9:8000/v1",
             "endpoint registered by resolved IP, not hostname"
         );
-        let patched = obleth.patched.lock().unwrap();
+        let patched = obleth.state_changes();
         assert!(patched
             .iter()
-            .any(|p| p.0 == rid && p.1.as_deref() == Some("healthy")));
+            .any(|p| p.0 == rid && p.1 == ReplicaState::Healthy));
         // The run it was promoted under and the port are recorded, and any
         // earlier detail is cleared.
-        let details = obleth.details.lock().unwrap();
-        let (_, d) = details.iter().find(|(id, _)| *id == rid).unwrap();
+        let patches = obleth.patches.lock().unwrap();
+        let (_, d) = patches.iter().find(|(id, _)| *id == rid).unwrap();
         assert_eq!(d.port, Some(8000));
         assert_eq!(d.job_started_at.map(|t| t.timestamp()), Some(1_700_000_000));
         assert_eq!(d.state_detail.as_deref(), Some(""));
@@ -566,12 +546,17 @@ mod tests {
         .await
         .unwrap();
         assert!(obleth.deleted_endpoints.lock().unwrap().contains(&ep));
-        let patched = obleth.patched.lock().unwrap();
+        let patched = obleth.state_changes();
         assert!(patched
             .iter()
-            .any(|p| p.0 == rid && p.1.as_deref() == Some("lost")));
+            .any(|p| p.0 == rid && p.1 == ReplicaState::Lost));
         let patches = obleth.patches.lock().unwrap();
-        assert_eq!(patches.last().unwrap().3.as_deref(), Some("job gone"));
+        let p = &patches.last().unwrap().1;
+        assert_eq!(p.message.as_deref(), Some("job gone"));
+        assert_eq!(
+            (p.end_state.as_deref(), p.end_reason.as_deref()),
+            (Some("gone"), None)
+        );
     }
 
     #[tokio::test]
@@ -600,11 +585,16 @@ mod tests {
         .await
         .unwrap();
         let patches = obleth.patches.lock().unwrap();
-        let p = patches.last().unwrap();
-        assert_eq!(p.1.as_deref(), Some("lost"));
+        let p = &patches.last().unwrap().1;
+        assert_eq!(p.state, Some(ReplicaState::Lost));
         assert_eq!(
-            p.3.as_deref(),
+            p.message.as_deref(),
             Some("job ended: OUT_OF_MEMORY (OutOfMemory)")
+        );
+        // The launch history gets the same facts as fields, not by parsing.
+        assert_eq!(
+            (p.end_state.as_deref(), p.end_reason.as_deref()),
+            (Some("OUT_OF_MEMORY"), Some("OutOfMemory"))
         );
     }
 
@@ -638,10 +628,17 @@ mod tests {
         // Endpoint removed from rotation BEFORE the job is cancelled (502 guard).
         assert!(obleth.deleted_endpoints.lock().unwrap().contains(&ep));
         assert!(slurm.cancelled.lock().unwrap().contains(&"j9".to_string()));
-        let patched = obleth.patched.lock().unwrap();
+        let patched = obleth.state_changes();
         assert!(patched
             .iter()
-            .any(|p| p.0 == rid && p.1.as_deref() == Some("draining")));
+            .any(|p| p.0 == rid && p.1 == ReplicaState::Draining));
+        // The launch history's end comes as fields, not from the message.
+        let patches = obleth.patches.lock().unwrap();
+        let p = &patches.last().unwrap().1;
+        assert_eq!(
+            (p.end_state.as_deref(), p.end_reason.as_deref()),
+            (Some("cancelled:scale-down"), Some("scaled down"))
+        );
     }
 
     #[tokio::test]
@@ -761,14 +758,12 @@ mod tests {
         run(&action, &slurm, &obleth).await.unwrap();
         assert_eq!(*obleth.deleted_endpoints.lock().unwrap(), vec![ep]);
         assert!(obleth
-            .patched
-            .lock()
-            .unwrap()
+            .state_changes()
             .iter()
-            .any(|p| p.0 == rid && p.1.as_deref() == Some("pending")));
-        let details = obleth.details.lock().unwrap();
+            .any(|p| p.0 == rid && p.1 == ReplicaState::Pending));
+        let patches = obleth.patches.lock().unwrap();
         assert_eq!(
-            details[0].1.state_detail.as_deref(),
+            patches[0].1.state_detail.as_deref(),
             Some(crate::plan::REQUEUED_DETAIL)
         );
     }
@@ -805,7 +800,7 @@ mod tests {
         for a in &actions {
             assert!(run(a, &slurm, &obleth).await.is_err(), "{a:?}");
         }
-        assert!(obleth.patched.lock().unwrap().is_empty());
+        assert!(obleth.state_changes().is_empty());
         assert!(
             slurm.cancelled.lock().unwrap().is_empty(),
             "no cancel while it takes requests"
@@ -827,11 +822,9 @@ mod tests {
         run(&drain, &slurm, &obleth).await.unwrap();
         assert!(slurm.cancelled.lock().unwrap().is_empty());
         assert!(obleth
-            .patched
-            .lock()
-            .unwrap()
+            .state_changes()
             .iter()
-            .any(|p| p.0 == rid && p.1.as_deref() == Some("draining")));
+            .any(|p| p.0 == rid && p.1 == ReplicaState::Draining));
         let later = Action::CancelJob {
             replica_id: rid,
             job_id: "j7".into(),

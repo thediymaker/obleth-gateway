@@ -72,7 +72,7 @@ export function PortalKeys({
   function handleCreate(formData: FormData) {
     setCreateError(null);
     start(async () => {
-      const result = await createPortalKey(formData);
+      const result = await createPortalKey(String(formData.get("name") ?? ""));
       if (result.ok) {
         setSecret(result.secret);
         setCreateOpen(false);
@@ -91,10 +91,7 @@ export function PortalKeys({
     if (!ok) return;
     setRowErrors((prev) => ({ ...prev, [key.id]: "" }));
     start(async () => {
-      const fd = new FormData();
-      fd.set("id", key.id);
-      fd.set("disabled", "true");
-      const result = await disablePortalKey(fd);
+      const result = await disablePortalKey(key.id);
       if (!result.ok) {
         setRowErrors((prev) => ({ ...prev, [key.id]: result.error }));
       }
@@ -109,9 +106,7 @@ export function PortalKeys({
     if (!ok) return;
     setRowErrors((prev) => ({ ...prev, [key.id]: "" }));
     start(async () => {
-      const fd = new FormData();
-      fd.set("id", key.id);
-      const result = await deletePortalKey(fd);
+      const result = await deletePortalKey(key.id);
       if (!result.ok) {
         setRowErrors((prev) => ({ ...prev, [key.id]: result.error }));
       }

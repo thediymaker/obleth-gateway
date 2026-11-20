@@ -37,8 +37,9 @@ import {
   type SettingsSectionId,
 } from "@/lib/models-model";
 import type { McpServer, ModelEndpoint, ModelHealthDetail, ModelHealthSummary, ModelRoute, UsageLogFacet } from "@/lib/obleth";
-import { poolOccupancy } from "@/lib/overview-model";
+import { poolOccupancy } from "@/lib/occupancy";
 import { cn, getJson } from "@/lib/utils";
+import { ReadNotice } from "@/components/ui/read-state";
 
 type NavId = "overview" | SettingsSectionId | "lifecycle" | "activity";
 
@@ -196,7 +197,7 @@ export function ModelPage({
   const endpoints = endpointsQuery.data ?? [];
   const status = modelStatus(model, summary);
   const runs = runsOn(model, managed);
-  const load = model.enabled ? poolOccupancy(model.model_name, model, fairshare.data, discovery.data) : { inFlight: 0, cap: 0, queued: 0 };
+  const load = poolOccupancy(model.model_name, model, fairshare.data, discovery.data);
   const capacityStatus = discovery.data?.models.find((m) => m.model_id === model.id)?.status;
   const first = awaitingFirstPass(checks);
   const chat = model.model_type === "chat";
@@ -379,7 +380,9 @@ export function ModelPage({
 
         <div className="flex min-w-0 flex-col gap-4">
           <div id="overview" className="scroll-mt-24">
-            <ModelOverview model={model} data={overviewQuery.data} summary={summary} checks={checks} runs={runs} capacity={capacityStatus} load={load} endpoints={endpoints.length} />
+            <ReadNotice query={fairshare} what="the live load" className="mb-2" />
+            <ReadNotice query={detailQuery} what="the health checks" className="mb-2" />
+            <ModelOverview model={model} overview={overviewQuery} summary={summary} checks={checks} runs={runs} capacity={capacityStatus} load={load} endpoints={endpoints.length} />
           </div>
           <ModelSettings
             model={model}

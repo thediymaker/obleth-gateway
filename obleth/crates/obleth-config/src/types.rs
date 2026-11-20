@@ -1222,7 +1222,8 @@ pub struct DeploymentLaunch {
     pub ended_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Slurm's terminal state (`TIMEOUT`, `OUT_OF_MEMORY`, `NODE_FAIL`,
     /// `FAILED`, ...), `gone` when the job vanished from slurmrestd,
-    /// `cancelled:scale-down|restart|probe-failed` when obleth cancelled it,
+    /// `cancelled:scale-down|restart|probe-failed|startup-timeout|stuck|replaced|removed`
+    /// when obleth cancelled it (`cancelled` alone from an older provisioner),
     /// or `deleted` when the replica row was removed while still open.
     pub end_state: Option<String>,
     pub end_reason: Option<String>,
@@ -1235,7 +1236,9 @@ pub struct DeploymentLaunch {
     pub ran_secs: Option<i64>,
 }
 
-/// Valid `ModelReplica::state` values, in lifecycle order.
+/// Valid `ModelReplica::state` values, in lifecycle order. The provisioner
+/// never writes `starting` (it records a start by reporting nodes); the
+/// value stays valid for API clients and older rows.
 pub const REPLICA_STATES: [&str; 5] = ["pending", "starting", "healthy", "draining", "lost"];
 
 /// A registered MCP (Model Context Protocol) server. obleth fronts it with the
@@ -3118,6 +3121,23 @@ pub struct SpeculationBoonSettings {
     /// own endpoint cannot speculate.
     #[serde(default)]
     pub verify_url_template: String,
+    /// Per-call bound on a verifier call (tokenize, score), in milliseconds.
+    /// Before anything is released the pre-release budget also applies; after
+    /// the commit this is what ends a stalled scorer, so the committed stream
+    /// ends instead of going silent.
+    #[serde(default = "default_spec_verify_timeout_ms")]
+    pub verify_timeout_ms: u64,
+    /// Largest verifier reply read, in bytes. A `prompt_logprobs` answer runs
+    /// to a few hundred bytes per prompt token, so a long prompt is megabytes.
+    #[serde(default = "default_spec_verify_reply_max_bytes")]
+    pub verify_reply_max_bytes: usize,
+}
+
+fn default_spec_verify_timeout_ms() -> u64 {
+    30_000
+}
+fn default_spec_verify_reply_max_bytes() -> usize {
+    64 * 1024 * 1024
 }
 
 fn default_spec_unlisted_speculate() -> bool {
@@ -3166,6 +3186,8 @@ impl Default for SpeculationBoonSettings {
             category_gates: Vec::new(),
             unlisted_categories_speculate: default_spec_unlisted_speculate(),
             verify_url_template: String::new(),
+            verify_timeout_ms: default_spec_verify_timeout_ms(),
+            verify_reply_max_bytes: default_spec_verify_reply_max_bytes(),
         }
     }
 }

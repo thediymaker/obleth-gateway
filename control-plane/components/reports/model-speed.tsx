@@ -31,18 +31,11 @@ import {
   type SpeedSort,
 } from "@/lib/speed-model";
 import { cn, getJson } from "@/lib/utils";
+import { readFailed, ReadFailedNote } from "@/components/ui/read-state";
 
 const COLUMNS = "grid grid-cols-[minmax(12rem,250px)_76px_104px_84px_minmax(0,1fr)_20px] gap-x-3.5";
 const CHART_W = 1400;
 const CHART_H = 176;
-
-function zone(): string | undefined {
-  try {
-    return Intl.DateTimeFormat().resolvedOptions().timeZone || undefined;
-  } catch {
-    return undefined;
-  }
-}
 
 function useSpeed(range: DayRange | null, filters: { tenantId: string; keyId: string; model: string }, bucket: "none" | SpeedBucket) {
   return useQuery({
@@ -54,8 +47,7 @@ function useSpeed(range: DayRange | null, filters: { tenantId: string; keyId: st
         until_ms: String(linkTime(range!.end, true)! + 1),
         bucket,
       });
-      const tz = zone();
-      if (tz && bucket !== "none") p.set("tz", tz);
+      // Hours and days are UTC, like the daily rollup the rest of Reports reads (the gateway's default).
       if (filters.tenantId) p.set("tenant_id", filters.tenantId);
       if (filters.keyId) p.set("key_id", filters.keyId);
       if (filters.model) p.set("model", filters.model);
@@ -176,7 +168,9 @@ export function ModelSpeed({ range, previous, filters, against, retentionDays, m
           {previous && <span className={cn(slowed.length > 0 && "font-medium text-foreground")}>{slowed.length ? `${slowed.length} slowed down` : "None slowed down"} by {SLOWDOWN * 100}% or more vs {against}</span>}
         </div>
       )}
-      {now.isLoading || series.isLoading ? (
+      {readFailed(now) || readFailed(series) ? (
+        <div className="px-[18px] pb-4"><ReadFailedNote query={readFailed(now) ? now : series} what="the models' speed" className="flex h-[120px] items-center justify-center" /></div>
+      ) : now.isLoading || series.isLoading ? (
         <div className="px-[18px] pb-4"><div className="skeleton h-[240px] rounded-lg" /></div>
       ) : all.length === 0 ? (
         <div className="px-[18px] pb-4">

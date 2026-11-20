@@ -31,6 +31,7 @@ import { HelpTip } from "@/components/fairshare/help";
 import { RunningHistory } from "@/components/fairshare/history";
 import { TenantPanel } from "@/components/fairshare/tenant-panel";
 import { FAIRSHARE_POLL_MS, useCapacityDiscovery, useFairshareHistory, useFairshareLive, useModelRoutes, useTenantSeries } from "@/components/fairshare/hooks";
+import { ReadNotice } from "@/components/ui/read-state";
 
 export {
   appendHistoryTail,
@@ -122,11 +123,7 @@ export function FairshareDashboard({ tenantNames, initialPool = "all" }: { tenan
             {!scoped && <HowItDecides />}
           </div>
           <StatusLine view={view} raw={raw} pool={poolRow} inPool={inPool} loading={!raw} poolCount={pools.length} />
-          {live.isError && (
-            <p role="alert" className="text-xs text-secondary-foreground">
-              {raw ? `Showing the last snapshot from ${new Date(live.dataUpdatedAt).toLocaleTimeString()}. Refresh failed; retrying automatically.` : "Could not load scheduler state. Retrying automatically."}
-            </p>
-          )}
+          <ReadNotice query={live} what="the scheduler state" />
         </div>
         <div className="flex flex-wrap items-center gap-2">
           {modeBadge && (

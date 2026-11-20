@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AuditEntry, FairshareLiveView, ModelHealthSummary, ModelRoute, TenantFairshareView, UsageModelAgg } from "@/lib/obleth";
-import { EMPTY_OVERVIEW_SUMMARY } from "@/lib/overview-summary";
-import { buildAttention, buildFleet, buildSeries, changeLabel, describeAudit, previousTotals } from "./overview-model";
+import { buildAttention, buildFleet, buildSeries, changeLabel, describeAudit } from "./overview-model";
 
 const HOUR = 3_600_000;
 const model = (name: string, extra: Partial<ModelRoute> = {}) =>
@@ -32,12 +31,6 @@ describe("buildSeries", () => {
 });
 
 describe("window comparisons", () => {
-  it("derives the previous window by subtracting the current one from a two-window read", () => {
-    const current = { ...EMPTY_OVERVIEW_SUMMARY, requests: 120, tokens: 1000, errors: 3, platformErrors: 1, cost: 2 };
-    const both = { ...EMPTY_OVERVIEW_SUMMARY, requests: 220, tokens: 1800, errors: 4, platformErrors: 2, cost: 3.5 };
-    expect(previousTotals(current, both)).toEqual({ requests: 100, tokens: 800, errors: 1, platformErrors: 1, cost: 1.5 });
-  });
-
   it("says which way things moved, and stays quiet with nothing to compare", () => {
     expect(changeLabel(111, 100, "yesterday")).toBe("▲ 11% vs yesterday");
     expect(changeLabel(96, 100, "yesterday")).toBe("▼ 4.0% vs yesterday");

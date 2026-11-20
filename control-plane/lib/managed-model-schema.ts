@@ -29,6 +29,16 @@ export const PORT_WINDOW = 8;
 /** `--mem` per node: an integer with an optional K/M/G/T unit. e.g. `560G`. */
 export const MEM_RE = /^\d+(?:\.\d+)?[KMGT]?B?$/i;
 
+/** `--cpus-per-task`: a whole number, or blank for the cluster default. */
+export const CPUS_RE = /^\d+$/;
+
+// What each placement field takes, said the same way by the launch wizard
+// (lib/deploy-form.ts) and the deployment page (this schema).
+export const GRES_RULE = "Write GPUs as Slurm gres, such as gpu:1, gpu:h100:2 or gpu:1,shard:1.";
+export const CPUS_RULE = "CPUs must be a whole number, or blank for the cluster default.";
+export const MEM_RULE = "Size with an optional unit, e.g. 560G, 32G, or 4096M; 0 asks for all of a node's memory.";
+export const TIME_LIMIT_RULE = "Write the walltime as Slurm does: D-HH:MM:SS, HH:MM:SS, MM:SS, minutes, or UNLIMITED.";
+
 const isBlank = (v: string) => v.trim() === "";
 
 /** A field that may be blank, but if filled must match `re`. */
@@ -56,16 +66,13 @@ export const managedModelFormSchema = z
   .object({
     // Blank means the cluster's default partition.
     slurm_partition: z.string(),
-    slurm_gres: optionalMatch(GRES_RE, "Write GPUs as Slurm gres, such as gpu:1, gpu:h100:2 or gpu:1,shard:1."),
-    slurm_cpus_per_task: optionalInt(0, "CPUs must be a whole number, or blank for the cluster default."),
-    slurm_mem: optionalMatch(MEM_RE, "Size with an optional unit, e.g. 560G, 32G, or 4096M."),
+    slurm_gres: optionalMatch(GRES_RE, GRES_RULE),
+    slurm_cpus_per_task: optionalMatch(CPUS_RE, CPUS_RULE),
+    slurm_mem: optionalMatch(MEM_RE, MEM_RULE),
     slurm_nodes: requiredInt(1, 100_000, "Whole number ≥ 1."),
     slurm_qos: z.string(),
     slurm_account: z.string(),
-    slurm_time_limit: optionalMatch(
-      SLURM_TIME_LIMIT_RE,
-      "Write the walltime as Slurm does: D-HH:MM:SS, HH:MM:SS, MM:SS, minutes, or UNLIMITED.",
-    ),
+    slurm_time_limit: optionalMatch(SLURM_TIME_LIMIT_RE, TIME_LIMIT_RULE),
     slurm_constraints: z.string(),
     slurm_exclude: z.string(),
     slurm_serving_port: requiredInt(1, 65_536 - PORT_WINDOW, `The port must be between 1 and ${65_536 - PORT_WINDOW}, so each replica's ${PORT_WINDOW} ports fit.`),

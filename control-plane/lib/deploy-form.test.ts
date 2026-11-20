@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import type { RecipeDeployPreview } from "@/components/recipes/recipe-card";
 import { baselineForm, changedPaths, formProblems, formToYaml, setField, toOverrides, yamlToForm } from "./deploy-form";
 import { EMPTY_CLUSTER } from "./recipe-inputs";
+import { validateManagedModelForm } from "./managed-model-schema";
+import { parseTimeLimit, walltimeLabel } from "./deployments-model";
 
 const p: RecipeDeployPreview = {
   apiModelName: "nemotron-3-ultra", modelType: "chat", engine: "vllm", port: 8000, healthPath: "/health", targetReplicas: 1, maxJobFailures: 2, partition: "", nodes: 1,
@@ -84,5 +86,36 @@ describe("launch names and model type", () => {
     expect(formProblems(f, preview, resources, []).map((p) => p.path)).toContain("name");
     expect(toOverrides(f).model_type).toBe("embedding");
     expect(baselineForm("vllm", { ...preview, maxJobFailures: undefined as unknown as number }, EMPTY_CLUSTER).serving.stop_after_failed_launches).toBe(2);
+  });
+});
+
+describe("placement rules", () => {
+  const base = baselineForm("nemotron", p, cv);
+  // The deployment page's form, with this one placement field set.
+  const page = (field: string, value: string) => validateManagedModelForm({
+    slurm_partition: "", slurm_gres: "", slurm_cpus_per_task: "", slurm_mem: "", slurm_nodes: "1", slurm_qos: "", slurm_account: "",
+    slurm_time_limit: "", slurm_constraints: "", slurm_exclude: "", slurm_serving_port: "8000", slurm_health_path: "/health",
+    slurm_min_replicas: "1", slurm_target_replicas: "1", slurm_max_job_failures: "2", [`slurm_${field}`]: value,
+  })[`slurm_${field}`];
+  const wizard = (field: string, value: string) => formProblems(setField(base, `slurm.${field}`, value), p, { partitions: [], accounts: [], qos: [] } as unknown as typeof resources, []).find((x) => x.path === `slurm.${field}`)?.message;
+
+  const cases: [string, string, boolean][] = [
+    ["time_limit", "1-00:00:00", true], ["time_limit", "4:00:00", true], ["time_limit", "UNLIMITED", true], ["time_limit", "a day", false],
+    ["mem", "64G", true], ["mem", "0", true], ["mem", "64 GB", false],
+    ["cpus_per_task", "8", true], ["cpus_per_task", "0.5", false],
+    ["gres", "gpu:h100:2", true], ["gres", "gpu:", false],
+    ["partition", "", true],
+  ];
+  for (const [field, value, ok] of cases) {
+    it(`${field} = ${JSON.stringify(value)} is ${ok ? "taken" : "refused"} the same way by the wizard and the page`, () => {
+      expect(wizard(field, value)).toBe(page(field, value));
+      expect(page(field, value) === undefined).toBe(ok);
+    });
+  }
+
+  it("reads UNLIMITED as no limit", () => {
+    expect(parseTimeLimit("UNLIMITED")).toBe(Infinity);
+    expect(parseTimeLimit("infinite")).toBe(Infinity);
+    expect(walltimeLabel(parseTimeLimit("UNLIMITED"))).toBe("no limit");
   });
 });

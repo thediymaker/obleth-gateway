@@ -33,6 +33,16 @@ cargo clippy --workspace --all-targets
 cargo test --workspace
 ```
 
+### Management API update bodies
+
+One rule for every update body: an omitted field keeps its stored value, and
+`null` clears a field that can be empty. In a DTO that means `#[serde(default)]
+Option<T>` for a field that only keeps, and `#[serde(default, deserialize_with =
+"nullable")]` on an `Option<Option<T>>` (with `#[schema(value_type =
+Option<T>)]`) for one that also clears. Never give an update field a default
+value of its own: a client that sends part of a body must not reset the rest.
+The handler reads the stored row and fills in what the body left out.
+
 ### Control plane
 
 The Next.js control plane lives in `control-plane/`.

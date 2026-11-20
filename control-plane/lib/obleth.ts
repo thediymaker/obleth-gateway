@@ -633,8 +633,9 @@ export interface DeploymentLaunch {
   healthy_at: string | null;
   ended_at: string | null;
   // Slurm's terminal state (TIMEOUT, OUT_OF_MEMORY, NODE_FAIL, FAILED, ...),
-  // "gone" when the job vanished from slurmrestd, "cancelled:scale-down" |
-  // "cancelled:restart" | "cancelled:probe-failed" when obleth cancelled it,
+  // "gone" when the job vanished from slurmrestd, "cancelled:<why>" when
+  // obleth cancelled it (scale-down, restart, probe-failed, startup-timeout,
+  // stuck, replaced, removed; plain "cancelled" from an older provisioner),
   // or "deleted" when the replica row was removed while still open.
   end_state: string | null;
   end_reason: string | null;
@@ -957,6 +958,8 @@ export interface UsageDailyRow {
   co2_g: number;
   /** The part of `error_requests` that were the platform's failures, not the caller's. Absent from older gateways. */
   platform_error_requests?: number;
+  /** The requests `avg_ttft_ms` averages over, for weighting several rows. Absent from older gateways. */
+  ttft_requests?: number;
 }
 
 /**
@@ -1503,17 +1506,20 @@ export interface UsageBreakdownEntry {
 /** Narrow a usage aggregate to one tenant or model; the gateway filters before it groups. */
 export interface UsageFilter {
   sinceMs?: number;
+  /** Exclusive end of the window; open-ended when left out. */
+  untilMs?: number;
   tenantId?: string;
   model?: string;
 }
 
 function usageQs(filter: UsageFilter) {
-  return qs({ since_ms: filter.sinceMs, tenant_id: filter.tenantId, model: filter.model });
+  return qs({ since_ms: filter.sinceMs, until_ms: filter.untilMs, tenant_id: filter.tenantId, model: filter.model });
 }
 
 export interface AuditParams {
   limit?: number;
   actor?: string;
+  /** One entity type or several, comma-separated. */
   entityType?: string;
   entityId?: string;
   /** One action or several, comma-separated. */
@@ -1964,6 +1970,10 @@ export interface BoonSettingsView {
   speculation_category_gates: SpeculationCategoryGate[];
   speculation_unlisted_categories_speculate: boolean;
   speculation_verify_url_template: string;
+  /** Per-call bound on a verifier call, in milliseconds. */
+  speculation_verify_timeout_ms: number;
+  /** Largest verifier reply read, in bytes. */
+  speculation_verify_reply_max_bytes: number;
   web_search_enabled: boolean;
   web_search_tool: string | null;
   web_search_tool_description: string;
@@ -2034,6 +2044,8 @@ export interface UpdateBoonSettings {
   speculation_category_gates?: SpeculationCategoryGate[];
   speculation_unlisted_categories_speculate?: boolean;
   speculation_verify_url_template?: string;
+  speculation_verify_timeout_ms?: number;
+  speculation_verify_reply_max_bytes?: number;
   web_search_enabled?: boolean;
   web_search_tool?: string | null;
   web_search_tool_description?: string;
@@ -3213,8 +3225,8 @@ export const obleth = {
       headers: auditActorHeaders(options),
     }),
   stats: () => api<LiveStats>("/stats"),
-  overviewSummary: (sinceMs?: number) =>
-    api<OverviewSummaryView>(`/overview/summary${qs({ since_ms: sinceMs })}`),
+  overviewSummary: (sinceMs?: number, untilMs?: number) =>
+    api<OverviewSummaryView>(`/overview/summary${qs({ since_ms: sinceMs, until_ms: untilMs })}`),
   fairshareLive: () => api<FairshareLiveView>("/fairshare/live"),
   fairshareHistory: (params: { since_ms?: number; model?: string } = {}) =>
     api<FairshareHistoryView>(
@@ -3250,13 +3262,6 @@ export const obleth = {
     ),
   /** Daily counters the proxy keeps: MCP calls per server, knowledge searches per collection. */
   dailyStats: (kind: "mcp" | "knowledge", days = 7) => api<DailyStatsView>(`/stats/daily${qs({ kind, days })}`),
-  getCapacity: () => api<{ max_in_flight: number }>("/capacity"),
-  setCapacity: (max_in_flight: number, options?: AuditOptions) =>
-    api<{ max_in_flight: number }>("/capacity", {
-      method: "PUT",
-      headers: auditActorHeaders(options),
-      body: JSON.stringify({ max_in_flight }),
-    }),
   getAlertSettings: reactCache(() => api<AlertSettingsView>("/settings/alerts")),
   setAlertSettings: (body: UpdateAlertSettings, options?: AuditOptions) =>
     api<AlertSettingsView>("/settings/alerts", {

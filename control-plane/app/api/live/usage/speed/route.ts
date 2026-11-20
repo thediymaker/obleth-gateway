@@ -1,25 +1,17 @@
-import { NextRequest, NextResponse } from "next/server";
-import { obleth } from "@/lib/obleth";
-import type { UsageSpeedParams } from "@/lib/obleth";
-import { guardAdmin } from "@/lib/auth/guard";
+import { obleth, type UsageSpeedParams } from "@/lib/obleth";
+import { liveRoute } from "@/lib/auth/guard";
+import { numParam, strParam } from "@/lib/log-params";
 
-export async function GET(req: NextRequest) {
-  const denied = await guardAdmin();
-  if (denied) return denied;
-  try {
-    const p = req.nextUrl.searchParams;
-    const untilMs = Number(p.get("until_ms") ?? Date.now());
-    const rows = await obleth.usageSpeed({
-      sinceMs: Number(p.get("since_ms") ?? untilMs - 86_400_000),
-      untilMs,
-      bucket: (p.get("bucket") as UsageSpeedParams["bucket"] | null) ?? undefined,
-      tz: p.get("tz") ?? undefined,
-      tenantId: p.get("tenant_id") ?? undefined,
-      keyId: p.get("key_id") ?? undefined,
-      model: p.get("model") ?? undefined,
-    });
-    return NextResponse.json(rows);
-  } catch (e) {
-    return NextResponse.json({ error: String(e) }, { status: 502 });
-  }
-}
+export const GET = liveRoute((req) => {
+  const p = req.nextUrl.searchParams;
+  const untilMs = numParam(p, "until_ms", Date.now());
+  return obleth.usageSpeed({
+    sinceMs: numParam(p, "since_ms", untilMs - 86_400_000),
+    untilMs,
+    bucket: strParam(p, "bucket") as UsageSpeedParams["bucket"] | undefined,
+    tz: strParam(p, "tz"),
+    tenantId: strParam(p, "tenant_id"),
+    keyId: strParam(p, "key_id"),
+    model: strParam(p, "model"),
+  });
+});

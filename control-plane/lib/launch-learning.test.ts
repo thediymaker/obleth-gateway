@@ -33,6 +33,11 @@ describe("learning from past launches", () => {
     expect(l.suggestions.find((x) => x.path === "slurm.exclude")).toMatchObject({ value: "gh-17", title: "Avoid gh-17", evidence: "2 of 3 launches on gh-17 failed; on other nodes, 0 of 1." });
   });
 
+  it("counts launches obleth cancelled for never becoming healthy as failures on their node", () => {
+    const l = learnFrom([run({ nodes: "gh-9", healthy_at: null, end_state: "cancelled:startup-timeout" }), run({ nodes: "gh-9", healthy_at: null, end_state: "cancelled:stuck" }), run({ nodes: "gh-9", end_state: "cancelled:scale-down" }), run({ nodes: "gh-2", end_state: "COMPLETED" })], form, { now });
+    expect(l.suggestions.find((x) => x.path === "slurm.exclude")).toMatchObject({ value: "gh-9", evidence: "2 of 3 launches on gh-9 failed; on other nodes, 0 of 1." });
+  });
+
   it("suggests more nodes after running out of memory", () => {
     const l = learnFrom([run({ end_state: "OUT_OF_MEMORY", healthy_at: null }), run({ nodes_requested: 4, end_state: "TIMEOUT" })], form, { now });
     expect(l.suggestions.find((x) => x.path === "slurm.nodes")).toMatchObject({ value: 4, title: "Run on 4 nodes" });

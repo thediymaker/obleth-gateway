@@ -625,9 +625,10 @@ async fn dispatch(
     if let Some(api_key) = &target.api_key {
         req = req.bearer_auth(api_key);
     }
-    let resp = tokio::time::timeout(timeout, req.send())
-        .await
-        .map_err(|_| anyhow::anyhow!("tool stream dispatch timed out"))??;
+    let resp = super::with_timeout("tool stream dispatch", timeout, async {
+        Ok(req.send().await?)
+    })
+    .await?;
     if !resp.status().is_success() {
         anyhow::bail!("upstream returned {}", resp.status());
     }

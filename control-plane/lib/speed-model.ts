@@ -103,13 +103,13 @@ export function speedBucket(range: DayRange): SpeedBucket {
   return daysBetween(range) <= 2 ? "hour" : "day";
 }
 
-/** The start of every hour or day in the range, in the reader's time, as epoch millis. */
+/** The start of every UTC hour or day in the range, as epoch millis. */
 export function bucketStarts(range: DayRange, bucket: SpeedBucket, now = Date.now()): number[] {
   const days = eachDay(range).map((d) => linkTime(d, false)!);
   if (bucket === "day") return days;
   const out: number[] = [];
   const end = Math.min(linkTime(range.end, true)!, now);
-  for (const d = new Date(days[0]); d.getTime() <= end && out.length < 24 * 3; d.setHours(d.getHours() + 1)) out.push(d.getTime());
+  for (const d = new Date(days[0]); d.getTime() <= end && out.length < 24 * 3; d.setUTCHours(d.getUTCHours() + 1)) out.push(d.getTime());
   return out;
 }
 
@@ -128,8 +128,8 @@ export const SHADE_STEPS = [1, 0.85, 0.73, 0.62, 0.5].map(shade);
 export function bucketLabel(t: number, bucket: SpeedBucket): string {
   const d = new Date(t);
   return bucket === "day"
-    ? d.toLocaleDateString([], { month: "short", day: "numeric" })
-    : d.toLocaleString([], { month: "short", day: "numeric", hour: "numeric" });
+    ? d.toLocaleDateString([], { month: "short", day: "numeric", timeZone: "UTC" })
+    : `${d.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", timeZone: "UTC" })} UTC`;
 }
 
 /** The header's label over each square: a full date where a month or day starts, else just the day or hour. */
@@ -138,8 +138,9 @@ export function columnLabels(starts: number[], bucket: SpeedBucket): string[] {
   return starts.map((t, i) => {
     if (i % every) return "";
     const d = new Date(t);
-    if (bucket === "day") return i === 0 || d.getDate() === 1 ? d.toLocaleDateString([], { month: "short", day: "numeric" }) : String(d.getDate());
-    return i === 0 || d.getHours() === 0 ? d.toLocaleDateString([], { month: "short", day: "numeric" }) : d.toLocaleTimeString([], { hour: "numeric" });
+    const date = () => d.toLocaleDateString([], { month: "short", day: "numeric", timeZone: "UTC" });
+    if (bucket === "day") return i === 0 || d.getUTCDate() === 1 ? date() : String(d.getUTCDate());
+    return i === 0 || d.getUTCHours() === 0 ? date() : d.toLocaleTimeString([], { hour: "numeric", timeZone: "UTC" });
   });
 }
 

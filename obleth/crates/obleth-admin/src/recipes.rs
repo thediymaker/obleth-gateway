@@ -1,7 +1,7 @@
 //! CRUD for admin-authored recipe templates (raw recipe documents).
 
 use axum::extract::{Path, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -45,7 +45,7 @@ fn audit_detail(r: &RecipeView) -> serde_json::Value {
     })
 }
 
-#[utoipa::path(get, path = "/api/v1/recipes", responses((status = 200, body = [RecipeView])))]
+#[utoipa::path(get, path = "/api/v1/recipes", tag = "recipes", responses((status = 200, body = [RecipeView])))]
 pub async fn list_recipes(State(state): State<AdminState>) -> Result<Json<Vec<RecipeView>>> {
     Ok(Json(
         state
@@ -58,7 +58,7 @@ pub async fn list_recipes(State(state): State<AdminState>) -> Result<Json<Vec<Re
     ))
 }
 
-#[utoipa::path(post, path = "/api/v1/recipes", request_body = UpsertRecipeBody,
+#[utoipa::path(post, path = "/api/v1/recipes", tag = "recipes", request_body = UpsertRecipeBody,
     responses((status = 200, body = RecipeView)))]
 pub async fn create_recipe(
     State(state): State<AdminState>,
@@ -71,8 +71,7 @@ pub async fn create_recipe(
     let r = view(
         state
             .store
-            .upsert_recipe(obleth_store::UpsertRecipe {
-                id: None,
+            .create_recipe(obleth_store::NewRecipe {
                 name: b.name,
                 body: b.body,
                 author: b.author,
@@ -92,8 +91,10 @@ pub async fn create_recipe(
     Ok(Json(r))
 }
 
-#[utoipa::path(put, path = "/api/v1/recipes/{id}", request_body = UpsertRecipeBody,
-    responses((status = 200, body = RecipeView)))]
+/// Changes a recipe that exists; a missing id is 404, never created (POST creates).
+#[utoipa::path(put, path = "/api/v1/recipes/{id}", tag = "recipes", request_body = UpsertRecipeBody,
+    params(("id" = Uuid, Path, description = "Recipe id")),
+    responses((status = 200, body = RecipeView), (status = 404)))]
 pub async fn update_recipe(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
@@ -106,12 +107,14 @@ pub async fn update_recipe(
     let r = view(
         state
             .store
-            .upsert_recipe(obleth_store::UpsertRecipe {
-                id: Some(id),
-                name: b.name,
-                body: b.body,
-                author: b.author,
-            })
+            .update_recipe(
+                id,
+                obleth_store::NewRecipe {
+                    name: b.name,
+                    body: b.body,
+                    author: b.author,
+                },
+            )
             .await?,
     );
     state
@@ -127,12 +130,14 @@ pub async fn update_recipe(
     Ok(Json(r))
 }
 
-#[utoipa::path(delete, path = "/api/v1/recipes/{id}", responses((status = 200)))]
+#[utoipa::path(delete, path = "/api/v1/recipes/{id}", tag = "recipes",
+    params(("id" = Uuid, Path, description = "Recipe id")),
+    responses((status = 204), (status = 404)))]
 pub async fn delete_recipe(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
-) -> Result<Json<serde_json::Value>> {
+) -> Result<StatusCode> {
     state.store.delete_recipe(id).await?;
     state
         .store
@@ -144,5 +149,5 @@ pub async fn delete_recipe(
             serde_json::json!({}),
         )
         .await?;
-    Ok(Json(serde_json::json!({"deleted": true})))
+    Ok(StatusCode::NO_CONTENT)
 }

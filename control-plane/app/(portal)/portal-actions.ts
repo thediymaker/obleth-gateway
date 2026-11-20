@@ -5,8 +5,8 @@ import { z } from "zod";
 import { requireUser } from "@/lib/auth/roles";
 import type { SessionUser } from "@/lib/auth/session";
 import { obleth } from "@/lib/obleth";
+import { actionError, type ActionResult } from "@/lib/action-result";
 
-export type PortalResult = { ok: true } | { ok: false; error: string };
 export type CreatePortalKeyResult =
   | { ok: true; secret: string }
   | { ok: false; error: string };
@@ -26,12 +26,9 @@ async function requireTenantUser(): Promise<SessionUser & { tenantId: string }> 
   return user as SessionUser & { tenantId: string };
 }
 
-export async function createPortalKey(
-  formData: FormData,
-): Promise<CreatePortalKeyResult> {
+export async function createPortalKey(name: string): Promise<CreatePortalKeyResult> {
   const user = await requireTenantUser();
-  const rawName = String(formData.get("name") ?? "").trim();
-  const parsed = z.string().min(1, "Key name is required").safeParse(rawName);
+  const parsed = z.string().trim().min(1, "Key name is required").safeParse(name);
   if (!parsed.success) {
     return { ok: false, error: parsed.error.issues[0]?.message ?? "Invalid name" };
   }
@@ -44,38 +41,31 @@ export async function createPortalKey(
     revalidatePath("/portal/keys");
     return { ok: true, secret: created.secret };
   } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : "Unexpected error" };
+    return actionError(e);
   }
 }
 
-export async function disablePortalKey(
-  formData: FormData,
-): Promise<PortalResult> {
+/**
+ * Turn one of the tenant's keys off. There is no portal action to turn one
+ * back on: that would let a tenant undo an administrator's revocation.
+ */
+export async function disablePortalKey(id: string): Promise<ActionResult> {
   const user = await requireTenantUser();
-  const id = String(formData.get("id") ?? "");
   if (!id) return { ok: false, error: "Missing key id" };
   if (!(await assertOwnedKey(user.tenantId, id))) {
     return { ok: false, error: "Key not found" };
-  }
-  // Disable-only: re-enabling would let a tenant undo an administrator's
-  // revocation, so that stays an admin decision.
-  if (String(formData.get("disabled")) !== "true") {
-    return { ok: false, error: "Contact an administrator to re-enable a key" };
   }
   try {
     await obleth.setKeyDisabled(id, true, { auditActor: user.email });
     revalidatePath("/portal/keys");
     return { ok: true };
   } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : "Unexpected error" };
+    return actionError(e);
   }
 }
 
-export async function deletePortalKey(
-  formData: FormData,
-): Promise<PortalResult> {
+export async function deletePortalKey(id: string): Promise<ActionResult> {
   const user = await requireTenantUser();
-  const id = String(formData.get("id") ?? "");
   if (!id) return { ok: false, error: "Missing key id" };
   if (!(await assertOwnedKey(user.tenantId, id))) {
     return { ok: false, error: "Key not found" };
@@ -85,6 +75,6 @@ export async function deletePortalKey(
     revalidatePath("/portal/keys");
     return { ok: true };
   } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : "Unexpected error" };
+    return actionError(e);
   }
 }

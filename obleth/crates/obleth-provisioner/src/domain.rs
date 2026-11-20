@@ -101,13 +101,58 @@ pub struct JobSubmit {
     pub script: String,
 }
 
+/// A replica row's state, as the provisioner reads and writes it. The
+/// gateway also accepts `starting`, which the provisioner never writes; such
+/// a row is read as `Pending`, a job that has not served yet.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReplicaState {
+    /// Submitted, queued or starting: not serving yet.
+    #[default]
+    Pending,
+    /// Promoted: registered as an endpoint and serving.
+    Healthy,
+    /// Out of rotation and being cancelled.
+    Draining,
+    /// The job ended or vanished.
+    Lost,
+}
+
+impl ReplicaState {
+    /// The state a gateway row names; `None` for a value the gateway does
+    /// not write.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "pending" | "starting" => Some(ReplicaState::Pending),
+            "healthy" => Some(ReplicaState::Healthy),
+            "draining" => Some(ReplicaState::Draining),
+            "lost" => Some(ReplicaState::Lost),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReplicaState::Pending => "pending",
+            ReplicaState::Healthy => "healthy",
+            ReplicaState::Draining => "draining",
+            ReplicaState::Lost => "lost",
+        }
+    }
+
+    /// Serving or on its way to serving: neither draining nor lost.
+    pub fn is_live(self) -> bool {
+        matches!(self, ReplicaState::Pending | ReplicaState::Healthy)
+    }
+}
+
 /// Minimal projection of a `ModelReplica` the planner reasons over.
 #[derive(Debug, Clone, Default)]
 pub struct ReplicaView {
     pub id: Uuid,
     pub model_id: Uuid,
     pub slurm_job_id: String,
-    pub state: String, // pending|starting|healthy|draining|lost
+    pub state: ReplicaState,
     pub endpoint_id: Option<Uuid>,
     pub age_secs: i64, // now - created_at, for cancel ordering
     /// now - updated_at. For a `lost` row this is how long ago it was lost
@@ -142,7 +187,7 @@ pub struct ReplicaView {
 impl ReplicaView {
     /// True once the replica has been promoted at least once: it served.
     pub fn has_served(&self) -> bool {
-        self.state == "healthy" || self.job_started_at.is_some() || self.port.is_some()
+        self.state == ReplicaState::Healthy || self.job_started_at.is_some() || self.port.is_some()
     }
 }
 
@@ -324,17 +369,32 @@ impl Action {
     }
 }
 
-/// The replica message recorded with a `lost` state: `job ended: <STATE>`,
-/// plus ` (<reason>)` when Slurm gave one, while the job is still visible in
-/// slurmrestd; `job gone` once it is not. The store parses this into the
-/// launch history's `end_state`/`end_reason`, so keep the two in step.
-pub fn lost_message(raw_state: Option<&str>, reason: Option<&str>) -> String {
+/// How a job ended, as the launch history records it: Slurm's terminal
+/// state and reason while the job is still visible in slurmrestd, `gone`
+/// once it is not.
+pub fn lost_end(raw_state: Option<&str>, reason: Option<&str>) -> (String, Option<String>) {
     match raw_state.map(str::trim).filter(|s| !s.is_empty()) {
-        None => "job gone".to_string(),
-        Some(state) => match reason.map(str::trim).filter(|r| !r.is_empty()) {
-            Some(r) => format!("job ended: {state} ({r})"),
-            None => format!("job ended: {state}"),
-        },
+        None => ("gone".to_string(), None),
+        Some(state) => (
+            state.to_string(),
+            reason
+                .map(str::trim)
+                .filter(|r| !r.is_empty())
+                .map(str::to_string),
+        ),
+    }
+}
+
+/// The replica message recorded with a `lost` state: `job ended: <STATE>`,
+/// plus ` (<reason>)` when Slurm gave one, or `job gone`. The launch history
+/// takes the same facts from [`lost_end`], sent as their own fields.
+pub fn lost_message(raw_state: Option<&str>, reason: Option<&str>) -> String {
+    if raw_state.is_none_or(|s| s.trim().is_empty()) {
+        return "job gone".to_string();
+    }
+    match lost_end(raw_state, reason) {
+        (state, Some(r)) => format!("job ended: {state} ({r})"),
+        (state, None) => format!("job ended: {state}"),
     }
 }
 
@@ -402,8 +462,85 @@ impl CancelReason {
         }
     }
 
+    /// The launch history's end state for a job obleth cancelled.
+    pub fn end_state(self) -> &'static str {
+        match self {
+            CancelReason::ScaleDown => "cancelled:scale-down",
+            CancelReason::OperatorRestart => "cancelled:restart",
+            CancelReason::ProbeFailed => "cancelled:probe-failed",
+            CancelReason::StartupTimeout => "cancelled:startup-timeout",
+            CancelReason::Stuck => "cancelled:stuck",
+            CancelReason::Replaced => "cancelled:replaced",
+            CancelReason::Removed => "cancelled:removed",
+        }
+    }
+
     /// True when the cancelled job counts as a failed launch.
     pub fn is_failed_launch(self) -> bool {
         matches!(self, CancelReason::StartupTimeout | CancelReason::Stuck)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const REASONS: [CancelReason; 7] = [
+        CancelReason::ScaleDown,
+        CancelReason::OperatorRestart,
+        CancelReason::ProbeFailed,
+        CancelReason::StartupTimeout,
+        CancelReason::Stuck,
+        CancelReason::Replaced,
+        CancelReason::Removed,
+    ];
+
+    #[test]
+    fn every_cancel_reason_has_its_own_end_state() {
+        let ends: std::collections::HashSet<&str> = REASONS.iter().map(|r| r.end_state()).collect();
+        assert_eq!(ends.len(), REASONS.len(), "{ends:?}");
+        assert!(ends.iter().all(|e| e.starts_with("cancelled:")));
+        assert_eq!(
+            CancelReason::StartupTimeout.end_state(),
+            "cancelled:startup-timeout"
+        );
+        assert_eq!(CancelReason::Stuck.end_state(), "cancelled:stuck");
+        assert_eq!(CancelReason::Replaced.end_state(), "cancelled:replaced");
+        assert_eq!(CancelReason::Removed.end_state(), "cancelled:removed");
+    }
+
+    #[test]
+    fn a_lost_job_ends_with_slurms_state_or_gone() {
+        assert_eq!(lost_end(None, Some("x")), ("gone".into(), None));
+        assert_eq!(lost_end(Some(" "), None), ("gone".into(), None));
+        assert_eq!(
+            lost_end(Some("TIMEOUT"), Some(" TimeLimit ")),
+            ("TIMEOUT".into(), Some("TimeLimit".into()))
+        );
+        assert_eq!(lost_message(None, None), "job gone");
+        assert_eq!(
+            lost_message(Some("NODE_FAIL"), Some("")),
+            "job ended: NODE_FAIL"
+        );
+        assert_eq!(
+            lost_message(Some("TIMEOUT"), Some("TimeLimit")),
+            "job ended: TIMEOUT (TimeLimit)"
+        );
+    }
+
+    #[test]
+    fn replica_states_parse_and_starting_reads_as_pending() {
+        for s in [
+            ReplicaState::Pending,
+            ReplicaState::Healthy,
+            ReplicaState::Draining,
+            ReplicaState::Lost,
+        ] {
+            assert_eq!(ReplicaState::parse(s.as_str()), Some(s));
+        }
+        assert_eq!(ReplicaState::parse("starting"), Some(ReplicaState::Pending));
+        assert_eq!(ReplicaState::parse("healthy "), None);
+        assert!(ReplicaState::Pending.is_live() && ReplicaState::Healthy.is_live());
+        assert!(!ReplicaState::Draining.is_live() && !ReplicaState::Lost.is_live());
     }
 }

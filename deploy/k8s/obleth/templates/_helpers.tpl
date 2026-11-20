@@ -161,6 +161,9 @@ a runaway allocation fails inside ClickHouse before the kernel kills the pod.
         <level>{{ .Values.clickhouse.logLevel | default "information" }}</level>
     </logger>
     <max_server_memory_usage_to_ram_ratio>{{ $ratio }}</max_server_memory_usage_to_ram_ratio>
+    <mark_cache_size>268435456</mark_cache_size>
+    <index_mark_cache_size>67108864</index_mark_cache_size>
+    <uncompressed_cache_size>0</uncompressed_cache_size>
 {{- range list "query_log" "query_thread_log" "query_views_log" "part_log" "trace_log" "text_log" "metric_log" "error_log" "asynchronous_metric_log" "processors_profile_log" "backup_log" }}
 {{- if and (eq . "metric_log") (not $.Values.clickhouse.metricLog) }}
     <metric_log remove="remove"/>

@@ -67,6 +67,7 @@ pub use alerts::AlertDispatcher;
 pub use error::AdminError;
 pub use model_health::{AlertSink, ModelHealthRuntime};
 pub use openapi::ApiDoc;
+pub use usage::READ_MAX_EXECUTION_SECS;
 
 type Result<T> = std::result::Result<T, AdminError>;
 const AUDIT_ACTOR_HEADER: &str = "x-obleth-audit-actor";
@@ -81,9 +82,12 @@ pub(crate) fn audit_actor(headers: &HeaderMap) -> String {
         .unwrap_or_else(|| "admin".to_string())
 }
 
-/// Serde helper for a patch field that tells "absent" (keep) from `null`
-/// (clear): use with `#[serde(default, deserialize_with = "nullable")]` on an
-/// `Option<Option<T>>`.
+/// Update bodies follow one rule: an omitted field keeps its stored value,
+/// and `null` clears a field that can be empty. A plain `Option<T>` with
+/// `#[serde(default)]` gives the first half; this helper gives both halves
+/// on an `Option<Option<T>>` with `#[serde(default, deserialize_with =
+/// "nullable")]` (and `#[schema(value_type = Option<T>)]`). An update body
+/// never fills an omitted field with a default of its own.
 fn nullable<'de, D, T>(d: D) -> std::result::Result<Option<Option<T>>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -692,40 +696,50 @@ pub struct CreateKey {
     pub allowed_countries: Vec<String>,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+/// Body of `PUT /api/v1/keys/{id}`. An omitted field keeps its stored value;
+/// `null` clears a cap, a budget or an allowlist.
+#[derive(Debug, Default, Deserialize, ToSchema)]
 pub struct UpdateKey {
-    pub name: String,
     #[serde(default)]
-    pub description: String,
+    pub name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
     /// Cumulative token ceiling for the current key term. `null` clears the cap.
-    #[serde(default)]
-    pub budget_tokens: Option<i64>,
+    #[serde(default, deserialize_with = "nullable")]
+    #[schema(value_type = Option<i64>)]
+    pub budget_tokens: Option<Option<i64>>,
     /// Cumulative USD-cost ceiling for the current key term. `null` clears the cap.
-    #[serde(default)]
-    pub budget_cost_usd: Option<f64>,
+    #[serde(default, deserialize_with = "nullable")]
+    #[schema(value_type = Option<f64>)]
+    pub budget_cost_usd: Option<Option<f64>>,
     /// Reset period: `lifetime`, `monthly`, or `term`. `null` = lifetime.
-    #[serde(default)]
-    pub budget_period: Option<String>,
+    #[serde(default, deserialize_with = "nullable")]
+    #[schema(value_type = Option<String>)]
+    pub budget_period: Option<Option<String>>,
     /// When the current key term began.
+    #[serde(default, deserialize_with = "nullable")]
+    #[schema(value_type = Option<chrono::DateTime<chrono::Utc>>)]
+    pub budget_started_at: Option<Option<chrono::DateTime<chrono::Utc>>>,
+    /// Fairshare weight among the tenant's keys, at least 1.
     #[serde(default)]
-    pub budget_started_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// Fairshare weight among the tenant's keys. Default 100, minimum 1.
-    #[serde(default = "obleth_config::default_key_weight")]
-    pub weight: i64,
+    pub weight: Option<i64>,
     /// Per-model in-flight ceiling for this key. `null` clears the cap.
-    #[serde(default)]
-    pub max_in_flight: Option<i64>,
+    #[serde(default, deserialize_with = "nullable")]
+    #[schema(value_type = Option<i64>)]
+    pub max_in_flight: Option<Option<i64>>,
     /// Networks the key may be used from (see `CreateKey::allowed_networks`).
-    /// Unlike the fields above, leaving it out (or sending `null`) keeps the
-    /// key's current list, so an edit that does not mention it never opens a
-    /// limited key to every network. Send `[]` to allow any network again.
-    #[serde(default)]
-    pub allowed_networks: Option<Vec<String>>,
+    /// Left out, the key keeps its list, so an edit that does not mention it
+    /// never opens a limited key to every network; `[]` or `null` allows any
+    /// network again.
+    #[serde(default, deserialize_with = "nullable")]
+    #[schema(value_type = Option<Vec<String>>)]
+    pub allowed_networks: Option<Option<Vec<String>>>,
     /// Countries the key may be used from (see
-    /// `CreateKey::allowed_countries`). Leaving it out (or sending `null`)
-    /// keeps the key's current list; send `[]` to clear it.
-    #[serde(default)]
-    pub allowed_countries: Option<Vec<String>>,
+    /// `CreateKey::allowed_countries`). Left out, the key keeps its list;
+    /// `[]` or `null` clears it.
+    #[serde(default, deserialize_with = "nullable")]
+    #[schema(value_type = Option<Vec<String>>)]
+    pub allowed_countries: Option<Option<Vec<String>>>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1250,7 +1264,10 @@ pub struct UpdateModel {
     pub cost_per_video: Option<f64>,
     pub context_window: Option<i64>,
     pub admission_weight: Option<i64>,
-    pub max_in_flight: Option<i64>,
+    /// The model-wide in-flight cap; `null` lifts it.
+    #[serde(default, deserialize_with = "nullable")]
+    #[schema(value_type = Option<i64>)]
+    pub max_in_flight: Option<Option<i64>>,
     /// `static`, `tuned` or `discovered`; omitted leaves it unchanged.
     #[serde(default)]
     pub capacity_mode: Option<String>,
@@ -1328,28 +1345,23 @@ pub struct SetModelCache {
     pub cache_ttl_secs: Option<i64>,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+/// Body of `PUT /api/v1/models/{id}/reliability`. An omitted field keeps
+/// its stored value.
+#[derive(Debug, Default, Deserialize, ToSchema)]
 pub struct SetModelReliability {
     /// Per-request upstream timeout in seconds. `null` defers to the global
     /// default.
+    #[serde(default, deserialize_with = "nullable")]
+    #[schema(value_type = Option<i64>)]
+    pub request_timeout_secs: Option<Option<i64>>,
     #[serde(default)]
-    pub request_timeout_secs: Option<i64>,
+    pub max_retries: Option<i64>,
     #[serde(default)]
-    pub max_retries: i64,
-    #[serde(default = "default_retry_backoff_ms_dto")]
-    pub retry_backoff_ms: i64,
-    #[serde(default = "default_selection_mode_dto")]
-    pub endpoint_selection_mode: String,
+    pub retry_backoff_ms: Option<i64>,
     #[serde(default)]
-    pub debug_diagnostics: bool,
-}
-
-fn default_retry_backoff_ms_dto() -> i64 {
-    obleth_config::DEFAULT_RETRY_BACKOFF_MS
-}
-
-fn default_selection_mode_dto() -> String {
-    obleth_config::DEFAULT_ENDPOINT_SELECTION_MODE.to_string()
+    pub endpoint_selection_mode: Option<String>,
+    #[serde(default)]
+    pub debug_diagnostics: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1371,20 +1383,25 @@ pub struct CreateModelEndpoint {
     pub max_in_flight: Option<i64>,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+/// Body of `PUT /api/v1/models/{id}/endpoints/{endpoint_id}`. An omitted
+/// field keeps its stored value; `null` clears the key or the cap.
+#[derive(Debug, Default, Deserialize, ToSchema)]
 pub struct UpdateModelEndpoint {
-    pub name: String,
-    pub api_base: String,
-    /// Omit to keep the stored key; empty string clears it.
     #[serde(default)]
-    pub api_key: Option<String>,
-    #[serde(default = "default_endpoint_priority")]
-    pub priority: i64,
-    #[serde(default = "default_endpoint_weight")]
-    pub weight: i64,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// Omitted keeps the stored value; `null` clears it.
+    pub name: Option<String>,
+    #[serde(default)]
+    pub api_base: Option<String>,
+    /// Write-only. `null` or an empty string clears the stored key.
+    #[serde(default, deserialize_with = "nullable")]
+    #[schema(value_type = Option<String>)]
+    pub api_key: Option<Option<String>>,
+    #[serde(default)]
+    pub priority: Option<i64>,
+    #[serde(default)]
+    pub weight: Option<i64>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// `null` lifts the endpoint's own cap.
     #[serde(default, deserialize_with = "nullable")]
     #[schema(value_type = Option<i64>)]
     pub max_in_flight: Option<Option<i64>>,
@@ -1661,6 +1678,13 @@ pub(crate) struct PatchReplica {
     /// Set or clear the surge-first replacement flag.
     #[serde(default)]
     replace_requested: Option<bool>,
+    /// How the job ended, for the launch history, sent with a `lost` or
+    /// `draining` state: Slurm's terminal state, `gone`, or
+    /// `cancelled:<why>`. Without it the end is read from `message`.
+    #[serde(default)]
+    end_state: Option<String>,
+    #[serde(default)]
+    end_reason: Option<String>,
 }
 
 impl PatchReplica {
@@ -1845,6 +1869,7 @@ pub struct AuditQuery {
     pub limit: Option<i64>,
     /// Exact actor (an email, `admin`, …).
     pub actor: Option<String>,
+    /// One entity type or several, comma-separated.
     pub entity_type: Option<String>,
     pub entity_id: Option<String>,
     /// One action or several, comma-separated.
@@ -1925,7 +1950,7 @@ async fn create_tenant(
         .store
         .create_tenant(
             &body.name,
-            body.weight.unwrap_or(100),
+            validate_weight(body.weight.unwrap_or(100))?,
             body.tokens_per_minute.unwrap_or(0),
             body.max_in_flight,
             body.fairshare_group.as_deref(),
@@ -3567,6 +3592,10 @@ pub struct BoonSettingsView {
     pub speculation_category_gates: serde_json::Value,
     pub speculation_unlisted_categories_speculate: bool,
     pub speculation_verify_url_template: String,
+    /// Per-call bound on a verifier call, in milliseconds.
+    pub speculation_verify_timeout_ms: u64,
+    /// Largest verifier reply read, in bytes.
+    pub speculation_verify_reply_max_bytes: usize,
     pub web_search_enabled: bool,
     pub web_search_tool: Option<String>,
     pub web_search_tool_description: String,
@@ -3631,6 +3660,8 @@ impl BoonSettingsView {
                 .unwrap_or_else(|_| serde_json::Value::Array(Vec::new())),
             speculation_unlisted_categories_speculate: s.speculation.unlisted_categories_speculate,
             speculation_verify_url_template: s.speculation.verify_url_template.clone(),
+            speculation_verify_timeout_ms: s.speculation.verify_timeout_ms,
+            speculation_verify_reply_max_bytes: s.speculation.verify_reply_max_bytes,
             web_search_enabled: s.web_search.enabled,
             web_search_tool: s.web_search.search_tool.clone(),
             web_search_tool_description: s.web_search.tool_description.clone(),
@@ -3802,6 +3833,13 @@ pub struct UpdateBoonSettings {
     /// placeholders). Empty string clears; omitted keeps the current value.
     #[serde(default)]
     pub speculation_verify_url_template: Option<String>,
+    /// Per-call bound on a verifier call (tokenize, score), in milliseconds;
+    /// after the commit it is what ends a stalled scorer. Omit to leave unchanged.
+    #[serde(default)]
+    pub speculation_verify_timeout_ms: Option<u64>,
+    /// Largest verifier reply read, in bytes. Omit to leave unchanged.
+    #[serde(default)]
+    pub speculation_verify_reply_max_bytes: Option<usize>,
     /// Enable or disable the web-search boon globally. Omit to leave unchanged.
     #[serde(default)]
     pub web_search_enabled: Option<bool>,
@@ -4175,46 +4213,64 @@ async fn put_boon_settings(
             draft_model: spec_draft_model,
             verify_model: spec_verify_model,
             classify_model: spec_classify_model,
-            agree_min: body
-                .speculation_agree_min
-                .filter(|v| (0.0..=1.0).contains(v))
-                .unwrap_or(existing.speculation.agree_min),
-            lp_min: body
-                .speculation_lp_min
-                .filter(|v| *v <= 0.0)
-                .unwrap_or(existing.speculation.lp_min),
-            abort_agree: body
-                .speculation_abort_agree
-                .filter(|v| (0.0..=1.0).contains(v))
-                .unwrap_or(existing.speculation.abort_agree),
-            abort_lp: body
-                .speculation_abort_lp
-                .filter(|v| *v <= 0.0)
-                .unwrap_or(existing.speculation.abort_lp),
-            first_chunk_tokens: body
-                .speculation_first_chunk_tokens
-                .filter(|n| *n > 0)
-                .unwrap_or(existing.speculation.first_chunk_tokens),
-            chunk_tokens: body
-                .speculation_chunk_tokens
-                .filter(|n| *n > 0)
-                .unwrap_or(existing.speculation.chunk_tokens),
-            decide_by_tokens: body
-                .speculation_decide_by_tokens
-                .filter(|n| *n > 0)
-                .unwrap_or(existing.speculation.decide_by_tokens),
-            max_draft_tokens: body
-                .speculation_max_draft_tokens
-                .filter(|n| *n > 0)
-                .unwrap_or(existing.speculation.max_draft_tokens),
+            agree_min: in_range(
+                "speculation_agree_min",
+                body.speculation_agree_min,
+                0.0..=1.0,
+                existing.speculation.agree_min,
+            )?,
+            lp_min: in_range(
+                "speculation_lp_min",
+                body.speculation_lp_min,
+                f64::NEG_INFINITY..=0.0,
+                existing.speculation.lp_min,
+            )?,
+            abort_agree: in_range(
+                "speculation_abort_agree",
+                body.speculation_abort_agree,
+                0.0..=1.0,
+                existing.speculation.abort_agree,
+            )?,
+            abort_lp: in_range(
+                "speculation_abort_lp",
+                body.speculation_abort_lp,
+                f64::NEG_INFINITY..=0.0,
+                existing.speculation.abort_lp,
+            )?,
+            first_chunk_tokens: at_least(
+                "speculation_first_chunk_tokens",
+                body.speculation_first_chunk_tokens,
+                1,
+                existing.speculation.first_chunk_tokens,
+            )?,
+            chunk_tokens: at_least(
+                "speculation_chunk_tokens",
+                body.speculation_chunk_tokens,
+                1,
+                existing.speculation.chunk_tokens,
+            )?,
+            decide_by_tokens: at_least(
+                "speculation_decide_by_tokens",
+                body.speculation_decide_by_tokens,
+                1,
+                existing.speculation.decide_by_tokens,
+            )?,
+            max_draft_tokens: at_least(
+                "speculation_max_draft_tokens",
+                body.speculation_max_draft_tokens,
+                1,
+                existing.speculation.max_draft_tokens,
+            )?,
             pace_ms: body
                 .speculation_pace_ms
                 .unwrap_or(existing.speculation.pace_ms),
             draft_chat_template_kwargs: spec_draft_kwargs,
-            timeout_ms: body
-                .speculation_timeout_ms
-                .filter(|ms| *ms > 0)
-                .unwrap_or(existing.speculation.timeout_ms),
+            timeout_ms: at_least(
+                "speculation_timeout_ms",
+                body.speculation_timeout_ms,
+                1,
+                existing.speculation.timeout_ms,
+            )?,
             category_gates: spec_category_gates,
             unlisted_categories_speculate: body
                 .speculation_unlisted_categories_speculate
@@ -4223,6 +4279,18 @@ async fn put_boon_settings(
                 .speculation_verify_url_template
                 .map(|t| t.trim().to_string())
                 .unwrap_or_else(|| existing.speculation.verify_url_template.clone()),
+            verify_timeout_ms: at_least(
+                "speculation_verify_timeout_ms",
+                body.speculation_verify_timeout_ms,
+                1,
+                existing.speculation.verify_timeout_ms,
+            )?,
+            verify_reply_max_bytes: at_least(
+                "speculation_verify_reply_max_bytes",
+                body.speculation_verify_reply_max_bytes,
+                1,
+                existing.speculation.verify_reply_max_bytes,
+            )?,
         },
         web_search: obleth_config::WebSearchBoonSettings {
             enabled: body
@@ -4340,7 +4408,7 @@ impl EnergySettingsView {
     }
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Default, Deserialize, ToSchema)]
 pub struct UpdateEnergySettings {
     #[serde(default)]
     pub enabled: Option<bool>,
@@ -4379,8 +4447,8 @@ pub struct UpdateEnergySettings {
 fn merge_energy_settings(
     existing: &obleth_config::EnergySettings,
     body: &UpdateEnergySettings,
-) -> obleth_config::EnergySettings {
-    obleth_config::EnergySettings {
+) -> Result<obleth_config::EnergySettings> {
+    Ok(obleth_config::EnergySettings {
         enabled: body.enabled.unwrap_or(existing.enabled),
         prometheus_url: body
             .prometheus_url
@@ -4407,20 +4475,27 @@ fn merge_energy_settings(
             .as_deref()
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|| existing.model_requests_query.clone()),
-        poll_interval_secs: body
-            .poll_interval_secs
-            .filter(|n| *n > 0)
-            .unwrap_or(existing.poll_interval_secs),
-        energy_cost_per_kwh: body
-            .energy_cost_per_kwh
-            .filter(|v| *v >= 0.0)
-            .unwrap_or(existing.energy_cost_per_kwh),
-        carbon_g_per_kwh: body
-            .carbon_g_per_kwh
-            .filter(|v| *v >= 0.0)
-            .unwrap_or(existing.carbon_g_per_kwh),
-        pue: body.pue.filter(|v| *v > 0.0).unwrap_or(existing.pue),
-    }
+        poll_interval_secs: at_least(
+            "poll_interval_secs",
+            body.poll_interval_secs,
+            1,
+            existing.poll_interval_secs,
+        )?,
+        energy_cost_per_kwh: at_least(
+            "energy_cost_per_kwh",
+            body.energy_cost_per_kwh,
+            0.0,
+            existing.energy_cost_per_kwh,
+        )?,
+        carbon_g_per_kwh: at_least(
+            "carbon_g_per_kwh",
+            body.carbon_g_per_kwh,
+            0.0,
+            existing.carbon_g_per_kwh,
+        )?,
+        // PUE is total facility power over IT power: 1.0 is the physical floor.
+        pue: at_least("pue", body.pue, 1.0, existing.pue)?,
+    })
 }
 
 #[utoipa::path(
@@ -4450,7 +4525,7 @@ async fn put_energy_settings(
             state.ssrf.validate(url).await?;
         }
     }
-    let settings = merge_energy_settings(&existing, &body);
+    let settings = merge_energy_settings(&existing, &body)?;
     state.store.put_energy_settings(&settings).await?;
     state
         .store
@@ -4852,7 +4927,10 @@ async fn patch_weight(
     headers: HeaderMap,
     Json(body): Json<UpdateWeight>,
 ) -> Result<Json<Tenant>> {
-    let tenant = state.store.update_tenant_weight(id, body.weight).await?;
+    let tenant = state
+        .store
+        .update_tenant_weight(id, validate_weight(body.weight)?)
+        .await?;
     sync_tenant_keys(&state, id).await?;
     state
         .store
@@ -5150,36 +5228,58 @@ async fn update_key(
     headers: HeaderMap,
     Json(body): Json<UpdateKey>,
 ) -> Result<Json<ApiKey>> {
-    let name = body.name.trim().to_string();
+    let existing = state
+        .store
+        .keys_by_ids(&[id])
+        .await?
+        .into_iter()
+        .next()
+        .ok_or(obleth_store::StoreError::NotFound)?;
+    let name = body
+        .name
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or(&existing.name)
+        .to_string();
     if name.is_empty() {
         return Err(AdminError::BadRequest("key name is required".into()));
     }
-    if body.weight < 1 {
+    let weight = body.weight.unwrap_or(existing.weight);
+    if weight < 1 {
         return Err(AdminError::BadRequest("weight must be >= 1".into()));
     }
-    if matches!(body.max_in_flight, Some(c) if c < 1) {
+    let max_in_flight = body.max_in_flight.unwrap_or(existing.max_in_flight);
+    if matches!(max_in_flight, Some(c) if c < 1) {
         return Err(AdminError::BadRequest("max_in_flight must be >= 1".into()));
     }
-    let description = body.description.trim().to_string();
+    let description = body
+        .description
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or(&existing.description)
+        .to_string();
+    let budget_tokens = body.budget_tokens.unwrap_or(existing.budget_tokens);
+    let budget_cost_usd = body.budget_cost_usd.unwrap_or(existing.budget_cost_usd);
+    let budget_period = body
+        .budget_period
+        .unwrap_or_else(|| existing.budget_period.clone());
     let (period, started_at) = normalize_budget_fields(
-        body.budget_tokens,
-        body.budget_cost_usd,
-        body.budget_period.as_deref(),
-        body.budget_started_at,
+        budget_tokens,
+        budget_cost_usd,
+        budget_period.as_deref(),
+        body.budget_started_at.unwrap_or(existing.budget_started_at),
         "budget_tokens",
         "budget_cost_usd",
         "budget_period",
     )?;
     let allowed_networks = body
         .allowed_networks
-        .as_deref()
-        .map(obleth_config::network::normalize_allowed_networks)
+        .map(|list| obleth_config::network::normalize_allowed_networks(&list.unwrap_or_default()))
         .transpose()
         .map_err(AdminError::BadRequest)?;
     let allowed_countries = body
         .allowed_countries
-        .as_deref()
-        .map(obleth_config::network::normalize_allowed_countries)
+        .map(|list| obleth_config::network::normalize_allowed_countries(&list.unwrap_or_default()))
         .transpose()
         .map_err(AdminError::BadRequest)?;
     let (hash, key, resolved) = state
@@ -5188,12 +5288,12 @@ async fn update_key(
             id,
             &name,
             &description,
-            body.budget_tokens,
-            body.budget_cost_usd,
+            budget_tokens,
+            budget_cost_usd,
             period.as_deref(),
             started_at,
-            body.weight,
-            body.max_in_flight,
+            weight,
+            max_in_flight,
             allowed_networks.as_deref(),
             allowed_countries.as_deref(),
         )
@@ -5761,7 +5861,7 @@ async fn get_costs(
         })
         .collect();
     Ok(Json(
-        usage::query_costs(&state.clickhouse, q.since_ms, q.include_internal, &costs).await?,
+        usage::query_costs(&state.clickhouse, &q, &costs).await?,
     ))
 }
 
@@ -6004,14 +6104,7 @@ async fn get_usage_breakdown(
     State(state): State<AdminState>,
     Query(q): Query<usage::UsageBreakdownQuery>,
 ) -> Result<Json<Vec<UsageBreakdownEntry>>> {
-    let rows = usage::query_usage_breakdown_by_model(
-        &state.clickhouse,
-        &q.model,
-        q.since_ms,
-        q.limit,
-        q.include_internal,
-    )
-    .await?;
+    let rows = usage::query_usage_breakdown_by_model(&state.clickhouse, &q).await?;
 
     let tenant_meta: std::collections::HashMap<Uuid, (String, String)> = state
         .store
@@ -6063,11 +6156,7 @@ async fn get_usage_daily(
     State(state): State<AdminState>,
     Query(q): Query<usage::UsageDailyQuery>,
 ) -> Result<Json<Vec<usage::UsageDailyRow>>> {
-    let key_ids = usage::parse_key_ids(q.key_id.as_deref())
-        .map_err(|e| AdminError::BadRequest(format!("invalid key_id: {e}")))?;
-    Ok(Json(
-        usage::query_usage_daily(&state.clickhouse, q, &key_ids).await?,
-    ))
+    Ok(Json(usage::query_usage_daily(&state.clickhouse, q).await?))
 }
 
 /// The prefix new API keys start with.
@@ -6362,7 +6451,7 @@ async fn get_overview_summary(
     // ClickHouse being down degrades the usage totals to zero rather than
     // failing the whole summary — the config counts are still useful and this
     // read backs a poll on every dashboard page.
-    let totals = usage::query_usage_totals(&state.clickhouse, q.since_ms, q.include_internal)
+    let totals = usage::query_usage_totals(&state.clickhouse, &q)
         .await
         .unwrap_or_default();
     // The ledger keeps rows for since-deleted tenants; clamp so the summary
@@ -7437,7 +7526,7 @@ async fn create_fairshare_group(
 ) -> Result<Json<FairshareGroup>> {
     let group = state
         .store
-        .create_fairshare_group(&body.name, body.weight.unwrap_or(100))
+        .create_fairshare_group(&body.name, validate_weight(body.weight.unwrap_or(100))?)
         .await?;
     state
         .store
@@ -7466,7 +7555,7 @@ async fn patch_fairshare_group_weight(
 ) -> Result<Json<FairshareGroup>> {
     let group = state
         .store
-        .update_fairshare_group_weight(&name, body.weight)
+        .update_fairshare_group_weight(&name, validate_weight(body.weight)?)
         .await?;
     sync_group_keys(&state, &name).await?;
     state
@@ -7736,6 +7825,77 @@ fn validate_quantization(raw: &str) -> Result<String> {
         )));
     }
     Ok(q)
+}
+
+/// A fairshare weight from the admin API: at least 1. The store used to fold
+/// 0 to 1 silently; an operator who sends 0 is told.
+fn validate_weight(weight: i64) -> Result<i64> {
+    if weight < 1 {
+        return Err(AdminError::BadRequest("weight must be >= 1".into()));
+    }
+    Ok(weight)
+}
+
+/// A model type from the admin API: one of the fixed vocabulary, rejected
+/// rather than folded to `chat`. The store's normaliser still runs for values
+/// a backend reports in its own spelling.
+fn validate_model_type(raw: &str) -> Result<String> {
+    let t = raw.trim().to_ascii_lowercase();
+    if !obleth_config::is_valid_model_type(&t) {
+        return Err(AdminError::BadRequest(format!(
+            "unknown model_type '{raw}' (expected one of: {})",
+            obleth_config::MODEL_TYPES.join(", ")
+        )));
+    }
+    Ok(t)
+}
+
+/// An endpoint selection mode from the admin API: one of the fixed
+/// vocabulary, rejected rather than folded to the default.
+fn validate_endpoint_selection_mode(raw: &str) -> Result<String> {
+    let m = raw.trim().to_ascii_lowercase();
+    if !obleth_config::is_valid_endpoint_selection_mode(&m) {
+        return Err(AdminError::BadRequest(format!(
+            "unknown endpoint_selection_mode '{raw}' (expected one of: {})",
+            obleth_config::ENDPOINT_SELECTION_MODES.join(", ")
+        )));
+    }
+    Ok(m)
+}
+
+/// A settings value that must lie in `range`, named by its field: a value
+/// outside it is 400, never kept silently as the old value.
+fn in_range<T: PartialOrd + Copy + std::fmt::Display>(
+    field: &str,
+    value: Option<T>,
+    range: std::ops::RangeInclusive<T>,
+    existing: T,
+) -> Result<T> {
+    match value {
+        None => Ok(existing),
+        Some(v) if range.contains(&v) => Ok(v),
+        Some(v) => Err(AdminError::BadRequest(format!(
+            "{field} must be between {} and {}, got {v}",
+            range.start(),
+            range.end()
+        ))),
+    }
+}
+
+/// A settings value that must be at least `min`, named by its field.
+fn at_least<T: PartialOrd + Copy + std::fmt::Display>(
+    field: &str,
+    value: Option<T>,
+    min: T,
+    existing: T,
+) -> Result<T> {
+    match value {
+        None => Ok(existing),
+        Some(v) if v >= min => Ok(v),
+        Some(v) => Err(AdminError::BadRequest(format!(
+            "{field} must be at least {min}, got {v}"
+        ))),
+    }
 }
 
 /// Normalize an alias list and reject any name already claimed elsewhere.
@@ -8069,101 +8229,62 @@ async fn create_model(
         &discovery,
         &[],
     )?;
+    let model_type = validate_model_type(body.model_type.as_deref().unwrap_or("chat"))?;
+    let lifecycle = obleth_config::ModelLifecycle {
+        status: initial_status,
+        changed_at: (initial_status == obleth_config::ModelStatus::Staged).then(chrono::Utc::now),
+        ..Default::default()
+    };
+    // One insert: switched off, staged, restricted and scheduled for health
+    // checks as asked before the first publish below, so the data plane
+    // never sees the route any other way.
     let model = state
         .store
-        .create_model(
-            &body.model_name,
-            body.description.as_deref().unwrap_or_default(),
-            &body.upstream_model,
-            &body.api_base,
-            body.api_key.as_deref(),
-            body.model_type.as_deref().unwrap_or("chat"),
-            body.input_cost_per_token.unwrap_or(0.0),
-            body.output_cost_per_token.unwrap_or(0.0),
-            body.cost_per_image.unwrap_or(0.0),
-            body.cost_per_audio_second.unwrap_or(0.0),
-            body.cost_per_character.unwrap_or(0.0),
-            body.context_window.unwrap_or(8192),
-            body.admission_weight.unwrap_or(100),
-            body.max_in_flight,
-            body.supports_function_calling.unwrap_or(false),
-            body.supports_system_messages.unwrap_or(true),
-            body.supports_response_schema.unwrap_or(false),
-            body.supports_tool_choice.unwrap_or(false),
-            body.supports_vision.unwrap_or(false),
-            &body.tags.clone().unwrap_or_default(),
-            &body.boons.clone().unwrap_or_default(),
-            &body.tool_servers.clone().unwrap_or_default(),
-            body.energy_slots_per_node.unwrap_or(0),
-            body.route_bias.unwrap_or(1.0),
-            body.auto_eligible.unwrap_or(true),
-            body.draft_model.as_deref().unwrap_or(""),
-            body.verify_api_base.as_deref().unwrap_or(""),
-            body.verify_upstream_model.as_deref().unwrap_or(""),
-            &aliases,
-            &quantization,
-            &upstream_headers,
-            body.cost_per_video.unwrap_or(0.0),
-            &capacity_mode,
-            &discovery,
-            &variants,
-        )
+        .create_model(&obleth_store::NewModel {
+            model_name: body.model_name.clone(),
+            fields: obleth_store::ModelFields {
+                description: body.description.clone().unwrap_or_default(),
+                upstream_model: body.upstream_model.clone(),
+                api_base: body.api_base.clone(),
+                api_key: body.api_key.clone(),
+                model_type,
+                input_cost_per_token: body.input_cost_per_token.unwrap_or(0.0),
+                output_cost_per_token: body.output_cost_per_token.unwrap_or(0.0),
+                cost_per_image: body.cost_per_image.unwrap_or(0.0),
+                cost_per_audio_second: body.cost_per_audio_second.unwrap_or(0.0),
+                cost_per_character: body.cost_per_character.unwrap_or(0.0),
+                cost_per_video: body.cost_per_video.unwrap_or(0.0),
+                context_window: body.context_window.unwrap_or(8192),
+                admission_weight: body.admission_weight.unwrap_or(100),
+                max_in_flight: body.max_in_flight,
+                supports_function_calling: body.supports_function_calling.unwrap_or(false),
+                supports_system_messages: body.supports_system_messages.unwrap_or(true),
+                supports_response_schema: body.supports_response_schema.unwrap_or(false),
+                supports_tool_choice: body.supports_tool_choice.unwrap_or(false),
+                supports_vision: body.supports_vision.unwrap_or(false),
+                tags: body.tags.clone().unwrap_or_default(),
+                boons: body.boons.clone().unwrap_or_default(),
+                tool_servers: body.tool_servers.clone().unwrap_or_default(),
+                energy_slots_per_node: body.energy_slots_per_node.unwrap_or(0),
+                route_bias: body.route_bias.unwrap_or(1.0),
+                auto_eligible: body.auto_eligible.unwrap_or(true),
+                draft_model: body.draft_model.clone().unwrap_or_default(),
+                verify_api_base: body.verify_api_base.clone().unwrap_or_default(),
+                verify_upstream_model: body.verify_upstream_model.clone().unwrap_or_default(),
+                aliases,
+                quantization,
+                upstream_headers,
+                capacity_mode,
+                discovery,
+                variants,
+            },
+            enabled: body.enabled != Some(false),
+            lifecycle,
+            rejected_request_fields,
+            session_affinity,
+            health_check_interval_secs: state.health.default_interval_secs,
+        })
         .await?;
-    // Switched off before the first publish below, so the data plane never
-    // sees the route on.
-    let model = if body.enabled == Some(false) {
-        state.store.set_model_enabled(model.id, false).await?
-    } else {
-        model
-    };
-    // Set the same way, before the first publish.
-    let model = if rejected_request_fields.is_empty() {
-        model
-    } else {
-        state
-            .store
-            .set_model_rejected_request_fields(model.id, &rejected_request_fields)
-            .await?
-    };
-    // Set the same way, before the first publish.
-    let model = if session_affinity.is_default() {
-        model
-    } else {
-        state
-            .store
-            .set_model_session_affinity(model.id, &session_affinity)
-            .await?
-    };
-    // Staged the same way, before the first publish.
-    let model = if initial_status == obleth_config::ModelStatus::Staged {
-        let lifecycle = obleth_config::ModelLifecycle {
-            status: initial_status,
-            changed_at: Some(chrono::Utc::now()),
-            ..Default::default()
-        };
-        state
-            .store
-            .set_model_lifecycle(model.id, &lifecycle)
-            .await?
-    } else {
-        model
-    };
-    if state.health.default_interval_secs != 900 {
-        let _ = state
-            .store
-            .update_model_health_config(
-                model.id,
-                obleth_store::ModelHealthConfigUpdate {
-                    checks_enabled: true,
-                    alerts_enabled: true,
-                    check_interval_secs: state.health.default_interval_secs,
-                    failure_threshold: 2,
-                    maintenance_until: None,
-                    maintenance_note: None,
-                },
-            )
-            .await?;
-    }
     sync_model(&state, &model).await?;
     state
         .store
@@ -8274,81 +8395,88 @@ async fn update_model(
         &discovery,
         &endpoint_concurrency(&state, existing.id).await?,
     )?;
+    let model_type =
+        validate_model_type(body.model_type.as_deref().unwrap_or(&existing.model_type))?;
     let model = state
         .store
         .update_model(
             id,
-            body.description.as_deref().unwrap_or(&existing.description),
-            &body.upstream_model,
-            &body.api_base,
-            api_key,
-            body.model_type.as_deref().unwrap_or(&existing.model_type),
-            body.input_cost_per_token
-                .unwrap_or(existing.input_cost_per_token),
-            body.output_cost_per_token
-                .unwrap_or(existing.output_cost_per_token),
-            body.cost_per_image.unwrap_or(existing.cost_per_image),
-            body.cost_per_audio_second
-                .unwrap_or(existing.cost_per_audio_second),
-            body.cost_per_character
-                .unwrap_or(existing.cost_per_character),
-            body.context_window.unwrap_or(existing.context_window),
-            body.admission_weight.unwrap_or(existing.admission_weight),
-            body.max_in_flight.or(existing.max_in_flight),
-            body.supports_function_calling
-                .unwrap_or(existing.supports_function_calling),
-            body.supports_system_messages
-                .unwrap_or(existing.supports_system_messages),
-            body.supports_response_schema
-                .unwrap_or(existing.supports_response_schema),
-            body.supports_tool_choice
-                .unwrap_or(existing.supports_tool_choice),
-            body.supports_vision.unwrap_or(existing.supports_vision),
-            body.enabled.unwrap_or(existing.enabled),
-            &body.tags.clone().unwrap_or_else(|| existing.tags.clone()),
-            &body.boons.clone().unwrap_or_else(|| existing.boons.clone()),
-            &body
-                .tool_servers
-                .clone()
-                .unwrap_or_else(|| existing.tool_servers.clone()),
-            body.energy_slots_per_node
-                .unwrap_or(existing.energy_slots_per_node),
-            body.route_bias.unwrap_or(existing.route_bias),
-            body.auto_eligible.unwrap_or(existing.auto_eligible),
-            body.draft_model.as_deref().unwrap_or(&existing.draft_model),
-            body.verify_api_base
-                .as_deref()
-                .unwrap_or(&existing.verify_api_base),
-            body.verify_upstream_model
-                .as_deref()
-                .unwrap_or(&existing.verify_upstream_model),
-            &aliases,
-            &quantization,
-            &upstream_headers,
-            body.cost_per_video.unwrap_or(existing.cost_per_video),
-            &capacity_mode,
-            &discovery,
-            &variants,
+            &obleth_store::ModelUpdate {
+                fields: obleth_store::ModelFields {
+                    description: body
+                        .description
+                        .clone()
+                        .unwrap_or_else(|| existing.description.clone()),
+                    upstream_model: body.upstream_model.clone(),
+                    api_base: body.api_base.clone(),
+                    api_key: api_key.map(str::to_string),
+                    model_type,
+                    input_cost_per_token: body
+                        .input_cost_per_token
+                        .unwrap_or(existing.input_cost_per_token),
+                    output_cost_per_token: body
+                        .output_cost_per_token
+                        .unwrap_or(existing.output_cost_per_token),
+                    cost_per_image: body.cost_per_image.unwrap_or(existing.cost_per_image),
+                    cost_per_audio_second: body
+                        .cost_per_audio_second
+                        .unwrap_or(existing.cost_per_audio_second),
+                    cost_per_character: body
+                        .cost_per_character
+                        .unwrap_or(existing.cost_per_character),
+                    cost_per_video: body.cost_per_video.unwrap_or(existing.cost_per_video),
+                    context_window: body.context_window.unwrap_or(existing.context_window),
+                    admission_weight: body.admission_weight.unwrap_or(existing.admission_weight),
+                    max_in_flight: body.max_in_flight.unwrap_or(existing.max_in_flight),
+                    supports_function_calling: body
+                        .supports_function_calling
+                        .unwrap_or(existing.supports_function_calling),
+                    supports_system_messages: body
+                        .supports_system_messages
+                        .unwrap_or(existing.supports_system_messages),
+                    supports_response_schema: body
+                        .supports_response_schema
+                        .unwrap_or(existing.supports_response_schema),
+                    supports_tool_choice: body
+                        .supports_tool_choice
+                        .unwrap_or(existing.supports_tool_choice),
+                    supports_vision: body.supports_vision.unwrap_or(existing.supports_vision),
+                    tags: body.tags.clone().unwrap_or_else(|| existing.tags.clone()),
+                    boons: body.boons.clone().unwrap_or_else(|| existing.boons.clone()),
+                    tool_servers: body
+                        .tool_servers
+                        .clone()
+                        .unwrap_or_else(|| existing.tool_servers.clone()),
+                    energy_slots_per_node: body
+                        .energy_slots_per_node
+                        .unwrap_or(existing.energy_slots_per_node),
+                    route_bias: body.route_bias.unwrap_or(existing.route_bias),
+                    auto_eligible: body.auto_eligible.unwrap_or(existing.auto_eligible),
+                    draft_model: body
+                        .draft_model
+                        .clone()
+                        .unwrap_or_else(|| existing.draft_model.clone()),
+                    verify_api_base: body
+                        .verify_api_base
+                        .clone()
+                        .unwrap_or_else(|| existing.verify_api_base.clone()),
+                    verify_upstream_model: body
+                        .verify_upstream_model
+                        .clone()
+                        .unwrap_or_else(|| existing.verify_upstream_model.clone()),
+                    aliases,
+                    quantization,
+                    upstream_headers,
+                    capacity_mode,
+                    discovery,
+                    variants,
+                },
+                enabled: body.enabled.unwrap_or(existing.enabled),
+                rejected_request_fields,
+                session_affinity: body.session_affinity,
+            },
         )
         .await?;
-    let model = match rejected_request_fields {
-        Some(fields) if fields != model.rejected_request_fields => {
-            state
-                .store
-                .set_model_rejected_request_fields(id, &fields)
-                .await?
-        }
-        _ => model,
-    };
-    let model = match body.session_affinity {
-        Some(affinity) if affinity != model.session_affinity => {
-            state
-                .store
-                .set_model_session_affinity(id, &affinity)
-                .await?
-        }
-        _ => model,
-    };
     if model_health::probe_config_changed(&existing, &model) {
         // The old failure streak / alert state describe a configuration that
         // no longer exists; reset so the scheduler re-verifies immediately.
@@ -9098,15 +9226,21 @@ async fn set_model_reliability(
     headers: HeaderMap,
     Json(body): Json<SetModelReliability>,
 ) -> Result<Json<ModelRouteView>> {
+    let existing = state.store.get_model(id).await?;
+    let selection_mode = match body.endpoint_selection_mode.as_deref() {
+        Some(mode) => validate_endpoint_selection_mode(mode)?,
+        None => existing.endpoint_selection_mode.clone(),
+    };
     let model = state
         .store
         .update_model_reliability(
             id,
-            body.request_timeout_secs,
-            body.max_retries,
-            body.retry_backoff_ms,
-            &body.endpoint_selection_mode,
-            body.debug_diagnostics,
+            body.request_timeout_secs
+                .unwrap_or(existing.request_timeout_secs),
+            body.max_retries.unwrap_or(existing.max_retries),
+            body.retry_backoff_ms.unwrap_or(existing.retry_backoff_ms),
+            &selection_mode,
+            body.debug_diagnostics.unwrap_or(existing.debug_diagnostics),
         )
         .await?;
     sync_model(&state, &model).await?;
@@ -9218,34 +9352,35 @@ async fn update_model_endpoint(
     headers: HeaderMap,
     Json(body): Json<UpdateModelEndpoint>,
 ) -> Result<Json<ModelEndpointView>> {
-    state.ssrf.validate(&body.api_base).await?;
     let model = state.store.get_model(id).await?;
-    let max_in_flight = match body.max_in_flight {
-        Some(v) => v,
-        // Omitted keeps the stored value. An id outside this model finds
-        // nothing here and is refused by the scoped update below.
-        None => state
-            .store
-            .list_model_endpoints(model.id)
-            .await?
-            .into_iter()
-            .find(|e| e.id == endpoint_id)
-            .and_then(|e| e.max_in_flight),
-    };
+    // An id outside this model finds nothing here: a 404, like the scoped
+    // update below would give.
+    let existing = state
+        .store
+        .list_model_endpoints(model.id)
+        .await?
+        .into_iter()
+        .find(|e| e.id == endpoint_id)
+        .ok_or(obleth_store::StoreError::NotFound)?;
+    let api_base = body.api_base.unwrap_or(existing.api_base);
+    state.ssrf.validate(&api_base).await?;
+    let max_in_flight = body.max_in_flight.unwrap_or(existing.max_in_flight);
     validate_endpoint_max_in_flight(max_in_flight)?;
     validate_endpoint_write(&state, &model, Some(endpoint_id), max_in_flight).await?;
+    // The store keeps the secret on `None` and clears it on an empty string.
+    let api_key = body.api_key.map(Option::unwrap_or_default);
     let endpoint = state
         .store
         // Scoped to the path model: another model's endpoint id is a 404.
         .update_model_endpoint(
             model.id,
             endpoint_id,
-            &body.name,
-            &body.api_base,
-            body.api_key.as_deref(),
-            body.priority,
-            body.weight,
-            body.enabled,
+            body.name.as_deref().unwrap_or(&existing.name),
+            &api_base,
+            api_key.as_deref(),
+            body.priority.unwrap_or(existing.priority),
+            body.weight.unwrap_or(existing.weight),
+            body.enabled.unwrap_or(existing.enabled),
             max_in_flight,
         )
         .await?;
@@ -9691,7 +9826,15 @@ async fn patch_replica(
     if let Some(state_val) = body.state.as_deref() {
         state
             .store
-            .update_replica_state(id, state_val, body.message.as_deref())
+            .update_replica_state(
+                id,
+                state_val,
+                body.message.as_deref(),
+                obleth_store::LaunchEnd {
+                    state: body.end_state.as_deref(),
+                    reason: body.end_reason.as_deref(),
+                },
+            )
             .await?;
     } else if let Some(msg) = body.message.as_deref() {
         state.store.set_replica_message(id, msg).await?;
@@ -10285,18 +10428,21 @@ async fn get_audit(
             .transpose()
     };
     let text = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let list = |v: Option<String>| {
+        text(v).map(|a| {
+            a.split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect::<Vec<_>>()
+        })
+    };
     let filter = obleth_store::AuditFilter {
         since: time(&q.since, "since")?,
         until: time(&q.until, "until")?,
         actor: text(q.actor),
-        entity_type: text(q.entity_type),
+        entity_types: list(q.entity_type),
         entity_id: text(q.entity_id),
-        actions: text(q.action).map(|a| {
-            a.split(',')
-                .map(|x| x.trim().to_string())
-                .filter(|x| !x.is_empty())
-                .collect()
-        }),
+        actions: list(q.action),
         before_id: q.before_id,
         q: text(q.q),
         limit: q.limit.unwrap_or(100),
@@ -10715,43 +10861,27 @@ mod tests {
             input_cost_per_token: f64,
         ) -> ModelRoute {
             store
-                .create_model(
+                .create_model(&obleth_store::NewModel::new(
                     name,
-                    "",
-                    name,
-                    "http://upstream.invalid",
-                    None,
-                    obleth_config::DEFAULT_MODEL_TYPE,
-                    input_cost_per_token,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    128_000,
-                    100,
-                    Some(4),
-                    true,
-                    true,
-                    true,
-                    true,
-                    false,
-                    &["coding".to_string()],
-                    &[],
-                    &[],
-                    0,
-                    1.0,
-                    true,
-                    "",
-                    "",
-                    "",
-                    &[],
-                    "",
-                    &Default::default(),
-                    0.0,
-                    "static",
-                    &Default::default(),
-                    &[],
-                )
+                    obleth_store::ModelFields {
+                        upstream_model: name.into(),
+                        api_base: "http://upstream.invalid".into(),
+                        model_type: obleth_config::DEFAULT_MODEL_TYPE.into(),
+                        input_cost_per_token,
+                        context_window: 128_000,
+                        admission_weight: 100,
+                        max_in_flight: Some(4),
+                        supports_function_calling: true,
+                        supports_system_messages: true,
+                        supports_response_schema: true,
+                        supports_tool_choice: true,
+                        tags: vec!["coding".into()],
+                        route_bias: 1.0,
+                        auto_eligible: true,
+                        capacity_mode: "static".into(),
+                        ..Default::default()
+                    },
+                ))
                 .await
                 .expect("create fixture model")
         }
@@ -10913,6 +11043,164 @@ mod tests {
             .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
             .body(axum::body::Body::from(body.to_string()))
             .expect("build request")
+    }
+
+    /// Out-of-range or unknown values on the admin write path are 400 with
+    /// the field named, never coerced to a default or kept silently as the
+    /// old value.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn bad_admin_input_is_400_not_coerced() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let name = format!("m-{}", Uuid::new_v4());
+        let (status, body) = send(
+            &t.app,
+            json_request("POST", "/api/v1/models", serde_json::json!({
+                "model_name": name, "upstream_model": "u", "api_base": "http://127.0.0.1:1/v1", "model_type": "embeddings"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("model_type"),
+            "{body}"
+        );
+        let (status, body) = send(
+            &t.app,
+            json_request(
+                "POST",
+                "/api/v1/tenants",
+                serde_json::json!({ "name": format!("t-{}", Uuid::new_v4()), "weight": 0 }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let (status, body) = send(
+            &t.app,
+            json_request(
+                "POST",
+                "/api/v1/fairshare/groups",
+                serde_json::json!({ "name": format!("g-{}", Uuid::new_v4()), "weight": -3 }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        // A bad threshold is refused and the stored value stays as it was.
+        let (_, before) = send(
+            &t.app,
+            json_request("GET", "/api/v1/settings/boons", serde_json::Value::Null),
+        )
+        .await;
+        let (status, body) = send(
+            &t.app,
+            json_request(
+                "PUT",
+                "/api/v1/settings/boons",
+                serde_json::json!({ "speculation_agree_min": 1.5 }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("speculation_agree_min"),
+            "{body}"
+        );
+        let (_, after) = send(
+            &t.app,
+            json_request("GET", "/api/v1/settings/boons", serde_json::Value::Null),
+        )
+        .await;
+        assert_eq!(
+            after["speculation_agree_min"],
+            before["speculation_agree_min"]
+        );
+        let (status, body) = send(
+            &t.app,
+            json_request(
+                "PUT",
+                "/api/v1/settings/energy",
+                serde_json::json!({ "pue": 0.5 }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    /// Recipes follow the admin API's conventions: a delete answers 204 and
+    /// 404 when nothing was deleted; a PUT changes an existing recipe and
+    /// 404s for a missing id instead of creating one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn recipes_delete_with_204_and_404_and_put_never_creates() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let missing = Uuid::new_v4();
+        let body = serde_json::json!({"name": "greeter", "body": "spec", "author": "ana"});
+        let (status, _) = send(
+            &t.app,
+            json_request("PUT", &format!("/api/v1/recipes/{missing}"), body.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = send(
+            &t.app,
+            json_request(
+                "DELETE",
+                &format!("/api/v1/recipes/{missing}"),
+                serde_json::Value::Null,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, made) = send(
+            &t.app,
+            json_request("POST", "/api/v1/recipes", body.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let id = made["id"].as_str().expect("id").to_string();
+        let (status, changed) = send(
+            &t.app,
+            json_request(
+                "PUT",
+                &format!("/api/v1/recipes/{id}"),
+                serde_json::json!({"name": "greeter-2"}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            (status, changed["name"].as_str()),
+            (StatusCode::OK, Some("greeter-2"))
+        );
+        let (status, _) = send(
+            &t.app,
+            json_request(
+                "DELETE",
+                &format!("/api/v1/recipes/{id}"),
+                serde_json::Value::Null,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = send(
+            &t.app,
+            json_request(
+                "DELETE",
+                &format!("/api/v1/recipes/{id}"),
+                serde_json::Value::Null,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     /// A Slurm-managed embedder has a blank `api_base` and lives only in its
@@ -12803,8 +13091,207 @@ mod tests {
         assert_eq!(cleared["allowed_networks"], serde_json::json!([]));
     }
 
+    /// One rule for update bodies: an omitted field keeps the stored value,
+    /// `null` clears it, a value sets it. Checked on the bodies that used to
+    /// reset what they were not sent: keys, reliability, endpoints and the
+    /// model-wide cap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn update_bodies_keep_omitted_fields_and_clear_null_ones() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let put =
+            |path: String, body: serde_json::Value| send(&t.app, json_request("PUT", &path, body));
+
+        // -- keys ----------------------------------------------------------
+        let tenant = t
+            .store
+            .create_tenant(&format!("t-{}", Uuid::new_v4()), 100, 1000, None, None)
+            .await
+            .expect("create tenant");
+        let (status, created) = send(
+            &t.app,
+            json_request(
+                "POST",
+                &format!("/api/v1/tenants/{}/keys", tenant.id),
+                serde_json::json!({
+                    "name": "lab", "weight": 300, "max_in_flight": 4,
+                    "budget_tokens": 1000, "allowed_networks": ["192.0.2.0/24"]
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let key_id = created["key"]["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let key_path = format!("/api/v1/keys/{key_id}");
+        let (status, kept) = put(key_path.clone(), serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{kept}");
+        assert_eq!(
+            (
+                kept["name"].as_str(),
+                kept["weight"].as_i64(),
+                kept["max_in_flight"].as_i64(),
+                kept["budget_tokens"].as_i64()
+            ),
+            (Some("lab"), Some(300), Some(4), Some(1000)),
+            "an empty update keeps every field: {kept}"
+        );
+        assert_eq!(
+            kept["allowed_networks"],
+            serde_json::json!(["192.0.2.0/24"])
+        );
+        let (_, cleared) = put(
+            key_path.clone(),
+            serde_json::json!({ "max_in_flight": null, "budget_tokens": null, "description": "edited" }),
+        )
+        .await;
+        assert!(
+            cleared["max_in_flight"].is_null() && cleared["budget_tokens"].is_null(),
+            "{cleared}"
+        );
+        assert_eq!(
+            (cleared["weight"].as_i64(), cleared["description"].as_str()),
+            (Some(300), Some("edited"))
+        );
+        assert_eq!(
+            cleared["allowed_networks"],
+            serde_json::json!(["192.0.2.0/24"])
+        );
+        let (status, _) = put(key_path.clone(), serde_json::json!({ "weight": 0 })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = put(
+            format!("/api/v1/keys/{}", Uuid::new_v4()),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let _ = t.store.delete_tenant(tenant.id).await;
+
+        // -- reliability ---------------------------------------------------
+        let model = fixture_model(&t.store, &format!("m-{}", Uuid::new_v4()), 0.0).await;
+        let reliability = format!("/api/v1/models/{}/reliability", model.id);
+        let (status, set) = put(
+            reliability.clone(),
+            serde_json::json!({ "max_retries": 3, "request_timeout_secs": 30 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{set}");
+        let (_, kept) = put(
+            reliability.clone(),
+            serde_json::json!({ "debug_diagnostics": true }),
+        )
+        .await;
+        assert_eq!(
+            (
+                kept["max_retries"].as_i64(),
+                kept["request_timeout_secs"].as_i64(),
+                kept["debug_diagnostics"].as_bool()
+            ),
+            (Some(3), Some(30), Some(true)),
+            "{kept}"
+        );
+        let (_, cleared) = put(
+            reliability.clone(),
+            serde_json::json!({ "request_timeout_secs": null }),
+        )
+        .await;
+        assert!(cleared["request_timeout_secs"].is_null(), "{cleared}");
+        assert_eq!(cleared["max_retries"].as_i64(), Some(3));
+
+        // -- endpoints -----------------------------------------------------
+        let endpoints = format!("/api/v1/models/{}/endpoints", model.id);
+        let (status, endpoint) = send(
+            &t.app,
+            json_request(
+                "POST",
+                &endpoints,
+                serde_json::json!({
+                    "name": "a", "api_base": "http://127.0.0.1:1/v1", "api_key": "k",
+                    "priority": 5, "weight": 7, "enabled": false, "max_in_flight": 3
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{endpoint}");
+        let endpoint_path = format!(
+            "{endpoints}/{}",
+            endpoint["id"].as_str().unwrap_or_default()
+        );
+        let (status, kept) = put(endpoint_path.clone(), serde_json::json!({ "name": "b" })).await;
+        assert_eq!(status, StatusCode::OK, "{kept}");
+        assert_eq!(
+            (
+                kept["name"].as_str(),
+                kept["priority"].as_i64(),
+                kept["weight"].as_i64(),
+                kept["enabled"].as_bool(),
+                kept["max_in_flight"].as_i64(),
+                kept["api_key_set"].as_bool()
+            ),
+            (
+                Some("b"),
+                Some(5),
+                Some(7),
+                Some(false),
+                Some(3),
+                Some(true)
+            ),
+            "{kept}"
+        );
+        let (_, cleared) = put(
+            endpoint_path.clone(),
+            serde_json::json!({ "max_in_flight": null, "api_key": null, "enabled": true }),
+        )
+        .await;
+        assert!(cleared["max_in_flight"].is_null(), "{cleared}");
+        assert_eq!(
+            (
+                cleared["enabled"].as_bool(),
+                cleared["api_key_set"].as_bool(),
+                cleared["weight"].as_i64()
+            ),
+            (Some(true), Some(false), Some(7))
+        );
+        let (status, _) = put(
+            format!("{endpoints}/{}", Uuid::new_v4()),
+            serde_json::json!({ "name": "c" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // -- the model-wide cap --------------------------------------------
+        let model_path = format!("/api/v1/models/{}", model.id);
+        let base = serde_json::json!({ "upstream_model": model.upstream_model, "api_base": "http://127.0.0.1:1/v1" });
+        let with = |extra: serde_json::Value| {
+            let mut body = base.clone();
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            body
+        };
+        let (status, set) = put(
+            model_path.clone(),
+            with(serde_json::json!({ "max_in_flight": 9 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{set}");
+        let (_, kept) = put(model_path.clone(), base.clone()).await;
+        assert_eq!(kept["max_in_flight"].as_i64(), Some(9), "{kept}");
+        let (_, lifted) = put(
+            model_path.clone(),
+            with(serde_json::json!({ "max_in_flight": null })),
+        )
+        .await;
+        assert!(lifted["max_in_flight"].is_null(), "{lifted}");
+        let _ = t.store.delete_model(model.id).await;
+    }
+
     /// Omitting `allowed_countries` from an update keeps the key's list;
-    /// `[]` clears it. On create it defaults to none.
+    /// `[]` or `null` clears it. On create it defaults to none.
     #[test]
     fn allowed_countries_are_optional_on_create_and_update() {
         let create: CreateKey =
@@ -12815,7 +13302,10 @@ mod tests {
         let clear: UpdateKey =
             serde_json::from_value(serde_json::json!({ "name": "lab", "allowed_countries": [] }))
                 .unwrap();
-        assert_eq!(clear.allowed_countries, Some(Vec::new()));
+        assert_eq!(clear.allowed_countries, Some(Some(Vec::new())));
+        let null: UpdateKey =
+            serde_json::from_value(serde_json::json!({ "allowed_countries": null })).unwrap();
+        assert_eq!(null.allowed_countries, Some(None));
     }
 
     /// Allowed countries are validated and normalised on create and update,
@@ -14242,8 +14732,15 @@ mod tests {
             carbon_g_per_kwh: None,
             pue: None,
         };
-        let merged = merge_energy_settings(&existing, &body);
+        let merged = merge_energy_settings(&existing, &body).expect("valid");
         assert!(merged.enabled);
+        let bad = UpdateEnergySettings {
+            pue: Some(0.5),
+            ..UpdateEnergySettings::default()
+        };
+        assert!(
+            matches!(merge_energy_settings(&existing, &bad), Err(AdminError::BadRequest(m)) if m.contains("pue"))
+        );
         assert_eq!(merged.poll_interval_secs, 60); // untouched default
         assert_eq!(merged.energy_cost_per_kwh, 0.15);
         assert_eq!(merged.pue, 1.0);

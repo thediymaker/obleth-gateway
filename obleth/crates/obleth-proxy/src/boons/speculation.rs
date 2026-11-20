@@ -506,10 +506,15 @@ struct Verifier {
     /// Prefill tokens consumed across all scorings, for helper billing.
     billed_input: u32,
     scorings: u32,
+    /// Each call's own bound: after the commit, a stalled scorer ends the
+    /// stream through this instead of leaving it silent.
+    timeout: Duration,
+    /// Largest reply read; a `prompt_logprobs` answer is megabytes for a long prompt.
+    reply_max: usize,
 }
 
 impl Verifier {
-    fn new(model: Arc<ResolvedModel>) -> Self {
+    fn new(model: Arc<ResolvedModel>, s: &SpeculationBoonSettings) -> Self {
         let root = backend_root(&model.api_base);
         Verifier {
             model,
@@ -517,19 +522,34 @@ impl Verifier {
             prefix: None,
             billed_input: 0,
             scorings: 0,
+            timeout: Duration::from_millis(s.verify_timeout_ms.max(1)),
+            reply_max: s.verify_reply_max_bytes.max(1),
         }
     }
 
-    async fn post_json(&self, state: &AppState, url: String, body: Value) -> anyhow::Result<Value> {
-        let mut req = state.http.post(url).json(&body);
-        if let Some(api_key) = &self.model.api_key {
-            req = req.bearer_auth(api_key);
-        }
-        let resp = req.send().await?;
-        if !resp.status().is_success() {
-            anyhow::bail!("verify backend returned {}", resp.status());
-        }
-        Ok(resp.json::<Value>().await?)
+    async fn post_json(
+        &self,
+        http: &reqwest::Client,
+        url: String,
+        body: Value,
+    ) -> anyhow::Result<Value> {
+        let call = async {
+            let bytes = super::post_json_capped(
+                http,
+                url,
+                &reqwest::header::HeaderMap::new(),
+                self.model.api_key.as_deref(),
+                &body,
+                self.reply_max,
+            )
+            .await?;
+            Ok(serde_json::from_slice::<Value>(&bytes)?)
+        };
+        super::with_timeout("speculation verify", self.timeout, call)
+            .await
+            .inspect_err(|e| {
+                tracing::warn!(model = %self.model.model_name, error = %e, "speculation verifier call failed")
+            })
     }
 
     async fn tokenize(&self, state: &AppState, mut body: Value) -> anyhow::Result<Value> {
@@ -539,7 +559,7 @@ impl Verifier {
                 Value::String(self.model.upstream_model.clone()),
             );
         }
-        self.post_json(state, format!("{}/tokenize", self.root), body)
+        self.post_json(&state.http, format!("{}/tokenize", self.root), body)
             .await
     }
 
@@ -620,7 +640,7 @@ impl Verifier {
         for attempt in 0..2u8 {
             let resp = self
                 .post_json(
-                    state,
+                    &state.http,
                     format!("{}/v1/completions", self.root),
                     json!({
                         "model": self.model.upstream_model,
@@ -676,9 +696,10 @@ async fn dispatch_stream(
     if let Some(api_key) = &target.api_key {
         req = req.bearer_auth(api_key);
     }
-    let resp = tokio::time::timeout(timeout, req.send())
-        .await
-        .map_err(|_| anyhow::anyhow!("speculation dispatch timed out"))??;
+    let resp = super::with_timeout("speculation dispatch", timeout, async {
+        Ok(req.send().await?)
+    })
+    .await?;
     if !resp.status().is_success() {
         anyhow::bail!("upstream returned {}", resp.status());
     }
@@ -920,7 +941,7 @@ pub async fn run(
         .get("max_tokens")
         .and_then(|v| v.as_u64())
         .filter(|v| *v > 0);
-    let mut verifier = Verifier::new(verifier_model);
+    let mut verifier = Verifier::new(verifier_model, s);
 
     if plan.client_stream {
         return match tokio::time::timeout(
@@ -1682,6 +1703,44 @@ mod tests {
         route.verify_upstream_model = String::new();
         let v = scoring_route(&route, "").expect("scoring endpoint set");
         assert_eq!(v.upstream_model, "glm-5-3-mxfp4");
+    }
+
+    /// A scorer that accepts the call and never answers: after a draft is
+    /// committed this is what would leave the client's stream silent, so the
+    /// verifier's own bound ends the call, as a typed timeout, within it.
+    #[tokio::test]
+    async fn a_stalled_scorer_is_cut_off_by_the_verifiers_own_bound() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hold = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(socket);
+        });
+        let mut route = target("glm-5-3");
+        route.verify_api_base = format!("http://{addr}/v1");
+        let scorer = scoring_route(&route, "").expect("scoring endpoint set");
+        let s = SpeculationBoonSettings {
+            verify_timeout_ms: 150,
+            ..settings()
+        };
+        let verifier = Verifier::new(scorer, &s);
+        let started = Instant::now();
+        let err = verifier
+            .post_json(
+                &reqwest::Client::new(),
+                format!("{}/tokenize", verifier.root),
+                json!({"prompt": "hi"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(crate::boons::HelperTimeout::is(&err), "{err:#}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        hold.abort();
     }
 
     fn settings() -> SpeculationBoonSettings {

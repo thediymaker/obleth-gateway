@@ -1,6 +1,6 @@
 import { obleth, type AuditEntry, type CacheStats, type RouterReadinessView, type UsageModelAgg, type UsageTimePoint } from "@/lib/obleth";
 import { EMPTY_OVERVIEW_SUMMARY, fetchOverviewSummary, type OverviewSummary } from "@/lib/overview-summary";
-import { RANGE_BUCKET_MS, RANGE_MS, previousTotals, type OverviewRange } from "@/lib/overview-model";
+import { RANGE_BUCKET_MS, RANGE_MS, type OverviewRange } from "@/lib/overview-model";
 import { safe } from "@/lib/safe";
 
 export const TOP_TENANTS = 5;
@@ -20,7 +20,7 @@ export interface OverviewWindow {
   now: number;
   summary: OverviewSummary;
   /** The window before, for the "vs yesterday" comparisons. Null when the read failed. */
-  previous: ReturnType<typeof previousTotals> | null;
+  previous: OverviewSummary | null;
   /** One read spanning the current and the previous window, split client-side. */
   series: UsageTimePoint[];
   models: UsageModelAgg[];
@@ -40,9 +40,9 @@ export interface OverviewContext {
 export async function loadOverviewWindow(range: OverviewRange, now = Date.now()): Promise<OverviewWindow> {
   const since = now - RANGE_MS[range];
   const twoWindows = now - 2 * RANGE_MS[range];
-  const [summary, both, series, models, usage, tenants, cache] = await Promise.all([
+  const [summary, previous, series, models, usage, tenants, cache] = await Promise.all([
     safe(fetchOverviewSummary(since), EMPTY_OVERVIEW_SUMMARY),
-    safe(fetchOverviewSummary(twoWindows).then((s) => s as OverviewSummary | null), null),
+    safe(fetchOverviewSummary(twoWindows, since).then((s) => s as OverviewSummary | null), null),
     safe(obleth.usageSeries(RANGE_BUCKET_MS[range], twoWindows), []),
     safe(obleth.usageByModel({ sinceMs: since }), []),
     safe(obleth.usage({ sinceMs: since }), []),
@@ -65,7 +65,7 @@ export async function loadOverviewWindow(range: OverviewRange, now = Date.now())
     range,
     now,
     summary,
-    previous: both ? previousTotals(summary, both) : null,
+    previous,
     series,
     models,
     tenants: rows.slice(0, TOP_TENANTS),

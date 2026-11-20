@@ -663,14 +663,14 @@ fn sanitize_generation_error(e: &anyhow::Error) -> String {
         }
         return "request failed".to_string();
     }
-    // Not a `reqwest::Error`: one of the two ad-hoc `anyhow::bail!` messages
-    // raised directly in `generate()`, both already address-free.
+    if super::HelperTimeout::is(e) {
+        return "timed out".to_string();
+    }
+    // Not a `reqwest::Error`: the one ad-hoc message raised in `generate()`,
+    // already address-free.
     let msg = e.to_string();
     if msg.starts_with("upstream returned ") {
         return msg;
-    }
-    if msg.contains("timed out") {
-        return "timed out".to_string();
     }
     "request failed".to_string()
 }
@@ -684,24 +684,18 @@ async fn generate(
 ) -> anyhow::Result<Value> {
     let fut = async {
         let target = super::helper_target(model, "", None)?;
-        let mut req = http
-            .post(build_images_url(&target.base))
-            .headers(target.headers.clone())
-            .json(&body);
-        if let Some(api_key) = &target.api_key {
-            req = req.bearer_auth(api_key);
-        }
-        let resp = req.send().await?;
-        if !resp.status().is_success() {
-            anyhow::bail!("upstream returned {}", resp.status());
-        }
-        let bytes = super::read_body_capped(resp, IMAGE_BODY_MAX_BYTES).await?;
+        let bytes = super::post_json_capped(
+            http,
+            build_images_url(&target.base),
+            &target.headers,
+            target.api_key.as_deref(),
+            &body,
+            IMAGE_BODY_MAX_BYTES,
+        )
+        .await?;
         Ok(serde_json::from_slice::<Value>(&bytes)?)
     };
-    match tokio::time::timeout(timeout, fut).await {
-        Ok(result) => result,
-        Err(_) => anyhow::bail!("image generation timed out after {timeout:?}"),
-    }
+    super::with_timeout("image generation", timeout, fut).await
 }
 
 #[cfg(test)]
@@ -1185,9 +1179,14 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_generation_error_maps_the_bail_timeout_message() {
-        let e = anyhow::anyhow!("image generation timed out after 30s");
+    fn sanitize_generation_error_maps_the_typed_timeout() {
+        let e = anyhow::Error::from(super::super::HelperTimeout {
+            what: "image generation".into(),
+            after: Duration::from_secs(30),
+        });
         assert_eq!(sanitize_generation_error(&e), "timed out");
+        let plain = anyhow::anyhow!("something that merely says timed out");
+        assert_eq!(sanitize_generation_error(&plain), "request failed");
     }
 
     #[tokio::test]

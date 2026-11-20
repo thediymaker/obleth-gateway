@@ -1,6 +1,7 @@
 import type { GatewayChatBody } from "@/lib/charo/gateway";
 import type { StepOutcome } from "./types";
 import { summarizeStep, type Sample } from "./stats";
+import { deltaText, readUpstreamSse } from "@/lib/charo/relay";
 
 type Gateway = (body: GatewayChatBody, signal?: AbortSignal) => Promise<Response>;
 
@@ -22,30 +23,12 @@ export async function runOneRequest(
     if (res.status === 429) { await res.body?.cancel().catch(() => {}); return { status: 429, ttfbMs: 0, totalMs: Date.now() - start, inTokens: 0, outTokens: 0 }; }
     if (!res.ok || !res.body) { await res.body?.cancel().catch(() => {}); return { status: res.status || 599, ttfbMs: 0, totalMs: Date.now() - start, inTokens: 0, outTokens: 0 }; }
 
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "", ttfbMs = 0, outTokens = 0;
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      let sep: number;
-      while ((sep = buffer.indexOf("\n\n")) !== -1) {
-        const frame = buffer.slice(0, sep); buffer = buffer.slice(sep + 2);
-        for (const line of frame.split("\n")) {
-          const t = line.trim();
-          if (!t.startsWith("data:")) continue;
-          const payload = t.slice(5).trim();
-          if (payload === "[DONE]") continue;
-          let chunk: unknown; try { chunk = JSON.parse(payload); } catch { continue; }
-          const content = (chunk as { choices?: Array<{ delta?: { content?: unknown } }> }).choices?.[0]?.delta?.content;
-          if (typeof content === "string" && content.length) {
-            if (ttfbMs === 0) ttfbMs = Date.now() - start;
-            outTokens += 1; // coarse token proxy: one delta ≈ one token
-          }
-        }
-      }
-    }
+    let ttfbMs = 0, outTokens = 0;
+    await readUpstreamSse(res, (chunk) => {
+      if (!deltaText(chunk)) return;
+      if (ttfbMs === 0) ttfbMs = Date.now() - start;
+      outTokens += 1; // coarse token proxy: one delta ≈ one token
+    });
     return { status: 200, ttfbMs: ttfbMs || Date.now() - start, totalMs: Date.now() - start, inTokens: 0, outTokens };
   } catch (e) {
     if (signal.aborted) return { status: 499, ttfbMs: 0, totalMs: Date.now() - start, inTokens: 0, outTokens: 0 };

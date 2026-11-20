@@ -7,6 +7,7 @@ import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { ChevronDown, ChevronRight, RefreshCw, Search } from "lucide-react";
 import { Kpi, Panel, PanelLink, Segmented } from "@/components/overview/ui";
 import { Input } from "@/components/ui/input";
+import { ListFooter } from "@/components/ui/list-footer";
 import { Select } from "@/components/ui/select";
 import {
   countryLabel,
@@ -196,6 +197,7 @@ export function KeyAccessView({
   const [onlyNew, setOnlyNew] = useState(false);
   const [openKey, setOpenKey] = useState<string | null>(null);
   const [shown, setShown] = useState(PAGE);
+  const [refusalsShown, setRefusalsShown] = useState(PAGE);
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 30_000);
@@ -247,10 +249,10 @@ export function KeyAccessView({
             aria-label="Tenant"
             className="h-[34px] w-56"
             value={tenant}
-            onValueChange={(v) => { setTenant(v); setShown(PAGE); }}
+            onValueChange={(v) => { setTenant(v); setShown(PAGE); setRefusalsShown(PAGE); }}
             options={[{ value: "", label: "All tenants" }, ...tenants.map((t) => ({ value: t.id, label: t.name }))]}
           />
-          <Segmented label="Time range" value={range} onChange={(v) => { setRange(v); setShown(PAGE); }} options={KEY_ACCESS_RANGES.map((r) => ({ value: r.id, label: r.label }))} />
+          <Segmented label="Time range" value={range} onChange={(v) => { setRange(v); setShown(PAGE); setRefusalsShown(PAGE); }} options={KEY_ACCESS_RANGES.map((r) => ({ value: r.id, label: r.label }))} />
           <button type="button" onClick={() => void query.refetch()} aria-label="Refresh" title="Refresh" className="flex h-[34px] w-[34px] items-center justify-center rounded-lg border border-border text-muted-foreground hover:bg-accent hover:text-foreground">
             <RefreshCw className={cn("h-3.5 w-3.5", query.isFetching && "animate-spin")} />
           </button>
@@ -329,11 +331,7 @@ export function KeyAccessView({
                   <KeyRow key={row.keyId} row={row} range={range} now={now} open={openKey === row.keyId} onToggle={() => setOpenKey(openKey === row.keyId ? null : row.keyId)} />
                 ))}
               </ul>
-              {visible.length > shown && (
-                <button type="button" onClick={() => setShown(shown + PAGE)} className="block w-full border-t border-border px-[18px] py-[9px] text-left text-[13px] text-muted-foreground hover:text-foreground">
-                  Show {Math.min(PAGE, visible.length - shown)} more of {visible.length - shown}
-                </button>
-              )}
+              <TableFooter total={visible.length} shown={shown} noun="keys" onMore={() => setShown(shown + PAGE)} />
             </div>
           </div>
         )}
@@ -359,7 +357,7 @@ export function KeyAccessView({
                 </tr>
               </thead>
               <tbody>
-                {refusals.slice(0, 200).map((r) => (
+                {refusals.slice(0, refusalsShown).map((r) => (
                   <tr key={`${r.key_id}:${r.reason}:${r.client_ip}:${r.client_country}`} className="border-t border-border">
                     <td className="px-[18px] py-[9px]">
                       <Link href={`/keys?key=${r.key_id}`} className="font-medium underline-offset-2 hover:underline">{r.key_name || `${r.key_id.slice(0, 8)}…`}</Link>
@@ -378,9 +376,15 @@ export function KeyAccessView({
                 ))}
               </tbody>
             </table>
+            <TableFooter total={refusals.length} shown={refusalsShown} noun="refusals" onMore={() => setRefusalsShown(refusalsShown + PAGE)} />
           </div>
         )}
       </Panel>
     </div>
   );
+}
+
+/** A table paged in the browser: how many of its rows show, and the next page. */
+function TableFooter({ total, shown, noun, onMore }: { total: number; shown: number; noun: string; onMore: () => void }) {
+  return <ListFooter shown={Math.min(shown, total)} total={total} noun={noun} more={total > shown} onMore={onMore} action={`Show ${Math.min(PAGE, total - shown)} more`} />;
 }

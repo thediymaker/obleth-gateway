@@ -24,7 +24,9 @@ import {
   buildChart,
   change,
   daysBetween,
+  dayLabel,
   isoDay,
+  pickedDay,
   MEASURES,
   presetRange,
   previousRange,
@@ -42,6 +44,7 @@ import {
 } from "@/lib/reports-model";
 import { toBreakdownRows } from "@/lib/usage-breakdown";
 import { cn, getJson } from "@/lib/utils";
+import { ReadNotice, readFailed, ReadFailedNote, readProblem } from "@/components/ui/read-state";
 
 const PREVIOUS = "hsl(240 4% 46%)";
 
@@ -84,7 +87,7 @@ function ChartTip({ active, payload, label, measure, series }: { active?: boolea
   const row = payload[0].payload;
   return (
     <div className="min-w-48 rounded-lg border border-border bg-[hsl(240_5%_9%)] px-3 py-2 text-xs shadow-xl">
-      <p className="mb-1.5 font-mono text-muted-foreground">{label}</p>
+      <p className="mb-1.5 font-mono text-muted-foreground">{String(row.label ?? label)}</p>
       {series.length ? (
         series.map((s) => (
           <div key={s.id} className="flex justify-between gap-6">
@@ -118,7 +121,7 @@ export function ReportsDashboard({ tenants, keys, models, retentionDays = null, 
 
   const router = useRouter();
   const range: DayRange | null = preset === "custom"
-    ? custom?.from ? { start: isoDay(custom.from), end: isoDay(custom.to ?? custom.from) } : null
+    ? custom?.from ? { start: pickedDay(custom.from), end: pickedDay(custom.to ?? custom.from) } : null
     : presetRange(preset);
   const prev = range ? previousRange(range, preset) : null;
   const filters = { tenantId, keyId, model };
@@ -146,7 +149,9 @@ export function ReportsDashboard({ tenants, keys, models, retentionDays = null, 
 
   const labelFor = (r: UsageDailyRow) => (split === "tenant" ? names.tenantNames.get(r.tenant_id) ?? "Deleted team" : r.model || "(unknown)");
   const chart = range ? buildChart(range, measure, split, days.data ?? [], prev && prevDays.data ? { range: prev, rows: prevDays.data } : null, splitRows.data ?? [], labelFor) : { days: [], series: [] };
-  const chartRows = chart.days.map((d) => ({ label: new Date(`${d.day}T00:00`).toLocaleDateString([], { month: "short", day: "numeric" }), value: d.value, previous: d.previous, ...d.parts }));
+  // The newest day is still filling up until 00:00 UTC.
+  const today = isoDay(new Date());
+  const chartRows = chart.days.map((d) => ({ label: `${dayLabel(d.day)} UTC${d.day === today ? ", so far" : ""}`, tick: dayLabel(d.day), value: d.value, previous: d.previous, ...d.parts }));
   const chartEmpty = chart.days.every((d) => !d.value);
 
   const teamRank = [...(teams.data ?? [])].sort((a, b) => b.cost_usd - a.cost_usd);
@@ -201,6 +206,7 @@ export function ReportsDashboard({ tenants, keys, models, retentionDays = null, 
           <p className="mt-1 text-[13px] text-muted-foreground">
             {range ? `${rangeLabel(range)} · ${filterLine}${prev ? ` · compared with ${rangeLabel(prev)}` : ""}` : "Pick the days to report on"}
           </p>
+          <ReadNotice query={days} what="these days' usage" />
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <Segmented<RangePreset> label="Date range" value={preset} onChange={(v) => { setPreset(v); if (v === "custom") setPicker(true); }} options={RANGE_PRESETS.map((r) => ({ value: r.value, label: r.value === "custom" && preset === "custom" && range ? rangeLabel(range) : r.label }))} />
@@ -242,7 +248,7 @@ export function ReportsDashboard({ tenants, keys, models, retentionDays = null, 
 
       <Panel
         label="Usage over time"
-        title={`${MEASURES.find((m) => m.value === measure)!.label} per day`}
+        title={`${MEASURES.find((m) => m.value === measure)!.label} per UTC day`}
         subtitle={`${chart.series.length ? `Split by ${split === "tenant" ? "team" : "model"}: the four largest, then the rest` : measure === "ttft" ? "Average per day; the dashed line is the same day in the previous period" : "Bars are this period; the dashed line is the same day in the previous period"} · click a day for its requests`}
         action={
           <div className="flex flex-wrap items-center gap-2">
@@ -252,7 +258,9 @@ export function ReportsDashboard({ tenants, keys, models, retentionDays = null, 
         }
       >
         <div className="px-[18px] pb-4 pt-3">
-          {days.isLoading ? (
+          {readFailed(days) ? (
+            <ReadFailedNote query={days} what="these days' usage" className="flex h-[260px] items-center justify-center" />
+          ) : days.isLoading ? (
             <div className="skeleton h-[260px] rounded-lg" />
           ) : chartEmpty ? (
             <div className="flex h-[260px] items-center justify-center rounded-lg border border-dashed border-border text-sm text-muted-foreground">No usage in these days</div>
@@ -270,7 +278,7 @@ export function ReportsDashboard({ tenants, keys, models, retentionDays = null, 
                   }}
                 >
                   <CartesianGrid {...chartGrid} vertical={false} />
-                  <XAxis dataKey="label" tick={axisTick} axisLine={false} tickLine={false} minTickGap={24} height={20} />
+                  <XAxis dataKey="tick" tick={axisTick} axisLine={false} tickLine={false} minTickGap={24} height={20} />
                   <YAxis tick={axisTick} axisLine={false} tickLine={false} width={52} tickFormatter={(v: number) => (measure === "spend" ? `$${compactAxis(v)}` : measure === "ttft" ? formatMs(v) : compactAxis(v))} />
                   <Tooltip cursor={{ fill: "hsl(240 4% 16% / 0.5)" }} content={<ChartTip measure={measure} series={chart.series} />} />
                   {chart.series.length ? (
@@ -299,7 +307,7 @@ export function ReportsDashboard({ tenants, keys, models, retentionDays = null, 
       <div className="grid gap-4 lg:grid-cols-2">
         <Panel title="Teams by spend" subtitle="Click a team to see only its usage">
           <div className="px-[18px] pb-2 pt-2">
-            {teamRank.length === 0 ? <p className="py-6 text-center text-xs text-muted-foreground">{teams.isLoading ? "Loading…" : "No usage in these days."}</p> : (
+            {teamRank.length === 0 ? <p className="py-6 text-center text-xs text-muted-foreground">{readFailed(teams) ? readProblem(teams, "the teams' usage") : teams.isLoading ? "Loading…" : "No usage in these days."}</p> : (
               <>
                 {teamRank.slice(0, 6).map((r) => (
                   <button key={r.tenant_id} type="button" onClick={() => { setTenantId(r.tenant_id); setKeyId(""); }} className="grid w-full grid-cols-[minmax(0,1fr)_120px_72px_40px] items-center gap-3 border-t border-border/70 py-2 text-left text-[13px] first:border-t-0 hover:text-foreground">
@@ -316,7 +324,7 @@ export function ReportsDashboard({ tenants, keys, models, retentionDays = null, 
         </Panel>
         <Panel title="Models by tokens" subtitle="Spend beside each">
           <div className="px-[18px] pb-2 pt-2">
-            {modelRank.length === 0 ? <p className="py-6 text-center text-xs text-muted-foreground">{modelRows.isLoading ? "Loading…" : "No usage in these days."}</p> : (
+            {modelRank.length === 0 ? <p className="py-6 text-center text-xs text-muted-foreground">{readFailed(modelRows) ? readProblem(modelRows, "the models' usage") : modelRows.isLoading ? "Loading…" : "No usage in these days."}</p> : (
               <>
                 {modelRank.slice(0, 6).map((r) => (
                   <button key={r.model} type="button" onClick={() => setModel(r.model)} className="grid w-full grid-cols-[minmax(0,1fr)_120px_64px_56px] items-center gap-3 border-t border-border/70 py-2 text-left text-[13px] first:border-t-0 hover:text-foreground">
@@ -399,7 +407,7 @@ export function ReportsDashboard({ tenants, keys, models, retentionDays = null, 
                 );
               })}
               {labeled.length === 0 && (
-                <tr><td colSpan={9} className="py-10 text-center text-muted-foreground">{table.isLoading ? "Loading…" : q ? `No ${groupInfo.plural} match “${rowFilter}”.` : "No usage in these days."}</td></tr>
+                <tr><td colSpan={9} className="py-10 text-center text-muted-foreground">{readFailed(table) ? readProblem(table, "the breakdown") : table.isLoading ? "Loading…" : q ? `No ${groupInfo.plural} match “${rowFilter}”.` : "No usage in these days."}</td></tr>
               )}
             </tbody>
             {labeled.length > 0 && (

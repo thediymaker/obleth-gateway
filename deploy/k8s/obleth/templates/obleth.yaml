@@ -104,6 +104,8 @@ spec:
             - { name: OBLETH_UPSTREAM_READ_TIMEOUT_SECS, value: {{ .Values.obleth.upstreamReadTimeoutSecs | quote }} }
             - { name: OBLETH_REDIS_RESPONSE_TIMEOUT_MS, value: {{ .Values.obleth.redisResponseTimeoutMs | quote }} }
             - { name: OBLETH_REDIS_CONNECT_TIMEOUT_MS, value: {{ .Values.obleth.redisConnectTimeoutMs | quote }} }
+            - { name: OBLETH_PG_MAX_CONNECTIONS, value: {{ .Values.obleth.pgMaxConnections | default 10 | quote }} }
+            - { name: OBLETH_PG_ACQUIRE_TIMEOUT_SECS, value: {{ .Values.obleth.pgAcquireTimeoutSecs | default 5 | quote }} }
             - { name: OBLETH_ADMISSION_TIMEOUT_SECS, value: {{ .Values.obleth.admissionTimeoutSecs | quote }} }
             - { name: OBLETH_VIDEO_JOB_RETENTION_HOURS, value: {{ .Values.obleth.videoJobRetentionHours | quote }} }
             - { name: OBLETH_VIDEO_JOB_SCOPE, value: {{ .Values.obleth.videoJobScope | default "key" | quote }} }

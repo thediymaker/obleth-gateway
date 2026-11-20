@@ -129,10 +129,7 @@ pub(super) async fn apply(
                     session_id,
                     request_id,
                     "vision_boon",
-                    crate::proxy::UpstreamUsage::uncached(
-                        result.input_tokens,
-                        result.output_tokens,
-                    ),
+                    result.usage,
                 );
                 let text = result.text.trim().to_string();
                 if cfg.cache_ttl_secs > 0 {

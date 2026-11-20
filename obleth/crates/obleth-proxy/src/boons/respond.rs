@@ -157,7 +157,7 @@ async fn enforce_schema(
                     session_id,
                     request_id,
                     "structured_output_boon",
-                    crate::proxy::UpstreamUsage::uncached(reply.input_tokens, reply.output_tokens),
+                    reply.usage,
                 );
                 match check(plan.schema.as_ref(), &reply.text) {
                     Ok(canonical) => return Some(canonical),

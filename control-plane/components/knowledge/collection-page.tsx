@@ -18,6 +18,7 @@ import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Select } from "@/components/ui/select";
+import { actionError } from "@/lib/action-result";
 import { formatBytes } from "@/lib/format";
 import { COLLECTION_STATUS_LABEL, collectionGlyph, collectionHref, collectionStatus, injectionSkipReason, retrievalUse } from "@/lib/knowledge-format";
 import { modelHref } from "@/lib/models-model";
@@ -33,14 +34,13 @@ function docMark(d: KnowledgeDocument) {
   return <StatusMark label={d.status === "pending" ? "Queued" : d.reindex_requested ? "Reindex queued" : "Indexing"} glyph="half" />;
 }
 
+/** A change to the collection; null when done, or why it failed. */
 async function call(url: string, method: string, body?: unknown): Promise<string | null> {
   try {
-    const res = await fetch(url, { method, headers: body ? { "Content-Type": "application/json" } : undefined, body: body ? JSON.stringify(body) : undefined });
-    if (res.ok) return null;
-    const b = await res.json().catch(() => null);
-    return (b && typeof b.error === "string" && b.error) || `That didn't work (HTTP ${res.status}).`;
+    await getJson(url, { method, headers: body ? { "Content-Type": "application/json" } : undefined, body: body ? JSON.stringify(body) : undefined });
+    return null;
   } catch (e) {
-    return e instanceof Error ? e.message : String(e);
+    return actionError(e).error;
   }
 }
 

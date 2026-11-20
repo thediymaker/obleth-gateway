@@ -1,20 +1,10 @@
-import { NextRequest, NextResponse } from "next/server";
 import { obleth } from "@/lib/obleth";
-import { guardAdmin } from "@/lib/auth/guard";
+import { liveRoute, RouteError } from "@/lib/auth/guard";
+import { numParam, strParam } from "@/lib/log-params";
 
-export async function GET(req: NextRequest) {
-  const denied = await guardAdmin();
-  if (denied) return denied;
-  try {
-    const model = req.nextUrl.searchParams.get("model") ?? "";
-    if (!model) {
-      return NextResponse.json({ error: "model is required" }, { status: 400 });
-    }
-    const bucketMs = Number(req.nextUrl.searchParams.get("bucket_ms") ?? 60_000);
-    const sinceMs = Number(req.nextUrl.searchParams.get("since_ms") ?? Date.now() - 3_600_000);
-    const series = await obleth.usageSeriesByModel(model, bucketMs, sinceMs);
-    return NextResponse.json(series);
-  } catch (e) {
-    return NextResponse.json({ error: String(e) }, { status: 502 });
-  }
-}
+export const GET = liveRoute((req) => {
+  const p = req.nextUrl.searchParams;
+  const model = strParam(p, "model");
+  if (!model) throw new RouteError(400, "model is required");
+  return obleth.usageSeriesByModel(model, numParam(p, "bucket_ms", 60_000), numParam(p, "since_ms", Date.now() - 3_600_000));
+});

@@ -13,9 +13,9 @@ function isoDay(ms: number) {
 export async function loadTenantOverview(id: string, now = Date.now()): Promise<TenantOverviewData> {
   const start = isoDay(now - 29 * DAY_MS);
   const end = isoDay(now);
-  const [today, both, histogram, facets, days, models, keys, audit] = await Promise.all([
+  const [today, yesterday, histogram, facets, days, models, keys, audit] = await Promise.all([
     safe(obleth.usage({ sinceMs: now - DAY_MS, tenantId: id }), [] as UsageAgg[]),
-    safe(obleth.usage({ sinceMs: now - 2 * DAY_MS, tenantId: id }).then((u) => u as UsageAgg[] | null), null),
+    safe(obleth.usage({ sinceMs: now - 2 * DAY_MS, untilMs: now - DAY_MS, tenantId: id }).then((u) => u as UsageAgg[] | null), null),
     safe(obleth.usageLogHistogram({ tenantId: id, sinceMs: now - DAY_MS, bucketMs: 3_600_000 }), null),
     safe(obleth.usageLogFacets({ tenantId: id, status: "error", sinceMs: now - DAY_MS }), null),
     safe(obleth.usageDaily({ startDay: start, endDay: end, groupBy: "day", tenantId: id }), [] as UsageDailyRow[]),
@@ -25,13 +25,10 @@ export async function loadTenantOverview(id: string, now = Date.now()): Promise<
   ]);
   // Scoped reads: one row (or none) each, and the audit log answers from its
   // entity index however long ago this tenant last changed.
-  const mine = today[0];
-  const total = both?.[0];
-  const requests24h = Number(mine?.requests ?? 0);
   return {
     now,
-    requests24h,
-    previous24h: both ? Math.max(0, Number(total?.requests ?? 0) - requests24h) : null,
+    requests24h: Number(today[0]?.requests ?? 0),
+    previous24h: yesterday ? Number(yesterday[0]?.requests ?? 0) : null,
     failed24h: (histogram?.buckets ?? []).reduce((n, b) => n + Number(b.errors), 0),
     topFailure: facets?.failures?.[0] ?? null,
     days: fillDays(

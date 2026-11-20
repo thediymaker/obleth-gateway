@@ -67,7 +67,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ---- connect dependencies (with simple boot-time retries) ----
-    let store = retry("postgres", || Store::connect(&cfg.database_url)).await?;
+    let store = retry("postgres", || {
+        Store::connect_with(&cfg.database_url, cfg.pg_pool)
+    })
+    .await?;
     store.migrate().await?;
     // Provision the reserved control-plane identity (Charo) — idempotent.
     store.ensure_control_plane_identity().await?;
@@ -656,7 +659,12 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // ---- admin (Management API) ----
-    let clickhouse_read = build_clickhouse(&cfg);
+    // Every Management API read stops at one execution cap; ingest keeps its
+    // own client without one.
+    let clickhouse_read = build_clickhouse(&cfg).with_option(
+        "max_execution_time",
+        obleth_admin::READ_MAX_EXECUTION_SECS.to_string(),
+    );
     let health_runtime = obleth_admin::ModelHealthRuntime {
         scheduled_enabled: cfg.model_health_enabled,
         default_interval_secs: cfg.model_health_interval_secs as i64,

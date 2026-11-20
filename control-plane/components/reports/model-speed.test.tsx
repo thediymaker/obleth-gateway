@@ -23,9 +23,9 @@ beforeEach(() => {
   vi.stubGlobal("fetch", vi.fn(async (url: string) => {
     calls.push(url);
     const p = new URL(url, "http://x").searchParams;
-    const previous = Number(p.get("since_ms")) < new Date(2026, 9, 1).getTime();
+    const previous = Number(p.get("since_ms")) < Date.UTC(2026, 9, 1);
     const body = p.get("bucket") !== "none"
-      ? [point({ bucket_ms: new Date(2026, 9, 2).getTime(), model: "glm-5-3", gen_tokens_per_sec: 30 })]
+      ? [point({ bucket_ms: Date.UTC(2026, 9, 2), model: "glm-5-3", gen_tokens_per_sec: 30 })]
       : previous
         ? [point({ model: "glm-5-3", gen_tokens_per_sec: 60 }), point({ model: "muse", gen_tokens_per_sec: 80 })]
         : [point({ model: "glm-5-3", gen_tokens_per_sec: 30 }), point({ model: "muse", gen_tokens_per_sec: 82, rated: 300 }), point({ model: "embed", rated: 0 })];
@@ -65,11 +65,14 @@ async function render(model = "", modelTypes: Record<string, string> = {}) {
 }
 
 describe("ModelSpeed", () => {
-  it("asks for the range, the period before, and the days in the reader's zone", async () => {
+  it("asks for the range, the period before, and UTC days", async () => {
     await render();
     const buckets = calls.map((u) => new URL(u, "http://x").searchParams.get("bucket"));
     expect(buckets.sort()).toEqual(["day", "none", "none"]);
-    expect(calls.find((u) => u.includes("bucket=day"))).toContain("tz=");
+    const days = new URL(calls.find((u) => u.includes("bucket=day"))!, "http://x").searchParams;
+    expect(days.get("tz")).toBeNull();
+    expect(Number(days.get("since_ms"))).toBe(Date.UTC(2026, 9, 1));
+    expect(Number(days.get("until_ms"))).toBe(Date.UTC(2026, 9, 8));
   });
 
   it("lists models that produced tokens, busiest first, and calls out one that slowed down", async () => {
@@ -107,5 +110,14 @@ describe("ModelSpeed", () => {
     expect(calls.every((u) => u.includes("model=glm-5-3"))).toBe(true);
     expect(host.textContent).toContain("How fast glm-5-3 answered");
     expect(host.textContent).toContain("Down to the slowest tenth");
+  });
+});
+
+describe("ModelSpeed when the gateway can't be read", () => {
+  it("says it can't read the speed instead of no requests", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: false, status: 502, json: async () => ({}) }) as Response));
+    await render();
+    expect(host.textContent).toContain("Can't read the models' speed right now");
+    expect(host.textContent).not.toContain("No token-producing requests");
   });
 });

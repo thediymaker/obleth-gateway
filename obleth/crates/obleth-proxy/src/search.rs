@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::{header, HeaderValue, Request, Response, StatusCode};
+use axum::http::{HeaderValue, Request, Response, StatusCode};
 use axum::response::IntoResponse;
 use obleth_config::{routing::Candidate, ResolvedKey, ResolvedModel, SEARCH_MODEL_TYPE};
 use obleth_tokenizer::CostEstimate;
@@ -34,8 +34,8 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::proxy::{
-    self, build_targets, effective_admission_weight, error_json, finalize, gate_resolved_key,
-    reject, resolve_conversation, resolve_model, surfaced_request_type, FinalizeOutcome, Rejection,
+    self, build_targets, effective_admission_weight, error_json, finalize, reject,
+    resolve_conversation, resolve_model, surfaced_request_type, FinalizeOutcome, Rejection,
     RequestMeta,
 };
 use crate::state::AppState;
@@ -110,8 +110,8 @@ pub async fn tools(
         return error_json(StatusCode::NOT_FOUND, "not found");
     }
     let client = crate::client::ClientInfo::of(req.extensions());
-    let resolved = match authenticate(&state, req.headers(), &client).await {
-        Ok((resolved, _)) => resolved,
+    let resolved = match proxy::authenticate_and_gate(&state, req.headers(), &client).await {
+        Ok(cred) => cred.resolved,
         Err(resp) => return resp,
     };
     let data: Vec<Value> = tool_names(
@@ -134,31 +134,7 @@ async fn with_request_id(
     req: Request<Body>,
 ) -> Response<Body> {
     let request_id = Uuid::new_v4();
-    let mut resp = handle(&state, tool, req, request_id).await;
-    if let Ok(value) = HeaderValue::from_str(&request_id.to_string()) {
-        resp.headers_mut()
-            .entry("x-obleth-request-id")
-            .or_insert(value);
-    }
-    resp
-}
-
-/// Bearer auth and the post-auth key gates, as on every endpoint. Returns the
-/// key and the device id of an identity credential.
-// The error is the finished response the caller returns as is, like
-// `gate_resolved_key`'s.
-#[allow(clippy::result_large_err)]
-async fn authenticate(
-    state: &AppState,
-    headers: &axum::http::HeaderMap,
-    client: &crate::client::ClientInfo,
-) -> Result<(Arc<ResolvedKey>, String), Response<Body>> {
-    let Some(secret) = proxy::bearer(headers) else {
-        return Err(error_json(StatusCode::UNAUTHORIZED, "missing bearer token"));
-    };
-    let cred = crate::jwt_auth::authenticate_credential(state, &secret).await?;
-    gate_resolved_key(state, &cred.resolved, client)?;
-    Ok((cred.resolved, cred.device_id))
+    proxy::with_request_id(handle(&state, tool, req, request_id).await, request_id)
 }
 
 async fn handle(
@@ -168,13 +144,30 @@ async fn handle(
     request_id: Uuid,
 ) -> Response<Body> {
     let started = Instant::now();
+    let proxy_start_ms = crate::tracer::now_ms();
     let (parts, body) = req.into_parts();
     let headers = parts.headers;
     let client = crate::client::ClientInfo::of(&parts.extensions);
-    let (resolved, device_id) = match authenticate(state, &headers, &client).await {
-        Ok(auth) => auth,
+    let auth_start = crate::tracer::now_ms();
+    let (resolved, device_id) = match proxy::authenticate_and_gate(state, &headers, &client).await {
+        Ok(cred) => (cred.resolved, cred.device_id),
         Err(resp) => return resp,
     };
+    // Traced like the pipeline: the auth and admission spans, finished when
+    // the answer is built.
+    let mut tracer = resolved.tracing_enabled.then(|| {
+        let mut t =
+            crate::tracer::SpanRecorder::new(request_id, proxy_start_ms, state.telemetry.clone());
+        t.record(
+            "auth_resolve",
+            "proxy_request",
+            auth_start,
+            (crate::tracer::now_ms() - auth_start) as u32,
+            "ok",
+            json!({ "tenant": resolved.tenant_name }),
+        );
+        t
+    });
 
     let body = match axum::body::to_bytes(body, BODY_MAX).await {
         Ok(b) => b,
@@ -261,28 +254,22 @@ async fn handle(
         estimated_output_tokens: 0,
     };
     let weight = effective_admission_weight(resolved.weight, Some(&route));
-    let admit = state.fairshare.admit(proxy::admit_request_for(
-        &resolved,
-        &model,
-        Some(&route),
-        weight,
-        0,
-        end_user.as_deref(),
-    ));
-    let admitted = match tokio::time::timeout(proxy::admission_timeout(), admit).await {
-        Ok(Some(a)) => a,
-        Ok(None) => {
-            state.alerts.issue(
-                "scheduler_unavailable",
-                "Fairshare scheduler unavailable",
-                format!(
-                    "tenant `{}` model `{model}` path `{SEARCH_PATH}`",
-                    resolved.tenant_name
-                ),
-            );
-            return error_json(StatusCode::SERVICE_UNAVAILABLE, "scheduler unavailable");
-        }
-        Err(_) => {
+    let admitted = match Box::pin(proxy::admit(
+        state,
+        proxy::Admit {
+            resolved: &resolved,
+            model: &model,
+            route: Some(&route),
+            weight,
+            cost: 0,
+            end_user: end_user.as_deref(),
+            batch: None,
+            session_id: None,
+            path: SEARCH_PATH,
+        },
+        tracer.as_mut(),
+        json!({}),
+        |queued_ms| {
             reject(
                 state,
                 request_id,
@@ -294,25 +281,21 @@ async fn handle(
                     since: started,
                     est,
                     cache_status: "off",
-                    queue_wait_ms: started.elapsed().as_millis() as u32,
+                    queue_wait_ms: queued_ms,
                 },
-            );
-            let mut resp = error_json(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "timed out waiting for search capacity",
-            );
-            resp.headers_mut().insert(
-                header::RETRY_AFTER,
-                HeaderValue::from_static(proxy::ADMISSION_RETRY_AFTER_SECS),
-            );
-            return resp;
-        }
+            )
+        },
+    ))
+    .await
+    {
+        Ok(admitted) => admitted,
+        Err(resp) => return resp,
     };
-    let queue_wait_ms = admitted.waited.as_millis() as u32;
+    let queue_wait_ms = admitted.queue_wait_ms;
 
     let outcome = call_upstream(state, &route, &request, &meta.session_id).await;
     drop(admitted.permit);
-    let resp = match outcome {
+    let mut resp = match outcome {
         Ok(results) => (
             StatusCode::OK,
             axum::Json(json!({ "id": request_id, "object": "search", "results": results })),
@@ -320,6 +303,9 @@ async fn handle(
             .into_response(),
         Err(failure) => error_json(failure.status, &failure.message),
     };
+    if let Ok(value) = HeaderValue::from_str(&queue_wait_ms.to_string()) {
+        resp.headers_mut().insert(proxy::QUEUE_WAIT_HEADER, value);
+    }
     finalize(
         state,
         request_id,
@@ -336,6 +322,9 @@ async fn handle(
             ..FinalizeOutcome::default()
         },
     );
+    if let Some(t) = tracer.take() {
+        t.finish("ok");
+    }
     resp
 }
 
@@ -477,13 +466,7 @@ async fn call_upstream(
     request: &SearchRequest,
     session: &str,
 ) -> Result<Vec<Value>, UpstreamFailure> {
-    let timeout = route
-        .request_timeout_secs
-        .and_then(|s| u64::try_from(s).ok())
-        .filter(|s| *s > 0)
-        .map(Duration::from_secs)
-        .unwrap_or(state.upstream_timeout)
-        .min(TIMEOUT_CAP);
+    let timeout = proxy::request_timeout(state, route).min(TIMEOUT_CAP);
     let params = request.upstream_params();
     let mut last = UpstreamFailure::bad_gateway("the search tool has no upstream");
     for target in build_targets(
@@ -1041,7 +1024,7 @@ mod pipeline_tests {
     use std::sync::Mutex;
 
     use axum::extract::Query;
-    use axum::http::{HeaderMap, Method};
+    use axum::http::{header, HeaderMap, Method};
     use axum::routing::get;
     use axum::Router;
     use moka::future::Cache;
@@ -1259,6 +1242,8 @@ mod pipeline_tests {
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(resp.headers().contains_key("x-obleth-request-id"));
+        // Admitted through the pipeline's own admission: the queue wait is reported.
+        assert!(resp.headers().contains_key(proxy::QUEUE_WAIT_HEADER));
         let body = json_of(resp).await;
         assert_eq!(body["object"], "search");
         let results = body["results"].as_array().unwrap();

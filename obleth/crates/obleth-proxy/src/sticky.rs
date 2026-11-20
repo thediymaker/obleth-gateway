@@ -54,12 +54,18 @@ pub(crate) async fn lookup(
     session_id: Option<&str>,
 ) -> Conversation {
     let session_key = session_id.map(sticky::session_key);
+    // The last assistant turn's key, hashed once: it is the incumbent
+    // record's key and the root of the retry key.
+    let incumbent_key = sticky::incumbent_key(json);
     // Within a named conversation, "the same request again" means in this
     // conversation: two chats that open the same way are not a regenerate.
-    let retry_key = sticky::retry_key(json).map(|k| match &session_key {
-        Some(s) => format!("{s}:{k}"),
-        None => k,
-    });
+    let retry_key = incumbent_key
+        .as_deref()
+        .and_then(|turn| sticky::retry_key_from(json, turn))
+        .map(|k| match &session_key {
+            Some(s) => format!("{s}:{k}"),
+            None => k,
+        });
     let get = |key: Option<String>| async move {
         match key {
             Some(k) => state
@@ -74,7 +80,7 @@ pub(crate) async fn lookup(
     };
     let (session, by_answer, seen) = tokio::join!(
         get(session_key.clone()),
-        get(sticky::incumbent_key(json)),
+        get(incumbent_key),
         get(retry_key.clone()),
     );
     let session = session.and_then(|raw| serde_json::from_str::<SessionRecord>(&raw).ok());

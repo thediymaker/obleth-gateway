@@ -42,6 +42,7 @@ import type { CacheStats, ModelFamily, ModelHealthSummary, ModelRoute, UsageMode
 import { compact, formatMs, isBenchmarkRoute } from "@/lib/overview-model";
 import { logsHref } from "@/lib/log-links";
 import { cn, getJson } from "@/lib/utils";
+import { ReadNotice, readFailed } from "@/components/ui/read-state";
 
 const DAY_MS = 86_400_000;
 
@@ -185,6 +186,8 @@ export function ModelsList({
         <div className="min-w-0">
           <h1 className="text-[26px] font-semibold tracking-tight">Models</h1>
           <p className="mt-1 text-[13px] text-muted-foreground">{real.length === 0 ? "No models yet" : statusLine(real)}</p>
+          <ReadNotice query={usageQuery} what="the last day's requests" />
+          <ReadNotice query={fairshare} what="the live load" />
         </div>
         <div className="flex items-center gap-2">
           <DropdownMenu>
@@ -303,7 +306,7 @@ export function ModelsList({
             </thead>
             <tbody>
               {shown.map((row) => (
-                <Row key={row.id} row={row} selected={selected.has(row.id)} onToggle={() => toggle(row.id)} onOpen={() => router.push(modelHref(row.name))} />
+                <Row key={row.id} row={row} unread={{ load: readFailed(fairshare), requests: readFailed(usageQuery) }} selected={selected.has(row.id)} onToggle={() => toggle(row.id)} onOpen={() => router.push(modelHref(row.name))} />
               ))}
             </tbody>
           </table>
@@ -354,7 +357,8 @@ export function ModelsList({
   );
 }
 
-function Row({ row, selected, onToggle, onOpen }: { row: ModelRow; selected: boolean; onToggle: () => void; onOpen: () => void }) {
+/** `unread` marks the columns whose live read never answered: they show a dash, not zero. */
+function Row({ row, unread, selected, onToggle, onOpen }: { row: ModelRow; unread: { load: boolean; requests: boolean }; selected: boolean; onToggle: () => void; onOpen: () => void }) {
   const m = row.model;
   const off = row.status === "off";
   const tags = tagLabels(m.tags);
@@ -390,8 +394,8 @@ function Row({ row, selected, onToggle, onOpen }: { row: ModelRow; selected: boo
       <td className="whitespace-nowrap py-2.5 pr-3 text-secondary-foreground">{MODEL_TYPE_NAMES[m.model_type] ?? m.model_type}</td>
       <td className="whitespace-nowrap py-2.5 pr-3"><StatusMark status={row.status} /></td>
       <td className="py-2.5 pr-3">
-        {off ? (
-          <span className="text-muted-foreground">—</span>
+        {off || unread.load ? (
+          <span className="text-muted-foreground" title={unread.load ? "Can't read the live load" : undefined}>—</span>
         ) : row.cap > 0 ? (
           <div className="flex items-center gap-2">
             <Meter value={row.inFlight} max={row.cap} strong={row.queued > 0} className="w-16" />
@@ -403,7 +407,9 @@ function Row({ row, selected, onToggle, onOpen }: { row: ModelRow; selected: boo
         )}
       </td>
       <td className="py-2.5 pr-3 text-right font-mono text-[12px] tabular-nums">
-        {row.requests ? (
+        {unread.requests ? (
+          <span className="text-muted-foreground" title="Can't read the last day's requests">—</span>
+        ) : row.requests ? (
           <Link href={logsHref({ model: row.name, window: "24h" })} onClick={(e) => e.stopPropagation()} title="See these requests" className="underline-offset-2 hover:underline">{compact(row.requests)}</Link>
         ) : "—"}
       </td>

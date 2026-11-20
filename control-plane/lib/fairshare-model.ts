@@ -9,7 +9,8 @@ import type {
 } from "@/lib/obleth";
 import { isAboveShare, isWaitingBelowShare } from "@/lib/fairshare";
 import { formatNumber } from "@/lib/utils";
-import { isBenchmarkRoute, poolOccupancy } from "@/lib/overview-model";
+import { isBenchmarkRoute } from "@/lib/overview-model";
+import { poolOccupancy } from "@/lib/occupancy";
 
 // ---------------------------------------------------------------------------
 // Scope and gateway modes

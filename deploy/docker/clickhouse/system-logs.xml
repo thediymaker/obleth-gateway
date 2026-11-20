@@ -14,13 +14,19 @@
   Nothing in Obleth reads it. The server also caps its own memory at 0.75 of
   what the container (or host) has, instead of the image's 0.9, so an
   oversized merge fails inside ClickHouse rather than getting the container
-  killed.
+  killed. Its caches are sized for a container of a few GiB (256 MiB of
+  marks, 64 MiB of index marks, no uncompressed cache) instead of the image's
+  5, 5 and 8 GiB, which assume a large host. ci.yml renders the chart and
+  checks it says the same as this file.
 -->
 <clickhouse>
     <logger>
         <level>information</level>
     </logger>
     <max_server_memory_usage_to_ram_ratio>0.75</max_server_memory_usage_to_ram_ratio>
+    <mark_cache_size>268435456</mark_cache_size>
+    <index_mark_cache_size>67108864</index_mark_cache_size>
+    <uncompressed_cache_size>0</uncompressed_cache_size>
     <query_log>
         <partition_by>event_date</partition_by>
         <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>

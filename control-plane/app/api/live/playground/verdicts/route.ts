@@ -1,6 +1,6 @@
-import { NextRequest, NextResponse } from "next/server";
+import { NextResponse } from "next/server";
 import { z } from "zod";
-import { guardAdmin } from "@/lib/auth/guard";
+import { liveRoute, RouteError } from "@/lib/auth/guard";
 import { gatewayVerdicts, type GatewayVerdictsBody } from "@/lib/charo/gateway";
 import { apiErrorMessage } from "@/lib/charo/errors";
 
@@ -42,34 +42,17 @@ const bodySchema = z.object({
   questions: z.record(z.string().min(1).max(64), questionSchema),
 });
 
-export async function POST(req: NextRequest) {
-  const denied = await guardAdmin();
-  if (denied) return denied;
-
+export const POST = liveRoute(async (req) => {
   const parsed = bodySchema.safeParse(await req.json().catch(() => null));
-  if (!parsed.success) {
-    return NextResponse.json({ error: "Invalid verdicts request." }, { status: 400 });
-  }
+  if (!parsed.success) throw new RouteError(400, "Invalid verdicts request.");
   const { model, state, images, questions } = parsed.data;
-  if (state === undefined && !images?.length) {
-    return NextResponse.json({ error: "Add a state, an image, or both." }, { status: 400 });
-  }
+  if (state === undefined && !images?.length) throw new RouteError(400, "Add a state, an image, or both.");
   const ids = Object.keys(questions);
-  if (ids.length === 0 || ids.length > 32) {
-    return NextResponse.json(
-      { error: "A verdicts request needs 1–32 questions." },
-      { status: 400 },
-    );
-  }
+  if (ids.length === 0 || ids.length > 32) throw new RouteError(400, "A verdicts request needs 1–32 questions.");
   for (const [id, q] of Object.entries(questions)) {
     if (q.type === "choice") {
       const options = Object.keys(q.criteria);
-      if (options.length < 2 || options.length > 26) {
-        return NextResponse.json(
-          { error: `Question "${id}": a choice needs 2–26 options.` },
-          { status: 400 },
-        );
-      }
+      if (options.length < 2 || options.length > 26) throw new RouteError(400, `Question "${id}": a choice needs 2–26 options.`);
     }
   }
 
@@ -80,25 +63,12 @@ export async function POST(req: NextRequest) {
     questions,
   };
   const started = Date.now();
-  try {
-    const upstream = await gatewayVerdicts(body);
-    const latencyMs = Date.now() - started;
-    const requestId = upstream.headers.get("x-obleth-request-id");
-    const json = await upstream.json().catch(() => null);
-    if (!upstream.ok) {
-      return NextResponse.json(
-        { error: apiErrorMessage(json, "verdict evaluation failed"), requestId },
-        { status: upstream.status },
-      );
-    }
-    return NextResponse.json({
-      model: json?.model ?? model,
-      verdicts: json?.verdicts ?? {},
-      usage: json?.usage ?? null,
-      latencyMs,
-      requestId,
-    });
-  } catch (e) {
-    return NextResponse.json({ error: String(e) }, { status: 502 });
+  const upstream = await gatewayVerdicts(body);
+  const latencyMs = Date.now() - started;
+  const requestId = upstream.headers.get("x-obleth-request-id");
+  const json = await upstream.json().catch(() => null);
+  if (!upstream.ok) {
+    return NextResponse.json({ error: apiErrorMessage(json, "verdict evaluation failed"), requestId }, { status: upstream.status });
   }
-}
+  return { model: json?.model ?? model, verdicts: json?.verdicts ?? {}, usage: json?.usage ?? null, latencyMs, requestId };
+});

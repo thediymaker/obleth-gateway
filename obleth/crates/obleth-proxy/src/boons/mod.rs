@@ -1065,10 +1065,75 @@ impl BoonEngine {
 
 /// Result of one helper-model chat call: the reply text plus the token usage
 /// the helper reported (zero when it did not return a `usage` object).
+#[derive(Debug)]
 pub(crate) struct ChatCallResult {
     pub text: String,
-    pub input_tokens: u32,
-    pub output_tokens: u32,
+    /// What the helper reported, cached prompt tokens included, for its ledger row.
+    pub usage: UpstreamUsage,
+}
+
+/// A helper call that did not answer within its bound. Typed, so a caller
+/// classes it with `downcast_ref` instead of matching the message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HelperTimeout {
+    pub what: String,
+    pub after: Duration,
+}
+
+impl std::fmt::Display for HelperTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} timed out after {:?}", self.what, self.after)
+    }
+}
+
+impl std::error::Error for HelperTimeout {}
+
+impl HelperTimeout {
+    /// Whether `error` is a helper call's timeout, anywhere in its chain.
+    pub(crate) fn is(error: &anyhow::Error) -> bool {
+        error
+            .chain()
+            .any(|e| e.downcast_ref::<HelperTimeout>().is_some())
+    }
+}
+
+/// Run a helper call under `after`; a call that outlasts it fails with a
+/// [`HelperTimeout`] naming `what`.
+pub(crate) async fn with_timeout<T>(
+    what: impl Into<String>,
+    after: Duration,
+    fut: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    match tokio::time::timeout(after, fut).await {
+        Ok(result) => result,
+        Err(_) => Err(HelperTimeout {
+            what: what.into(),
+            after,
+        }
+        .into()),
+    }
+}
+
+/// POST `body` as JSON to `url`, with `headers` and the bearer `api_key` when
+/// there is one, and read a success reply of at most `max` bytes. An error
+/// status, or a reply over the cap, is an error; nothing is truncated.
+pub(crate) async fn post_json_capped(
+    http: &reqwest::Client,
+    url: String,
+    headers: &reqwest::header::HeaderMap,
+    api_key: Option<&str>,
+    body: &Value,
+    max: usize,
+) -> anyhow::Result<bytes::Bytes> {
+    let mut req = http.post(url).headers(headers.clone()).json(body);
+    if let Some(api_key) = api_key {
+        req = req.bearer_auth(api_key);
+    }
+    let resp = req.send().await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("upstream returned {}", resp.status());
+    }
+    read_body_capped(resp, max).await
 }
 
 /// Largest helper reply body read into memory. A helper reply is one chat
@@ -1146,18 +1211,15 @@ async fn post_chat_completion(
     target: &crate::proxy::Target,
     body: &Value,
 ) -> anyhow::Result<Value> {
-    let mut req = http
-        .post(build_chat_url(&target.base))
-        .headers(target.headers.clone())
-        .json(body);
-    if let Some(api_key) = &target.api_key {
-        req = req.bearer_auth(api_key);
-    }
-    let resp = req.send().await?;
-    if !resp.status().is_success() {
-        anyhow::bail!("upstream returned {}", resp.status());
-    }
-    let bytes = read_body_capped(resp, HELPER_BODY_MAX_BYTES).await?;
+    let bytes = post_json_capped(
+        http,
+        build_chat_url(&target.base),
+        &target.headers,
+        target.api_key.as_deref(),
+        body,
+        HELPER_BODY_MAX_BYTES,
+    )
+    .await?;
     Ok(serde_json::from_slice(&bytes)?)
 }
 
@@ -1189,24 +1251,12 @@ async fn chat_call_with(
         if text.trim().is_empty() {
             anyhow::bail!("helper returned an empty reply");
         }
-        let input_tokens = body
-            .pointer("/usage/prompt_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
-        let output_tokens = body
-            .pointer("/usage/completion_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
         Ok(ChatCallResult {
             text,
-            input_tokens,
-            output_tokens,
+            usage: reported_usage(&body),
         })
     };
-    match tokio::time::timeout(timeout, fut).await {
-        Ok(result) => result,
-        Err(_) => anyhow::bail!("helper call timed out after {timeout:?}"),
-    }
+    with_timeout("helper call", timeout, fut).await
 }
 
 /// Send a chat-completions request to a model and return the **complete**
@@ -1230,10 +1280,12 @@ pub(crate) async fn chat_call_completion_on(
     body: Value,
     timeout: Duration,
 ) -> anyhow::Result<Value> {
-    match tokio::time::timeout(timeout, post_chat_completion(http, target, &body)).await {
-        Ok(result) => result,
-        Err(_) => anyhow::bail!("chat call timed out after {timeout:?}"),
-    }
+    with_timeout(
+        "chat call",
+        timeout,
+        post_chat_completion(http, target, &body),
+    )
+    .await
 }
 
 /// Label override for helper-call usage rows: synthetic tenants' helper calls
@@ -2197,7 +2249,7 @@ mod tests {
     async fn chat_call_reaches_an_endpoint_only_model() {
         let (base, seen) = chat_server(serde_json::json!({
             "choices": [{ "message": { "role": "assistant", "content": "described" } }],
-            "usage": { "prompt_tokens": 7, "completion_tokens": 3 }
+            "usage": { "prompt_tokens": 7, "completion_tokens": 3, "prompt_tokens_details": { "cached_tokens": 5 } }
         }))
         .await;
         let route = endpoint_only_route(&base);
@@ -2210,8 +2262,73 @@ mod tests {
         .await
         .expect("helper call through the endpoint");
         assert_eq!(reply.text, "described");
-        assert_eq!((reply.input_tokens, reply.output_tokens), (7, 3));
+        // The cached part of the prompt reaches the helper's ledger row too.
+        assert_eq!(reply.usage, UpstreamUsage::new(7, 3, 5));
         assert_eq!(seen.lock().unwrap().as_slice(), ["Bearer endpoint-key"]);
+    }
+
+    /// A helper that accepts and never answers ends as a typed timeout the
+    /// caller classes by type, not by matching the message.
+    #[tokio::test]
+    async fn a_silent_helper_is_a_typed_timeout() {
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                "{}"
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let route = endpoint_only_route(&base);
+        let err = chat_call_with(
+            &reqwest::Client::new(),
+            &route,
+            serde_json::json!({ "messages": [] }),
+            Duration::from_millis(50),
+        )
+        .await
+        .expect_err("a silent helper must not be waited for");
+        assert!(HelperTimeout::is(&err), "{err}");
+        assert_eq!(
+            err.downcast_ref::<HelperTimeout>().map(|t| t.what.as_str()),
+            Some("helper call")
+        );
+        assert!(!HelperTimeout::is(&anyhow::anyhow!(
+            "a message that says timed out"
+        )));
+    }
+
+    /// A reply over the cap is an error, never a truncated body.
+    #[tokio::test]
+    async fn an_oversize_helper_reply_is_refused_not_cut() {
+        let big = serde_json::json!({ "pad": "x".repeat(10_000) });
+        let (base, _) = chat_server(big).await;
+        let route = endpoint_only_route(&base);
+        let target = helper_target(&route, "", None).unwrap();
+        let err = post_json_capped(
+            &reqwest::Client::new(),
+            build_chat_url(&target.base),
+            &target.headers,
+            target.api_key.as_deref(),
+            &serde_json::json!({}),
+            1024,
+        )
+        .await
+        .expect_err("over the cap");
+        assert!(err.to_string().contains("exceeds 1024 bytes"), "{err}");
+        let whole = post_json_capped(
+            &reqwest::Client::new(),
+            build_chat_url(&target.base),
+            &target.headers,
+            target.api_key.as_deref(),
+            &serde_json::json!({}),
+            64 * 1024,
+        )
+        .await
+        .expect("under the cap");
+        assert!(whole.len() > 10_000);
     }
 
     #[tokio::test]

@@ -1,6 +1,5 @@
-import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
-import { guardAdmin } from "@/lib/auth/guard";
+import { liveRoute, RouteError } from "@/lib/auth/guard";
 import { gatewayImages, type GatewayImagesBody } from "@/lib/charo/gateway";
 import { apiErrorMessage } from "@/lib/charo/errors";
 import { imageUrls } from "@/lib/charo/images";
@@ -26,14 +25,9 @@ const bodySchema = z.object({
   seed: z.number().int().min(0).max(4_294_967_295).optional(),
 });
 
-export async function POST(req: NextRequest) {
-  const denied = await guardAdmin();
-  if (denied) return denied;
-
+export const POST = liveRoute(async (req) => {
   const parsed = bodySchema.safeParse(await req.json().catch(() => null));
-  if (!parsed.success) {
-    return NextResponse.json({ error: "Invalid generation request." }, { status: 400 });
-  }
+  if (!parsed.success) throw new RouteError(400, "Invalid generation request.");
   const { model, prompt, negative_prompt, size, n, steps, seed } = parsed.data;
 
   const body: GatewayImagesBody = {
@@ -48,26 +42,12 @@ export async function POST(req: NextRequest) {
   };
 
   const started = Date.now();
-  try {
-    const upstream = await gatewayImages(body);
-    const latencyMs = Date.now() - started;
-    const requestId = upstream.headers.get("x-obleth-request-id");
-    const json = await upstream.json().catch(() => null);
-    if (!upstream.ok) {
-      return NextResponse.json(
-        { error: apiErrorMessage(json, "generation failed") },
-        { status: upstream.status },
-      );
-    }
-    const images = imageUrls(json);
-    if (images.length === 0) {
-      return NextResponse.json(
-        { error: "The model returned no image." },
-        { status: 502 },
-      );
-    }
-    return NextResponse.json({ images, latencyMs, requestId });
-  } catch (e) {
-    return NextResponse.json({ error: String(e) }, { status: 502 });
-  }
-}
+  const upstream = await gatewayImages(body);
+  const latencyMs = Date.now() - started;
+  const requestId = upstream.headers.get("x-obleth-request-id");
+  const json = await upstream.json().catch(() => null);
+  if (!upstream.ok) throw new RouteError(upstream.status, apiErrorMessage(json, "generation failed"));
+  const images = imageUrls(json);
+  if (images.length === 0) throw new RouteError(502, "The model returned no image.");
+  return { images, latencyMs, requestId };
+});
