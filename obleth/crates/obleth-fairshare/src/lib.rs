@@ -117,6 +117,10 @@ pub const IDLE_POOL_TTL: Duration = Duration::from_secs(600);
 /// which forgives that lead.
 const MAX_IDLE_KEYS_PER_TENANT: usize = 512;
 
+/// How many of the smallest-lead idle keys go at once when a tenant is over
+/// [`MAX_IDLE_KEYS_PER_TENANT`], so the ranking pass runs once per batch.
+const IDLE_KEY_EVICT_BATCH: usize = MAX_IDLE_KEYS_PER_TENANT / 8;
+
 /// Housekeeping period: a sixtieth of the idle TTL, kept between 1 and 10 s.
 fn housekeeping_interval(idle_pool_ttl: Duration) -> Duration {
     (idle_pool_ttl / 60).clamp(Duration::from_secs(1), Duration::from_secs(10))
@@ -1024,6 +1028,12 @@ struct Pool {
     /// `served - served_base` is its actual service.
     served_base: HashMap<Uuid, f64>,
     key_in_flight: HashMap<Uuid, usize>,
+    /// For each key with a slot, the tenant that owned it when its first
+    /// slot was taken, and per owner how many of its keys hold a slot: a
+    /// tenant is quiet only when that count is zero, read in O(1) instead of
+    /// scanning every in-flight key.
+    in_flight_owner: HashMap<Uuid, Uuid>,
+    owner_in_flight: HashMap<Uuid, usize>,
     key_served: HashMap<Uuid, f64>,
     key_weight: HashMap<Uuid, i64>,
     /// Configured per-key caps; enforced as this replica's share.
@@ -1111,6 +1121,8 @@ impl Pool {
             served: HashMap::new(),
             served_base: HashMap::new(),
             key_in_flight: HashMap::new(),
+            in_flight_owner: HashMap::new(),
+            owner_in_flight: HashMap::new(),
             key_served: HashMap::new(),
             key_weight: HashMap::new(),
             key_cap: HashMap::new(),
@@ -1342,6 +1354,17 @@ impl Pool {
         let old = self.key_tenant.insert(key, tenant)?;
         if old == tenant {
             return None;
+        }
+        // A slot the key holds now counts for its new owner, which is kept
+        // while the request runs, as the old owner was.
+        if let Some(prev) = self.in_flight_owner.insert(key, tenant) {
+            if let Some(n) = self.owner_in_flight.get_mut(&prev) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    self.owner_in_flight.remove(&prev);
+                }
+            }
+            *self.owner_in_flight.entry(tenant).or_insert(0) += 1;
         }
         if let Some(idle) = self.key_idle.get_mut(&old) {
             idle.remove(&key);
@@ -1642,7 +1665,13 @@ impl Pool {
     fn occupy(&mut self, tenant: Uuid, key: Uuid, cost: u32) {
         self.in_flight += 1;
         *self.tenant_in_flight.entry(tenant).or_insert(0) += 1;
-        *self.key_in_flight.entry(key).or_insert(0) += 1;
+        let slots = self.key_in_flight.entry(key).or_insert(0);
+        *slots += 1;
+        if *slots == 1 {
+            let owner = self.key_owner(&key, tenant);
+            self.in_flight_owner.insert(key, owner);
+            *self.owner_in_flight.entry(owner).or_insert(0) += 1;
+        }
         self.charge(tenant, key, cost);
     }
 
@@ -1761,8 +1790,52 @@ impl Pool {
     }
 
     /// Nothing of `key` is queued, under any tenant, or running.
+    /// Whether `key` holds no slot and has nothing queued. A key queues under
+    /// its owner, so one queue answers; a key that has moved between tenants
+    /// may still have a waiter under its old one, so only then every queue is
+    /// read.
     fn key_quiet(&self, key: &Uuid) -> bool {
-        !self.key_in_flight.contains_key(key) && self.queues.values().all(|q| q.key_len(key) == 0)
+        if self.key_in_flight.contains_key(key) {
+            return false;
+        }
+        if self.key_moves.contains_key(key) {
+            return self.queues.values().all(|q| q.key_len(key) == 0);
+        }
+        let quiet = self
+            .key_tenant
+            .get(key)
+            .and_then(|t| self.queues.get(t))
+            .is_none_or(|q| q.key_len(key) == 0);
+        debug_assert!(
+            !quiet || self.queues.values().all(|q| q.key_len(key) == 0),
+            "an unmoved key is queued under a tenant that does not own it"
+        );
+        quiet
+    }
+
+    /// Whether `tenant` has nothing queued, holds no slot, and owns no key
+    /// that holds one. O(1): the counts are kept as slots come and go.
+    fn tenant_quiet(&self, tenant: &Uuid) -> bool {
+        self.queues.get(tenant).is_none_or(|q| q.len == 0)
+            && !self.tenant_in_flight.contains_key(tenant)
+            && !self.owner_in_flight.contains_key(tenant)
+    }
+
+    /// Housekeeping: every tenant the pool still remembers that has gone
+    /// quiet is reconsidered now, not on its own next request. A quiet tenant
+    /// ahead of its clock is forgotten once the clock, moved by the tenants
+    /// still being served, reaches it; one alone in its scope at once. Its
+    /// idle keys go with it.
+    fn forget_quiet_tenants(&mut self) {
+        let quiet: Vec<Uuid> = self
+            .served
+            .keys()
+            .filter(|t| self.tenant_quiet(t))
+            .copied()
+            .collect();
+        for tenant in quiet {
+            self.forget_tenant_if_quiet(tenant);
+        }
     }
 
     /// `key` is quiet and belongs to `tenant`, so it may be forgotten from
@@ -2383,6 +2456,13 @@ impl Pool {
             *n = n.saturating_sub(1);
             if *n == 0 {
                 self.key_in_flight.remove(&key);
+                let owner = self.in_flight_owner.remove(&key).unwrap_or(tenant);
+                if let Some(n) = self.owner_in_flight.get_mut(&owner) {
+                    *n = n.saturating_sub(1);
+                    if *n == 0 {
+                        self.owner_in_flight.remove(&owner);
+                    }
+                }
             }
         }
         self.forget_if_quiet(tenant, key);
@@ -2609,13 +2689,7 @@ impl Pool {
     /// owns a key running in another tenant's slot is kept: a refused claim
     /// of that key goes back in line under it.
     fn forget_tenant_if_quiet(&mut self, tenant: Uuid) {
-        let quiet = self.queues.get(&tenant).is_none_or(|q| q.len == 0)
-            && !self.tenant_in_flight.contains_key(&tenant)
-            && !self
-                .key_in_flight
-                .keys()
-                .any(|k| self.key_tenant.get(k) == Some(&tenant));
-        if !quiet {
+        if !self.tenant_quiet(&tenant) {
             return;
         }
         let scope = self.clock_scope(&tenant);
@@ -2638,19 +2712,25 @@ impl Pool {
         if idle.len() <= MAX_IDLE_KEYS_PER_TENANT {
             return;
         }
-        let (here, gone): (Vec<Uuid>, Vec<Uuid>) = self.key_idle[&tenant]
+        // Over the bound: one pass ranks the idle keys by lead and forgets a
+        // batch of the smallest, so the pass runs once per batch of arrivals
+        // rather than once per arrival.
+        let (mut here, gone): (Vec<Uuid>, Vec<Uuid>) = self.key_idle[&tenant]
             .iter()
             .partition(|k| self.key_idle_here(&tenant, k));
-        let smallest = here
+        here.sort_by(|a, b| self.key_standing(a).total_cmp(&self.key_standing(b)));
+        let over = here.len().saturating_sub(MAX_IDLE_KEYS_PER_TENANT);
+        let evict: Vec<Uuid> = here
             .into_iter()
-            .min_by(|a, b| self.key_standing(a).total_cmp(&self.key_standing(b)));
+            .take(over.max(IDLE_KEY_EVICT_BATCH.min(MAX_IDLE_KEYS_PER_TENANT)))
+            .collect();
         if let Some(idle) = self.key_idle.get_mut(&tenant) {
-            for key in gone.iter().chain(smallest.iter()) {
+            for key in gone.iter().chain(evict.iter()) {
                 idle.remove(key);
             }
         }
-        if let Some(smallest) = smallest {
-            self.forget_key(&smallest);
+        for key in &evict {
+            self.forget_key(key);
         }
     }
 
@@ -2716,6 +2796,8 @@ impl Pool {
         self.served.clear();
         self.served_base.clear();
         self.key_in_flight.clear();
+        self.in_flight_owner.clear();
+        self.owner_in_flight.clear();
         self.key_served.clear();
         self.key_weight.clear();
         self.key_cap.clear();
@@ -4192,6 +4274,7 @@ impl Scheduler {
         for pool in self.pools.values_mut() {
             dropped += pool.prune_dead_waiters();
             pool.affinity.prune(now);
+            pool.forget_quiet_tenants();
             pool.settle_idle();
         }
         self.queued_total = self.queued_total.saturating_sub(dropped);
@@ -4537,6 +4620,100 @@ mod tests {
                 before += 1;
             }
             before
+        }
+    }
+
+    /// A tenant that went quiet while ahead of its clock used to be kept, with
+    /// its idle keys, until its own next request or until the whole pool
+    /// emptied. Housekeeping now reconsiders it: once the tenants still being
+    /// served have moved the clock past it, one sweep forgets it while the
+    /// pool stays busy.
+    #[test]
+    fn a_quiet_tenant_ahead_of_its_clock_is_forgotten_by_a_sweep_while_the_pool_is_busy() {
+        let mut sim = Sim::new(1);
+        let (ahead, busy) = (Uuid::new_v4(), Uuid::new_v4());
+        let (ahead_key, busy_key) = (Uuid::new_v4(), Uuid::new_v4());
+        // Both start level; `ahead` gets a large request, then goes quiet.
+        sim.queue(ahead, ahead_key, 1_000);
+        sim.queue(busy, busy_key, 1);
+        sim.grant();
+        sim.grant();
+        while let Some((t, k)) = sim.running.pop_front() {
+            sim.pool.release(t, k);
+        }
+        // Quiet, with no slot and nothing queued, but ahead of the clock: kept.
+        sim.pool.forget_quiet_tenants();
+        assert!(
+            sim.pool.served.contains_key(&ahead),
+            "ahead of its clock: kept"
+        );
+        // The busy tenant keeps being served, moving the clock past `ahead`.
+        for _ in 0..1_200 {
+            sim.queue(busy, busy_key, 1);
+            sim.grant();
+        }
+        assert!(!sim.pool.is_idle(), "the pool stays busy");
+        sim.pool.forget_quiet_tenants();
+        assert!(
+            !sim.pool.served.contains_key(&ahead),
+            "caught up: forgotten by the sweep"
+        );
+        assert!(
+            !sim.pool.key_served.contains_key(&ahead_key),
+            "its idle key went with it"
+        );
+        assert!(sim.pool.served.contains_key(&busy));
+    }
+
+    /// `key_quiet` reads one queue and the in-flight counts; on random
+    /// sequences of queueing, granting and finishing it says what the full
+    /// scan says, and a tenant's quiet state matches the scan too.
+    #[test]
+    fn the_constant_time_quiet_checks_match_the_scan_on_random_states() {
+        let mut seed: u64 = 0x5eed_c0de_1234_5678;
+        let mut next = move |n: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        let tenants: Vec<Uuid> = (0..4).map(|_| Uuid::new_v4()).collect();
+        let keys: Vec<(Uuid, Uuid)> = tenants
+            .iter()
+            .flat_map(|t| (0..3).map(move |_| (*t, Uuid::new_v4())))
+            .collect();
+        let mut sim = Sim::new(2);
+        for step in 0..600 {
+            match next(3) {
+                0 | 1 => {
+                    let (tenant, key) = keys[next(keys.len() as u64) as usize];
+                    sim.queue(tenant, key, 1 + next(50) as u32);
+                }
+                _ if sim.pool.queued_total > 0 => {
+                    sim.grant();
+                }
+                _ => {}
+            }
+            if step % 7 == 0 {
+                if let Some((tenant, key)) = sim.running.pop_front() {
+                    sim.pool.release(tenant, key);
+                }
+            }
+            for (_, key) in &keys {
+                let scan = !sim.pool.key_in_flight.contains_key(key)
+                    && sim.pool.queues.values().all(|q| q.key_len(key) == 0);
+                assert_eq!(sim.pool.key_quiet(key), scan, "step {step}");
+            }
+            for tenant in &tenants {
+                let scan = sim.pool.queues.get(tenant).is_none_or(|q| q.len == 0)
+                    && !sim.pool.tenant_in_flight.contains_key(tenant)
+                    && !sim
+                        .pool
+                        .key_in_flight
+                        .keys()
+                        .any(|k| sim.pool.key_tenant.get(k) == Some(tenant));
+                assert_eq!(sim.pool.tenant_quiet(tenant), scan, "step {step}");
+            }
         }
     }
 
