@@ -373,6 +373,13 @@ export function sortKeys(rows: KeyRow[], sort: KeySort): KeyRow[] {
   return out.sort((a, b) => b.lastUsedMs - a.lastUsedMs || Number(a.key.disabled) - Number(b.key.disabled) || byName(a, b));
 }
 
+/** A budget's period, as tenant and key budgets offer it. */
+export const PERIOD_OPTIONS = [
+  { value: "monthly", label: "each month" },
+  { value: "term", label: "per term" },
+  { value: "lifetime", label: "in total" },
+];
+
 /** "12 s ago", "4 min ago", "yesterday", "41 days ago", or "never". */
 export function lastUsed(ms: number, now = Date.now()): string {
   if (!ms) return "never";

@@ -5,12 +5,11 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Plus, Search } from "lucide-react";
 import { BudgetBar, StateDot, TENANT_STATUS_LABEL, tenantState } from "@/components/access/ui";
-import { CreateTenant } from "@/components/create-tenant";
+import { AddTenantSheet } from "@/components/access/add-tenant";
 import { useFairshareLive } from "@/components/fairshare/hooks";
 import { Tile } from "@/components/models/ui";
 import { Segmented } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
-import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Select } from "@/components/ui/select";
 import {
   accessLabel,
@@ -63,7 +62,6 @@ export function TenantsList({
   usage24h,
   budgets,
   monthSpend,
-  models,
 }: {
   tenants: Tenant[];
   keys: ApiKey[];
@@ -72,7 +70,6 @@ export function TenantsList({
   budgets: BudgetUsage[];
   /** Spend this calendar month, by tenant id. */
   monthSpend: Record<string, number>;
-  models: string[];
 }) {
   const router = useRouter();
   const fairshare = useFairshareLive();
@@ -216,15 +213,7 @@ export function TenantsList({
         </div>
       </section>
 
-      <Dialog open={adding} onOpenChange={setAdding}>
-        <DialogContent className="grid h-[min(760px,85vh)] max-h-[85vh] max-w-4xl grid-rows-[auto_minmax(0,1fr)] overflow-hidden">
-          <DialogHeader>
-            <DialogTitle>Add a tenant</DialogTitle>
-            <DialogDescription>A team or project that gets its own keys, share of the gateway, and optional limits.</DialogDescription>
-          </DialogHeader>
-          <CreateTenant models={models} tenantWeights={tenants.map((t) => t.weight)} onCreated={() => { setAdding(false); router.refresh(); }} />
-        </DialogContent>
-      </Dialog>
+      <AddTenantSheet open={adding} onClose={() => setAdding(false)} tenants={tenants} />
     </div>
   );
 }

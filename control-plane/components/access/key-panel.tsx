@@ -4,7 +4,7 @@ import { useState, useTransition } from "react";
 import Link from "next/link";
 import { useQuery } from "@tanstack/react-query";
 import { deleteKeyAction, replaceKeyAction, saveKeySettingsAction, setKeysDisabledAction } from "@/app/actions";
-import { PERIOD_OPTIONS } from "@/components/access/key-dialogs";
+import { PERIOD_OPTIONS } from "@/lib/access-model";
 import { SettingsForm } from "@/components/access/settings-form";
 import { BudgetBar, StateDot } from "@/components/access/ui";
 import { SelectField, Setting, Switch, TextField } from "@/components/models/fields";

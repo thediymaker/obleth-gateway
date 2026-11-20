@@ -133,29 +133,11 @@ const positiveIntWithDefault = (def: number) =>
 
 const tenantCreateSchema = z.object({
   name: requiredText("Tenant name is required"),
-  description: optionalText,
   organization: optionalText,
-  contact_email: z.preprocess(
-    blankToUndef,
-    z.string().email("Invalid contact email").optional(),
-  ),
-  status: z.preprocess(
-    blankToUndef,
-    z.enum(["active", "suspended", "archived"]).default("active"),
-  ),
   fairshare_group: optionalText,
   weight: optionalPositiveInt,
   tokens_per_minute: optionalNonNegInt,
   max_in_flight: optionalPositiveInt,
-  timezone: z.preprocess(blankToUndef, z.string().default("UTC")),
-  active_from: z.preprocess(blankToUndef, z.string().datetime().optional()),
-  active_until: z.preprocess(blankToUndef, z.string().datetime().optional()),
-  budget_tokens: optionalNonNegInt,
-  budget_cost_usd: optionalNonNegNumber,
-  budget_period: z.preprocess(
-    blankToUndef,
-    z.enum(["lifetime", "monthly", "term"]).default("lifetime"),
-  ),
 });
 
 const tenantUpdateSchema = z.object({
@@ -280,101 +262,40 @@ function parseWeeklyWindows(value: FormDataEntryValue | null) {
   }
 }
 
-export async function createTenantAction(formData: FormData): Promise<ActionResult> {
+/**
+ * Add a tenant from the Add tenant sheet: name, organization, group, weight
+ * and caps. Its hours, budget, models and policies are set on its page.
+ */
+export async function createTenantAction(formData: FormData): Promise<{ ok: true; tenant: { id: string; name: string } } | { ok: false; error: string }> {
   const session = await requireAdmin();
   const parsed = tenantCreateSchema.safeParse({
     name: formData.get("name"),
-    description: formData.get("description"),
     organization: formData.get("organization"),
-    contact_email: formData.get("contact_email"),
-    status: formData.get("status"),
     fairshare_group: formData.get("fairshare_group"),
     weight: formData.get("weight"),
     tokens_per_minute: formData.get("tokens_per_minute"),
     max_in_flight: formData.get("max_in_flight"),
-    timezone: formData.get("timezone"),
-    active_from: formData.get("active_from"),
-    active_until: formData.get("active_until"),
-    budget_tokens: formData.get("budget_tokens"),
-    budget_cost_usd: formData.get("budget_cost_usd"),
-    budget_period: formData.get("budget_period"),
   });
   if (!parsed.success) return { ok: false, error: firstIssue(parsed.error) };
-  const windows = parseWeeklyWindows(formData.get("weekly_windows"));
-  if (!windows.success) return { ok: false, error: firstIssue(windows.error) };
-  const allowed_models = formData
-    .getAll("allowed_models")
-    .map((value) => trimmed(value))
-    .filter(Boolean);
-
   const data = parsed.data;
-  if (
-    data.active_from &&
-    data.active_until &&
-    new Date(data.active_until) <= new Date(data.active_from)
-  ) {
-    return { ok: false, error: "Active-until must be after active-from." };
-  }
-
   try {
     const tenant = await obleth.createTenant({
       name: data.name,
-      weight: data.weight,
+      weight: data.weight ?? 100,
       tokens_per_minute: data.tokens_per_minute ?? 0,
       max_in_flight: data.max_in_flight,
       fairshare_group: data.fairshare_group || undefined,
     }, { auditActor: session.email });
-
-    if (data.description || data.organization || data.contact_email) {
-      await obleth.updateTenant(tenant.id, {
-        name: data.name,
-        description: data.description,
-        organization: data.organization,
-        contact_email: data.contact_email ?? "",
-      }, { auditActor: session.email });
+    if (data.organization) {
+      await obleth.updateTenant(tenant.id, { name: data.name, organization: data.organization }, { auditActor: session.email });
     }
-
-    if (data.status !== "active") {
-      await obleth.setTenantStatus(tenant.id, data.status, { auditActor: session.email });
-    }
-
-    const hasSchedule =
-      data.timezone !== "UTC" ||
-      data.active_from ||
-      data.active_until ||
-      windows.data.length > 0;
-    if (hasSchedule) {
-      await obleth.setTenantSchedule(tenant.id, {
-        timezone: data.timezone,
-        active_from: data.active_from ?? null,
-        active_until: data.active_until ?? null,
-        weekly_windows: windows.data.length ? windows.data : null,
-      }, { auditActor: session.email });
-    }
-
-    const hasBudget =
-      data.budget_tokens != null ||
-      data.budget_cost_usd != null ||
-      data.budget_period !== "lifetime";
-    if (hasBudget) {
-      await obleth.setTenantBudget(tenant.id, {
-        budget_tokens: data.budget_tokens ?? null,
-        budget_cost_usd: data.budget_cost_usd ?? null,
-        budget_period: data.budget_period,
-      }, { auditActor: session.email });
-    }
-
-    if (allowed_models.length > 0) {
-      await obleth.setTenantAllowlist(tenant.id, allowed_models, { auditActor: session.email });
-    }
+    revalidatePath("/tenants");
+    revalidatePath("/fairshare");
+    revalidatePath("/");
+    return { ok: true, tenant: { id: tenant.id, name: tenant.name } };
   } catch (e) {
     return actionError(e);
   }
-
-  revalidatePath("/tenants");
-  revalidatePath("/fairshare");
-  revalidatePath("/");
-  return { ok: true };
 }
 
 export async function setTenantStatusAction(id: string, status: string): Promise<ActionResult> {

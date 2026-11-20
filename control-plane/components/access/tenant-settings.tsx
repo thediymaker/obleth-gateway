@@ -7,7 +7,7 @@ import { SettingsForm } from "@/components/access/settings-form";
 import { BudgetBar, SettingsCard } from "@/components/access/ui";
 import { WeekGrid } from "@/components/access/week-grid";
 import { SelectField, Setting, Switch, TextArea, TextField } from "@/components/models/fields";
-import { clockIn, groupShare, isTimeZone, utcToZoned, zonedToUtc, type BudgetView } from "@/lib/access-model";
+import { clockIn, groupShare, isTimeZone, PERIOD_OPTIONS, utcToZoned, zonedToUtc, type BudgetView } from "@/lib/access-model";
 import { money } from "@/lib/models-model";
 import type { Tenant } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
@@ -69,12 +69,6 @@ export const SECTION_CARD: Record<TenantSettingsSection, string> = {
   tracing: "advanced",
   synthetic: "advanced",
 };
-
-const PERIODS = [
-  { value: "monthly", label: "each month" },
-  { value: "term", label: "per term" },
-  { value: "lifetime", label: "in total" },
-];
 
 const ZONES: string[] = (() => {
   try {
@@ -144,7 +138,7 @@ function BudgetFields({ tenant, budget }: { tenant: Tenant; budget: (BudgetView 
             <span className="text-muted-foreground">$</span>
             <input name="budget_cost_usd" aria-label="Spend cap" inputMode="decimal" value={cost} onChange={(e) => setCost(e.target.value)} placeholder="No cap" className="h-full min-w-0 flex-1 bg-transparent px-1.5 font-mono text-[12.5px] outline-none" />
           </span>
-          <div className="w-36"><SelectField name="budget_period" label="Budget period" value={period} onChange={setPeriod} options={PERIODS} /></div>
+          <div className="w-36"><SelectField name="budget_period" label="Budget period" value={period} onChange={setPeriod} options={PERIOD_OPTIONS} /></div>
         </div>
         {budget && (cost || tokens) && (
           <div className="flex flex-wrap items-center gap-2.5 text-[12.5px] text-secondary-foreground">

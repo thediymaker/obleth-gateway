@@ -12,14 +12,8 @@ import { Segmented } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Select } from "@/components/ui/select";
-import { tenantHref } from "@/lib/access-model";
+import { PERIOD_OPTIONS, tenantHref } from "@/lib/access-model";
 import type { ApiKey, NamedNetwork, Tenant } from "@/lib/obleth";
-
-export const PERIOD_OPTIONS = [
-  { value: "monthly", label: "each month" },
-  { value: "term", label: "per term" },
-  { value: "lifetime", label: "in total" },
-];
 
 /** " 2 failed: a (why); b (why)" after a bulk key action's count, or "" when none did. */
 export function bulkFailures(r: BulkKeyResult): string {
