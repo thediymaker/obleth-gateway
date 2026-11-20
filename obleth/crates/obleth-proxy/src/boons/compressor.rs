@@ -510,9 +510,11 @@ mod tests {
         }
         let scored = client.score(&http, &batches).await;
         assert_eq!(scored.outcome, ScoreOutcome::Open);
-        assert_eq!(
-            hits.load(Ordering::SeqCst),
-            BREAKER_AFTER as usize,
+        // Under load a 50 ms call can time out before the stub counts it, so
+        // let any in flight land, then check the open breaker added none.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            hits.load(Ordering::SeqCst) <= BREAKER_AFTER as usize,
             "the open breaker sends nothing"
         );
     }
