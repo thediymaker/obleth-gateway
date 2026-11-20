@@ -15,9 +15,11 @@ pub mod capacity_discovery;
 pub mod energy_probe;
 mod error;
 pub mod knowledge;
+pub mod live_catalog;
 pub mod live_load;
 pub mod model_health;
 mod models_io;
+mod names;
 mod openapi;
 pub mod recipes;
 pub mod router_readiness;
@@ -148,6 +150,9 @@ pub struct AdminState {
     /// findings. Injected by the binary that owns the data plane; `None`
     /// (a standalone admin process) leaves findings unjudged.
     pub judge: Option<advice::JudgeFn>,
+    /// Models and endpoints for `/fairshare/live`, re-read at most every
+    /// [`live_catalog::LIVE_CATALOG_TTL`].
+    pub live_catalog: Arc<live_catalog::LiveCatalog>,
 }
 
 /// A boxed call into the data plane's classifier: `(prompt, available_tags)`
@@ -5899,28 +5904,12 @@ async fn get_usage_logs(
     Query(q): Query<usage::UsageLogQuery>,
 ) -> Result<Json<Vec<UsageLogEntry>>> {
     let rows = usage::query_usage_logs(&state.clickhouse, q).await?;
-
-    let tenant_names: std::collections::HashMap<Uuid, String> = state
-        .store
-        .list_tenants()
-        .await?
-        .into_iter()
-        .map(|t| (t.id, t.name))
-        .collect();
-
-    let key_ids: Vec<Uuid> = {
-        let mut ids: Vec<Uuid> = rows.iter().map(|r| r.key_id).collect();
-        ids.sort_unstable();
-        ids.dedup();
-        ids
-    };
-    let key_meta: std::collections::HashMap<Uuid, (String, String)> = state
-        .store
-        .keys_by_ids(&key_ids)
-        .await?
-        .into_iter()
-        .map(|k| (k.id, (k.name, k.key_prefix)))
-        .collect();
+    let known = names::resolve_names(
+        &state,
+        rows.iter().map(|r| r.tenant_id),
+        rows.iter().map(|r| r.key_id),
+    )
+    .await?;
 
     let request_ids: Vec<Uuid> = rows.iter().map(|r| r.request_id).collect();
     let traced = usage::batch_has_trace(&state.clickhouse, &request_ids).await;
@@ -5931,14 +5920,14 @@ async fn get_usage_logs(
         .map(|row| {
             // The live name when the key or tenant still exists, else the one
             // recorded on the row, so a deleted key's requests keep their name.
-            let tenant_name = tenant_names
-                .get(&row.tenant_id)
-                .cloned()
-                .unwrap_or_else(|| row.recorded_tenant_name.clone());
-            let (key_name, key_prefix) = key_meta
-                .get(&row.key_id)
-                .cloned()
-                .unwrap_or_else(|| (row.recorded_key_name.clone(), String::new()));
+            let tenant_name = known
+                .tenant_name(&row.tenant_id)
+                .unwrap_or(&row.recorded_tenant_name)
+                .to_string();
+            let (key_name, key_prefix) = match known.keys.get(&row.key_id) {
+                Some(k) => (k.name.clone(), k.key_prefix.clone()),
+                None => (row.recorded_key_name.clone(), String::new()),
+            };
             let has_trace = traced.contains(&row.request_id);
             let network_name = (!row.client_ip.is_empty())
                 .then(|| names.name_of(&row.client_ip).map(str::to_string))
@@ -5971,37 +5960,32 @@ async fn get_usage_log_facets(
     Query(q): Query<usage::UsageLogQuery>,
 ) -> Result<Json<usage::UsageLogFacets>> {
     let mut facets = usage::query_usage_log_facets(&state.clickhouse, q).await?;
-    let tenant_names: std::collections::HashMap<String, String> = state
-        .store
-        .list_tenants()
-        .await?
-        .into_iter()
-        .map(|t| (t.id.to_string(), t.name))
-        .collect();
+    let ids = |values: &[usage::UsageLogFacet]| -> Vec<Uuid> {
+        values
+            .iter()
+            .filter_map(|v| Uuid::parse_str(&v.value).ok())
+            .collect()
+    };
+    let known = names::resolve_names(&state, ids(&facets.tenants), ids(&facets.keys)).await?;
     for t in &mut facets.tenants {
-        t.label = tenant_names.get(&t.value).cloned().unwrap_or_default();
+        t.label = Uuid::parse_str(&t.value)
+            .ok()
+            .and_then(|id| known.tenant_name(&id))
+            .unwrap_or_default()
+            .to_string();
     }
-    let key_ids: Vec<Uuid> = facets
-        .keys
-        .iter()
-        .filter_map(|k| Uuid::parse_str(&k.value).ok())
-        .collect();
-    let key_names: std::collections::HashMap<String, String> = state
-        .store
-        .keys_by_ids(&key_ids)
-        .await?
-        .into_iter()
-        .map(|k| {
-            let label = if k.name.is_empty() {
-                k.key_prefix
-            } else {
-                format!("{} · {}", k.name, k.key_prefix)
-            };
-            (k.id.to_string(), label)
-        })
-        .collect();
     for k in &mut facets.keys {
-        k.label = key_names.get(&k.value).cloned().unwrap_or_default();
+        k.label = Uuid::parse_str(&k.value)
+            .ok()
+            .and_then(|id| known.keys.get(&id))
+            .map(|k| {
+                if k.name.is_empty() {
+                    k.key_prefix.clone()
+                } else {
+                    format!("{} · {}", k.name, k.key_prefix)
+                }
+            })
+            .unwrap_or_default();
     }
     Ok(Json(facets))
 }
@@ -6021,28 +6005,18 @@ async fn get_usage_failure_groups(
     Query(q): Query<usage::UsageLogQuery>,
 ) -> Result<Json<usage::UsageFailureGroups>> {
     let mut failures = usage::query_usage_failure_groups(&state.clickhouse, q).await?;
-    let tenant_names: std::collections::HashMap<Uuid, String> = state
-        .store
-        .list_tenants()
-        .await?
-        .into_iter()
-        .map(|t| (t.id, t.name))
-        .collect();
-    let key_ids: Vec<Uuid> = failures.groups.iter().map(|g| g.key_id).collect();
-    let key_names: std::collections::HashMap<Uuid, String> = state
-        .store
-        .keys_by_ids(&key_ids)
-        .await?
-        .into_iter()
-        .filter(|k| !k.name.is_empty())
-        .map(|k| (k.id, k.name))
-        .collect();
+    let known = names::resolve_names(
+        &state,
+        failures.groups.iter().map(|g| g.tenant_id),
+        failures.groups.iter().map(|g| g.key_id),
+    )
+    .await?;
     for g in &mut failures.groups {
-        if let Some(name) = tenant_names.get(&g.tenant_id) {
-            g.tenant_name = name.clone();
+        if let Some(name) = known.tenant_name(&g.tenant_id) {
+            g.tenant_name = name.to_string();
         }
-        if let Some(name) = key_names.get(&g.key_id) {
-            g.key_name = name.clone();
+        if let Some(name) = known.key_name(&g.key_id).filter(|n| !n.is_empty()) {
+            g.key_name = name.to_string();
         }
     }
     Ok(Json(failures))
@@ -6105,35 +6079,26 @@ async fn get_usage_breakdown(
     Query(q): Query<usage::UsageBreakdownQuery>,
 ) -> Result<Json<Vec<UsageBreakdownEntry>>> {
     let rows = usage::query_usage_breakdown_by_model(&state.clickhouse, &q).await?;
-
-    let tenant_meta: std::collections::HashMap<Uuid, (String, String)> = state
-        .store
-        .list_tenants()
-        .await?
-        .into_iter()
-        .map(|t| (t.id, (t.name, t.fairshare_group)))
-        .collect();
-
-    let key_ids: Vec<Uuid> = {
-        let mut ids: Vec<Uuid> = rows.iter().map(|r| r.key_id).collect();
-        ids.sort_unstable();
-        ids.dedup();
-        ids
-    };
-    let key_meta: std::collections::HashMap<Uuid, (String, String)> = state
-        .store
-        .keys_by_ids(&key_ids)
-        .await?
-        .into_iter()
-        .map(|k| (k.id, (k.name, k.key_prefix)))
-        .collect();
+    let known = names::resolve_names(
+        &state,
+        rows.iter().map(|r| r.tenant_id),
+        rows.iter().map(|r| r.key_id),
+    )
+    .await?;
 
     let entries = rows
         .into_iter()
         .map(|row| {
-            let (tenant_name, fairshare_group) =
-                tenant_meta.get(&row.tenant_id).cloned().unwrap_or_default();
-            let (key_name, key_prefix) = key_meta.get(&row.key_id).cloned().unwrap_or_default();
+            let (tenant_name, fairshare_group) = known
+                .tenants
+                .get(&row.tenant_id)
+                .map(|t| (t.name.clone(), t.fairshare_group.clone()))
+                .unwrap_or_default();
+            let (key_name, key_prefix) = known
+                .keys
+                .get(&row.key_id)
+                .map(|k| (k.name.clone(), k.key_prefix.clone()))
+                .unwrap_or_default();
             UsageBreakdownEntry {
                 row,
                 tenant_name,
@@ -7265,9 +7230,10 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
         Some(c) => &c.pools,
         None => &snap.pools,
     };
-    let tenants = state.store.list_tenants().await?;
-    let tenant_names: std::collections::HashMap<Uuid, String> =
-        tenants.into_iter().map(|t| (t.id, t.name)).collect();
+    let tenant_ids: Vec<Uuid> = source
+        .iter()
+        .flat_map(|p| p.tenants.iter().map(|t| t.tenant_id))
+        .collect();
     let key_ids: Vec<Uuid> = source
         .iter()
         .flat_map(|p| {
@@ -7275,20 +7241,19 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
                 .iter()
                 .map(|k| k.end_user.as_ref().map_or(k.key_id, |e| e.parent_key))
         })
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
         .collect();
-    let key_names: std::collections::HashMap<Uuid, String> = state
-        .store
-        .keys_by_ids(&key_ids)
-        .await?
-        .into_iter()
-        .map(|k| (k.id, k.name))
+    let known = names::resolve_names(&state, tenant_ids, key_ids).await?;
+    let tenant_names: std::collections::HashMap<Uuid, String> = known
+        .tenants
+        .into_values()
+        .map(|t| (t.id, t.name))
         .collect();
-    let models = state.store.list_models().await?;
-    let endpoints = state.store.all_model_endpoints().await?;
+    let key_names: std::collections::HashMap<Uuid, String> =
+        known.keys.into_values().map(|k| (k.id, k.name)).collect();
+    let catalog = state.live_catalog.get(&state.store).await?;
+    let (models, endpoints) = (&catalog.models, &catalog.endpoints);
     let discovered = state.capacity_discovery.effective_caps();
-    let (counted, serving) = served_models(&state, models.clone(), &endpoints);
+    let (counted, serving) = served_models(&state, models.clone(), endpoints);
     let configured_capacity =
         enabled_pool_share_with(&counted, state.default_model_max_in_flight, 1, &discovered);
     let capacity = enabled_pool_share_with(
@@ -10036,6 +10001,7 @@ async fn delete_model(
         )));
     }
     state.store.delete_model(id).await?;
+    state.live_catalog.invalidate().await;
     // Aliases and variants are resolver keys of their own, so a delete has to
     // clear all of them or the model stays reachable under its old names.
     let mut evict_err = None;
@@ -10645,6 +10611,9 @@ async fn sync_model_from(
     model: &ModelRoute,
     previous: Option<&ModelRoute>,
 ) -> Result<()> {
+    // Every model or endpoint write lands here; this replica's live view sees
+    // it on its next poll rather than after the cache ages out.
+    state.live_catalog.invalidate().await;
     // Endpoints carry the per-cluster wire targets and health; the data plane
     // prefers them over the legacy single api_base/api_key when present. A
     // lookup that fails fails the write: publishing the model with no
@@ -10975,6 +10944,7 @@ mod tests {
                 classify: None,
                 capacity_discovery,
                 judge: None,
+                live_catalog: Default::default(),
                 health: ModelHealthRuntime {
                     scheduled_enabled: false,
                     default_interval_secs: 60,
@@ -13733,6 +13703,83 @@ mod tests {
             "the total ceiling is reported: {body}"
         );
         assert_eq!(body["default_model_max_in_flight"], serde_json::json!(32));
+    }
+
+    /// The live view names a pool's tenant and key from the narrow name
+    /// reads, and keeps its model list for the cache's lifetime: a model
+    /// written straight to Postgres is not seen until the copy is dropped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn fairshare_live_names_from_narrow_reads_and_caches_models() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let tenant = t
+            .store
+            .create_tenant(&format!("live-{}", Uuid::new_v4()), 100, 1000, None, None)
+            .await
+            .expect("tenant");
+        let (key, _) = t
+            .store
+            .create_api_key(
+                tenant.id,
+                "live key",
+                "",
+                None,
+                None,
+                None,
+                None,
+                100,
+                None,
+                &[],
+                &[],
+            )
+            .await
+            .expect("key");
+        let admitted = t
+            .fairshare
+            .admit(
+                obleth_fairshare::AdmitRequest::new(tenant.id, "named-pool", 1)
+                    .key(key.id, 100)
+                    .model_cap(4),
+            )
+            .await
+            .expect("admitted");
+        let get = || {
+            axum::http::Request::get("/api/v1/fairshare/live")
+                .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+                .body(axum::body::Body::empty())
+                .expect("build request")
+        };
+        let (status, body) = send(&t.app, get()).await;
+        drop(admitted);
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let pool = body["pools"]
+            .as_array()
+            .expect("pools")
+            .iter()
+            .find(|p| p["model"] == serde_json::json!("named-pool"))
+            .cloned()
+            .expect("the pool is reported");
+        assert_eq!(pool["tenants"][0]["name"], serde_json::json!(tenant.name));
+        assert_eq!(pool["keys"][0]["name"], serde_json::json!("live key"));
+
+        let catalog = live_catalog::LiveCatalog::default();
+        let first = catalog.get(&t.store).await.expect("first read");
+        let name = format!("live-cat-{}", Uuid::new_v4());
+        let model = fixture_model(&t.store, &name, 0.0).await;
+        let cached = catalog.get(&t.store).await.expect("cached read");
+        assert!(
+            Arc::ptr_eq(&first, &cached),
+            "a read inside the TTL is the cached copy"
+        );
+        assert!(!cached.models.iter().any(|m| m.model_name == name));
+        catalog.invalidate().await;
+        let fresh = catalog.get(&t.store).await.expect("fresh read");
+        assert!(fresh.models.iter().any(|m| m.model_name == name));
+
+        t.store.delete_model(model.id).await.ok();
+        t.store.delete_tenant(tenant.id).await.ok();
     }
 
     /// With several replicas live, the view reports this replica's share of

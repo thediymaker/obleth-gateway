@@ -141,6 +141,24 @@ pub struct Recipe {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// A tenant's display name and fair-share group, for labelling rows that
+/// carry only its id (see `tenant_names`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantName {
+    pub id: Uuid,
+    pub name: String,
+    pub fairshare_group: String,
+}
+
+/// A key's display name and prefix, for labelling rows that carry only its
+/// id (see `key_names`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyName {
+    pub id: Uuid,
+    pub name: String,
+    pub key_prefix: String,
+}
+
 /// Config-side counts for the dashboard overview (see `overview_counts`).
 pub struct OverviewCounts {
     pub tenant_count: i64,
@@ -1089,6 +1107,48 @@ impl Store {
             }
         };
         rows.iter().map(api_key_from_row).collect()
+    }
+
+    /// Names and fair-share groups of the given tenants, without reading or
+    /// decoding the rest of each row. Unknown ids are left out.
+    pub async fn tenant_names(&self, ids: &[Uuid]) -> Result<Vec<TenantName>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query("select id, name, fairshare_group from tenants where id = any($1)")
+            .bind(ids)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(TenantName {
+                    id: r.try_get("id")?,
+                    name: r.try_get("name")?,
+                    fairshare_group: r.try_get("fairshare_group")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Names and prefixes of the given keys, without reading the rest of each
+    /// row. Unknown ids are left out.
+    pub async fn key_names(&self, ids: &[Uuid]) -> Result<Vec<KeyName>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query("select id, name, key_prefix from api_keys where id = any($1)")
+            .bind(ids)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(KeyName {
+                    id: r.try_get("id")?,
+                    name: r.try_get("name")?,
+                    key_prefix: r.try_get("key_prefix")?,
+                })
+            })
+            .collect()
     }
 
     /// Fetch a bounded set of keys by id in one query. Used to resolve the
@@ -6014,6 +6074,61 @@ mod tests {
             ..base
         };
         assert_eq!(store.list_audit_filtered(&byid).await.unwrap().len(), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn name_reads_match_the_full_rows_and_skip_unknown_ids() {
+        let Some(url) = crate::test_support::test_db_url() else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        let mut fixtures = FixtureGuard::new(&store);
+        let tenant = store
+            .create_tenant(&format!("t-{}", Uuid::new_v4()), 100, 1000, None, None)
+            .await
+            .expect("create tenant");
+        fixtures.track_tenant(tenant.id);
+        let (key, _) = store
+            .create_api_key(
+                tenant.id,
+                "named",
+                "",
+                None,
+                None,
+                None,
+                None,
+                100,
+                None,
+                &[],
+                &[],
+            )
+            .await
+            .expect("create key");
+        let stranger = Uuid::new_v4();
+
+        let tenants = store.tenant_names(&[tenant.id, stranger]).await.unwrap();
+        assert_eq!(
+            tenants,
+            vec![TenantName {
+                id: tenant.id,
+                name: tenant.name.clone(),
+                fairshare_group: tenant.fairshare_group.clone(),
+            }]
+        );
+        let keys = store.key_names(&[key.id, stranger]).await.unwrap();
+        assert_eq!(
+            keys,
+            vec![KeyName {
+                id: key.id,
+                name: "named".into(),
+                key_prefix: key.key_prefix.clone(),
+            }]
+        );
+        assert!(store.tenant_names(&[]).await.unwrap().is_empty());
+        assert!(store.key_names(&[]).await.unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
