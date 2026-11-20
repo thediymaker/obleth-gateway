@@ -459,6 +459,7 @@ use obleth_config::{
         (name = "fairshare", description = "Live scheduler snapshot and group weights"),
         (name = "models", description = "Model registry, capacity, endpoints, health, and auto-tune"),
         (name = "mcp", description = "MCP server registry"),
+        (name = "recipes", description = "Admin-authored recipe documents"),
         (name = "knowledge", description = "Institutional knowledge base: collections, documents, and re-indexing"),
         (name = "audit", description = "Admin audit log"),
         (name = "batches", description = "Batches across every tenant"),

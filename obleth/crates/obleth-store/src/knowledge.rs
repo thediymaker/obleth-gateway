@@ -53,19 +53,9 @@ const COLLECTION_COLS: &str = "id, name, description, embedding_model, \
     indexed_embedding_model, embedding_dim, chunk_tokens, chunk_overlap_tokens, \
     version";
 
-/// `fetch_one` on a caller-supplied id surfaces a missing row as
-/// `sqlx::Error::RowNotFound`, which the blanket `From<sqlx::Error>` wraps as
-/// `StoreError::Db` — mapped by the admin layer to a 500, not a 404, since
-/// only the explicit `StoreError::NotFound` variant gets the 404 treatment.
-/// Every by-id lookup/update/delete below that can legitimately be called
-/// with a nonexistent id runs its `fetch_one` through this so the API
-/// contract holds.
-fn map_missing(e: sqlx::Error) -> StoreError {
-    match e {
-        sqlx::Error::RowNotFound => StoreError::NotFound,
-        other => StoreError::Db(other),
-    }
-}
+// A by-id lookup, update or delete of a missing row is `StoreError::NotFound`
+// (`fetch_optional(..).ok_or(NotFound)`), the store's one rule, which the
+// admin layer answers with 404.
 
 /// True for Postgres SQLSTATE `40P01` (deadlock_detected) — an expected,
 /// transient outcome of concurrent writers, safe to retry.
@@ -126,9 +116,9 @@ impl Store {
             "select {COLLECTION_COLS} from knowledge_collections where id = $1"
         ))
         .bind(id)
-        .fetch_one(self.pool())
-        .await
-        .map_err(map_missing)?;
+        .fetch_optional(self.pool())
+        .await?
+        .ok_or(StoreError::NotFound)?;
         Ok(row_to_collection(&row))
     }
 
@@ -153,9 +143,9 @@ impl Store {
         .bind(embedding_model)
         .bind(chunk_tokens)
         .bind(chunk_overlap_tokens)
-        .fetch_one(self.pool())
-        .await
-        .map_err(map_missing)?;
+        .fetch_optional(self.pool())
+        .await?
+        .ok_or(StoreError::NotFound)?;
         Ok(row_to_collection(&row))
     }
 
@@ -175,9 +165,9 @@ impl Store {
         .bind(id)
         .bind(model)
         .bind(dim)
-        .fetch_one(self.pool())
-        .await
-        .map_err(map_missing)?;
+        .fetch_optional(self.pool())
+        .await?
+        .ok_or(StoreError::NotFound)?;
         Ok(row_to_collection(&row))
     }
 
@@ -460,10 +450,10 @@ impl Store {
         let row =
             sqlx::query("delete from knowledge_documents where id = $1 returning collection_id")
                 .bind(id)
-                .fetch_one(self.pool())
-                .await
-                .map_err(map_missing)?;
-        Ok(row.get("collection_id"))
+                .fetch_optional(self.pool())
+                .await?
+                .ok_or(StoreError::NotFound)?;
+        Ok(row.try_get("collection_id")?)
     }
 
     /// Commit one document's freshly embedded chunks and make them live, in a
@@ -745,7 +735,7 @@ impl Store {
         .bind(exclude_document_id)
         .fetch_one(self.pool())
         .await?;
-        Ok(row.get("n"))
+        Ok(row.try_get("n")?)
     }
 
     /// Chunk count and approximate stored bytes per collection, for the
@@ -944,9 +934,9 @@ impl Store {
               returning {DOC_COLS}"
         ))
         .bind(id)
-        .fetch_one(self.pool())
-        .await
-        .map_err(map_missing)?;
+        .fetch_optional(self.pool())
+        .await?
+        .ok_or(StoreError::NotFound)?;
         Ok(row_to_document(&row))
     }
 }
@@ -1055,6 +1045,28 @@ mod tests {
             .migrate()
             .await
             .expect("migrations must be re-runnable");
+    }
+
+    /// A lookup, an update or a delete of a missing row is `NotFound`, the
+    /// store's one rule, not a database error.
+    #[tokio::test]
+    async fn a_missing_collection_or_document_is_not_found() {
+        let Some((store, _serial)) = test_store().await else {
+            return;
+        };
+        let missing = uuid::Uuid::new_v4();
+        assert!(matches!(
+            store.get_collection(missing).await,
+            Err(crate::StoreError::NotFound)
+        ));
+        assert!(matches!(
+            store.delete_document(missing).await,
+            Err(crate::StoreError::NotFound)
+        ));
+        assert!(matches!(
+            store.set_indexed_embedder(missing, "m", 2).await,
+            Err(crate::StoreError::NotFound)
+        ));
     }
 
     #[tokio::test]

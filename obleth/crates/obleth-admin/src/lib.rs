@@ -10934,6 +10934,75 @@ mod tests {
             .expect("build request")
     }
 
+    /// Recipes follow the admin API's conventions: a delete answers 204 and
+    /// 404 when nothing was deleted; a PUT changes an existing recipe and
+    /// 404s for a missing id instead of creating one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn recipes_delete_with_204_and_404_and_put_never_creates() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let missing = Uuid::new_v4();
+        let body = serde_json::json!({"name": "greeter", "body": "spec", "author": "ana"});
+        let (status, _) = send(
+            &t.app,
+            json_request("PUT", &format!("/api/v1/recipes/{missing}"), body.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = send(
+            &t.app,
+            json_request(
+                "DELETE",
+                &format!("/api/v1/recipes/{missing}"),
+                serde_json::Value::Null,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, made) = send(
+            &t.app,
+            json_request("POST", "/api/v1/recipes", body.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let id = made["id"].as_str().expect("id").to_string();
+        let (status, changed) = send(
+            &t.app,
+            json_request(
+                "PUT",
+                &format!("/api/v1/recipes/{id}"),
+                serde_json::json!({"name": "greeter-2"}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            (status, changed["name"].as_str()),
+            (StatusCode::OK, Some("greeter-2"))
+        );
+        let (status, _) = send(
+            &t.app,
+            json_request(
+                "DELETE",
+                &format!("/api/v1/recipes/{id}"),
+                serde_json::Value::Null,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = send(
+            &t.app,
+            json_request(
+                "DELETE",
+                &format!("/api/v1/recipes/{id}"),
+                serde_json::Value::Null,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
     /// A Slurm-managed embedder has a blank `api_base` and lives only in its
     /// endpoints. Indexing and the search preview must reach the healthy one
     /// with its key, like the data plane does, not fail on the blank base.

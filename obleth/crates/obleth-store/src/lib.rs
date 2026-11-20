@@ -147,8 +147,8 @@ pub struct OverviewCounts {
     pub has_pricing: bool,
 }
 
-pub struct UpsertRecipe {
-    pub id: Option<Uuid>,
+/// What a recipe is made of or changed to; `create_recipe` mints the id.
+pub struct NewRecipe {
     pub name: String,
     pub body: String,
     pub author: String,
@@ -2805,17 +2805,13 @@ impl Store {
         row.as_ref().map(recipe_from_row).transpose()
     }
 
-    pub async fn upsert_recipe(&self, r: UpsertRecipe) -> Result<Recipe> {
-        let id = r.id.unwrap_or_else(Uuid::new_v4);
+    pub async fn create_recipe(&self, r: NewRecipe) -> Result<Recipe> {
         let row = sqlx::query(
             "insert into recipes (id, name, body, author)
              values ($1,$2,$3,$4)
-             on conflict (id) do update set
-               name=excluded.name, body=excluded.body,
-               author=excluded.author, updated_at=now()
              returning id, name, body, author, created_at, updated_at",
         )
-        .bind(id)
+        .bind(Uuid::new_v4())
         .bind(&r.name)
         .bind(&r.body)
         .bind(&r.author)
@@ -2824,11 +2820,32 @@ impl Store {
         recipe_from_row(&row)
     }
 
+    /// `NotFound` for an id that is not there: an update never creates.
+    pub async fn update_recipe(&self, id: Uuid, r: NewRecipe) -> Result<Recipe> {
+        let row = sqlx::query(
+            "update recipes set name=$2, body=$3, author=$4, updated_at=now()
+             where id = $1
+             returning id, name, body, author, created_at, updated_at",
+        )
+        .bind(id)
+        .bind(&r.name)
+        .bind(&r.body)
+        .bind(&r.author)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+        recipe_from_row(&row)
+    }
+
+    /// `NotFound` when there was nothing to delete.
     pub async fn delete_recipe(&self, id: Uuid) -> Result<()> {
-        sqlx::query("delete from recipes where id = $1")
+        let done = sqlx::query("delete from recipes where id = $1")
             .bind(id)
             .execute(&self.pool)
             .await?;
+        if done.rows_affected() == 0 {
+            return Err(StoreError::NotFound);
+        }
         Ok(())
     }
 
@@ -3166,18 +3183,26 @@ impl Store {
     /// Delete a replica row. Its launch-history row stays; if the launch was
     /// still open (the row was removed before it drained or was lost) it is
     /// closed now with end state `deleted`.
+    /// `NotFound` when there was no such replica; its launch record, if any,
+    /// is closed as deleted.
     pub async fn delete_replica(&self, id: Uuid) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("delete from model_replicas where id = $1 returning id")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(StoreError::NotFound)?;
         sqlx::query(
-            "with d as (delete from model_replicas where id = $1 returning id)
-             update deployment_launches set
+            "update deployment_launches set
                  ended_at = coalesce(ended_at, now()),
                  end_state = coalesce(end_state, 'deleted'),
                  updated_at = now()
-             where id in (select id from d) and (ended_at is null or end_state is null)",
+             where id = $1 and (ended_at is null or end_state is null)",
         )
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -5127,6 +5152,49 @@ mod tests {
     }
 
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
+    /// A missing recipe is `NotFound` on update and delete, and `None` on get;
+    /// an update never creates.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_missing_recipe_is_not_found_and_never_created_by_an_update() {
+        let Some(url) = crate::test_support::test_db_url() else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        let recipe = |name: &str| NewRecipe {
+            name: name.into(),
+            body: "spec".into(),
+            author: "ana".into(),
+        };
+        let missing = Uuid::new_v4();
+        assert!(matches!(
+            store.update_recipe(missing, recipe("x")).await,
+            Err(StoreError::NotFound)
+        ));
+        assert!(matches!(
+            store.delete_recipe(missing).await,
+            Err(StoreError::NotFound)
+        ));
+        assert!(store.get_recipe(missing).await.expect("get").is_none());
+        let made = store.create_recipe(recipe("first")).await.expect("create");
+        let changed = store
+            .update_recipe(made.id, recipe("second"))
+            .await
+            .expect("update");
+        assert_eq!((changed.id, changed.name.as_str()), (made.id, "second"));
+        store.delete_recipe(made.id).await.expect("delete");
+        assert!(matches!(
+            store.delete_recipe(made.id).await,
+            Err(StoreError::NotFound)
+        ));
+        assert!(matches!(
+            store.delete_replica(Uuid::new_v4()).await,
+            Err(StoreError::NotFound)
+        ));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn model_upstream_headers_roundtrip() {
         let Some(url) = crate::test_support::test_db_url() else {
@@ -7976,8 +8044,7 @@ mod tests {
         store.migrate().await.expect("migrate");
 
         let saved = store
-            .upsert_recipe(UpsertRecipe {
-                id: None,
+            .create_recipe(NewRecipe {
                 name: "GLM".into(),
                 body: "---\nname: GLM\n---\nllama-server".into(),
                 author: "you".into(),
@@ -7992,12 +8059,14 @@ mod tests {
             .any(|r| r.id == saved.id));
 
         let updated = store
-            .upsert_recipe(UpsertRecipe {
-                id: Some(saved.id),
-                name: "GLM v2".into(),
-                body: saved.body.clone(),
-                author: "you".into(),
-            })
+            .update_recipe(
+                saved.id,
+                NewRecipe {
+                    name: "GLM v2".into(),
+                    body: saved.body.clone(),
+                    author: "you".into(),
+                },
+            )
             .await
             .expect("update");
         assert_eq!(updated.name, "GLM v2");

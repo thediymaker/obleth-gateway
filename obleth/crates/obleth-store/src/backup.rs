@@ -1257,14 +1257,13 @@ mod tests {
             .await
             .expect("link endpoint");
         let recipe = store
-            .upsert_recipe(crate::UpsertRecipe {
-                id: None,
+            .create_recipe(crate::NewRecipe {
                 name: format!("r-{}", uuid::Uuid::new_v4()),
                 body: "#!/bin/bash\nserve\n".into(),
                 author: "test".into(),
             })
             .await
-            .expect("upsert recipe");
+            .expect("create recipe");
 
         // Export carries the stored hash and the tenant config.
         let data = store.export_backup_data().await.expect("export");
