@@ -2101,7 +2101,6 @@ mod settlement_tests {
 
     #[test]
     fn verdicts_admission_is_bounded_by_the_shared_admission_timeout() {
-        let h = handler();
         // Same wrapper as the passthrough pipeline (proxy.rs): bounded by
         // `OBLETH_ADMISSION_TIMEOUT_SECS`, and a timed-out wait answers 503
         // with the shared `Retry-After` value rather than parking forever.
