@@ -26,7 +26,12 @@ use uuid::Uuid;
 use crate::state::AppState;
 pub(crate) use obleth_admin::{build_targets, UpstreamTarget as Target};
 
+/// Largest request body any surface accepts: `/v1/chat/completions`, the
+/// Responses and Messages shims, and the file-free batch and job calls read
+/// through [`read_body`], so one limit and one answer hold everywhere.
 pub(crate) const BODY_LIMIT: usize = 64 * 1024 * 1024;
+/// The message of the 413 every surface gives a body over [`BODY_LIMIT`].
+pub(crate) const BODY_TOO_LARGE: &str = "request body too large";
 const TAIL_CAP: usize = 16 * 1024;
 /// Upper bound on a response we are willing to cache. Larger responses stream
 /// through uncached so the cache can't be used to balloon Redis memory.
@@ -124,14 +129,6 @@ fn canonical_path(method: &Method, path: &str) -> Option<String> {
 
 pub async fn proxy_handler(state: State<AppState>, mut req: Request<Body>) -> Response<Body> {
     let request_id = Uuid::new_v4();
-    // The surface marker is the gateway's own annotation (see
-    // `crate::responses::SURFACE_HEADER`); stripped here unconditionally so a
-    // caller cannot stamp a direct chat call as Responses traffic and pollute
-    // the adoption metric. The shim re-inserts it after this strip.
-    req.headers_mut().remove(crate::responses::SURFACE_HEADER);
-    // Likewise the effort the Responses and Messages shims carry over: a
-    // caller sets effort in the body, never with the gateway's own header.
-    req.headers_mut().remove(crate::reasoning::EFFORT_HEADER);
     if let Some(canonical) = canonical_path(req.method(), req.uri().path()) {
         let pq = match req.uri().query() {
             Some(q) => format!("{canonical}?{q}"),
@@ -175,9 +172,81 @@ pub async fn proxy_handler(state: State<AppState>, mut req: Request<Body>) -> Re
     resp
 }
 
-/// Largest `/v1/responses` body accepted. The translated body is held in
-/// memory, and the pipeline's own limits apply after that.
-const RESPONSES_BODY_MAX: usize = 32 * 1024 * 1024;
+/// Largest upstream answer a shim translates whole; a larger one passes back
+/// untouched (see [`translate_body`]).
+const TRANSLATED_RESPONSE_MAX: usize = 32 * 1024 * 1024;
+
+/// A request body over [`BODY_LIMIT`]: the one thing `to_bytes` fails on,
+/// since a malformed transport read surfaces earlier, from the connection
+/// itself. Each surface renders it in its own error shape, with one status
+/// and one message.
+pub(crate) struct BodyTooLarge;
+
+impl BodyTooLarge {
+    /// The OpenAI-shaped 413 (`/v1/chat/completions`, `/v1/responses`, batches, jobs).
+    pub(crate) fn openai(self) -> Response<Body> {
+        error_json(StatusCode::PAYLOAD_TOO_LARGE, BODY_TOO_LARGE)
+    }
+    /// The Anthropic-shaped 413 (`/v1/messages`).
+    fn anthropic(self) -> Response<Body> {
+        anthropic_error(StatusCode::PAYLOAD_TOO_LARGE, BODY_TOO_LARGE, None)
+    }
+}
+
+/// The whole request body, or [`BodyTooLarge`] past [`BODY_LIMIT`].
+pub(crate) async fn read_body(body: Body) -> Result<Bytes, BodyTooLarge> {
+    axum::body::to_bytes(body, BODY_LIMIT)
+        .await
+        .map_err(|_| BodyTooLarge)
+}
+
+/// Background admission for a batch item: its share of the model and the
+/// longest it may wait for a slot.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct BackgroundShare {
+    pub share: f64,
+    pub admission_wait: Duration,
+}
+
+/// What an in-process caller (a shim, the batch runner) already knows about
+/// the request it hands to the pipeline, as a request extension. The pipeline
+/// takes each piece from here instead of doing it again, and none of it rides
+/// on a header a client could set or strip. Only in-process code inserts it;
+/// it never arrives over HTTP.
+#[derive(Clone, Default)]
+pub(crate) struct PipelineInput {
+    /// The surface the caller used (`responses`, `messages`); chat when none.
+    pub surface: Option<&'static str>,
+    /// The effort the surface spelled in fields chat has no name for.
+    pub effort: Option<crate::reasoning::Requested>,
+    /// The credential the caller already authenticated and gated.
+    pub credential: Option<crate::jwt_auth::Credential>,
+    /// The translated body, so the pipeline parses nothing.
+    pub body: Option<serde_json::Value>,
+    /// The caller's input estimate, when it counts what the tokenizer does
+    /// not see (the Messages shim counts tools and images).
+    pub estimate: Option<u32>,
+    /// A batch item's background admission.
+    pub batch: Option<BackgroundShare>,
+}
+
+impl PipelineInput {
+    /// The input an in-process caller set, or nothing for a request over HTTP.
+    pub(crate) fn of(extensions: &http::Extensions) -> PipelineInput {
+        extensions
+            .get::<PipelineInput>()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The estimate to reserve: the caller's input count when it gave one.
+    fn reserve(&self, mut est: CostEstimate) -> CostEstimate {
+        if let Some(input_tokens) = self.estimate {
+            est.input_tokens = input_tokens;
+        }
+        est
+    }
+}
 
 /// Run a Responses request as a chat request and translate the answer back.
 ///
@@ -197,20 +266,19 @@ async fn responses_shim(
     let Some(secret) = bearer(&parts.headers) else {
         return error_json(StatusCode::UNAUTHORIZED, "missing bearer token");
     };
-    match crate::jwt_auth::authenticate_credential(&state, &secret).await {
+    let credential = match crate::jwt_auth::authenticate_credential(&state, &secret).await {
         Ok(cred) => {
             let client = crate::client::ClientInfo::of(&parts.extensions);
             if let Err(resp) = gate_resolved_key(&state, &cred.resolved, &client) {
                 return resp;
             }
+            cred
         }
         Err(resp) => return resp,
-    }
-    let Ok(bytes) = axum::body::to_bytes(body, RESPONSES_BODY_MAX).await else {
-        return error_json(
-            StatusCode::BAD_REQUEST,
-            "request body too large or unreadable",
-        );
+    };
+    let bytes = match read_body(body).await {
+        Ok(bytes) => bytes,
+        Err(too_large) => return too_large.openai(),
     };
     let Ok(incoming) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return error_json(StatusCode::BAD_REQUEST, "invalid JSON body");
@@ -236,15 +304,6 @@ async fn responses_shim(
         .unwrap_or("unknown")
         .to_string();
     let chat_body = crate::responses::to_chat_request(&incoming);
-    let chat_bytes = match serde_json::to_vec(&chat_body) {
-        Ok(b) => b,
-        Err(_) => {
-            return error_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "request translation failed",
-            )
-        }
-    };
 
     // Re-point at the chat path so `is_chat_path` holds and every boon runs,
     // and record the surface the caller actually used so telemetry does not
@@ -262,17 +321,18 @@ async fn responses_shim(
     };
     parts.uri = uri;
     parts.headers.remove(header::CONTENT_LENGTH);
-    if let Ok(v) = header::HeaderValue::from_str("responses") {
-        parts.headers.insert(crate::responses::SURFACE_HEADER, v);
-    }
-    // `reasoning.effort` has no chat spelling the translation keeps; carry it
-    // for the pipeline to translate per model.
-    if let Some(v) =
-        crate::reasoning::header_value(obleth_config::reasoning::responses_effort(&incoming))
-    {
-        parts.headers.insert(crate::reasoning::EFFORT_HEADER, v);
-    }
-    let chat_req = Request::from_parts(parts, Body::from(chat_bytes));
+    // `reasoning.effort` has no chat spelling the translation keeps; the
+    // pipeline translates it per model.
+    parts.extensions.insert(PipelineInput {
+        surface: Some(crate::responses::SURFACE),
+        effort: crate::reasoning::Requested::of_surface(
+            obleth_config::reasoning::responses_effort(&incoming),
+        ),
+        credential: Some(credential),
+        body: Some(chat_body),
+        ..PipelineInput::default()
+    });
+    let chat_req = Request::from_parts(parts, Body::empty());
 
     let mut resp = proxy_handler_inner(state, chat_req, request_id).await;
     if !resp.headers().contains_key("x-obleth-request-id") {
@@ -286,7 +346,7 @@ async fn responses_shim(
     if !resp.status().is_success() {
         return resp;
     }
-    if streaming {
+    if should_translate_as_stream(streaming, resp.headers()) {
         translate_response_stream(resp, request_id, model)
     } else {
         translate_response_body(resp, request_id).await
@@ -295,25 +355,12 @@ async fn responses_shim(
 
 /// Buffer a translated chat reply and hand back the Responses object.
 async fn translate_response_body(resp: Response<Body>, request_id: Uuid) -> Response<Body> {
-    let (parts, body) = resp.into_parts();
-    let Ok(bytes) = axum::body::to_bytes(body, RESPONSES_BODY_MAX).await else {
-        return error_json(StatusCode::BAD_GATEWAY, "upstream response too large");
-    };
-    let Ok(chat) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        // Not JSON: hand it back untouched rather than inventing a shape.
-        return Response::from_parts(parts, Body::from(bytes));
-    };
-    let translated = crate::responses::from_chat_response(&chat, &request_id.to_string());
-    let mut builder = Response::builder().status(parts.status);
-    for (name, value) in parts.headers.iter() {
-        if name != header::CONTENT_LENGTH {
-            builder = builder.header(name, value);
-        }
-    }
-    builder
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(translated.to_string()))
-        .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
+    translate_body(
+        resp,
+        || error_json(StatusCode::BAD_GATEWAY, "upstream response too large"),
+        |chat| crate::responses::from_chat_response(chat, &request_id.to_string()),
+    )
+    .await
 }
 
 /// Re-emit a chat SSE stream as Responses events, frame by frame.
@@ -322,18 +369,96 @@ fn translate_response_stream(
     request_id: Uuid,
     model: String,
 ) -> Response<Body> {
+    translate_stream(
+        resp,
+        crate::responses::StreamTranslator::new(&request_id.to_string(), &model),
+    )
+}
+
+/// A shim's stream translator as the shared driver sees it: chat chunks in,
+/// frames of the shim's own event format out.
+trait StreamShim: Send + 'static {
+    fn on_chunk(&mut self, chunk: &serde_json::Value) -> Vec<String>;
+    /// A heartbeat while the upstream is silent.
+    fn ping(&mut self) -> Vec<String>;
+    /// Close a stream whose upstream broke off; `finish` is a no-op after it.
+    fn fail(&mut self, message: &str) -> Vec<String>;
+    fn finish(&mut self) -> Vec<String>;
+}
+
+impl StreamShim for crate::responses::StreamTranslator {
+    fn on_chunk(&mut self, chunk: &serde_json::Value) -> Vec<String> {
+        self.on_chunk(chunk)
+    }
+    fn ping(&mut self) -> Vec<String> {
+        self.ping()
+    }
+    fn fail(&mut self, message: &str) -> Vec<String> {
+        self.fail(message)
+    }
+    fn finish(&mut self) -> Vec<String> {
+        self.finish()
+    }
+}
+
+impl StreamShim for crate::messages::AnthropicStreamTranslator {
+    fn on_chunk(&mut self, chunk: &serde_json::Value) -> Vec<String> {
+        self.on_chunk(chunk)
+    }
+    fn ping(&mut self) -> Vec<String> {
+        self.ping()
+    }
+    fn fail(&mut self, message: &str) -> Vec<String> {
+        self.fail("api_error", message)
+    }
+    fn finish(&mut self) -> Vec<String> {
+        self.finish()
+    }
+}
+
+/// Interval on which an idle translated stream gets a heartbeat. The driver
+/// below exists only once `proxy_handler_inner` has already returned a
+/// streaming response, so it covers gaps between upstream chunks (e.g. a slow
+/// decode) — it starts nothing early and cannot cover an admission queue wait
+/// or buffered-boon work, which both happen before this function is even called.
+const STREAM_PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Re-emit a chat SSE stream through `translator`, frame by frame, with a
+/// heartbeat while the upstream is silent. Shared by the Responses and
+/// Messages shims so a fix on one surface is a fix on both.
+fn translate_stream<T: StreamShim>(resp: Response<Body>, translator: T) -> Response<Body> {
+    translate_stream_with(resp, translator, STREAM_PING_INTERVAL)
+}
+
+fn translate_stream_with<T: StreamShim>(
+    resp: Response<Body>,
+    mut translator: T,
+    ping_interval: std::time::Duration,
+) -> Response<Body> {
     let (parts, body) = resp.into_parts();
-    let id = request_id.to_string();
     let stream = async_stream::stream! {
-        let mut translator = crate::responses::StreamTranslator::new(&id, &model);
         let mut upstream = body.into_data_stream();
         // Bytes in, complete lines out — see `drain_sse_data_lines` for why
         // the split happens on bytes rather than decoded text.
         let mut buffer: Vec<u8> = Vec::new();
-        while let Some(item) = upstream.next().await {
+        loop {
+            let item = match tokio::time::timeout(ping_interval, upstream.next()).await {
+                Ok(item) => item,
+                Err(_) => {
+                    // Silence, not failure: a gap between upstream chunks (a
+                    // slow decode step) is not itself an error. The heartbeat
+                    // keeps the client's own idle timeout from firing while
+                    // the upstream is still working.
+                    for frame in translator.ping() {
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+                    }
+                    continue;
+                }
+            };
+            let Some(item) = item else { break };
             let Ok(chunk) = item else {
                 // The pipeline aborts its body when the upstream stream
-                // breaks; say so instead of closing with `completed`.
+                // breaks; say so instead of closing as complete.
                 for frame in translator.fail("upstream stream ended before the response finished") {
                     yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
                 }
@@ -350,20 +475,53 @@ fn translate_response_stream(
                 }
             }
         }
+        // `fail` followed by `finish` is safe: `finish` is a no-op once `fail`
+        // has closed the translator.
         for frame in translator.finish() {
             yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
         }
     };
-    let mut builder = Response::builder().status(parts.status);
-    for (name, value) in parts.headers.iter() {
-        if name != header::CONTENT_LENGTH && name != header::CONTENT_TYPE {
-            builder = builder.header(name, value);
-        }
-    }
-    builder
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .body(Body::from_stream(stream))
-        .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
+    translated_response(parts, "text/event-stream", Body::from_stream(stream))
+}
+
+/// Buffer a chat reply and hand back `translate` of it. A body that is not JSON
+/// goes back untouched rather than dressed in an invented shape.
+async fn translate_body(
+    resp: Response<Body>,
+    too_large: impl FnOnce() -> Response<Body>,
+    translate: impl FnOnce(&serde_json::Value) -> serde_json::Value,
+) -> Response<Body> {
+    let (parts, body) = resp.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, TRANSLATED_RESPONSE_MAX).await else {
+        return too_large();
+    };
+    let Ok(chat) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Response::from_parts(parts, Body::from(bytes));
+    };
+    let translated = translate(&chat);
+    translated_response(
+        parts,
+        "application/json",
+        Body::from(translated.to_string()),
+    )
+}
+
+/// The pipeline's response with its body replaced: the status and headers
+/// stay (request id, rate limits), the length no longer applies, and there
+/// is exactly one Content-Type.
+fn translated_response(
+    parts: http::response::Parts,
+    content_type: &'static str,
+    body: Body,
+) -> Response<Body> {
+    let mut resp = Response::from_parts(parts, body);
+    let headers = resp.headers_mut();
+    headers.remove(header::CONTENT_LENGTH);
+    headers.insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static(content_type),
+    );
+    resp
 }
 
 /// Anthropic-shaped error response. Status and `Retry-After` are the
@@ -450,14 +608,10 @@ async fn messages_shim(
         chat_body,
         requested_model,
         streaming,
+        credential,
+        effort,
+        estimate,
     } = front;
-    let Ok(chat_bytes) = serde_json::to_vec(&chat_body) else {
-        return anthropic_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "request translation failed",
-            None,
-        );
-    };
     let query = strip_beta_query(parts.uri.query())
         .map(|q| format!("?{q}"))
         .unwrap_or_default();
@@ -474,10 +628,15 @@ async fn messages_shim(
     // pointless at best (`anthropic-beta` also leaks which client library is
     // in use to a backend that has no use for the information).
     parts.headers.remove("anthropic-beta");
-    if let Ok(v) = header::HeaderValue::from_str(crate::messages::SURFACE) {
-        parts.headers.insert(crate::responses::SURFACE_HEADER, v);
-    }
-    let chat_req = Request::from_parts(parts, Body::from(chat_bytes));
+    parts.extensions.insert(PipelineInput {
+        surface: Some(crate::messages::SURFACE),
+        effort,
+        credential: Some(credential),
+        body: Some(chat_body),
+        estimate,
+        batch: None,
+    });
+    let chat_req = Request::from_parts(parts, Body::empty());
 
     let mut resp = proxy_handler_inner(state, chat_req, request_id).await;
     if !resp.headers().contains_key("x-obleth-request-id") {
@@ -536,6 +695,12 @@ struct MessagesFront {
     chat_body: serde_json::Value,
     requested_model: String,
     streaming: bool,
+    /// Authenticated and gated here, once.
+    credential: crate::jwt_auth::Credential,
+    /// `thinking` / `output_config.effort`, which chat has no spelling for.
+    effort: Option<crate::reasoning::Requested>,
+    /// The input estimate with tools and images counted, for the reservation.
+    estimate: Option<u32>,
 }
 
 /// Anthropic's real `count_tokens` endpoint takes no `max_tokens` field, and
@@ -558,7 +723,7 @@ async fn messages_front(
     req: Request<Body>,
     count_tokens: bool,
 ) -> Result<MessagesFront, Response<Body>> {
-    let (mut parts, body) = req.into_parts();
+    let (parts, body) = req.into_parts();
     // Authenticate before buffering (same reasoning as `responses_shim`).
     let Some(secret) = bearer(&parts.headers) else {
         return Err(anthropic_error(
@@ -567,25 +732,17 @@ async fn messages_front(
             None,
         ));
     };
-    match crate::jwt_auth::authenticate_credential(state, &secret).await {
+    let credential = match crate::jwt_auth::authenticate_credential(state, &secret).await {
         Ok(cred) => {
             let client = crate::client::ClientInfo::of(&parts.extensions);
             if let Err(resp) = gate_resolved_key(state, &cred.resolved, &client) {
                 return Err(redress_error(resp).await);
             }
+            cred
         }
         Err(resp) => return Err(redress_error(resp).await),
-    }
-    // `axum::body::to_bytes` fails only past the cap (a malformed transport
-    // read surfaces earlier, from `into_parts`/the connection itself), so
-    // every failure here is the client's body being too large.
-    let Ok(bytes) = axum::body::to_bytes(body, RESPONSES_BODY_MAX).await else {
-        return Err(anthropic_error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "request body too large",
-            None,
-        ));
     };
+    let bytes = read_body(body).await.map_err(BodyTooLarge::anthropic)?;
     let Ok(mut incoming) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return Err(anthropic_error(
             StatusCode::BAD_REQUEST,
@@ -632,9 +789,11 @@ async fn messages_front(
     // every smaller candidate hard-filtered out by the router (503). Skipped
     // for `count_tokens`: its `max_tokens` is a backfilled placeholder, never
     // forwarded, and never dispatched to a pipeline that could reject it.
+    let mut estimate = None;
     if !count_tokens {
         let text_est = state.tokenizer.estimate_request(&chat_body).input_tokens as u64;
         let input_est = messages_input_estimate(&chat_body, text_est);
+        estimate = Some(u32::try_from(input_est).unwrap_or(u32::MAX));
         let window = context_window_for(state, &served, effort.clone().ok().flatten()).await;
         let requested_max_tokens = chat_body
             .get("max_tokens")
@@ -663,17 +822,14 @@ async fn messages_front(
         }
     }
     chat_body["model"] = serde_json::Value::String(served);
-    // `thinking` and `output_config.effort` have no chat spelling the
-    // translation keeps; carry the level for the pipeline to translate per
-    // model.
-    if let Some(v) = crate::reasoning::header_value(effort) {
-        parts.headers.insert(crate::reasoning::EFFORT_HEADER, v);
-    }
     Ok(MessagesFront {
         parts,
         chat_body,
         requested_model,
         streaming,
+        credential,
+        effort: crate::reasoning::Requested::of_surface(effort),
+        estimate,
     })
 }
 
@@ -770,6 +926,24 @@ pub(crate) const IMAGE_PART_TOKEN_ESTIMATE: u64 = 1500;
 /// the upstream still rejects on the real (text + tools + images) prompt.
 /// Not used for `count_tokens`'s reported figure: that endpoint's contract is
 /// "what the tokenizer counts", not this surface's own admission math.
+/// The length `value` serializes to, counted without building the string.
+fn serialized_len(value: &serde_json::Value) -> usize {
+    struct Counting(usize);
+    impl std::io::Write for Counting {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counting = Counting(0);
+    // A `Value` always serializes; the writer never fails.
+    let _ = serde_json::to_writer(&mut counting, value);
+    counting.0
+}
+
 fn messages_input_estimate(chat_body: &serde_json::Value, text_estimate: u64) -> u64 {
     // `to_string().len() / 3`, not the tokenizer's own chars-per-token-4
     // heuristic: `tools` is JSON schema (short, punctuation- and
@@ -780,7 +954,7 @@ fn messages_input_estimate(chat_body: &serde_json::Value, text_estimate: u64) ->
     // upstream-rejecting value.
     let tools_tokens = chat_body
         .get("tools")
-        .map(|t| t.to_string().len() as u64 / 3)
+        .map(|t| serialized_len(t) as u64 / 3)
         .unwrap_or(0);
     let image_count = chat_body
         .get("messages")
@@ -869,33 +1043,13 @@ async fn translate_messages_body(
     resp: Response<Body>,
     ctx: crate::messages::ResponseContext,
 ) -> Response<Body> {
-    let (parts, body) = resp.into_parts();
-    let Ok(bytes) = axum::body::to_bytes(body, RESPONSES_BODY_MAX).await else {
-        return anthropic_error(StatusCode::BAD_GATEWAY, "upstream response too large", None);
-    };
-    let Ok(chat) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        // Not JSON: hand it back untouched rather than inventing a shape.
-        return Response::from_parts(parts, Body::from(bytes));
-    };
-    let translated = crate::messages::from_chat_response(&chat, &ctx);
-    let mut builder = Response::builder().status(parts.status);
-    for (name, value) in parts.headers.iter() {
-        if name != header::CONTENT_LENGTH && name != header::CONTENT_TYPE {
-            builder = builder.header(name, value);
-        }
-    }
-    builder
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(translated.to_string()))
-        .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
+    translate_body(
+        resp,
+        || anthropic_error(StatusCode::BAD_GATEWAY, "upstream response too large", None),
+        |chat| crate::messages::from_chat_response(chat, &ctx),
+    )
+    .await
 }
-
-/// Interval on which an idle Messages stream gets a `ping` frame. This loop
-/// exists only once `proxy_handler_inner` has already returned a streaming
-/// response, so it covers gaps between upstream chunks (e.g. a slow decode)
-/// — it starts nothing early and cannot cover an admission queue wait or
-/// buffered-boon work, which both happen before this function is even called.
-const MESSAGES_PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Re-emit a chat SSE stream as Anthropic Messages events, frame by frame,
 /// with a `ping` heartbeat while the upstream is silent.
@@ -903,58 +1057,7 @@ fn translate_messages_stream(
     resp: Response<Body>,
     ctx: crate::messages::ResponseContext,
 ) -> Response<Body> {
-    let (parts, body) = resp.into_parts();
-    let stream = async_stream::stream! {
-        let mut translator = crate::messages::AnthropicStreamTranslator::new(ctx);
-        let mut upstream = body.into_data_stream();
-        let mut buffer: Vec<u8> = Vec::new();
-        loop {
-            let item = match tokio::time::timeout(MESSAGES_PING_INTERVAL, upstream.next()).await {
-                Ok(item) => item,
-                Err(_) => {
-                    // Silence, not failure: a gap between upstream chunks (a
-                    // slow decode step) is not itself an error. Sending a
-                    // `ping` is what keeps the client's own idle timeout from
-                    // firing while the upstream is still working.
-                    for frame in translator.ping() {
-                        yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
-                    }
-                    continue;
-                }
-            };
-            let Some(item) = item else { break };
-            let Ok(chunk) = item else {
-                for frame in translator.fail("api_error", "upstream stream ended before the response finished") {
-                    yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
-                }
-                break;
-            };
-            buffer.extend_from_slice(&chunk);
-            for payload in crate::responses::drain_sse_data_lines(&mut buffer) {
-                if payload == "[DONE]" { continue; }
-                let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload) else { continue };
-                for frame in translator.on_chunk(&value) {
-                    yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
-                }
-            }
-        }
-        // `fail` followed by `finish` is safe on both paths: `finish` is a
-        // no-op once `fail` has set the translator's `done` flag.
-        for frame in translator.finish() {
-            yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
-        }
-    };
-    // Same header handling as `translate_response_stream`.
-    let mut builder = Response::builder().status(parts.status);
-    for (name, value) in parts.headers.iter() {
-        if name != header::CONTENT_LENGTH && name != header::CONTENT_TYPE {
-            builder = builder.header(name, value);
-        }
-    }
-    builder
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .body(Body::from_stream(stream))
-        .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
+    translate_stream(resp, crate::messages::AnthropicStreamTranslator::new(ctx))
 }
 
 /// `POST /v1/messages/count_tokens`: the gateway's own estimate of the prompt
@@ -983,6 +1086,47 @@ pub(crate) const MODEL_VARIANT_HEADER: &str = "x-obleth-model-variant";
 /// Milliseconds the request waited in the fairshare queue before admission. Sent on every
 /// admitted response, so a client can tell time spent queued from time the model took.
 pub(crate) const QUEUE_WAIT_HEADER: &str = "x-obleth-queue-wait-ms";
+
+/// What every answer built after admission says about itself: the request
+/// id, how long it queued, that proxies must not buffer it, and the boons
+/// and compression that shaped it. One builder, so no exit forgets a header.
+struct Answer<'a> {
+    request_id: Uuid,
+    queue_wait_ms: u32,
+    boons_applied: &'a [&'static str],
+    compression: Option<&'a str>,
+}
+
+impl Answer<'_> {
+    fn respond(
+        &self,
+        status: impl Into<u16>,
+        content_type: header::HeaderValue,
+        body: Body,
+    ) -> Response<Body> {
+        let mut builder = Response::builder()
+            .status(status.into())
+            .header(header::CONTENT_TYPE, content_type)
+            .header("x-obleth-request-id", self.request_id.to_string())
+            .header(QUEUE_WAIT_HEADER, self.queue_wait_ms.to_string())
+            .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
+        if !self.boons_applied.is_empty() {
+            builder = builder.header(crate::boons::BOONS_HEADER, self.boons_applied.join(","));
+            if let Some(h) = self.compression {
+                builder = builder.header(crate::boons::COMPRESSION_HEADER, h);
+            }
+        }
+        builder.body(body).unwrap_or_else(|_| {
+            error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
+        })
+    }
+}
+
+/// `value` as a header, or `application/json` when it is not one.
+fn content_type_header(value: &str) -> header::HeaderValue {
+    header::HeaderValue::from_str(value)
+        .unwrap_or_else(|_| header::HeaderValue::from_static("application/json"))
+}
 
 /// The pipeline every proxied request runs ([`run_pipeline`]), plus the
 /// response headers that describe how it was served, whichever exit the
@@ -1068,7 +1212,7 @@ pub(crate) struct BackgroundAdmission {
 /// which is admitted as interactive work.
 pub(crate) fn background_admission(
     route: Option<&ResolvedModel>,
-    batch: Option<&crate::batches::BatchCaller>,
+    batch: Option<&BackgroundShare>,
     resolved: &ResolvedKey,
     key_share: impl FnOnce() -> f64,
 ) -> Option<BackgroundAdmission> {
@@ -1119,13 +1263,11 @@ async fn run_pipeline(
         .map(|q| format!("?{q}"))
         .unwrap_or_default();
     let headers = parts.headers;
-    // A batch item the runner sends in process: the caller is the batch's
-    // owner, already resolved, and the request is background work. Only the
-    // runner sets this; it never arrives over HTTP.
-    let batch = parts
-        .extensions
-        .get::<crate::batches::BatchCaller>()
-        .cloned();
+    // What an in-process caller already did: a shim's credential, surface,
+    // effort, body and estimate; a batch item's owner and background share.
+    let mut input = PipelineInput::of(&parts.extensions);
+    let batch = input.batch;
+    let presented = input.credential.is_some();
 
     // ---- reject path traversal before any upstream work ----
     if has_path_traversal(&path) {
@@ -1134,8 +1276,8 @@ async fn run_pipeline(
 
     // ---- auth ----
     let auth_start = crate::tracer::now_ms();
-    let (resolved, device_id, auth_kind) = match &batch {
-        Some(b) => (b.resolved.clone(), String::new(), "batch"),
+    let (resolved, device_id, auth_kind) = match input.credential.take() {
+        Some(c) => (c.resolved, c.device_id, c.auth_kind),
         None => {
             let Some(secret) = bearer(&headers) else {
                 return error_json(StatusCode::UNAUTHORIZED, "missing bearer token");
@@ -1157,8 +1299,12 @@ async fn run_pipeline(
     } else {
         crate::client::ClientInfo::of(&parts.extensions)
     };
-    if let Err(resp) = gate_resolved_key(&state, &resolved, &client) {
-        return resp;
+    // A shim gated the key before translating; a batch item's owner is gated
+    // again here, as in-process work.
+    if !presented || batch.is_some() {
+        if let Err(resp) = gate_resolved_key(&state, &resolved, &client) {
+            return resp;
+        }
     }
 
     // ---- job follow-ups: videos, meshes (poll, download, delete, list) ----
@@ -1231,12 +1377,21 @@ async fn run_pipeline(
     }
 
     // ---- read + parse body ----
-    let mut body_bytes = match axum::body::to_bytes(body, BODY_LIMIT).await {
-        Ok(b) => b,
-        Err(_) => return error_json(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
+    // An in-process caller hands over the body it built; its bytes are made
+    // once, where the cache key and the upstream need them.
+    let body_given = input.body.is_some();
+    let (mut body_bytes, mut json) = match input.body.take() {
+        Some(json) => (Bytes::new(), json),
+        None => {
+            let bytes = match read_body(body).await {
+                Ok(bytes) => bytes,
+                Err(too_large) => return too_large.openai(),
+            };
+            let json: serde_json::Value =
+                serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            (bytes, json)
+        }
     };
-    let mut json: serde_json::Value =
-        serde_json::from_slice(&body_bytes).unwrap_or(serde_json::Value::Null);
     // `stream` decides how the answer is read and what it is billed from. A
     // value that is neither true nor false (`1`, `"true"`) reads as "not a
     // stream" here while a model server may still stream for it, and that
@@ -1296,7 +1451,7 @@ async fn run_pipeline(
     };
     // The effort the caller asked for, read before the name resolves: a
     // family name needs it to pick the model that answers.
-    let requested_effort = crate::reasoning::Requested::read(&headers, &json);
+    let requested_effort = crate::reasoning::Requested::read(input.effort.take(), &json);
     // Set when the name was a family's: the level the member serves at, and
     // the family, which the ledger records apart from variants.
     let mut family_level: Option<obleth_config::ReasoningLevel> = None;
@@ -1371,7 +1526,7 @@ async fn run_pipeline(
         request_type: if batch.is_some() {
             obleth_config::BATCH_REQUEST_TYPE
         } else {
-            surfaced_request_type(&resolved, &path, &headers)
+            surfaced_request_type(&resolved, &path, input.surface)
         },
         device_id,
         end_user: end_user.clone().unwrap_or_default(),
@@ -1398,7 +1553,7 @@ async fn run_pipeline(
     // Cost estimate, computed once per request body. Re-estimated below only
     // when a boon actually rewrites the body; the later upstream model-name
     // swap does not affect it (the tokenizer ignores the `model` field).
-    let mut est = state.tokenizer.estimate_request(&json);
+    let mut est = input.reserve(state.tokenizer.estimate_request(&json));
 
     // The routed `auto` turn, stored once it is answered when stickiness is on.
     let mut sticky_turn: Option<crate::sticky::Turn> = None;
@@ -1718,28 +1873,19 @@ async fn run_pipeline(
                     obleth_config::ErrorClass::Retired,
                     &reason,
                 ));
-                let elapsed = request_start.elapsed().as_millis() as u32;
-                finalize(
+                reject(
                     &state,
                     request_id,
                     &resolved,
                     &req_meta,
                     &model,
-                    Admission::Rejected,
-                    CostEstimate {
-                        input_tokens: 0,
-                        estimated_output_tokens: 0,
+                    Rejection {
+                        status: StatusCode::GONE,
+                        since: request_start,
+                        est: CostEstimate::default(),
+                        cache_status: "off",
+                        queue_wait_ms: 0,
                     },
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    elapsed,
-                    StatusCode::GONE.as_u16(),
-                    "off",
-                    0.0,
-                    crate::energy::EnergyFigures::default(),
                 );
                 return resp;
             }
@@ -1793,17 +1939,12 @@ async fn run_pipeline(
         return error_json(StatusCode::NOT_FOUND, "unknown endpoint");
     }
     // ---- per-tenant model allowlist (Phase 4) ----
-    // A variant is allowed by its parent's name, as an alias is, or by its
-    // own name, so a tenant can be given the variant alone.
-    if !resolved.internal {
-        if let Some(allowed) = &resolved.allowed_models {
-            if !allowed
-                .iter()
-                .any(|m| m == &model || variant.as_deref() == Some(m.as_str()))
-            {
-                return error_json(StatusCode::FORBIDDEN, "model not permitted for tenant");
-            }
-        }
+    let permitted = match route.as_deref() {
+        Some(route) => model_permitted(&resolved, route, variant.as_deref()),
+        None => model_visible(allowed_models_for(&resolved), &model),
+    };
+    if !permitted {
+        return error_json(StatusCode::FORBIDDEN, "model not permitted for tenant");
     }
 
     // ---- request fields the model refuses ----
@@ -1813,31 +1954,19 @@ async fn run_pipeline(
         .as_ref()
         .and_then(|r| obleth_config::rejected_request_field(&json, &r.rejected_request_fields))
     {
-        if let Some(t) = tracer.take() {
-            t.finish("error");
-        }
-        let elapsed = request_start.elapsed().as_millis() as u32;
-        finalize(
+        reject(
             &state,
             request_id,
             &resolved,
             &req_meta,
             &model,
-            Admission::Rejected,
-            CostEstimate {
-                input_tokens: 0,
-                estimated_output_tokens: 0,
+            Rejection {
+                status: StatusCode::BAD_REQUEST,
+                since: request_start,
+                est: CostEstimate::default(),
+                cache_status: "off",
+                queue_wait_ms: 0,
             },
-            0,
-            0,
-            0,
-            0,
-            0,
-            elapsed,
-            StatusCode::BAD_REQUEST.as_u16(),
-            "off",
-            0.0,
-            crate::energy::EnergyFigures::default(),
         );
         return rejected_field_response(&model, field);
     }
@@ -1870,31 +1999,19 @@ async fn run_pipeline(
             };
             tracing::warn!(%request_id, model = %model, fingerprint = %req_meta.crash_fp, status = status.as_u16(), "crash guard: request not sent");
             req_meta.failure = Some(obleth_config::Failure::new(class, &msg));
-            if let Some(t) = tracer.take() {
-                t.finish("error");
-            }
-            let elapsed = request_start.elapsed().as_millis() as u32;
-            finalize(
+            reject(
                 &state,
                 request_id,
                 &resolved,
                 &req_meta,
                 &model,
-                Admission::Rejected,
-                CostEstimate {
-                    input_tokens: 0,
-                    estimated_output_tokens: 0,
+                Rejection {
+                    status,
+                    since: request_start,
+                    est: CostEstimate::default(),
+                    cache_status: "off",
+                    queue_wait_ms: 0,
                 },
-                0,
-                0,
-                0,
-                0,
-                0,
-                elapsed,
-                status.as_u16(),
-                "off",
-                0.0,
-                crate::energy::EnergyFigures::default(),
             );
             return crate::crash_guard::guard_response(status, &msg);
         }
@@ -1977,9 +2094,6 @@ async fn run_pipeline(
     // Refused before the input scan so a request that cannot be served never
     // spends a guard-model call first.
     if method == Method::POST && output_guardrails_unenforceable(&resolved, &path) {
-        if let Some(t) = tracer.take() {
-            t.finish("error");
-        }
         return error_json(
             StatusCode::BAD_REQUEST,
             "this tenant's output guardrails read chat responses only; \
@@ -1987,9 +2101,6 @@ async fn run_pipeline(
         );
     }
     if method == Method::POST && input_guardrails_unscannable(&resolved, &path) {
-        if let Some(t) = tracer.take() {
-            t.finish("error");
-        }
         return error_json(
             StatusCode::BAD_REQUEST,
             "this tenant's input guardrails cannot scan requests to this path; \n             use /v1/chat/completions, /v1/responses, or /v1/messages",
@@ -2011,9 +2122,6 @@ async fn run_pipeline(
         )
         .await;
     if let Some(block) = boon_outcome.blocked {
-        if let Some(t) = tracer.take() {
-            t.finish("error");
-        }
         return error_json(block.status, block.reason);
     }
     if boon_outcome.rewritten {
@@ -2063,27 +2171,19 @@ async fn run_pipeline(
                 obleth_config::ErrorClass::ClientInput,
                 &message,
             ));
-            if let Some(t) = tracer.take() {
-                t.finish("error");
-            }
-            finalize(
+            reject(
                 &state,
                 request_id,
                 &resolved,
                 &req_meta,
                 &model,
-                Admission::Rejected,
-                est,
-                0,
-                0,
-                0,
-                0,
-                0,
-                request_start.elapsed().as_millis() as u32,
-                StatusCode::BAD_REQUEST.as_u16(),
-                "off",
-                0.0,
-                crate::energy::EnergyFigures::default(),
+                Rejection {
+                    status: StatusCode::BAD_REQUEST,
+                    since: request_start,
+                    est,
+                    cache_status: "off",
+                    queue_wait_ms: 0,
+                },
             );
             return context_overflow_response(&message);
         }
@@ -2145,6 +2245,17 @@ async fn run_pipeline(
     // never hit and would only cost a Redis round-trip.
     let cache_name =
         response_cache_name(&model, variant.as_deref(), effort_served.or(family_level));
+    if body_given && body_bytes.is_empty() {
+        match serde_json::to_vec(&json) {
+            Ok(bytes) => body_bytes = Bytes::from(bytes),
+            Err(_) => {
+                return error_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "request translation failed",
+                )
+            }
+        }
+    }
     let cache_key = (cache_enabled && cache_ttl > 0).then(|| {
         obleth_config::cache_key(&resolved.tenant_id.to_string(), &cache_name, &body_bytes)
     });
@@ -2184,18 +2295,17 @@ async fn run_pipeline(
                     &model,
                     Admission::Fast,
                     est,
-                    cached.input_tokens,
-                    cached.output_tokens,
-                    0,
-                    0,
-                    0,
-                    0,
-                    cached.status,
-                    "hit",
-                    (cached.input_tokens as f64) * in_cost_rate
-                        + (cached.output_tokens as f64) * out_cost_rate
-                        + modality_cost,
-                    crate::energy::EnergyFigures::default(),
+                    FinalizeOutcome {
+                        input_tokens: cached.input_tokens,
+                        output_tokens: cached.output_tokens,
+                        total_ms: request_start.elapsed().as_millis() as u32,
+                        status_code: cached.status,
+                        cache_status: "hit",
+                        cost_usd: (cached.input_tokens as f64) * in_cost_rate
+                            + (cached.output_tokens as f64) * out_cost_rate
+                            + modality_cost,
+                        ..FinalizeOutcome::default()
+                    },
                 );
                 return cached_response(cached, request_id);
             }
@@ -2285,28 +2395,20 @@ async fn run_pipeline(
     let admitted = match timeout(admit_wait, admit).await {
         Ok(Some(a)) => a,
         Err(_) => {
-            if let Some(t) = tracer.take() {
-                t.finish("error");
-            }
             let queued_ms = (crate::tracer::now_ms() - admission_start) as u32;
-            finalize(
+            reject(
                 &state,
                 request_id,
                 &resolved,
                 &req_meta,
                 &model,
-                Admission::Rejected,
-                est,
-                0,
-                0,
-                0,
-                queued_ms,
-                0,
-                request_start.elapsed().as_millis() as u32,
-                503,
-                cache_status_label,
-                0.0,
-                crate::energy::EnergyFigures::default(),
+                Rejection {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    since: request_start,
+                    est,
+                    cache_status: cache_status_label,
+                    queue_wait_ms: queued_ms,
+                },
             );
             let mut resp = error_json(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -2319,9 +2421,6 @@ async fn run_pipeline(
             return resp;
         }
         Ok(None) => {
-            if let Some(t) = tracer.take() {
-                t.finish("error");
-            }
             state.alerts.issue(
                 "scheduler_unavailable",
                 "Fairshare scheduler unavailable",
@@ -2336,6 +2435,12 @@ async fn run_pipeline(
     let admission = admitted.admission;
     let permit = admitted.permit;
     let queue_wait_ms = admitted.waited.as_millis() as u32;
+    let answer = Answer {
+        request_id,
+        queue_wait_ms,
+        boons_applied: &boons_applied,
+        compression: compression_header.as_deref(),
+    };
     // Energy is metered from admission: queue time is never charged.
     let request_energy = state.energy.request(route.as_deref());
     let admission_ms = (crate::tracer::now_ms() - admission_start) as u32;
@@ -2364,243 +2469,30 @@ async fn run_pipeline(
     // cannot all pass the gate on the same headroom; each such reservation is
     // settled exactly once, through `term_reconcile` at settlement or
     // `release_term_hold` on a rejection between the two scopes.
-    let capacity = resolved.tokens_per_minute.max(0);
-    let now = chrono::Utc::now();
     let est_cost = estimated_cost(est, in_cost_rate, out_cost_rate, modality_cost);
-    let term_period = term_period_key(&resolved, now);
-    let term_gate = term_period
-        .as_deref()
-        .map(|period_key| obleth_redis::TermGate {
-            period_key,
-            budget_tokens: resolved.budget_tokens,
-            budget_cost_usd: resolved.budget_cost_usd,
-        });
-    let key_term_period = key_term_period_key(&resolved, now);
-    let key_term_gate = key_term_period
-        .as_deref()
-        .map(|period_key| obleth_redis::TermGate {
-            period_key,
-            budget_tokens: resolved.key_budget_tokens,
-            budget_cost_usd: resolved.key_budget_cost_usd,
-        });
-    // Whether each scope holds a term reservation that settlement must
-    // reconcile. False on the fail-open path: nothing was reserved, so the
-    // settle commits usage with a plain add instead.
-    let mut key_term_held = false;
-    // Releases the key reservation if the request ends (client drop included)
-    // before settlement takes ownership of it.
-    let mut key_hold: Option<PendingTermHold> = None;
-    let mut tenant_term_held = false;
-    if let Some(gate) = key_term_gate {
-        match state
-            .redis
-            .reserve_with_term(&resolved.key_id, 0, 0, est.total(), Some(gate), est_cost)
-            .instrument(tracing::info_span!("reserve_key_budget"))
-            .await
-        {
-            Ok(obleth_redis::ReserveOutcome::Reserved { .. }) => {
-                key_term_held = true;
-                key_hold = key_term_period.clone().map(|period| {
-                    PendingTermHold::new(&state, resolved.key_id, period, est, est_cost)
-                });
-            }
-            // Capacity 0 has no per-minute bucket; nothing was reserved.
-            Ok(obleth_redis::ReserveOutcome::RateLimited { .. }) => {}
-            Ok(obleth_redis::ReserveOutcome::TermExhausted {
-                used_tokens,
-                used_cost,
-            }) => {
-                drop(permit);
-                state.alerts.issue(
-                    format!("key_term_budget_exhausted:{}", resolved.key_id),
-                    "API key term budget exhausted",
-                    format!(
-                        "tenant `{}` key `{}` blocked: used {used_tokens} tokens / ${used_cost:.4} against caps tokens={:?} cost={:?}",
-                        resolved.tenant_name,
-                        resolved.key_id,
-                        resolved.key_budget_tokens,
-                        resolved.key_budget_cost_usd,
-                    ),
-                );
-                finalize(
+    let reserved = match reserve_budget(&state, &resolved, &model, est, est_cost).await {
+        Ok(reserved) => reserved,
+        Err(refusal) => {
+            drop(permit);
+            if refusal.ledger {
+                reject(
                     &state,
                     request_id,
                     &resolved,
                     &req_meta,
                     &model,
-                    Admission::Rejected,
-                    est,
-                    0,
-                    0,
-                    0,
-                    queue_wait_ms,
-                    0,
-                    0,
-                    403,
-                    cache_status_label,
-                    0.0,
-                    crate::energy::EnergyFigures::default(),
-                );
-                if let Some(t) = tracer.take() {
-                    t.finish("error");
-                }
-                return error_json(StatusCode::FORBIDDEN, "api key term budget exhausted");
-            }
-            Err(e) => {
-                if !state.fail_open {
-                    drop(permit);
-                    state.alerts.issue(
-                        "redis_key_budget_reserve_failed_closed",
-                        "Redis key-budget reserve failed",
-                        format!(
-                            "fail-open is disabled; rejecting tenant `{}` key `{}` model `{model}`: {e}",
-                            resolved.tenant_name,
-                            resolved.key_id
-                        ),
-                    );
-                    if let Some(t) = tracer.take() {
-                        t.finish("error");
-                    }
-                    return error_json(StatusCode::SERVICE_UNAVAILABLE, "key budget check failed");
-                }
-                tracing::warn!(error = %e, "key budget reserve failed; failing open");
-                state.alerts.issue(
-                    "redis_key_budget_reserve_failed_open",
-                    "Redis key-budget reserve failed",
-                    format!(
-                        "fail-open is enabled; admitting tenant `{}` key `{}` model `{model}` without key budget enforcement: {e}",
-                        resolved.tenant_name,
-                        resolved.key_id
-                    ),
+                    Rejection {
+                        status: refusal.status,
+                        since: request_start,
+                        est,
+                        cache_status: cache_status_label,
+                        queue_wait_ms,
+                    },
                 );
             }
+            return error_json(refusal.status, refusal.message);
         }
-    }
-    let tenant_gate_armed = term_gate.is_some();
-    let should_check_budget = capacity > 0 || tenant_gate_armed;
-    if should_check_budget {
-        match state
-            .redis
-            .reserve_with_term(
-                &resolved.tenant_id,
-                capacity,
-                resolved.tokens_per_minute,
-                est.total(),
-                term_gate,
-                est_cost,
-            )
-            .instrument(tracing::info_span!("reserve_budget"))
-            .await
-        {
-            Ok(obleth_redis::ReserveOutcome::Reserved { .. }) => {
-                tenant_term_held = tenant_gate_armed;
-            }
-            Ok(obleth_redis::ReserveOutcome::RateLimited { .. }) => {
-                drop(permit);
-                if let Some(hold) = key_hold.take() {
-                    hold.release().await;
-                }
-                finalize(
-                    &state,
-                    request_id,
-                    &resolved,
-                    &req_meta,
-                    &model,
-                    Admission::Rejected,
-                    est,
-                    0,
-                    0,
-                    0,
-                    queue_wait_ms,
-                    0,
-                    0,
-                    429,
-                    cache_status_label,
-                    0.0,
-                    crate::energy::EnergyFigures::default(),
-                );
-                if let Some(t) = tracer.take() {
-                    t.finish("error");
-                }
-                return error_json(StatusCode::TOO_MANY_REQUESTS, "token budget exceeded");
-            }
-            Ok(obleth_redis::ReserveOutcome::TermExhausted {
-                used_tokens,
-                used_cost,
-            }) => {
-                drop(permit);
-                if let Some(hold) = key_hold.take() {
-                    hold.release().await;
-                }
-                state.alerts.issue(
-                    format!("term_budget_exhausted:{}", resolved.tenant_id),
-                    "Tenant term budget exhausted",
-                    format!(
-                        "tenant `{}` blocked: used {used_tokens} tokens / ${used_cost:.4} against caps tokens={:?} cost={:?}",
-                        resolved.tenant_name,
-                        resolved.budget_tokens,
-                        resolved.budget_cost_usd,
-                    ),
-                );
-                finalize(
-                    &state,
-                    request_id,
-                    &resolved,
-                    &req_meta,
-                    &model,
-                    Admission::Rejected,
-                    est,
-                    0,
-                    0,
-                    0,
-                    queue_wait_ms,
-                    0,
-                    0,
-                    403,
-                    cache_status_label,
-                    0.0,
-                    crate::energy::EnergyFigures::default(),
-                );
-                if let Some(t) = tracer.take() {
-                    t.finish("error");
-                }
-                return error_json(StatusCode::FORBIDDEN, "tenant term budget exhausted");
-            }
-            Err(e) => {
-                if !state.fail_open {
-                    drop(permit);
-                    if let Some(hold) = key_hold.take() {
-                        hold.release().await;
-                    }
-                    state.alerts.issue(
-                        "redis_budget_reserve_failed_closed",
-                        "Redis budget reserve failed",
-                        format!(
-                            "fail-open is disabled; rejecting tenant `{}` model `{model}`: {e}",
-                            resolved.tenant_name
-                        ),
-                    );
-                    if let Some(t) = tracer.take() {
-                        t.finish("error");
-                    }
-                    return error_json(StatusCode::SERVICE_UNAVAILABLE, "budget check failed");
-                }
-                tracing::warn!(error = %e, "budget reserve failed; failing open");
-                state.alerts.issue(
-                    "redis_budget_reserve_failed_open",
-                    "Redis budget reserve failed",
-                    format!(
-                        "fail-open is enabled; admitting tenant `{}` model `{model}` without budget enforcement: {e}",
-                        resolved.tenant_name
-                    ),
-                );
-            }
-        }
-    }
-
-    if let Some(hold) = key_hold.take() {
-        hold.hand_off();
-    }
+    };
 
     // From here on every exit settles through `settle_guard`, so the
     // per-minute bucket and any term reservation are reconciled exactly once
@@ -2620,18 +2512,14 @@ async fn run_pipeline(
         queue_wait_ms,
         request_start,
         cache_status: cache_status_label.to_string(),
-        capacity,
-        term_period: term_period.clone(),
-        key_term_period: key_term_period.clone(),
+        capacity: reserved.capacity,
+        term_period: reserved.term_period,
+        key_term_period: reserved.key_term_period,
         in_cost_rate,
         out_cost_rate,
         modality_cost,
         energy: request_energy,
-        holds: TermHolds {
-            tenant: tenant_term_held,
-            key: key_term_held,
-            est_cost,
-        },
+        holds: reserved.holds,
     };
     let mut settle_guard = accounting.unbilled_guard();
 
@@ -2705,22 +2593,16 @@ async fn run_pipeline(
                     if let Some(t) = tracer.take() {
                         t.finish("ok");
                     }
-                    let mut builder = Response::builder()
-                        .status(StatusCode::OK)
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .header("x-obleth-request-id", request_id.to_string())
-                        .header(QUEUE_WAIT_HEADER, queue_wait_ms.to_string())
-                        .header(crate::boons::speculation::DRAFTED_BY_HEADER, drafted_by)
-                        .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
-                    if !boons_applied.is_empty() {
-                        builder =
-                            builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
-                    }
-                    return builder
-                        .body(Body::from(body.to_string()))
-                        .unwrap_or_else(|_| {
-                            error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
-                        });
+                    let mut resp = answer.respond(
+                        StatusCode::OK,
+                        header::HeaderValue::from_static("application/json"),
+                        Body::from(body.to_string()),
+                    );
+                    resp.headers_mut().insert(
+                        crate::boons::speculation::DRAFTED_BY_HEADER,
+                        content_type_header(&drafted_by),
+                    );
+                    return resp;
                 }
                 crate::boons::speculation::Outcome::Stream { driver, drafted_by } => {
                     accounting.arm_estimate(&mut settle_guard);
@@ -2781,22 +2663,16 @@ async fn run_pipeline(
                     if let Some(t) = tracer.take() {
                         t.finish("ok");
                     }
-                    let mut builder = Response::builder()
-                        .status(StatusCode::OK)
-                        .header(header::CONTENT_TYPE, "text/event-stream")
-                        .header("x-obleth-request-id", request_id.to_string())
-                        .header(QUEUE_WAIT_HEADER, queue_wait_ms.to_string())
-                        .header(crate::boons::speculation::DRAFTED_BY_HEADER, drafted_by)
-                        .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
-                    if !boons_applied.is_empty() {
-                        builder =
-                            builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
-                    }
-                    return builder
-                        .body(Body::from_stream(body_stream))
-                        .unwrap_or_else(|_| {
-                            error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
-                        });
+                    let mut resp = answer.respond(
+                        StatusCode::OK,
+                        header::HeaderValue::from_static("text/event-stream"),
+                        Body::from_stream(body_stream),
+                    );
+                    resp.headers_mut().insert(
+                        crate::boons::speculation::DRAFTED_BY_HEADER,
+                        content_type_header(&drafted_by),
+                    );
+                    return resp;
                 }
             }
         }
@@ -2960,7 +2836,9 @@ async fn run_pipeline(
                     // end here rather than in the arm below. It is the same
                     // timeout: a 504, and never the fresh-connection retry,
                     // which would run the whole generation again.
-                    let read_timed_out = e.is_timeout();
+                    // A connect timeout is also reported as a timeout, but the
+                    // request never left: that one is a connection error.
+                    let read_timed_out = e.is_timeout() && !e.is_connect();
                     timed_out |= read_timed_out;
                     let connection_error = is_connection_error(&e);
                     last_err = Some(e.to_string());
@@ -2969,6 +2847,9 @@ async fn run_pipeline(
                             "no answer from the model server within {}",
                             secs_label(req_timeout)
                         )
+                    } else if e.is_connect() && e.is_timeout() {
+                        "could not reach the model server: no connection within the connect timeout"
+                            .to_string()
                     } else {
                         format!("could not reach the model server: {}", transport_cause(&e))
                     });
@@ -3063,7 +2944,6 @@ async fn run_pipeline(
                         serde_json::to_value(&diag).unwrap_or_default(),
                     );
                 }
-                t.finish("error");
             }
             state.metrics.record_upstream_attempt("exhausted");
             let msg = last_err.unwrap_or_else(|| "upstream request failed".to_string());
@@ -3224,25 +3104,8 @@ async fn run_pipeline(
         let _ = settle_guard
             .complete(accounting.settle_with(tokens, ttft_ms, total_ms, status_code, None, billed))
             .await;
-        if let Some(t) = tracer.take() {
-            t.finish("error");
-        }
 
-        let mut builder = Response::builder()
-            .status(status_code)
-            .header(header::CONTENT_TYPE, content_type)
-            .header("x-obleth-request-id", request_id.to_string())
-            .header(QUEUE_WAIT_HEADER, queue_wait_ms.to_string())
-            .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
-        if !boons_applied.is_empty() {
-            builder = builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
-            if let Some(h) = &compression_header {
-                builder = builder.header(crate::boons::COMPRESSION_HEADER, h);
-            }
-        }
-        return builder.body(Body::from(buf)).unwrap_or_else(|_| {
-            error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
-        });
+        return answer.respond(status_code, content_type, Body::from(buf));
     }
 
     // Success: record the `upstream` span here (the error path above records its
@@ -3450,23 +3313,11 @@ async fn run_pipeline(
                 if let Some(t) = tracer.take() {
                     t.finish(if status_code < 400 { "ok" } else { "error" });
                 }
-                let mut builder = Response::builder()
-                    .status(status_code)
-                    .header(header::CONTENT_TYPE, "text/event-stream")
-                    .header("x-obleth-request-id", request_id.to_string())
-                    .header(QUEUE_WAIT_HEADER, queue_wait_ms.to_string())
-                    .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
-                if !boons_applied.is_empty() {
-                    builder = builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
-                    if let Some(h) = &compression_header {
-                        builder = builder.header(crate::boons::COMPRESSION_HEADER, h);
-                    }
-                }
-                return builder
-                    .body(Body::from_stream(body_stream))
-                    .unwrap_or_else(|_| {
-                        error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
-                    });
+                return answer.respond(
+                    status_code,
+                    header::HeaderValue::from_static("text/event-stream"),
+                    Body::from_stream(body_stream),
+                );
             }
         }
     }
@@ -3533,9 +3384,6 @@ async fn run_pipeline(
             let _ = settle_guard
                 .complete(accounting.settle_unbilled(ttft_ms, total_ms, 502))
                 .await;
-            if let Some(t) = tracer.take() {
-                t.finish("error");
-            }
             return error_json(StatusCode::BAD_GATEWAY, "upstream stream failed");
         }
 
@@ -3592,21 +3440,7 @@ async fn run_pipeline(
                     billed,
                 ))
                 .await;
-            if let Some(t) = tracer.take() {
-                t.finish("error");
-            }
-            let mut builder = Response::builder()
-                .status(failure.status)
-                .header(header::CONTENT_TYPE, content_type)
-                .header("x-obleth-request-id", request_id.to_string())
-                .header(QUEUE_WAIT_HEADER, queue_wait_ms.to_string())
-                .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
-            if !boons_applied.is_empty() {
-                builder = builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
-            }
-            return builder.body(Body::from(buf)).unwrap_or_else(|_| {
-                error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
-            });
+            return answer.respond(failure.status, content_type, Body::from(buf));
         }
 
         let (final_body, final_content_type): (Bytes, String) = match completion.as_mut() {
@@ -3664,9 +3498,6 @@ async fn run_pipeline(
                                     None,
                                 ))
                                 .await;
-                            if let Some(t) = tracer.take() {
-                                t.finish("error");
-                            }
                             return error_json(block.status, block.reason);
                         }
                         crate::boons::guardrails::ApplyOutputResult::Pass => {}
@@ -3711,9 +3542,6 @@ async fn run_pipeline(
                         None,
                     ))
                     .await;
-                if let Some(t) = tracer.take() {
-                    t.finish("error");
-                }
                 return error_json(block.status, block.reason);
             }
             None => (
@@ -3765,27 +3593,19 @@ async fn run_pipeline(
             turn.record(&state, done);
         }
 
-        let mut builder = Response::builder()
-            .status(status_code)
-            .header(header::CONTENT_TYPE, final_content_type)
-            .header("x-obleth-request-id", request_id.to_string())
-            .header(QUEUE_WAIT_HEADER, queue_wait_ms.to_string())
-            .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
-        if !boons_applied.is_empty() {
-            builder = builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
-            if let Some(h) = &compression_header {
-                builder = builder.header(crate::boons::COMPRESSION_HEADER, h);
-            }
-        }
+        let mut resp = answer.respond(
+            status_code,
+            content_type_header(&final_content_type),
+            Body::from(final_body),
+        );
         if let Some(w) = warning {
-            builder = builder.header(crate::boons::BOONS_WARNING_HEADER, w);
+            resp.headers_mut()
+                .insert(crate::boons::BOONS_WARNING_HEADER, content_type_header(w));
         }
         if let Some(t) = tracer.take() {
             t.finish(if status_code < 400 { "ok" } else { "error" });
         }
-        return builder.body(Body::from(final_body)).unwrap_or_else(|_| {
-            error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
-        });
+        return resp;
     }
 
     // Finish the tracer before entering the async stream body — the stream macro
@@ -4059,21 +3879,7 @@ async fn run_pipeline(
         }
     };
 
-    let mut builder = Response::builder().status(status_code);
-    builder = builder
-        .header(header::CONTENT_TYPE, content_type)
-        .header("x-obleth-request-id", request_id.to_string())
-        .header(QUEUE_WAIT_HEADER, queue_wait_ms.to_string())
-        .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
-    if !boons_applied.is_empty() {
-        builder = builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
-        if let Some(h) = &compression_header {
-            builder = builder.header(crate::boons::COMPRESSION_HEADER, h);
-        }
-    }
-    builder
-        .body(Body::from_stream(body_stream))
-        .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
+    answer.respond(status_code, content_type, Body::from_stream(body_stream))
 }
 
 /// Above this much held, unterminated buffer, [`UsageChunkFilter`] gives up
@@ -4327,6 +4133,230 @@ fn is_usage_only_event(event: &[u8]) -> bool {
         Some(c) => c.as_array().is_some_and(|a| a.is_empty()),
     };
     has_usage && no_choices
+}
+
+/// What an admitted request holds against its budgets, for settlement: the
+/// per-minute capacity it reserved under, the term periods it reserved in,
+/// and which of those reservations settlement must reconcile.
+pub(crate) struct Reserved {
+    pub(crate) capacity: i64,
+    pub(crate) term_period: Option<String>,
+    pub(crate) key_term_period: Option<String>,
+    pub(crate) holds: TermHolds,
+}
+
+/// Why a request could not reserve its budget: what to answer, and whether
+/// it is a refusal of the caller's (a cap or a rate limit, recorded as a
+/// rejected ledger row) or the gateway's own failure closed (no row).
+pub(crate) struct BudgetRefusal {
+    pub(crate) status: StatusCode,
+    pub(crate) message: &'static str,
+    pub(crate) ledger: bool,
+}
+
+/// Reserve an admitted request's estimate against the key's term cap, then
+/// the tenant's per-minute bucket and term cap, in one Redis round trip per
+/// scope. The term gate runs first inside the script, so a term-exhausted
+/// request never reserves per-minute tokens it has no completion path to
+/// refund; a key reservation is released when the tenant scope refuses, and
+/// handed to settlement otherwise. A Redis failure admits the request without
+/// enforcement when the gateway fails open, and refuses it otherwise; both
+/// raise an alert. Shared by the passthrough pipeline and verdicts, so the
+/// two cannot drift.
+pub(crate) async fn reserve_budget(
+    state: &AppState,
+    resolved: &ResolvedKey,
+    model: &str,
+    est: CostEstimate,
+    est_cost: f64,
+) -> Result<Reserved, BudgetRefusal> {
+    let capacity = resolved.tokens_per_minute.max(0);
+    let now = chrono::Utc::now();
+    let term_period = term_period_key(resolved, now);
+    let term_gate = term_period
+        .as_deref()
+        .map(|period_key| obleth_redis::TermGate {
+            period_key,
+            budget_tokens: resolved.budget_tokens,
+            budget_cost_usd: resolved.budget_cost_usd,
+        });
+    let key_term_period = key_term_period_key(resolved, now);
+    let key_term_gate = key_term_period
+        .as_deref()
+        .map(|period_key| obleth_redis::TermGate {
+            period_key,
+            budget_tokens: resolved.key_budget_tokens,
+            budget_cost_usd: resolved.key_budget_cost_usd,
+        });
+    // Whether each scope holds a term reservation that settlement must
+    // reconcile. False on the fail-open path: nothing was reserved, so the
+    // settle commits usage with a plain add instead.
+    let mut key_term_held = false;
+    // Releases the key reservation if the request ends before settlement
+    // takes ownership of it.
+    let mut key_hold: Option<PendingTermHold> = None;
+    let mut tenant_term_held = false;
+    if let Some(gate) = key_term_gate {
+        match state
+            .redis
+            .reserve_with_term(&resolved.key_id, 0, 0, est.total(), Some(gate), est_cost)
+            .instrument(tracing::info_span!("reserve_key_budget"))
+            .await
+        {
+            Ok(obleth_redis::ReserveOutcome::Reserved { .. }) => {
+                key_term_held = true;
+                key_hold = key_term_period.clone().map(|period| {
+                    PendingTermHold::new(state, resolved.key_id, period, est, est_cost)
+                });
+            }
+            // Capacity 0 has no per-minute bucket; nothing was reserved.
+            Ok(obleth_redis::ReserveOutcome::RateLimited { .. }) => {}
+            Ok(obleth_redis::ReserveOutcome::TermExhausted {
+                used_tokens,
+                used_cost,
+            }) => {
+                state.alerts.issue(
+                    format!("key_term_budget_exhausted:{}", resolved.key_id),
+                    "API key term budget exhausted",
+                    format!(
+                        "tenant `{}` key `{}` blocked: used {used_tokens} tokens / ${used_cost:.4} against caps tokens={:?} cost={:?}",
+                        resolved.tenant_name,
+                        resolved.key_id,
+                        resolved.key_budget_tokens,
+                        resolved.key_budget_cost_usd,
+                    ),
+                );
+                return Err(BudgetRefusal {
+                    status: StatusCode::FORBIDDEN,
+                    message: "api key term budget exhausted",
+                    ledger: true,
+                });
+            }
+            Err(e) => {
+                if !state.fail_open {
+                    state.alerts.issue(
+                        "redis_key_budget_reserve_failed_closed",
+                        "Redis key-budget reserve failed",
+                        format!(
+                            "fail-open is disabled; rejecting tenant `{}` key `{}` model `{model}`: {e}",
+                            resolved.tenant_name,
+                            resolved.key_id
+                        ),
+                    );
+                    return Err(BudgetRefusal {
+                        status: StatusCode::SERVICE_UNAVAILABLE,
+                        message: "key budget check failed",
+                        ledger: false,
+                    });
+                }
+                tracing::warn!(error = %e, "key budget reserve failed; failing open");
+                state.alerts.issue(
+                    "redis_key_budget_reserve_failed_open",
+                    "Redis key-budget reserve failed",
+                    format!(
+                        "fail-open is enabled; admitting tenant `{}` key `{}` model `{model}` without key budget enforcement: {e}",
+                        resolved.tenant_name,
+                        resolved.key_id
+                    ),
+                );
+            }
+        }
+    }
+    let tenant_gate_armed = term_gate.is_some();
+    if capacity > 0 || tenant_gate_armed {
+        match state
+            .redis
+            .reserve_with_term(
+                &resolved.tenant_id,
+                capacity,
+                resolved.tokens_per_minute,
+                est.total(),
+                term_gate,
+                est_cost,
+            )
+            .instrument(tracing::info_span!("reserve_budget"))
+            .await
+        {
+            Ok(obleth_redis::ReserveOutcome::Reserved { .. }) => {
+                tenant_term_held = tenant_gate_armed;
+            }
+            Ok(obleth_redis::ReserveOutcome::RateLimited { .. }) => {
+                if let Some(hold) = key_hold.take() {
+                    hold.release().await;
+                }
+                return Err(BudgetRefusal {
+                    status: StatusCode::TOO_MANY_REQUESTS,
+                    message: "token budget exceeded",
+                    ledger: true,
+                });
+            }
+            Ok(obleth_redis::ReserveOutcome::TermExhausted {
+                used_tokens,
+                used_cost,
+            }) => {
+                if let Some(hold) = key_hold.take() {
+                    hold.release().await;
+                }
+                state.alerts.issue(
+                    format!("term_budget_exhausted:{}", resolved.tenant_id),
+                    "Tenant term budget exhausted",
+                    format!(
+                        "tenant `{}` blocked: used {used_tokens} tokens / ${used_cost:.4} against caps tokens={:?} cost={:?}",
+                        resolved.tenant_name,
+                        resolved.budget_tokens,
+                        resolved.budget_cost_usd,
+                    ),
+                );
+                return Err(BudgetRefusal {
+                    status: StatusCode::FORBIDDEN,
+                    message: "tenant term budget exhausted",
+                    ledger: true,
+                });
+            }
+            Err(e) => {
+                if !state.fail_open {
+                    if let Some(hold) = key_hold.take() {
+                        hold.release().await;
+                    }
+                    state.alerts.issue(
+                        "redis_budget_reserve_failed_closed",
+                        "Redis budget reserve failed",
+                        format!(
+                            "fail-open is disabled; rejecting tenant `{}` model `{model}`: {e}",
+                            resolved.tenant_name
+                        ),
+                    );
+                    return Err(BudgetRefusal {
+                        status: StatusCode::SERVICE_UNAVAILABLE,
+                        message: "budget check failed",
+                        ledger: false,
+                    });
+                }
+                tracing::warn!(error = %e, "budget reserve failed; failing open");
+                state.alerts.issue(
+                    "redis_budget_reserve_failed_open",
+                    "Redis budget reserve failed",
+                    format!(
+                        "fail-open is enabled; admitting tenant `{}` model `{model}` without budget enforcement: {e}",
+                        resolved.tenant_name
+                    ),
+                );
+            }
+        }
+    }
+    if let Some(hold) = key_hold.take() {
+        hold.hand_off();
+    }
+    Ok(Reserved {
+        capacity,
+        term_period,
+        key_term_period,
+        holds: TermHolds {
+            tenant: tenant_term_held,
+            key: key_term_held,
+            est_cost,
+        },
+    })
 }
 
 /// Which term reservations a request holds, and the cost estimate they were
@@ -4834,34 +4864,8 @@ impl StreamAccounting {
         cache_put: Option<(String, i64, String, String)>,
         billed: bool,
     ) {
-        let cache_enabled = cache_put.is_some();
-        let (key, ttl, content_type, body) = cache_put.unwrap_or_default();
-        settle_inner(
-            &self.state,
-            self.request_id,
-            &self.resolved,
-            &self.meta,
-            &self.model,
-            self.admission,
-            self.est,
-            tokens,
-            self.queue_wait_ms,
-            ttft_ms,
-            total_ms,
-            status_code,
-            &self.cache_status,
-            self.capacity,
-            self.term_period.as_deref(),
-            self.key_term_period.as_deref(),
-            self.in_cost_rate,
-            self.out_cost_rate,
-            self.modality_cost,
-            &self.energy,
-            cache_enabled.then_some((key.as_str(), ttl, content_type.as_str(), body)),
-            self.holds,
-            billed,
-        )
-        .await;
+        self.settle_inner(tokens, ttft_ms, total_ms, status_code, cache_put, billed)
+            .await;
     }
 }
 
@@ -4878,215 +4882,234 @@ impl StreamAccounting {
 /// false` settles a request that produced nothing billable: tokens and cost
 /// are frozen at zero (energy is still charged) and the reservations are
 /// fully refunded.
-#[allow(clippy::too_many_arguments)]
-async fn settle_inner(
-    state: &AppState,
-    request_id: Uuid,
-    resolved: &ResolvedKey,
-    meta: &RequestMeta,
-    model: &str,
-    admission: Admission,
-    est: CostEstimate,
-    tokens: UpstreamUsage,
-    queue_wait_ms: u32,
-    ttft_ms: u32,
-    total_ms: u32,
-    status_code: u16,
-    cache_status: &str,
-    capacity: i64,
-    term_period: Option<&str>,
-    key_term_period: Option<&str>,
-    in_cost_rate: f64,
-    out_cost_rate: f64,
-    modality_cost: f64,
-    request_energy: &crate::energy::RequestEnergy,
-    cache_put: Option<(&str, i64, &str, String)>,
-    holds: TermHolds,
-    billed: bool,
-) {
-    let UpstreamUsage {
-        input: input_tokens,
-        output: output_tokens,
-        cached: cached_input_tokens,
-    } = tokens;
-    // The crash guard counts a strike against every request that was in
-    // flight when the model server's engine died.
-    if !meta.crash_fp.is_empty()
-        && meta
-            .failure
-            .as_ref()
-            .is_some_and(|f| crate::crash_guard::is_engine_death(&f.reason))
-    {
-        state
-            .crash_guard
-            .record_death(&state.redis, model, &meta.crash_fp)
-            .await;
-    }
-    // Feed the router's per-request cost estimate: one EWMA sample of how
-    // long this model's answers actually run. Successful requests only — an
-    // error body's usage says nothing about the model's answering behavior.
-    if status_code == 200 && output_tokens > 0 {
-        state.output_stats.observe(model, output_tokens as u64);
-    }
-
-    // store the full response for identical future requests
-    if let Some((ck, ttl, content_type, body)) = cache_put {
-        let cached = obleth_config::CachedResponse {
-            status: status_code,
-            content_type: content_type.to_string(),
-            body,
-            input_tokens,
-            output_tokens,
-        };
-        if let Err(e) = state.redis.cache_put(ck, &cached, ttl).await {
-            tracing::warn!(error = %e, "cache store failed");
-            state.alerts.issue(
-                "redis_cache_store_failed",
-                "Redis response-cache store failed",
-                format!(
-                    "tenant `{}` model `{model}` cache ttl `{ttl}`: {e}",
-                    resolved.tenant_name
-                ),
-            );
-        }
-    }
-
-    // Reconcile estimate vs actual against the per-minute budget bucket.
-    // A zero token rate means the tenant has no per-minute limiter.
-    if capacity > 0 {
-        if let Err(e) = state
-            .redis
-            .reconcile_budget(
-                &resolved.tenant_id,
-                capacity,
-                est.total(),
-                input_tokens.saturating_add(output_tokens),
-            )
-            .await
+impl StreamAccounting {
+    async fn settle_inner(
+        self,
+        tokens: UpstreamUsage,
+        ttft_ms: u32,
+        total_ms: u32,
+        status_code: u16,
+        cache_put: Option<(String, i64, String, String)>,
+        billed: bool,
+    ) {
+        let StreamAccounting {
+            state,
+            request_id,
+            resolved,
+            meta,
+            model,
+            admission,
+            est,
+            queue_wait_ms,
+            cache_status,
+            capacity,
+            term_period,
+            key_term_period,
+            in_cost_rate,
+            out_cost_rate,
+            modality_cost,
+            energy,
+            holds,
+            ..
+        } = self;
+        let (state, resolved, meta, model, cache_status) = (
+            &state,
+            &*resolved,
+            &meta,
+            model.as_str(),
+            cache_status.as_str(),
+        );
+        let (term_period, key_term_period) = (term_period.as_deref(), key_term_period.as_deref());
+        let request_energy = &energy;
+        let cache_put = cache_put.as_ref().map(|(key, ttl, content_type, body)| {
+            (key.as_str(), *ttl, content_type.as_str(), body.clone())
+        });
+        let UpstreamUsage {
+            input: input_tokens,
+            output: output_tokens,
+            cached: cached_input_tokens,
+        } = tokens;
+        // The crash guard counts a strike against every request that was in
+        // flight when the model server's engine died.
+        if !meta.crash_fp.is_empty()
+            && meta
+                .failure
+                .as_ref()
+                .is_some_and(|f| crate::crash_guard::is_engine_death(&f.reason))
         {
-            tracing::warn!(error = %e, "budget reconcile failed");
-            state.alerts.issue(
-                "redis_budget_reconcile_failed",
-                "Redis budget reconcile failed",
-                format!(
-                    "tenant `{}` model `{model}` estimated `{}` actual `{}`: {e}",
-                    resolved.tenant_name,
-                    est.total(),
-                    input_tokens.saturating_add(output_tokens),
-                ),
-            );
+            state
+                .crash_guard
+                .record_death(&state.redis, model, &meta.crash_fp)
+                .await;
         }
-    }
+        // Feed the router's per-request cost estimate: one EWMA sample of how
+        // long this model's answers actually run. Successful requests only — an
+        // error body's usage says nothing about the model's answering behavior.
+        if status_code == 200 && output_tokens > 0 {
+            state.output_stats.observe(model, output_tokens as u64);
+        }
 
-    // ---- term-usage commit + budget alerts (Phase 3 + Phase 5) ----
-    // Frozen request cost: per-token rates (captured at admission) plus any
-    // per-request modality surcharge. Computed once and used for both the
-    // term-budget commit and the persisted usage ledger so they agree.
-    // Frozen energy figures: the request's share of its model's measured
-    // power, or the slot share of node power, over serving time (queue wait
-    // excluded). Zeros when accounting is off. Frozen like `cost_usd` so
-    // later settings edits never rewrite history.
-    let (cost_usd, energy) = settled_figures(
-        &state.energy,
-        billed,
-        (input_tokens, output_tokens),
-        (in_cost_rate, out_cost_rate, modality_cost),
-        request_energy,
-        total_ms,
-        queue_wait_ms,
-    );
-    let added = input_tokens.saturating_add(output_tokens) as i64;
-    let est_tokens = est.total() as i64;
-    if let Some(period) = term_period {
-        let committed = if holds.tenant {
-            state
-                .redis
-                .term_reconcile(
-                    &resolved.tenant_id.to_string(),
-                    period,
-                    est_tokens,
-                    holds.est_cost,
-                    added,
-                    cost_usd,
-                )
-                .await
-        } else {
-            state
-                .redis
-                .term_usage_add(&resolved.tenant_id, period, added, cost_usd)
-                .await
-        };
-        match committed {
-            Ok((total_tokens, total_cost)) => {
-                maybe_alert_budget(state, resolved, total_tokens, total_cost);
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "term usage commit failed");
+        // store the full response for identical future requests
+        if let Some((ck, ttl, content_type, body)) = cache_put {
+            let cached = obleth_config::CachedResponse {
+                status: status_code,
+                content_type: content_type.to_string(),
+                body,
+                input_tokens,
+                output_tokens,
+            };
+            if let Err(e) = state.redis.cache_put(ck, &cached, ttl).await {
+                tracing::warn!(error = %e, "cache store failed");
                 state.alerts.issue(
-                    "redis_term_usage_failed",
-                    "Redis term-usage commit failed",
-                    format!("tenant `{}` model `{model}`: {e}", resolved.tenant_name),
-                );
-            }
-        }
-    }
-    if let Some(period) = key_term_period {
-        let committed = if holds.key {
-            state
-                .redis
-                .term_reconcile(
-                    &resolved.key_id.to_string(),
-                    period,
-                    est_tokens,
-                    holds.est_cost,
-                    added,
-                    cost_usd,
-                )
-                .await
-        } else {
-            state
-                .redis
-                .term_usage_add(&resolved.key_id, period, added, cost_usd)
-                .await
-        };
-        match committed {
-            Ok((total_tokens, total_cost)) => {
-                maybe_alert_key_budget(state, resolved, total_tokens, total_cost);
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "key term usage commit failed");
-                state.alerts.issue(
-                    "redis_key_term_usage_failed",
-                    "Redis key term-usage commit failed",
+                    "redis_cache_store_failed",
+                    "Redis response-cache store failed",
                     format!(
-                        "tenant `{}` key `{}` model `{model}`: {e}",
-                        resolved.tenant_name, resolved.key_id
+                        "tenant `{}` model `{model}` cache ttl `{ttl}`: {e}",
+                        resolved.tenant_name
                     ),
                 );
             }
         }
-    }
 
-    finalize(
-        state,
-        request_id,
-        resolved,
-        meta,
-        model,
-        admission,
-        est,
-        input_tokens,
-        output_tokens,
-        cached_input_tokens,
-        queue_wait_ms,
-        ttft_ms,
-        total_ms,
-        status_code,
-        cache_status,
-        cost_usd,
-        energy,
-    );
-    state.metrics.total_ms.observe(total_ms as f64);
+        // Reconcile estimate vs actual against the per-minute budget bucket.
+        // A zero token rate means the tenant has no per-minute limiter.
+        if capacity > 0 {
+            if let Err(e) = state
+                .redis
+                .reconcile_budget(
+                    &resolved.tenant_id,
+                    capacity,
+                    est.total(),
+                    input_tokens.saturating_add(output_tokens),
+                )
+                .await
+            {
+                tracing::warn!(error = %e, "budget reconcile failed");
+                state.alerts.issue(
+                    "redis_budget_reconcile_failed",
+                    "Redis budget reconcile failed",
+                    format!(
+                        "tenant `{}` model `{model}` estimated `{}` actual `{}`: {e}",
+                        resolved.tenant_name,
+                        est.total(),
+                        input_tokens.saturating_add(output_tokens),
+                    ),
+                );
+            }
+        }
+
+        // ---- term-usage commit + budget alerts (Phase 3 + Phase 5) ----
+        // Frozen request cost: per-token rates (captured at admission) plus any
+        // per-request modality surcharge. Computed once and used for both the
+        // term-budget commit and the persisted usage ledger so they agree.
+        // Frozen energy figures: the request's share of its model's measured
+        // power, or the slot share of node power, over serving time (queue wait
+        // excluded). Zeros when accounting is off. Frozen like `cost_usd` so
+        // later settings edits never rewrite history.
+        let (cost_usd, energy) = settled_figures(
+            &state.energy,
+            billed,
+            (input_tokens, output_tokens),
+            (in_cost_rate, out_cost_rate, modality_cost),
+            request_energy,
+            total_ms,
+            queue_wait_ms,
+        );
+        let added = input_tokens.saturating_add(output_tokens) as i64;
+        let est_tokens = est.total() as i64;
+        if let Some(period) = term_period {
+            let committed = if holds.tenant {
+                state
+                    .redis
+                    .term_reconcile(
+                        &resolved.tenant_id.to_string(),
+                        period,
+                        est_tokens,
+                        holds.est_cost,
+                        added,
+                        cost_usd,
+                    )
+                    .await
+            } else {
+                state
+                    .redis
+                    .term_usage_add(&resolved.tenant_id, period, added, cost_usd)
+                    .await
+            };
+            match committed {
+                Ok((total_tokens, total_cost)) => {
+                    maybe_alert_budget(state, resolved, total_tokens, total_cost);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "term usage commit failed");
+                    state.alerts.issue(
+                        "redis_term_usage_failed",
+                        "Redis term-usage commit failed",
+                        format!("tenant `{}` model `{model}`: {e}", resolved.tenant_name),
+                    );
+                }
+            }
+        }
+        if let Some(period) = key_term_period {
+            let committed = if holds.key {
+                state
+                    .redis
+                    .term_reconcile(
+                        &resolved.key_id.to_string(),
+                        period,
+                        est_tokens,
+                        holds.est_cost,
+                        added,
+                        cost_usd,
+                    )
+                    .await
+            } else {
+                state
+                    .redis
+                    .term_usage_add(&resolved.key_id, period, added, cost_usd)
+                    .await
+            };
+            match committed {
+                Ok((total_tokens, total_cost)) => {
+                    maybe_alert_key_budget(state, resolved, total_tokens, total_cost);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "key term usage commit failed");
+                    state.alerts.issue(
+                        "redis_key_term_usage_failed",
+                        "Redis key term-usage commit failed",
+                        format!(
+                            "tenant `{}` key `{}` model `{model}`: {e}",
+                            resolved.tenant_name, resolved.key_id
+                        ),
+                    );
+                }
+            }
+        }
+
+        finalize(
+            state,
+            request_id,
+            resolved,
+            meta,
+            model,
+            admission,
+            est,
+            FinalizeOutcome {
+                input_tokens,
+                output_tokens,
+                cached_input_tokens,
+                queue_wait_ms,
+                ttft_ms,
+                total_ms,
+                status_code,
+                cache_status,
+                cost_usd,
+                energy,
+            },
+        );
+        state.metrics.total_ms.observe(total_ms as f64);
+    }
 }
 
 /// Resolve a key via moka, falling back to Redis and caching the result.
@@ -5723,6 +5746,34 @@ pub(crate) fn allowed_models_for(resolved: &ResolvedKey) -> Option<&[String]> {
 /// True when `model_name` is visible under `allowed` (see [`allowed_models_for`]).
 pub(crate) fn model_visible(allowed: Option<&[String]>, model_name: &str) -> bool {
     allowed.is_none_or(|list| list.iter().any(|m| m == model_name))
+}
+
+/// `requested`, when it names one of `route`'s variants rather than the
+/// model itself or an alias.
+pub(crate) fn variant_called<'a>(route: &ResolvedModel, requested: &'a str) -> Option<&'a str> {
+    route
+        .variants
+        .iter()
+        .any(|v| v.name == requested)
+        .then_some(requested)
+}
+
+/// Whether the caller may use `route`, served as `variant` when one was
+/// named. A tenant's allowlist names a model by its own name, which covers
+/// its aliases and variants, or a variant by the variant's name, so a tenant
+/// can be given the variant alone; an alias on the list grants nothing.
+/// Internal callers and tenants without a list may use everything. The one
+/// rule for the pipeline, search, speech and batches.
+pub(crate) fn model_permitted(
+    resolved: &ResolvedKey,
+    route: &ResolvedModel,
+    variant: Option<&str>,
+) -> bool {
+    allowed_models_for(resolved).is_none_or(|allowed| {
+        allowed
+            .iter()
+            .any(|m| m == &route.model_name || variant == Some(m.as_str()))
+    })
 }
 
 /// The OpenAI `{object:"list", data:[…]}` listing for a registry snapshot,
@@ -6671,12 +6722,16 @@ fn is_retryable_status(status: u16) -> bool {
 /// well-known signatures.
 fn is_connection_error(e: &reqwest::Error) -> bool {
     use std::error::Error;
+    // A connect timeout is a timeout too, but the request never left.
+    if e.is_connect() {
+        return true;
+    }
     // reqwest reports a read timeout before the headers as a request error;
     // the upstream got the request and was working on it.
     if e.is_timeout() {
         return false;
     }
-    if e.is_connect() || e.is_request() {
+    if e.is_request() {
         return true;
     }
     let mut source: Option<&dyn Error> = Some(e);
@@ -6815,10 +6870,12 @@ pub(crate) fn forward_headers(headers: &HeaderMap) -> HeaderMap {
     let mut out = HeaderMap::new();
     for (name, value) in headers {
         match name.as_str() {
-            // strip hop-by-hop / auth / encoding so the body stays inspectable;
-            // x-obleth-boons is a gateway directive, not an upstream header
+            // strip hop-by-hop / auth / encoding so the body stays inspectable
             "host" | "content-length" | "authorization" | "x-api-key" | "accept-encoding"
-            | "connection" | "x-obleth-boons" | END_USER_HEADER => continue,
+            | "connection" => continue,
+            // every x-obleth-* header is between the client and the gateway
+            // (directives, the end user, session hints); none is an upstream's
+            n if n.starts_with("x-obleth-") => continue,
             _ => {
                 out.insert(name.clone(), value.clone());
             }
@@ -7070,25 +7127,16 @@ fn effective_request_type(resolved: &ResolvedKey, path: &str) -> &'static str {
 pub(crate) fn surfaced_request_type(
     resolved: &ResolvedKey,
     path: &str,
-    headers: &HeaderMap,
+    surface: Option<&str>,
 ) -> &'static str {
     if !resolved.synthetic {
-        match surface(headers) {
-            Some("responses") => return "responses",
+        match surface {
+            Some(crate::responses::SURFACE) => return "responses",
             Some(crate::messages::SURFACE) => return "messages",
             _ => {}
         }
     }
     effective_request_type(resolved, path)
-}
-
-/// The API surface a shim translated this request from, if any. The header
-/// is set by the shims only: `proxy_handler` strips it from every incoming
-/// request before dispatch.
-fn surface(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(crate::responses::SURFACE_HEADER)
-        .and_then(|v| v.to_str().ok())
 }
 
 /// Whether chat-only boons (knowledge, compression, tools, structured output,
@@ -7357,6 +7405,63 @@ fn recorded_ttft(streamed: bool, ttft_ms: u32) -> u32 {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// How a request came out, for its ledger row: everything `finalize` records
+/// beyond the request's identity. `Default` is a request that produced
+/// nothing and cost nothing; a refusal sets its status, time and class.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FinalizeOutcome<'a> {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub cached_input_tokens: u32,
+    pub queue_wait_ms: u32,
+    pub ttft_ms: u32,
+    pub total_ms: u32,
+    pub status_code: u16,
+    /// `off`, `hit`, `miss` or `bypass`; `off` when caching never applied.
+    pub cache_status: &'a str,
+    pub cost_usd: f64,
+    pub energy: crate::energy::EnergyFigures,
+}
+
+/// A request refused before it reached an upstream: its status, when it
+/// started (the row's `total_ms` is measured here, so no refusal records a
+/// zero), what it had reserved, and the cache status it had reached.
+pub(crate) struct Rejection<'a> {
+    pub status: StatusCode,
+    pub since: Instant,
+    pub est: CostEstimate,
+    pub cache_status: &'a str,
+    pub queue_wait_ms: u32,
+}
+
+/// Record one rejected request's ledger row. The class and reason come from
+/// `meta.failure` and the status, as for every other row.
+pub(crate) fn reject(
+    state: &AppState,
+    request_id: Uuid,
+    resolved: &ResolvedKey,
+    meta: &RequestMeta,
+    model: &str,
+    rejection: Rejection<'_>,
+) {
+    finalize(
+        state,
+        request_id,
+        resolved,
+        meta,
+        model,
+        Admission::Rejected,
+        rejection.est,
+        FinalizeOutcome {
+            total_ms: rejection.since.elapsed().as_millis() as u32,
+            status_code: rejection.status.as_u16(),
+            cache_status: rejection.cache_status,
+            queue_wait_ms: rejection.queue_wait_ms,
+            ..FinalizeOutcome::default()
+        },
+    );
+}
+
 pub(crate) fn finalize(
     state: &AppState,
     request_id: Uuid,
@@ -7365,17 +7470,20 @@ pub(crate) fn finalize(
     model: &str,
     admission: Admission,
     est: CostEstimate,
-    input_tokens: u32,
-    output_tokens: u32,
-    cached_input_tokens: u32,
-    queue_wait_ms: u32,
-    ttft_ms: u32,
-    total_ms: u32,
-    status_code: u16,
-    cache_status: &str,
-    cost_usd: f64,
-    energy: crate::energy::EnergyFigures,
+    outcome: FinalizeOutcome<'_>,
 ) {
+    let FinalizeOutcome {
+        input_tokens,
+        output_tokens,
+        cached_input_tokens,
+        queue_wait_ms,
+        ttft_ms,
+        total_ms,
+        status_code,
+        cache_status,
+        cost_usd,
+        energy,
+    } = outcome;
     let ttft_ms = recorded_ttft(meta.streamed, ttft_ms);
     state
         .metrics
@@ -7592,23 +7700,41 @@ fn record_key_rejection(
 /// The `type` of an error the gateway itself reports, in OpenAI's error shape.
 pub(crate) const GATEWAY_ERROR_TYPE: &str = "obleth_gateway_error";
 
+/// An error about a gateway condition (no capacity, storage down, a key's
+/// limit) in OpenAI's error shape with the gateway's own `type`. An error
+/// about the request's shape on an OpenAI surface goes through
+/// [`invalid_request`] instead, so clients can match on `invalid_request_error`.
 pub(crate) fn error_json(status: StatusCode, msg: &str) -> Response<Body> {
     let body = serde_json::json!({ "error": { "message": msg, "type": GATEWAY_ERROR_TYPE } });
     (status, axum::Json(body)).into_response()
 }
 
-/// `400` for a request carrying a field the model is set to refuse, in the
-/// OpenAI error shape with the field as `param`.
-fn rejected_field_response(model: &str, field: &str) -> Response<Body> {
+/// An error about the request itself on an OpenAI surface: a missing or
+/// refused field (`param` names it), an unknown id, a body over the limit.
+/// `code` is the OpenAI code when one applies (`unsupported_parameter`,
+/// `batch_running`), else null.
+pub(crate) fn invalid_request(
+    status: StatusCode,
+    msg: &str,
+    param: Option<&str>,
+    code: Option<&str>,
+) -> Response<Body> {
     let body = serde_json::json!({ "error": {
-        "message": format!(
+        "message": msg, "type": "invalid_request_error", "param": param, "code": code,
+    } });
+    (status, axum::Json(body)).into_response()
+}
+
+/// `400` for a request carrying a field the model is set to refuse.
+fn rejected_field_response(model: &str, field: &str) -> Response<Body> {
+    invalid_request(
+        StatusCode::BAD_REQUEST,
+        &format!(
             "`{field}` is not supported by model `{model}`. Remove it from the request and retry."
         ),
-        "type": "invalid_request_error",
-        "param": field,
-        "code": "unsupported_parameter",
-    } });
-    (StatusCode::BAD_REQUEST, axum::Json(body)).into_response()
+        Some(field),
+        Some("unsupported_parameter"),
+    )
 }
 
 fn now_ms() -> i64 {
@@ -7632,10 +7758,11 @@ mod tests {
         messages_input_estimate, multipart_text_view, output_guardrails_unenforceable,
         parse_multipart, prepare_upstream_body, redress_error, request_type_for_path,
         requires_registered_model, resolve_conversation, response_cache_name, route_keeps_sessions,
-        should_translate_as_stream, strip_beta_query, strip_tool_strict, sure_overflow, surface,
+        should_translate_as_stream, strip_beta_query, strip_tool_strict, sure_overflow,
         tenant_active_now, MultipartField, RequestMeta, TooLong, END_USER_HEADER,
         REGISTERED_MODEL_PATHS, SEED_CAP,
     };
+    use super::{model_permitted, variant_called};
     use crate::router::{BoonGrants, Candidate, Intent, RequestFeatures, RouterWeights};
     use axum::body::{Body, Bytes};
     use axum::http::{header, HeaderMap, Method, Response, StatusCode};
@@ -7666,7 +7793,7 @@ mod tests {
         }
     }
 
-    fn key_with_schedule(
+    pub(super) fn key_with_schedule(
         timezone: &str,
         active_from: Option<DateTime<Utc>>,
         active_until: Option<DateTime<Utc>>,
@@ -8045,28 +8172,6 @@ mod tests {
             ),
             "https://inference.example.com/v1/chat/completions"
         );
-    }
-
-    #[test]
-    fn a_translated_responses_call_is_distinguished_from_a_native_chat_one() {
-        // The shim runs the request down the chat path on purpose, so the path
-        // alone cannot tell the two surfaces apart — the header does.
-        let mut headers = HeaderMap::new();
-        assert_eq!(surface(&headers), None);
-        assert_eq!(request_type_for_path("/v1/chat/completions"), "chat");
-
-        headers.insert(
-            crate::responses::SURFACE_HEADER,
-            "responses".parse().unwrap(),
-        );
-        assert_eq!(surface(&headers), Some("responses"));
-
-        let mut other = HeaderMap::new();
-        other.insert(
-            crate::responses::SURFACE_HEADER,
-            "something-else".parse().unwrap(),
-        );
-        assert_eq!(surface(&other), Some("something-else"));
     }
 
     #[test]
@@ -8787,6 +8892,43 @@ mod tests {
     }
 
     #[test]
+    fn model_permitted_by_its_name_or_a_variants_own_name() {
+        let mut route = crate::boons::test_support::test_route();
+        route.model_name = "glm-5-3".into();
+        route.aliases = vec!["glm".into()];
+        route.variants = vec![obleth_config::ModelVariant {
+            name: "glm-5-3-spec".into(),
+            description: String::new(),
+            boons: vec![],
+        }];
+        let mut key = crate::boons::test_support::test_key();
+        key.internal = false;
+        let check = |list: Option<Vec<&str>>, requested: &str| {
+            let mut key = key.clone();
+            key.allowed_models = list.map(|l| l.into_iter().map(String::from).collect());
+            model_permitted(&key, &route, variant_called(&route, requested))
+        };
+        // No list: everything.
+        assert!(check(None, "glm-5-3"));
+        // The model's name covers the model, its alias and its variant.
+        assert!(check(Some(vec!["glm-5-3"]), "glm-5-3"));
+        assert!(check(Some(vec!["glm-5-3"]), "glm"));
+        assert!(check(Some(vec!["glm-5-3"]), "glm-5-3-spec"));
+        // A variant's name covers only that variant.
+        assert!(check(Some(vec!["glm-5-3-spec"]), "glm-5-3-spec"));
+        assert!(!check(Some(vec!["glm-5-3-spec"]), "glm-5-3"));
+        // An alias, a family name or an unlisted model grant nothing.
+        assert!(!check(Some(vec!["glm"]), "glm"));
+        assert!(!check(Some(vec!["glm-family"]), "glm-5-3"));
+        assert!(!check(Some(vec!["other"]), "glm-5-3"));
+        // Internal callers see everything.
+        let mut internal = key.clone();
+        internal.internal = true;
+        internal.allowed_models = Some(vec!["other".into()]);
+        assert!(model_permitted(&internal, &route, None));
+    }
+
+    #[test]
     fn models_listing_lists_each_variant_as_its_own_entry() {
         use super::{model_entry, model_facts_index, registry_models_list};
         let candidates = vec![with_variants(candidate(
@@ -9454,7 +9596,7 @@ mod tests {
                 .find("async fn translate_response_body(")
                 .expect("end of responses_shim");
         let shim = &src[start..end];
-        let read = shim.find("to_bytes(").expect("body read");
+        let read = shim.find("read_body(").expect("body read");
         for step in [
             "bearer(",
             "UNAUTHORIZED",
@@ -9489,7 +9631,7 @@ mod tests {
             body.find(needle)
                 .unwrap_or_else(|| panic!("{needle} in messages_front"))
         };
-        let read = pos("to_bytes(");
+        let read = pos("read_body(");
         assert!(pos("bearer(") < read);
         assert!(pos("authenticate_credential(") < read);
         assert!(pos("gate_resolved_key(") < read);
@@ -9553,22 +9695,6 @@ mod tests {
     }
 
     #[test]
-    fn surface_recognises_both_shims() {
-        let mut h = HeaderMap::new();
-        assert_eq!(surface(&h), None);
-        h.insert(
-            crate::responses::SURFACE_HEADER,
-            header::HeaderValue::from_static("responses"),
-        );
-        assert_eq!(surface(&h), Some("responses"));
-        h.insert(
-            crate::responses::SURFACE_HEADER,
-            header::HeaderValue::from_static("messages"),
-        );
-        assert_eq!(surface(&h), Some("messages"));
-    }
-
-    #[test]
     fn stream_translation_falls_back_to_buffered_when_upstream_ignored_stream() {
         // A `stream: true` request whose upstream answered plain JSON (no
         // `text/event-stream`) must not be handed to the SSE translator: it
@@ -9590,6 +9716,96 @@ mod tests {
         assert!(!should_translate_as_stream(true, &json));
 
         assert!(!should_translate_as_stream(true, &HeaderMap::new()));
+    }
+
+    fn chat_reply(content_type: &str) -> Response<Body> {
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, content_type)
+            .header(header::CONTENT_LENGTH, "999")
+            .header("x-obleth-request-id", "r1")
+            .body(Body::from(
+                r#"{"id":"c","object":"chat.completion","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}"#,
+            ))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_translated_responses_body_carries_exactly_one_content_type() {
+        let out = super::translate_response_body(chat_reply("application/json"), Uuid::nil()).await;
+        let types: Vec<_> = out.headers().get_all(header::CONTENT_TYPE).iter().collect();
+        assert_eq!(types, vec!["application/json"]);
+        assert!(out.headers().get(header::CONTENT_LENGTH).is_none());
+        assert_eq!(out.headers().get("x-obleth-request-id").unwrap(), "r1");
+        let bytes = axum::body::to_bytes(out.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["object"], "response");
+    }
+
+    #[tokio::test]
+    async fn a_stream_request_answered_with_plain_json_gets_a_translated_body() {
+        // The upstream ignored `stream`: the reply is a JSON object, so it is
+        // translated as a body, not fed to the SSE translator as an empty stream.
+        let reply = chat_reply("application/json");
+        assert!(!should_translate_as_stream(true, reply.headers()));
+        let out = super::translate_response_body(reply, Uuid::nil()).await;
+        let bytes = axum::body::to_bytes(out.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["output"][0]["content"][0]["text"], "hi");
+    }
+
+    #[tokio::test]
+    async fn an_idle_upstream_gets_a_heartbeat_on_every_shim() {
+        use futures_util::StreamExt;
+        let interval = std::time::Duration::from_millis(50);
+        for shim in ["responses", "messages"] {
+            let silent = Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from_stream(futures_util::stream::pending::<
+                    Result<Bytes, std::io::Error>,
+                >()))
+                .unwrap();
+            let out = if shim == "responses" {
+                super::translate_stream_with(
+                    silent,
+                    crate::responses::StreamTranslator::new("r", "m"),
+                    interval,
+                )
+            } else {
+                super::translate_stream_with(
+                    silent,
+                    crate::messages::AnthropicStreamTranslator::new(
+                        crate::messages::ResponseContext {
+                            request_id: "r".into(),
+                            model: "m".into(),
+                        },
+                    ),
+                    interval,
+                )
+            };
+            let types: Vec<_> = out.headers().get_all(header::CONTENT_TYPE).iter().collect();
+            assert_eq!(types, vec!["text/event-stream"], "{shim}");
+            let mut body = out.into_body().into_data_stream();
+            // Nothing arrives for 15 s of (paused) time, then the heartbeat.
+            let mut seen = String::new();
+            while !seen.contains(if shim == "responses" {
+                ": keep-alive"
+            } else {
+                "\"type\":\"ping\""
+            }) {
+                let chunk = tokio::time::timeout(std::time::Duration::from_secs(16), body.next())
+                    .await
+                    .expect("a frame within the ping interval")
+                    .expect("stream open")
+                    .unwrap();
+                seen.push_str(std::str::from_utf8(&chunk).unwrap());
+            }
+        }
     }
 
     #[test]
@@ -10453,8 +10669,7 @@ mod tests {
         assert_eq!(admission_pool(None), obleth_fairshare::PoolKey::Unrouted);
 
         // A batch item keeps its own share and wait.
-        let batch = crate::batches::BatchCaller {
-            resolved: std::sync::Arc::new(resolved.clone()),
+        let batch = super::BackgroundShare {
             share: 0.25,
             admission_wait: Duration::from_secs(7),
         };
@@ -10816,8 +11031,8 @@ mod lifecycle_tests {
         // A refusal is recorded before it is returned.
         let refuse = h.find("Gate::Refuse(resp,reason)").expect("refusal arm");
         let ret = refuse + h[refuse..].find("returnresp;").expect("refusal returns");
-        assert!(h[refuse..ret].contains("finalize("));
-        assert!(h[refuse..ret].contains("StatusCode::GONE"));
+        assert!(h[refuse..ret].contains("reject("));
+        assert!(h[refuse..ret].contains("status:StatusCode::GONE"));
     }
 
     #[test]
@@ -10840,9 +11055,8 @@ mod lifecycle_tests {
             + h[check..]
                 .find("returnrejected_field_response(&model,field);")
                 .expect("refusal returns");
-        assert!(h[check..ret].contains("finalize("));
-        assert!(h[check..ret].contains("Admission::Rejected"));
-        assert!(h[check..ret].contains("StatusCode::BAD_REQUEST.as_u16()"));
+        assert!(h[check..ret].contains("reject("));
+        assert!(h[check..ret].contains("status:StatusCode::BAD_REQUEST"));
     }
 
     #[test]
@@ -10911,7 +11125,7 @@ mod lifecycle_tests {
         let dispatch = h.find("letprepared_body").expect("normal dispatch");
         assert_eq!(
             h[spec..dispatch]
-                .matches(".header(crate::boons::speculation::DRAFTED_BY_HEADER,drafted_by)")
+                .matches("crate::boons::speculation::DRAFTED_BY_HEADER,content_type_header(&drafted_by),")
                 .count(),
             2,
             "both the buffered and the streamed commit carry the header"
@@ -10927,24 +11141,35 @@ mod lifecycle_tests {
             .find("letqueue_wait_ms=admitted.waited.as_millis()asu32;")
             .expect("admission wait");
         let after = &h[admitted..];
-        let builders = after
-            .matches(".header(\"x-obleth-request-id\",request_id.to_string())")
+        let answers = after.matches("answer.respond(").count();
+        assert!(answers >= 7, "found {answers} answers");
+        // No answer after admission is built by hand: `Answer::respond` owns
+        // the request id, the queue wait and the rest of the header set.
+        assert!(!after.contains(".header(\"x-obleth-request-id\""));
+        assert!(after.contains("letanswer=Answer{request_id,queue_wait_ms,"));
+    }
+
+    /// Every refusal before the upstream goes through `reject`, which measures
+    /// the row's `total_ms` from the request's start; none passes a duration
+    /// of its own (three used to record 0).
+    #[test]
+    fn every_refusal_measures_its_own_duration() {
+        let h = squash(handler());
+        let refusals = h
+            .matches("reject(&state,request_id,&resolved,&req_meta,&model,Rejection{")
             .count();
-        assert!(builders >= 7, "found {builders} response builders");
-        assert_eq!(
-            after
-                .matches(".header(\"x-obleth-request-id\",request_id.to_string()).header(QUEUE_WAIT_HEADER,queue_wait_ms.to_string())")
-                .count(),
-            builders,
-            "every response built after admission carries the queue wait"
-        );
+        // Retired, refused field, crash guard, prompt over the window, admission
+        // timeout, and the one refusal `reserve_budget` can answer with.
+        assert!(refusals >= 6, "found {refusals} refusals");
+        assert_eq!(h.matches("since:request_start,").count(), refusals);
+        assert!(!h.contains("total_ms:0"));
     }
 
     #[test]
     fn admission_precedes_the_budget_reservation() {
         let h = handler();
         let admit = h.find(".admit_to(").expect("admission");
-        let reserve = h.find(".reserve_with_term(").expect("reservation");
+        let reserve = h.find("reserve_budget(&state").expect("reservation");
         assert!(admit < reserve, "a queued request must hold no budget");
         assert!(h[admit..reserve].contains("timeout(admit_wait"));
     }
@@ -10974,24 +11199,36 @@ mod lifecycle_tests {
 
     #[test]
     fn a_rejection_between_the_two_scopes_releases_the_key_hold() {
-        let flat = squash(handler());
+        // The reservation lives in `reserve_budget`, shared with verdicts.
+        let src = squash(include_str!("proxy.rs"));
+        let start = src
+            .find("pub(crate)asyncfnreserve_budget(")
+            .expect("reserve_budget");
+        let flat = &src[start..];
+        let end = flat.find("Ok(Reserved{").expect("the reservation returns");
+        let flat = &flat[..end];
         let key = flat
             .find(".reserve_with_term(&resolved.key_id,")
             .expect("key reserve");
         let tenant = flat
             .find(".reserve_with_term(&resolved.tenant_id,")
             .expect("tenant reserve");
-        let proceed = flat
-            .find("letmutaccounting=StreamAccounting{")
-            .expect("accounting");
         assert!(key < tenant);
-        let releases = flat[tenant..proceed]
-            .matches("hold.release().await")
-            .count();
+        let releases = flat[tenant..].matches("hold.release().await").count();
         // Rate limited, term exhausted, and fail-closed error.
         assert_eq!(releases, 3);
         // Success hands the hold to settlement before the guard exists.
-        assert!(flat[tenant..proceed].contains("hold.hand_off()"));
+        assert!(flat[tenant..].contains("hold.hand_off()"));
+        // The pipeline takes the helper's answer and records a refusal once.
+        let h = squash(handler());
+        let reserve = h
+            .find("reserve_budget(&state,&resolved,&model,est,est_cost)")
+            .expect("pipeline reserve");
+        let guard = h
+            .find("letmutsettle_guard=accounting.unbilled_guard();")
+            .expect("guard");
+        assert!(reserve < guard);
+        assert!(h[reserve..guard].contains("ifrefusal.ledger{reject("));
     }
 
     #[test]
@@ -11607,6 +11844,27 @@ mod lifecycle_tests {
         );
     }
 
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set (the
+    /// target address needs no server, but the test needs a routable network).
+    #[tokio::test]
+    async fn a_connect_timeout_is_a_connection_error() {
+        if std::env::var("OBLETH_TEST_REDIS_URL").is_err() {
+            eprintln!("skipping: set OBLETH_TEST_REDIS_URL to run");
+            return;
+        }
+        let err = reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(300))
+            .build()
+            .unwrap()
+            .post("http://10.255.255.1:9/chat/completions")
+            .body("{}")
+            .send()
+            .await
+            .expect_err("a blackholed address never connects");
+        assert!(err.is_connect() && err.is_timeout(), "{err:?}");
+        assert!(is_connection_error(&err), "{err:?}");
+    }
+
     #[tokio::test]
     async fn a_connection_dropped_before_response_headers_is_a_connection_error() {
         use crate::upstream_failure::test_support::{spawn_failing_upstream, Hangup};
@@ -11656,6 +11914,219 @@ mod lifecycle_tests {
         let src = squash(handler());
         let arm = src.find("Ok(Err(e))=>{").expect("the send-error arm");
         let rest = &src[arm..];
-        assert!(rest.contains("letread_timed_out=e.is_timeout();timed_out|=read_timed_out;"));
+        assert!(rest.contains(
+            "letread_timed_out=e.is_timeout()&&!e.is_connect();timed_out|=read_timed_out;"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod client_error_tests {
+    use super::*;
+
+    async fn error_body(resp: Response<Body>) -> (StatusCode, serde_json::Value) {
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// One limit on every surface: a body one byte over it is refused with
+    /// 413 and the same message in the surface's own error shape; a body at
+    /// the limit is read whole.
+    #[tokio::test]
+    async fn a_body_over_the_limit_is_413_on_every_surface_and_at_the_limit_is_read() {
+        let Err(too_large) = read_body(Body::from(vec![b'x'; BODY_LIMIT + 1])).await else {
+            panic!("a body over the limit was read");
+        };
+        let (status, json) = error_body(too_large.openai()).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(json["error"]["message"], BODY_TOO_LARGE);
+        assert_eq!(json["error"]["type"], GATEWAY_ERROR_TYPE);
+        let (status, json) = error_body(BodyTooLarge.anthropic()).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(json["error"]["message"], BODY_TOO_LARGE);
+        assert_eq!(json["error"]["type"], "request_too_large");
+        let at = read_body(Body::from(vec![b'x'; BODY_LIMIT])).await;
+        assert_eq!(at.map(|b| b.len()).ok(), Some(BODY_LIMIT));
+    }
+
+    #[tokio::test]
+    async fn a_request_error_carries_type_param_and_code() {
+        let (status, json) = error_body(invalid_request(
+            StatusCode::NOT_FOUND,
+            "No such batch: 'b1'",
+            Some("id"),
+            None,
+        ))
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+        assert_eq!(json["error"]["param"], "id");
+        assert!(json["error"]["code"].is_null());
+        let (_, json) = error_body(rejected_field_response("m", "logprobs")).await;
+        assert_eq!(json["error"]["param"], "logprobs");
+        assert_eq!(json["error"]["code"], "unsupported_parameter");
+    }
+}
+
+#[cfg(test)]
+mod pipeline_input_tests {
+    use super::*;
+
+    fn key() -> ResolvedKey {
+        super::tests::key_with_schedule("UTC", None, None, None)
+    }
+
+    /// The surface is what the shim put in the extension; a header a client
+    /// sends is not read at all, so it cannot stamp a chat call as Responses.
+    #[test]
+    fn a_translated_call_is_distinguished_by_the_extension_not_a_header() {
+        let mut extensions = http::Extensions::new();
+        assert_eq!(PipelineInput::of(&extensions).surface, None);
+        extensions.insert(PipelineInput {
+            surface: Some(crate::responses::SURFACE),
+            ..PipelineInput::default()
+        });
+        assert_eq!(PipelineInput::of(&extensions).surface, Some("responses"));
+        let resolved = key();
+        assert_eq!(
+            surfaced_request_type(&resolved, "/v1/chat/completions", None),
+            "chat"
+        );
+        assert_eq!(
+            surfaced_request_type(&resolved, "/v1/chat/completions", Some("responses")),
+            "responses"
+        );
+        assert_eq!(
+            surfaced_request_type(
+                &resolved,
+                "/v1/chat/completions",
+                Some(crate::messages::SURFACE)
+            ),
+            "messages"
+        );
+        assert_eq!(
+            surfaced_request_type(&resolved, "/v1/chat/completions", Some("something-else")),
+            "chat"
+        );
+    }
+
+    /// No gateway header reaches a model server: directives, the end user and
+    /// any session hint stay between the client and the gateway.
+    #[test]
+    fn no_gateway_header_is_forwarded_upstream() {
+        let mut headers = HeaderMap::new();
+        for (name, value) in [
+            ("x-obleth-boons", "none"),
+            ("x-obleth-api-surface", "responses"),
+            ("x-obleth-internal-reasoning-effort", "high"),
+            (END_USER_HEADER, "ana"),
+            ("x-obleth-session", "s1"),
+            ("content-type", "application/json"),
+            ("x-request-id", "r1"),
+        ] {
+            headers.insert(name, header::HeaderValue::from_static(value));
+        }
+        let out = forward_headers(&headers);
+        assert!(
+            out.keys().all(|k| !k.as_str().starts_with("x-obleth-")),
+            "{out:?}"
+        );
+        assert_eq!(out.len(), 2);
+    }
+
+    /// The reservation uses the shim's estimate, which counts tools and
+    /// images, when it gave one.
+    #[test]
+    fn the_reservation_estimate_is_the_callers_when_it_gave_one() {
+        let est = CostEstimate {
+            input_tokens: 10,
+            estimated_output_tokens: 5,
+        };
+        assert_eq!(PipelineInput::default().reserve(est).input_tokens, 10);
+        let input = PipelineInput {
+            estimate: Some(400),
+            ..PipelineInput::default()
+        };
+        let reserved = input.reserve(est);
+        assert_eq!(
+            (reserved.input_tokens, reserved.estimated_output_tokens),
+            (400, 5)
+        );
+    }
+
+    /// The pipeline takes the caller's credential before it would read a
+    /// bearer token, and parses no body when one was handed over.
+    #[test]
+    fn the_pipeline_uses_the_input_before_authenticating_or_parsing_again() {
+        let src = include_str!("proxy.rs");
+        let start = src.find("async fn run_pipeline(").expect("run_pipeline");
+        let body = &src[start..];
+        let pos = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("{needle} in run_pipeline"))
+        };
+        assert!(pos("input.credential.take()") < pos("bearer(&headers)"));
+        assert!(pos("input.body.take()") < pos("read_body(body)"));
+        pos("input.reserve(");
+        pos("input.surface");
+    }
+
+    #[test]
+    fn the_tools_length_is_counted_not_built() {
+        let tools = serde_json::json!([{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]);
+        assert_eq!(serialized_len(&tools), tools.to_string().len());
+    }
+}
+
+#[cfg(test)]
+mod answer_tests {
+    use super::*;
+
+    /// Every answer after admission carries the same header set, whatever
+    /// exit built it: the request id, the queue wait, no proxy buffering,
+    /// and the boons and compression when boons applied.
+    #[tokio::test]
+    async fn an_answer_carries_the_whole_header_set() {
+        let request_id = Uuid::new_v4();
+        let plain = Answer {
+            request_id,
+            queue_wait_ms: 7,
+            boons_applied: &[],
+            compression: Some("1000->500"),
+        };
+        let resp = plain.respond(
+            StatusCode::OK,
+            header::HeaderValue::from_static("application/json"),
+            Body::from("{}"),
+        );
+        let h = resp.headers();
+        assert_eq!(h["x-obleth-request-id"], request_id.to_string().as_str());
+        assert_eq!(h[QUEUE_WAIT_HEADER], "7");
+        assert_eq!(h[NO_BUFFER_HEADER.0], NO_BUFFER_HEADER.1);
+        assert_eq!(h[header::CONTENT_TYPE], "application/json");
+        assert!(h.get(crate::boons::BOONS_HEADER).is_none());
+        assert!(
+            h.get(crate::boons::COMPRESSION_HEADER).is_none(),
+            "no boons, no compression header"
+        );
+
+        let with_boons = Answer {
+            boons_applied: &["compression", "knowledge"],
+            ..plain
+        };
+        let resp = with_boons.respond(
+            StatusCode::BAD_GATEWAY,
+            content_type_header("text/event-stream"),
+            Body::empty(),
+        );
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let h = resp.headers();
+        assert_eq!(h[crate::boons::BOONS_HEADER], "compression,knowledge");
+        assert_eq!(h[crate::boons::COMPRESSION_HEADER], "1000->500");
+        assert_eq!(h[header::CONTENT_TYPE], "text/event-stream");
+        assert_eq!(content_type_header("not a header\n"), "application/json");
     }
 }

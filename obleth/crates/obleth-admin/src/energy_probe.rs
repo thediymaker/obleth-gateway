@@ -94,7 +94,7 @@ async fn query_json(
     let resp = http
         .get(&url)
         .query(&[("query", expr)])
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(crate::ssrf::ADMIN_OUTBOUND_TIMEOUT)
         .send()
         .await
         .map_err(|e| format!("prometheus request failed: {e}"))?;

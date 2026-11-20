@@ -98,7 +98,7 @@ describe("bootstrapAdmin (real auth configuration)", { timeout: 30_000 }, () => 
       emailVerified: true,
       role: "admin",
       status: "pending",
-    });
+    }, { method: "admin" });
     process.env.DASHBOARD_ADMIN_EMAIL = EMAIL;
     process.env.DASHBOARD_PASSWORD = PASSWORD;
     await bootstrapAdmin();
@@ -122,7 +122,7 @@ describe("bootstrapAdmin (real auth configuration)", { timeout: 30_000 }, () => 
     const store = emptyStore();
     const auth = realAuth(store);
     const ctx = await auth.$context;
-    await ctx.internalAdapter.createUser({ email: EMAIL, name: EMAIL, emailVerified: true, role: "user", status: "active" });
+    await ctx.internalAdapter.createUser({ email: EMAIL, name: EMAIL, emailVerified: true, role: "user", status: "active" }, { method: "admin" });
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
     process.env.DASHBOARD_ADMIN_EMAIL = EMAIL;
     process.env.DASHBOARD_PASSWORD = PASSWORD;

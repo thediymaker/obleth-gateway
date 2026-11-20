@@ -107,7 +107,10 @@ obleth:
   # blockPrivateNetworks is true — then list trusted ranges, e.g. "10.0.0.0/8".
   allowedPrivateCidrs: ""
   upstreamBaseUrl: ""   # empty -> defaults to the in-chart benchmark fixture backend
-  # OTLP/HTTP trace export endpoint (e.g. http://my-collector:4318). Empty disables.
+  # OTLP/HTTP trace export endpoint (e.g. http://my-collector:4318, the HTTP
+  # port, not gRPC 4317). http:// only: the exporter is built without TLS, so
+  # put a collector beside the gateway and let it forward over TLS. Empty
+  # disables.
   otelEndpoint: ""
   # Slack incoming-webhook alerts. Keep the webhook URL in an external Secret
   # for production chart values.
@@ -154,6 +157,11 @@ obleth:
   # Seconds between re-pushes of keys/models/MCP servers from Postgres into
   # Redis (also runs after every Redis reconnect). 0 disables the timer.
   redisRewarmSecs: 300
+  # How long (seconds) a new connection to a model server may take. A host
+  # that drops packets would otherwise hold the request, and its fairshare
+  # slot, for the kernel's connect give-up (about two minutes) before the
+  # next endpoint is tried. "0" disables.
+  upstreamConnectTimeoutSecs: "5"
   # Longest wait for an upstream to return response headers before the
   # attempt fails (the body is bounded by upstreamReadTimeoutSecs below).
   upstreamTimeoutSecs: 300
@@ -189,13 +197,25 @@ obleth:
   # request waits. It names no other tenant or key. false makes the path
   # answer 404.
   loadEndpoint: true
-  # The OpenAI Files and Batches APIs (/v1/files, /v1/batches). Batch
-  # requests run through the gateway at background priority: only while a
-  # model has no interactive request waiting, and in at most `maxShare` of
-  # its slots, so interactive callers always find the rest free. Keys with
-  # background priority use the same `maxShare`, even with batches off.
+  # One S3 or S3-compatible bucket for the bytes the gateway keeps outside
+  # Postgres. Each feature uses its own key prefix in it (batches use
+  # `batches/`). Features that need it, batches today, are off while this is.
+  objectStorage:
+    enabled: false
+    # The store's URL, e.g. https://s3.example.edu:9021; empty for AWS S3
+    # itself (then `region` picks it).
+    endpoint: ""
+    bucket: ""
+    region: ""
+    # A Secret with OBLETH_S3_ACCESS_KEY_ID and OBLETH_S3_SECRET_ACCESS_KEY.
+    existingSecret: ""
+  # The OpenAI Files and Batches APIs (/v1/files, /v1/batches); on when
+  # `objectStorage` is. Batch requests run through the gateway at background
+  # priority: only while a model has no interactive request waiting, and in
+  # at most `maxShare` of its slots, so interactive callers always find the
+  # rest free. Keys with background priority use the same `maxShare`, even
+  # with batches off.
   batches:
-    enabled: true
     maxShare: "0.75"
     maxLines: 50000
     maxFileBytes: 209715200
@@ -206,7 +226,10 @@ obleth:
     # Batch requests each replica keeps in flight (running or waiting for a
     # slot).
     runnerConcurrency: 64
-    retentionDays: 30
+    # How long a batch and its answers are kept after it ends (<n>h or <n>d);
+    # also how long an uploaded file waits for a batch. An input file is
+    # deleted as soon as its batch ends.
+    retention: 24h
     # `key`: files and batches are private to the key that created them;
     # `tenant`: shared by every key of the tenant.
     scope: key
@@ -434,6 +457,17 @@ clickhouse:
   # gateway they outgrow the usage ledger many times over. Each system log
   # table drops days older than this, and text_log keeps warnings and errors.
   systemLogRetentionDays: 7
+  # ClickHouse's per-second snapshot of its own counters (system.metric_log,
+  # about 1,000 columns). Nothing in Obleth reads it, and merging it costs
+  # about 4 GiB of memory per merge on this image, so it is off. Turn it on
+  # only while diagnosing ClickHouse itself; the chart then merges it column
+  # by column so the cost stays small.
+  metricLog: false
+  # The server caps its own memory at this fraction of the container limit
+  # (the image default is 0.9). The rest is headroom for memory ClickHouse
+  # does not track, so an oversized merge fails inside ClickHouse with
+  # MEMORY_LIMIT_EXCEEDED instead of the kernel killing the pod.
+  memoryRatio: 0.75
   # Server log level (none, fatal, critical, error, warning, notice,
   # information, debug, trace).
   logLevel: information
@@ -445,7 +479,9 @@ clickhouse:
     storageClass: ""
     accessMode: ReadWriteOnce
   external:
-    # e.g. http://my-clickhouse-host:8123
+    # e.g. http://my-clickhouse-host:8123, or https://my-clickhouse-host:8443
+    # when the server's certificate chains to a public root (the Mozilla
+    # bundle built into the gateway); a private CA is not trusted.
     url: ""
 
 benchmarkBackend:

@@ -196,6 +196,32 @@ fn plain_decimal(value: f64) -> String {
 
 /// Validate the request against the MVP limits. The returned string becomes
 /// the message of an OpenAI-style 400 error body.
+/// The request-log fields of a verdicts body: the conversation and end-user
+/// readers take a JSON value, and this is the one they get, instead of a
+/// second tree of the whole request.
+#[derive(Deserialize, Default)]
+pub(crate) struct Envelope {
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub prompt_cache_key: Option<String>,
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
+}
+
+impl Envelope {
+    pub(crate) fn into_value(self) -> serde_json::Value {
+        serde_json::json!({
+            "session_id": self.session_id,
+            "prompt_cache_key": self.prompt_cache_key,
+            "user": self.user,
+            "metadata": self.metadata,
+        })
+    }
+}
+
 pub(crate) fn validate(req: &VerdictsRequest) -> Result<(), String> {
     match &req.state {
         serde_json::Value::String(_)

@@ -38,6 +38,11 @@ jobs:
     env:
       OBLETH_TEST_DATABASE_URL: postgres://obleth:obleth@localhost:5432/obleth_test
       OBLETH_TEST_REDIS_URL: redis://localhost:6379
+      # The object store tests' bucket (SeaweedFS, started below).
+      OBLETH_TEST_S3_BUCKET: obleth-test
+      OBLETH_TEST_S3_ENDPOINT: http://127.0.0.1:8333
+      OBLETH_TEST_S3_ACCESS_KEY_ID: obleth-test
+      OBLETH_TEST_S3_SECRET_ACCESS_KEY: obleth-test-secret
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
@@ -53,6 +58,15 @@ jobs:
       - name: clippy
         working-directory: obleth
         run: cargo clippy --workspace --all-targets
+      - name: object store for the batch tests
+        run: |
+          printf '%s' '{"identities":[{"name":"ci","credentials":[{"accessKey":"obleth-test","secretKey":"obleth-test-secret"}],"actions":["Admin","Read","Write","List"]}]}' > "$RUNNER_TEMP/s3.json"
+          docker run -d --name s3 -p 8333:8333 -v "$RUNNER_TEMP/s3.json:/etc/s3.json:ro" \
+            chrislusf/seaweedfs:4.54 server -s3 -s3.config=/etc/s3.json -dir=/data \
+            -volume.max=100 -master.volumeSizeLimitMB=64
+          for i in $(seq 1 60); do curl -s -o /dev/null http://127.0.0.1:8333/ && break; sleep 1; done
+          curl -sf -X PUT --aws-sigv4 "aws:amz:us-east-1:s3" \
+            --user obleth-test:obleth-test-secret http://127.0.0.1:8333/obleth-test
       - name: test
         working-directory: obleth
         run: cargo test --workspace

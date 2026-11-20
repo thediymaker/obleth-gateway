@@ -12,7 +12,7 @@
 use serde_json::Value;
 
 /// Estimated cost of a request, in tokens.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CostEstimate {
     pub input_tokens: u32,
     pub estimated_output_tokens: u32,

@@ -1,6 +1,6 @@
 import type { TenantOverviewData } from "@/lib/access-model";
 import { fillDays } from "@/lib/access-model";
-import { obleth, type UsageAgg, type UsageDailyRow } from "@/lib/obleth";
+import { type AuditEntry, obleth, type UsageAgg, type UsageDailyRow } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
 
 const DAY_MS = 86_400_000;
@@ -14,17 +14,19 @@ export async function loadTenantOverview(id: string, now = Date.now()): Promise<
   const start = isoDay(now - 29 * DAY_MS);
   const end = isoDay(now);
   const [today, both, histogram, facets, days, models, keys, audit] = await Promise.all([
-    safe(obleth.usage(now - DAY_MS), [] as UsageAgg[]),
-    safe(obleth.usage(now - 2 * DAY_MS).then((u) => u as UsageAgg[] | null), null),
+    safe(obleth.usage({ sinceMs: now - DAY_MS, tenantId: id }), [] as UsageAgg[]),
+    safe(obleth.usage({ sinceMs: now - 2 * DAY_MS, tenantId: id }).then((u) => u as UsageAgg[] | null), null),
     safe(obleth.usageLogHistogram({ tenantId: id, sinceMs: now - DAY_MS, bucketMs: 3_600_000 }), null),
     safe(obleth.usageLogFacets({ tenantId: id, status: "error", sinceMs: now - DAY_MS }), null),
     safe(obleth.usageDaily({ startDay: start, endDay: end, groupBy: "day", tenantId: id }), [] as UsageDailyRow[]),
     safe(obleth.usageDaily({ startDay: start, endDay: end, groupBy: "model", tenantId: id }), [] as UsageDailyRow[]),
     safe(obleth.usageKeysSummary({ tenantId: id, sinceMs: now - 30 * DAY_MS, limit: 500 }), []),
-    safe(obleth.audit(500), []),
+    safe(obleth.auditQuery({ entityType: "tenant", entityId: id, limit: 10 }), [] as AuditEntry[]),
   ]);
-  const mine = today.find((u) => u.tenant_id === id);
-  const total = both?.find((u) => u.tenant_id === id);
+  // Scoped reads: one row (or none) each, and the audit log answers from its
+  // entity index however long ago this tenant last changed.
+  const mine = today[0];
+  const total = both?.[0];
   const requests24h = Number(mine?.requests ?? 0);
   return {
     now,
@@ -43,9 +45,6 @@ export async function loadTenantOverview(id: string, now = Date.now()): Promise<
     tokens30d: days.reduce((n, d) => n + Number(d.total_tokens), 0),
     inputTokens30d: days.reduce((n, d) => n + Number(d.input_tokens), 0),
     keys,
-    audit: audit
-      .filter((e) => e.entity_type === "tenant" && e.entity_id === id)
-      .slice(0, 10)
-      .map((e) => ({ ts: e.ts, actor: e.actor, action: e.action, detail: e.detail })),
+    audit: audit.map((e) => ({ ts: e.ts, actor: e.actor, action: e.action, detail: e.detail })),
   };
 }

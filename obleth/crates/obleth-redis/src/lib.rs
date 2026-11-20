@@ -440,6 +440,32 @@ impl RedisStore {
         Ok(())
     }
 
+    /// [`compress_put`](Self::compress_put) for several originals in one round
+    /// trip: a pipeline of `SET ... EX`. Nothing is written for an empty set or
+    /// a `ttl_secs` of 0.
+    pub async fn compress_put_many(
+        &self,
+        tenant: &Uuid,
+        originals: &[(String, String)],
+        ttl_secs: u64,
+    ) -> Result<()> {
+        if ttl_secs == 0 || originals.is_empty() {
+            return Ok(());
+        }
+        let mut pipe = redis::pipe();
+        for (hash, content) in originals {
+            pipe.cmd("SET")
+                .arg(Self::compress_key(tenant, hash))
+                .arg(content)
+                .arg("EX")
+                .arg(ttl_secs)
+                .ignore();
+        }
+        let mut conn = self.conn.clone();
+        let _: () = pipe.query_async(&mut conn).await?;
+        Ok(())
+    }
+
     /// Fetch a tenant's stashed original by its content hash, or `None` when
     /// it has expired, was never stored, or belongs to another tenant.
     pub async fn compress_get(&self, tenant: &Uuid, hash: &str) -> Result<Option<String>> {
@@ -1292,6 +1318,26 @@ mod tests {
             store.compress_get(&tenant, &hash).await.unwrap().as_deref(),
             Some("the original content")
         );
+
+        // Several at once, in one round trip, each under its own hash and
+        // with the TTL; nothing for a TTL of 0.
+        let many: Vec<(String, String)> = (0..3)
+            .map(|n| (format!("{hash}-{n}"), format!("original {n}")))
+            .collect();
+        store.compress_put_many(&tenant, &many, 60).await.unwrap();
+        for (h, content) in &many {
+            assert_eq!(
+                store.compress_get(&tenant, h).await.unwrap().as_deref(),
+                Some(content.as_str())
+            );
+        }
+        let unkept = vec![(format!("{hash}-unkept"), "gone".to_owned())];
+        store.compress_put_many(&tenant, &unkept, 0).await.unwrap();
+        assert!(store
+            .compress_get(&tenant, &unkept[0].0)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.

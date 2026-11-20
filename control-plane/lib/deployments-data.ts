@@ -23,11 +23,11 @@ export async function loadDeployments(now = Date.now()): Promise<DeploymentsData
   const [models, specs, replicas, discovery, usage, slurm] = await Promise.all([
     // Uncached: right after a launch the redirect can land on a replica whose
     // cached list doesn't have the new model yet, and the page would 404.
-    safe(note("models", obleth.listModelsFresh()), [] as ModelRoute[]),
+    safe(note("models", obleth.listModels()), [] as ModelRoute[]),
     safe(note("specs", obleth.listManagedModels()), [] as ManagedModelSpec[]),
     safe(note("replicas", obleth.listAllReplicas()), [] as ModelReplica[]),
     safe<CapacityDiscoveryView | null>(obleth.capacityDiscovery(), null),
-    safe(obleth.usageByModel(now - 86_400_000), []),
+    safe(obleth.usageByModel({ sinceMs: now - 86_400_000 }), []),
     safe<SlurmSettingsView | null>(note("slurm", obleth.getSlurmSettings()), null),
   ]);
   return {

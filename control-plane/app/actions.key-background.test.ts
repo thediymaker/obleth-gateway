@@ -14,7 +14,7 @@ function mockObleth(extra: Record<string, unknown> = {}) {
       tenantId: null,
     }),
   }));
-  vi.doMock("next/cache", () => ({ revalidatePath: vi.fn(), updateTag: vi.fn() }));
+  vi.doMock("next/cache", () => ({ revalidatePath: vi.fn() }));
   const obleth = {
     setKeyBackground: vi.fn().mockResolvedValue(undefined),
     setKeyEndUserFairshare: vi.fn().mockResolvedValue(undefined),
@@ -23,7 +23,6 @@ function mockObleth(extra: Record<string, unknown> = {}) {
   };
   vi.doMock("@/lib/obleth", () => ({
     obleth,
-    CACHE_TAGS: new Proxy({}, { get: () => "tag" }),
     OblethApiError: class OblethApiError extends Error {},
   }));
   return obleth;

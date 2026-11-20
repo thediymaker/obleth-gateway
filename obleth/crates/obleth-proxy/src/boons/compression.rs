@@ -266,6 +266,10 @@ pub(super) struct LossyStats {
     pub refs_created: u32,
     pub tokens_before: u32,
     pub tokens_after: u32,
+    /// How the sidecar call ended, when one was made; `None` means the
+    /// heuristic path alone (no sidecar, or nothing worth scoring).
+    pub scorer: Option<super::compressor::ScoreOutcome>,
+    pub score_ms: u64,
 }
 
 /// Lossy semantic compression: deterministically compacts long Prose segments
@@ -273,48 +277,81 @@ pub(super) struct LossyStats {
 /// AND array-parts text, across all messages except a trailing assistant message.
 /// Stashes each original in Redis for reversibility (best-effort; never fails the
 /// request on Redis error). Only replaces on strict token reduction. Fail-open.
+/// The segments a pass may rewrite: every text at or over `min_tokens` as
+/// `(message index, part index, text)`, in request order, leaving out the
+/// active turn. The active turn is the latest user message, which is what the
+/// model is answering, and a trailing assistant message, which it is
+/// continuing; compacting either changes the question itself.
+fn segment_targets(
+    tk: &HeuristicTokenizer,
+    json: &Value,
+    min_tokens: u32,
+) -> Vec<(usize, Option<usize>, String)> {
+    let Some(messages) = json.get("messages").and_then(|m| m.as_array()) else {
+        return Vec::new();
+    };
+    let role = |i: usize| messages[i].get("role").and_then(|r| r.as_str());
+    let latest_user = (0..messages.len()).rev().find(|&i| role(i) == Some("user"));
+    let trailing_assistant = messages
+        .len()
+        .checked_sub(1)
+        .filter(|&last| role(last) == Some("assistant"));
+    let mut out = Vec::new();
+    for (mi, msg) in messages.iter().enumerate() {
+        if Some(mi) == latest_user || Some(mi) == trailing_assistant {
+            continue;
+        }
+        match msg.get("content") {
+            Some(Value::String(s)) if tk.count_text(s) >= min_tokens => {
+                out.push((mi, None, s.clone()));
+            }
+            Some(Value::Array(parts)) => {
+                for (pi, part) in parts.iter().enumerate() {
+                    if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                        if tk.count_text(t) >= min_tokens {
+                            out.push((mi, Some(pi), t.to_string()));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Stash the originals a pass replaced, in one round trip, for
+/// `retrieve_original`. Best effort: a Redis failure never fails the request.
+async fn stash_originals(
+    state: &AppState,
+    cfg: &CompressionBoonSettings,
+    key: &ResolvedKey,
+    originals: &[(String, String)],
+) {
+    if let Err(e) = state
+        .redis
+        .compress_put_many(&key.tenant_id, originals, cfg.original_ttl_secs)
+        .await
+    {
+        tracing::debug!(error = %e, "could not stash compressed originals");
+    }
+}
+
+/// `reversible` says whether the model can call `retrieve_original` on this
+/// request (function calling and the tool loop both on): only then are the
+/// originals stashed and the markers mention the tool.
 pub(super) async fn apply_lossy(
     state: &AppState,
     cfg: &CompressionBoonSettings,
     key: &ResolvedKey,
-    _session_id: &str,
+    reversible: bool,
     json: &mut Value,
 ) -> LossyStats {
     let mut stats = LossyStats::default();
     let tk = HeuristicTokenizer::new();
     let query_terms = latest_user_query_terms(json);
 
-    // Collect (message_index, Option<part_index>, original_text) for eligible segments.
-    let targets: Vec<(usize, Option<usize>, String)> = {
-        let Some(messages) = json.get("messages").and_then(|m| m.as_array()) else {
-            return stats;
-        };
-        let n = messages.len();
-        let skip_last_assistant =
-            n > 0 && messages[n - 1].get("role").and_then(|r| r.as_str()) == Some("assistant");
-        let mut out = Vec::new();
-        for (mi, msg) in messages.iter().enumerate() {
-            if skip_last_assistant && mi + 1 == n {
-                continue;
-            }
-            match msg.get("content") {
-                Some(Value::String(s)) if tk.count_text(s) >= cfg.min_tokens => {
-                    out.push((mi, None, s.clone()));
-                }
-                Some(Value::Array(parts)) => {
-                    for (pi, part) in parts.iter().enumerate() {
-                        if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
-                            if tk.count_text(t) >= cfg.min_tokens {
-                                out.push((mi, Some(pi), t.to_string()));
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        out
-    };
+    let targets = segment_targets(&tk, json, cfg.min_tokens);
 
     // Largest segments first: the loop below stops after `max_lossy_segments`
     // compactions, so this is the order in which segments can be used, and it
@@ -328,16 +365,14 @@ pub(super) async fn apply_lossy(
     let neural_scores: Vec<Option<Vec<f32>>> = {
         let (prose_indices, batches) = scoring_batches(&targets, cfg.max_lossy_segments);
         // No references to `targets` are held past this point.
-        let flat: Option<Vec<Vec<f32>>> = if let Some(kc) = state.compressor.as_ref() {
-            if !prose_indices.is_empty() {
-                kc.score(&state.http, &batches)
-                    .await
-                    .filter(|v| v.len() == prose_indices.len())
-            } else {
-                None
+        let flat: Option<Vec<Vec<f32>>> = match state.compressor.as_ref() {
+            Some(kc) if !prose_indices.is_empty() => {
+                let scored = kc.score(&state.http, &batches).await;
+                stats.scorer = Some(scored.outcome);
+                stats.score_ms = scored.elapsed.as_millis() as u64;
+                scored.scores.filter(|v| v.len() == prose_indices.len())
             }
-        } else {
-            None
+            _ => None,
         };
         let mut scores: Vec<Option<Vec<f32>>> = vec![None; n_targets];
         if let Some(s) = flat {
@@ -348,6 +383,7 @@ pub(super) async fn apply_lossy(
         scores
     };
 
+    let mut stash: Vec<(String, String)> = Vec::new();
     for (idx, (mi, pi, original)) in targets.into_iter().enumerate() {
         if stats.segments >= cfg.max_lossy_segments {
             break;
@@ -379,16 +415,15 @@ pub(super) async fn apply_lossy(
         if after >= before {
             continue; // no token gain — skip before any Redis write
         }
-        // Best-effort stash for the retrieve_original bonus; never fail on Redis error.
-        let _ = state
-            .redis
-            .compress_put(&key.tenant_id, &hash, &original, cfg.original_ttl_secs)
-            .await;
         if set_segment_text(json, mi, pi, marker) {
             stats.refs_created += 1;
             stats.tokens_before = stats.tokens_before.saturating_add(before);
             stats.tokens_after = stats.tokens_after.saturating_add(after);
+            stash.push((hash, original));
         }
+    }
+    if reversible {
+        stash_originals(state, cfg, key, &stash).await;
     }
     stats
 }
@@ -497,9 +532,16 @@ fn set_segment_text(json: &mut Value, mi: usize, pi: Option<usize>, text: String
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Marker substituted for a duplicate occurrence of a block already present
-/// earlier in the request. The original is retrievable via `retrieve_original`.
-fn dedup_marker(hash: &str) -> String {
-    format!("[ref:{hash}] (identical to earlier content; call retrieve_original for the full text)")
+/// earlier in the request. When the request is reversible the marker says how
+/// to get the original back; otherwise it names no tool the model cannot call.
+fn dedup_marker(hash: &str, reversible: bool) -> String {
+    if reversible {
+        format!(
+            "[ref:{hash}] (identical to earlier content; call retrieve_original for the full text)"
+        )
+    } else {
+        format!("[ref:{hash}] (duplicate of earlier content omitted)")
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -522,17 +564,12 @@ pub(super) async fn apply_dedup(
     state: &AppState,
     cfg: &CompressionBoonSettings,
     key: &ResolvedKey,
-    _session_id: &str,
+    reversible: bool,
     json: &mut Value,
 ) -> DedupStats {
-    let (stats, stash) = dedup_rewrite(cfg, json);
-    // Best-effort stash of each replaced original for `retrieve_original`; never
-    // fail the request on a Redis error.
-    for (hash, original) in stash {
-        let _ = state
-            .redis
-            .compress_put(&key.tenant_id, &hash, &original, cfg.original_ttl_secs)
-            .await;
+    let (stats, stash) = dedup_rewrite(cfg, reversible, json);
+    if reversible {
+        stash_originals(state, cfg, key, &stash).await;
     }
     stats
 }
@@ -544,41 +581,13 @@ pub(super) async fn apply_dedup(
 /// block is kept verbatim; a trailing assistant message (active turn) is skipped.
 pub(super) fn dedup_rewrite(
     cfg: &CompressionBoonSettings,
+    reversible: bool,
     json: &mut Value,
 ) -> (DedupStats, Vec<(String, String)>) {
     let mut stats = DedupStats::default();
     let mut stash: Vec<(String, String)> = Vec::new();
     let tk = HeuristicTokenizer::new();
-    let targets: Vec<(usize, Option<usize>, String)> = {
-        let Some(messages) = json.get("messages").and_then(|m| m.as_array()) else {
-            return (stats, stash);
-        };
-        let n = messages.len();
-        let skip_last_assistant =
-            n > 0 && messages[n - 1].get("role").and_then(|r| r.as_str()) == Some("assistant");
-        let mut out = Vec::new();
-        for (mi, msg) in messages.iter().enumerate() {
-            if skip_last_assistant && mi + 1 == n {
-                continue;
-            }
-            match msg.get("content") {
-                Some(Value::String(s)) if tk.count_text(s) >= cfg.min_tokens => {
-                    out.push((mi, None, s.clone()));
-                }
-                Some(Value::Array(parts)) => {
-                    for (pi, part) in parts.iter().enumerate() {
-                        if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
-                            if tk.count_text(t) >= cfg.min_tokens {
-                                out.push((mi, Some(pi), t.to_string()));
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        out
-    };
+    let targets = segment_targets(&tk, json, cfg.min_tokens);
     // First occurrence of each distinct text is kept; later ones are replaced.
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let dups: Vec<(usize, Option<usize>, String)> = targets
@@ -593,7 +602,7 @@ pub(super) fn dedup_rewrite(
         }
         let before = tk.count_text(&content);
         let hash = obleth_config::content_hash(&content);
-        let marker = dedup_marker(&hash);
+        let marker = dedup_marker(&hash, reversible);
         let after = tk.count_text(&marker);
         if after >= before {
             continue;
@@ -631,15 +640,12 @@ pub(super) async fn apply_log_compaction(
     state: &AppState,
     cfg: &CompressionBoonSettings,
     key: &ResolvedKey,
-    _session_id: &str,
+    reversible: bool,
     json: &mut Value,
 ) -> LogStats {
     let (stats, stash) = log_rewrite(cfg, json);
-    for (hash, original) in stash {
-        let _ = state
-            .redis
-            .compress_put(&key.tenant_id, &hash, &original, cfg.original_ttl_secs)
-            .await;
+    if reversible {
+        stash_originals(state, cfg, key, &stash).await;
     }
     stats
 }
@@ -656,36 +662,7 @@ pub(super) fn log_rewrite(
     let mut stash: Vec<(String, String)> = Vec::new();
     let tk = HeuristicTokenizer::new();
 
-    let targets: Vec<(usize, Option<usize>, String)> = {
-        let Some(messages) = json.get("messages").and_then(|m| m.as_array()) else {
-            return (stats, stash);
-        };
-        let n = messages.len();
-        let skip_last_assistant =
-            n > 0 && messages[n - 1].get("role").and_then(|r| r.as_str()) == Some("assistant");
-        let mut out = Vec::new();
-        for (mi, msg) in messages.iter().enumerate() {
-            if skip_last_assistant && mi + 1 == n {
-                continue;
-            }
-            match msg.get("content") {
-                Some(Value::String(s)) if tk.count_text(s) >= cfg.min_tokens => {
-                    out.push((mi, None, s.clone()));
-                }
-                Some(Value::Array(parts)) => {
-                    for (pi, part) in parts.iter().enumerate() {
-                        if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
-                            if tk.count_text(t) >= cfg.min_tokens {
-                                out.push((mi, Some(pi), t.to_string()));
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        out
-    };
+    let targets = segment_targets(&tk, json, cfg.min_tokens);
 
     for (mi, pi, original) in targets {
         if stats.refs_created >= cfg.max_lossy_segments {
@@ -1056,7 +1033,7 @@ mod tests {
 
     #[test]
     fn dedup_marker_carries_ref() {
-        let m = dedup_marker("cafef00d");
+        let m = dedup_marker("cafef00d", true);
         assert!(m.contains("[ref:cafef00d]"));
     }
 
@@ -1243,8 +1220,73 @@ mod tests {
         );
     }
 
+    /// EX-04: the active turn is never a target. The latest user message is the
+    /// question being answered and a trailing assistant message is being
+    /// continued; every earlier segment over the floor is.
     #[test]
-    fn apply_lossy_compacts_prose_in_latest_user_message() {
+    fn the_active_turn_is_never_compacted() {
+        let tk = HeuristicTokenizer::new();
+        let long = |what: &str| {
+            (0..40)
+                .map(|i| format!("{what} line {i} of pasted notes.\n"))
+                .collect::<String>()
+        };
+        let mut body = json!({
+            "messages": [
+                { "role": "user", "content": long("first") },
+                { "role": "assistant", "content": [{"type": "text", "text": long("reply")}] },
+                { "role": "user", "content": long("latest") }
+            ]
+        });
+        let targets: Vec<usize> = segment_targets(&tk, &body, 16)
+            .iter()
+            .map(|t| t.0)
+            .collect();
+        assert_eq!(targets, vec![0, 1], "the latest user message is left alone");
+        body["messages"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "role": "assistant", "content": long("draft") }));
+        let targets: Vec<usize> = segment_targets(&tk, &body, 16)
+            .iter()
+            .map(|t| t.0)
+            .collect();
+        assert_eq!(
+            targets,
+            vec![0, 1],
+            "a trailing assistant message is left alone too"
+        );
+        // The passes read targets through the collector, so a pasted duplicate in
+        // the latest message survives dedup.
+        let dup = long("same");
+        let mut body = json!({"messages": [
+            { "role": "user", "content": dup.clone() },
+            { "role": "assistant", "content": "ok" },
+            { "role": "user", "content": dup.clone() }
+        ]});
+        let cfg = obleth_config::CompressionBoonSettings {
+            enabled: true,
+            min_tokens: 16,
+            max_lossy_segments: 8,
+            ..Default::default()
+        };
+        let (stats, stash) = dedup_rewrite(&cfg, true, &mut body);
+        assert_eq!((stats.refs_created, stash.len()), (0, 0));
+        assert_eq!(body["messages"][2]["content"], dup);
+    }
+
+    #[test]
+    fn a_dedup_marker_names_the_tool_only_when_it_can_be_called() {
+        assert!(dedup_marker("abc", true).contains("retrieve_original"));
+        let plain = dedup_marker("abc", false);
+        assert!(
+            plain.starts_with("[ref:abc]") && !plain.contains("retrieve_original"),
+            "{plain}"
+        );
+    }
+
+    #[test]
+    fn extract_prose_shortens_pasted_notes_around_the_query_terms() {
         // Build a long prose user message (the latest turn) + a short follow-up question.
         let big: String = (0..60)
             .map(|i| format!("This is line number {i} of some pasted notes.\n"))

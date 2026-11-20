@@ -1,6 +1,5 @@
 import { createAuthClient } from "better-auth/react";
-import { genericOAuthClient } from "better-auth/client/plugins";
 
-export const authClient = createAuthClient({
-  plugins: [genericOAuthClient()],
-});
+// Configured OIDC providers (genericOAuth on the server) sign in through the
+// standard signIn.social; no client plugin is needed.
+export const authClient = createAuthClient();

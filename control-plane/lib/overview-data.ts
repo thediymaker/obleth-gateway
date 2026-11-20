@@ -44,8 +44,8 @@ export async function loadOverviewWindow(range: OverviewRange, now = Date.now())
     safe(fetchOverviewSummary(since), EMPTY_OVERVIEW_SUMMARY),
     safe(fetchOverviewSummary(twoWindows).then((s) => s as OverviewSummary | null), null),
     safe(obleth.usageSeries(RANGE_BUCKET_MS[range], twoWindows), []),
-    safe(obleth.usageByModel(since), []),
-    safe(obleth.usage(since), []),
+    safe(obleth.usageByModel({ sinceMs: since }), []),
+    safe(obleth.usage({ sinceMs: since }), []),
     safe(obleth.listTenants(), []),
     safe(obleth.cacheStats(since).then((c) => c as CacheStats | null), null),
   ]);

@@ -40,7 +40,10 @@ services:
     restart: unless-stopped
     # AUTH is always on: the request path reads API keys from Redis, so an
     # unauthenticated instance would let anyone who reaches it mint keys.
-    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?set REDIS_PASSWORD in deploy/docker/.env (copy from .env.example)}"]
+    # Same ceiling and eviction as the chart: TTL entries (response cache,
+    # compression originals, rate-limit windows) are evicted at the ceiling;
+    # keys and routes have no TTL and never are.
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?set REDIS_PASSWORD in deploy/docker/.env (copy from .env.example)}", "--maxmemory", "${REDIS_MAXMEMORY:-400mb}", "--maxmemory-policy", "volatile-lru"]
     environment:
       REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in deploy/docker/.env}
     ports: ["127.0.0.1:6379:6379"]
@@ -123,13 +126,20 @@ services:
       OBLETH_SESSION_ID_DERIVATION: ${OBLETH_SESSION_ID_DERIVATION:-true}
       # GET /v1/load: each model's live load for callers. false answers 404.
       OBLETH_LOAD_ENDPOINT: ${OBLETH_LOAD_ENDPOINT:-true}
-      # The OpenAI Files and Batches APIs, run at background priority.
-      OBLETH_BATCHES: ${OBLETH_BATCHES:-true}
+      # Object storage: an S3 or S3-compatible bucket; empty = off. The Files
+      # and Batches APIs (background priority) are on while it is.
+      OBLETH_S3_BUCKET: ${OBLETH_S3_BUCKET:-}
+      OBLETH_S3_ENDPOINT: ${OBLETH_S3_ENDPOINT:-}
+      OBLETH_S3_REGION: ${OBLETH_S3_REGION:-}
+      OBLETH_S3_ACCESS_KEY_ID: ${OBLETH_S3_ACCESS_KEY_ID:-}
+      OBLETH_S3_SECRET_ACCESS_KEY: ${OBLETH_S3_SECRET_ACCESS_KEY:-}
+      OBLETH_BATCH_RETENTION: ${OBLETH_BATCH_RETENTION:-24h}
       OBLETH_BATCH_MAX_SHARE: ${OBLETH_BATCH_MAX_SHARE:-0.75}
       # Boot-time seed only; the dashboard's routing settings win once saved.
       OBLETH_AUTO_CLASSIFIER_ENABLED: ${OBLETH_AUTO_CLASSIFIER_ENABLED:-false}
       OBLETH_AUTO_CLASSIFIER_MODEL: ${OBLETH_AUTO_CLASSIFIER_MODEL:-}
       OBLETH_AUTO_CLASSIFIER_TIMEOUT_MS: ${OBLETH_AUTO_CLASSIFIER_TIMEOUT_MS:-250}
+      OBLETH_UPSTREAM_CONNECT_TIMEOUT_SECS: ${OBLETH_UPSTREAM_CONNECT_TIMEOUT_SECS:-5}
       # Empty = the upstream request timeout (OBLETH_UPSTREAM_TIMEOUT_SECS).
       OBLETH_UPSTREAM_READ_TIMEOUT_SECS: ${OBLETH_UPSTREAM_READ_TIMEOUT_SECS:-}
       # Keep below stop_grace_period (below) minus the telemetry flush.
@@ -234,13 +244,9 @@ services:
   # absent or unreachable, so obleth must NOT depend on this service.
   compressor:
     profiles: ["compressor"]
-    # Tagged separately from the other first-party images: the edge build
-    # (docker.yml) skips this component because baking the ONNX model is slow,
-    # so an edge tag like :dev exists for every image EXCEPT this one. Pinning
-    # it independently lets OBLETH_VERSION track edge without breaking the pull
-    # here. Release tags (vX.Y.Z, latest) cover all five components, so set
-    # OBLETH_COMPRESSOR_VERSION to match OBLETH_VERSION for release deploys.
-    image: ghcr.io/thediymaker/obleth-gateway/obleth-compressor:${OBLETH_COMPRESSOR_VERSION:-latest}
+    # Follows OBLETH_VERSION like every other first-party image (release and
+    # edge builds publish all five); OBLETH_COMPRESSOR_VERSION pins it apart.
+    image: ghcr.io/thediymaker/obleth-gateway/obleth-compressor:${OBLETH_COMPRESSOR_VERSION:-${OBLETH_VERSION:-latest}}
     build:
       context: ../..
       dockerfile: deploy/docker/obleth-compressor.Dockerfile
@@ -427,7 +433,7 @@ services:
     depends_on:
       redis: { condition: service_healthy }
 
-  # OTLP trace collector + UI. Set OBLETH_OTEL_ENDPOINT=http://jaeger:4317 (see
+  # OTLP trace collector + UI. Set OBLETH_OTEL_ENDPOINT=http://jaeger:4318 (see
   # .env.example) so obleth exports spans here. UI on http://localhost:16686.
   jaeger:
     profiles: ["observability"]

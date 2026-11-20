@@ -100,6 +100,7 @@ spec:
             - { name: OBLETH_SHUTDOWN_GRACE_SECS, value: {{ .Values.obleth.shutdownGraceSecs | quote }} }
             - { name: OBLETH_REDIS_REWARM_SECS, value: {{ .Values.obleth.redisRewarmSecs | quote }} }
             - { name: OBLETH_UPSTREAM_TIMEOUT_SECS, value: {{ .Values.obleth.upstreamTimeoutSecs | quote }} }
+            - { name: OBLETH_UPSTREAM_CONNECT_TIMEOUT_SECS, value: {{ .Values.obleth.upstreamConnectTimeoutSecs | default "5" | quote }} }
             - { name: OBLETH_UPSTREAM_READ_TIMEOUT_SECS, value: {{ .Values.obleth.upstreamReadTimeoutSecs | quote }} }
             - { name: OBLETH_REDIS_RESPONSE_TIMEOUT_MS, value: {{ .Values.obleth.redisResponseTimeoutMs | quote }} }
             - { name: OBLETH_REDIS_CONNECT_TIMEOUT_MS, value: {{ .Values.obleth.redisConnectTimeoutMs | quote }} }
@@ -107,7 +108,17 @@ spec:
             - { name: OBLETH_VIDEO_JOB_RETENTION_HOURS, value: {{ .Values.obleth.videoJobRetentionHours | quote }} }
             - { name: OBLETH_VIDEO_JOB_SCOPE, value: {{ .Values.obleth.videoJobScope | default "key" | quote }} }
             - { name: OBLETH_LOAD_ENDPOINT, value: {{ .Values.obleth.loadEndpoint | quote }} }
-            - { name: OBLETH_BATCHES, value: {{ .Values.obleth.batches.enabled | quote }} }
+            {{- with .Values.obleth.objectStorage }}
+            {{- if .enabled }}
+            - { name: OBLETH_S3_BUCKET, value: {{ required "obleth.objectStorage.bucket is required when objectStorage is enabled" .bucket | quote }} }
+            {{- with .endpoint }}
+            - { name: OBLETH_S3_ENDPOINT, value: {{ . | quote }} }
+            {{- end }}
+            {{- with .region }}
+            - { name: OBLETH_S3_REGION, value: {{ . | quote }} }
+            {{- end }}
+            {{- end }}
+            {{- end }}
             - { name: OBLETH_BATCH_MAX_SHARE, value: {{ .Values.obleth.batches.maxShare | quote }} }
             - { name: OBLETH_BATCH_MAX_LINES, value: {{ .Values.obleth.batches.maxLines | int64 | quote }} }
             - { name: OBLETH_BATCH_MAX_FILE_BYTES, value: {{ .Values.obleth.batches.maxFileBytes | int64 | quote }} }
@@ -115,7 +126,7 @@ spec:
             - { name: OBLETH_BATCH_WINDOW_MIN, value: {{ .Values.obleth.batches.windowMin | quote }} }
             - { name: OBLETH_BATCH_WINDOW_MAX, value: {{ .Values.obleth.batches.windowMax | quote }} }
             - { name: OBLETH_BATCH_RUNNER_CONCURRENCY, value: {{ .Values.obleth.batches.runnerConcurrency | int64 | quote }} }
-            - { name: OBLETH_BATCH_RETENTION_DAYS, value: {{ .Values.obleth.batches.retentionDays | int64 | quote }} }
+            - { name: OBLETH_BATCH_RETENTION, value: {{ .Values.obleth.batches.retention | default "24h" | quote }} }
             - { name: OBLETH_BATCH_SCOPE, value: {{ .Values.obleth.batches.scope | default "key" | quote }} }
             # Telemetry spill file used while ClickHouse is unreachable. Must be
             # writable by the non-root runtime user; backed by the wal volume.
@@ -127,6 +138,10 @@ spec:
           envFrom:
             - secretRef:
                 name: {{ include "obleth.secretName" . }}
+            {{- if .Values.obleth.objectStorage.enabled }}
+            - secretRef:
+                name: {{ required "obleth.objectStorage.existingSecret is required when objectStorage is enabled: a Secret with OBLETH_S3_ACCESS_KEY_ID and OBLETH_S3_SECRET_ACCESS_KEY" .Values.obleth.objectStorage.existingSecret }}
+            {{- end }}
           volumeMounts:
             - { name: wal, mountPath: /var/lib/obleth }
           # SIGTERM makes the gateway stop accepting at once, but endpoint

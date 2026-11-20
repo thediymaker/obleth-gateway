@@ -28,14 +28,15 @@ use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderValue, Request, Response, StatusCode};
 use axum::response::IntoResponse;
-use obleth_config::{routing::Candidate, Admission, ResolvedKey, ResolvedModel, SEARCH_MODEL_TYPE};
+use obleth_config::{routing::Candidate, ResolvedKey, ResolvedModel, SEARCH_MODEL_TYPE};
 use obleth_tokenizer::CostEstimate;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::proxy::{
     self, build_targets, effective_admission_weight, error_json, finalize, gate_resolved_key,
-    resolve_conversation, resolve_model, surfaced_request_type, RequestMeta,
+    reject, resolve_conversation, resolve_model, surfaced_request_type, FinalizeOutcome, Rejection,
+    RequestMeta,
 };
 use crate::state::AppState;
 
@@ -113,10 +114,13 @@ pub async fn tools(
         Ok((resolved, _)) => resolved,
         Err(resp) => return resp,
     };
-    let data: Vec<Value> = tool_names(&state.model_registry.load(), allowed_for(&resolved))
-        .into_iter()
-        .map(|name| json!({ "search_tool_name": name, "search_provider": "searxng" }))
-        .collect();
+    let data: Vec<Value> = tool_names(
+        &state.model_registry.load(),
+        crate::proxy::allowed_models_for(&resolved),
+    )
+    .into_iter()
+    .map(|name| json!({ "search_tool_name": name, "search_provider": "searxng" }))
+    .collect();
     (
         StatusCode::OK,
         axum::Json(json!({ "object": "list", "data": data })),
@@ -205,7 +209,7 @@ async fn handle(
     let meta = RequestMeta {
         session_id: conversation.value,
         session_id_source: conversation.source.as_str(),
-        request_type: surfaced_request_type(&resolved, SEARCH_PATH, &headers),
+        request_type: surfaced_request_type(&resolved, SEARCH_PATH, None),
         device_id,
         end_user: end_user.clone().unwrap_or_default(),
         model_variant: String::new(),
@@ -279,25 +283,19 @@ async fn handle(
             return error_json(StatusCode::SERVICE_UNAVAILABLE, "scheduler unavailable");
         }
         Err(_) => {
-            let elapsed = started.elapsed().as_millis() as u32;
-            finalize(
+            reject(
                 state,
                 request_id,
                 &resolved,
                 &meta,
                 &model,
-                Admission::Rejected,
-                est,
-                0,
-                0,
-                0,
-                elapsed,
-                0,
-                elapsed,
-                503,
-                "off",
-                0.0,
-                crate::energy::EnergyFigures::default(),
+                Rejection {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    since: started,
+                    est,
+                    cache_status: "off",
+                    queue_wait_ms: started.elapsed().as_millis() as u32,
+                },
             );
             let mut resp = error_json(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -330,28 +328,15 @@ async fn handle(
         &model,
         admitted.admission,
         est,
-        0,
-        0,
-        0,
-        queue_wait_ms,
-        0,
-        started.elapsed().as_millis() as u32,
-        resp.status().as_u16(),
-        "off",
-        0.0,
-        crate::energy::EnergyFigures::default(),
+        FinalizeOutcome {
+            queue_wait_ms,
+            total_ms: started.elapsed().as_millis() as u32,
+            status_code: resp.status().as_u16(),
+            cache_status: "off",
+            ..FinalizeOutcome::default()
+        },
     );
     resp
-}
-
-/// The model allowlist that bounds what a caller may search with, or `None`
-/// when it may use everything (internal callers, tenants without a list).
-fn allowed_for(resolved: &ResolvedKey) -> Option<&[String]> {
-    if resolved.internal {
-        None
-    } else {
-        resolved.allowed_models.as_deref()
-    }
 }
 
 /// The enabled search tools a caller may use, sorted. A retired tool is not
@@ -382,7 +367,10 @@ async fn pick_tool(
     let name = match name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()) {
         Some(name) => name,
         None => {
-            let names = tool_names(&state.model_registry.load(), allowed_for(resolved));
+            let names = tool_names(
+                &state.model_registry.load(),
+                crate::proxy::allowed_models_for(resolved),
+            );
             match <[String; 1]>::try_from(names) {
                 Ok([only]) => only,
                 Err(names) if names.is_empty() => {
@@ -425,13 +413,15 @@ async fn pick_tool(
         crate::lifecycle::Gate::Redirect(next, _) => next,
         crate::lifecycle::Gate::Refuse(resp, _) => return Err(resp),
     };
-    if let Some(allowed) = allowed_for(resolved) {
-        if !allowed.iter().any(|m| m == &route.model_name) {
-            return Err(error_json(
-                StatusCode::FORBIDDEN,
-                "model not permitted for tenant",
-            ));
-        }
+    if !crate::proxy::model_permitted(
+        resolved,
+        &route,
+        crate::proxy::variant_called(&route, &name),
+    ) {
+        return Err(error_json(
+            StatusCode::FORBIDDEN,
+            "model not permitted for tenant",
+        ));
     }
     Ok(route)
 }

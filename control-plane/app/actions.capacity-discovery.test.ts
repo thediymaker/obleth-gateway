@@ -14,7 +14,7 @@ async function discoveryAction(fd: FormData, reject?: Error) {
       tenantId: null,
     }),
   }));
-  vi.doMock("next/cache", () => ({ revalidatePath: vi.fn(), updateTag: vi.fn() }));
+  vi.doMock("next/cache", () => ({ revalidatePath: vi.fn() }));
   class OblethApiError extends Error {}
   const setModelCapacityMode = reject
     ? vi.fn().mockRejectedValue(new OblethApiError(reject.message))
@@ -25,8 +25,8 @@ async function discoveryAction(fd: FormData, reject?: Error) {
       setModelCapacityMode,
       setModelCapacity,
       listModels: vi.fn().mockResolvedValue([{ id: "m-1", model_name: "m", capacity_mode: "static", max_in_flight: null }]),
+      getModel: vi.fn().mockResolvedValue({ id: "m-1", model_name: "m", capacity_mode: "static", max_in_flight: null }),
     },
-    CACHE_TAGS: new Proxy({}, { get: () => "tag" }),
     OblethApiError,
   }));
   const { saveModelSettingsAction } = await import("./actions");

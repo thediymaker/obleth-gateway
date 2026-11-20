@@ -82,7 +82,13 @@ export function PortalKeys({
     });
   }
 
-  function handleDisable(key: ApiKey) {
+  async function handleDisable(key: ApiKey) {
+    const ok = await confirm({
+      title: "Turn off API key",
+      description: `Turn off "${key.name}"? Clients using this key stop working at once. Only an administrator can turn it back on.`,
+      confirmLabel: "Turn off",
+    });
+    if (!ok) return;
     setRowErrors((prev) => ({ ...prev, [key.id]: "" }));
     start(async () => {
       const fd = new FormData();

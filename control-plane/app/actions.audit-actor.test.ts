@@ -2,8 +2,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 afterEach(() => vi.resetModules());
 
 // actions.ts imports from:
-//   "next/cache"     -> revalidatePath, updateTag
-//   "@/lib/obleth"   -> CACHE_TAGS, obleth, OblethApiError
+//   "next/cache"     -> revalidatePath
+//   "@/lib/obleth"   -> obleth, OblethApiError
 //   "@/lib/auth/roles" -> requireAdmin
 //   "@/lib/sbatch-recipes" -> resolveRecipeById, buildManagedFromRecipe, parseRecipe
 
@@ -19,7 +19,6 @@ function mockAdmin() {
   }));
   vi.doMock("next/cache", () => ({
     revalidatePath: vi.fn(),
-    updateTag: vi.fn(),
   }));
 }
 
@@ -38,7 +37,6 @@ describe("admin actions attribute the acting user", () => {
         setTenantBudget: vi.fn().mockResolvedValue({}),
         setTenantAllowlist: vi.fn().mockResolvedValue({}),
       },
-      CACHE_TAGS: new Proxy({}, { get: () => "tag" }),
       OblethApiError: class OblethApiError extends Error {},
     }));
     const { createTenantAction } = await import("./actions");
@@ -56,7 +54,6 @@ describe("admin actions attribute the acting user", () => {
     const deleteModel = vi.fn().mockResolvedValue(undefined);
     vi.doMock("@/lib/obleth", () => ({
       obleth: { deleteModel },
-      CACHE_TAGS: new Proxy({}, { get: () => "tag" }),
       OblethApiError: class OblethApiError extends Error {},
     }));
     const { deleteModelAction } = await import("./actions");
@@ -71,7 +68,6 @@ describe("admin actions attribute the acting user", () => {
     const setBoonSettings = vi.fn().mockResolvedValue(undefined);
     vi.doMock("@/lib/obleth", () => ({
       obleth: { setBoonSettings },
-      CACHE_TAGS: new Proxy({}, { get: () => "tag" }),
       OblethApiError: class OblethApiError extends Error {},
     }));
     const { setBoonSettingsAction } = await import("./actions");

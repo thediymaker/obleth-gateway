@@ -1032,41 +1032,34 @@ mod tests {
     /// twice inside this initialiser, while every other test is still awaiting
     /// it and therefore issuing no DML at all. If the second run fails, init
     /// panics and the whole suite fails — a louder signal than one test failing.
-    static MIGRATED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
-
-    /// Requires a live Postgres; skipped when TEST_DATABASE_URL is unset so the
-    /// unit suite stays runnable without infrastructure.
-    async fn test_store() -> Option<crate::Store> {
-        let url = std::env::var("TEST_DATABASE_URL").ok()?;
-        let store = crate::Store::connect(&url).await.ok()?;
-        MIGRATED
-            .get_or_init(|| async {
-                store.migrate().await.expect("migrate test database");
-                // Every migration runs on every boot, so it must be re-runnable.
-                store
-                    .migrate()
-                    .await
-                    .expect("migrations must be re-runnable");
-            })
-            .await;
-        Some(store)
+    /// The integration store, with the suite-wide lock held for the test's
+    /// duration: these tests share the database with the main suite, which
+    /// serialises every DB test the same way. `None` (the test skips) only when
+    /// `OBLETH_TEST_DATABASE_URL` is unset outside CI; see `test_db_url`.
+    async fn test_store() -> Option<(crate::Store, tokio::sync::MutexGuard<'static, ()>)> {
+        let url = crate::test_support::test_db_url()?;
+        let guard = crate::test_support::serial().lock().await;
+        let store = crate::Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate test database");
+        Some((store, guard))
     }
 
+    /// Every migration runs on every boot, so it must be re-runnable: a second
+    /// `migrate()` on an already migrated database must be a no-op.
     #[tokio::test]
     async fn migrate_is_rerunnable() {
-        // The actual double-migration proof lives in `test_store`'s `MIGRATED`
-        // once-cell initializer above: it runs `migrate()` twice before any
-        // other test can issue DML, which is what used to deadlock when every
-        // test ran `migrate()` on its own. This is just a thin assertion that
-        // initialization (connect + migrate-twice) succeeded.
-        let Some(_store) = test_store().await else {
+        let Some((store, _serial)) = test_store().await else {
             return;
         };
+        store
+            .migrate()
+            .await
+            .expect("migrations must be re-runnable");
     }
 
     #[tokio::test]
     async fn create_and_get_collection() {
-        let Some(store) = test_store().await else {
+        let Some((store, _serial)) = test_store().await else {
             return;
         };
         let name = format!("policies-{}", uuid::Uuid::new_v4());
@@ -1090,7 +1083,7 @@ mod tests {
 
     #[tokio::test]
     async fn needs_reindex_when_embedder_differs() {
-        let Some(store) = test_store().await else {
+        let Some((store, _serial)) = test_store().await else {
             return;
         };
         let name = format!("catalog-{}", uuid::Uuid::new_v4());
@@ -1136,7 +1129,7 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_document_dedupes_by_content_hash() {
-        let Some(store) = test_store().await else {
+        let Some((store, _serial)) = test_store().await else {
             return;
         };
         let c = store
@@ -1177,7 +1170,7 @@ mod tests {
         // corrected filename/content type is a real recovery path distinct
         // from the "Reindex" action, and must actually requeue the document
         // rather than leaving it stuck `failed` while reporting success.
-        let Some(store) = test_store().await else {
+        let Some((store, _serial)) = test_store().await else {
             return;
         };
         let c = store
@@ -1221,7 +1214,7 @@ mod tests {
         // knowledge_chunks (document_id, generation, ordinal)` statement (or
         // skipping migration 0020) makes the second insert below succeed
         // instead of erroring, and this test fails.
-        let Some(store) = test_store().await else {
+        let Some((store, _serial)) = test_store().await else {
             return;
         };
         let c = store
@@ -1273,7 +1266,7 @@ mod tests {
 
     #[tokio::test]
     async fn indexing_a_second_document_preserves_the_first() {
-        let Some(store) = test_store().await else {
+        let Some((store, _serial)) = test_store().await else {
             return;
         };
         let c = store
@@ -1337,7 +1330,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_documents_own_reindex_replaces_only_its_chunks() {
-        let Some(store) = test_store().await else {
+        let Some((store, _serial)) = test_store().await else {
             return;
         };
         let c = store
@@ -1401,7 +1394,7 @@ mod tests {
         // document's existing chunks to its own incoming ones, refusing a
         // same-size re-index of a document that alone makes up a large share
         // of the cap even though the collection's real storage wouldn't grow.
-        let Some(store) = test_store().await else {
+        let Some((store, _serial)) = test_store().await else {
             return;
         };
         let c = store
@@ -1496,7 +1489,7 @@ mod tests {
 
     #[tokio::test]
     async fn flip_bumps_version_even_when_the_embedder_does_not_advance() {
-        let Some(store) = test_store().await else {
+        let Some((store, _serial)) = test_store().await else {
             return;
         };
         let c = store
@@ -1558,7 +1551,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_stranded_indexing_document_is_reclaimed_after_the_window() {
-        let Some(store) = test_store().await else {
+        let Some((store, _serial)) = test_store().await else {
             return;
         };
         let c = store
@@ -1633,7 +1626,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_is_atomic_so_a_document_is_never_ready_without_live_chunks() {
-        let Some(store) = test_store().await else {
+        let Some((store, _serial)) = test_store().await else {
             return;
         };
         let c = store
@@ -1713,7 +1706,7 @@ mod tests {
 
     #[tokio::test]
     async fn model_collections_roundtrip_and_replace() {
-        let Some(store) = test_store().await else {
+        let Some((store, _serial)) = test_store().await else {
             return;
         };
         let model_id = make_model(&store, &format!("model-{}", uuid::Uuid::new_v4())).await;
@@ -1753,7 +1746,7 @@ mod tests {
 
     #[tokio::test]
     async fn all_model_collection_ids_groups_by_model_in_one_query() {
-        let Some(store) = test_store().await else {
+        let Some((store, _serial)) = test_store().await else {
             return;
         };
         let m1 = make_model(&store, &format!("model-a-{}", uuid::Uuid::new_v4())).await;
@@ -1783,7 +1776,7 @@ mod tests {
 
     #[tokio::test]
     async fn reindex_collection_documents_requeues_only_that_collection() {
-        let Some(store) = test_store().await else {
+        let Some((store, _serial)) = test_store().await else {
             return;
         };
         let a = store
@@ -1838,7 +1831,7 @@ mod tests {
         // `reindex_collection_documents`'s conditional CASE back to an
         // unconditional `status = 'pending'` -- the in-flight document
         // would then read back `status == "pending"` here.
-        let Some(store) = test_store().await else {
+        let Some((store, _serial)) = test_store().await else {
             return;
         };
         let c = store
@@ -1880,7 +1873,7 @@ mod tests {
 
     #[tokio::test]
     async fn reindex_document_resets_status_and_clears_error() {
-        let Some(store) = test_store().await else {
+        let Some((store, _serial)) = test_store().await else {
             return;
         };
         let c = store
@@ -1909,7 +1902,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_collection_on_a_missing_id_is_not_found() {
-        let Some(store) = test_store().await else {
+        let Some((store, _serial)) = test_store().await else {
             return;
         };
         let err = store
@@ -1926,7 +1919,7 @@ mod tests {
     #[tokio::test]
     async fn existing_collection_ids_excludes_unknown_ids_so_the_admin_guard_can_reject_before_writing(
     ) {
-        let Some(store) = test_store().await else {
+        let Some((store, _serial)) = test_store().await else {
             return;
         };
         let model_id = make_model(&store, &format!("model-guard-{}", uuid::Uuid::new_v4())).await;
@@ -1967,7 +1960,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_preserves_a_concurrent_reindex_request_but_still_publishes_chunks() {
-        let Some(store) = test_store().await else {
+        let Some((store, _serial)) = test_store().await else {
             return;
         };
         let c = store
@@ -2042,7 +2035,7 @@ mod tests {
         // would then read back `status == "pending"` here, which is exactly
         // what let a second `claim_pending_document` reclaim a document a
         // first worker still holds.
-        let Some(store) = test_store().await else {
+        let Some((store, _serial)) = test_store().await else {
             return;
         };
         let c = store
@@ -2081,7 +2074,7 @@ mod tests {
         // to the unconditional `status = 'pending'` it had before this round
         // -- the document would then read back `status == "pending"` here,
         // reopening the same double-claim race for the re-upload path.
-        let Some(store) = test_store().await else {
+        let Some((store, _serial)) = test_store().await else {
             return;
         };
         let c = store
@@ -2131,7 +2124,7 @@ mod tests {
         // the second commit would *also* requeue to `pending` instead of
         // settling at `ready` -- an infinite reindex loop, one full
         // embedding run per cycle, forever.
-        let Some(store) = test_store().await else {
+        let Some((store, _serial)) = test_store().await else {
             return;
         };
         let c = store
@@ -2218,7 +2211,7 @@ mod tests {
         // run was in flight survives into `failed`, where nothing will ever
         // consult it again -- stranded until some unrelated write happens to
         // overwrite it.
-        let Some(store) = test_store().await else {
+        let Some((store, _serial)) = test_store().await else {
             return;
         };
         let c = store
@@ -2257,7 +2250,7 @@ mod tests {
 
     #[tokio::test]
     async fn document_titles_maps_id_to_title_scoped_to_the_collection() {
-        let Some(store) = test_store().await else {
+        let Some((store, _serial)) = test_store().await else {
             return;
         };
         let a = store

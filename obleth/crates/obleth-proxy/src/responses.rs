@@ -26,10 +26,10 @@ pub(crate) const RESPONSES_PATH: &str = "/v1/responses";
 /// and the boons apply exactly as they would to a native chat call.
 pub(crate) const CHAT_PATH: &str = "/v1/chat/completions";
 
-/// Header stamped on a translated request so the handler can still record the
-/// surface the caller actually used, rather than logging every Responses call
-/// as chat.
-pub(crate) const SURFACE_HEADER: &str = "x-obleth-api-surface";
+/// The surface name a translated request carries to the pipeline (in
+/// `PipelineInput`), so the ledger records the Responses call the caller made
+/// rather than the chat call it became.
+pub(crate) const SURFACE: &str = "responses";
 
 /// Fields that only mean something with server-side conversation storage.
 /// Returning the offending name lets the caller be told which one to drop.
@@ -389,9 +389,23 @@ pub(crate) struct StreamTranslator {
     /// Completed items in stream order, echoed on `response.completed`.
     done_items: Vec<Value>,
     next_index: usize,
-    tool_calls: Vec<Value>,
+    tool_calls: crate::tool_slots::ToolSlots<ToolCall>,
     usage: Option<Value>,
     finish_reason: String,
+}
+
+/// A streamed tool call: arguments arrive as fragments and are joined here.
+#[derive(Default)]
+struct ToolCall {
+    call_id: String,
+    name: String,
+    arguments: String,
+}
+
+impl crate::tool_slots::Slot for ToolCall {
+    fn id(&self) -> Option<&str> {
+        (!self.call_id.is_empty()).then_some(self.call_id.as_str())
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -454,7 +468,7 @@ impl StreamTranslator {
             current: None,
             done_items: Vec::new(),
             next_index: 0,
-            tool_calls: Vec::new(),
+            tool_calls: Default::default(),
             usage: None,
             finish_reason: "stop".to_string(),
         }
@@ -653,26 +667,35 @@ impl StreamTranslator {
         out
     }
 
-    /// Merge streamed tool-call fragments by index, the way chat sends them.
+    /// Merge streamed tool-call fragments into their calls (see `tool_slots`),
+    /// appending argument text as it arrives; the JSON is built once, in `finish`.
     fn absorb_tool_calls(&mut self, calls: &[Value]) {
         for call in calls {
-            let idx = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-            while self.tool_calls.len() <= idx {
-                self.tool_calls
-                    .push(json!({ "call_id": "", "name": "", "arguments": "" }));
-            }
-            let slot = &mut self.tool_calls[idx];
+            let (slot, _) = self.tool_calls.resolve(call);
+            let slot = &mut self.tool_calls[slot];
             if let Some(id) = call.get("id").and_then(Value::as_str) {
-                slot["call_id"] = json!(id);
+                slot.call_id = id.to_string();
             }
             if let Some(n) = call.pointer("/function/name").and_then(Value::as_str) {
-                slot["name"] = json!(n);
+                slot.name = n.to_string();
             }
             if let Some(a) = call.pointer("/function/arguments").and_then(Value::as_str) {
-                let existing = slot["arguments"].as_str().unwrap_or("").to_string();
-                slot["arguments"] = json!(format!("{existing}{a}"));
+                slot.arguments.push_str(a);
             }
         }
+    }
+
+    /// A keep-alive while the upstream is silent: an SSE comment, which every
+    /// event-stream reader skips, since the Responses API has no event for it.
+    /// Opens the response first if nothing has been sent yet, so the client sees
+    /// it has started before its own idle timeout fires.
+    pub(crate) fn ping(&mut self) -> Vec<String> {
+        if self.completed {
+            return Vec::new();
+        }
+        let mut out = self.start();
+        out.push(": keep-alive\n\n".to_string());
+        out
     }
 
     /// Close the stream. Safe to call twice; the second call emits nothing.
@@ -685,17 +708,24 @@ impl StreamTranslator {
         out.extend(self.start());
 
         let mut output: Vec<Value> = self.done_items.clone();
-        for (i, call) in self.tool_calls.clone().iter().enumerate() {
+        let calls: Vec<Value> = self
+            .tool_calls
+            .iter()
+            .enumerate()
+            .map(|(i, call)| {
+                json!({
+                    "id": format!("fc_{}_{i}", self.request_id),
+                    "type": "function_call",
+                    "status": "completed",
+                    "call_id": call.call_id,
+                    "name": call.name,
+                    "arguments": if call.arguments.is_empty() { "{}" } else { call.arguments.as_str() },
+                })
+            })
+            .collect();
+        for item in calls {
             let index = self.next_index;
             self.next_index += 1;
-            let item = json!({
-                "id": format!("fc_{}_{i}", self.request_id),
-                "type": "function_call",
-                "status": "completed",
-                "call_id": call.get("call_id").cloned().unwrap_or(json!("")),
-                "name": call.get("name").cloned().unwrap_or(json!("")),
-                "arguments": call.get("arguments").cloned().unwrap_or(json!("{}")),
-            });
             output.push(item.clone());
             out.push(self.frame(
                 "response.output_item.added",
@@ -1131,6 +1161,81 @@ mod tests {
             "input_tokens": 300, "input_tokens_details": { "cached_tokens": 256 },
             "output_tokens": 2, "total_tokens": 302 })
         );
+    }
+
+    #[test]
+    fn tool_calls_without_an_index_stay_separate_calls() {
+        let mut t = StreamTranslator::new("req1", "m");
+        let mut frames = t.on_chunk(&json!({ "choices": [{ "delta": { "tool_calls": [
+            { "id": "c1", "function": { "name": "look", "arguments": "{\"a\":1}" } }] } }] }));
+        frames.extend(t.on_chunk(&json!({ "choices": [{ "delta": { "tool_calls": [
+            { "id": "c2", "function": { "name": "fetch", "arguments": "{\"b\":2}" } }] }, "finish_reason": "tool_calls" }] })));
+        frames.extend(t.finish());
+        let items: Vec<Value> = parse(&frames)
+            .into_iter()
+            .filter(|(e, _)| e == "response.output_item.done")
+            .map(|(_, d)| d["item"].clone())
+            .collect();
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert_eq!(
+            (items[0]["call_id"].as_str(), items[0]["arguments"].as_str()),
+            (Some("c1"), Some("{\"a\":1}"))
+        );
+        assert_eq!(
+            (items[1]["call_id"].as_str(), items[1]["name"].as_str()),
+            (Some("c2"), Some("fetch"))
+        );
+    }
+
+    /// Joins `n` one-byte argument fragments and returns the time it took and
+    /// the joined length.
+    fn join_fragments(n: usize) -> (std::time::Duration, usize) {
+        let mut t = StreamTranslator::new("req1", "m");
+        t.on_chunk(&json!({ "choices": [{ "delta": { "tool_calls": [
+            { "index": 0, "id": "c1", "function": { "name": "write", "arguments": "" } }] } }] }));
+        let fragment = json!({ "choices": [{ "delta": { "tool_calls": [
+            { "index": 0, "function": { "arguments": "x" } }] } }] });
+        let started = std::time::Instant::now();
+        for _ in 0..n {
+            t.on_chunk(&fragment);
+        }
+        let frames = t.finish();
+        let took = started.elapsed();
+        let (_, done) = parse(&frames)
+            .into_iter()
+            .find(|(e, _)| e == "response.output_item.done")
+            .expect("item");
+        (took, done["item"]["arguments"].as_str().map_or(0, str::len))
+    }
+
+    #[test]
+    fn a_large_argument_streamed_byte_by_byte_joins_in_linear_time() {
+        let (small, len) = join_fragments(20_000);
+        assert_eq!(len, 20_000);
+        let (large, len) = join_fragments(200_000);
+        assert_eq!(len, 200_000);
+        // Ten times the fragments: about ten times the work when the join is
+        // linear, a hundred times when each fragment re-copies the whole
+        // argument. The margin absorbs a slow or busy runner.
+        assert!(
+            large < small * 30 + std::time::Duration::from_millis(500),
+            "20k: {small:?}, 200k: {large:?}"
+        );
+    }
+
+    #[test]
+    fn a_ping_opens_the_response_and_sends_a_comment_the_reader_skips() {
+        let mut t = StreamTranslator::new("req1", "m");
+        let frames = t.ping();
+        assert!(
+            frames[0].starts_with("event: response.created\n"),
+            "{:?}",
+            frames[0]
+        );
+        assert_eq!(frames.last().map(String::as_str), Some(": keep-alive\n\n"));
+        assert_eq!(t.ping(), vec![": keep-alive\n\n".to_string()]);
+        t.finish();
+        assert!(t.ping().is_empty());
     }
 
     #[test]

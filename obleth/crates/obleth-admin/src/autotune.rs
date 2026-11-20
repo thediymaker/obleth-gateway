@@ -377,6 +377,15 @@ fn recommend(steps: &[AutotuneStep], latency_ceiling_ms: u64) -> (usize, KneeRea
     (knee.concurrency, reason, knee.throughput_rps)
 }
 
+/// What remains until `deadline`, never zero: reqwest treats a zero timeout as
+/// an instant failure, and a probe that starts on the deadline should still
+/// fail by timing out rather than by never being sent.
+fn time_left(deadline: Instant) -> Duration {
+    deadline
+        .saturating_duration_since(Instant::now())
+        .max(Duration::from_millis(1))
+}
+
 /// Run one concurrency level for [`STEP_DURATION`] (or until `deadline`),
 /// returning its measurements. Closed-loop: `concurrency` workers each loop
 /// firing requests back-to-back and recording total latency per request. Every
@@ -422,7 +431,13 @@ async fn run_step(
                 // response and make this level look faster than it is.
                 let prompt = unique_prompt(salt, &base_prompt);
                 let body = probe_body(&upstream_model, modality, reply_tokens, &prompt);
-                let mut req = http.post(&url).headers(headers.clone()).json(&body);
+                // Each probe is bounded by what is left of the run's deadline,
+                // so a stalled backend cannot hold the admin request past it.
+                let mut req = http
+                    .post(&url)
+                    .headers(headers.clone())
+                    .json(&body)
+                    .timeout(time_left(deadline));
                 if let Some(key) = &api_key {
                     req = req.bearer_auth(key);
                 }
@@ -590,6 +605,18 @@ mod tests {
             requests: 100,
             errors: 0,
         }
+    }
+
+    #[test]
+    fn a_probe_is_bounded_by_what_is_left_of_the_deadline() {
+        let soon = Instant::now() + Duration::from_secs(5);
+        let left = time_left(soon);
+        assert!(left > Duration::from_secs(4) && left <= Duration::from_secs(5));
+        // Past the deadline: a tiny positive bound, never zero.
+        assert_eq!(
+            time_left(Instant::now() - Duration::from_secs(1)),
+            Duration::from_millis(1)
+        );
     }
 
     #[test]

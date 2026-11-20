@@ -1,4 +1,5 @@
 import { auth } from "@/lib/auth/better-auth";
+import { withCurrentCallbackPath } from "@/lib/auth/legacy-callback";
 import { toNextJsHandler } from "better-auth/next-js";
 
 // Defer auth.handler access to first request so `next build` (which imports
@@ -11,5 +12,5 @@ function h() {
   return (handlers ??= toNextJsHandler(auth.handler));
 }
 
-export const GET = (req: Request) => h().GET(req);
-export const POST = (req: Request) => h().POST(req);
+export const GET = (req: Request) => h().GET(withCurrentCallbackPath(req));
+export const POST = (req: Request) => h().POST(withCurrentCallbackPath(req));

@@ -8,16 +8,14 @@ export const dynamic = "force-dynamic";
 export default async function PortalUsagePage() {
   const tenantId = await requireTenant();
   const sinceMs = Date.now() - 24 * 60 * 60_000;
-  const [allUsage, keyUsage, recent] = await Promise.all([
-    safe(obleth.usage(), [] as UsageAgg[]),
+  const [usage, keyUsage, recent] = await Promise.all([
+    safe(obleth.usage({ tenantId }), [] as UsageAgg[]),
     safe(obleth.usageKeysSummary({ tenantId, sinceMs, limit: 100 }), [] as KeyUsageSummary[]),
     safe(obleth.usageLogs({ tenantId, sinceMs, limit: 50 }), [] as UsageLogEntry[]),
   ]);
-  const mine = allUsage.filter((row) => row.tenant_id === tenantId);
-
   return (
     <PortalUsage
-      usage={mine}
+      usage={usage}
       keyUsage={keyUsage}
       recent={recent}
       gatewayBase={process.env.OBLETH_PROXY_BASE_URL ?? "http://localhost:8080"}

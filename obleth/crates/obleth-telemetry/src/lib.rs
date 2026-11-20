@@ -239,11 +239,90 @@ impl<'a> From<&'a SpanRecord> for SpanRow<'a> {
     }
 }
 
+/// The three kinds of row the sink writes, as the loss ledger names them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stream {
+    Usage,
+    Spans,
+    Rejections,
+}
+
+impl Stream {
+    pub fn name(self) -> &'static str {
+        match self {
+            Stream::Usage => "usage",
+            Stream::Spans => "spans",
+            Stream::Rejections => "rejections",
+        }
+    }
+}
+
+/// What became of a row that did not reach ClickHouse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// Lost: a full channel, no schema, a failed insert, or a refused spill.
+    Dropped,
+    /// Written to the WAL, to be replayed when ClickHouse is back (usage only).
+    Spilled,
+}
+
+impl Outcome {
+    pub fn name(self) -> &'static str {
+        match self {
+            Outcome::Dropped => "dropped",
+            Outcome::Spilled => "spilled",
+        }
+    }
+}
+
+/// What became of the rows each stream was given, counted the same way by all
+/// three flushers, so one exported counter says whether a replica is losing
+/// or spilling accounting rows and which kind.
 #[derive(Debug, Default)]
 pub struct TelemetryStats {
+    /// Usage rows accepted onto the channel.
     pub recorded: AtomicU64,
-    pub dropped: AtomicU64,
-    pub waled: AtomicU64,
+    usage_dropped: AtomicU64,
+    usage_spilled: AtomicU64,
+    spans_dropped: AtomicU64,
+    rejections_dropped: AtomicU64,
+}
+
+impl TelemetryStats {
+    /// Every (stream, outcome) the ledger keeps, in export order.
+    pub const LOSSES: [(Stream, Outcome); 4] = [
+        (Stream::Usage, Outcome::Dropped),
+        (Stream::Usage, Outcome::Spilled),
+        (Stream::Spans, Outcome::Dropped),
+        (Stream::Rejections, Outcome::Dropped),
+    ];
+
+    fn cell(&self, stream: Stream, outcome: Outcome) -> &AtomicU64 {
+        match (stream, outcome) {
+            (Stream::Usage, Outcome::Dropped) => &self.usage_dropped,
+            (Stream::Usage, Outcome::Spilled) => &self.usage_spilled,
+            (Stream::Spans, _) => &self.spans_dropped,
+            (Stream::Rejections, _) => &self.rejections_dropped,
+        }
+    }
+
+    /// `rows` of `stream` met `outcome`. Spans and rejections never spill, so
+    /// for them every outcome counts as dropped.
+    pub fn lose(&self, stream: Stream, outcome: Outcome, rows: u64) {
+        self.cell(stream, outcome)
+            .fetch_add(rows, Ordering::Relaxed);
+    }
+
+    pub fn lost(&self, stream: Stream, outcome: Outcome) -> u64 {
+        self.cell(stream, outcome).load(Ordering::Relaxed)
+    }
+
+    /// Every ledger cell with its running total, for export as a counter.
+    pub fn losses(&self) -> impl Iterator<Item = (Stream, Outcome, u64)> + '_ {
+        Self::LOSSES
+            .into_iter()
+            .map(|(stream, outcome)| (stream, outcome, self.lost(stream, outcome)))
+    }
 }
 
 /// Cloneable handle used by the data plane to emit usage records.
@@ -372,16 +451,16 @@ impl TelemetrySink {
             Ok(()) => {
                 self.stats.recorded.fetch_add(1, Ordering::Relaxed);
             }
-            Err(_) => {
-                self.stats.dropped.fetch_add(1, Ordering::Relaxed);
-            }
+            Err(_) => self.stats.lose(Stream::Usage, Outcome::Dropped, 1),
         }
     }
 
-    /// Non-blocking span emit. Silently drops if the buffer is full so the hot
-    /// path is never stalled by the tracer.
+    /// Non-blocking span emit. Drops (and counts) the span if the buffer is
+    /// full so the hot path is never stalled by the tracer.
     pub fn record_span(&self, span: SpanRecord) {
-        let _ = self.tx_spans.try_send(span);
+        if self.tx_spans.try_send(span).is_err() {
+            self.stats.lose(Stream::Spans, Outcome::Dropped, 1);
+        }
     }
 
     /// Record a refused use of a real key. Never waits on ClickHouse: the
@@ -593,15 +672,12 @@ impl Flusher {
 
     async fn write_wal(&self, batch: &[UsageRecord]) {
         match self.wal.append(batch).await {
-            Ok(()) => {
-                self.stats
-                    .waled
-                    .fetch_add(batch.len() as u64, Ordering::Relaxed);
-            }
+            Ok(()) => self
+                .stats
+                .lose(Stream::Usage, Outcome::Spilled, batch.len() as u64),
             Err(e) => {
                 self.stats
-                    .dropped
-                    .fetch_add(batch.len() as u64, Ordering::Relaxed);
+                    .lose(Stream::Usage, Outcome::Dropped, batch.len() as u64);
                 tracing::error!(error = %e, count = batch.len(), "telemetry WAL spill failed; records dropped");
             }
         }
@@ -794,8 +870,7 @@ impl RejectionFlusher {
         }
         if !self.schema_ready.load(Ordering::Acquire) {
             self.stats
-                .dropped
-                .fetch_add(rows.len() as u64, Ordering::Relaxed);
+                .lose(Stream::Rejections, Outcome::Dropped, rows.len() as u64);
             tracing::debug!(
                 count = rows.len(),
                 "key rejections dropped; clickhouse schema not ready"
@@ -812,12 +887,14 @@ impl RejectionFlusher {
         })
         .await;
         match insert {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => return,
             Ok(Err(e)) => {
                 tracing::warn!(error = %e, count = rows.len(), "key rejections insert failed")
             }
             Err(_) => tracing::warn!(count = rows.len(), "key rejections insert timed out"),
         }
+        self.stats
+            .lose(Stream::Rejections, Outcome::Dropped, rows.len() as u64);
     }
 }
 
@@ -849,7 +926,6 @@ struct SpansFlusher {
     client: Client,
     schema_ready: Arc<AtomicBool>,
     flush_interval: Duration,
-    #[allow(dead_code)]
     stats: Arc<TelemetryStats>,
 }
 
@@ -902,10 +978,14 @@ impl SpansFlusher {
         let count = batch.len();
         // Spans are disposable; without a schema the insert can only fail.
         if !self.schema_ready.load(Ordering::Acquire) {
+            self.stats
+                .lose(Stream::Spans, Outcome::Dropped, count as u64);
             tracing::debug!(count, "spans dropped; clickhouse schema not ready");
             return;
         }
         if let Err(e) = self.insert(&batch).await {
+            self.stats
+                .lose(Stream::Spans, Outcome::Dropped, count as u64);
             tracing::warn!(error = %e, count, "spans insert failed");
         } else {
             tracing::debug!(count, "spans flushed to ClickHouse");
@@ -1663,6 +1743,25 @@ async fn won_claim(client: &Client, database: &str, key: &str) -> Result<bool, T
 mod conv_tests {
     use super::*;
 
+    #[test]
+    fn each_stream_and_outcome_is_counted_apart() {
+        let stats = TelemetryStats::default();
+        stats.lose(Stream::Usage, Outcome::Dropped, 1);
+        stats.lose(Stream::Usage, Outcome::Spilled, 4);
+        stats.lose(Stream::Spans, Outcome::Dropped, 2);
+        stats.lose(Stream::Rejections, Outcome::Dropped, 3);
+        let totals: Vec<(Stream, Outcome, u64)> = stats.losses().collect();
+        assert_eq!(
+            totals,
+            vec![
+                (Stream::Usage, Outcome::Dropped, 1),
+                (Stream::Usage, Outcome::Spilled, 4),
+                (Stream::Spans, Outcome::Dropped, 2),
+                (Stream::Rejections, Outcome::Dropped, 3),
+            ]
+        );
+    }
+
     fn record() -> UsageRecord {
         UsageRecord {
             request_id: uuid::Uuid::new_v4(),
@@ -1728,11 +1827,13 @@ mod conv_tests {
         sink.record(record());
         let stats = sink.stats();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        while stats.waled.load(Ordering::Relaxed) == 0 && tokio::time::Instant::now() < deadline {
+        while stats.lost(Stream::Usage, Outcome::Spilled) == 0
+            && tokio::time::Instant::now() < deadline
+        {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        assert_eq!(stats.waled.load(Ordering::Relaxed), 1);
-        assert_eq!(stats.dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.lost(Stream::Usage, Outcome::Spilled), 1);
+        assert_eq!(stats.lost(Stream::Usage, Outcome::Dropped), 0);
         let _ = tokio::fs::remove_dir_all(&directory).await;
     }
 
@@ -1759,8 +1860,8 @@ mod conv_tests {
         sink.shutdown().await;
         // Settled by the time shutdown returns, with no waiting on ticks.
         let stats = sink.stats();
-        assert_eq!(stats.waled.load(Ordering::Relaxed), 25);
-        assert_eq!(stats.dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.lost(Stream::Usage, Outcome::Spilled), 25);
+        assert_eq!(stats.lost(Stream::Usage, Outcome::Dropped), 0);
         // Recording after shutdown neither panics nor blocks.
         sink.record(record());
         let _ = tokio::fs::remove_dir_all(&directory).await;
@@ -1791,9 +1892,9 @@ mod conv_tests {
         }
         tokio::time::sleep(Duration::from_millis(1500)).await;
         let stats = sink.stats();
-        assert_eq!(stats.waled.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.lost(Stream::Usage, Outcome::Spilled), 0);
         sink.shutdown().await;
-        assert_eq!(stats.waled.load(Ordering::Relaxed), 3);
+        assert_eq!(stats.lost(Stream::Usage, Outcome::Spilled), 3);
         let _ = tokio::fs::remove_dir_all(&directory).await;
     }
 
@@ -1819,8 +1920,8 @@ mod conv_tests {
         }
         sink.shutdown().await;
         let stats = sink.stats();
-        assert_eq!(stats.waled.load(Ordering::Relaxed), 7);
-        assert_eq!(stats.dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.lost(Stream::Usage, Outcome::Spilled), 7);
+        assert_eq!(stats.lost(Stream::Usage, Outcome::Dropped), 0);
         let _ = tokio::fs::remove_dir_all(&directory).await;
     }
 
@@ -2483,7 +2584,7 @@ mod clickhouse_tests {
         sink.shutdown().await;
         let usage = format!("SELECT count() FROM {database}.usage");
         assert_eq!(scalar(&client, &usage).await, 30);
-        assert_eq!(sink.stats().waled.load(Ordering::Relaxed), 0);
+        assert_eq!(sink.stats().lost(Stream::Usage, Outcome::Spilled), 0);
         drop_database(&client, &database).await;
         let _ = tokio::fs::remove_dir_all(&directory).await;
     }

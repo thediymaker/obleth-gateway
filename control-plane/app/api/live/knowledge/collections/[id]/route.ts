@@ -27,7 +27,8 @@ export async function PUT(
   try {
     const { id } = await params;
     const body = await req.json();
-    return NextResponse.json(await obleth.updateCollection(id, body, { auditActor: session.email }));
+    const updated = await obleth.updateCollection(id, body, { auditActor: session.email });
+    return NextResponse.json(updated);
   } catch (e) {
     return NextResponse.json({ error: String(e) }, { status: 502 });
   }

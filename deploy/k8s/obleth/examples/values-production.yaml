@@ -71,7 +71,7 @@ obleth:
   # If your external datastores sit on private/LAN addresses AND you enable
   # strict SSRF (OBLETH_BLOCK_PRIVATE_NETWORKS=1), allow those ranges here.
   allowedPrivateCidrs: ""
-  otelEndpoint: ""   # e.g. http://otel-collector.observability.svc:4317
+  otelEndpoint: ""   # e.g. http://otel-collector.observability.svc:4318 (OTLP over HTTP, port 4318 not 4317; http:// only)
 
 # External, operator-managed datastores — nothing stateful runs in this chart.
 postgres:
@@ -134,6 +134,8 @@ serviceMonitor:
 
 controlPlane:
   enabled: true
+  # Replicas are interchangeable: the dashboard keeps no cross-request cache
+  # of gateway data, so a save on one is seen on the next load of any other.
   replicas: 2
   existingSecret: obleth-control-plane
   resources:

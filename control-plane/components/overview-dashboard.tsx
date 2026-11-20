@@ -83,7 +83,9 @@ export function OverviewDashboard({
   });
   const contextQuery = useQuery({ queryKey: ["overview-context"], queryFn: () => getJson<OverviewContext>("/api/live/overview/context"), initialData: initialContext, refetchInterval: SLOW_POLL_MS });
   const fairshareQuery = useQuery({ queryKey: ["fairshare-live"], queryFn: () => getJson<FairshareLiveView>("/api/live/fairshare"), initialData: initialFairshare, refetchInterval: FAST_POLL_MS });
-  const statsQuery = useQuery({ queryKey: ["gateway-stats"], queryFn: () => getJson<LiveStats>("/api/live/stats"), initialData: initialStats, refetchInterval: STATS_POLL_MS });
+  // The stats are only what liveCapacity falls back to when the fairshare view
+  // cannot be read, so they are polled only then.
+  const statsQuery = useQuery({ queryKey: ["gateway-stats"], queryFn: () => getJson<LiveStats>("/api/live/stats"), initialData: initialStats, refetchInterval: STATS_POLL_MS, enabled: !fairshareQuery.data || fairshareQuery.isError });
   const modelsQuery = useQuery({ queryKey: ["model-routes"], queryFn: () => getJson<ModelRoute[]>("/api/live/models"), initialData: initialModels, refetchInterval: SLOW_POLL_MS });
   // Pool sizes and cluster-wide counts for models the answering gateway has not served yet.
   const discoveryQuery = useQuery({ queryKey: ["capacity-discovery"], queryFn: () => getJson<CapacityDiscoveryView>("/api/live/capacity/discovery"), refetchInterval: STATS_POLL_MS, retry: false });

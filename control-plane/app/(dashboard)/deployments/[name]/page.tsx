@@ -13,7 +13,7 @@ export const dynamic = "force-dynamic";
 export default async function DeploymentPage({ params }: { params: Promise<{ name: string }> }) {
   await requireAdmin();
   const name = decodeURIComponent((await params).name);
-  const [data, audit] = await Promise.all([loadDeployments(), safe(obleth.audit(500), [] as AuditEntry[])]);
+  const data = await loadDeployments();
   // A failed read isn't a missing deployment: say so rather than 404 or send the page to Models.
   if (data.failed?.includes("models") || data.failed?.includes("specs")) {
     throw new Error("obleth couldn't read the models or their launch settings just now. Try again in a moment.");
@@ -24,8 +24,14 @@ export default async function DeploymentPage({ params }: { params: Promise<{ nam
   const spec = data.specs.find((s) => s.model_id === model.id);
   // A model obleth neither launches nor watches has no deployment: its page is in Models.
   if (!spec && model.capacity_source !== "kubernetes") redirect(modelHref(model.model_name));
-  const changes = audit
-    .filter((e) => (e.entity_type === "model" || e.entity_type === "managed_model") && e.entity_id === model.id)
+  // This model's changes under both entity types, from the audit log's entity index.
+  const changes = (
+    await Promise.all(
+      ["model", "managed_model"].map((entityType) => safe(obleth.auditQuery({ entityType, entityId: model.id, limit: 12 }), [] as AuditEntry[])),
+    )
+  )
+    .flat()
+    .sort((a, b) => b.id - a.id)
     .slice(0, 12);
   return spec ? <ManagedPage key={model.id} modelId={model.id} initial={data} changes={changes} /> : <WatchedPage key={model.id} modelId={model.id} initial={data} changes={changes} />;
 }

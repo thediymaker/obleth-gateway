@@ -13,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "2.11.0"
+version = "2.12.0"
 edition = "2021"
 license = "BUSL-1.1"
 repository = "https://github.com/thediymaker/obleth-gateway"
@@ -45,7 +45,9 @@ serde_json = { version = "1", features = ["float_roundtrip"] }
 # datastores
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono"] }
-clickhouse = { version = "0.13", features = ["uuid"] }
+# TLS through rustls with ring and the Mozilla roots, the stack reqwest and sqlx
+# already link: an https:// ClickHouse works, a private CA does not.
+clickhouse = { version = "0.13", features = ["uuid", "rustls-tls-ring", "rustls-tls-webpki-roots"] }
 
 # caching
 moka = { version = "0.12", features = ["future"] }
@@ -56,6 +58,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 prometheus = "0.14"
 opentelemetry = "0.32"
 opentelemetry_sdk = "0.32.1"
+# Plain HTTP only: the crate's TLS features route through reqwest 0.13, whose
+# rustls brings aws-lc-rs, a second crypto provider next to ring. Terminate TLS
+# at a collector beside the gateway instead.
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
 tracing-opentelemetry = "0.33"
 

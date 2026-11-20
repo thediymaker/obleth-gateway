@@ -16,6 +16,97 @@
 pub struct CompressorClient {
     pub base_url: String,
     pub timeout: std::time::Duration,
+    breaker: std::sync::Arc<Breaker>,
+}
+
+/// Largest `/score` answer read; a sidecar answering more is an error.
+const SCORE_RESPONSE_MAX: usize = 1024 * 1024;
+/// Consecutive timeouts after which the sidecar is left alone for
+/// [`BREAKER_HOLD`]: a stalled sidecar must not add its timeout to every
+/// request, and a short hold lets a recovering one back soon.
+const BREAKER_AFTER: u32 = 3;
+const BREAKER_HOLD: std::time::Duration = std::time::Duration::from_secs(30);
+/// How often a failing sidecar is logged; the counter carries the rest.
+const WARN_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How one `/score` call ended; the span and the
+/// `obleth_compressor_scores_total` counter carry it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScoreOutcome {
+    /// The sidecar scored every batch.
+    Neural,
+    /// The sidecar did not answer within its timeout.
+    Timeout,
+    /// The sidecar could not be reached, answered an error, or an unreadable body.
+    Error,
+    /// Not asked: the breaker is open after consecutive timeouts.
+    Open,
+}
+
+impl ScoreOutcome {
+    pub fn name(self) -> &'static str {
+        match self {
+            ScoreOutcome::Neural => "neural",
+            ScoreOutcome::Timeout => "timeout",
+            ScoreOutcome::Error => "error",
+            ScoreOutcome::Open => "breaker_open",
+        }
+    }
+}
+
+/// What a `/score` call came to: the scores when the sidecar answered, how
+/// it ended, and how long it took.
+pub struct Scored {
+    pub scores: Option<Vec<Vec<f32>>>,
+    pub outcome: ScoreOutcome,
+    pub elapsed: std::time::Duration,
+}
+
+/// The sidecar's recent health, shared by every request on this replica.
+#[derive(Default)]
+struct Breaker {
+    consecutive_timeouts: std::sync::atomic::AtomicU32,
+    open_until: std::sync::Mutex<Option<std::time::Instant>>,
+    last_warning: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+impl Breaker {
+    fn is_open(&self, now: std::time::Instant) -> bool {
+        self.open_until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|until| now < until)
+    }
+
+    /// Note how a call ended; opens the breaker on the `BREAKER_AFTER`th
+    /// consecutive timeout and closes it on any answer.
+    fn note(&self, outcome: ScoreOutcome, now: std::time::Instant) {
+        use std::sync::atomic::Ordering;
+        match outcome {
+            ScoreOutcome::Timeout => {
+                let run = self.consecutive_timeouts.fetch_add(1, Ordering::Relaxed) + 1;
+                if run >= BREAKER_AFTER {
+                    *self.open_until.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(now + BREAKER_HOLD);
+                    self.consecutive_timeouts.store(0, Ordering::Relaxed);
+                }
+            }
+            ScoreOutcome::Neural | ScoreOutcome::Error => {
+                self.consecutive_timeouts.store(0, Ordering::Relaxed);
+            }
+            ScoreOutcome::Open => {}
+        }
+    }
+
+    /// Whether a failure may be logged now: once per `WARN_EVERY`.
+    fn may_warn(&self, now: std::time::Instant) -> bool {
+        let mut last = self.last_warning.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_some_and(|at| now.duration_since(at) < WARN_EVERY) {
+            return false;
+        }
+        *last = Some(now);
+        true
+    }
 }
 
 /// Build a `CompressorClient` from explicit values.
@@ -34,7 +125,11 @@ fn parse_config(url: Option<&str>, timeout_ms: Option<&str>) -> Option<Compresso
         .and_then(|s| s.parse::<u64>().ok())
         .map(std::time::Duration::from_millis)
         .unwrap_or_else(|| std::time::Duration::from_millis(800));
-    Some(CompressorClient { base_url, timeout })
+    Some(CompressorClient {
+        base_url,
+        timeout,
+        breaker: std::sync::Arc::default(),
+    })
 }
 
 impl CompressorClient {
@@ -54,27 +149,70 @@ impl CompressorClient {
     /// POST `batches` to the sidecar's `/score` endpoint and return the
     /// per-sentence scores.
     ///
-    /// Fails open on any error (send failure, non-2xx status, parse error) by
-    /// returning `None`.  The caller supplies the shared `http` client.
-    pub(super) async fn score(
-        &self,
-        http: &reqwest::Client,
-        batches: &[Vec<String>],
-    ) -> Option<Vec<Vec<f32>>> {
+    /// Fails open: on a timeout, an unreachable sidecar, a non-2xx answer or an
+    /// unreadable body the scores are `None` and the outcome says why, so the
+    /// request goes on with the heuristic path. After `BREAKER_AFTER`
+    /// consecutive timeouts the sidecar is not asked for `BREAKER_HOLD`.
+    /// The caller supplies the shared `http` client.
+    pub(super) async fn score(&self, http: &reqwest::Client, batches: &[Vec<String>]) -> Scored {
+        let started = std::time::Instant::now();
+        if self.breaker.is_open(started) {
+            return Scored {
+                scores: None,
+                outcome: ScoreOutcome::Open,
+                elapsed: started.elapsed(),
+            };
+        }
         let url = format!("{}/score", self.base_url);
         let body = build_score_body(batches);
-        let resp = http
+        let answered = http
             .post(&url)
             .json(&body)
             .timeout(self.timeout)
             .send()
-            .await
-            .ok()?;
-        if !resp.status().is_success() {
-            return None;
+            .await;
+        let (scores, outcome, why) = match answered {
+            Err(e) if e.is_timeout() => (
+                None,
+                ScoreOutcome::Timeout,
+                "did not answer in time".to_owned(),
+            ),
+            Err(e) => (None, ScoreOutcome::Error, e.without_url().to_string()),
+            Ok(resp) if !resp.status().is_success() => (
+                None,
+                ScoreOutcome::Error,
+                format!("answered {}", resp.status()),
+            ),
+            Ok(resp) => match super::read_body_capped(resp, SCORE_RESPONSE_MAX).await {
+                Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    Ok(json) => (
+                        parse_score_response(&json, batches.len()),
+                        ScoreOutcome::Neural,
+                        String::new(),
+                    ),
+                    Err(e) => (
+                        None,
+                        ScoreOutcome::Error,
+                        format!("answered something other than JSON: {e}"),
+                    ),
+                },
+                Err(e) => (None, ScoreOutcome::Error, e.to_string()),
+            },
+        };
+        let now = std::time::Instant::now();
+        self.breaker.note(outcome, now);
+        if outcome != ScoreOutcome::Neural && self.breaker.may_warn(now) {
+            tracing::warn!(
+                outcome = outcome.name(),
+                elapsed_ms = now.duration_since(started).as_millis() as u64,
+                "compressor sidecar {why}; prose is compacted by the heuristic path meanwhile"
+            );
         }
-        let json: serde_json::Value = resp.json().await.ok()?;
-        parse_score_response(&json, batches.len())
+        Scored {
+            scores,
+            outcome,
+            elapsed: now.duration_since(started),
+        }
     }
 }
 
@@ -262,6 +400,82 @@ pub(super) fn compact_prose_segment(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn the_breaker_opens_after_consecutive_timeouts_and_closes_on_an_answer() {
+        let breaker = Breaker::default();
+        let t0 = Instant::now();
+        for _ in 0..BREAKER_AFTER - 1 {
+            breaker.note(ScoreOutcome::Timeout, t0);
+        }
+        assert!(
+            !breaker.is_open(t0),
+            "one short of the threshold stays closed"
+        );
+        breaker.note(ScoreOutcome::Neural, t0);
+        breaker.note(ScoreOutcome::Timeout, t0);
+        assert!(!breaker.is_open(t0), "an answer resets the run");
+        for _ in 0..BREAKER_AFTER {
+            breaker.note(ScoreOutcome::Timeout, t0);
+        }
+        assert!(breaker.is_open(t0 + Duration::from_secs(1)));
+        assert!(
+            !breaker.is_open(t0 + BREAKER_HOLD + Duration::from_secs(1)),
+            "the hold is short"
+        );
+        assert!(breaker.may_warn(t0));
+        assert!(
+            !breaker.may_warn(t0 + Duration::from_secs(1)),
+            "one warning per window"
+        );
+        assert!(breaker.may_warn(t0 + WARN_EVERY + Duration::from_secs(1)));
+    }
+
+    /// A sidecar that accepts and never answers ends as a timeout within the
+    /// client's own bound, not reqwest's; a run of them opens the breaker, and
+    /// the next call is not sent at all.
+    #[tokio::test]
+    async fn a_silent_sidecar_times_out_and_then_trips_the_breaker() {
+        use axum::{routing::post, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let seen = hits.clone();
+        let app = Router::new().route(
+            "/score",
+            post(move || {
+                let seen = seen.clone();
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    "{}"
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = parse_config(Some(&url), Some("50")).unwrap();
+        let http = reqwest::Client::new();
+        let batches = vec![vec!["one".to_owned(), "two".to_owned()]];
+        for _ in 0..BREAKER_AFTER {
+            let scored = client.score(&http, &batches).await;
+            assert_eq!(scored.outcome, ScoreOutcome::Timeout);
+            assert!(scored.scores.is_none());
+            assert!(
+                scored.elapsed < Duration::from_secs(2),
+                "{:?}",
+                scored.elapsed
+            );
+        }
+        let scored = client.score(&http, &batches).await;
+        assert_eq!(scored.outcome, ScoreOutcome::Open);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            BREAKER_AFTER as usize,
+            "the open breaker sends nothing"
+        );
+    }
     use std::collections::HashSet;
 
     #[test]

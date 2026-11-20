@@ -30,7 +30,7 @@ import { HealthGlyph, Meter, Panel, PanelLink, Pill, SectionLabel } from "@/comp
 import { HelpTip } from "@/components/fairshare/help";
 import { RunningHistory } from "@/components/fairshare/history";
 import { TenantPanel } from "@/components/fairshare/tenant-panel";
-import { useCapacityDiscovery, useFairshareHistory, useFairshareLive, useModelRoutes, useTenantSeries } from "@/components/fairshare/hooks";
+import { FAIRSHARE_POLL_MS, useCapacityDiscovery, useFairshareHistory, useFairshareLive, useModelRoutes, useTenantSeries } from "@/components/fairshare/hooks";
 
 export {
   appendHistoryTail,
@@ -75,7 +75,7 @@ function HowItDecides() {
 export function FairshareDashboard({ tenantNames, initialPool = "all" }: { tenantNames: Record<string, string>; initialPool?: string }) {
   const queryClient = useQueryClient();
   const router = useRouter();
-  const live = useFairshareLive();
+  const live = useFairshareLive({ intervalMs: FAIRSHARE_POLL_MS });
   const routes = useModelRoutes();
   const discovery = useCapacityDiscovery();
   const [scope, setScopeState] = useState(initialPool);

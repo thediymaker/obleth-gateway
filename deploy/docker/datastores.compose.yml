@@ -57,7 +57,10 @@ services:
     restart: unless-stopped
     # AOF persistence so the cache/token budgets survive a restart. AUTH is
     # always on: obleth reads API keys from Redis on every request.
-    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--requirepass", "${REDIS_PASSWORD:?set REDIS_PASSWORD in datastores.env}"]
+    # Same ceiling and eviction as the chart's bundled Redis, so a gateway on
+    # this tier behaves as its documentation says: TTL entries are evicted at
+    # the ceiling, keys and routes never are.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--requirepass", "${REDIS_PASSWORD:?set REDIS_PASSWORD in datastores.env}", "--maxmemory", "${REDIS_MAXMEMORY:-400mb}", "--maxmemory-policy", "volatile-lru"]
     environment:
       REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in datastores.env}
     ports: ["${BIND_ADDR:-127.0.0.1}:6379:6379"]

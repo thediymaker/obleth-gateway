@@ -14,7 +14,9 @@ use obleth_config::{ModelEndpoint, ModelRoute};
 use sqlx::Row;
 use uuid::Uuid;
 
-use crate::{cipher, endpoint_from_row, model_from_row, serialize_tag_levels, Result, Store};
+use crate::{
+    cipher, endpoint_from_row, model_from_row, serialize_tag_levels, Result, Store, MODEL_COLUMNS,
+};
 
 /// One model's resolved target state, ready to write.
 #[derive(Debug, Clone)]
@@ -36,19 +38,6 @@ pub struct ModelImportOutcome {
     /// Post-write endpoints, present only when the manifest listed any.
     pub endpoints: Option<Vec<ModelEndpoint>>,
 }
-
-/// Every column of `models` that `model_from_row` reads. Kept as one const so
-/// the insert's RETURNING clause cannot drift from the mapper.
-const MODEL_COLUMNS: &str = "id, model_name, aliases, variants, reasoning, listed, rejected_request_fields, session_affinity, description, upstream_model, api_base, api_key,
-     upstream_headers, model_type, quantization, input_cost_per_token, output_cost_per_token, cost_per_image,
-     cost_per_audio_second, cost_per_character, cost_per_video, context_window, admission_weight,
-     max_in_flight, capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace,
-     capacity_service, per_replica_max_in_flight, capacity_headroom, supports_function_calling,
-     supports_system_messages, supports_response_schema, supports_tool_choice,
-     supports_vision, enabled, cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-     request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
-     debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
-     created_at, updated_at";
 
 const ENDPOINT_COLUMNS: &str = "id, model_id, name, api_base, api_key, priority, weight, enabled,
      max_in_flight,

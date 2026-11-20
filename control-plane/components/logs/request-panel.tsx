@@ -47,10 +47,10 @@ export function StepDetail({ node, onClose }: { node: SpanNode; onClose: () => v
     .sort((a, b) => a.span.start_ms - b.span.start_ms);
   const longest = Math.max(...rounds.map((c) => c.span.duration_ms), 1);
   return (
-    <section aria-label={`${spanLabel(span.span_name)} details`} className="rounded-xl border border-border bg-background/40 p-4">
+    <section aria-label={`${spanLabel(span.span_name, span.attributes)} details`} className="rounded-xl border border-border bg-background/40 p-4">
       <div className="mb-2.5 flex items-start justify-between gap-3">
         <div>
-          <p className="text-[13px] font-semibold">{spanLabel(span.span_name)}</p>
+          <p className="text-[13px] font-semibold">{spanLabel(span.span_name, span.attributes)}</p>
           {spanHint(span.span_name) && <p className="text-xs text-muted-foreground">{spanHint(span.span_name)}</p>}
         </div>
         <div className="flex items-center gap-3">

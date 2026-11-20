@@ -54,7 +54,7 @@ export async function bootstrapAdmin(): Promise<void> {
     emailVerified: true,
     role: "admin",
     status: "active",
-  });
+  }, { method: "admin" });
   await ctx.internalAdapter.linkAccount({
     userId: user.id,
     providerId: "credential",

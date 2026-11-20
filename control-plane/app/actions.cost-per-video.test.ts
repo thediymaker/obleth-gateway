@@ -16,7 +16,6 @@ function mockAdmin() {
   }));
   vi.doMock("next/cache", () => ({
     revalidatePath: vi.fn(),
-    updateTag: vi.fn(),
   }));
 }
 
@@ -69,10 +68,10 @@ async function connectionUpdate(current: Record<string, unknown>, fd: FormData) 
   vi.doMock("@/lib/obleth", () => ({
     obleth: {
       listModels: vi.fn().mockResolvedValue([current]),
+      getModel: vi.fn().mockResolvedValue(current),
       updateModel,
       listUpstreamModels: vi.fn().mockResolvedValue([]),
     },
-    CACHE_TAGS: new Proxy({}, { get: () => "tag" }),
     OblethApiError: class OblethApiError extends Error {},
   }));
   const { saveModelSettingsAction } = await import("./actions");

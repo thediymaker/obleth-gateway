@@ -37,7 +37,7 @@ const questionSchema = z.discriminatedUnion("type", [
 const bodySchema = z.object({
   model: z.string().min(1).max(200),
   // Optional when images are sent; checked below.
-  state: z.union([z.string().min(1), z.record(z.unknown()), z.array(z.unknown())]).optional(),
+  state: z.union([z.string().min(1), z.record(z.string(), z.unknown()), z.array(z.unknown())]).optional(),
   images: z.array(z.string().startsWith("data:image/")).max(8).optional(),
   questions: z.record(z.string().min(1).max(64), questionSchema),
 });

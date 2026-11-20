@@ -1500,6 +1500,17 @@ export interface UsageBreakdownEntry {
   key_prefix: string;
 }
 
+/** Narrow a usage aggregate to one tenant or model; the gateway filters before it groups. */
+export interface UsageFilter {
+  sinceMs?: number;
+  tenantId?: string;
+  model?: string;
+}
+
+function usageQs(filter: UsageFilter) {
+  return qs({ since_ms: filter.sinceMs, tenant_id: filter.tenantId, model: filter.model });
+}
+
 export interface AuditParams {
   limit?: number;
   actor?: string;
@@ -2327,9 +2338,9 @@ async function api<T>(path: string, init?: ApiInit): Promise<T> {
       ...(headers ?? {}),
     },
   };
-  // Default to `no-store` so reads are always fresh. Callers may opt specific
-  // GETs into Next's Data Cache by passing `next: { revalidate }`; those routes
-  // already call `revalidatePath` on mutation, so cached lists stay correct.
+  // Default to `no-store` so reads are always fresh: each dashboard replica has
+  // its own Data Cache, so gateway data cached on one replica would go stale
+  // on the others after a save. Only the version check opts into the cache.
   if (next) fetchInit.next = next;
   else fetchInit.cache = cache ?? "no-store";
 
@@ -2462,27 +2473,11 @@ export interface VersionInfo {
   built_at: string | null;
 }
 
-// The slow-changing entity lists are opted into Next's Data Cache with a short
-// revalidate window plus a tag. Every mutating server action calls
-// `revalidateTag` for the lists it changes, so dashboards see writes
-// immediately while auto-refresh polling stops re-fetching unchanged lists
-// from the admin API on every tick. The window only bounds staleness for
-// writes made outside the control plane (e.g. direct admin-API calls).
-const LIST_REVALIDATE_SECS = 30;
-export const CACHE_TAGS = {
-  tenants: "tenants",
-  keys: "keys",
-  models: "models",
-  knowledgeCollections: "knowledge-collections",
-} as const;
-
 export const obleth = {
   gatewayVersion: () =>
     api<VersionInfo>("/version", { next: { revalidate: 300 } }),
-  listTenants: () =>
-    api<Tenant[]>("/tenants", {
-      next: { revalidate: LIST_REVALIDATE_SECS, tags: [CACHE_TAGS.tenants] },
-    }),
+  listTenants: () => api<Tenant[]>("/tenants"),
+  getTenant: (id: string) => api<Tenant>(`/tenants/${seg(id)}`),
   createTenant: (
     body: {
       name: string;
@@ -2622,10 +2617,7 @@ export const obleth = {
       method: "DELETE",
       headers: auditActorHeaders(options),
     }),
-  listKeys: (tenantId?: string) =>
-    api<ApiKey[]>(`/keys${qs({ tenant_id: tenantId })}`, {
-      next: { revalidate: LIST_REVALIDATE_SECS, tags: [CACHE_TAGS.keys] },
-    }),
+  listKeys: (tenantId?: string) => api<ApiKey[]>(`/keys${qs({ tenant_id: tenantId })}`),
   createKey: (
     tenantId: string,
     body: {
@@ -2730,14 +2722,8 @@ export const obleth = {
       method: "DELETE",
       headers: auditActorHeaders(options),
     }),
-  listModels: () =>
-    api<ModelRoute[]>("/models", {
-      next: { revalidate: LIST_REVALIDATE_SECS, tags: [CACHE_TAGS.models] },
-    }),
-  /** The model list uncached. Each dashboard replica has its own Data Cache,
-   *  and a tag revalidated on one doesn't reach the others, so a page that
-   *  must see a model created a moment ago (on any replica) reads this. */
-  listModelsFresh: () => api<ModelRoute[]>("/models"),
+  listModels: () => api<ModelRoute[]>("/models"),
+  getModel: (id: string) => api<ModelRoute>(`/models/${seg(id)}`),
   createModel: (
     body: ModelWriteFields & {
       model_name: string;
@@ -3072,8 +3058,8 @@ export const obleth = {
       method: "DELETE",
       headers: auditActorHeaders(options),
     }),
-  usage: (sinceMs?: number) =>
-    api<UsageAgg[]>(`/usage${qs({ since_ms: sinceMs })}`),
+  usage: (filter: UsageFilter = {}) =>
+    api<UsageAgg[]>(`/usage${usageQs(filter)}`),
   usageByKey: (sinceMs?: number, limit?: number) =>
     api<UsageKeyAgg[]>(`/usage/keys${qs({ since_ms: sinceMs, limit })}`),
   keyUsage: (id: string, sinceMs?: number) =>
@@ -3117,8 +3103,8 @@ export const obleth = {
       }));
     }
   },
-  usageByModel: (sinceMs?: number) =>
-    api<UsageModelAgg[]>(`/usage/models${qs({ since_ms: sinceMs })}`),
+  usageByModel: (filter: UsageFilter = {}) =>
+    api<UsageModelAgg[]>(`/usage/models${usageQs(filter)}`),
   usageSeries: (bucketMs = 300_000, sinceMs?: number) =>
     api<UsageTimePoint[]>(
       `/usage/series${qs({ bucket_ms: bucketMs, since_ms: sinceMs })}`,
@@ -3380,13 +3366,7 @@ export const obleth = {
         body: JSON.stringify(body),
       },
     ),
-  listCollections: () =>
-    api<KnowledgeCollection[]>("/knowledge/collections", {
-      next: {
-        revalidate: LIST_REVALIDATE_SECS,
-        tags: [CACHE_TAGS.knowledgeCollections],
-      },
-    }),
+  listCollections: () => api<KnowledgeCollection[]>("/knowledge/collections"),
   createCollection: (
     body: { name: string; description?: string; embedding_model: string },
     options?: AuditOptions,

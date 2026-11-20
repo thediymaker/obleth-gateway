@@ -19,7 +19,8 @@ export async function POST(req: NextRequest) {
   if (denied) return denied;
   try {
     const body = await req.json();
-    return NextResponse.json(await obleth.createCollection(body, { auditActor: session.email }));
+    const created = await obleth.createCollection(body, { auditActor: session.email });
+    return NextResponse.json(created);
   } catch (e) {
     return NextResponse.json({ error: String(e) }, { status: 502 });
   }
