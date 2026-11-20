@@ -40,7 +40,7 @@ serde = { version = "1", features = ["derive"] }
 # stable. Without it the gateway can shift a client's float by 1 ULP when it
 # re-serializes a rewritten body, and the compression codec silently declines to
 # compact any float-bearing JSON (its lossless self-check would otherwise fail).
-serde_json = { version = "1", features = ["float_roundtrip"] }
+serde_json = { version = "1", features = ["float_roundtrip", "raw_value"] }
 
 # datastores
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }

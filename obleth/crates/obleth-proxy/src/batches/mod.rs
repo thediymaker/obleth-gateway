@@ -104,6 +104,11 @@ const STORAGE_PAUSE_SECS: f64 = 30.0;
 /// Lines per page when streaming an output or error file.
 const OUTPUT_PAGE: i64 = 500;
 
+/// Bytes of stored answers one page reads at most (a page always has at
+/// least one line), so a batch of large answers, such as embeddings, streams
+/// in more, smaller pages instead of holding 500 of them at once.
+const OUTPUT_PAGE_BYTES: i64 = 8 << 20;
+
 /// How long the runner's claim on an item lasts without renewal. Leases are
 /// renewed every [`HOUSEKEEPING`], so a live runner has several chances; a
 /// dead one's items return to the queue this long after it stopped.
@@ -935,13 +940,17 @@ async fn output_page(
     which: BatchOutput,
     after: i32,
 ) -> Result<Option<(Bytes, Option<i32>)>, String> {
-    let rows = store
+    let mut rows = store
         .batch_output_rows(batch_id, which, after, OUTPUT_PAGE)
         .await
         .map_err(|e| e.to_string())?;
     if rows.is_empty() {
         return Ok(None);
     }
+    let full = rows.len() as i64 == OUTPUT_PAGE;
+    let fits = rows_within(&rows, OUTPUT_PAGE_BYTES);
+    let cut = fits < rows.len();
+    rows.truncate(fits);
     let keys: Vec<Option<String>> = rows
         .iter()
         .map(|r| {
@@ -969,19 +978,26 @@ async fn output_page(
         .buffered(FETCH_CONCURRENCY)
         .try_collect()
         .await?;
-    let next = (rows.len() as i64 == OUTPUT_PAGE)
-        .then(|| rows.last().map(|r| r.line))
-        .flatten();
-    let mut out = Vec::new();
+    let next = (full || cut).then(|| rows.last().map(|r| r.line)).flatten();
+    let size: usize = answers.iter().flatten().map(Bytes::len).sum();
+    let mut out = Vec::with_capacity(size + rows.len() * 160);
     for (row, answer) in rows.iter().zip(&answers) {
-        out.extend_from_slice(
-            output_line(batch_id, row, answer.as_deref())
-                .to_string()
-                .as_bytes(),
-        );
-        out.push(b'\n');
+        write_output_line(&mut out, batch_id, row, answer.as_deref());
     }
     Ok(Some((Bytes::from(out), next)))
+}
+
+/// How many of `rows`, from the first, a page holds: their stored answers
+/// total at most `max_bytes`, and there is always at least one.
+fn rows_within(rows: &[OutputRow], max_bytes: i64) -> usize {
+    let mut total = 0i64;
+    for (k, row) in rows.iter().enumerate() {
+        total += i64::from(row.response_bytes.unwrap_or(0).max(0));
+        if k > 0 && total > max_bytes {
+            return k;
+        }
+    }
+    rows.len()
 }
 
 /// obleth extension: `GET /v1/batches/{id}/results` streams the lines of the
@@ -1029,30 +1045,64 @@ fn jsonl_response(body: Body, filename: &str) -> Response<Body> {
 }
 
 /// One line of an output or error file, in the OpenAI shape, with the
-/// item's stored answer when it has one.
-pub(crate) fn output_line(
+/// item's stored answer when it has one; the fields in the order they always
+/// had (alphabetical).
+#[derive(serde::Serialize)]
+struct OutputLine<'a> {
+    custom_id: &'a str,
+    error: serde_json::Value,
+    id: String,
+    response: Option<OutputResponse<'a>>,
+}
+
+#[derive(serde::Serialize)]
+struct OutputResponse<'a> {
+    body: AnswerBody<'a>,
+    request_id: Option<String>,
+    status_code: i32,
+}
+
+/// A stored answer as it goes into its line.
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum AnswerBody<'a> {
+    /// The answer's bytes as the backend sent them, unparsed.
+    Stored(&'a serde_json::value::RawValue),
+    /// Anything else: re-written, or as a string when it is not JSON.
+    Value(serde_json::Value),
+}
+
+impl<'a> AnswerBody<'a> {
+    fn of(answer: Option<&'a [u8]>) -> Self {
+        let Some(b) = answer else {
+            return Self::Value(serde_json::Value::Null);
+        };
+        // A line of JSONL is one line, so only an answer without line breaks
+        // goes in as stored (JSON has them only as whitespace, which
+        // re-writing drops). Checking it is JSON builds nothing.
+        if !b.contains(&b'\n') && !b.contains(&b'\r') {
+            if let Ok(raw) = serde_json::from_slice::<&serde_json::value::RawValue>(b) {
+                return Self::Stored(raw);
+            }
+        }
+        Self::Value(
+            serde_json::from_slice(b)
+                .unwrap_or_else(|_| serde_json::Value::String(String::from_utf8_lossy(b).into())),
+        )
+    }
+}
+
+/// Append one line of an output or error file, with its newline, to `out`.
+pub(crate) fn write_output_line(
+    out: &mut Vec<u8>,
     batch_id: &str,
     row: &OutputRow,
     answer: Option<&[u8]>,
-) -> serde_json::Value {
-    let id = format!(
-        "batch_req_{}_{}",
-        batch_id.trim_start_matches("batch_"),
-        row.line
-    );
-    let response = row.response_status.map(|status| {
-        let body = answer
-            .map(|b| {
-                serde_json::from_slice::<serde_json::Value>(b).unwrap_or_else(|_| {
-                    serde_json::Value::String(String::from_utf8_lossy(b).into())
-                })
-            })
-            .unwrap_or(serde_json::Value::Null);
-        serde_json::json!({
-            "status_code": status,
-            "request_id": row.request_id.map(|r| r.to_string()),
-            "body": body,
-        })
+) {
+    let response = row.response_status.map(|status_code| OutputResponse {
+        body: AnswerBody::of(answer),
+        request_id: row.request_id.map(|r| r.to_string()),
+        status_code,
     });
     let error = if response.is_some() {
         serde_json::Value::Null
@@ -1062,12 +1112,19 @@ pub(crate) fn output_line(
             .and_then(|e| serde_json::from_str(e).ok())
             .unwrap_or_else(|| serde_json::json!({ "code": row.status, "message": row.status }))
     };
-    serde_json::json!({
-        "id": id,
-        "custom_id": row.custom_id,
-        "response": response,
-        "error": error,
-    })
+    let line = OutputLine {
+        custom_id: &row.custom_id,
+        error,
+        id: format!(
+            "batch_req_{}_{}",
+            batch_id.trim_start_matches("batch_"),
+            row.line
+        ),
+        response,
+    };
+    // Writing to a Vec cannot fail, and every part is serializable.
+    serde_json::to_writer(&mut *out, &line).expect("an output line serializes");
+    out.push(b'\n');
 }
 
 // ---- batches --------------------------------------------------------------
@@ -1766,9 +1823,10 @@ pub(crate) fn spawn_runner(
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut runnable = Runnable::default();
         loop {
             tokio::select! {
-                _ = tick.tick() => {}
+                _ = tick.tick() => runnable.expire(),
                 _ = finished.notified() => {}
                 _ = shutdown.changed() => {}
             }
@@ -1776,7 +1834,15 @@ pub(crate) fn spawn_runner(
                 tracing::info!("shutdown requested; batch runner claims no more work");
                 return;
             }
-            if let Err(e) = fill(&state, &batches, &owners, &in_flight, &finished).await {
+            let filled = fill(
+                &state,
+                &batches,
+                &owners,
+                &in_flight,
+                &finished,
+                &mut runnable,
+            );
+            if let Err(e) = filled.await {
                 tracing::warn!(error = %e, "batch runner could not claim work");
             }
         }
@@ -1863,6 +1929,43 @@ async fn clean_up(batches: &Batches) {
     }
 }
 
+/// The runnable batches as last read. An item finishing wakes the runner
+/// many times a second on a busy replica; those wakes reuse this list, and
+/// only the 1 s tick reads it again.
+#[derive(Default)]
+struct Runnable {
+    batches: Option<Vec<Arc<BatchRecord>>>,
+}
+
+impl Runnable {
+    fn expire(&mut self) {
+        self.batches = None;
+    }
+
+    /// The batches, read with `read` when the list has expired, leaving out
+    /// any whose deadline has passed since.
+    async fn get<F, Fut>(
+        &mut self,
+        read: F,
+    ) -> Result<Vec<Arc<BatchRecord>>, obleth_store::StoreError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<Vec<BatchRecord>, obleth_store::StoreError>>,
+    {
+        if self.batches.is_none() {
+            self.batches = Some(read().await?.into_iter().map(Arc::new).collect());
+        }
+        let now = Utc::now();
+        Ok(self
+            .batches
+            .iter()
+            .flatten()
+            .filter(|b| b.deadline_at > now)
+            .cloned()
+            .collect())
+    }
+}
+
 /// Claim work up to this replica's concurrency, spread evenly across the
 /// runnable batches (earliest deadline first), and start it.
 async fn fill(
@@ -1871,12 +1974,13 @@ async fn fill(
     owners: &moka::future::Cache<Uuid, Option<Arc<ResolvedKey>>>,
     in_flight: &Arc<Mutex<InFlight>>,
     finished: &Arc<tokio::sync::Notify>,
+    runnable: &mut Runnable,
 ) -> Result<(), obleth_store::StoreError> {
     let cfg = &batches.cfg;
     if in_flight.lock().unwrap().total >= cfg.concurrency {
         return Ok(());
     }
-    let runnable = batches.store.runnable_batches().await?;
+    let runnable = runnable.get(|| batches.store.runnable_batches()).await?;
     if runnable.is_empty() {
         return Ok(());
     }
@@ -1915,7 +2019,6 @@ async fn fill(
             continue;
         }
         in_flight.lock().unwrap().add(&batch.id, items.len());
-        let batch = Arc::new(batch);
         for item in items {
             let (state, batches, owners, in_flight, batch, finished) = (
                 state.clone(),
@@ -2466,6 +2569,152 @@ mod tests {
         assert!((5.0..=6.0).contains(&backoff(1)));
         assert!((10.0..=12.0).contains(&backoff(2)));
         assert!((300.0..=360.0).contains(&backoff(20)));
+    }
+
+    /// One output line, parsed.
+    fn output_line(batch_id: &str, row: &OutputRow, answer: Option<&[u8]>) -> serde_json::Value {
+        let mut out = Vec::new();
+        write_output_line(&mut out, batch_id, row, answer);
+        assert_eq!(out.iter().filter(|b| **b == b'\n').count(), 1, "one line");
+        serde_json::from_slice(&out).unwrap()
+    }
+
+    fn answered(line: i32, bytes: i32) -> OutputRow {
+        OutputRow {
+            line,
+            custom_id: format!("c{line}"),
+            status: "succeeded".into(),
+            response_status: Some(200),
+            response_bytes: Some(bytes),
+            attempts: 1,
+            error: None,
+            request_id: Some(Uuid::nil()),
+        }
+    }
+
+    /// An answer goes into its line as stored. A body re-written the old way
+    /// (parsed, keys sorted) reads the same where the backend already wrote
+    /// it compact with sorted keys; otherwise the stored bytes are kept, and
+    /// an answer with line breaks, or one that is not JSON, is handled as
+    /// before so the line stays one line.
+    #[test]
+    fn answers_go_into_their_lines_as_stored() {
+        let row = answered(7, 0);
+        let line = |answer: &[u8]| {
+            let mut out = Vec::new();
+            write_output_line(&mut out, "batch_x", &row, Some(answer));
+            String::from_utf8(out).unwrap()
+        };
+        let old = |body: &str| {
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "custom_id": "c7",
+                    "error": null,
+                    "id": "batch_req_x_7",
+                    "response": {
+                        "body": serde_json::from_str::<serde_json::Value>(body).unwrap(),
+                        "request_id": Uuid::nil().to_string(),
+                        "status_code": 200,
+                    },
+                })
+            )
+        };
+        let sorted =
+            r#"{"data":[{"embedding":[0.25,-1.5],"index":0}],"model":"e5","object":"list"}"#;
+        assert_eq!(line(sorted.as_bytes()), old(sorted));
+
+        let backend = r#"{"object":"list","data":[{"index":0,"embedding":[1e-7,0.1]}]}"#;
+        assert!(
+            line(backend.as_bytes()).contains(backend),
+            "the stored bytes"
+        );
+
+        let pretty = "{\n  \"b\": 1,\n  \"a\": 2\n}";
+        assert_eq!(
+            line(pretty.as_bytes()),
+            old(pretty),
+            "re-written onto one line"
+        );
+
+        let v: serde_json::Value = serde_json::from_str(&line(b"not json\n")).unwrap();
+        assert_eq!(v["response"]["body"], "not json\n");
+    }
+
+    /// A page stops at its byte budget as well as at its line count, and
+    /// always holds at least one line.
+    #[test]
+    fn a_page_of_large_answers_stops_at_its_bytes() {
+        let ten_mb = 10 << 20;
+        let rows: Vec<OutputRow> = (1..=5).map(|l| answered(l, ten_mb)).collect();
+        assert_eq!(rows_within(&rows, OUTPUT_PAGE_BYTES), 1);
+        let rows: Vec<OutputRow> = (1..=40).map(|l| answered(l, 1 << 20)).collect();
+        assert_eq!(rows_within(&rows, OUTPUT_PAGE_BYTES), 8);
+        let rows: Vec<OutputRow> = (1..=500).map(|l| answered(l, 2_000)).collect();
+        assert_eq!(rows_within(&rows, OUTPUT_PAGE_BYTES), 500);
+        let failed = OutputRow {
+            response_bytes: None,
+            ..answered(1, 0)
+        };
+        assert_eq!(rows_within(&[failed.clone(), failed], OUTPUT_PAGE_BYTES), 2);
+    }
+
+    fn batch_due(id: &str, deadline_at: DateTime<Utc>) -> BatchRecord {
+        BatchRecord {
+            id: id.into(),
+            tenant_id: Uuid::nil(),
+            key_id: Uuid::nil(),
+            model: "m".into(),
+            endpoint: "/v1/chat/completions".into(),
+            input_file_id: "file_in".into(),
+            output_file_id: None,
+            error_file_id: None,
+            completion_window: "24h".into(),
+            deadline_at,
+            status: "in_progress".into(),
+            total: 1,
+            completed: 0,
+            failed: 0,
+            last_progress_at: None,
+            metadata: None,
+            errors: None,
+            created_at: Utc::now(),
+            in_progress_at: None,
+            finalizing_at: None,
+            completed_at: None,
+            failed_at: None,
+            expired_at: None,
+            cancelling_at: None,
+            cancelled_at: None,
+        }
+    }
+
+    /// The runnable batches are read on the tick and reused on the wakes an
+    /// item finishing causes, without a batch whose deadline has passed.
+    #[tokio::test]
+    async fn the_runner_reads_its_batches_once_a_tick() {
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let later = Utc::now() + chrono::Duration::hours(1);
+        let earlier = Utc::now() - chrono::Duration::seconds(1);
+        let read = || async {
+            reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![
+                batch_due("batch_a", later),
+                batch_due("batch_b", earlier),
+            ])
+        };
+        let mut runnable = Runnable::default();
+        for _ in 0..3 {
+            let got = runnable.get(read).await.unwrap();
+            assert_eq!(
+                got.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(),
+                ["batch_a"]
+            );
+        }
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        runnable.expire();
+        runnable.get(read).await.unwrap();
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]
