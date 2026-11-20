@@ -4,6 +4,10 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
+## Unreleased
+
+- **A batch claim reads only the items it takes, and one replica moves batches on per tick.** Claiming a batch's next items used an index ordered by retry time before line, so each claim read and sorted every due pending item of the batch; on a 50,000-line batch that was the whole batch, every few seconds, per runner. Postgres migration `0047` indexes pending items by batch and line, so a claim reads the 64 rows it takes, and drops the old index. Every replica also recounted every item of every active batch every 3 seconds; the tick now runs on one replica at a time, under an advisory lock, and recounts only batches with an item finished since their last progress (found through a second new index).
+
 ## v2.13.0
 
 The review's first wave: usage reads share one bounded filter and agree on what a first token is, update bodies keep what they are not sent, the admin API refuses bad values instead of coercing them, the side endpoints and helper calls share one envelope and one set of limits, and the dashboard reaches every row of its long lists, says when a read failed, and passes the gateway's own errors through. No Postgres migrations; ClickHouse's daily rollup gains a column, applied when the gateway starts.

@@ -343,6 +343,20 @@ fn bind_owner<'q>(
 /// Rows per insert when copying a batch's lines into `batch_items`.
 const ITEM_CHUNK: usize = 1000;
 
+/// Claims a batch's next pending items in line order. `batch_items_pending_line_idx`
+/// returns them in that order, so it reads only the rows it takes.
+const CLAIM_ITEMS_SQL: &str = "update batch_items i
+     set status = 'running', lease_owner = $2,
+         lease_until = now() + make_interval(secs => $4),
+         attempts = i.attempts + 1
+     where (i.batch_id, i.line) in (
+         select batch_id, line from batch_items
+         where batch_id = $1 and status = 'pending' and next_attempt_at <= now()
+         order by line
+         limit $3
+         for update skip locked)
+     returning i.batch_id, i.line, i.custom_id, i.input_offset, i.input_length,
+               i.attempts";
 impl Store {
     // ---- files ------------------------------------------------------------
 
@@ -851,26 +865,13 @@ impl Store {
         limit: i64,
         lease_secs: i64,
     ) -> Result<Vec<ClaimedItem>> {
-        let rows = sqlx::query(
-            "update batch_items i
-             set status = 'running', lease_owner = $2,
-                 lease_until = now() + make_interval(secs => $4),
-                 attempts = i.attempts + 1
-             where (i.batch_id, i.line) in (
-                 select batch_id, line from batch_items
-                 where batch_id = $1 and status = 'pending' and next_attempt_at <= now()
-                 order by line
-                 limit $3
-                 for update skip locked)
-             returning i.batch_id, i.line, i.custom_id, i.input_offset, i.input_length,
-                       i.attempts",
-        )
-        .bind(batch_id)
-        .bind(instance)
-        .bind(limit.max(0))
-        .bind(lease_secs as f64)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = sqlx::query(CLAIM_ITEMS_SQL)
+            .bind(batch_id)
+            .bind(instance)
+            .bind(limit.max(0))
+            .bind(lease_secs as f64)
+            .fetch_all(&self.pool)
+            .await?;
         let mut items = rows
             .iter()
             .map(|r| {
@@ -1043,8 +1044,11 @@ impl Store {
         Ok(failed.rows_affected() + requeued.rows_affected())
     }
 
-    /// Recompute the counts of every active batch from its items:
-    /// `completed` is succeeded items, `failed` is failed and expired ones.
+    /// Recompute the counts of active batches from their items: `completed` is
+    /// succeeded items, `failed` is failed and expired ones. Only batches with
+    /// an item finished since a minute before their last progress are read: an
+    /// item's `finished_at` is its transaction's start, so one that commits
+    /// just after a recount can carry a slightly earlier time.
     pub async fn refresh_batch_counts(&self) -> Result<u64> {
         let done = sqlx::query(
             "update batches b set completed = c.ok, failed = c.bad, last_progress_at = c.last
@@ -1056,6 +1060,10 @@ impl Store {
                    from batch_items i
                    join batches a on a.id = i.batch_id
                    where a.status in ('in_progress', 'cancelling')
+                     and exists (select 1 from batch_items f
+                                 where f.batch_id = a.id and f.finished_at is not null
+                                   and f.finished_at > coalesce(a.last_progress_at, '-infinity')
+                                       - interval '1 minute')
                    group by i.batch_id) c
              where b.id = c.batch_id
                and (b.completed, b.failed, b.last_progress_at)
@@ -1070,11 +1078,21 @@ impl Store {
     /// refresh the counts of active batches, and give every active batch with
     /// nothing pending or running its final status, with its output and
     /// error files. `new_file_id` mints file ids. Returns the batches that
-    /// reached a final status.
+    /// reached a final status. One replica advances at a time: another that
+    /// ticks meanwhile returns at once with nothing.
     pub async fn advance_batches(
         &self,
         new_file_id: &(dyn Fn() -> String + Send + Sync),
     ) -> Result<Vec<FinishedBatch>> {
+        // Held until `turn` ends, committed or dropped.
+        let mut turn = self.pool.begin().await?;
+        let ours: bool = sqlx::query_scalar("select pg_try_advisory_xact_lock($1)")
+            .bind(crate::BATCH_ADVANCE_LOCK_KEY)
+            .fetch_one(&mut *turn)
+            .await?;
+        if !ours {
+            return Ok(Vec::new());
+        }
         // Expire the queue of every batch past its deadline.
         sqlx::query(
             "update batch_items i
@@ -1115,6 +1133,7 @@ impl Store {
                 finished.push(done);
             }
         }
+        turn.commit().await?;
         Ok(finished)
     }
 
@@ -1417,6 +1436,94 @@ mod tests {
         let finished = upload(&store, owner, &uid("file"), 1).await;
         assert_eq!(store.abandon_batch_file(&finished.id).await.unwrap(), None);
         store.delete_batch_file_row(&failed).await.unwrap();
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_claim_reads_pending_items_in_line_order_from_the_index() {
+        let _g = serial().lock().await;
+        let Some(store) = store().await else {
+            return;
+        };
+        let owner = JobOwner::key(Uuid::new_v4(), Uuid::new_v4());
+        let batch = make_batch(
+            &store,
+            owner,
+            50_000,
+            Utc::now() + chrono::Duration::hours(1),
+        )
+        .await;
+        sqlx::query("analyze batch_items")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let plan: Vec<String> = sqlx::query_scalar(&format!("explain {CLAIM_ITEMS_SQL}"))
+            .bind(&batch.id)
+            .bind("gw-a")
+            .bind(64_i64)
+            .bind(60.0_f64)
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+        let plan = plan.join("\n");
+        assert!(plan.contains("batch_items_pending_line_idx"), "{plan}");
+        assert!(!plan.contains("Sort"), "{plan}");
+        let claimed = store
+            .claim_batch_items(&batch.id, "gw-a", 64, 60)
+            .await
+            .unwrap();
+        assert_eq!(claimed.first().map(|i| i.line), Some(0));
+        assert_eq!(claimed.len(), 64);
+        sqlx::query("delete from batches where id = $1")
+            .bind(&batch.id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn one_replica_advances_batches_at_a_time() {
+        let _g = serial().lock().await;
+        let Some(store) = store().await else {
+            return;
+        };
+        let owner = JobOwner::key(Uuid::new_v4(), Uuid::new_v4());
+        let batch = make_batch(&store, owner, 1, Utc::now() + chrono::Duration::hours(1)).await;
+        let item = store
+            .claim_batch_items(&batch.id, "gw-a", 1, 60)
+            .await
+            .unwrap();
+        assert!(store
+            .complete_batch_item(&batch.id, item[0].line, "gw-a", 200, 2, Uuid::new_v4())
+            .await
+            .unwrap());
+        // Another replica is advancing: this one does nothing this tick.
+        let mut other = store.pool.acquire().await.unwrap();
+        sqlx::query("select pg_advisory_lock($1)")
+            .bind(crate::BATCH_ADVANCE_LOCK_KEY)
+            .execute(&mut *other)
+            .await
+            .unwrap();
+        assert!(store
+            .advance_batches(&|| uid("file"))
+            .await
+            .unwrap()
+            .is_empty());
+        let b = store.get_batch(&batch.id, owner).await.unwrap().unwrap();
+        assert_eq!((b.status.as_str(), b.completed), ("in_progress", 0));
+        sqlx::query("select pg_advisory_unlock($1)")
+            .bind(crate::BATCH_ADVANCE_LOCK_KEY)
+            .execute(&mut *other)
+            .await
+            .unwrap();
+        // Its turn: the batch finishes with its count.
+        let done = store.advance_batches(&|| uid("file")).await.unwrap();
+        assert!(done
+            .iter()
+            .any(|d| d.id == batch.id && d.status == "completed"));
+        let b = store.get_batch(&batch.id, owner).await.unwrap().unwrap();
+        assert_eq!(b.completed, 1);
     }
 
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.

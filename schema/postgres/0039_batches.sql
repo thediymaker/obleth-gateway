@@ -99,7 +99,6 @@ create table if not exists batch_items (
     primary key (batch_id, line)
 );
 
-create index if not exists batch_items_pending_idx
-    on batch_items (batch_id, next_attempt_at, line) where status = 'pending';
+-- The pending-items index is batch_items_pending_line_idx, from 0047.
 create index if not exists batch_items_running_idx
     on batch_items (lease_until) where status = 'running';

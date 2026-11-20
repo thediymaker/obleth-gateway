@@ -121,6 +121,7 @@ const SCHEMA_V44: &str = include_str!("../../../../schema/postgres/0044_key_pref
 const SCHEMA_V45: &str =
     include_str!("../../../../schema/postgres/0045_api_key_allowed_countries.sql");
 const SCHEMA_V46: &str = include_str!("../../../../schema/postgres/0046_batch_object_storage.sql");
+const SCHEMA_V47: &str = include_str!("../../../../schema/postgres/0047_batch_item_indexes.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -128,6 +129,8 @@ const MIGRATE_LOCK_KEY: i64 = 0x0B1E_7480_0001;
 /// Advisory-lock key serializing reserved control-plane identity provisioning
 /// across racing replicas (distinct from `MIGRATE_LOCK_KEY`).
 const CONTROL_PLANE_LOCK_KEY: i64 = 0x0B1E_7480_0002;
+/// Advisory-lock key letting one replica at a time advance batches.
+const BATCH_ADVANCE_LOCK_KEY: i64 = 0x0B1E_7480_0003;
 
 pub struct Recipe {
     pub id: Uuid,
@@ -309,6 +312,7 @@ impl Store {
             sqlx::raw_sql(SCHEMA_V44).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V45).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V46).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V47).execute(&mut *conn).await?;
             Ok(())
         }
         .await;
