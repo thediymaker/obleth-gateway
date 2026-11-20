@@ -1,3 +1,4 @@
+import { cache } from "react";
 import { headers } from "next/headers";
 import { auth } from "@/lib/auth/better-auth";
 
@@ -9,7 +10,11 @@ export interface SessionUser {
   tenantId: string | null;
 }
 
-export async function getSession(): Promise<SessionUser | null> {
+/**
+ * The signed-in user. Memoised per request: a layout and its page both ask,
+ * and each ask was a Postgres read.
+ */
+export const getSession = cache(async (): Promise<SessionUser | null> => {
   const res = await auth.api.getSession({ headers: await headers() });
   if (!res?.user) return null;
   const u = res.user as Record<string, unknown>;
@@ -20,7 +25,7 @@ export async function getSession(): Promise<SessionUser | null> {
     status: (u.status as "pending" | "active") ?? "pending",
     tenantId: (u.tenantId as string | null) ?? null,
   };
-}
+});
 
 /**
  * Authorize the current request. Server Actions are POST routes that the Next.js

@@ -23,15 +23,17 @@ export interface LatestRelease {
 
 /**
  * Latest published GitHub release, or null when the check is unavailable
- * (no release yet, rate-limited, or an air-gapped install). Cached for an
+ * (no release yet, rate-limited, no answer in 3 s, or an air-gapped install). Cached for an
  * hour via the Data Cache so the unauthenticated rate limit is never an
  * issue.
  */
 export async function fetchLatestRelease(): Promise<LatestRelease | null> {
   try {
+    // Short: an air-gapped install must not hold the page on GitHub.
     const res = await fetch(RELEASES_URL, {
       headers: { Accept: "application/vnd.github+json" },
       next: { revalidate: 3600 },
+      signal: AbortSignal.timeout(3_000),
     });
     if (!res.ok) return null;
     const release = await res.json();

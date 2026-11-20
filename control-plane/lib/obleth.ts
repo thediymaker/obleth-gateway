@@ -2355,7 +2355,21 @@ export class OblethApiError extends Error {
 
 /** Next.js fetch caching options accepted alongside a standard RequestInit. */
 type NextFetchOptions = { revalidate?: number | false; tags?: string[] };
-type ApiInit = RequestInit & { next?: NextFetchOptions };
+type ApiInit = RequestInit & {
+  next?: NextFetchOptions;
+  /** Overrides the default time limit (see `API_TIMEOUT_MS`). */
+  timeoutMs?: number;
+};
+
+/**
+ * How long the dashboard waits for the Management API before it gives up, so
+ * a stalled gateway shows a fallback or an error instead of hanging a page.
+ * Reads get just over the gateway's own 30 s cap on a ClickHouse read
+ * (`READ_MAX_EXECUTION_SECS`), so no read the gateway allows is cut short;
+ * writes run checks and side effects; `long` is for operations that walk
+ * every model or move a whole configuration.
+ */
+export const API_TIMEOUT_MS = { read: 35_000, write: 120_000, long: 600_000 } as const;
 interface AuditOptions {
   auditActor?: string | null;
 }
@@ -2367,9 +2381,14 @@ function auditActorHeaders(options?: AuditOptions): Record<string, string> {
 }
 
 async function api<T>(path: string, init?: ApiInit): Promise<T> {
-  const { next, cache, headers, ...rest } = init ?? {};
+  const { next, cache, headers, timeoutMs, ...rest } = init ?? {};
+  const limit =
+    timeoutMs ??
+    ((rest.method ?? "GET").toUpperCase() === "GET" ? API_TIMEOUT_MS.read : API_TIMEOUT_MS.write);
+  const timeout = AbortSignal.timeout(limit);
   const fetchInit: ApiInit = {
     ...rest,
+    signal: timeout,
     headers: {
       Authorization: `Bearer ${adminToken()}`,
       "Content-Type": "application/json",
@@ -2382,6 +2401,24 @@ async function api<T>(path: string, init?: ApiInit): Promise<T> {
   if (next) fetchInit.next = next;
   else fetchInit.cache = cache ?? "no-store";
 
+  try {
+    return await send<T>(path, fetchInit);
+  } catch (e) {
+    // The time limit reads as the gateway not answering, which `safe()`
+    // turns into its fallback.
+    if (timeout.aborted) {
+      throw new OblethApiError(
+        504,
+        `The gateway did not answer in ${Math.round(limit / 1000)} s.`,
+        path,
+      );
+    }
+    throw e;
+  }
+}
+
+/** One Management API call: the response body, or an `OblethApiError`. */
+async function send<T>(path: string, fetchInit: ApiInit): Promise<T> {
   const res = await fetch(`${BASE}/api/v1${path}`, fetchInit);
   if (!res.ok) {
     const text = await res.text().catch(() => "");
@@ -2814,7 +2851,10 @@ export const obleth = {
       headers: auditActorHeaders(options),
     }),
   checkAllModelHealth: () =>
-    api<BulkModelHealthResult>("/models/health/check", { method: "POST" }),
+    api<BulkModelHealthResult>("/models/health/check", {
+      method: "POST",
+      timeoutMs: API_TIMEOUT_MS.long,
+    }),
   setModelHealthConfig: (
     id: string,
     body: ModelHealthConfigBody,
@@ -2907,6 +2947,7 @@ export const obleth = {
   ) =>
     api<AutotuneReport>(`/models/${seg(id)}/autotune`, {
       method: "POST",
+      timeoutMs: API_TIMEOUT_MS.long,
       headers: auditActorHeaders(options),
       body: JSON.stringify(opts ?? {}),
     }),
@@ -3253,6 +3294,7 @@ export const obleth = {
   resync: (options?: AuditOptions) =>
     api<ResyncReport>("/resync", {
       method: "POST",
+      timeoutMs: API_TIMEOUT_MS.long,
       headers: auditActorHeaders(options),
     }),
   stats: () => api<LiveStats>("/stats"),
@@ -3381,17 +3423,20 @@ export const obleth = {
     api<SlurmHealthView>("/settings/slurm/test", { method: "POST" }),
   exportBackup: (options?: AuditOptions) =>
     api<ConfigBackup>("/backup/export", {
+      timeoutMs: API_TIMEOUT_MS.long,
       headers: auditActorHeaders(options),
     }),
   restoreBackup: (body: ConfigBackup, options?: AuditOptions) =>
     api<RestoreReport>("/backup/restore", {
       method: "POST",
+      timeoutMs: API_TIMEOUT_MS.long,
       headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
   /** The model manifest; `names` limits it to those models (unknown names are skipped). */
   exportModels: (names: string[] = [], options?: AuditOptions) =>
     api<ModelManifest>(`/models/export${qs({ names: names.length ? names.join(",") : undefined })}`, {
+      timeoutMs: API_TIMEOUT_MS.long,
       headers: auditActorHeaders(options),
     }),
   importModels: (
@@ -3402,6 +3447,7 @@ export const obleth = {
       `/models/import?dry_run=${opts.dryRun ? "true" : "false"}`,
       {
         method: "POST",
+        timeoutMs: API_TIMEOUT_MS.long,
         headers: auditActorHeaders(opts),
         body: JSON.stringify(body),
       },
@@ -3452,6 +3498,7 @@ export const obleth = {
       `/knowledge/collections/${seg(collectionId)}/documents`,
       {
         method: "POST",
+        timeoutMs: API_TIMEOUT_MS.long,
         headers: auditActorHeaders(options),
         body: JSON.stringify(body),
       },
@@ -3464,6 +3511,7 @@ export const obleth = {
   reindexCollection: (id: string, options?: AuditOptions) =>
     api<KnowledgeReindexResult>(`/knowledge/collections/${seg(id)}/reindex`, {
       method: "POST",
+      timeoutMs: API_TIMEOUT_MS.long,
       headers: auditActorHeaders(options),
     }),
   reindexDocument: (id: string, options?: AuditOptions) =>
