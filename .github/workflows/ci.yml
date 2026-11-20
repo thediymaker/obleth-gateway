@@ -49,7 +49,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
         with:
-          toolchain: stable
+          # Matches rust-toolchain.toml and the builder images (rust:1.95-slim).
+          toolchain: "1.95"
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -59,7 +60,7 @@ jobs:
         run: cargo fmt --check
       - name: clippy
         working-directory: obleth
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: object store for the batch tests
         run: |
           printf '%s' '{"identities":[{"name":"ci","credentials":[{"accessKey":"obleth-test","secretKey":"obleth-test-secret"}],"actions":["Admin","Read","Write","List"]}]}' > "$RUNNER_TEMP/s3.json"
@@ -71,7 +72,7 @@ jobs:
             --user obleth-test:obleth-test-secret http://127.0.0.1:8333/obleth-test
       - name: test
         working-directory: obleth
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
   benchmark-backend:
     runs-on: ubuntu-latest
@@ -79,7 +80,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
         with:
-          toolchain: stable
+          toolchain: "1.95"
           components: rustfmt
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -88,7 +89,7 @@ jobs:
         working-directory: benchmark-backend
         run: cargo fmt --check
       - working-directory: benchmark-backend
-        run: cargo build --release
+        run: cargo check --locked
 
   obench:
     runs-on: ubuntu-latest
@@ -96,7 +97,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
         with:
-          toolchain: stable
+          toolchain: "1.95"
           components: rustfmt
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -105,9 +106,7 @@ jobs:
         working-directory: obench
         run: cargo fmt --check
       - working-directory: obench
-        run: cargo test
-      - working-directory: obench
-        run: cargo build --release
+        run: cargo test --locked
 
   control-plane:
     runs-on: ubuntu-latest
@@ -131,7 +130,9 @@ jobs:
         with:
           python-version: "3.12"
       - name: install test deps
-        run: pip install fastapi "uvicorn[standard]" pydantic pytest httpx
+        # The serving deps with requirements.txt's bounds, plus the test tools;
+        # not the full requirements (no onnxruntime: the tests stub the model).
+        run: pip install "fastapi>=0.111,<1.0" "uvicorn[standard]>=0.30,<1.0" "pydantic>=2.7,<3.0" "pytest>=8,<10" "httpx>=0.27,<1.0"
       - name: test
         working-directory: compressor
         run: python -m pytest -q

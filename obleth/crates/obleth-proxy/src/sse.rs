@@ -308,7 +308,8 @@ impl UsageRewriter {
             }
         } else {
             // Stripping reads any body as events; only a stream is stamped.
-            if !strip && !(stamp && sse) {
+            let rewrites = strip || (stamp && sse);
+            if !rewrites {
                 return None;
             }
             Body::Sse(Splitter::new(USAGE_MAX_EVENT))

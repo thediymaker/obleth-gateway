@@ -1,0 +1,7 @@
+# The Rust release CI and local builds use. Keep it on the same release as the
+# builder images (rust:1.95-slim in deploy/docker/*.Dockerfile) and bump both
+# together: clippy runs with -D warnings, so a newer toolchain can add lints.
+[toolchain]
+channel = "1.95"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

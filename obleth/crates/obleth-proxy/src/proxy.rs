@@ -739,6 +739,8 @@ fn backfill_max_tokens_for_count_tokens(incoming: &mut serde_json::Value) {
 /// Auth, gate, body read and translation shared by `messages_shim` and
 /// `count_tokens_shim`. `count_tokens` is true only for the latter — see
 /// `backfill_max_tokens_for_count_tokens`.
+// The error is a finished response, like `gate_resolved_key`'s.
+#[allow(clippy::result_large_err)]
 async fn messages_front(
     state: &AppState,
     req: Request<Body>,
@@ -4218,7 +4220,7 @@ async fn release_term_hold(
     };
     if let Err(e) = state
         .redis
-        .term_reconcile(&scope, period, est.total() as i64, est_cost, 0, 0.0)
+        .term_reconcile(scope, period, est.total() as i64, est_cost, 0, 0.0)
         .await
     {
         tracing::warn!(error = %e, "term reservation release failed");
@@ -4924,6 +4926,8 @@ pub(crate) fn union_candidate_tags(
 /// `auto`), then cheap heuristics, then a neutral default. Every fallback
 /// lowers difficulty rather than raising it, so a slow or broken brain makes
 /// routing cheaper and never silently more expensive.
+// Each argument is one independent input to the routing decision.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn derive_intent(
     state: &AppState,
     json: &serde_json::Value,
@@ -7152,7 +7156,6 @@ fn recorded_ttft(streamed: bool, ttft_ms: u32) -> u32 {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 /// How a request came out, for its ledger row: everything `finalize` records
 /// beyond the request's identity. `Default` is a request that produced
 /// nothing and cost nothing; a refusal sets its status, time and class.
@@ -7210,6 +7213,7 @@ pub(crate) fn reject(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn finalize(
     state: &AppState,
     request_id: Uuid,
@@ -7308,19 +7312,6 @@ fn cached_response(cached: obleth_config::CachedResponse, request_id: Uuid) -> R
         })
 }
 
-/// Post-auth key/tenant gates shared by the passthrough pipeline and native
-/// endpoints (e.g. `/v1/verdicts`): key disabled, the key's allowed networks,
-/// tenant lifecycle status, the activation/expiry/weekly schedule window, and
-/// the near-expiry operator alert. Internal probe keys bypass tenant lifecycle
-/// gating. Every data-plane surface that authenticates a credential calls
-/// this right after `authenticate_credential`, with the client the request
-/// came from; a refusal of a real key for being disabled or used from outside
-/// its networks is recorded in the `key_rejections` ledger (folded per key,
-/// address and reason, so a hammering client costs nothing extra).
-// The error is the finished response every caller returns as-is
-// (`return resp`); boxing it would push a deref into each call site for a
-// rejection path that is cold anyway.
-#[allow(clippy::result_large_err)]
 /// The request id every answer of an endpoint carries, on a response that
 /// did not set one itself.
 pub(crate) fn with_request_id(mut resp: Response<Body>, request_id: Uuid) -> Response<Body> {
@@ -7421,6 +7412,8 @@ pub(crate) struct Admitted {
 /// keeps sessions, the `admission` span when traced, and one refusal shape
 /// when the wait runs out (`on_timeout` records the rejection) or the
 /// scheduler is gone.
+// The error is a finished response, like `gate_resolved_key`'s.
+#[allow(clippy::result_large_err)]
 pub(crate) async fn admit(
     state: &AppState,
     spec: Admit<'_>,
@@ -7516,6 +7509,19 @@ pub(crate) async fn admit(
     })
 }
 
+/// Post-auth key/tenant gates shared by the passthrough pipeline and native
+/// endpoints (e.g. `/v1/verdicts`): key disabled, the key's allowed networks,
+/// tenant lifecycle status, the activation/expiry/weekly schedule window, and
+/// the near-expiry operator alert. Internal probe keys bypass tenant lifecycle
+/// gating. Every data-plane surface that authenticates a credential calls
+/// this right after `authenticate_credential`, with the client the request
+/// came from; a refusal of a real key for being disabled or used from outside
+/// its networks is recorded in the `key_rejections` ledger (folded per key,
+/// address and reason, so a hammering client costs nothing extra).
+// The error is the finished response every caller returns as-is
+// (`return resp`); boxing it would push a deref into each call site for a
+// rejection path that is cold anyway.
+#[allow(clippy::result_large_err)]
 pub(crate) fn gate_resolved_key(
     state: &AppState,
     resolved: &ResolvedKey,
@@ -11891,8 +11897,9 @@ mod lifecycle_tests {
             .filter(|&at| {
                 let before = rest[..at].chars().next_back().unwrap_or(' ');
                 let after = rest[at + 4..].chars().next().unwrap_or(' ');
-                !(before.is_alphanumeric() || before == '_' || before == '/')
-                    && !(after.is_alphanumeric() || after == '_' || after == '!')
+                let word_before = before.is_alphanumeric() || before == '_' || before == '/';
+                let word_after = after.is_alphanumeric() || after == '_' || after == '!';
+                !word_before && !word_after
             })
             .collect();
         assert!(

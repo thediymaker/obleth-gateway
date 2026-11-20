@@ -5,6 +5,11 @@ name: release
 # GitHub Release whose notes are the version's CHANGELOG.md section (generated
 # notes when there is none). Prerelease tags (vX.Y.Z-rc.N) publish images +
 # chart but skip the :latest tag and mark the release as a prerelease.
+#
+# The amd64 images are not rebuilt when docker-edge (docker.yml) already built
+# the tagged commit: a release tags a commit already on dev, so the build job
+# re-tags the :dev or :main image whose revision label is the tag's commit,
+# and builds only when neither is.
 on:
   push:
     tags: ["v*.*.*"]
@@ -58,6 +63,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      actions: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
@@ -66,9 +72,44 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # The commit time, as docker.yml stamps it, so a rebuilt image and a
+      # re-tagged edge image report the same build timestamp.
       - id: meta
-        run: echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
-      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        run: echo "built_at=$(TZ=UTC git log -1 --date=format-local:%Y-%m-%dT%H:%M:%SZ --format=%cd)" >> "$GITHUB_OUTPUT"
+      # Edge builds are amd64 only. Wait for any docker-edge run of this commit
+      # still in flight, then re-tag the edge image built from it, checked by
+      # its org.opencontainers.image.revision label. Anything else (no such
+      # image, a label for another commit, an inspect error) falls through to
+      # the build below.
+      - id: reuse
+        if: matrix.arch == 'amd64'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE: ${{ env.REGISTRY }}/${{ matrix.component }}
+        run: |
+          for run in $(gh run list -R "$GITHUB_REPOSITORY" --workflow docker.yml \
+              --commit "$GITHUB_SHA" --json databaseId,status \
+              --jq '.[] | select(.status != "completed") | .databaseId' || true); do
+            gh run watch -R "$GITHUB_REPOSITORY" "$run" --interval 30 > /dev/null || true
+          done
+          for edge in dev main; do
+            digest="$(docker buildx imagetools inspect "$IMAGE:$edge" \
+              --format '{{json .Manifest}}' | jq -r '.digest')" || continue
+            revision="$(docker buildx imagetools inspect "$IMAGE@$digest" \
+              --format '{{json .Image}}' | jq -r '
+                (if has("config") then . else (.["linux/amd64"] // {}) end)
+                | .config.Labels["org.opencontainers.image.revision"] // empty')" || continue
+            if [ "$revision" = "$GITHUB_SHA" ] && docker buildx imagetools create \
+                -t "$IMAGE:$GITHUB_REF_NAME-${{ matrix.arch }}" "$IMAGE@$digest"; then
+              echo "re-tagged $IMAGE:$edge ($digest), built from $GITHUB_SHA"
+              echo "reused=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "$IMAGE:$edge is ${revision:-unlabelled}, not $GITHUB_SHA"
+          done
+          echo "no edge image of $GITHUB_SHA; building"
+      - if: steps.reuse.outputs.reused != 'true'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: ${{ matrix.context }}
           file: deploy/docker/${{ matrix.component }}.Dockerfile

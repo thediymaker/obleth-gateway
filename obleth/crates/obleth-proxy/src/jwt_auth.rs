@@ -414,6 +414,8 @@ pub(crate) fn credential_route(jwt_enabled: bool, secret: &str) -> Route {
 /// the feature is on and the credential looks like a JWT, else the secret-key
 /// path (`hash_api_key` -> `try_resolve_key`, byte-for-byte unchanged). Every
 /// failure returns the same response the caller would have built inline.
+// The error is a finished response, like `proxy::gate_resolved_key`'s.
+#[allow(clippy::result_large_err)]
 pub(crate) async fn authenticate_credential(
     state: &AppState,
     secret: &str,

@@ -1,20 +1,31 @@
 # Build context must be the repo root (mirrors obleth.Dockerfile's context so the
 # two builds are interchangeable). The provisioner doesn't read schema/, but we
 # keep the COPY to keep the build context identical and harmless.
-FROM rust:1.95-slim AS builder
-WORKDIR /app
+#
+# Dependencies compile in their own layer (cargo-chef), as in obleth.Dockerfile:
+# a source-only change reuses the cooked layer.
+FROM rust:1.95-slim AS chef
+WORKDIR /app/obleth
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
     && rm -rf /var/lib/apt/lists/*
-COPY schema ./schema
-COPY obleth ./obleth
-WORKDIR /app/obleth
+RUN cargo install cargo-chef --locked --version 0.1.78
+
+FROM chef AS planner
+COPY obleth ./
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+COPY --from=planner /app/obleth/recipe.json recipe.json
+RUN cargo chef cook --release --locked --recipe-path recipe.json --bin obleth-provisioner
+COPY schema /app/schema
+COPY obleth ./
 # Release builds inject the commit + timestamp, reported to the gateway on each
 # poll and shown on the dashboard's Slurm connection (Deployments). Must be set before cargo build:
 # option_env! reads them at compile time.
 ARG GIT_SHA
 ARG BUILD_TIMESTAMP
 ENV OBLETH_BUILD_SHA=$GIT_SHA OBLETH_BUILD_TIMESTAMP=$BUILD_TIMESTAMP
-RUN cargo build --release --bin obleth-provisioner
+RUN cargo build --release --locked --bin obleth-provisioner
 
 FROM debian:bookworm-slim AS runtime
 LABEL org.opencontainers.image.source="https://github.com/thediymaker/obleth-gateway"

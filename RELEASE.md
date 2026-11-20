@@ -48,8 +48,13 @@ Pushing the tag triggers `.github/workflows/release.yml`, which:
 
 1. **verify** — fails fast if the tag doesn't match the version in the files
    (`scripts/check-versions.sh`).
-2. **build** — builds each component natively on amd64 and arm64 runners
-   (never QEMU) and pushes per-arch tags.
+2. **build** — pushes per-arch tags for each component. arm64 builds
+   natively on an arm64 runner (never QEMU). amd64 re-tags the `:dev` or
+   `:main` edge image built from the tagged commit (it waits for an edge
+   build of that commit still running, and checks the image's
+   `org.opencontainers.image.revision` label against the tag's commit), and
+   builds only when no edge image matches. Builds stamp the commit time as
+   the build timestamp, so either way `/api/v1/version` reports the same.
 3. **manifest** — merges them into multi-arch `:vX.Y.Z` and `:latest` tags.
 4. **helm** — packages and pushes the chart to
    `oci://ghcr.io/thediymaker/charts/obleth`.

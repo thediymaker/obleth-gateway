@@ -4371,10 +4371,10 @@ impl Scheduler {
                 let idx = (self.cursor + i) % n;
                 // Most pools have nothing queued: skip them before working
                 // out what they may fill.
-                if !self
+                if self
                     .pools
                     .get(&self.pool_order[idx])
-                    .is_some_and(|p| p.queued_total > 0)
+                    .is_none_or(|p| p.queued_total == 0)
                 {
                     continue;
                 }
@@ -5198,11 +5198,11 @@ mod tests {
             2,
             "it went back in line under its new tenant"
         );
-        assert!(!sim
+        assert!(sim
             .pool
             .queues
             .get(&old)
-            .is_some_and(|q| q.key_len(&moved) > 0));
+            .is_none_or(|q| q.key_len(&moved) == 0));
     }
 
     /// Shared mode: a key moved away and back while its claims were out does
@@ -5423,7 +5423,7 @@ mod tests {
         }
         sim.pool
             .track_meta(&AdmitRequest::new(b, "m", 100).key(moved, 100));
-        assert!(!sim.pool.queues.get(&b).is_some_and(|q| !q.is_empty()));
+        assert!(sim.pool.queues.get(&b).is_none_or(|q| q.is_empty()));
         sim.pool.requeue(claim);
         let standing = |t: Uuid| sim.pool.served[&t] / sim.pool.tenant_weight[&t] as f64;
         assert!(
