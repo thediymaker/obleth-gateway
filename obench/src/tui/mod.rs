@@ -21,6 +21,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use crate::admin::AdminClient;
 use crate::cli::{Cli, Profile, Scope, Target};
 use crate::engine::fleet;
+use crate::engine::stats::{Summary, Tails};
 
 // ── TUI wizard ────────────────────────────────────────────────────────────────
 //
@@ -1168,6 +1169,10 @@ async fn run_dashboard(
     let mut last_completed: u64 = 0;
     // Whether the user asked to quit vs. the engine finishing on its own.
     let mut user_quit = false;
+    // Percentiles cost a sort of every sample; they are refreshed at most
+    // once a second, from a copy sorted outside the lock the workers need.
+    let mut tails = Tails::default();
+    let mut tails_at: Option<Instant> = None;
 
     loop {
         // Refresh fairshare roughly every 2 s — only when obench owns the local
@@ -1180,13 +1185,21 @@ async fn run_dashboard(
             last_live_refresh = Instant::now();
         }
 
-        let summary = {
+        let refresh_tails = tails_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(1));
+        let (counts, samples) = {
             let s = stats.lock().unwrap();
-            s.summarize(
-                started.elapsed().as_secs_f64().max(1.0),
-                plan.max_error_rate,
-            )
+            (s.counts(), refresh_tails.then(|| s.samples()))
         };
+        if let Some(samples) = samples {
+            tails = samples.tails();
+            tails_at = Some(Instant::now());
+        }
+        let summary = Summary::new(
+            counts,
+            tails,
+            started.elapsed().as_secs_f64().max(1.0),
+            plan.max_error_rate,
+        );
 
         // Sample instantaneous req/s once per second.
         if last_sample.elapsed() >= Duration::from_secs(1) {

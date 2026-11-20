@@ -172,6 +172,7 @@ impl LoadClient {
         let status = resp.status().as_u16();
         let mut ttfb_ms = 0u64;
         let mut text = String::new();
+        let mut sse = usage::SseReader::default();
         let mut gaps_ms: Vec<u64> = Vec::new();
         let mut last_chunk_at: Option<Instant> = None;
         let mut stream = resp.bytes_stream();
@@ -187,7 +188,11 @@ impl LoadClient {
                         }
                     }
                     last_chunk_at = Some(now);
-                    text.push_str(&String::from_utf8_lossy(&bytes));
+                    if req.stream {
+                        sse.feed(&bytes);
+                    } else {
+                        text.push_str(&String::from_utf8_lossy(&bytes));
+                    }
                 }
                 Err(_) => break,
             }
@@ -209,14 +214,14 @@ impl LoadClient {
             };
         }
 
-        let parsed = if req.stream {
-            usage::from_sse(&text)
+        let reply = if req.stream {
+            sse.finish()
         } else {
             usage::from_json(&text)
         };
-        let (u, estimated) = match parsed {
+        let (u, estimated) = match reply.usage {
             Some(u) => (u, false),
-            None => (usage::estimate(req.input_tokens, text.len()), true),
+            None => (usage::estimate(req.input_tokens, reply.content_chars), true),
         };
         RequestOutcome {
             status,

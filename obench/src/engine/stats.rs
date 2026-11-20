@@ -86,27 +86,78 @@ pub fn is_stall(consecutive_zeros: u32, threshold: u32, conc: u32, stopped: bool
     !stopped && conc > 0 && consecutive_zeros >= threshold
 }
 
-/// Nearest-rank percentile over an unsorted slice. Matches the .mjs harness.
-pub fn percentile(values: &[u64], p: f64) -> u64 {
-    if values.is_empty() {
-        return 0;
+/// Nearest-rank percentile over samples sorted ascending. Matches the .mjs harness.
+fn nearest_rank<T: Copy + Default>(sorted: &[T], p: f64) -> T {
+    if sorted.is_empty() {
+        return T::default();
     }
-    let mut sorted = values.to_vec();
-    sorted.sort_unstable();
     let idx = ((p / 100.0) * sorted.len() as f64).floor() as usize;
     sorted[idx.min(sorted.len() - 1)]
 }
 
-/// Nearest-rank percentile over unsorted f64 samples. Samples are NaN-free by
-/// construction (finite tokens over a positive-ms window), so total order holds.
-pub fn percentile_f64(values: &[f64], p: f64) -> f64 {
-    if values.is_empty() {
-        return 0.0;
+/// The counters of a run: cheap to copy out from under the stats lock.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Counts {
+    pub ok: u64,
+    pub rejected: u64,
+    pub error: u64,
+    pub in_tokens: u64,
+    pub out_tokens: u64,
+    pub any_estimated: bool,
+    pub stalled: bool,
+    pub stall_events: u64,
+}
+
+/// The latency and speed samples of a run, copied out so they can be sorted
+/// without holding the stats lock the load workers need.
+#[derive(Clone, Debug, Default)]
+pub struct Samples {
+    pub ttfb: Vec<u64>,
+    pub total: Vec<u64>,
+    pub gaps: Vec<u64>,
+    pub decode_tps: Vec<f64>,
+}
+
+/// The percentiles of one set of samples.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Tails {
+    pub p50_ttfb_ms: u64,
+    pub p90_ttfb_ms: u64,
+    pub p99_ttfb_ms: u64,
+    pub p50_total_ms: u64,
+    pub p99_total_ms: u64,
+    pub p50_gap_ms: u64,
+    pub p99_gap_ms: u64,
+    pub gap_samples: u64,
+    pub p50_decode_tps: f64,
+    pub p10_decode_tps: f64,
+    pub decode_samples: u64,
+}
+
+impl Samples {
+    /// Sort each vector once and read the percentiles off it.
+    pub fn tails(mut self) -> Tails {
+        self.ttfb.sort_unstable();
+        self.total.sort_unstable();
+        self.gaps.sort_unstable();
+        // Decode samples are NaN-free by construction (finite tokens over a
+        // positive-ms window), so total order holds.
+        self.decode_tps
+            .sort_by(|a, b| a.partial_cmp(b).expect("decode samples are never NaN"));
+        Tails {
+            p50_ttfb_ms: nearest_rank(&self.ttfb, 50.0),
+            p90_ttfb_ms: nearest_rank(&self.ttfb, 90.0),
+            p99_ttfb_ms: nearest_rank(&self.ttfb, 99.0),
+            p50_total_ms: nearest_rank(&self.total, 50.0),
+            p99_total_ms: nearest_rank(&self.total, 99.0),
+            p50_gap_ms: nearest_rank(&self.gaps, 50.0),
+            p99_gap_ms: nearest_rank(&self.gaps, 99.0),
+            gap_samples: self.gaps.len() as u64,
+            p50_decode_tps: nearest_rank(&self.decode_tps, 50.0),
+            p10_decode_tps: nearest_rank(&self.decode_tps, 10.0),
+            decode_samples: self.decode_tps.len() as u64,
+        }
     }
-    let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).expect("decode samples are never NaN"));
-    let idx = ((p / 100.0) * sorted.len() as f64).floor() as usize;
-    sorted[idx.min(sorted.len() - 1)]
 }
 
 impl Stats {
@@ -141,19 +192,55 @@ impl Stats {
         }
     }
 
-    pub fn summarize(&self, elapsed_s: f64, max_error_rate: f64) -> Summary {
-        let attempts = self.ok + self.rejected + self.error;
-        let error_rate = if attempts > 0 {
-            self.error as f64 / attempts as f64
-        } else {
-            0.0
-        };
-        let req_per_s = if elapsed_s > 0.0 {
-            self.ok as f64 / elapsed_s
-        } else {
-            0.0
-        };
+    pub fn counts(&self) -> Counts {
+        Counts {
+            ok: self.ok,
+            rejected: self.rejected,
+            error: self.error,
+            in_tokens: self.in_tokens,
+            out_tokens: self.out_tokens,
+            any_estimated: self.any_estimated,
+            stalled: self.stalled,
+            stall_events: self.stall_events,
+        }
+    }
 
+    pub fn samples(&self) -> Samples {
+        Samples {
+            ttfb: self.ttfb.clone(),
+            total: self.total.clone(),
+            gaps: self.gaps.clone(),
+            decode_tps: self.decode_tps.clone(),
+        }
+    }
+
+    /// The whole summary in one go: sorts every sample vector, so a live view
+    /// should call `counts()` per frame and `samples().tails()` now and then.
+    pub fn summarize(&self, elapsed_s: f64, max_error_rate: f64) -> Summary {
+        Summary::new(
+            self.counts(),
+            self.samples().tails(),
+            elapsed_s,
+            max_error_rate,
+        )
+    }
+}
+
+impl Summary {
+    pub fn new(counts: Counts, tails: Tails, elapsed_s: f64, max_error_rate: f64) -> Summary {
+        let attempts = counts.ok + counts.rejected + counts.error;
+        let error_rate = if attempts > 0 {
+            counts.error as f64 / attempts as f64
+        } else {
+            0.0
+        };
+        let per_second = |n: u64| {
+            if elapsed_s > 0.0 {
+                n as f64 / elapsed_s
+            } else {
+                0.0
+            }
+        };
         let mut issues = Vec::new();
         if error_rate > max_error_rate {
             issues.push(format!(
@@ -162,7 +249,7 @@ impl Stats {
                 max_error_rate * 100.0
             ));
         }
-        if self.stalled {
+        if counts.stalled {
             issues.push("traffic stalled: a sample window saw zero completions".to_string());
         }
         let verdict = if issues.is_empty() {
@@ -170,37 +257,30 @@ impl Stats {
         } else {
             Verdict::Fail(issues)
         };
-
-        let agg_out_tok_per_s = if elapsed_s > 0.0 {
-            self.out_tokens as f64 / elapsed_s
-        } else {
-            0.0
-        };
-
         Summary {
             attempts,
-            completed: self.ok,
-            rejected: self.rejected,
-            errors: self.error,
+            completed: counts.ok,
+            rejected: counts.rejected,
+            errors: counts.error,
             error_rate,
-            req_per_s,
-            p50_ttfb_ms: percentile(&self.ttfb, 50.0),
-            p90_ttfb_ms: percentile(&self.ttfb, 90.0),
-            p99_ttfb_ms: percentile(&self.ttfb, 99.0),
-            p50_total_ms: percentile(&self.total, 50.0),
-            p99_total_ms: percentile(&self.total, 99.0),
-            in_tokens: self.in_tokens,
-            out_tokens: self.out_tokens,
-            any_estimated: self.any_estimated,
+            req_per_s: per_second(counts.ok),
+            p50_ttfb_ms: tails.p50_ttfb_ms,
+            p90_ttfb_ms: tails.p90_ttfb_ms,
+            p99_ttfb_ms: tails.p99_ttfb_ms,
+            p50_total_ms: tails.p50_total_ms,
+            p99_total_ms: tails.p99_total_ms,
+            in_tokens: counts.in_tokens,
+            out_tokens: counts.out_tokens,
+            any_estimated: counts.any_estimated,
             verdict,
-            p50_gap_ms: percentile(&self.gaps, 50.0),
-            p99_gap_ms: percentile(&self.gaps, 99.0),
-            gap_samples: self.gaps.len() as u64,
-            stall_events: self.stall_events,
-            agg_out_tok_per_s,
-            p50_decode_tps: percentile_f64(&self.decode_tps, 50.0),
-            p10_decode_tps: percentile_f64(&self.decode_tps, 10.0),
-            decode_samples: self.decode_tps.len() as u64,
+            p50_gap_ms: tails.p50_gap_ms,
+            p99_gap_ms: tails.p99_gap_ms,
+            gap_samples: tails.gap_samples,
+            stall_events: counts.stall_events,
+            agg_out_tok_per_s: per_second(counts.out_tokens),
+            p50_decode_tps: tails.p50_decode_tps,
+            p10_decode_tps: tails.p10_decode_tps,
+            decode_samples: tails.decode_samples,
         }
     }
 }
@@ -224,9 +304,28 @@ mod tests {
     #[test]
     fn percentile_nearest_rank() {
         let v = vec![10, 20, 30, 40, 50];
-        assert_eq!(percentile(&v, 50.0), 30);
-        assert_eq!(percentile(&v, 99.0), 50);
-        assert_eq!(percentile(&[], 50.0), 0);
+        assert_eq!(nearest_rank(&v, 50.0), 30);
+        assert_eq!(nearest_rank(&v, 99.0), 50);
+        assert_eq!(nearest_rank::<u64>(&[], 50.0), 0);
+    }
+
+    #[test]
+    fn tails_sort_the_samples_and_counts_plus_tails_make_the_same_summary() {
+        let mut s = Stats::default();
+        for (ttfb, total) in [(50, 400), (10, 100), (30, 300), (20, 200), (40, 500)] {
+            s.record(&ok(ttfb, total));
+        }
+        let tails = s.samples().tails();
+        assert_eq!(tails.p50_ttfb_ms, 30);
+        assert_eq!(tails.p99_ttfb_ms, 50);
+        assert_eq!(tails.p50_total_ms, 300);
+        let whole = s.summarize(2.0, 0.05);
+        let parts = Summary::new(s.counts(), tails, 2.0, 0.05);
+        assert_eq!(parts.completed, whole.completed);
+        assert_eq!(parts.req_per_s, whole.req_per_s);
+        assert_eq!(parts.p90_ttfb_ms, whole.p90_ttfb_ms);
+        assert_eq!(parts.p50_decode_tps, whole.p50_decode_tps);
+        assert_eq!(parts.verdict, whole.verdict);
     }
 
     #[test]
@@ -387,10 +486,10 @@ mod tests {
     #[test]
     fn percentile_f64_nearest_rank() {
         let v = vec![10.0, 20.0, 30.0, 40.0, 50.0];
-        assert_eq!(percentile_f64(&v, 50.0), 30.0);
-        assert_eq!(percentile_f64(&v, 99.0), 50.0);
-        assert_eq!(percentile_f64(&v, 10.0), 10.0);
-        assert_eq!(percentile_f64(&[], 50.0), 0.0);
+        assert_eq!(nearest_rank(&v, 50.0), 30.0);
+        assert_eq!(nearest_rank(&v, 99.0), 50.0);
+        assert_eq!(nearest_rank(&v, 10.0), 10.0);
+        assert_eq!(nearest_rank::<f64>(&[], 50.0), 0.0);
     }
 
     #[test]

@@ -420,20 +420,21 @@ async fn stream_response(
             "id": "chatcmpl-bench", "object": "chat.completion.chunk", "model": model,
             "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]
         });
-        yield sse(&role);
+        yield Ok(sse(&role));
 
         if stall {
             tokio::time::sleep(Duration::from_secs(60)).await;
             return;
         }
 
+        // Every token is the same chunk: render it once, hand out copies.
+        let token = sse(&json!({
+            "id": "chatcmpl-bench", "object": "chat.completion.chunk", "model": model,
+            "choices": [{"index": 0, "delta": {"content": "lorem "}, "finish_reason": null}]
+        }));
         for _ in 0..output_tokens {
             tokio::time::sleep(Duration::from_millis(profile.token_ms)).await;
-            let chunk = json!({
-                "id": "chatcmpl-bench", "object": "chat.completion.chunk", "model": model,
-                "choices": [{"index": 0, "delta": {"content": "lorem "}, "finish_reason": null}]
-            });
-            yield sse(&chunk);
+            yield Ok(token.clone());
         }
 
         let final_chunk = json!({
@@ -445,7 +446,7 @@ async fn stream_response(
                 "total_tokens": prompt_tokens + output_tokens
             }
         });
-        yield sse(&final_chunk);
+        yield Ok(sse(&final_chunk));
         yield Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"data: [DONE]\n\n"));
     };
 
@@ -456,8 +457,8 @@ async fn stream_response(
         .unwrap()
 }
 
-fn sse(value: &Value) -> Result<axum::body::Bytes, std::io::Error> {
-    Ok(axum::body::Bytes::from(format!("data: {value}\n\n")))
+fn sse(value: &Value) -> axum::body::Bytes {
+    axum::body::Bytes::from(format!("data: {value}\n\n"))
 }
 
 fn estimate_prompt_tokens(body: &Value) -> u32 {
