@@ -9,6 +9,7 @@ import type { ModelRoute } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
 import type { PlaygroundSession } from "./playground";
 import { Segmented } from "./ui";
+import { useStoppable } from "./use-stoppable";
 
 type QuestionDraft = NonNullable<PlaygroundSession["verdictQuestions"]>[number];
 
@@ -299,13 +300,17 @@ export function VerdictsWorkspace({ session, update, models, loading }: {
     questions.length > 0 &&
     questions.every((q) => q.instructions.trim().length > 0);
 
+  const runs = useStoppable();
+
   const run = async () => {
     if (!canRun) return;
+    const signal = runs.start();
     setBusy(true);
     setError(null);
     try {
       const res = await fetch("/api/live/playground/verdicts", {
         method: "POST",
+        signal,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           model,
@@ -321,6 +326,8 @@ export function VerdictsWorkspace({ session, update, models, loading }: {
       }
       setResult(json as RunResult);
     } catch (e) {
+      // Stopped: the earlier result stays, and nothing went wrong.
+      if (signal.aborted) return;
       setResult(null);
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -401,10 +408,9 @@ export function VerdictsWorkspace({ session, update, models, loading }: {
           {blind
             ? <span className="ml-auto text-xs text-muted-foreground">{model} can't see images. Pick a model with vision, or auto.</span>
             : <span className="ml-auto hidden text-xs text-muted-foreground sm:inline">Ctrl + Enter</span>}
-          <Button disabled={!canRun} onClick={() => void run()} aria-label="Run verdicts">
-            {busy && <Loader2 className="h-4 w-4 animate-spin" />}
-            Run verdicts
-          </Button>
+          {busy
+            ? <Button variant="outline" onClick={runs.stop} aria-label="Stop verdicts"><Loader2 className="h-4 w-4 animate-spin" />Stop</Button>
+            : <Button disabled={!canRun} onClick={() => void run()} aria-label="Run verdicts">Run verdicts</Button>}
         </div>
       </section>
 

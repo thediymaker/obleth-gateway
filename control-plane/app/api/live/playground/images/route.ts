@@ -42,7 +42,7 @@ export const POST = liveRoute(async (req) => {
   };
 
   const started = Date.now();
-  const upstream = await gatewayImages(body);
+  const upstream = await gatewayImages(body, req.signal);
   const latencyMs = Date.now() - started;
   const requestId = upstream.headers.get("x-obleth-request-id");
   const json = await upstream.json().catch(() => null);

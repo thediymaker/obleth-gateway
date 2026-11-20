@@ -10,7 +10,8 @@ import { uuid } from "@/lib/uuid";
 import type { ModelRoute } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
 import type { PlaygroundSession } from "./playground";
-import { ModelAvatar, RunError, SectionLabel, Segmented, SettingsPanel, formatCost } from "./ui";
+import { ModelAvatar, Pill, RunError, SectionLabel, Segmented, SettingsPanel, formatCost } from "./ui";
+import { useStoppable } from "./use-stoppable";
 
 // Sizes offered in the picker. Deliberately a superset of the boon's default
 // allowed list: the playground drives the image model directly, so it is not
@@ -45,7 +46,7 @@ interface RunParams {
 
 interface Run extends RunParams {
   id: string;
-  status: "busy" | "done" | "error";
+  status: "busy" | "done" | "error" | "stopped";
   images: GeneratedImage[];
   error?: string;
 }
@@ -123,12 +124,16 @@ export function ImageWorkspace({
   const patch = (id: string, next: Partial<Run>) =>
     setRuns((all) => all.map((r) => (r.id === id ? { ...r, ...next } : r)));
 
+  const active = useStoppable();
+
   async function generate(params: RunParams) {
     const id = `${Date.now()}-${uuid()}`;
+    const signal = active.start();
     setRuns((all) => [...all, { ...params, id, status: "busy", images: [] }]);
     try {
       const res = await fetch("/api/live/playground/images", {
         method: "POST",
+        signal,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           model: params.model,
@@ -168,7 +173,7 @@ export function ImageWorkspace({
         })),
       });
     } catch (e) {
-      patch(id, { status: "error", error: String(e) });
+      patch(id, signal.aborted ? { status: "stopped" } : { status: "error", error: String(e) });
     }
   }
 
@@ -235,6 +240,7 @@ export function ImageWorkspace({
                     {run.negativePrompt && <p className="text-[11.5px] text-muted-foreground">Negative: {run.negativePrompt}</p>}
                   </div>
                   {run.status === "busy" && <span className="inline-flex h-[22px] items-center gap-1.5 rounded-full border border-border px-2 text-[11.5px]"><Loader2 className="h-3 w-3 animate-spin" />Generating</span>}
+                  {run.status === "stopped" && <Pill off>Stopped</Pill>}
                   <Button variant="ghost" size="sm" className="text-muted-foreground" onClick={() => reuse(run)}>Reuse prompt</Button>
                   <Button variant="ghost" size="sm" className="text-muted-foreground" title="Generate this prompt again" disabled={busy} onClick={() => void generate(run)}>Run again</Button>
                   {run.status === "done" && (
@@ -315,10 +321,9 @@ export function ImageWorkspace({
               </DropdownMenu>
               <div className="flex-1" />
               {perImage > 0 && <span className="font-mono text-[11.5px] text-muted-foreground" title="List price × images">≈ {formatCost(perImage * count)}</span>}
-              <Button id="image-generate" className="h-9" disabled={busy || !target || !prompt.trim()} onClick={submit}>
-                {busy && <Loader2 className="h-4 w-4 animate-spin" />}
-                Generate
-              </Button>
+              {busy
+                ? <Button id="image-stop" variant="outline" className="h-9" onClick={active.stop}><Loader2 className="h-4 w-4 animate-spin" />Stop</Button>
+                : <Button id="image-generate" className="h-9" disabled={!target || !prompt.trim()} onClick={submit}>Generate</Button>}
             </div>
           </div>
           <p className="mx-auto mt-2 max-w-3xl text-center text-xs text-muted-foreground">

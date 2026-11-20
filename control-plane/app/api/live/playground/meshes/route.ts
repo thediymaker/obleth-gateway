@@ -45,7 +45,7 @@ export const POST = liveRoute(async (req) => {
     upstream.set(name, String(n));
   }
 
-  const res = await gatewayMeshCreate(upstream);
+  const res = await gatewayMeshCreate(upstream, req.signal);
   const json = await res.json().catch(() => null);
   if (!res.ok) throw new RouteError(res.status, apiErrorMessage(json, "the mesh job could not be started"));
   return { job: json, requestId: res.headers.get("x-obleth-request-id") };

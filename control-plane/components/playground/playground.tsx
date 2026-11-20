@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { z } from "zod";
 import { ArrowDownToLine, Code2, PanelLeft, PanelRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -134,6 +134,9 @@ const fresh = (): PlaygroundSession => ({
   launcher: true, updatedAt: Date.now(),
 });
 
+/** How long the session list waits for typing to pause before it is saved. */
+export const SESSIONS_SAVE_DELAY_MS = 500;
+
 export function Playground({ scope, gatewayBase = "http://localhost:8080", openModel, visionBoonActive = false }: {
   scope: string;
   gatewayBase?: string;
@@ -164,11 +167,27 @@ export function Playground({ scope, gatewayBase = "http://localhost:8080", openM
       setSessions(stored); setActive(stored[0].id);
     } catch { const session = fresh(); setSessions([session]); setActive(session.id); setNotice("Browser storage is unavailable. Sessions will last only until you leave."); }
   }, [root]);
+  // Every keystroke in a form changes a session, and each save rewrites all
+  // of them, so save once typing pauses, and at once when the page is hidden
+  // or the playground closes.
+  const unsaved = useRef<{ root: string; sessions: PlaygroundSession[] } | null>(null);
+  const save = useCallback(() => {
+    const pending = unsaved.current;
+    if (!pending) return;
+    unsaved.current = null;
+    try { localStorage.setItem(pending.root, JSON.stringify(pending.sessions)); }
+    catch { setNotice("Session settings could not be saved. Export important conversations before leaving."); }
+  }, []);
   useEffect(() => {
     if (!sessions.length) return;
-    try { localStorage.setItem(root, JSON.stringify(sessions)); }
-    catch { setNotice("Session settings could not be saved. Export important conversations before leaving."); }
-  }, [root, sessions]);
+    unsaved.current = { root, sessions };
+    const timer = setTimeout(save, SESSIONS_SAVE_DELAY_MS);
+    return () => clearTimeout(timer);
+  }, [root, sessions, save]);
+  useEffect(() => {
+    window.addEventListener("pagehide", save);
+    return () => { window.removeEventListener("pagehide", save); save(); };
+  }, [save]);
   const opened = useRef(false);
   useEffect(() => {
     if (!openModel || opened.current || !sessions.length) return;

@@ -31,7 +31,7 @@ export const POST = liveRoute(async (req) => {
     ...(timeRange ? { time_range: timeRange } : {}),
   };
   const started = Date.now();
-  const upstream = await gatewaySearch(body);
+  const upstream = await gatewaySearch(body, req.signal);
   const latencyMs = Date.now() - started;
   const requestId = upstream.headers.get("x-obleth-request-id");
   const json = await upstream.json().catch(() => null);

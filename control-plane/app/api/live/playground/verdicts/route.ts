@@ -63,7 +63,7 @@ export const POST = liveRoute(async (req) => {
     questions,
   };
   const started = Date.now();
-  const upstream = await gatewayVerdicts(body);
+  const upstream = await gatewayVerdicts(body, req.signal);
   const latencyMs = Date.now() - started;
   const requestId = upstream.headers.get("x-obleth-request-id");
   const json = await upstream.json().catch(() => null);

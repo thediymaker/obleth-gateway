@@ -1,7 +1,10 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { Playground } from "./playground";
+import { Playground, SESSIONS_SAVE_DELAY_MS } from "./playground";
+
+/** The session list's storage key for `scope="test"`. */
+const ROOT = "obleth-playground:test";
 
 let root: Root;
 let host: HTMLDivElement;
@@ -115,12 +118,42 @@ describe("Playground shell", () => {
     Object.defineProperty(input, "files", { value: [file] });
     await act(async () => { input.dispatchEvent(new Event("change", { bubbles: true })); await new Promise((r) => setTimeout(r, 0)); });
 
-    const saved = JSON.parse(localStorage.getItem("obleth-playground:test") ?? "[]") as { id: string; title: string }[];
+    act(() => { window.dispatchEvent(new Event("pagehide")); });
+    const saved = JSON.parse(localStorage.getItem(ROOT) ?? "[]") as { id: string; title: string }[];
     const imported = saved.find((s) => s.title === "Imported chat")!;
     expect(imported.id).not.toBe("old");
     expect(localStorage.getItem(`obleth-playground:test:${imported.id}:compare:0`)).not.toBeNull();
     // Only conversation lanes come back; nothing else is written.
     expect(localStorage.getItem(`obleth-playground:test:${imported.id}:image`)).toBeNull();
+  });
+});
+
+describe("Playground session storage", () => {
+  /** Type into a controlled textarea the way React sees a keystroke. */
+  function type(el: HTMLTextAreaElement, text: string) {
+    const setValue = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!;
+    setValue.call(el, text);
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+
+  it("saves the session list once typing pauses, and at once when the page is hidden", async () => {
+    const card = [...host.querySelectorAll("button")].find((b) => b.textContent?.startsWith("Image"))!;
+    await act(async () => card.click());
+    await act(() => new Promise((r) => setTimeout(r, SESSIONS_SAVE_DELAY_MS + 50)));
+    const writes = vi.spyOn(Storage.prototype, "setItem");
+    const sessionWrites = () => writes.mock.calls.filter(([key]) => key === ROOT).length;
+    const field = host.querySelector<HTMLTextAreaElement>("#image-negative-prompt")!;
+    for (let i = 1; i <= 20; i++) act(() => type(field, "x".repeat(i)));
+    expect(sessionWrites()).toBe(0);
+    await act(() => new Promise((r) => setTimeout(r, SESSIONS_SAVE_DELAY_MS + 50)));
+    expect(sessionWrites()).toBe(1);
+    expect(JSON.parse(localStorage.getItem(ROOT)!)[0].imageNegativePrompt).toBe("x".repeat(20));
+
+    act(() => type(field, "last"));
+    act(() => { window.dispatchEvent(new Event("pagehide")); });
+    expect(sessionWrites()).toBe(2);
+    expect(JSON.parse(localStorage.getItem(ROOT)!)[0].imageNegativePrompt).toBe("last");
+    writes.mockRestore();
   });
 });
 
@@ -133,7 +166,8 @@ describe("Playground opened on a model", () => {
     });
     expect(button("Speech").getAttribute("aria-pressed")).toBe("true");
     expect(host.querySelector<HTMLButtonElement>("#speech-target")!.textContent).toContain("voice-1");
-    const saved = JSON.parse(localStorage.getItem("obleth-playground:test") ?? "[]") as { mode: string; speechModel?: string; title: string }[];
+    act(() => { window.dispatchEvent(new Event("pagehide")); });
+    const saved = JSON.parse(localStorage.getItem(ROOT) ?? "[]") as { mode: string; speechModel?: string; title: string }[];
     expect(saved[0]).toMatchObject({ mode: "speech", speechModel: "voice-1", title: "voice-1" });
   });
 });

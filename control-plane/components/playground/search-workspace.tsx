@@ -9,6 +9,7 @@ import type { ModelRoute } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
 import type { PlaygroundSession } from "./playground";
 import { Segmented } from "./ui";
+import { useStoppable } from "./use-stoppable";
 
 export interface SearchResult {
   title: string;
@@ -88,15 +89,18 @@ export function SearchWorkspace({ session, update, models, loading }: {
   const [result, setResult] = useState<RunResult | null>(null);
 
   const canRun = !busy && tool !== "" && query.trim().length > 0;
+  const runs = useStoppable();
 
   const run = async () => {
     if (!canRun) return;
+    const signal = runs.start();
     setBusy(true);
     setError(null);
     try {
       const domains = domainList(domainsText);
       const res = await fetch("/api/live/playground/search", {
         method: "POST",
+        signal,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           tool,
@@ -112,6 +116,8 @@ export function SearchWorkspace({ session, update, models, loading }: {
       }
       setResult({ tool, results: json?.results ?? [], latencyMs: json?.latencyMs ?? 0, requestId: json?.requestId ?? null });
     } catch (e) {
+      // Stopped: the earlier result stays, and nothing went wrong.
+      if (signal.aborted) return;
       setResult(null);
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -169,10 +175,9 @@ export function SearchWorkspace({ session, update, models, loading }: {
         <div className="flex shrink-0 items-center gap-2 border-t border-border px-4 py-3">
           {loading && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" aria-label="Loading models" />}
           <span className="ml-auto hidden text-xs text-muted-foreground sm:inline">Ctrl + Enter</span>
-          <Button disabled={!canRun} onClick={() => void run()} aria-label="Run search">
-            {busy && <Loader2 className="h-4 w-4 animate-spin" />}
-            Search
-          </Button>
+          {busy
+            ? <Button variant="outline" onClick={runs.stop} aria-label="Stop search"><Loader2 className="h-4 w-4 animate-spin" />Stop</Button>
+            : <Button disabled={!canRun} onClick={() => void run()} aria-label="Run search">Search</Button>}
         </div>
       </section>
 

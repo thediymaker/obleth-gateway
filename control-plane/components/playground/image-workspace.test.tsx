@@ -295,6 +295,50 @@ describe("ImageWorkspace", () => {
     expect(alert.querySelector("pre")!.textContent).toBe(long);
   });
 
+  it("stops a run on Stop and when the workspace goes away", async () => {
+    const signals: AbortSignal[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        (_url: string, init?: RequestInit) =>
+          new Promise<Response>((_, reject) => {
+            signals.push(init!.signal!);
+            init!.signal!.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+          }),
+      ),
+    );
+    act(() => {
+      root.render(
+        <ImageWorkspace
+          session={session({ imageModel: "sdxl", imagePrompt: "a cat" })}
+          update={() => {}}
+          models={models}
+          loading={false}
+          storageKey={STORAGE_KEY}
+        />,
+      );
+    });
+    await act(async () => {
+      host.querySelector<HTMLButtonElement>("#image-generate")!.click();
+    });
+    expect(host.querySelector("#image-generate")).toBeNull();
+    await act(async () => {
+      host.querySelector<HTMLButtonElement>("#image-stop")!.click();
+    });
+    expect(signals[0].aborted).toBe(true);
+    expect(host.textContent).toContain("Stopped");
+    expect(host.querySelector("[role='alert']")).toBeNull();
+    expect(host.querySelector<HTMLButtonElement>("#image-generate")!.disabled).toBe(false);
+
+    await act(async () => {
+      host.querySelector<HTMLButtonElement>("#image-generate")!.click();
+    });
+    expect(signals[1].aborted).toBe(false);
+    act(() => root.unmount());
+    expect(signals[1].aborted).toBe(true);
+    root = createRoot(host);
+  });
+
   it("blocks generation with no prompt", () => {
     act(() => {
       root.render(
