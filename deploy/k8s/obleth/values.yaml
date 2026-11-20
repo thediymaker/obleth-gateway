@@ -567,7 +567,7 @@ compressor:
   # Requests one pod scores at once (each already uses every thread), and how
   # many more may wait for a turn before the pod answers 503 at once. The
   # gateway sends its timeout with each call, so a waiting request gives up
-  # when the gateway does; a turned-away request is compacted heuristically.
+  # when the gateway does; a turned-away request leaves its new prose whole.
   concurrency: 1
   maxWaiting: 8
   image:
