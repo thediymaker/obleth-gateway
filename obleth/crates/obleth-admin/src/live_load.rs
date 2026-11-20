@@ -109,10 +109,10 @@ pub async fn live_load<'a>(
     discovery: &CapacityDiscovery,
     routes: impl IntoIterator<Item = &'a ResolvedModel>,
 ) -> Option<LiveLoad> {
-    let snap = fairshare.snapshot().await?;
     let stats = fairshare.stats();
     let (mode, replicas, divisor) = crate::enforcement(&stats, settings.replica_aware);
     let scope = crate::live_scope(fairshare, mode).await;
+    let snap = crate::local_snapshot(fairshare, &scope).await?;
     let source = scope
         .cluster
         .as_ref()

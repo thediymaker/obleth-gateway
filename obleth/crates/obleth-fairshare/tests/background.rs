@@ -431,3 +431,47 @@ async fn the_cluster_view_reports_the_background_pool_by_its_share() {
     }
     drop(held);
 }
+
+/// The batch runner's narrow read: what waits in background pools, per model
+/// and key, the same counts the full snapshot reports; and the pools-only
+/// snapshot keeps every count but leaves tenants and keys out.
+#[tokio::test]
+async fn background_queue_counts_and_the_pools_only_snapshot_match_the_full_one() {
+    let fs = local(1024);
+    let t = Uuid::new_v4();
+    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+    let mut held = Vec::new();
+    for _ in 0..6 {
+        held.push(admit_now(&fs, background(), bg_req(t, 8, 0.75).key(a, 1)).await);
+    }
+    let waiting = [
+        waiter(&fs, background(), bg_req(t, 8, 0.75).key(a, 1)),
+        waiter(&fs, background(), bg_req(t, 8, 0.75).key(a, 1)),
+        waiter(&fs, background(), bg_req(t, 8, 0.75).key(b, 1)),
+    ];
+    for w in &waiting {
+        still_waiting(w).await;
+    }
+
+    let queued = fs.background_queued().await.expect("scheduler alive");
+    assert_eq!(queued.len(), 2, "{queued:?}");
+    assert_eq!(queued[&("m".to_string(), a)], 2);
+    assert_eq!(queued[&("m".to_string(), b)], 1);
+    let full = fs.snapshot().await.expect("snapshot");
+    let from_full: usize = full.pools[0].keys.iter().map(|k| k.queued).sum();
+    assert_eq!(from_full, 3);
+
+    let pools = fs.pool_snapshot().await.expect("snapshot");
+    let (p, f) = (&pools.pools[0], &full.pools[0]);
+    assert!(p.tenants.is_empty() && p.keys.is_empty());
+    assert_eq!(
+        (p.model.as_str(), p.in_flight, p.queued, p.cap, p.borrowed),
+        (f.model.as_str(), f.in_flight, f.queued, f.cap, f.borrowed)
+    );
+    assert_eq!(p.groups.len(), f.groups.len());
+    assert_eq!((pools.global_in_flight, pools.global_queued), (6, 3));
+    drop(held);
+    for w in waiting {
+        admitted(w).await;
+    }
+}

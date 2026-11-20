@@ -1882,19 +1882,11 @@ async fn fill(
     }
     let per_batch = cfg.concurrency.div_ceil(runnable.len()).max(1);
     // Items already waiting for a background slot here, per model and owner.
-    let mut waiting: HashMap<(String, Uuid), usize> = HashMap::new();
-    if let Some(snap) = state.fairshare.snapshot().await {
-        for pool in snap.pools {
-            if let Some(model) = pool
-                .model
-                .strip_suffix(obleth_fairshare::BACKGROUND_POOL_SUFFIX)
-            {
-                for key in pool.keys {
-                    waiting.insert((model.to_string(), key.key_id), key.queued);
-                }
-            }
-        }
-    }
+    let mut waiting = state
+        .fairshare
+        .background_queued()
+        .await
+        .unwrap_or_default();
     for batch in runnable {
         let queued = waiting
             .entry((batch.model.clone(), batch.key_id))

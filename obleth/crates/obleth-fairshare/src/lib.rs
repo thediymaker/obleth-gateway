@@ -554,7 +554,12 @@ enum Ctl {
         session: Option<String>,
     },
     Snapshot {
+        /// Include each pool's tenants and keys.
+        members: bool,
         respond: oneshot::Sender<FairshareSnapshot>,
+    },
+    BackgroundQueued {
+        respond: oneshot::Sender<HashMap<(String, Uuid), usize>>,
     },
     Sample {
         respond: oneshot::Sender<FairshareSample>,
@@ -800,8 +805,27 @@ impl FairShare {
     }
 
     pub async fn snapshot(&self) -> Option<FairshareSnapshot> {
+        self.snapshot_with(true).await
+    }
+
+    /// [`FairShare::snapshot`] without each pool's tenants and keys (left
+    /// empty): pool and group counts only, for a caller that reads members
+    /// from elsewhere (the cluster view in `shared` mode).
+    pub async fn pool_snapshot(&self) -> Option<FairshareSnapshot> {
+        self.snapshot_with(false).await
+    }
+
+    async fn snapshot_with(&self, members: bool) -> Option<FairshareSnapshot> {
         let (respond, rx) = oneshot::channel();
-        self.ctl.send(Ctl::Snapshot { respond }).ok()?;
+        self.ctl.send(Ctl::Snapshot { members, respond }).ok()?;
+        rx.await.ok()
+    }
+
+    /// Requests waiting in each model's background pool, per key: (model,
+    /// key) to count, keys with nothing waiting left out.
+    pub async fn background_queued(&self) -> Option<HashMap<(String, Uuid), usize>> {
+        let (respond, rx) = oneshot::channel();
+        self.ctl.send(Ctl::BackgroundQueued { respond }).ok()?;
         rx.await.ok()
     }
 
@@ -2505,7 +2529,6 @@ impl Pool {
     /// yet tried for a slot held for it, and give it its local slot, for a
     /// claim on that held slot alone. Undone by [`Pool::requeue`].
     fn take_probe(&mut self) -> Option<(Uuid, Uuid, Waiter)> {
-        let oldest = self.oldest_eligible();
         let (tenant, key, at) = self.queues.iter().find_map(|(tenant, queue)| {
             queue.keys.iter().find_map(|(key, deque)| {
                 deque
@@ -2515,6 +2538,9 @@ impl Pool {
                     .map(|at| (*tenant, *key, at))
             })
         })?;
+        // Read before the waiter leaves the queue, as it counts among those
+        // it may have jumped.
+        let oldest = self.oldest_eligible();
         let queue = self.queues.get_mut(&tenant).expect("tenant just found");
         let mut waiter = queue.pop_at(&key, at).expect("waiter just found");
         if queue.is_empty() {
@@ -2981,7 +3007,8 @@ impl Pool {
 
     /// `headroom` is the global ceiling's free slots, so group caps and
     /// borrowing are reported against the capacity actually enforced.
-    fn snapshot(&self, headroom: usize) -> ModelPoolFairshare {
+    /// The pool's state; its tenants and keys only when `members`.
+    fn snapshot(&self, headroom: usize, members: bool) -> ModelPoolFairshare {
         let ids: HashSet<Uuid> = self
             .queues
             .keys()
@@ -3046,6 +3073,7 @@ impl Pool {
 
         let mut tenants: Vec<TenantFairshare> = ids
             .iter()
+            .filter(|_| members)
             .map(|&tenant_id| {
                 let weight = self
                     .tenant_weight
@@ -3080,6 +3108,7 @@ impl Pool {
 
         let mut keys: Vec<KeyFairshare> = key_ids
             .iter()
+            .filter(|_| members)
             .filter_map(|&key_id| {
                 let tenant_id = self.key_tenant.get(&key_id).copied()?;
                 let weight = self.key_weight.get(&key_id).copied().unwrap_or(1).max(1);
@@ -3423,8 +3452,11 @@ impl Scheduler {
                 self.dispatch_all();
                 self.publish_stats();
             }
-            Ctl::Snapshot { respond } => {
-                let _ = respond.send(self.build_snapshot());
+            Ctl::Snapshot { members, respond } => {
+                let _ = respond.send(self.build_snapshot(members));
+            }
+            Ctl::BackgroundQueued { respond } => {
+                let _ = respond.send(self.background_queued());
             }
             Ctl::Sample { respond } => {
                 let _ = respond.send(self.build_sample());
@@ -3869,18 +3901,24 @@ impl Scheduler {
                     break;
                 }
                 let idx = (self.cursor + i) % n;
+                let key = &self.pool_order[idx];
+                // Most pools have nothing to send: skip them before working
+                // out what they may fill.
+                let ready = self.pools.get(key).is_some_and(|pool| {
+                    let limit = if pool.probing { 1 } else { max_pending };
+                    pool.queued_total > 0 && !pool.blocked && pool.pending.len() < limit
+                });
+                if !ready {
+                    continue;
+                }
                 let headroom = ceiling.saturating_sub(self.in_flight);
-                let key = self.pool_order[idx].clone();
-                let Some(effective) = self.effective_of(&key, headroom, ceiling) else {
+                let Some(effective) = self.effective_of(key, headroom, ceiling) else {
                     continue;
                 };
+                let key = key.clone();
                 let Some(pool) = self.pools.get_mut(&key) else {
                     continue;
                 };
-                let limit = if pool.probing { 1 } else { max_pending };
-                if pool.queued_total == 0 || pool.blocked || pool.pending.len() >= limit {
-                    continue;
-                }
                 let (next, dropped) = pool.take_claim(effective);
                 if dropped > 0 {
                     pool.settle_idle();
@@ -4331,11 +4369,20 @@ impl Scheduler {
                     break;
                 }
                 let idx = (self.cursor + i) % n;
+                // Most pools have nothing queued: skip them before working
+                // out what they may fill.
+                if !self
+                    .pools
+                    .get(&self.pool_order[idx])
+                    .is_some_and(|p| p.queued_total > 0)
+                {
+                    continue;
+                }
                 let headroom = ceiling.saturating_sub(self.in_flight);
                 let effective = self.effective_of(&self.pool_order[idx], headroom, ceiling);
                 let (granted, dropped) =
                     match (self.pools.get_mut(&self.pool_order[idx]), effective) {
-                        (Some(pool), Some(effective)) if pool.queued_total > 0 => {
+                        (Some(pool), Some(effective)) => {
                             let outcome = pool.dispatch_one(effective);
                             if outcome.1 > 0 {
                                 pool.settle_idle();
@@ -4453,11 +4500,32 @@ impl Scheduler {
         }
     }
 
-    fn build_snapshot(&self) -> FairshareSnapshot {
+    fn background_queued(&self) -> HashMap<(String, Uuid), usize> {
+        let mut out = HashMap::new();
+        for (key, pool) in &self.pools {
+            let PoolKey::Background(model) = key else {
+                continue;
+            };
+            for queue in pool.queues.values() {
+                for key_id in queue.keys.keys() {
+                    let (_, queued) = pool.key_state(key_id);
+                    if queued > 0 {
+                        out.insert((model.clone(), *key_id), queued);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn build_snapshot(&self, members: bool) -> FairshareSnapshot {
         let ceiling = self.ceiling();
         let headroom = ceiling.saturating_sub(self.in_flight);
-        let mut pools: Vec<ModelPoolFairshare> =
-            self.pools.values().map(|p| p.snapshot(headroom)).collect();
+        let mut pools: Vec<ModelPoolFairshare> = self
+            .pools
+            .values()
+            .map(|p| p.snapshot(headroom, members))
+            .collect();
         pools.sort_by(|a, b| a.model.cmp(&b.model));
         let model_in_flight = pools
             .iter()
@@ -4541,7 +4609,7 @@ mod tests {
         assert_eq!(service["many"], 40.0);
         assert_eq!(service["one"], 40.0);
 
-        let snap = pool.snapshot(usize::MAX);
+        let snap = pool.snapshot(usize::MAX, true);
         let score = |name: &str| {
             snap.groups
                 .iter()

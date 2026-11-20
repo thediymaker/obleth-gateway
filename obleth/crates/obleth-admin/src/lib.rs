@@ -7365,6 +7365,20 @@ pub(crate) struct LiveScope {
 /// In `shared` mode, every live replica's scheduler state merged; when the
 /// shared backend cannot give it, or outside `shared` mode, the answering
 /// replica's own, with why when the cluster view was wanted.
+/// The answering replica's scheduler state for a live view in `scope`. With
+/// the cluster view in hand its tenants and keys come from there, so only the
+/// replica's pool and group counts are read.
+pub(crate) async fn local_snapshot(
+    fairshare: &FairShare,
+    scope: &LiveScope,
+) -> Option<obleth_fairshare::FairshareSnapshot> {
+    if scope.cluster.is_some() {
+        fairshare.pool_snapshot().await
+    } else {
+        fairshare.snapshot().await
+    }
+}
+
 pub(crate) async fn live_scope(fairshare: &FairShare, mode: SlotMode) -> LiveScope {
     if mode != SlotMode::Shared {
         return LiveScope {
@@ -7404,13 +7418,11 @@ pub(crate) async fn live_scope(fairshare: &FairShare, mode: SlotMode) -> LiveSco
     responses((status = 200, body = FairshareLiveView))
 )]
 async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<FairshareLiveView>> {
-    let snap = state
-        .fairshare
-        .snapshot()
-        .await
-        .ok_or(AdminError::Internal("fairshare unavailable".into()))?;
     let (mode, _, divisor) = enforcement(&state.fairshare_stats, state.fairshare_replica_aware);
     let scope = live_scope(&state.fairshare, mode).await;
+    let snap = local_snapshot(&state.fairshare, &scope)
+        .await
+        .ok_or(AdminError::Internal("fairshare unavailable".into()))?;
     let source: &[ModelPoolFairshare] = match &scope.cluster {
         Some(c) => &c.pools,
         None => &snap.pools,
