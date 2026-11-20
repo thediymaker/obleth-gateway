@@ -398,7 +398,7 @@ fn run(fix: &Fixture, cfg: &CompressionBoonSettings) -> Metrics {
     Metrics {
         before,
         after,
-        compressed: stats.compressed,
+        compressed: stats.replaced,
         changed,
         lossless,
     }
@@ -649,8 +649,8 @@ fn print_dedup_report() {
     println!("\nCROSS-TURN DEDUP — lossless removal of context re-sent across turns");
     println!("{}", "─".repeat(104));
     println!("conversation: a reference doc re-sent 3× across {msg_count} messages");
-    println!("  duplicates found : {}", stats.duplicates);
-    println!("  refs created     : {} (later copies → [ref:HASH]; original stashed for retrieve_original)", stats.refs_created);
+    println!("  duplicates found : {}", stats.examined);
+    println!("  refs created     : {} (later copies → [ref:HASH]; original stashed for retrieve_original)", stats.replaced);
     println!("  tokens before    : {before}");
     println!(
         "  tokens after     : {after}  ({:.1}% saved)",
@@ -713,7 +713,7 @@ fn code_compaction_is_off_by_default() {
         json!({"model": "verify", "messages": [{"role": "user", "content": messy.clone()}]});
     let stats = compression::apply(&prod_cfg(), false, &mut body);
     assert_eq!(
-        stats.compressed, 0,
+        stats.replaced, 0,
         "code must not be touched unless code_compaction is enabled"
     );
     assert_eq!(body["messages"][0]["content"].as_str().unwrap(), messy);
@@ -759,10 +759,7 @@ fn cross_turn_dedup_removes_repeated_blocks_losslessly() {
     let after = count_body_tokens(&body);
 
     // The doc appears 3× → first occurrence kept, the two later copies deduped.
-    assert_eq!(
-        stats.refs_created, 2,
-        "two later duplicates should be replaced"
-    );
+    assert_eq!(stats.replaced, 2, "two later duplicates should be replaced");
     assert!(
         after < before,
         "dedup should reduce total tokens (got {before}→{after})"
@@ -984,7 +981,7 @@ fn log_rewrite_collapses_and_is_reversible() {
     let (stats, stash) = compression::log_rewrite(&cfg, &mut body);
 
     assert_eq!(
-        stats.refs_created, 1,
+        stats.replaced, 1,
         "the repetitive log segment should collapse"
     );
     let out = body["messages"][0]["content"].as_str().unwrap();
@@ -1017,7 +1014,7 @@ fn log_rewrite_skips_structural_tables() {
     let mut body = json!({"model": "verify", "messages": [{"role": "user", "content": table}]});
     let (stats, _) = compression::log_rewrite(&cfg, &mut body);
     assert_eq!(
-        stats.refs_created, 0,
+        stats.replaced, 0,
         "structural table must be left alone by the log pass"
     );
     assert_eq!(body["messages"][0]["content"].as_str().unwrap(), snapshot);
@@ -1068,7 +1065,7 @@ fn dedup_leaves_unique_content_untouched() {
     });
     let snapshot = body.clone();
     let (stats, stash) = compression::dedup_rewrite(&cfg, true, &mut body);
-    assert_eq!(stats.refs_created, 0, "no duplicates → nothing replaced");
+    assert_eq!(stats.replaced, 0, "no duplicates → nothing replaced");
     assert!(stash.is_empty());
     assert_eq!(
         body, snapshot,
@@ -1094,7 +1091,7 @@ fn lossless_output_is_byte_identical_to_the_recorded_digest() {
         h.update(
             format!(
                 "|{} {} {} {}|",
-                stats.scanned, stats.compressed, stats.tokens_before, stats.tokens_after
+                stats.examined, stats.replaced, stats.tokens_before, stats.tokens_after
             )
             .as_bytes(),
         );
@@ -1134,5 +1131,127 @@ fn lossless_output_is_byte_identical_to_the_recorded_digest() {
     assert_eq!(
         digest,
         "58f36af8778eea1bceea7e00a8ae16c728fe86623469a1dda08ef33ba83e16d7"
+    );
+}
+
+/// Synthetic logs: templates that vary in numbers, words and token count,
+/// with problem lines and blank lines mixed in.
+fn varied_log(rng: &mut Rng, lines: usize) -> String {
+    const HOSTS: [&str; 5] = ["alpha", "beta", "gamma", "delta", "epsilon"];
+    const VERBS: [&str; 4] = ["GET", "POST", "PUT", "DELETE"];
+    let mut out = String::new();
+    for i in 0..lines {
+        let line = match rng.below(9) {
+            0 => format!(
+                "2026-11-20T10:{:02}:{:02}Z INFO request {} handled in {}ms",
+                i % 60,
+                rng.below(60),
+                rng.below(9999),
+                rng.below(500)
+            ),
+            1 => format!(
+                "Nov 20 10:{:02}:01 node-{} kernel: eth0 link up",
+                i % 60,
+                rng.below(40)
+            ),
+            2 => format!(
+                "[{}] {} /api/v1/{} {} host={}",
+                i,
+                VERBS[rng.below(4) as usize],
+                HOSTS[rng.below(5) as usize],
+                200 + rng.below(3) * 100,
+                HOSTS[rng.below(5) as usize]
+            ),
+            3 => format!(
+                "ERROR worker {} failed: connection reset by {}",
+                rng.below(16),
+                HOSTS[rng.below(5) as usize]
+            ),
+            4 => format!(
+                "user {} logged in from workstation-{}",
+                HOSTS[rng.below(5) as usize],
+                HOSTS[rng.below(5) as usize]
+            ),
+            5 => String::new(),
+            6 => format!(
+                "Warn: Disk usage at {}% on /dev/sd{}",
+                80 + rng.below(20),
+                ["a", "b"][rng.below(2) as usize]
+            ),
+            7 => format!(
+                "DEBUG cache {} {} {}",
+                HOSTS[rng.below(5) as usize],
+                rng.below(3),
+                "x".repeat(rng.below(4) as usize)
+            ),
+            _ => format!("scheduler tick {} queue depth {} idle", i, rng.below(30)),
+        };
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
+}
+
+/// The dedup and log passes, and the log template miner under them, digested.
+/// Recorded before the shared segment index (P2-15): the rewrite must leave
+/// their output byte-identical.
+#[test]
+fn dedup_and_log_output_is_byte_identical_to_the_recorded_digest() {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    let cfg = CompressionBoonSettings {
+        enabled: true,
+        min_tokens: 16,
+        max_lossy_segments: 6,
+        ..Default::default()
+    };
+    let mut rng = Rng(0x5EED_1234_ABCD_0001);
+    let logs: Vec<String> = (0..60).map(|i| varied_log(&mut rng, 8 + i * 7)).collect();
+    let mut collapsed = 0;
+    for log in logs.iter().chain([repetitive_log()].iter()) {
+        let out = compression::compact_log(log);
+        collapsed += usize::from(out.is_some());
+        h.update(out.unwrap_or_default().as_bytes());
+        h.update(b"|");
+    }
+    for reversible in [false, true] {
+        let mut body = conversation_with_repeated_context();
+        let (_, stash) = compression::dedup_rewrite(&cfg, reversible, &mut body);
+        h.update(format!("{body}{stash:?}").as_bytes());
+    }
+    for k in 0..20usize {
+        // A conversation of logs, prose and repeats, as strings and as parts.
+        let mut messages = Vec::new();
+        for j in 0..(4 + k % 5) {
+            let text = if j % 3 == 2 {
+                logs[(k + j) % 3].clone()
+            } else {
+                logs[(k * 7 + j) % logs.len()].clone()
+            };
+            let role = if j % 2 == 0 { "user" } else { "assistant" };
+            if j % 4 == 1 {
+                messages.push(json!({"role": role, "content": [{"type": "text", "text": text}, {"type": "text", "text": prose_thread()}]}));
+            } else {
+                messages.push(json!({"role": role, "content": text}));
+            }
+        }
+        messages.push(json!({"role": "user", "content": "what failed?"}));
+        let body = json!({"messages": messages});
+        for reversible in [false, true] {
+            let mut b = body.clone();
+            let (_, stash) = compression::dedup_rewrite(&cfg, reversible, &mut b);
+            h.update(format!("{b}{stash:?}").as_bytes());
+            let (_, stash) = compression::log_rewrite(&cfg, &mut b);
+            h.update(format!("{b}{stash:?}").as_bytes());
+        }
+    }
+    assert!(
+        collapsed > 40,
+        "the logs barely exercised the miner ({collapsed})"
+    );
+    let digest = hex::encode(h.finalize());
+    assert_eq!(
+        digest,
+        "e714c52ab680df271bfeecc930307c856e77b53fd8aef2dfdd46be36fdc2dc51"
     );
 }

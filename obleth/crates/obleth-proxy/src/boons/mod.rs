@@ -596,9 +596,9 @@ impl BoonEngine {
         // text passes after tool-loop injection. Stats accumulate across both and
         // the single span is recorded once, below.
         let comp_start = crate::tracer::now_ms();
-        let mut lossless = compression::CompressionStats::default();
-        let mut dedup = compression::DedupStats::default();
-        let mut logs = compression::LogStats::default();
+        let mut lossless = compression::PassStats::default();
+        let mut dedup = compression::PassStats::default();
+        let mut logs = compression::PassStats::default();
         let mut lossy = compression::LossyStats::default();
 
         // Lossless structural/code compaction: `is_chat` is always true here; the
@@ -606,12 +606,10 @@ impl BoonEngine {
         if compression_eligible(route, &settings, key, is_chat) {
             let code_compaction = effective_code_compaction(&settings, key);
             lossless = compression::apply(&settings.compression, code_compaction, json);
-            if lossless.compressed > 0 {
+            if lossless.replaced > 0 {
                 outcome.rewritten = true;
                 outcome.applied.push("compression");
-                state.metrics.record_compression_saved(
-                    lossless.tokens_before.saturating_sub(lossless.tokens_after),
-                );
+                state.metrics.record_compression_saved(lossless.saved());
             }
         }
 
@@ -778,37 +776,31 @@ impl BoonEngine {
         // are reversible only when the model can call that tool: then the
         // originals are stashed and the markers say so.
         let reversible = route.supports_function_calling && settings.tool_loop.active();
-        if dedup_eligible(route, &settings, key)
-            || log_compaction_eligible(route, &settings, key)
-            || lossy_eligible(route, &settings, key, force_lossy)
-        {
-            if dedup_eligible(route, &settings, key) {
-                dedup =
-                    compression::apply_dedup(state, &settings.compression, key, reversible, json)
-                        .await;
+        let dedup_on = dedup_eligible(route, &settings, key);
+        let logs_on = log_compaction_eligible(route, &settings, key);
+        let lossy_on = lossy_eligible(route, &settings, key, force_lossy);
+        if dedup_on || logs_on || lossy_on {
+            // One segment index for the three passes; each records its
+            // rewrites, and `finish` writes them and stashes the originals.
+            let mut text_passes =
+                compression::TextPasses::new(&settings.compression, reversible, json);
+            if dedup_on {
+                dedup = text_passes.dedup(json);
             }
-            if log_compaction_eligible(route, &settings, key) {
-                logs = compression::apply_log_compaction(
-                    state,
-                    &settings.compression,
-                    key,
-                    reversible,
-                    json,
-                )
-                .await;
+            if logs_on {
+                logs = text_passes.logs(json);
             }
-            if lossy_eligible(route, &settings, key, force_lossy) {
-                lossy =
-                    compression::apply_lossy(state, &settings.compression, key, reversible, json)
-                        .await;
+            if lossy_on {
+                lossy = text_passes.lossy(state, json).await;
                 if let Some(outcome) = lossy.scorer {
                     state.metrics.record_compressor_score(outcome.name());
                 }
             }
+            text_passes.finish(state, key, json).await;
             let refs = dedup
-                .refs_created
-                .saturating_add(logs.refs_created)
-                .saturating_add(lossy.refs_created);
+                .replaced
+                .saturating_add(logs.replaced)
+                .saturating_add(lossy.pass.replaced);
             if refs > 0 {
                 outcome.rewritten = true;
                 if !outcome.applied.contains(&"compression") {
@@ -829,25 +821,21 @@ impl BoonEngine {
                 }
                 state.metrics.record_compression_saved(
                     dedup
-                        .tokens_before
-                        .saturating_sub(dedup.tokens_after)
-                        .saturating_add(logs.tokens_before.saturating_sub(logs.tokens_after))
-                        .saturating_add(lossy.tokens_before.saturating_sub(lossy.tokens_after)),
+                        .saved()
+                        .saturating_add(logs.saved())
+                        .saturating_add(lossy.pass.saved()),
                 );
             }
         }
 
         // ---- combined compression token totals (all passes) ----
-        let tokens_before = lossless
-            .tokens_before
-            .saturating_add(dedup.tokens_before)
-            .saturating_add(logs.tokens_before)
-            .saturating_add(lossy.tokens_before);
-        let tokens_after = lossless
-            .tokens_after
-            .saturating_add(dedup.tokens_after)
-            .saturating_add(logs.tokens_after)
-            .saturating_add(lossy.tokens_after);
+        let passes = [lossless, dedup, logs, lossy.pass];
+        let tokens_before = passes
+            .iter()
+            .fold(0u32, |n, p| n.saturating_add(p.tokens_before));
+        let tokens_after = passes
+            .iter()
+            .fold(0u32, |n, p| n.saturating_add(p.tokens_after));
         // Surface totals for the `x-obleth-compression` response header whenever
         // the compression boon actually inspected tokens on this request.
         if tokens_before > 0 {
@@ -856,17 +844,23 @@ impl BoonEngine {
 
         // ---- single compression trace span (all passes combined) ----
         if let Some(t) = tracer.as_deref_mut() {
-            if lossless.scanned > 0 || tokens_before > 0 {
+            if lossless.examined > 0 || tokens_before > 0 {
                 t.record_elapsed(
                     "boon:compression",
                     "proxy_request",
                     comp_start,
                     "ok",
                     serde_json::json!({
-                        "json_compacted": lossless.compressed,
-                        "dedup_refs": dedup.refs_created,
-                        "log_segments": logs.refs_created,
-                        "lossy_segments": lossy.refs_created,
+                        "json_compacted": lossless.replaced,
+                        "dedup_refs": dedup.replaced,
+                        "log_segments": logs.replaced,
+                        "lossy_segments": lossy.pass.replaced,
+                        "passes": {
+                            "lossless": lossless.to_json(),
+                            "dedup": dedup.to_json(),
+                            "logs": logs.to_json(),
+                            "lossy": lossy.pass.to_json(),
+                        },
                         "scorer": lossy.scorer.map_or("heuristic", |o| o.name()),
                         "score_ms": lossy.score_ms,
                         "tokens_before": tokens_before,
@@ -2460,8 +2454,8 @@ mod tests {
             .find("compression::apply(")
             .expect("lossless compression::apply call");
         let apply_lossy = src
-            .find("compression::apply_lossy(")
-            .expect("apply_lossy call");
+            .find("text_passes.finish(")
+            .expect("the call that writes the text passes' rewrites");
         // The in-flow call, not the `guard_input` helper defined above
         // `enrich_request` (which would satisfy the ordering vacuously).
         let guardrails_marker = src

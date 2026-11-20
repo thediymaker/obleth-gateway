@@ -300,48 +300,29 @@ fn parse_score_response(v: &serde_json::Value, expected_len: usize) -> Option<Ve
 /// faithful.
 pub(super) fn split_sentences(text: &str) -> Vec<String> {
     let mut sentences: Vec<String> = Vec::new();
-    let mut current = String::new();
-
-    let chars: Vec<char> = text.chars().collect();
-    let len = chars.len();
-    let mut i = 0;
-
-    while i < len {
-        let ch = chars[i];
-
+    let mut push = |piece: &str| {
+        let piece = piece.trim();
+        if !piece.is_empty() {
+            sentences.push(piece.to_owned());
+        }
+    };
+    let mut start = 0;
+    let mut chars = text.char_indices().peekable();
+    while let Some((i, ch)) = chars.next() {
         if ch == '\n' {
-            // Hard newline always ends the current sentence.
-            let trimmed = current.trim().to_string();
-            if !trimmed.is_empty() {
-                sentences.push(trimmed);
-            }
-            current.clear();
-            i += 1;
-            continue;
+            // A hard newline always ends the sentence, and is not part of it.
+            push(&text[start..i]);
+            start = i + 1;
+        } else if matches!(ch, '.' | '!' | '?')
+            && chars.peek().is_none_or(|(_, next)| next.is_whitespace())
+        {
+            // Punctuation ends it when whitespace (or the end) follows.
+            push(&text[start..i + 1]);
+            start = i + 1;
         }
-
-        current.push(ch);
-
-        if matches!(ch, '.' | '!' | '?') {
-            // Break when the next non-consumed character is whitespace (or end).
-            if i + 1 >= len || chars[i + 1].is_whitespace() {
-                let trimmed = current.trim().to_string();
-                if !trimmed.is_empty() {
-                    sentences.push(trimmed);
-                }
-                current.clear();
-            }
-        }
-
-        i += 1;
     }
-
-    // Flush any trailing text that did not end with punctuation.
-    let trimmed = current.trim().to_string();
-    if !trimmed.is_empty() {
-        sentences.push(trimmed);
-    }
-
+    // Trailing text that did not end with punctuation.
+    push(&text[start..]);
     sentences
 }
 
@@ -383,10 +364,9 @@ pub(super) fn select_kept(
     let mut kept_set: std::collections::HashSet<usize> =
         indexed[..keep.min(n)].iter().map(|(i, _)| *i).collect();
 
-    // Force-keep any sentence whose lowercased text contains a query term.
+    // Force-keep any sentence that has a query term.
     for (idx, sent) in sentences.iter().enumerate() {
-        let lower = sent.to_lowercase();
-        if query_terms.iter().any(|term| lower.contains(term.as_str())) {
+        if super::compression::mentions_any(sent, query_terms) {
             kept_set.insert(idx);
         }
     }

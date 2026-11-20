@@ -3391,14 +3391,16 @@ pub struct CompressionBoonSettings {
     /// floor (overhead would exceed savings).
     #[serde(default = "default_compression_min_tokens")]
     pub min_tokens: u32,
-    /// Cap on how many segments are compacted per request (safety guard).
+    /// Cap on how many segments the lossless pass compacts per request. The
+    /// pass also stops after reading 8 MB of segment text.
     #[serde(default = "default_compression_max_segments")]
     pub max_segments: u32,
     /// Redis TTL for stashed originals (seconds); tuned to a session lifetime.
     #[serde(default = "default_compression_original_ttl_secs")]
     pub original_ttl_secs: u64,
-    /// Cap on lossy (helper-summarized) segments per request — a cost guard
-    /// distinct from `max_segments`, which caps lossless compaction.
+    /// Segments each reversible text pass (dedup, log, lossy) may replace
+    /// per request; distinct from `max_segments`, which caps lossless
+    /// compaction.
     #[serde(default = "default_compression_max_lossy_segments")]
     pub max_lossy_segments: u32,
     /// Conservative, opt-in whitespace normalization of fenced code segments
