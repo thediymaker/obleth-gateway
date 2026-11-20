@@ -112,7 +112,6 @@ describe("rows", () => {
       ["glm-5.2", "slurm", 1, 2, "gh200 · gpu:1 · 72 CPU · 560G · 1 day"],
       ["glm-5-3-flash", "kubernetes", 10, null, "aibrix-system-llm / glm-5-3-flash"],
     ]);
-    expect(rows[1].poolCap).toBe(160);
     expect(deploymentsLine(rows)).toBe("1 on Kubernetes, 10 replicas ready · 1 on Slurm");
   });
 });

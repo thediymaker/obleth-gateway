@@ -16,7 +16,8 @@ import type {
   ReasoningMode,
   UsageModelAgg,
 } from "@/lib/obleth";
-import { healthState, isBenchmarkRoute, poolOccupancy, type HealthState } from "@/lib/overview-model";
+import { healthState, isBenchmarkRoute, type HealthState } from "@/lib/overview-model";
+import { poolOccupancy } from "@/lib/occupancy";
 import { parseTagLevel, TAG_LEVEL_LABELS } from "@/lib/utils";
 
 /**
@@ -199,7 +200,7 @@ export function buildModelRows(
   const byName = new Map(usage.map((u) => [u.model, u]));
   return models.map((model) => {
     const row = byId.get(model.id);
-    const pool = model.enabled ? poolOccupancy(model.model_name, model, fairshare, discovery) : { inFlight: 0, cap: 0, queued: 0 };
+    const pool = poolOccupancy(model.model_name, model, fairshare, discovery);
     const u = byName.get(model.model_name);
     return {
       id: model.id,

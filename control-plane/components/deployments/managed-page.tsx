@@ -62,6 +62,7 @@ import { modelHref } from "@/lib/models-model";
 import type { AuditEntry, ManagedModelSpec, ModelReplica } from "@/lib/obleth";
 import { PORT_WINDOW } from "@/lib/managed-model-schema";
 import { compact } from "@/lib/overview-model";
+import { poolOccupancy } from "@/lib/occupancy";
 import { sbatchLines, stripSbatchDirectives, type PlacementKey, type SbatchLine } from "@/lib/sbatch-directives";
 import { useClusterResources } from "@/lib/use-cluster-resources";
 import { cn, getJson } from "@/lib/utils";
@@ -397,9 +398,7 @@ export function ManagedPage({ modelId, initial, changes }: { modelId: string; in
   const lost = replicas.filter((r) => r.state === "lost").sort((a, b) => b.updated_at.localeCompare(a.updated_at));
   const counts = countReplicas(replicas);
   const day = useModelDay(model.model_name);
-  const inFlight = fairshare.data?.model_in_flight?.[model.model_name] ?? 0;
-  const queued = fairshare.data?.model_queued?.[model.model_name] ?? 0;
-  const cap = model.max_in_flight ?? 0;
+  const { inFlight, cap, queued } = poolOccupancy(model.model_name, model, fairshare.data, data.discovery);
   const engine = typeof spec.launcher_spec?.name === "string" ? (spec.launcher_spec.name as string) : null;
   const fromRecipe = typeof spec.launcher_spec?.recipe_id === "string";
   // Launches from this version on record a digest of the script they sent, so

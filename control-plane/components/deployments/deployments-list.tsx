@@ -34,6 +34,7 @@ import {
 import { logsHref } from "@/lib/log-links";
 import { MODEL_TYPE_NAMES } from "@/lib/models-model";
 import { compact } from "@/lib/overview-model";
+import { poolOccupancy } from "@/lib/occupancy";
 import { useClusterResources } from "@/lib/use-cluster-resources";
 import { cn, getJson } from "@/lib/utils";
 
@@ -44,11 +45,6 @@ function ago(secs: number | null | undefined): string {
   if (secs < 60) return `${Math.round(secs)} s ago`;
   if (secs < 3600) return `${Math.round(secs / 60)} min ago`;
   return `${Math.round(secs / 3600)} h ago`;
-}
-
-function inFlightOf(r: DeploymentRow, live: Record<string, number> | undefined): number {
-  if (r.discovery) return r.discovery.cluster_in_flight ?? r.discovery.in_flight ?? 0;
-  return live?.[r.model.model_name] ?? 0;
 }
 
 export function DeploymentsList({ initial, recipes, tab: initialTab, slurmSheet = false }: { initial: DeploymentsData; recipes: RecipeCard[]; tab: "deployments" | "recipes"; slurmSheet?: boolean }) {
@@ -73,9 +69,10 @@ export function DeploymentsList({ initial, recipes, tab: initialTab, slurmSheet 
   const k8s = rows.filter((r) => r.kind === "kubernetes");
   const slurm = rows.filter((r) => r.kind === "slurm");
   const attention = rows.filter((r) => r.view.attention);
-  const flights = fairshare.data?.model_in_flight;
-  const full = rows.filter((r) => r.poolCap > 0 && inFlightOf(r, flights) >= r.poolCap);
-  const busiest = [...rows].filter((r) => r.poolCap > 0).sort((a, b) => inFlightOf(b, flights) / b.poolCap - inFlightOf(a, flights) / a.poolCap)[0];
+  const occupancy = new Map(rows.map((r) => [r.model.id, poolOccupancy(r.model.model_name, r.model, fairshare.data, data.discovery)]));
+  const pool = (r: DeploymentRow) => occupancy.get(r.model.id)!;
+  const full = rows.filter((r) => pool(r).cap > 0 && pool(r).inFlight >= pool(r).cap);
+  const busiest = [...rows].filter((r) => pool(r).cap > 0).sort((a, b) => pool(b).inFlight / pool(b).cap - pool(a).inFlight / pool(a).cap)[0];
   const readyTotal = rows.reduce((n, r) => n + r.ready, 0);
   const slurmWanted = slurm.reduce((n, r) => n + (r.wanted ?? 0), 0);
   const slurmReady = slurm.reduce((n, r) => n + r.ready, 0);
@@ -215,7 +212,7 @@ export function DeploymentsList({ initial, recipes, tab: initialTab, slurmSheet 
               label="Pools full now"
               value={full.length}
               emphasis={full.length > 0}
-              detail={full.length ? full.map((r) => r.model.model_name).join(" · ") : busiest ? `${busiest.model.model_name} busiest, ${inFlightOf(busiest, flights)} of ${busiest.poolCap}` : null}
+              detail={full.length ? full.map((r) => r.model.model_name).join(" · ") : busiest ? `${busiest.model.model_name} busiest, ${pool(busiest).inFlight} of ${pool(busiest).cap}` : null}
             />
           </div>
 
@@ -251,7 +248,7 @@ export function DeploymentsList({ initial, recipes, tab: initialTab, slurmSheet 
                 )}
                 {shown.map((r) => {
                   const c = countReplicas(r.replicas);
-                  const inFlight = inFlightOf(r, flights);
+                  const { inFlight, cap } = pool(r);
                   const href = deploymentHref(r.model.model_name);
                   return (
                     <div
@@ -276,15 +273,15 @@ export function DeploymentsList({ initial, recipes, tab: initialTab, slurmSheet 
                         <span className="truncate font-mono text-[11.5px] text-muted-foreground" title={r.where}>{r.where}</span>
                       </span>
                       <span className="flex flex-col gap-1">
-                        <span className="font-mono text-[12px]">{r.poolCap ? `${inFlight} of ${r.poolCap}` : "—"}</span>
-                        <Meter value={inFlight} max={r.poolCap} strong={r.poolCap > 0 && inFlight >= r.poolCap} />
+                        <span className="font-mono text-[12px]">{cap ? `${inFlight} of ${cap}` : "—"}</span>
+                        <Meter value={inFlight} max={cap} strong={cap > 0 && inFlight >= cap} />
                       </span>
                       {r.requests24h ? (
                         <Link href={logsHref({ model: r.model.model_name, window: "24h" })} title="See these requests" className="text-right font-mono text-[12px] underline decoration-muted-foreground/40 underline-offset-[3px] hover:decoration-foreground">{compact(r.requests24h)}</Link>
                       ) : (
                         <span className="text-right font-mono text-[12px] text-muted-foreground">0</span>
                       )}
-                      <span className="text-right font-mono text-[12px] text-secondary-foreground">{r.perReplica ?? (r.kind === "slurm" && r.wanted ? Math.round(r.poolCap / Math.max(1, r.wanted)) || "—" : "—")}</span>
+                      <span className="text-right font-mono text-[12px] text-secondary-foreground">{r.perReplica ?? (r.kind === "slurm" && r.wanted ? Math.round(cap / Math.max(1, r.wanted)) || "—" : "—")}</span>
                     </div>
                   );
                 })}

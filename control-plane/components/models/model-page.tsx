@@ -37,7 +37,7 @@ import {
   type SettingsSectionId,
 } from "@/lib/models-model";
 import type { McpServer, ModelEndpoint, ModelHealthDetail, ModelHealthSummary, ModelRoute, UsageLogFacet } from "@/lib/obleth";
-import { poolOccupancy } from "@/lib/overview-model";
+import { poolOccupancy } from "@/lib/occupancy";
 import { cn, getJson } from "@/lib/utils";
 
 type NavId = "overview" | SettingsSectionId | "lifecycle" | "activity";
@@ -196,7 +196,7 @@ export function ModelPage({
   const endpoints = endpointsQuery.data ?? [];
   const status = modelStatus(model, summary);
   const runs = runsOn(model, managed);
-  const load = model.enabled ? poolOccupancy(model.model_name, model, fairshare.data, discovery.data) : { inFlight: 0, cap: 0, queued: 0 };
+  const load = poolOccupancy(model.model_name, model, fairshare.data, discovery.data);
   const capacityStatus = discovery.data?.models.find((m) => m.model_id === model.id)?.status;
   const first = awaitingFirstPass(checks);
   const chat = model.model_type === "chat";

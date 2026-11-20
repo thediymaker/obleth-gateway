@@ -270,7 +270,6 @@ export interface DeploymentRow {
   /** Kubernetes: namespace / Service. Slurm: partition · gres · mem · walltime. */
   where: string;
   perReplica: number | null;
-  poolCap: number;
   requests24h: number;
   spec?: ManagedModelSpec;
   replicas: ModelReplica[];
@@ -331,7 +330,6 @@ export function buildDeploymentRows(
         wanted: s.enabled ? s.target_replicas : 0,
         where: slurmPlacement(s),
         perReplica: null,
-        poolCap: m.max_in_flight ?? 0,
         requests24h: requests[m.model_name] ?? 0,
         spec: s,
         replicas: mine,
@@ -349,7 +347,6 @@ export function buildDeploymentRows(
         wanted: null,
         where: d?.status?.namespace && d.status.service ? `${d.status.namespace} / ${d.status.service}` : m.capacity_service || "—",
         perReplica: d?.status?.per_replica_max_in_flight ?? m.per_replica_max_in_flight ?? null,
-        poolCap: d?.status?.effective_max_in_flight ?? d?.enforced_max_in_flight ?? m.max_in_flight ?? 0,
         requests24h: requests[m.model_name] ?? 0,
         replicas: [],
         discovery: d,

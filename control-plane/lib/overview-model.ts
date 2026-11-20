@@ -9,6 +9,7 @@ import type {
 } from "@/lib/obleth";
 import { belowShareInPools, countsScope } from "@/lib/fairshare";
 import { modelHref } from "@/lib/model-links";
+import { poolOccupancy } from "@/lib/occupancy";
 
 /** The Overview's one time control. Every tile, chart and table follows it. */
 export type OverviewRange = "1h" | "24h" | "7d";
@@ -108,39 +109,6 @@ export interface FleetTile {
   p50TtftMs: number;
   /** A condition that belongs in Needs attention. */
   attention: "down" | "full" | null;
-}
-
-/**
- * Live pool occupancy for one model: cluster-wide in shared mode, else this
- * gateway's own. Waiting follows the view's scope: every gateway's when the
- * view is cluster-wide. The view lists only the pools with traffic somewhere
- * or that the answering gateway has served since it started, so a model it
- * does not list falls back to capacity discovery (its enforced size and
- * cluster-wide count), then to the configured size.
- */
-export function poolOccupancy(name: string, model: ModelRoute, fairshare?: FairshareLiveView, discovery?: CapacityDiscoveryView) {
-  const shared = fairshare?.mode === "shared";
-  const pool = fairshare?.pools?.find((p) => p.model === name);
-  if (pool) {
-    return {
-      inFlight: shared ? pool.cluster_in_flight ?? pool.in_flight : pool.in_flight,
-      cap: shared ? pool.configured_cap ?? pool.cap : pool.cap,
-      queued: pool.queued,
-    };
-  }
-  const found = discovery?.models.find((d) => d.model_name === name && d.enforced_max_in_flight > 0);
-  if (found) {
-    return {
-      inFlight: found.cluster_in_flight ?? found.in_flight,
-      cap: found.enforced_max_in_flight,
-      queued: fairshare?.model_queued?.[name] ?? 0,
-    };
-  }
-  return {
-    inFlight: fairshare?.model_in_flight?.[name] ?? 0,
-    cap: model.max_in_flight ?? fairshare?.default_model_max_in_flight ?? 0,
-    queued: fairshare?.model_queued?.[name] ?? 0,
-  };
 }
 
 const TILE_ORDER: Record<HealthState, number> = { unhealthy: 0, healthy: 1, unknown: 2, maintenance: 3 };
