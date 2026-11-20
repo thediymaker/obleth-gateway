@@ -55,6 +55,9 @@ pub const DEFAULT_CLIENT_IP_RETENTION_DAYS: u32 = 90;
 /// `usage_meta` key recording the client address retention the column TTLs
 /// were last set to, so a changed setting is applied once, not on every boot.
 const CLIENT_IP_TTL_META: &str = "client_ip_ttl_days";
+/// `usage_meta` key recording that `key_network_seen` has been seeded from
+/// the addresses the ledger still holds.
+const KEY_NETWORK_SEEN_MARKER: &str = "key_network_seen_v1";
 /// Refused uses of one key from one address for one reason are folded into
 /// one `key_rejections` row per window of this length.
 pub const REJECTION_WINDOW: Duration = Duration::from_secs(10);
@@ -922,6 +925,12 @@ fn client_ip_ttl(days: u32) -> String {
     format!("TTL toDate(fromUnixTimestamp64Milli(ts_ms)) + INTERVAL {days} DAY")
 }
 
+/// `key_network_seen`'s row TTL: a key and network last seen together longer
+/// ago than client addresses are kept.
+fn key_network_ttl(days: u32) -> String {
+    format!("TTL toDate(fromUnixTimestamp64Milli(last_seen_ms)) + INTERVAL {days} DAY")
+}
+
 struct SpansFlusher {
     client: Client,
     schema_ready: Arc<AtomicBool>,
@@ -1578,6 +1587,11 @@ async fn view_matches(
 ///   country, kept forever (the raw ledger is pruned, this is not), fed by a
 ///   materialized view on `usage`. Rows written before countries were
 ///   recorded have none, so it starts empty.
+/// - `key_network_seen`: the same per client network, kept as long as client
+///   addresses are (a row goes once the key has not been seen from the
+///   network for that long). Seeded once from the ledger, then fed by a
+///   materialized view, so `key-sources` reads it instead of scanning the
+///   whole retention of the ledger on every call.
 ///
 /// Then, when the client address retention changed since the column TTLs
 /// were last set, moves every client-identifying column to the new TTL once.
@@ -1632,6 +1646,50 @@ async fn ensure_key_watch(
         ))
         .execute()
         .await?;
+    client
+        .query(&format!(
+            "CREATE TABLE IF NOT EXISTS {database}.key_network_seen (
+                key_id UUID,
+                client_network String,
+                first_seen_ms SimpleAggregateFunction(min, Int64),
+                last_seen_ms SimpleAggregateFunction(max, Int64)
+            ) ENGINE = AggregatingMergeTree()
+            ORDER BY (key_id, client_network)
+            {}",
+            key_network_ttl(ip_days)
+        ))
+        .execute()
+        .await?;
+    client
+        .query(&format!(
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS {database}.key_network_seen_mv
+            TO {database}.key_network_seen AS
+            SELECT key_id, client_network,
+                   min(ts_ms) AS first_seen_ms, max(ts_ms) AS last_seen_ms
+            FROM {database}.usage
+            WHERE client_network != ''
+            GROUP BY key_id, client_network"
+        ))
+        .execute()
+        .await?;
+    // Seed from the addresses the ledger still holds, after the view exists
+    // so nothing written meanwhile is missed. Rows the view also caught are
+    // counted twice, which `min` and `max` absorb, so replicas racing here
+    // (or a seed cut short and re-run at the next start) do no harm.
+    if meta_count(client, database, KEY_NETWORK_SEEN_MARKER).await? == 0 {
+        client
+            .query(&format!(
+                "INSERT INTO {database}.key_network_seen
+                 SELECT key_id, client_network, min(ts_ms), max(ts_ms)
+                 FROM {database}.usage
+                 WHERE client_network != ''
+                 GROUP BY key_id, client_network"
+            ))
+            .with_option("insert_deduplicate", "0")
+            .execute()
+            .await?;
+        meta_put(client, database, KEY_NETWORK_SEEN_MARKER, "1").await?;
+    }
 
     // The TTL a column was created with is the retention in force when it
     // was added, recorded here the first time. A later change is applied with
@@ -1657,6 +1715,13 @@ async fn ensure_key_watch(
                     .execute()
                     .await?;
             }
+            client
+                .query(&format!(
+                    "ALTER TABLE {database}.key_network_seen MODIFY {}",
+                    key_network_ttl(ip_days)
+                ))
+                .execute()
+                .await?;
             meta_put(client, database, CLIENT_IP_TTL_META, &wanted).await?;
             tracing::info!(
                 from_days = %previous,
@@ -2410,6 +2475,67 @@ mod clickhouse_tests {
     /// Client columns, their TTLs, the rejections ledger and the per-country
     /// first-seen table come up on a fresh database and on a second boot,
     /// and a changed retention moves the TTLs once.
+    /// `key_network_seen` is fed by its view, seeded once from rows written
+    /// before it existed, and drops pairs not seen for the retention.
+    #[tokio::test]
+    async fn key_network_seen_is_fed_seeded_and_expires() {
+        let Some((client, database)) = fixture() else {
+            return;
+        };
+        ensure_schema(&client, &database).await.unwrap();
+        let flusher = flusher(&client, &database);
+        let day = 86_400_000;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let row = |key: u128, network: &str, ts_ms: i64| {
+            let mut rec = record(1);
+            rec.key_id = Uuid::from_u128(key);
+            rec.ts_ms = ts_ms;
+            rec.client_ip = "203.0.113.9".into();
+            rec.client_network = network.into();
+            rec
+        };
+        flusher
+            .insert(&[
+                row(7, "203.0.113.0/24", now - 3 * day),
+                row(7, "203.0.113.0/24", now - day),
+                row(8, "198.51.100.0/24", now - 200 * day),
+            ])
+            .await
+            .unwrap();
+        let first_seen = format!(
+            "SELECT toUInt64(min(first_seen_ms)) FROM {database}.key_network_seen \
+             WHERE key_id = toUUID('{}')",
+            Uuid::from_u128(7)
+        );
+        assert_eq!(scalar(&client, &first_seen).await, (now - 3 * day) as u64);
+
+        // Forget the table and the marker: the next start seeds it from the
+        // ledger, and a second start leaves it alone.
+        for sql in [
+            format!("TRUNCATE TABLE {database}.key_network_seen"),
+            format!("ALTER TABLE {database}.usage_meta DELETE WHERE key = '{KEY_NETWORK_SEEN_MARKER}' SETTINGS mutations_sync = 2"),
+        ] {
+            client.query(&sql).execute().await.unwrap();
+        }
+        ensure_key_watch(&client, &database, 90).await.unwrap();
+        ensure_key_watch(&client, &database, 90).await.unwrap();
+        assert_eq!(scalar(&client, &first_seen).await, (now - 3 * day) as u64);
+
+        // The pair last seen 200 days ago is past a 90-day retention, so it
+        // is gone once parts are merged (or was dropped as it was written).
+        client
+            .query(&format!("OPTIMIZE TABLE {database}.key_network_seen FINAL"))
+            .execute()
+            .await
+            .unwrap();
+        let pairs = format!("SELECT count() FROM {database}.key_network_seen");
+        assert_eq!(scalar(&client, &pairs).await, 1);
+        drop_database(&client, &database).await;
+    }
+
     #[tokio::test]
     async fn client_columns_and_key_watch_tables_are_applied_idempotently() {
         let Some((client, database)) = fixture() else {
@@ -2419,6 +2545,11 @@ mod clickhouse_tests {
         ensure_schema(&client, &database).await.unwrap();
         let flusher = flusher(&client, &database);
         let mut rec = record(1);
+        // Recent, or the address TTL blanks it as it is written.
+        rec.ts_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
         rec.key_id = Uuid::from_u128(7);
         rec.client_ip = "203.0.113.9".into();
         rec.client_network = "203.0.113.0/24".into();
@@ -2440,7 +2571,11 @@ mod clickhouse_tests {
             .fetch_one()
             .await
             .unwrap();
-        assert!(create.contains("INTERVAL 90 DAY"), "{create}");
+        // Older servers print `INTERVAL 90 DAY`, 24.x `toIntervalDay(90)`.
+        assert!(
+            create.contains("INTERVAL 90 DAY") || create.contains("toIntervalDay(90)"),
+            "{create}"
+        );
 
         let rejections = RejectionFlusher {
             client: client.clone().with_database(&database),

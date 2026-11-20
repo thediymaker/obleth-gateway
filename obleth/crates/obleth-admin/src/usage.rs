@@ -630,7 +630,9 @@ fn usage_log_select() -> String {
 }
 
 /// Read individual `usage` rows newest-first, honoring the supplied filters and
-/// keyset cursor.
+/// keyset cursor. Two reads: the page's `(ts_ms, request_id)` pairs, which
+/// reads only those columns (and the filters') across the window, then every
+/// column of just those rows, within the time span they cover.
 pub async fn query_usage_logs(
     client: &clickhouse::Client,
     q: UsageLogQuery,
@@ -639,30 +641,65 @@ pub async fn query_usage_logs(
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
     let filter = log_filter_sql(&q, since);
 
-    let mut sql = usage_log_select();
-    sql.push_str(filter.sql());
+    let mut page_sql = format!("select ts_ms, request_id from usage{}", filter.sql());
     // Keyset cursor: (ts_ms, request_id) tuple strictly less than the cursor.
     // Tuple comparison matches the `order by` below for stable paging.
     if q.before_ms.is_some() && q.before_request_id.is_some() {
-        sql.push_str(" and (ts_ms, toString(request_id)) < (?, ?)");
+        page_sql.push_str(" and (ts_ms, toString(request_id)) < (?, ?)");
     } else if q.before_ms.is_some() {
-        sql.push_str(" and ts_ms < ?");
+        page_sql.push_str(" and ts_ms < ?");
     }
-    // Order by the same expression the keyset cursor compares against
-    // (`toString(request_id)`), so paging is stable across millisecond ties:
-    // ClickHouse's native UUID ordering differs from its string ordering.
-    sql.push_str(&format!(
-        " order by ts_ms desc, toString(request_id) desc limit {limit}"
-    ));
-
-    let mut query = filter.bind(client.query(&sql));
+    page_sql.push_str(&format!(" {LOG_ORDER} limit {limit}"));
+    let mut page = filter.bind(client.query(&page_sql));
     if let (Some(before_ms), Some(before_id)) = (q.before_ms, q.before_request_id) {
-        query = query.bind(before_ms).bind(before_id.to_string());
+        page = page.bind(before_ms).bind(before_id.to_string());
     } else if let Some(before_ms) = q.before_ms {
-        query = query.bind(before_ms);
+        page = page.bind(before_ms);
     }
+    let page = page.fetch_all::<LogPageEntry>().await?;
+    let Some(rows_sql) = usage_log_rows_sql(filter.sql(), &page) else {
+        return Ok(Vec::new());
+    };
+    filter
+        .bind(client.query(&rows_sql))
+        .fetch_all::<UsageLogRow>()
+        .await
+}
 
-    query.fetch_all::<UsageLogRow>().await
+/// Newest first. Ties on the millisecond order by the expression the keyset
+/// cursor compares (`toString(request_id)`): ClickHouse's native UUID
+/// ordering differs from its string ordering.
+const LOG_ORDER: &str = "order by ts_ms desc, toString(request_id) desc";
+
+#[derive(Debug, Row, Deserialize)]
+struct LogPageEntry {
+    ts_ms: i64,
+    #[serde(with = "clickhouse::serde::uuid")]
+    request_id: Uuid,
+}
+
+/// Every column of the rows on `page`: the log's filters again (so a row is
+/// returned only if it matched), the page's time span, which bounds the
+/// partitions and granules read, and its ids. `None` for an empty page.
+/// Values are written into the SQL: an `i64` and a UUID print only digits,
+/// hex and dashes.
+fn usage_log_rows_sql(filter: &str, page: &[LogPageEntry]) -> Option<String> {
+    let oldest = page.iter().map(|e| e.ts_ms).min()?;
+    let newest = page.iter().map(|e| e.ts_ms).max()?;
+    let ids = page
+        .iter()
+        .map(|e| format!("toUUID('{}')", e.request_id))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "{}{filter} \
+         and ts between fromUnixTimestamp64Milli(toInt64({oldest})) and fromUnixTimestamp64Milli(toInt64({newest})) \
+         and ts_ms between {oldest} and {newest} \
+         and request_id in ({ids}) \
+         {LOG_ORDER} limit {}",
+        usage_log_select(),
+        page.len()
+    ))
 }
 
 /// The request log's histogram: the bucket width used, and each non-empty bucket.
@@ -783,63 +820,97 @@ pub const LOG_FACET_DIMENSIONS: &[(&str, &str)] = &[
     ("error_classes", obleth_config::EFFECTIVE_CLASS_SQL),
 ];
 
-fn usage_log_facet_sql(expr: &str, filter: &str) -> String {
+/// The `grouping(...)` mask of a facet row: one bit per grouping column,
+/// the first column highest, set when the row is NOT grouped by it.
+const FACET_GROUPING_COLUMNS: u32 = LOG_FACET_DIMENSIONS.len() as u32 + 2;
+
+fn facet_mask(grouped: &[u32]) -> u64 {
+    let all = (1u64 << FACET_GROUPING_COLUMNS) - 1;
+    grouped
+        .iter()
+        .fold(all, |m, i| m & !(1 << (FACET_GROUPING_COLUMNS - 1 - i)))
+}
+
+/// Every facet and the most common failures in one scan: a grouping set per
+/// dimension (`d0`..), and one of failed requests by status and model
+/// (`fail_status`, `fail_model`; zero and empty on successes, which are
+/// dropped). Each set keeps its [`LOG_FACET_LIMIT`] busiest rows.
+fn usage_log_facets_sql(filter: &str) -> String {
+    let dims = LOG_FACET_DIMENSIONS.len() as u32;
+    let columns: Vec<String> = LOG_FACET_DIMENSIONS
+        .iter()
+        .enumerate()
+        .map(|(i, (_, expr))| format!("{expr} as d{i}"))
+        .collect();
+    let names: Vec<String> = (0..dims).map(|i| format!("d{i}")).collect();
+    let sets: Vec<String> = names.iter().map(|d| format!("({d})")).collect();
     format!(
-        "select {expr} as facet, \
-         count() as requests, \
-         countIf(status_code >= 400) as errors \
-         from usage{filter} group by facet order by requests desc, facet limit {LOG_FACET_LIMIT}"
+        "select grouping({names}, fail_status, fail_model) as g, {columns}, \
+         if(status_code >= 400, status_code, 0) as fail_status, \
+         if(status_code >= 400, model, '') as fail_model, \
+         count() as requests, countIf(status_code >= 400) as errors \
+         from usage{filter} \
+         group by grouping sets ({sets}, (fail_status, fail_model)) \
+         having g != {failures} or fail_status != 0 \
+         order by g, requests desc, {names}, fail_model, fail_status \
+         limit {LOG_FACET_LIMIT} by g",
+        names = names.join(", "),
+        columns = columns.join(", "),
+        sets = sets.join(", "),
+        failures = facet_mask(&[dims, dims + 1]),
     )
 }
 
-fn usage_log_failures_sql(filter: &str) -> String {
-    format!(
-        "select status_code, model, count() as requests \
-         from usage{filter} and status_code >= 400 \
-         group by status_code, model order by requests desc, model limit {LOG_FACET_LIMIT}"
-    )
+/// A row of [`usage_log_facets_sql`]. Read positionally: `d0`..`d5` follow
+/// [`LOG_FACET_DIMENSIONS`].
+#[derive(Debug, Row, Deserialize)]
+struct UsageLogFacetsRow {
+    g: u64,
+    d: [String; 6],
+    fail_status: u16,
+    fail_model: String,
+    requests: u64,
+    errors: u64,
 }
 
 /// Each facet of the requests matching the log's filters, and the most common
-/// failures. The reads run together; labels are left to the handler.
+/// failures, from one scan. Labels are left to the handler.
 pub async fn query_usage_log_facets(
     client: &clickhouse::Client,
     q: UsageLogQuery,
 ) -> Result<UsageLogFacets, clickhouse::error::Error> {
     let since = window_start(q.since_ms, q.until_ms);
     let filter = log_filter_sql(&q, since);
-    let facet = |expr: &str| {
-        let sql = usage_log_facet_sql(expr, filter.sql());
-        let query = filter.bind(client.query(&sql));
-        async move {
-            let rows = query.fetch_all::<UsageLogFacetRow>().await?;
-            Ok::<_, clickhouse::error::Error>(
-                rows.into_iter()
-                    .map(|r| UsageLogFacet {
-                        value: r.facet,
-                        label: String::new(),
-                        requests: r.requests,
-                        errors: r.errors,
-                    })
-                    .collect::<Vec<_>>(),
-            )
+    let rows = filter
+        .bind(client.query(&usage_log_facets_sql(filter.sql())))
+        .fetch_all::<UsageLogFacetsRow>()
+        .await?;
+    Ok(facets_from_rows(rows))
+}
+
+fn facets_from_rows(rows: Vec<UsageLogFacetsRow>) -> UsageLogFacets {
+    let dims = LOG_FACET_DIMENSIONS.len() as u32;
+    let mut facets: [Vec<UsageLogFacet>; 6] = Default::default();
+    let mut failures = Vec::new();
+    let failures_mask = facet_mask(&[dims, dims + 1]);
+    for mut row in rows {
+        if row.g == failures_mask {
+            failures.push(UsageLogFailure {
+                status_code: row.fail_status,
+                model: row.fail_model,
+                requests: row.requests,
+            });
+        } else if let Some(i) = (0..dims).find(|&i| row.g == facet_mask(&[i])) {
+            facets[i as usize].push(UsageLogFacet {
+                value: std::mem::take(&mut row.d[i as usize]),
+                label: String::new(),
+                requests: row.requests,
+                errors: row.errors,
+            });
         }
-    };
-    let failures_sql = usage_log_failures_sql(filter.sql());
-    let failures = filter
-        .bind(client.query(&failures_sql))
-        .fetch_all::<UsageLogFailure>();
-    let dims = LOG_FACET_DIMENSIONS;
-    let (status_codes, models, tenants, keys, request_types, error_classes, failures) = tokio::try_join!(
-        facet(dims[0].1),
-        facet(dims[1].1),
-        facet(dims[2].1),
-        facet(dims[3].1),
-        facet(dims[4].1),
-        facet(dims[5].1),
-        failures,
-    )?;
-    Ok(UsageLogFacets {
+    }
+    let [status_codes, models, tenants, keys, request_types, error_classes] = facets;
+    UsageLogFacets {
         status_codes,
         models,
         tenants,
@@ -847,7 +918,7 @@ pub async fn query_usage_log_facets(
         request_types,
         error_classes,
         failures,
-    })
+    }
 }
 
 /// Most groups [`query_usage_failure_groups`] returns.
@@ -1779,9 +1850,9 @@ const KEY_WATCH_MAX_ROWS: u64 = 10_000;
 /// [`KeyRejections::truncated`]).
 const KEY_REJECTIONS_MAX_ROWS: u32 = 10_000;
 
-/// Seconds ClickHouse may spend on one `key-rejections` read before it gives
-/// up, so a wide window cannot tie up the server.
-const KEY_REJECTIONS_MAX_EXECUTION_SECS: u32 = 10;
+/// Seconds ClickHouse may spend on one `key-sources` or `key-rejections`
+/// read before it gives up, so a wide window cannot tie up the server.
+const KEY_WATCH_MAX_EXECUTION_SECS: u32 = 10;
 
 /// Filters for the endpoints an account system polls to watch where its keys
 /// are used from (`/usage/key-sources`, `/usage/key-rejections`).
@@ -1827,9 +1898,10 @@ impl KeyWatchQuery {
     }
 
     /// The tenant and key filters on `table`, added to `f`. Columns are
-    /// qualified so a SELECT alias can never shadow them; `key_id` leads the
-    /// sort key of both tables, so an `in` list still reads only those keys'
-    /// granules.
+    /// qualified so a SELECT alias can never shadow them. `key_id` leads the
+    /// sort key of `key_rejections`, so there an `in` list reads only those
+    /// keys' granules; the ledger is sorted by tenant, so on `usage` only the
+    /// tenant filter (and the window) narrows what is read.
     fn key_filters<'f>(&self, f: &'f mut Filter, table: &str) -> &'f mut Filter {
         f.uuid(&format!("{table}.tenant_id"), self.tenant_id)
             .uuids(&format!("{table}.key_id"), &self.key_id)
@@ -1923,23 +1995,19 @@ impl From<KeySourceRow> for KeySource {
 }
 
 /// The `key-sources` query and its filters, in bind order: the window's,
-/// the first-seen scan's (from `scan_from`), and the country table's.
-fn key_sources_sql(
-    q: &KeyWatchQuery,
-    since: i64,
-    until: i64,
-    scan_from: i64,
-) -> (String, [Filter; 3]) {
+/// then the first-seen tables' (country, then network).
+fn key_sources_sql(q: &KeyWatchQuery, since: i64, until: i64) -> (String, [Filter; 3]) {
     let mut window = Filter::window(since, Some(until));
     window.and(" and client_ip != '' and client_network != ''");
     q.key_filters(&mut window, "usage");
-    let mut scan = Filter::window(scan_from, None);
-    scan.and(" and client_network != ''");
-    q.key_filters(&mut scan, "usage");
-    // `key_country_seen` has no tenant column; its rows only join to the
-    // window's keys, which are already filtered by tenant.
-    let mut seen = Filter::from("client_country != ''", Vec::new());
-    seen.uuids("key_country_seen.key_id", &q.key_id);
+    // The first-seen tables have no tenant column; their rows only join to
+    // the window's keys, which are already filtered by tenant.
+    let mut country = Filter::from("client_country != ''", Vec::new());
+    country.uuids("key_country_seen.key_id", &q.key_id);
+    let mut network = Filter::from("client_network != ''", Vec::new());
+    network.uuids("key_network_seen.key_id", &q.key_id);
+    // One row past the cap, so the caller can tell a cut list.
+    let fetch = KEY_WATCH_MAX_ROWS + 1;
     let sql = format!(
         "select w.key_id as key_id, w.kname as key_name, w.tid as tenant_id, \
          w.tname as tenant_name, w.net as network, w.country as client_country, \
@@ -1954,22 +2022,30 @@ fn key_sources_sql(
            group by key_id, net, country \
          ) as w \
          left join ( \
-           select key_id, client_network as net, min(ts_ms) as first_ms \
-           from usage{} \
-           group by key_id, net \
-         ) as n on w.key_id = n.key_id and w.net = n.net \
-         left join ( \
            select key_id, client_country as country, min(first_seen_ms) as first_ms \
            from key_country_seen{} \
            group by key_id, country \
          ) as c on w.key_id = c.key_id and w.country = c.country \
+         left join ( \
+           select key_id, client_network as net, min(first_seen_ms) as first_ms \
+           from key_network_seen{} \
+           group by key_id, net \
+         ) as n on w.key_id = n.key_id and w.net = n.net \
          order by key_id, requests desc \
-         limit {KEY_WATCH_MAX_ROWS}",
+         limit {fetch} \
+         settings max_execution_time = {KEY_WATCH_MAX_EXECUTION_SECS}",
         window.sql(),
-        scan.sql(),
-        seen.sql(),
+        country.sql(),
+        network.sql(),
     );
-    (sql, [window, scan, seen])
+    (sql, [window, country, network])
+}
+
+/// What `key-sources` read: the rows, and whether more matched than the
+/// 10,000-row cap let through.
+pub struct KeySources {
+    pub rows: Vec<KeySource>,
+    pub truncated: bool,
 }
 
 /// Each key with traffic in the window, one row per network and country it
@@ -1981,17 +2057,18 @@ pub async fn query_key_sources(
     q: &KeyWatchQuery,
     since: i64,
     until: i64,
-    ip_retention_days: u32,
-) -> Result<Vec<KeySource>, clickhouse::error::Error> {
-    // Addresses older than their retention are blank, so the first-seen scan
-    // stops there instead of reading the whole ledger.
-    let scan_from = (until - i64::from(ip_retention_days + 1) * 86_400_000).min(since);
-    let (sql, filters) = key_sources_sql(q, since, until, scan_from);
+) -> Result<KeySources, clickhouse::error::Error> {
+    let (sql, filters) = key_sources_sql(q, since, until);
     let query = filters
         .iter()
         .fold(client.query(&sql), |query, f| f.bind(query));
-    let rows = query.fetch_all::<KeySourceRow>().await?;
-    Ok(rows.into_iter().map(KeySource::from).collect())
+    let mut rows = query.fetch_all::<KeySourceRow>().await?;
+    let truncated = rows.len() > KEY_WATCH_MAX_ROWS as usize;
+    rows.truncate(KEY_WATCH_MAX_ROWS as usize);
+    Ok(KeySources {
+        rows: rows.into_iter().map(KeySource::from).collect(),
+        truncated,
+    })
 }
 
 /// Refused uses of one key for one reason from one address and country in
@@ -2058,7 +2135,7 @@ fn key_rejections_sql(q: &KeyWatchQuery, since: i64, until: i64) -> (String, Fil
          group by key_id, reason, client_ip, client_country \
          order by last_ms desc{per_key} \
          limit {fetch} \
-         settings max_execution_time = {KEY_REJECTIONS_MAX_EXECUTION_SECS}",
+         settings max_execution_time = {KEY_WATCH_MAX_EXECUTION_SECS}",
         filter.sql()
     );
     (sql, filter)
@@ -2971,14 +3048,22 @@ mod alias_tests {
     fn key_watch_reads_bind_one_value_per_placeholder() {
         for (tenant, key) in [(false, false), (true, false), (false, true), (true, true)] {
             let q = watch_query(tenant, key);
-            let (sql, [window, scan, seen]) = key_sources_sql(&q, 1, 2, 0);
+            let (sql, [window, country, network]) = key_sources_sql(&q, 1, 2);
             let filters = usize::from(tenant) + usize::from(key);
             assert_eq!(window.binds.len(), 4 + filters);
-            assert_eq!(scan.binds.len(), 2 + filters);
-            assert_eq!(seen.binds.len(), usize::from(key));
+            assert_eq!(country.binds.len(), usize::from(key));
+            assert_eq!(network.binds.len(), usize::from(key));
             assert_eq!(
                 sql.matches('?').count(),
-                window.binds.len() + scan.binds.len() + seen.binds.len(),
+                window.binds.len() + country.binds.len() + network.binds.len(),
+                "{sql}"
+            );
+            assert!(
+                !sql.contains("from usage where ts >= fromUnixTimestamp64Milli(toInt64(?)) and ts_ms >= ? and client_network"),
+                "first-seen networks come from key_network_seen, not a ledger scan"
+            );
+            assert!(
+                sql.ends_with("limit 10001 settings max_execution_time = 10"),
                 "{sql}"
             );
             assert!(
@@ -2992,11 +3077,12 @@ mod alias_tests {
             assert_no_shadowing(&sql);
             assert_eq!(select_items(&sql).len(), 11);
         }
-        let (sql, _) = key_sources_sql(&watch_query(true, true), 1, 2, 0);
+        let (sql, _) = key_sources_sql(&watch_query(true, true), 1, 2);
         assert_no_shadowing(&sql);
         assert_eq!(select_items(&sql).len(), 11);
         assert!(sql.contains("usage.tenant_id = toUUID(?)"));
         assert!(sql.contains("key_country_seen.key_id = toUUID(?)"));
+        assert!(sql.contains("key_network_seen.key_id = toUUID(?)"));
         assert!(!sql.contains("key_country_seen.tenant_id"));
     }
 
@@ -3034,13 +3120,21 @@ mod alias_tests {
         assert!(sql.ends_with("settings max_execution_time = 10"), "{sql}");
         assert_no_shadowing(&sql);
 
-        // key-sources reads the same list from both of its tables.
-        let (sql, [window, scan, seen]) = key_sources_sql(&q, 1, 2, 0);
-        assert_eq!((window.texts().len(), seen.texts().len()), (4, 3));
+        // key-sources reads the same list from each of its tables.
+        let (sql, [window, country, network]) = key_sources_sql(&q, 1, 2);
+        assert_eq!(
+            (
+                window.texts().len(),
+                country.texts().len(),
+                network.texts().len()
+            ),
+            (4, 3, 3)
+        );
         assert!(sql.contains("key_country_seen.key_id in (toUUID(?), toUUID(?), toUUID(?))"));
+        assert!(sql.contains("key_network_seen.key_id in (toUUID(?), toUUID(?), toUUID(?))"));
         assert_eq!(
             sql.matches('?').count(),
-            window.binds.len() + scan.binds.len() + seen.binds.len()
+            window.binds.len() + country.binds.len() + network.binds.len()
         );
 
         // A single key reads exactly as before; limits default and clamp.
@@ -3199,7 +3293,7 @@ mod alias_tests {
         assert_eq!(select_items(&sql).len(), 4);
     }
 
-    fn log_query() -> UsageLogQuery {
+    pub(super) fn log_query() -> UsageLogQuery {
         UsageLogQuery {
             tenant_id: Vec::new(),
             key_id: Vec::new(),
@@ -3418,16 +3512,7 @@ mod alias_tests {
     }
 
     #[test]
-    fn log_facet_aliases_do_not_shadow_columns() {
-        for (_, expr) in LOG_FACET_DIMENSIONS {
-            let sql = usage_log_facet_sql(expr, " where ts_ms >= ?");
-            assert_no_shadowing(&sql);
-            assert_eq!(select_items(&sql).len(), 3);
-        }
-    }
-
-    #[test]
-    fn log_failures_count_only_failures_and_keep_the_filters() {
+    fn log_facets_read_in_one_query_that_keeps_the_filters() {
         let Filter { sql: filter, binds } = log_filter_sql(
             &UsageLogQuery {
                 model: vec!["m".into()],
@@ -3435,10 +3520,28 @@ mod alias_tests {
             },
             0,
         );
-        let sql = usage_log_failures_sql(&filter);
+        let sql = usage_log_facets_sql(&filter);
+        // g, six dimensions, the failure pair, two counts.
+        let items = select_items(&sql);
+        assert_eq!(items.len(), 11);
+        // `grouping(...)` names the grouping columns by alias, as it must;
+        // no other item may read one.
+        for (expr, alias) in items.iter().filter(|(_, a)| a != "g") {
+            for (_, other) in &items {
+                assert!(
+                    other == alias || !reads(expr, other),
+                    "alias `{other}` shadows a column that `{alias}` reads: {expr}"
+                );
+            }
+        }
         assert!(sql.contains(" and model = ?"));
-        assert!(sql.contains(" and status_code >= 400 group by"));
         assert_eq!(sql.matches('?').count(), binds.len());
+        assert!(sql.contains("having g != 252 or fail_status != 0"), "{sql}");
+        assert!(sql.ends_with("limit 12 by g"), "{sql}");
+        // The first grouping column is the highest bit.
+        assert_eq!(facet_mask(&[0]), 0b0111_1111);
+        assert_eq!(facet_mask(&[5]), 0b1111_1011);
+        assert_eq!(facet_mask(&[6, 7]), 252);
     }
 
     #[test]
@@ -3567,9 +3670,11 @@ mod clickhouse_tests {
             per_key: None,
         };
         let (since, until) = q.window(now + 1000).unwrap();
-        let sources = query_key_sources(&client, &q, since, until, 90)
+        let sources = query_key_sources(&client, &q, since, until)
             .await
             .expect("key sources");
+        assert!(!sources.truncated);
+        let sources = sources.rows;
         assert_eq!(sources.len(), 2, "{sources:?}");
         let de = sources.iter().find(|s| s.client_country == "DE").unwrap();
         assert_eq!((de.requests, de.distinct_ips), (1, 1));
@@ -3835,6 +3940,196 @@ mod clickhouse_tests {
             ov.tenants.iter().any(|t| t.0 == Uuid::nil()),
             "the nil tenant is a tenant row"
         );
+
+        clickhouse::Client::default()
+            .with_url(&url)
+            .query(&format!("drop database if exists {database}"))
+            .execute()
+            .await
+            .ok();
+    }
+
+    /// The one-scan facets read returns what one query per facet (and one
+    /// for failures) returned.
+    #[tokio::test]
+    async fn log_facets_match_one_query_per_facet() {
+        let Ok(url) = std::env::var("OBLETH_TEST_CLICKHOUSE_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_CLICKHOUSE_URL to run");
+            return;
+        };
+        let database = format!("obleth_test_{}", Uuid::new_v4().simple());
+        let dir = std::env::temp_dir().join(format!("obleth-facets-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sink = obleth_telemetry::TelemetrySink::start(
+            &url,
+            &database,
+            "default",
+            "",
+            dir.join("usage.wal").to_str().unwrap(),
+            std::time::Duration::from_millis(50),
+            true,
+        )
+        .await
+        .expect("sink");
+        let now = now_ms();
+        let tenants: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+        // More models and keys than a facet lists, so the limit applies.
+        for i in 0..200i64 {
+            let mut rec = usage(
+                Uuid::from_u128((i % 15) as u128 + 1),
+                now - 1000 - i,
+                "",
+                "",
+                "",
+            );
+            rec.tenant_id = tenants[(i % 3) as usize];
+            rec.model = format!("m{}", i % 17);
+            rec.request_type = ["chat", "embeddings", "completions"][(i % 3) as usize].into();
+            rec.status_code = [200, 200, 200, 429, 500, 502, 400][(i % 7) as usize];
+            sink.record(rec);
+        }
+        sink.shutdown().await;
+        let client = clickhouse::Client::default()
+            .with_url(&url)
+            .with_database(&database);
+        let q = || UsageLogQuery {
+            since_ms: Some(now - 60_000),
+            ..super::alias_tests::log_query()
+        };
+        let facets = query_usage_log_facets(&client, q()).await.expect("facets");
+
+        let filter = log_filter_sql(&q(), now - 60_000);
+        let one = |expr: &str| {
+            let sql = format!(
+                "select {expr} as facet, count() as requests, countIf(status_code >= 400) as errors \
+                 from usage{} group by facet order by requests desc, facet limit {LOG_FACET_LIMIT}",
+                filter.sql()
+            );
+            let query = filter.bind(client.query(&sql));
+            async move { query.fetch_all::<UsageLogFacetRow>().await.unwrap() }
+        };
+        let got = [
+            &facets.status_codes,
+            &facets.models,
+            &facets.tenants,
+            &facets.keys,
+            &facets.request_types,
+            &facets.error_classes,
+        ];
+        for ((name, expr), got) in LOG_FACET_DIMENSIONS.iter().zip(got) {
+            let want: Vec<(String, u64, u64)> = one(expr)
+                .await
+                .into_iter()
+                .map(|r| (r.facet, r.requests, r.errors))
+                .collect();
+            let got: Vec<(String, u64, u64)> = got
+                .iter()
+                .map(|f| (f.value.clone(), f.requests, f.errors))
+                .collect();
+            assert_eq!(got, want, "{name}");
+        }
+        assert_eq!(facets.models.len(), LOG_FACET_LIMIT as usize);
+        let failures_sql = format!(
+            "select status_code, model, count() as requests from usage{} and status_code >= 400 \
+             group by status_code, model order by requests desc, model, status_code limit {LOG_FACET_LIMIT}",
+            filter.sql()
+        );
+        let want: Vec<(u16, String, u64)> = filter
+            .bind(client.query(&failures_sql))
+            .fetch_all::<UsageLogFailure>()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|f| (f.status_code, f.model, f.requests))
+            .collect();
+        let got: Vec<(u16, String, u64)> = facets
+            .failures
+            .iter()
+            .map(|f| (f.status_code, f.model.clone(), f.requests))
+            .collect();
+        assert_eq!(got, want);
+        assert!(got.iter().all(|f| f.0 >= 400));
+
+        clickhouse::Client::default()
+            .with_url(&url)
+            .query(&format!("drop database if exists {database}"))
+            .execute()
+            .await
+            .ok();
+    }
+
+    /// The two-step log read pages through the same rows, in the same order,
+    /// as one read of every column did, ties on the millisecond included.
+    #[tokio::test]
+    async fn log_pages_match_a_single_full_read() {
+        let Ok(url) = std::env::var("OBLETH_TEST_CLICKHOUSE_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_CLICKHOUSE_URL to run");
+            return;
+        };
+        let database = format!("obleth_test_{}", Uuid::new_v4().simple());
+        let dir = std::env::temp_dir().join(format!("obleth-logs-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sink = obleth_telemetry::TelemetrySink::start(
+            &url,
+            &database,
+            "default",
+            "",
+            dir.join("usage.wal").to_str().unwrap(),
+            std::time::Duration::from_millis(50),
+            true,
+        )
+        .await
+        .expect("sink");
+        let now = now_ms();
+        for i in 0..40i64 {
+            // Three rows per millisecond, and every fourth row another model.
+            let mut rec = usage(Uuid::new_v4(), now - 5_000 + i / 3, "", "", "");
+            rec.model = if i % 4 == 0 {
+                "other".into()
+            } else {
+                "m".into()
+            };
+            rec.status_code = if i % 5 == 0 { 500 } else { 200 };
+            sink.record(rec);
+        }
+        sink.shutdown().await;
+        let client = clickhouse::Client::default()
+            .with_url(&url)
+            .with_database(&database);
+        let query = |before: Option<(i64, Uuid)>| UsageLogQuery {
+            since_ms: Some(now - 60_000),
+            model: vec!["m".into()],
+            limit: Some(7),
+            before_ms: before.map(|b| b.0),
+            before_request_id: before.map(|b| b.1),
+            ..super::alias_tests::log_query()
+        };
+        let single = |before: Option<(i64, Uuid)>| {
+            let q = query(before);
+            let filter = log_filter_sql(&q, now - 60_000);
+            let mut sql = format!("{}{}", usage_log_select(), filter.sql());
+            if before.is_some() {
+                sql.push_str(" and (ts_ms, toString(request_id)) < (?, ?)");
+            }
+            sql.push_str(&format!(" {LOG_ORDER} limit 7"));
+            let mut read = filter.bind(client.query(&sql));
+            if let Some((ms, id)) = before {
+                read = read.bind(ms).bind(id.to_string());
+            }
+            async move { read.fetch_all::<UsageLogRow>().await.unwrap() }
+        };
+        let json = |rows: &[UsageLogRow]| serde_json::to_value(rows).unwrap();
+        let mut cursor = None;
+        let mut seen = 0;
+        loop {
+            let got = query_usage_logs(&client, query(cursor)).await.unwrap();
+            let want = single(cursor).await;
+            assert_eq!(json(&got), json(&want));
+            seen += got.len();
+            let Some(last) = got.last() else { break };
+            cursor = Some((last.ts_ms, last.request_id));
+        }
+        assert_eq!(seen, 30, "every row of model m, once");
 
         clickhouse::Client::default()
             .with_url(&url)

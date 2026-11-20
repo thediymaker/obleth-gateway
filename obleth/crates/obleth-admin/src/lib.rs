@@ -5675,34 +5675,49 @@ async fn get_key_usage(
 /// the named networks holds it. For an account system that
 /// watches its keys for use from somewhere new. Default window: the last 24
 /// hours; at most 31 days. Requests recorded before client addresses were
-/// captured are left out.
+/// captured are left out. At most 10,000 rows; when rows were left out the
+/// response carries `x-obleth-truncated: true`. The read gives up after 10
+/// seconds.
 #[utoipa::path(
     get, path = "/api/v1/usage/key-sources", tag = "usage",
     params(usage::KeyWatchQuery),
-    responses((status = 200, body = [usage::KeySource]), (status = 400))
+    responses(
+        (status = 200, body = [usage::KeySource], headers(
+            ("x-obleth-truncated" = String, description = "`true` when more rows matched than the 10,000-row cap let through")
+        )),
+        (status = 400)
+    )
 )]
 async fn get_usage_key_sources(
     State(state): State<AdminState>,
     Query(q): Query<usage::KeyWatchQuery>,
-) -> Result<Json<Vec<usage::KeySource>>> {
+) -> Result<(HeaderMap, Json<Vec<usage::KeySource>>)> {
     let (since, until) = q
         .window(chrono::Utc::now().timestamp_millis())
         .map_err(AdminError::BadRequest)?;
-    let mut rows = usage::query_key_sources(
-        &state.clickhouse,
-        &q,
-        since,
-        until,
-        obleth_telemetry::client_ip_retention_days(),
-    )
-    .await?;
+    let usage::KeySources {
+        mut rows,
+        truncated,
+    } = usage::query_key_sources(&state.clickhouse, &q, since, until).await?;
     let names = NetworkNames::new(&state.store.named_networks().await?);
     if !names.is_empty() {
         for r in &mut rows {
             r.network_name = names.name_of(&r.network).map(str::to_string);
         }
     }
-    Ok(Json(rows))
+    Ok((truncated_header(truncated), Json(rows)))
+}
+
+/// `x-obleth-truncated: true` when a capped read left rows out.
+fn truncated_header(truncated: bool) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    if truncated {
+        headers.insert(
+            "x-obleth-truncated",
+            axum::http::HeaderValue::from_static("true"),
+        );
+    }
+    headers
 }
 
 /// Refused uses of real keys in the window: a disabled key, or a key used
@@ -5735,13 +5750,7 @@ async fn get_usage_key_rejections(
         mut rows,
         truncated,
     } = usage::query_key_rejections(&state.clickhouse, &q, since, until).await?;
-    let mut headers = HeaderMap::new();
-    if truncated {
-        headers.insert(
-            "x-obleth-truncated",
-            axum::http::HeaderValue::from_static("true"),
-        );
-    }
+    let headers = truncated_header(truncated);
     let names = NetworkNames::new(&state.store.named_networks().await?);
     if !names.is_empty() {
         for r in &mut rows {
