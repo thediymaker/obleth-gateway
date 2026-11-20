@@ -2601,6 +2601,9 @@ async fn run_pipeline(
                     return resp;
                 }
                 crate::boons::speculation::Outcome::Stream { driver, drafted_by } => {
+                    // Released to the client as it is produced, so the row is a
+                    // stream and keeps its first-token time.
+                    accounting.meta.streamed = true;
                     accounting.arm_estimate(&mut settle_guard);
                     let body_stream = async_stream::stream! {
                         futures_util::pin_mut!(driver);
@@ -8102,6 +8105,19 @@ mod tests {
             !args.contains("request_type == \"chat\""),
             "the ledger's request_type is an accounting label and must not gate boons"
         );
+    }
+
+    #[test]
+    fn a_speculation_stream_is_recorded_as_streamed() {
+        // The normal dispatch sets `meta.streamed` from the upstream content
+        // type; the speculation stream returns before that, so its arm must set
+        // it, or its row records no first-token time.
+        let src = include_str!("proxy.rs");
+        let arm = src
+            .find("speculation::Outcome::Stream { driver, drafted_by } => {")
+            .expect("the speculation stream arm");
+        let body = &src[arm..(arm + 400).min(src.len())];
+        assert!(body.contains("accounting.meta.streamed = true;"));
     }
 
     #[test]
