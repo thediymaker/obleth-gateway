@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::{header, HeaderValue, Request, Response, StatusCode};
+use axum::http::{HeaderValue, Request, Response, StatusCode};
 use axum::response::IntoResponse;
 use obleth_config::{routing::Candidate, ResolvedKey, ResolvedModel, SEARCH_MODEL_TYPE};
 use obleth_tokenizer::CostEstimate;
@@ -1024,7 +1024,7 @@ mod pipeline_tests {
     use std::sync::Mutex;
 
     use axum::extract::Query;
-    use axum::http::{HeaderMap, Method};
+    use axum::http::{header, HeaderMap, Method};
     use axum::routing::get;
     use axum::Router;
     use moka::future::Cache;

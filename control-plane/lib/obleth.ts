@@ -1504,12 +1504,14 @@ export interface UsageBreakdownEntry {
 /** Narrow a usage aggregate to one tenant or model; the gateway filters before it groups. */
 export interface UsageFilter {
   sinceMs?: number;
+  /** Exclusive end of the window; open-ended when left out. */
+  untilMs?: number;
   tenantId?: string;
   model?: string;
 }
 
 function usageQs(filter: UsageFilter) {
-  return qs({ since_ms: filter.sinceMs, tenant_id: filter.tenantId, model: filter.model });
+  return qs({ since_ms: filter.sinceMs, until_ms: filter.untilMs, tenant_id: filter.tenantId, model: filter.model });
 }
 
 export interface AuditParams {
@@ -3220,8 +3222,8 @@ export const obleth = {
       headers: auditActorHeaders(options),
     }),
   stats: () => api<LiveStats>("/stats"),
-  overviewSummary: (sinceMs?: number) =>
-    api<OverviewSummaryView>(`/overview/summary${qs({ since_ms: sinceMs })}`),
+  overviewSummary: (sinceMs?: number, untilMs?: number) =>
+    api<OverviewSummaryView>(`/overview/summary${qs({ since_ms: sinceMs, until_ms: untilMs })}`),
   fairshareLive: () => api<FairshareLiveView>("/fairshare/live"),
   fairshareHistory: (params: { since_ms?: number; model?: string } = {}) =>
     api<FairshareHistoryView>(

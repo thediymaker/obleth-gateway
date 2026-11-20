@@ -79,6 +79,7 @@ export function toOverviewSummary(view: OverviewSummaryView): OverviewSummary {
  *  API aggregates counts and usage totals server-side, so this no longer
  *  deserializes the full tenant/key/model lists per poll. `sinceMs` defaults
  *  to the gateway's own 24-hour window. */
-export async function fetchOverviewSummary(sinceMs?: number): Promise<OverviewSummary> {
-  return toOverviewSummary(await obleth.overviewSummary(sinceMs));
+/** The summary of `[sinceMs, untilMs)`; open-ended without `untilMs`. */
+export async function fetchOverviewSummary(sinceMs?: number, untilMs?: number): Promise<OverviewSummary> {
+  return toOverviewSummary(await obleth.overviewSummary(sinceMs, untilMs));
 }

@@ -659,7 +659,12 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // ---- admin (Management API) ----
-    let clickhouse_read = build_clickhouse(&cfg);
+    // Every Management API read stops at one execution cap; ingest keeps its
+    // own client without one.
+    let clickhouse_read = build_clickhouse(&cfg).with_option(
+        "max_execution_time",
+        obleth_admin::READ_MAX_EXECUTION_SECS.to_string(),
+    );
     let health_runtime = obleth_admin::ModelHealthRuntime {
         scheduled_enabled: cfg.model_health_enabled,
         default_interval_secs: cfg.model_health_interval_secs as i64,

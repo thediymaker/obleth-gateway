@@ -641,13 +641,15 @@ pub struct ModelTotals {
     pub mean_output: f64,
 }
 
-/// Advice reads the same ledger the request log shows: the window back to
-/// the bound start, without the probe and benchmark traffic the log hides.
-fn ledger_window() -> String {
-    format!(" where ts_ms >= ?{}", usage::internal_filter(None))
+/// Advice reads the same ledger the request log shows: the window from
+/// `since`, without the probe and benchmark traffic the log hides.
+fn ledger_window(since_ms: i64) -> usage::Filter {
+    let mut f = usage::Filter::window(since_ms, None);
+    f.internal(None);
+    f
 }
 
-fn model_totals_sql() -> String {
+fn model_totals_sql(window: &str) -> String {
     format!(
         "select model, count() as n, \
          countIf(status_code >= 400 and {class} in {platform} and {class} != 'capacity') as pf, \
@@ -657,34 +659,30 @@ fn model_totals_sql() -> String {
          ifNotFinite(avgIf(toFloat64(output_tokens), \
              status_code = 200 and output_tokens > 0 and request_type = 'chat'), 0) as mean_out \
          from usage{window} group by model",
-        window = ledger_window(),
         class = obleth_config::EFFECTIVE_CLASS_SQL,
         platform = obleth_config::PLATFORM_CLASSES_SQL,
     )
 }
 
-async fn query_failure_groups(
+pub(crate) async fn query_failure_groups(
     client: &clickhouse::Client,
     since_ms: i64,
 ) -> std::result::Result<Vec<UsageFailureGroup>, clickhouse::error::Error> {
-    client
-        .query(&usage::failure_groups_sql(
-            &ledger_window(),
-            MIN_GROUP_FAILURES,
-            GROUP_LIMIT,
-        ))
-        .bind(since_ms)
+    let window = ledger_window(since_ms);
+    let sql = usage::failure_groups_sql(window.sql(), MIN_GROUP_FAILURES, GROUP_LIMIT);
+    window
+        .bind(client.query(&sql))
         .fetch_all::<UsageFailureGroup>()
         .await
 }
 
-async fn query_model_totals(
+pub(crate) async fn query_model_totals(
     client: &clickhouse::Client,
     since_ms: i64,
 ) -> std::result::Result<Vec<ModelTotals>, clickhouse::error::Error> {
-    client
-        .query(&model_totals_sql())
-        .bind(since_ms)
+    let window = ledger_window(since_ms);
+    window
+        .bind(client.query(&model_totals_sql(window.sql())))
         .fetch_all::<ModelTotals>()
         .await
 }
@@ -1377,15 +1375,13 @@ mod tests {
     #[test]
     fn advice_reads_leave_internal_traffic_out_like_the_request_log() {
         let hidden = " and request_type not in ('health_probe', 'benchmark')";
-        let groups = usage::failure_groups_sql(&ledger_window(), MIN_GROUP_FAILURES, GROUP_LIMIT);
+        let window = ledger_window(0);
+        let groups = usage::failure_groups_sql(window.sql(), MIN_GROUP_FAILURES, GROUP_LIMIT);
         assert!(groups.contains(hidden), "{groups}");
         assert!(groups.contains("having failed >= 20"), "{groups}");
         assert!(groups.contains("limit 200"), "{groups}");
-        assert!(
-            model_totals_sql().contains(hidden),
-            "{}",
-            model_totals_sql()
-        );
+        let totals = model_totals_sql(window.sql());
+        assert!(totals.contains(hidden), "{totals}");
     }
 
     fn totals(model: &str, requests: u64) -> ModelTotals {

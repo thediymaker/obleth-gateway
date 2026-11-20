@@ -67,6 +67,7 @@ pub use alerts::AlertDispatcher;
 pub use error::AdminError;
 pub use model_health::{AlertSink, ModelHealthRuntime};
 pub use openapi::ApiDoc;
+pub use usage::READ_MAX_EXECUTION_SECS;
 
 type Result<T> = std::result::Result<T, AdminError>;
 const AUDIT_ACTOR_HEADER: &str = "x-obleth-audit-actor";
@@ -5859,7 +5860,7 @@ async fn get_costs(
         })
         .collect();
     Ok(Json(
-        usage::query_costs(&state.clickhouse, q.since_ms, q.include_internal, &costs).await?,
+        usage::query_costs(&state.clickhouse, &q, &costs).await?,
     ))
 }
 
@@ -6102,14 +6103,7 @@ async fn get_usage_breakdown(
     State(state): State<AdminState>,
     Query(q): Query<usage::UsageBreakdownQuery>,
 ) -> Result<Json<Vec<UsageBreakdownEntry>>> {
-    let rows = usage::query_usage_breakdown_by_model(
-        &state.clickhouse,
-        &q.model,
-        q.since_ms,
-        q.limit,
-        q.include_internal,
-    )
-    .await?;
+    let rows = usage::query_usage_breakdown_by_model(&state.clickhouse, &q).await?;
 
     let tenant_meta: std::collections::HashMap<Uuid, (String, String)> = state
         .store
@@ -6161,11 +6155,7 @@ async fn get_usage_daily(
     State(state): State<AdminState>,
     Query(q): Query<usage::UsageDailyQuery>,
 ) -> Result<Json<Vec<usage::UsageDailyRow>>> {
-    let key_ids = usage::parse_key_ids(q.key_id.as_deref())
-        .map_err(|e| AdminError::BadRequest(format!("invalid key_id: {e}")))?;
-    Ok(Json(
-        usage::query_usage_daily(&state.clickhouse, q, &key_ids).await?,
-    ))
+    Ok(Json(usage::query_usage_daily(&state.clickhouse, q).await?))
 }
 
 /// The prefix new API keys start with.
@@ -6460,7 +6450,7 @@ async fn get_overview_summary(
     // ClickHouse being down degrades the usage totals to zero rather than
     // failing the whole summary — the config counts are still useful and this
     // read backs a poll on every dashboard page.
-    let totals = usage::query_usage_totals(&state.clickhouse, q.since_ms, q.include_internal)
+    let totals = usage::query_usage_totals(&state.clickhouse, &q)
         .await
         .unwrap_or_default();
     // The ledger keeps rows for since-deleted tenants; clamp so the summary

@@ -7,7 +7,6 @@ import type {
   UsageModelAgg,
   UsageTimePoint,
 } from "@/lib/obleth";
-import type { OverviewSummary } from "@/lib/overview-summary";
 import { belowShareInPools, countsScope } from "@/lib/fairshare";
 import { modelHref } from "@/lib/model-links";
 
@@ -74,17 +73,6 @@ export function buildSeries(points: UsageTimePoint[], range: OverviewRange, now:
 }
 
 /** Additive totals for the window before the current one: (both windows) − (current window). */
-export function previousTotals(current: OverviewSummary, both: OverviewSummary) {
-  const minus = (a: number, b: number) => Math.max(0, a - b);
-  return {
-    requests: minus(both.requests, current.requests),
-    tokens: minus(both.tokens, current.tokens),
-    errors: minus(both.errors, current.errors),
-    platformErrors: minus(both.platformErrors, current.platformErrors),
-    cost: minus(both.cost, current.cost),
-  };
-}
-
 /** "▲ 11% vs yesterday"; null when there is nothing to compare with. */
 export function changeLabel(current: number, previous: number, against: string): string | null {
   if (!previous) return null;

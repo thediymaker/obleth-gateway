@@ -21,7 +21,7 @@ const window: OverviewWindow = {
   range: "24h",
   now: Date.now(),
   summary: { ...EMPTY_OVERVIEW_SUMMARY, detailed: true, classified: true, requests: 1200, tokens: 50_000, errors: 6, platformErrors: 2, cost: 3.2, hasPricing: true, activeTenants: 2, p50TtftMs: 380, avgTtftMs: 520 },
-  previous: { requests: 1000, tokens: 40_000, errors: 5, platformErrors: 1, cost: 2 },
+  previous: { ...EMPTY_OVERVIEW_SUMMARY, requests: 1000, tokens: 40_000, errors: 5, platformErrors: 1, cost: 2 },
   series: [],
   models: [],
   tenants: [{ id: "t1", name: "research", requests: 900, tokens: 40_000, cost: 2.5 }],
