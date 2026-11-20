@@ -2632,9 +2632,7 @@ async fn run_pipeline(
                         drop(permit);
                         let (ttft_ms, settled) = {
                             let s = spec_stats.lock().unwrap_or_else(|e| e.into_inner());
-                            let usage = s
-                                .final_set
-                                .then(|| UpstreamUsage::uncached(s.input_tokens, s.output_tokens));
+                            let usage = s.final_set.then_some(s.usage);
                             (s.ttft_ms, drained_settlement(200, s.failure, usage, 0, est))
                         };
                         let total_ms = request_start.elapsed().as_millis() as u32;

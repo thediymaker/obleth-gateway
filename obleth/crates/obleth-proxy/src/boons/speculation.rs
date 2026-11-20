@@ -46,7 +46,8 @@ use futures_util::Stream;
 use obleth_config::{ResolvedKey, ResolvedModel, SpeculationBoonSettings};
 use serde_json::{json, Value};
 
-use super::tool_stream::{content_chunk, done, finish_chunk, usage_chunk};
+use super::tool_stream::{chunk_usage, content_chunk, done, finish_chunk, usage_chunk};
+use crate::proxy::UpstreamUsage;
 use crate::state::AppState;
 use crate::upstream_failure::{payload_failure, stream_cut_error, DEFAULT_FAILURE_STATUS};
 
@@ -109,8 +110,10 @@ pub struct SpeculationPlan {
 #[derive(Default)]
 pub struct SpecStats {
     pub ttft_ms: u32,
-    pub input_tokens: u32,
-    pub output_tokens: u32,
+    /// What the request settles with once `final_set`: the target's own
+    /// usage after an escalation (cached prompt tokens included), or the
+    /// gateway's count for a shipped draft.
+    pub usage: UpstreamUsage,
     pub final_set: bool,
     /// The status to record when the continuation failed: it broke off,
     /// could not be dispatched, or reported an error of its own. The tokens
@@ -439,46 +442,259 @@ pub(crate) struct Score {
     pub n_draft: usize,
 }
 
-/// Parse one `prompt_logprobs` response against the draft ids that were sent.
-/// Returns `Err(misses)` on the cold-bucket corrupt-keys signature (>10% of
-/// entries missing the sent token id as their key).
-pub(crate) fn parse_score(
-    prompt_logprobs: &Value,
+/// What scoring reads of one prompt position: the sent token's rank and
+/// log-probability.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
+pub(crate) struct Pick {
+    #[serde(default)]
+    rank: Option<u64>,
+    #[serde(default)]
+    logprob: Option<f64>,
+}
+
+/// Read a `/v1/completions` reply for scoring: for each draft position
+/// (`start` onward), the entry under the sent token id, or `None` when that
+/// key is missing. Every other position, every other key and the rest of the
+/// reply are skipped unread, so a long prompt's megabytes of logprobs are
+/// never built into a tree. `Ok(None)` when the reply has no
+/// `prompt_logprobs`.
+pub(crate) fn read_picks(
+    reply: &[u8],
     start: usize,
     draft_ids: &[i64],
-) -> Result<Score, usize> {
-    let plp = prompt_logprobs.as_array();
+) -> serde_json::Result<Option<Vec<Option<Pick>>>> {
+    use serde::de::DeserializeSeed;
+    let mut de = serde_json::Deserializer::from_slice(reply);
+    let picks = picks::Reply { start, draft_ids }.deserialize(&mut de)?;
+    de.end()?;
+    Ok(picks)
+}
+
+/// The visitors behind [`read_picks`].
+mod picks {
+    use std::fmt;
+
+    use serde::de::{DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
+
+    use super::Pick;
+
+    type Picks = Option<Vec<Option<Pick>>>;
+
+    /// `{"choices": [{"prompt_logprobs": [...]}, ...], ...}`
+    pub(super) struct Reply<'a> {
+        pub(super) start: usize,
+        pub(super) draft_ids: &'a [i64],
+    }
+
+    impl<'de> DeserializeSeed<'de> for Reply<'_> {
+        type Value = Picks;
+        fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Picks, D::Error> {
+            d.deserialize_map(self)
+        }
+    }
+
+    impl<'de> Visitor<'de> for Reply<'_> {
+        type Value = Picks;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a completion")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Picks, A::Error> {
+            let mut picks = None;
+            while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                if key == "choices" && picks.is_none() {
+                    picks = map.next_value_seed(Choices {
+                        start: self.start,
+                        draft_ids: self.draft_ids,
+                    })?;
+                } else {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+            Ok(picks)
+        }
+    }
+
+    /// The first choice's `prompt_logprobs`; later choices are skipped.
+    struct Choices<'a> {
+        start: usize,
+        draft_ids: &'a [i64],
+    }
+
+    impl<'de> DeserializeSeed<'de> for Choices<'_> {
+        type Value = Picks;
+        fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Picks, D::Error> {
+            d.deserialize_any(self)
+        }
+    }
+
+    impl<'de> Visitor<'de> for Choices<'_> {
+        type Value = Picks;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a list of choices")
+        }
+        fn visit_unit<E>(self) -> Result<Picks, E> {
+            Ok(None)
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Picks, A::Error> {
+            let picks = seq
+                .next_element_seed(Choice {
+                    start: self.start,
+                    draft_ids: self.draft_ids,
+                })?
+                .flatten();
+            while seq.next_element::<IgnoredAny>()?.is_some() {}
+            Ok(picks)
+        }
+    }
+
+    struct Choice<'a> {
+        start: usize,
+        draft_ids: &'a [i64],
+    }
+
+    impl<'de> DeserializeSeed<'de> for Choice<'_> {
+        type Value = Picks;
+        fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Picks, D::Error> {
+            d.deserialize_map(self)
+        }
+    }
+
+    impl<'de> Visitor<'de> for Choice<'_> {
+        type Value = Picks;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a choice")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Picks, A::Error> {
+            let mut picks = None;
+            while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                if key == "prompt_logprobs" && picks.is_none() {
+                    picks = map.next_value_seed(Positions {
+                        start: self.start,
+                        draft_ids: self.draft_ids,
+                    })?;
+                } else {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+            Ok(picks)
+        }
+    }
+
+    /// `prompt_logprobs`: one entry per prompt token, `null` for the first.
+    struct Positions<'a> {
+        start: usize,
+        draft_ids: &'a [i64],
+    }
+
+    impl<'de> DeserializeSeed<'de> for Positions<'_> {
+        type Value = Picks;
+        fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Picks, D::Error> {
+            d.deserialize_any(self)
+        }
+    }
+
+    impl<'de> Visitor<'de> for Positions<'_> {
+        type Value = Picks;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("prompt_logprobs")
+        }
+        fn visit_unit<E>(self) -> Result<Picks, E> {
+            Ok(None)
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Picks, A::Error> {
+            let mut picks = vec![None; self.draft_ids.len()];
+            let mut at = 0usize;
+            loop {
+                let wanted = at
+                    .checked_sub(self.start)
+                    .and_then(|k| self.draft_ids.get(k).map(|id| (k, id)));
+                let more = match wanted {
+                    Some((k, id)) => match seq.next_element_seed(Entry {
+                        key: id.to_string(),
+                    })? {
+                        Some(pick) => {
+                            picks[k] = pick;
+                            true
+                        }
+                        None => false,
+                    },
+                    None => seq.next_element::<IgnoredAny>()?.is_some(),
+                };
+                if !more {
+                    return Ok(Some(picks));
+                }
+                at += 1;
+            }
+        }
+    }
+
+    /// One position: `{"<token id>": {"logprob": .., "rank": ..}, ...}` or
+    /// `null`; the entry under `key`, if any.
+    struct Entry {
+        key: String,
+    }
+
+    impl<'de> DeserializeSeed<'de> for Entry {
+        type Value = Option<Pick>;
+        fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Option<Pick>, D::Error> {
+            d.deserialize_any(self)
+        }
+    }
+
+    impl<'de> Visitor<'de> for Entry {
+        type Value = Option<Pick>;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a prompt logprob entry")
+        }
+        fn visit_unit<E>(self) -> Result<Option<Pick>, E> {
+            Ok(None)
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Option<Pick>, A::Error> {
+            let mut pick = None;
+            while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                if pick.is_none() && *key == *self.key {
+                    pick = Some(map.next_value::<Pick>()?);
+                } else {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+            Ok(pick)
+        }
+    }
+}
+
+/// Score the draft from its picks. Returns `Err(misses)` on the cold-bucket
+/// corrupt-keys signature (>10% of entries missing the sent token id as their
+/// key).
+pub(crate) fn score_picks(picks: &[Option<Pick>]) -> Result<Score, usize> {
     let mut agree = 0usize;
     let mut lp_sum = 0.0f64;
     let mut lp_n = 0usize;
     let mut misses = 0usize;
-    for (k, tid) in draft_ids.iter().enumerate() {
-        let info = plp
-            .and_then(|a| a.get(start + k))
-            .and_then(|e| e.get(tid.to_string()));
-        let Some(info) = info else {
+    for pick in picks {
+        let Some(pick) = pick else {
             misses += 1;
             continue;
         };
-        if info.get("rank").and_then(|r| r.as_u64()) == Some(1) {
+        if pick.rank == Some(1) {
             agree += 1;
         }
-        if let Some(lp) = info.get("logprob").and_then(|l| l.as_f64()) {
+        if let Some(lp) = pick.logprob {
             lp_sum += lp;
             lp_n += 1;
         }
     }
-    if misses > draft_ids.len() / 10 {
+    if misses > picks.len() / 10 {
         return Err(misses);
     }
     Ok(Score {
-        agree: agree as f64 / draft_ids.len().max(1) as f64,
+        agree: agree as f64 / picks.len().max(1) as f64,
         mean_lp: if lp_n > 0 {
             lp_sum / lp_n as f64
         } else {
             -99.0
         },
-        n_draft: draft_ids.len(),
+        n_draft: picks.len(),
     })
 }
 
@@ -493,14 +709,30 @@ pub(crate) fn think_closer(tail_token_strs: &[String]) -> &'static str {
     }
 }
 
+/// The think-block closer's token ids per (scoring root, upstream model,
+/// closer): a constant string, so tokenized once per model rather than once
+/// per request. An hour's life covers a model redeployed with a new
+/// tokenizer.
+type CloserKey = (String, String, &'static str);
+
+static CLOSER_IDS: std::sync::LazyLock<moka::future::Cache<CloserKey, Arc<[i64]>>> =
+    std::sync::LazyLock::new(|| {
+        moka::future::Cache::builder()
+            .max_capacity(256)
+            .time_to_live(Duration::from_secs(3600))
+            .build()
+    });
+
 /// The verifier client: tokenize + prompt_logprobs scoring against the
-/// registered verify model's backend.
+/// target's scoring endpoint.
 struct Verifier {
     model: Arc<ResolvedModel>,
     root: String,
-    /// Templated prompt ids ending in a closed empty think block, computed
-    /// once per request.
-    prefix: Option<Vec<i64>>,
+    /// The scoring prompt: the templated prompt ids ending in a closed empty
+    /// think block (its first `prefix_len` ids, computed once per request),
+    /// then the draft being scored. Reused across scorings.
+    prompt: Vec<i64>,
+    prefix_len: Option<usize>,
     /// Prefill tokens consumed across all scorings, for helper billing.
     billed_input: u32,
     scorings: u32,
@@ -517,12 +749,35 @@ impl Verifier {
         Verifier {
             model,
             root,
-            prefix: None,
+            prompt: Vec::new(),
+            prefix_len: None,
             billed_input: 0,
             scorings: 0,
             timeout: Duration::from_millis(s.verify_timeout_ms.max(1)),
             reply_max: s.verify_reply_max_bytes.max(1),
         }
+    }
+
+    async fn post(
+        &self,
+        http: &reqwest::Client,
+        url: String,
+        body: Value,
+    ) -> anyhow::Result<Bytes> {
+        let headers = reqwest::header::HeaderMap::new();
+        let call = super::post_json_capped(
+            http,
+            url,
+            &headers,
+            self.model.api_key.as_deref(),
+            &body,
+            self.reply_max,
+        );
+        super::with_timeout("speculation verify", self.timeout, call)
+            .await
+            .inspect_err(|e| {
+                tracing::warn!(model = %self.model.model_name, error = %e, "speculation verifier call failed")
+            })
     }
 
     async fn post_json(
@@ -531,33 +786,17 @@ impl Verifier {
         url: String,
         body: Value,
     ) -> anyhow::Result<Value> {
-        let call = async {
-            let bytes = super::post_json_capped(
-                http,
-                url,
-                &reqwest::header::HeaderMap::new(),
-                self.model.api_key.as_deref(),
-                &body,
-                self.reply_max,
-            )
-            .await?;
-            Ok(serde_json::from_slice::<Value>(&bytes)?)
-        };
-        super::with_timeout("speculation verify", self.timeout, call)
-            .await
-            .inspect_err(|e| {
-                tracing::warn!(model = %self.model.model_name, error = %e, "speculation verifier call failed")
-            })
+        Ok(serde_json::from_slice(&self.post(http, url, body).await?)?)
     }
 
-    async fn tokenize(&self, state: &AppState, mut body: Value) -> anyhow::Result<Value> {
+    async fn tokenize(&self, http: &reqwest::Client, mut body: Value) -> anyhow::Result<Value> {
         if let Some(o) = body.as_object_mut() {
             o.insert(
                 "model".into(),
                 Value::String(self.model.upstream_model.clone()),
             );
         }
-        self.post_json(&state.http, format!("{}/tokenize", self.root), body)
+        self.post_json(http, format!("{}/tokenize", self.root), body)
             .await
     }
 
@@ -569,13 +808,15 @@ impl Verifier {
     }
 
     /// Templated prompt ids for scoring, ending in a CLOSED empty think block.
-    async fn prefix_ids(&mut self, state: &AppState, messages: &Value) -> anyhow::Result<()> {
-        if self.prefix.is_some() {
+    /// Started alongside the draft call, so the tokenizer round trips overlap
+    /// the drafter's first token; a later call is a no-op once it succeeded.
+    async fn prefix_ids(&mut self, http: &reqwest::Client, messages: &Value) -> anyhow::Result<()> {
+        if self.prefix_len.is_some() {
             return Ok(());
         }
         let pre = self
             .tokenize(
-                state,
+                http,
                 json!({
                     "messages": messages,
                     "add_generation_prompt": true,
@@ -596,18 +837,28 @@ impl Verifier {
             })
             .unwrap_or_default();
         let closer = think_closer(&tail);
-        let clo = self
-            .tokenize(
-                state,
-                json!({ "prompt": closer, "add_special_tokens": false }),
-            )
-            .await?;
+        let key = (self.root.clone(), self.model.upstream_model.clone(), closer);
+        let closer_ids = match CLOSER_IDS.get(&key).await {
+            Some(ids) => ids,
+            None => {
+                let clo = self
+                    .tokenize(
+                        http,
+                        json!({ "prompt": closer, "add_special_tokens": false }),
+                    )
+                    .await?;
+                let ids: Arc<[i64]> = Self::token_ids(&clo).into();
+                CLOSER_IDS.insert(key, ids.clone()).await;
+                ids
+            }
+        };
         let mut ids = Self::token_ids(&pre);
         if ids.is_empty() {
             anyhow::bail!("verify tokenize returned no tokens");
         }
-        ids.extend(Self::token_ids(&clo));
-        self.prefix = Some(ids);
+        ids.extend_from_slice(&closer_ids);
+        self.prefix_len = Some(ids.len());
+        self.prompt = ids;
         Ok(())
     }
 
@@ -619,11 +870,11 @@ impl Verifier {
         messages: &Value,
         draft_text: &str,
     ) -> anyhow::Result<Score> {
-        self.prefix_ids(state, messages).await?;
-        let prefix = self.prefix.as_ref().expect("prefix computed above");
+        self.prefix_ids(&state.http, messages).await?;
+        let start = self.prefix_len.expect("prefix computed above");
         let dtok = self
             .tokenize(
-                state,
+                &state.http,
                 json!({ "prompt": draft_text, "add_special_tokens": false }),
             )
             .await?;
@@ -631,18 +882,17 @@ impl Verifier {
         if draft_ids.is_empty() {
             anyhow::bail!("draft tokenized to nothing");
         }
-        let mut prompt: Vec<i64> = prefix.clone();
-        let start = prompt.len();
-        prompt.extend(&draft_ids);
-        let total = prompt.len() as u32;
+        self.prompt.truncate(start);
+        self.prompt.extend_from_slice(&draft_ids);
+        let total = self.prompt.len() as u32;
         for attempt in 0..2u8 {
-            let resp = self
-                .post_json(
+            let reply = self
+                .post(
                     &state.http,
                     format!("{}/v1/completions", self.root),
                     json!({
                         "model": self.model.upstream_model,
-                        "prompt": prompt,
+                        "prompt": self.prompt,
                         "max_tokens": 1,
                         "temperature": 0.0,
                         "prompt_logprobs": 0,
@@ -651,14 +901,10 @@ impl Verifier {
                 .await?;
             self.billed_input = self.billed_input.saturating_add(total);
             self.scorings += 1;
-            let plp = resp
-                .pointer("/choices/0/prompt_logprobs")
-                .cloned()
-                .unwrap_or(Value::Null);
-            if plp.is_null() {
+            let Some(picks) = read_picks(&reply, start, &draft_ids)? else {
                 anyhow::bail!("verify backend returned no prompt_logprobs");
-            }
-            match parse_score(&plp, start, &draft_ids) {
+            };
+            match score_picks(&picks) {
                 Ok(score) => return Ok(score),
                 Err(misses) => {
                     tracing::info!(
@@ -674,7 +920,7 @@ impl Verifier {
     }
 
     fn prefix_len(&self) -> u32 {
-        self.prefix.as_ref().map(|p| p.len() as u32).unwrap_or(0)
+        self.prefix_len.unwrap_or(0) as u32
     }
 }
 
@@ -711,7 +957,7 @@ struct DraftReader {
     events: crate::sse::Splitter,
     pub deltas: Vec<String>,
     pub finish: Option<String>,
-    pub usage: Option<(u32, u32)>,
+    pub usage: Option<UpstreamUsage>,
     pub done: bool,
 }
 
@@ -736,12 +982,7 @@ impl DraftReader {
             return;
         };
         if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
-            let it = u.get("prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-            let ot = u
-                .get("completion_tokens")
-                .and_then(|x| x.as_u64())
-                .unwrap_or(0) as u32;
-            self.usage = Some((it, ot));
+            self.usage = Some(chunk_usage(u));
         }
         let Some(choice) = v.pointer("/choices/0") else {
             return;
@@ -1004,14 +1245,14 @@ fn bill_verify(req: &SpecRequest<'_>, verifier: &Verifier) {
             req.session_id,
             req.request_id,
             "speculation_verify",
-            crate::proxy::UpstreamUsage::uncached(verifier.billed_input, verifier.scorings),
+            UpstreamUsage::uncached(verifier.billed_input, verifier.scorings),
         );
     }
 }
 
-fn bill_draft(req: &SpecRequest<'_>, drafter: &ResolvedModel, usage: Option<(u32, u32)>) {
-    let (it, ot) = usage.unwrap_or((0, 0));
-    if it > 0 || ot > 0 {
+fn bill_draft(req: &SpecRequest<'_>, drafter: &ResolvedModel, usage: Option<UpstreamUsage>) {
+    let usage = usage.unwrap_or_default();
+    if usage.input > 0 || usage.output > 0 {
         super::bill_helper_call(
             req.state,
             drafter,
@@ -1019,7 +1260,7 @@ fn bill_draft(req: &SpecRequest<'_>, drafter: &ResolvedModel, usage: Option<(u32
             req.session_id,
             req.request_id,
             "speculation_draft",
-            crate::proxy::UpstreamUsage::uncached(it, ot),
+            usage,
         );
     }
 }
@@ -1044,22 +1285,22 @@ async fn run_nonstream(
         client_max_tokens,
         false,
     );
-    let completion =
-        match super::chat_call_completion(req.state, drafter, body, req.dispatch_timeout).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::info!(error = %e, "speculation draft failed");
-                return Outcome::Abstain("draft failed");
-            }
-        };
-    let usage = completion.get("usage").map(|u| {
-        (
-            u.get("prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
-            u.get("completion_tokens")
-                .and_then(|x| x.as_u64())
-                .unwrap_or(0) as u32,
-        )
-    });
+    // The scoring prefix is tokenized while the drafter writes; a failure
+    // here is retried by the first score.
+    let (completion, _) = tokio::join!(
+        super::chat_call_completion(req.state, drafter, body, req.dispatch_timeout),
+        verifier.prefix_ids(&req.state.http, &plan.messages),
+    );
+    let completion = match completion {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::info!(error = %e, "speculation draft failed");
+            return Outcome::Abstain("draft failed");
+        }
+    };
+    let usage = completion
+        .get("usage")
+        .map(|_| super::reported_usage(&completion));
     bill_draft(req, drafter, usage);
     let draft = completion
         .pointer("/choices/0/message/content")
@@ -1155,7 +1396,13 @@ async fn precommit_stream(
         client_max_tokens,
         true,
     );
-    let resp = match dispatch_stream(req.state, drafter, &body, req.dispatch_timeout).await {
+    // The scoring prefix is tokenized while the drafter starts; a failure
+    // here is retried by the first score.
+    let (resp, _) = tokio::join!(
+        dispatch_stream(req.state, drafter, &body, req.dispatch_timeout),
+        verifier.prefix_ids(&req.state.http, &plan.messages),
+    );
+    let resp = match resp {
         Ok(r) => r,
         Err(e) => {
             tracing::info!(error = %e, "speculation draft dispatch failed");
@@ -1404,13 +1651,13 @@ fn drive_stream(
                             bill_draft(&breq, &drafter, reader.usage);
                             bill_verify(&breq, &verifier);
                             yield Ok(Bytes::from(finish_chunk(&id, &model_name, created, None)));
+                            let usage = UpstreamUsage::uncached(input, output);
                             if plan.include_usage {
-                                yield Ok(Bytes::from(usage_chunk(&id, &model_name, created, crate::proxy::UpstreamUsage::uncached(input, output))));
+                                yield Ok(Bytes::from(usage_chunk(&id, &model_name, created, usage)));
                             }
                             yield Ok(Bytes::from(done()));
                             if let Ok(mut st) = stats.lock() {
-                                st.input_tokens = input;
-                                st.output_tokens = output;
+                                st.usage = usage;
                                 st.final_set = true;
                             }
                             return;
@@ -1435,7 +1682,13 @@ fn drive_stream(
         // renders the continued message after a CLOSED think block, but
         // streaming reasoning parsers mislabel the continuation as reasoning —
         // remap those deltas to content deterministically.
-        bill_draft(&breq, &drafter, reader.usage.or(Some((0, reader.deltas.len() as u32))));
+        bill_draft(
+            &breq,
+            &drafter,
+            reader
+                .usage
+                .or(Some(UpstreamUsage::uncached(0, reader.deltas.len() as u32))),
+        );
         bill_verify(&breq, &verifier);
         let released_text: String = reader.deltas[..released].concat();
         drop(reader); // disconnect aborts any still-running draft generation
@@ -1450,7 +1703,7 @@ fn drive_stream(
             &route.upstream_model,
             &released_text,
         );
-        let mut cont_usage: Option<(u32, u32)> = None;
+        let mut cont_usage: Option<UpstreamUsage> = None;
         let mut finish: Option<Value> = None;
         // How the continuation ended: `[DONE]`, broken off (its connection
         // broke or went silent, or it never started), or with an error event
@@ -1486,16 +1739,13 @@ fn drive_stream(
                                 }
                             }
                             if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
-                                cont_usage = Some((
-                                    u.get("prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
-                                    u.get("completion_tokens").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
-                                ));
+                                cont_usage = Some(chunk_usage(u));
                             }
                             let Some(choice) = v.pointer("/choices/0") else { continue };
                             if let Some(f) = choice.get("finish_reason").filter(|f| !f.is_null()) {
                                 finish = Some(f.clone());
                             }
-                            let delta = choice.get("delta").cloned().unwrap_or(Value::Null);
+                            let delta = choice.get("delta").unwrap_or(&Value::Null);
                             let mut text = String::new();
                             for k in ["reasoning", "reasoning_content", "content"] {
                                 if let Some(t) = delta.get(k).and_then(|t| t.as_str()) {
@@ -1527,8 +1777,14 @@ fn drive_stream(
         // Settle with what the target actually processed: its prompt covers
         // the original request plus the released prefix; the client received
         // released draft deltas plus the continuation's completion tokens.
-        let (cin, cout) = cont_usage.unwrap_or((0, 0));
-        let input = if cin > 0 { cin } else { verifier.prefix_len() };
+        let cont = cont_usage.unwrap_or_default();
+        // The target's own prompt count, with the part its prefix cache
+        // served; the scoring prefix's length when it reported none.
+        let (input, cached) = if cont.input > 0 {
+            (cont.input, cont.cached)
+        } else {
+            (verifier.prefix_len(), 0)
+        };
 
         // A continuation that stopped short, or closed with neither `[DONE]`
         // nor a finish reason, ends with an error item and no finish chunk or
@@ -1539,13 +1795,13 @@ fn drive_stream(
         // token).
         if !error_forwarded && (broke_off || (!done_seen && finish.is_none())) {
             let cont_out = match cont_usage {
-                Some(_) => cout,
+                Some(_) => cont.output,
                 None if cont_chars == 0 => 0,
                 None => u32::try_from(cont_chars / 4).unwrap_or(u32::MAX).max(1),
             };
             if let Ok(mut st) = stats.lock() {
-                st.input_tokens = input;
-                st.output_tokens = (released as u32).saturating_add(cont_out);
+                st.usage =
+                    UpstreamUsage::new(input, (released as u32).saturating_add(cont_out), cached);
                 st.final_set = true;
                 st.failure = Some(failure.unwrap_or(DEFAULT_FAILURE_STATUS));
             }
@@ -1553,18 +1809,17 @@ fn drive_stream(
             return;
         }
 
-        let output = (released as u32).saturating_add(cout);
+        let usage = UpstreamUsage::new(input, (released as u32).saturating_add(cont.output), cached);
         // The upstream's own error event already ended the answer.
         if !error_forwarded {
             yield Ok(Bytes::from(finish_chunk(&id, &model_name, created, finish)));
             if plan.include_usage {
-                yield Ok(Bytes::from(usage_chunk(&id, &model_name, created, crate::proxy::UpstreamUsage::uncached(input, output))));
+                yield Ok(Bytes::from(usage_chunk(&id, &model_name, created, usage)));
             }
         }
         yield Ok(Bytes::from(done()));
         if let Ok(mut st) = stats.lock() {
-            st.input_tokens = input;
-            st.output_tokens = output;
+            st.usage = usage;
             st.final_set = true;
             st.failure = failure;
         }
@@ -1745,7 +2000,6 @@ mod tests {
         SpeculationBoonSettings {
             enabled: true,
             draft_model: Some("drafter".into()),
-            verify_model: Some("verifier".into()),
             ..Default::default()
         }
     }
@@ -1804,6 +2058,184 @@ mod tests {
         s.unlisted_categories_speculate = false;
         assert!(resolve_gate(&s, &["math".into()]).is_none());
         assert!(resolve_gate(&s, &[]).is_none());
+    }
+
+    /// Score a `prompt_logprobs` array as the verifier reads it off the wire.
+    fn parse_score(plp: &Value, start: usize, draft_ids: &[i64]) -> Result<Score, usize> {
+        let reply = serde_json::to_vec(&json!({
+            "id": "cmpl-1",
+            "choices": [{ "index": 0, "text": "x", "prompt_logprobs": plp }, { "index": 1 }],
+            "usage": { "prompt_tokens": 4 },
+        }))
+        .unwrap();
+        let picks = read_picks(&reply, start, draft_ids)
+            .expect("a well-formed reply")
+            .expect("prompt_logprobs present");
+        score_picks(&picks)
+    }
+
+    /// The scoring the gateway did before the reply was read without a tree,
+    /// kept to pin that both decide the same.
+    fn reference_score(plp: &Value, start: usize, draft_ids: &[i64]) -> Result<Score, usize> {
+        let plp = plp.as_array();
+        let (mut agree, mut lp_sum, mut lp_n, mut misses) = (0usize, 0.0f64, 0usize, 0usize);
+        for (k, tid) in draft_ids.iter().enumerate() {
+            let Some(info) = plp
+                .and_then(|a| a.get(start + k))
+                .and_then(|e| e.get(tid.to_string()))
+            else {
+                misses += 1;
+                continue;
+            };
+            if info.get("rank").and_then(|r| r.as_u64()) == Some(1) {
+                agree += 1;
+            }
+            if let Some(lp) = info.get("logprob").and_then(|l| l.as_f64()) {
+                lp_sum += lp;
+                lp_n += 1;
+            }
+        }
+        if misses > draft_ids.len() / 10 {
+            return Err(misses);
+        }
+        Ok(Score {
+            agree: agree as f64 / draft_ids.len().max(1) as f64,
+            mean_lp: if lp_n > 0 {
+                lp_sum / lp_n as f64
+            } else {
+                -99.0
+            },
+            n_draft: draft_ids.len(),
+        })
+    }
+
+    #[test]
+    fn the_streamed_reader_decides_as_the_tree_did_on_recorded_shapes() {
+        // vLLM's shape: a null first entry, then per position the sent
+        // token plus the top-1 when they differ, with decoded_token.
+        let entry = |id: i64, lp: f64, rank: u64, top: Option<i64>| {
+            let mut m = serde_json::Map::new();
+            m.insert(
+                id.to_string(),
+                json!({ "logprob": lp, "rank": rank, "decoded_token": "t" }),
+            );
+            if let Some(top) = top {
+                m.insert(
+                    top.to_string(),
+                    json!({ "logprob": -0.01, "rank": 1, "decoded_token": "u" }),
+                );
+            }
+            Value::Object(m)
+        };
+        let ids: Vec<i64> = (100..140).collect();
+        let mut clean = vec![
+            Value::Null,
+            entry(1, -1.0, 1, None),
+            entry(2, -1.0, 1, None),
+        ];
+        for (k, id) in ids.iter().enumerate() {
+            let agrees = k % 3 != 0;
+            clean.push(entry(
+                *id,
+                -(k as f64) / 10.0,
+                if agrees { 1 } else { 2 },
+                (!agrees).then_some(9),
+            ));
+        }
+        let clean = Value::Array(clean);
+        // Corrupt keys at a few positions (under and over the 10% line).
+        let corrupt = |n: usize| {
+            let mut v = clean.clone();
+            for k in 0..n {
+                v[3 + k * 3] = entry(896_757_760 + k as i64, -0.1, 1, None);
+            }
+            v
+        };
+        // Short (the reply ends early), a missing rank, a `null` mid-draft.
+        let mut odd = clean.clone();
+        odd.as_array_mut().unwrap().truncate(30);
+        odd[5] = json!({ "103": { "logprob": -0.5 } });
+        odd[6] = Value::Null;
+        for (name, plp, start) in [
+            ("clean", clean.clone(), 3),
+            ("corrupt under", corrupt(4), 3),
+            ("corrupt over", corrupt(5), 3),
+            ("odd", odd, 3),
+            ("start past the end", clean.clone(), 60),
+            ("no logprobs at all", Value::Array(vec![]), 0),
+        ] {
+            let (new, old) = (
+                parse_score(&plp, start, &ids),
+                reference_score(&plp, start, &ids),
+            );
+            match (&new, &old) {
+                (Ok(a), Ok(b)) => {
+                    assert_eq!(a.n_draft, b.n_draft, "{name}");
+                    assert!((a.agree - b.agree).abs() < 1e-12, "{name}");
+                    assert!((a.mean_lp - b.mean_lp).abs() < 1e-12, "{name}");
+                }
+                _ => assert_eq!(new, old, "{name}"),
+            }
+        }
+    }
+
+    /// The closer is a constant string: a second request to the same model
+    /// tokenizes only its own prompt.
+    #[tokio::test]
+    async fn the_think_closer_is_tokenized_once_per_model() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
+        let seen = calls.clone();
+        let app = axum::Router::new().route(
+            "/tokenize",
+            axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                let seen = seen.clone();
+                async move {
+                    if body.get("messages").is_some() {
+                        seen.0.fetch_add(1, Ordering::SeqCst);
+                        axum::Json(json!({ "tokens": [1, 2, 3], "token_strs": ["a", "b", "c"] }))
+                    } else {
+                        seen.1.fetch_add(1, Ordering::SeqCst);
+                        axum::Json(json!({ "tokens": [7, 8] }))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let mut route = target("closer-once");
+        route.verify_api_base = format!("http://{addr}/v1");
+        let http = reqwest::Client::new();
+        let messages = json!([{ "role": "user", "content": "hi" }]);
+        for _ in 0..3 {
+            let scorer = scoring_route(&route, "").expect("scoring endpoint set");
+            let mut verifier = Verifier::new(scorer, &settings());
+            verifier.prefix_ids(&http, &messages).await.unwrap();
+            assert_eq!(verifier.prompt, vec![1, 2, 3, 7, 8]);
+            assert_eq!(verifier.prefix_len(), 5);
+        }
+        assert_eq!(
+            calls.0.load(Ordering::SeqCst),
+            3,
+            "each request's own prompt"
+        );
+        assert_eq!(calls.1.load(Ordering::SeqCst), 1, "the closer once");
+        server.abort();
+    }
+
+    #[test]
+    fn a_reply_without_prompt_logprobs_reads_as_none() {
+        for reply in [
+            json!({ "choices": [{ "index": 0, "text": "x" }] }),
+            json!({ "choices": [{ "prompt_logprobs": null }] }),
+            json!({ "choices": [] }),
+            json!({ "error": { "message": "no" } }),
+        ] {
+            let bytes = serde_json::to_vec(&reply).unwrap();
+            assert_eq!(read_picks(&bytes, 0, &[1]).unwrap(), None, "{reply}");
+        }
+        assert!(read_picks(b"{\"choices\": [", 0, &[1]).is_err());
     }
 
     #[test]

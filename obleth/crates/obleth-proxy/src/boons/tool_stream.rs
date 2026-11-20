@@ -703,7 +703,7 @@ fn set_ttft(stats: &Arc<Mutex<StreamStats>>, ms: u32) {
 
 /// One stream chunk's `usage` object: each count independently, zero when
 /// absent, with the cached part of the prompt when it reports one.
-fn chunk_usage(u: &Value) -> UpstreamUsage {
+pub(crate) fn chunk_usage(u: &Value) -> UpstreamUsage {
     let read = |field: &str| u.get(field).and_then(Value::as_u64).unwrap_or(0) as u32;
     UpstreamUsage::new(
         read("prompt_tokens"),

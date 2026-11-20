@@ -3040,14 +3040,6 @@ pub struct SpeculationBoonSettings {
     /// disables the boon regardless of `enabled`.
     #[serde(default)]
     pub draft_model: Option<String>,
-    /// `model_name` of the registered model that scores drafts via
-    /// `prompt_logprobs`. Must be the target model's family (it defines
-    /// "verified") on a backend that supports prompt logprobs, registered with
-    /// a DIRECT service `api_base` — scoring also calls the backend's
-    /// `/tokenize` endpoint, which gateway-routed bases may not forward.
-    /// `None` disables the boon regardless of `enabled`.
-    #[serde(default)]
-    pub verify_model: Option<String>,
     /// Ship floor: minimum fraction of draft tokens the verifier ranks #1.
     #[serde(default = "default_spec_agree_min")]
     pub agree_min: f64,
@@ -3170,7 +3162,6 @@ impl Default for SpeculationBoonSettings {
         SpeculationBoonSettings {
             enabled: false,
             draft_model: None,
-            verify_model: None,
             agree_min: default_spec_agree_min(),
             lp_min: default_spec_lp_min(),
             abort_agree: default_spec_abort_agree(),

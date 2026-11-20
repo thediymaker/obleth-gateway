@@ -1980,7 +1980,6 @@ export interface BoonSettingsView {
   image_generation_timeout_ms: number;
   speculation_enabled: boolean;
   speculation_draft_model: string | null;
-  speculation_verify_model: string | null;
   speculation_classify_model: string | null;
   speculation_agree_min: number;
   speculation_lp_min: number;
@@ -2052,7 +2051,6 @@ export interface UpdateBoonSettings {
   image_generation_timeout_ms?: number;
   speculation_enabled?: boolean;
   speculation_draft_model?: string | null;
-  speculation_verify_model?: string | null;
   speculation_classify_model?: string | null;
   speculation_agree_min?: number;
   speculation_lp_min?: number;

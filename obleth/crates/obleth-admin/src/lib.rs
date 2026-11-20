@@ -3651,7 +3651,6 @@ pub struct BoonSettingsView {
     pub image_generation_timeout_ms: u64,
     pub speculation_enabled: bool,
     pub speculation_draft_model: Option<String>,
-    pub speculation_verify_model: Option<String>,
     pub speculation_classify_model: Option<String>,
     pub speculation_agree_min: f64,
     pub speculation_lp_min: f64,
@@ -3719,7 +3718,6 @@ impl BoonSettingsView {
             image_generation_timeout_ms: s.image_generation.timeout_ms,
             speculation_enabled: s.speculation.enabled,
             speculation_draft_model: s.speculation.draft_model.clone(),
-            speculation_verify_model: s.speculation.verify_model.clone(),
             speculation_classify_model: s.speculation.classify_model.clone(),
             speculation_agree_min: s.speculation.agree_min,
             speculation_lp_min: s.speculation.lp_min,
@@ -3855,10 +3853,6 @@ pub struct UpdateBoonSettings {
     /// clears it (which deactivates the boon).
     #[serde(default)]
     pub speculation_draft_model: Option<String>,
-    /// `model_name` of the registered model that scores drafts via
-    /// prompt_logprobs. Empty string clears it (which deactivates the boon).
-    #[serde(default)]
-    pub speculation_verify_model: Option<String>,
     /// `model_name` of the tiny classify model for per-category gates. Empty
     /// string clears it (the default gate then applies to everything).
     #[serde(default)]
@@ -4104,11 +4098,6 @@ async fn put_boon_settings(
         Some(m) => Some(m.to_string()),
         None => existing.speculation.draft_model.clone(),
     };
-    let spec_verify_model = match body.speculation_verify_model.as_deref().map(str::trim) {
-        Some("") => None,
-        Some(m) => Some(m.to_string()),
-        None => existing.speculation.verify_model.clone(),
-    };
     let spec_classify_model = match body.speculation_classify_model.as_deref().map(str::trim) {
         Some("") => None,
         Some(m) => Some(m.to_string()),
@@ -4119,11 +4108,6 @@ async fn put_boon_settings(
             "speculation_draft_model",
             body.speculation_draft_model.is_some(),
             spec_draft_model.as_deref(),
-        ),
-        (
-            "speculation_verify_model",
-            body.speculation_verify_model.is_some(),
-            spec_verify_model.as_deref(),
         ),
         (
             "speculation_classify_model",
@@ -4290,7 +4274,6 @@ async fn put_boon_settings(
                 .speculation_enabled
                 .unwrap_or(existing.speculation.enabled),
             draft_model: spec_draft_model,
-            verify_model: spec_verify_model,
             classify_model: spec_classify_model,
             agree_min: in_range(
                 "speculation_agree_min",
@@ -4437,7 +4420,6 @@ async fn put_boon_settings(
                 "image_generation_timeout_ms": settings.image_generation.timeout_ms,
                 "speculation_enabled": settings.speculation.enabled,
                 "speculation_draft_model": settings.speculation.draft_model,
-                "speculation_verify_model": settings.speculation.verify_model,
                 "speculation_classify_model": settings.speculation.classify_model,
                 "speculation_agree_min": settings.speculation.agree_min,
                 "speculation_lp_min": settings.speculation.lp_min,
