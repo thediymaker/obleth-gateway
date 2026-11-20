@@ -1,15 +1,29 @@
 use crate::config::ProvisionerConfig;
-use crate::domain::ReplicaView;
+use crate::domain::{ReplicaState, ReplicaView};
 use async_trait::async_trait;
 use obleth_config::{ManagedBackoff, ManagedModelSpec, SlurmSettings};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-/// Provisioner-reported details of a replica (`PATCH /replicas/{id}`).
-/// `None` leaves a field as it is; an empty `state_detail` or `log_path`
-/// clears it.
+/// One update to a replica row, sent as one PATCH. `None` leaves a field as
+/// it is; an empty `state_detail` or `log_path` clears it.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
-pub struct ReplicaDetails {
+pub struct ReplicaPatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<ReplicaState>,
+    /// The replica's message (the dashboard's short status).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nodes: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint_id: Option<Uuid>,
+    /// How the job ended, for the launch history, sent with `lost` and
+    /// `draining`: Slurm's terminal state, `gone`, or `cancelled:<why>`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub job_started_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -60,24 +74,23 @@ pub trait OblethClient: Send + Sync {
     /// Management API's provisioner-facing `resolved` route. `None` only when
     /// the gateway has never had Slurm configured.
     async fn get_slurm_settings(&self) -> anyhow::Result<Option<SlurmSettings>>;
-    async fn model_name(&self, model_id: Uuid) -> anyhow::Result<String>;
+    /// Every model's name and upstream name by id, in one read.
+    async fn model_identities(&self) -> anyhow::Result<HashMap<Uuid, ModelIdentity>>;
+    /// One model's name and upstream name.
+    async fn model_identity(&self, model_id: Uuid) -> anyhow::Result<ModelIdentity>;
     /// Every replica row across all models — used to reconcile orphans and drain
     /// models that have left the managed set.
     async fn list_all_replicas(&self) -> anyhow::Result<Vec<ReplicaView>>;
+    /// Record a new replica and where its job's output goes.
     async fn create_replica(
         &self,
         model_id: Uuid,
         slurm_job_id: &str,
         port_base: i64,
+        log_path: Option<&str>,
     ) -> anyhow::Result<Uuid>;
-    async fn patch_replica(
-        &self,
-        replica_id: Uuid,
-        state: Option<&str>,
-        nodes: Option<&str>,
-        endpoint_id: Option<Uuid>,
-        message: Option<&str>,
-    ) -> anyhow::Result<()>;
+    /// Apply one update to a replica row; an empty patch sends nothing.
+    async fn patch_replica(&self, replica_id: Uuid, patch: &ReplicaPatch) -> anyhow::Result<()>;
     async fn delete_replica(&self, replica_id: Uuid) -> anyhow::Result<()>;
     /// Register a live replica as a model endpoint; returns the endpoint id.
     async fn create_endpoint(
@@ -104,58 +117,12 @@ pub trait OblethClient: Send + Sync {
     /// Record (or clear with `None`) the provisioner's last submit error for a
     /// model, so the dashboard can show it.
     async fn set_provision_error(&self, model_id: Uuid, error: Option<&str>) -> anyhow::Result<()>;
-    /// Every model's name and upstream name by id, in one read.
-    async fn model_identities(&self) -> anyhow::Result<HashMap<Uuid, ModelIdentity>> {
-        Ok(HashMap::new())
-    }
-    /// One model's name and upstream name.
-    async fn model_identity(&self, model_id: Uuid) -> anyhow::Result<ModelIdentity> {
-        Ok(ModelIdentity {
-            name: self.model_name(model_id).await?,
-            upstream: String::new(),
-        })
-    }
-    /// Record a new replica and where its job's output goes.
-    async fn create_replica_with_log(
-        &self,
-        model_id: Uuid,
-        slurm_job_id: &str,
-        port_base: i64,
-        _log_path: Option<&str>,
-    ) -> anyhow::Result<Uuid> {
-        self.create_replica(model_id, slurm_job_id, port_base).await
-    }
-    /// Update a replica's Slurm times, plain-sentence detail, log path, port
-    /// or replacement flag.
-    async fn patch_replica_details(
-        &self,
-        _replica_id: Uuid,
-        _details: &ReplicaDetails,
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
     /// Record a managed model's failure count and pause (backoff) state.
     async fn set_managed_backoff(
         &self,
-        _model_id: Uuid,
-        _backoff: &ManagedBackoff,
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
-    /// A state change and the replica's details in one update.
-    async fn patch_replica_with_details(
-        &self,
-        replica_id: Uuid,
-        state: Option<&str>,
-        nodes: Option<&str>,
-        endpoint_id: Option<Uuid>,
-        message: Option<&str>,
-        details: &ReplicaDetails,
-    ) -> anyhow::Result<()> {
-        self.patch_replica(replica_id, state, nodes, endpoint_id, message)
-            .await?;
-        self.patch_replica_details(replica_id, details).await
-    }
+        model_id: Uuid,
+        backoff: &ManagedBackoff,
+    ) -> anyhow::Result<()>;
 }
 
 /// Map a JSON array of replica rows (`ModelReplica`) into `ReplicaView`s. Rows
@@ -198,6 +165,14 @@ fn replica_views_from_json(rows: &[serde_json::Value]) -> Vec<ReplicaView> {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
         };
+        let Some(state) = r
+            .get("state")
+            .and_then(|x| x.as_str())
+            .and_then(ReplicaState::parse)
+        else {
+            tracing::warn!(replica_id = %id, "replica row has an unknown state; skipping");
+            continue;
+        };
         let created = time("created_at").unwrap_or(now);
         let updated = time("updated_at").unwrap_or(created);
         out.push(ReplicaView {
@@ -208,11 +183,7 @@ fn replica_views_from_json(rows: &[serde_json::Value]) -> Vec<ReplicaView> {
                 .and_then(|x| x.as_str())
                 .unwrap_or_default()
                 .to_string(),
-            state: r
-                .get("state")
-                .and_then(|x| x.as_str())
-                .unwrap_or_default()
-                .to_string(),
+            state,
             endpoint_id: r
                 .get("endpoint_id")
                 .and_then(|x| x.as_str())
@@ -411,9 +382,6 @@ impl HttpObleth {
 #[async_trait]
 impl OblethClient for HttpObleth {
     async fn list_managed_models(&self) -> anyhow::Result<Vec<ManagedModelSpec>> {
-        // /managed is per-model; the provisioner needs them all. List models,
-        // then GET each /managed. (A bulk /managed route exists and is a fine
-        // future optimization; v1 keeps the surface minimal.)
         // One read of every spec. An error status fails the whole list (it
         // must not read as "nothing is managed", which would drain replicas).
         let rows = self.get_array("/managed").await?;
@@ -448,78 +416,9 @@ impl OblethClient for HttpObleth {
         Ok(Some(s))
     }
 
-    async fn model_name(&self, model_id: Uuid) -> anyhow::Result<String> {
-        let m: serde_json::Value = self
-            .req(reqwest::Method::GET, &format!("/models/{model_id}"))
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        Ok(m.get("model_name")
-            .and_then(|x| x.as_str())
-            .unwrap_or_default()
-            .to_string())
-    }
-
     async fn list_all_replicas(&self) -> anyhow::Result<Vec<ReplicaView>> {
         let rows = self.get_array("/replicas").await?;
         Ok(replica_views_from_json(&rows))
-    }
-
-    async fn create_replica(
-        &self,
-        model_id: Uuid,
-        slurm_job_id: &str,
-        port_base: i64,
-    ) -> anyhow::Result<Uuid> {
-        let v: serde_json::Value = self
-            .req(
-                reqwest::Method::POST,
-                &format!("/models/{model_id}/replicas"),
-            )
-            .json(&serde_json::json!({ "slurm_job_id": slurm_job_id, "port_base": port_base }))
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        // A successful POST must return a parseable id. Returning a nil UUID on a
-        // missing/unparseable id (the old `unwrap_or_default`) silently strands
-        // the caller with an invalid reference, so surface it as an error instead.
-        v.get("id")
-            .and_then(|x| x.as_str())
-            .and_then(|s| s.parse().ok())
-            .ok_or_else(|| anyhow::anyhow!("create_replica: response missing a valid id: {v}"))
-    }
-
-    async fn patch_replica(
-        &self,
-        replica_id: Uuid,
-        state: Option<&str>,
-        nodes: Option<&str>,
-        endpoint_id: Option<Uuid>,
-        message: Option<&str>,
-    ) -> anyhow::Result<()> {
-        let mut body = serde_json::Map::new();
-        if let Some(s) = state {
-            body.insert("state".into(), serde_json::json!(s));
-        }
-        if let Some(n) = nodes {
-            body.insert("nodes".into(), serde_json::json!(n));
-        }
-        if let Some(e) = endpoint_id {
-            body.insert("endpoint_id".into(), serde_json::json!(e.to_string()));
-        }
-        if let Some(m) = message {
-            body.insert("message".into(), serde_json::json!(m));
-        }
-        self.req(reqwest::Method::PATCH, &format!("/replicas/{replica_id}"))
-            .json(&serde_json::Value::Object(body))
-            .send()
-            .await?
-            .error_for_status()?;
-        Ok(())
     }
 
     async fn delete_replica(&self, replica_id: Uuid) -> anyhow::Result<()> {
@@ -673,43 +572,19 @@ impl OblethClient for HttpObleth {
         Ok(identity_from_json(&m).unwrap_or_default())
     }
 
-    async fn patch_replica_with_details(
-        &self,
-        replica_id: Uuid,
-        state: Option<&str>,
-        nodes: Option<&str>,
-        endpoint_id: Option<Uuid>,
-        message: Option<&str>,
-        details: &ReplicaDetails,
-    ) -> anyhow::Result<()> {
-        let mut body = match serde_json::to_value(details)? {
-            serde_json::Value::Object(m) => m,
-            _ => serde_json::Map::new(),
-        };
-        if let Some(s) = state {
-            body.insert("state".into(), serde_json::json!(s));
-        }
-        if let Some(n) = nodes {
-            body.insert("nodes".into(), serde_json::json!(n));
-        }
-        if let Some(e) = endpoint_id {
-            body.insert("endpoint_id".into(), serde_json::json!(e.to_string()));
-        }
-        if let Some(m) = message {
-            body.insert("message".into(), serde_json::json!(m));
-        }
-        if body.is_empty() {
+    async fn patch_replica(&self, replica_id: Uuid, patch: &ReplicaPatch) -> anyhow::Result<()> {
+        if *patch == ReplicaPatch::default() {
             return Ok(());
         }
         self.req(reqwest::Method::PATCH, &format!("/replicas/{replica_id}"))
-            .json(&serde_json::Value::Object(body))
+            .json(patch)
             .send()
             .await?
             .error_for_status()?;
         Ok(())
     }
 
-    async fn create_replica_with_log(
+    async fn create_replica(
         &self,
         model_id: Uuid,
         slurm_job_id: &str,
@@ -731,26 +606,12 @@ impl OblethClient for HttpObleth {
             .error_for_status()?
             .json()
             .await?;
+        // A successful POST must return a parseable id: a nil id would strand
+        // the caller with an invalid reference.
         v.get("id")
             .and_then(|x| x.as_str())
             .and_then(|s| s.parse().ok())
             .ok_or_else(|| anyhow::anyhow!("create_replica: response missing a valid id: {v}"))
-    }
-
-    async fn patch_replica_details(
-        &self,
-        replica_id: Uuid,
-        details: &ReplicaDetails,
-    ) -> anyhow::Result<()> {
-        if *details == ReplicaDetails::default() {
-            return Ok(());
-        }
-        self.req(reqwest::Method::PATCH, &format!("/replicas/{replica_id}"))
-            .json(details)
-            .send()
-            .await?
-            .error_for_status()?;
-        Ok(())
     }
 
     async fn set_managed_backoff(
@@ -894,6 +755,44 @@ mod tests {
         assert!(c.model_identity(Uuid::nil()).await.is_err());
     }
 
+    #[test]
+    fn a_replica_patch_sends_only_what_it_sets() {
+        let patch = ReplicaPatch {
+            state: Some(ReplicaState::Draining),
+            message: Some("scaled down".into()),
+            end_state: Some("cancelled:scale-down".into()),
+            state_detail: Some(String::new()),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&patch).unwrap(),
+            serde_json::json!({
+                "state": "draining",
+                "message": "scaled down",
+                "end_state": "cancelled:scale-down",
+                "state_detail": "",
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(ReplicaPatch::default()).unwrap(),
+            serde_json::json!({})
+        );
+    }
+
+    #[test]
+    fn replica_rows_are_read_with_a_typed_state() {
+        let row = |state: &str| {
+            serde_json::json!({
+                "id": Uuid::new_v4().to_string(),
+                "model_id": Uuid::new_v4().to_string(),
+                "state": state,
+            })
+        };
+        let views = replica_views_from_json(&[row("starting"), row("healthy"), row("bogus")]);
+        let states: Vec<ReplicaState> = views.iter().map(|v| v.state).collect();
+        assert_eq!(states, vec![ReplicaState::Pending, ReplicaState::Healthy]);
+    }
+
     #[tokio::test]
     async fn deleting_an_endpoint_that_is_already_gone_succeeds() {
         let c = admin_stub(404, r#"{"error":"not found"}"#).await;
@@ -974,13 +873,9 @@ pub struct MockObleth {
     pub deleted_endpoints: std::sync::Mutex<Vec<Uuid>>,
     pub updated_endpoints: std::sync::Mutex<Vec<(Uuid, String)>>, // (endpoint_id, new api_base)
     pub deleted_replicas: std::sync::Mutex<Vec<Uuid>>,
-    pub patched: std::sync::Mutex<Vec<(Uuid, Option<String>)>>, // (replica_id, state)
-    /// Every replica patch in full: (replica_id, state, nodes, message).
-    #[allow(clippy::type_complexity)]
-    pub patches: std::sync::Mutex<Vec<(Uuid, Option<String>, Option<String>, Option<String>)>>,
+    /// Every replica patch: (replica_id, patch).
+    pub patches: std::sync::Mutex<Vec<(Uuid, ReplicaPatch)>>,
     pub provision_errors: std::sync::Mutex<Vec<(Uuid, Option<String>)>>,
-    /// Every details patch: (replica_id, details).
-    pub details: std::sync::Mutex<Vec<(Uuid, ReplicaDetails)>>,
     /// Every backoff write: (model_id, state).
     pub backoffs: std::sync::Mutex<Vec<(Uuid, ManagedBackoff)>>,
     /// Endpoints `list_endpoints` reports for every model.
@@ -993,6 +888,19 @@ pub struct MockObleth {
     /// When set, the tick's planning reads fail — drives the hold-the-tick path.
     pub fail_list_managed: std::sync::atomic::AtomicBool,
     pub fail_list_replicas: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+impl MockObleth {
+    /// The state changes patched so far: (replica_id, state).
+    pub fn state_changes(&self) -> Vec<(Uuid, ReplicaState)> {
+        self.patches
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(id, p)| Some((*id, p.state?)))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -1010,8 +918,14 @@ impl OblethClient for MockObleth {
     async fn get_slurm_settings(&self) -> anyhow::Result<Option<SlurmSettings>> {
         Ok(self.slurm.lock().unwrap().clone())
     }
-    async fn model_name(&self, _model_id: Uuid) -> anyhow::Result<String> {
-        Ok("test-model".to_string())
+    async fn model_identities(&self) -> anyhow::Result<HashMap<Uuid, ModelIdentity>> {
+        Ok(HashMap::new())
+    }
+    async fn model_identity(&self, _model_id: Uuid) -> anyhow::Result<ModelIdentity> {
+        Ok(ModelIdentity {
+            name: "test-model".to_string(),
+            upstream: String::new(),
+        })
     }
     async fn list_all_replicas(&self) -> anyhow::Result<Vec<ReplicaView>> {
         if self
@@ -1027,6 +941,7 @@ impl OblethClient for MockObleth {
         model_id: Uuid,
         slurm_job_id: &str,
         port_base: i64,
+        _log_path: Option<&str>,
     ) -> anyhow::Result<Uuid> {
         if self
             .fail_create_replica
@@ -1040,24 +955,11 @@ impl OblethClient for MockObleth {
             .push((model_id, slurm_job_id.to_string(), port_base));
         Ok(Uuid::new_v4())
     }
-    async fn patch_replica(
-        &self,
-        replica_id: Uuid,
-        state: Option<&str>,
-        nodes: Option<&str>,
-        _endpoint_id: Option<Uuid>,
-        message: Option<&str>,
-    ) -> anyhow::Result<()> {
-        self.patched
+    async fn patch_replica(&self, replica_id: Uuid, patch: &ReplicaPatch) -> anyhow::Result<()> {
+        self.patches
             .lock()
             .unwrap()
-            .push((replica_id, state.map(|s| s.to_string())));
-        self.patches.lock().unwrap().push((
-            replica_id,
-            state.map(str::to_string),
-            nodes.map(str::to_string),
-            message.map(str::to_string),
-        ));
+            .push((replica_id, patch.clone()));
         Ok(())
     }
     async fn delete_replica(&self, replica_id: Uuid) -> anyhow::Result<()> {
@@ -1093,17 +995,6 @@ impl OblethClient for MockObleth {
             anyhow::bail!("simulated delete_endpoint failure");
         }
         self.deleted_endpoints.lock().unwrap().push(endpoint_id);
-        Ok(())
-    }
-    async fn patch_replica_details(
-        &self,
-        replica_id: Uuid,
-        details: &ReplicaDetails,
-    ) -> anyhow::Result<()> {
-        self.details
-            .lock()
-            .unwrap()
-            .push((replica_id, details.clone()));
         Ok(())
     }
     async fn set_managed_backoff(

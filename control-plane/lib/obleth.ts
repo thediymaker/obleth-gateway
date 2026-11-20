@@ -633,8 +633,9 @@ export interface DeploymentLaunch {
   healthy_at: string | null;
   ended_at: string | null;
   // Slurm's terminal state (TIMEOUT, OUT_OF_MEMORY, NODE_FAIL, FAILED, ...),
-  // "gone" when the job vanished from slurmrestd, "cancelled:scale-down" |
-  // "cancelled:restart" | "cancelled:probe-failed" when obleth cancelled it,
+  // "gone" when the job vanished from slurmrestd, "cancelled:<why>" when
+  // obleth cancelled it (scale-down, restart, probe-failed, startup-timeout,
+  // stuck, replaced, removed; plain "cancelled" from an older provisioner),
   // or "deleted" when the replica row was removed while still open.
   end_state: string | null;
   end_reason: string | null;

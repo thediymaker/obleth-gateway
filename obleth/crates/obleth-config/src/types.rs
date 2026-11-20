@@ -1222,7 +1222,8 @@ pub struct DeploymentLaunch {
     pub ended_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Slurm's terminal state (`TIMEOUT`, `OUT_OF_MEMORY`, `NODE_FAIL`,
     /// `FAILED`, ...), `gone` when the job vanished from slurmrestd,
-    /// `cancelled:scale-down|restart|probe-failed` when obleth cancelled it,
+    /// `cancelled:scale-down|restart|probe-failed|startup-timeout|stuck|replaced|removed`
+    /// when obleth cancelled it (`cancelled` alone from an older provisioner),
     /// or `deleted` when the replica row was removed while still open.
     pub end_state: Option<String>,
     pub end_reason: Option<String>,
@@ -1235,7 +1236,9 @@ pub struct DeploymentLaunch {
     pub ran_secs: Option<i64>,
 }
 
-/// Valid `ModelReplica::state` values, in lifecycle order.
+/// Valid `ModelReplica::state` values, in lifecycle order. The provisioner
+/// never writes `starting` (it records a start by reporting nodes); the
+/// value stays valid for API clients and older rows.
 pub const REPLICA_STATES: [&str; 5] = ["pending", "starting", "healthy", "draining", "lost"];
 
 /// A registered MCP (Model Context Protocol) server. obleth fronts it with the

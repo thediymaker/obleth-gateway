@@ -30,8 +30,9 @@ create table if not exists deployment_launches (
     ended_at        timestamptz,
     -- Slurm's terminal state (TIMEOUT, OUT_OF_MEMORY, NODE_FAIL, FAILED,
     -- COMPLETED, CANCELLED, PREEMPTED, ...), `gone` when the job vanished
-    -- from slurmrestd, or `cancelled:scale-down|restart|probe-failed` when
-    -- obleth cancelled it.
+    -- from slurmrestd, or `cancelled:<why>` when obleth cancelled it
+    -- (scale-down, restart, probe-failed, startup-timeout, stuck, replaced,
+    -- removed).
     end_state       text,
     end_reason      text,
     updated_at      timestamptz not null default now()

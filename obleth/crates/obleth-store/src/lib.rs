@@ -2893,11 +2893,12 @@ impl Store {
         id: Uuid,
         state: &str,
         message: Option<&str>,
+        end: LaunchEnd<'_>,
     ) -> Result<ModelReplica> {
         // The launch-history row follows in the same statement: timestamps are
         // stamped once (coalesce) and the first end state recorded wins, so a
         // replica that drains and is later seen gone keeps its cancel reason.
-        let t = launch_transition(state, message);
+        let t = launch_transition(state, message, end);
         let row = sqlx::query(
             "with r as (
                 update model_replicas set state = $2, last_message = $3, updated_at = now()
@@ -4828,12 +4829,33 @@ struct LaunchTransition {
     end_reason: Option<String>,
 }
 
-/// Map a replica state change (and the message the provisioner sent with it)
-/// onto the launch row. `lost` messages come from the provisioner's
-/// `lost_message`: `job ended: STATE (reason)` or `job gone`. `draining`
-/// messages name why obleth cancelled the job (see the provisioner's
-/// `CancelReason`).
-fn launch_transition(state: &str, message: Option<&str>) -> LaunchTransition {
+/// How a replica's job ended, as the provisioner reports it alongside a
+/// `lost` or `draining` state: Slurm's terminal state, `gone`, or
+/// `cancelled:<why>`, and the reason.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LaunchEnd<'a> {
+    pub state: Option<&'a str>,
+    pub reason: Option<&'a str>,
+}
+
+/// Map a replica state change onto the launch row. A provisioner that names
+/// how the job ended (`end`) is taken at its word; without it (an older
+/// provisioner) the end is read from the message: `job ended: STATE
+/// (reason)` or `job gone` for `lost`, the cancel reason for `draining`.
+fn launch_transition(state: &str, message: Option<&str>, end: LaunchEnd<'_>) -> LaunchTransition {
+    let mut t = launch_transition_from_message(state, message);
+    if let (true, Some(end_state)) = (t.ended, end.state.map(str::trim).filter(|s| !s.is_empty())) {
+        t.end_state = Some(end_state.to_string());
+        t.end_reason = end
+            .reason
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .map(str::to_string);
+    }
+    t
+}
+
+fn launch_transition_from_message(state: &str, message: Option<&str>) -> LaunchTransition {
     let msg = message.map(str::trim).filter(|m| !m.is_empty());
     match state {
         "starting" => LaunchTransition {
@@ -4880,6 +4902,12 @@ fn launch_transition(state: &str, message: Option<&str>) -> LaunchTransition {
                 Some(m) if m.starts_with("restarting: failed health probes") => {
                     "cancelled:probe-failed"
                 }
+                Some("cancelled: server did not become healthy in time") => {
+                    "cancelled:startup-timeout"
+                }
+                Some("cancelled: job could not start") => "cancelled:stuck",
+                Some("replaced: a successor is serving") => "cancelled:replaced",
+                Some("stopping: deployment paused or removed") => "cancelled:removed",
                 _ => "cancelled",
             };
             LaunchTransition {
@@ -7561,7 +7589,7 @@ mod tests {
         );
 
         let promoted = store
-            .update_replica_state(r.id, "starting", Some("node alloc"))
+            .update_replica_state(r.id, "starting", Some("node alloc"), LaunchEnd::default())
             .await
             .expect("update state");
         assert_eq!(promoted.state, "starting");
@@ -7762,7 +7790,7 @@ mod tests {
 
         // Mark one as lost.
         store
-            .update_replica_state(r1.id, "lost", Some("node gone"))
+            .update_replica_state(r1.id, "lost", Some("node gone"), LaunchEnd::default())
             .await
             .expect("mark lost");
 
@@ -7784,16 +7812,16 @@ mod tests {
     #[test]
     fn launch_transition_maps_states_and_messages() {
         assert_eq!(
-            launch_transition("pending", None),
+            launch_transition("pending", None, LaunchEnd::default()),
             LaunchTransition::default()
         );
-        let s = launch_transition("starting", Some("node alloc"));
+        let s = launch_transition("starting", Some("node alloc"), LaunchEnd::default());
         assert!(s.started && !s.healthy && !s.ended);
-        let h = launch_transition("healthy", Some("promoted"));
+        let h = launch_transition("healthy", Some("promoted"), LaunchEnd::default());
         assert!(h.started && h.healthy && !h.ended && h.end_state.is_none());
 
         let lost = |m: Option<&str>| {
-            let t = launch_transition("lost", m);
+            let t = launch_transition("lost", m, LaunchEnd::default());
             assert!(t.ended);
             (t.end_state, t.end_reason)
         };
@@ -7812,7 +7840,8 @@ mod tests {
         );
         assert_eq!(lost(None), (Some("lost".into()), None));
 
-        let drained = |m: &str| launch_transition("draining", Some(m)).end_state;
+        let drained =
+            |m: &str| launch_transition("draining", Some(m), LaunchEnd::default()).end_state;
         assert_eq!(
             drained("scaled down").as_deref(),
             Some("cancelled:scale-down")
@@ -7826,7 +7855,48 @@ mod tests {
             Some("cancelled:probe-failed")
         );
         assert_eq!(drained("by hand").as_deref(), Some("cancelled"));
-        assert!(launch_transition("draining", Some("scaled down")).ended);
+        assert_eq!(
+            drained("cancelled: server did not become healthy in time").as_deref(),
+            Some("cancelled:startup-timeout")
+        );
+        assert_eq!(
+            drained("cancelled: job could not start").as_deref(),
+            Some("cancelled:stuck")
+        );
+
+        // A named end wins over the message, for lost and draining alike, and
+        // means nothing for a state that does not end the launch.
+        let named = |state: &str, m: &str, end: &str, reason: Option<&str>| {
+            let t = launch_transition(
+                state,
+                Some(m),
+                LaunchEnd {
+                    state: Some(end),
+                    reason,
+                },
+            );
+            (t.end_state, t.end_reason)
+        };
+        assert_eq!(
+            named(
+                "lost",
+                "job ended: TIMEOUT (Time (limit))",
+                "TIMEOUT",
+                Some("Time (limit)")
+            ),
+            (Some("TIMEOUT".into()), Some("Time (limit)".into()))
+        );
+        assert_eq!(
+            named("draining", "reworded", "cancelled:stuck", Some("reworded")),
+            (Some("cancelled:stuck".into()), Some("reworded".into()))
+        );
+        assert_eq!(named("healthy", "promoted", "x", None), (None, None));
+        assert_eq!(
+            named("lost", "job gone", " ", None),
+            (Some("gone".into()), None),
+            "a blank end falls back to the message"
+        );
+        assert!(launch_transition("draining", Some("scaled down"), LaunchEnd::default()).ended);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -7920,27 +7990,41 @@ mod tests {
             .await
             .expect("runtime again");
         store
-            .update_replica_state(r1.id, "healthy", Some("promoted"))
+            .update_replica_state(r1.id, "healthy", Some("promoted"), LaunchEnd::default())
             .await
             .expect("healthy");
         store
-            .update_replica_state(r1.id, "lost", Some("job ended: TIMEOUT (TimeLimit)"))
+            .update_replica_state(
+                r1.id,
+                "lost",
+                Some("job ended: TIMEOUT (TimeLimit)"),
+                LaunchEnd::default(),
+            )
             .await
             .expect("lost");
         // Later messages must not overwrite the first recorded end.
         store
-            .update_replica_state(r1.id, "lost", Some("job gone"))
+            .update_replica_state(r1.id, "lost", Some("job gone"), LaunchEnd::default())
             .await
             .expect("lost again");
 
-        // A second launch, cancelled by a scale-down, then GC'd.
+        // A second launch, cancelled for a startup timeout, then GC'd. The
+        // end comes as fields; the message is not read for it.
         let r2 = store
             .create_replica(model.id, "job-launch-2", Some(8008))
             .await
             .expect("create r2");
         fixtures.track_replica(r2.id);
         store
-            .update_replica_state(r2.id, "draining", Some("scaled down"))
+            .update_replica_state(
+                r2.id,
+                "draining",
+                Some("worded any way at all"),
+                LaunchEnd {
+                    state: Some("cancelled:startup-timeout"),
+                    reason: Some("not healthy within 60 minutes"),
+                },
+            )
             .await
             .expect("drain");
         store.delete_replica(r2.id).await.expect("delete r2");
@@ -7958,7 +8042,14 @@ mod tests {
         assert_eq!(launches.len(), 2);
         let (second, first) = (&launches[0], &launches[1]);
         assert_eq!(second.id, r2.id);
-        assert_eq!(second.end_state.as_deref(), Some("cancelled:scale-down"));
+        assert_eq!(
+            second.end_state.as_deref(),
+            Some("cancelled:startup-timeout")
+        );
+        assert_eq!(
+            second.end_reason.as_deref(),
+            Some("not healthy within 60 minutes")
+        );
         assert!(second.ended_at.is_some());
         assert!(second.started_at.is_none() && second.ran_secs.is_none());
 

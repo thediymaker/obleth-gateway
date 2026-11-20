@@ -48,6 +48,11 @@ export interface Learned {
 
 const DAY = 86_400_000;
 
+/** End states of a launch that never got going: a failed or vanished job, a
+ * boot failure, or one obleth cancelled for not starting or not becoming
+ * healthy. Counted against a node only when the launch never served. */
+const BAD_START_END_STATES = ["FAILED", "gone", "BOOT_FAIL", "cancelled:startup-timeout", "cancelled:stuck"];
+
 function median(xs: number[]): number | null {
   if (!xs.length) return null;
   const s = [...xs].sort((a, b) => a - b);
@@ -124,7 +129,7 @@ export function learnFrom(all: LaunchRecord[], form: DeployForm, opts: { now?: n
     if (!n || !l.end_state) continue;
     const e = byNode.get(n) ?? { bad: 0, total: 0 };
     e.total += 1;
-    if (l.end_state === "NODE_FAIL" || (!l.healthy_at && ["FAILED", "gone", "BOOT_FAIL"].includes(l.end_state))) e.bad += 1;
+    if (l.end_state === "NODE_FAIL" || (!l.healthy_at && BAD_START_END_STATES.includes(l.end_state))) e.bad += 1;
     byNode.set(n, e);
   }
   const excluded = new Set(form.slurm.exclude.split(",").map((x) => x.trim()).filter(Boolean));

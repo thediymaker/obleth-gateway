@@ -1677,6 +1677,13 @@ pub(crate) struct PatchReplica {
     /// Set or clear the surge-first replacement flag.
     #[serde(default)]
     replace_requested: Option<bool>,
+    /// How the job ended, for the launch history, sent with a `lost` or
+    /// `draining` state: Slurm's terminal state, `gone`, or
+    /// `cancelled:<why>`. Without it the end is read from `message`.
+    #[serde(default)]
+    end_state: Option<String>,
+    #[serde(default)]
+    end_reason: Option<String>,
 }
 
 impl PatchReplica {
@@ -9828,7 +9835,15 @@ async fn patch_replica(
     if let Some(state_val) = body.state.as_deref() {
         state
             .store
-            .update_replica_state(id, state_val, body.message.as_deref())
+            .update_replica_state(
+                id,
+                state_val,
+                body.message.as_deref(),
+                obleth_store::LaunchEnd {
+                    state: body.end_state.as_deref(),
+                    reason: body.end_reason.as_deref(),
+                },
+            )
             .await?;
     } else if let Some(msg) = body.message.as_deref() {
         state.store.set_replica_message(id, msg).await?;

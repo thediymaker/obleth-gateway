@@ -14,8 +14,8 @@ pub(crate) use obleth_provisioner::{domain, slurm};
 
 use chrono::{DateTime, Utc};
 use config::ProvisionerConfig;
-use domain::{Action, JobInfo, JobState, ReplicaView};
-use obleth_client::{HttpObleth, ModelIdentity, OblethClient, TickReport};
+use domain::{Action, JobInfo, JobState, ReplicaState, ReplicaView};
+use obleth_client::{HttpObleth, ModelIdentity, OblethClient, ReplicaPatch, TickReport};
 use obleth_config::{ManagedBackoff, ManagedModelSpec};
 use obleth_provisioner::slurm::{SlurmClient, SlurmErrorKind, Slurmrestd};
 use std::collections::{HashMap, HashSet};
@@ -273,12 +273,7 @@ fn vanished_fleet(
 ) -> Option<Vec<String>> {
     let live: HashSet<&str> = replicas
         .iter()
-        .filter(|r| {
-            r.state != "lost"
-                && r.state != "draining"
-                && !r.cancel_requested
-                && !r.slurm_job_id.is_empty()
-        })
+        .filter(|r| r.state.is_live() && !r.cancel_requested && !r.slurm_job_id.is_empty())
         .map(|r| r.slurm_job_id.as_str())
         .collect();
     let mut ids: Vec<String> = live.iter().map(|s| s.to_string()).collect();
@@ -351,7 +346,7 @@ async fn tick(
     mem.probe_failures.retain(|id, _| {
         all_replicas
             .iter()
-            .any(|r| r.id == *id && r.state == "healthy")
+            .any(|r| r.id == *id && r.state == ReplicaState::Healthy)
     });
     mem.waiting_since
         .retain(|id, _| all_replicas.iter().any(|r| r.id == *id));
@@ -366,7 +361,7 @@ async fn tick(
     // error on a long-gone job must not hold every model's tick.
     for id in all_replicas
         .iter()
-        .filter(|r| r.state != "lost")
+        .filter(|r| r.state != ReplicaState::Lost)
         .map(|r| &r.slurm_job_id)
     {
         if id.is_empty() || jobs.contains_key(id) {
@@ -442,7 +437,10 @@ async fn tick(
     // ones get the planner's MarkLost message) and only when the message changed,
     // so we don't write every tick. Draining rows are left alone: their last
     // update marks when the drain started.
-    for r in all_replicas.iter().filter(|r| r.state != "draining") {
+    for r in all_replicas
+        .iter()
+        .filter(|r| r.state != ReplicaState::Draining)
+    {
         if let Some(job) = jobs.get(&r.slurm_job_id) {
             if matches!(job.state, JobState::Pending | JobState::Running) {
                 let msg = slurm::job_status_message(&job.raw_state, job.reason.as_deref());
@@ -453,10 +451,12 @@ async fn tick(
                     // launch history.
                     let nodes = (job.state == JobState::Running && !job.nodes.is_empty())
                         .then(|| job.nodes.join(","));
-                    if let Err(e) = obleth
-                        .patch_replica(r.id, None, nodes.as_deref(), None, Some(&msg))
-                        .await
-                    {
+                    let patch = ReplicaPatch {
+                        message: Some(msg),
+                        nodes,
+                        ..Default::default()
+                    };
+                    if let Err(e) = obleth.patch_replica(r.id, &patch).await {
                         tracing::warn!(replica_id = %r.id, error = %e, "failed to annotate replica status");
                     }
                 }
@@ -476,13 +476,13 @@ async fn tick(
     // taken until the job is found or given up on.
     let mut live_bases: Vec<i64> = all_replicas
         .iter()
-        .filter(|r| r.state != "lost")
+        .filter(|r| r.state != ReplicaState::Lost)
         .map(|r| r.port_base)
         .chain(mem.uncertain.values().flatten().map(|u| u.port_base))
         .collect();
     let mut tracked: HashSet<String> = all_replicas
         .iter()
-        .filter(|r| r.state != "lost")
+        .filter(|r| r.state != ReplicaState::Lost)
         .map(|r| r.slurm_job_id.clone())
         .collect();
 
@@ -694,7 +694,7 @@ async fn tick(
                         // A launch served (not a relink of a serving replica).
                         if w.replicas
                             .iter()
-                            .any(|r| r.id == *replica_id && r.state != "healthy")
+                            .any(|r| r.id == *replica_id && r.state != ReplicaState::Healthy)
                         {
                             outcome.served = true;
                         }
@@ -714,7 +714,7 @@ async fn tick(
         // snapshot (fetch succeeded above).
         if let Some(eps) = &endpoints {
             for r in &w.replicas {
-                if r.state != "healthy" {
+                if r.state != ReplicaState::Healthy {
                     continue;
                 }
                 let Some(ep_id) = r.endpoint_id else { continue };
@@ -820,11 +820,11 @@ fn waited_secs(
 ) -> HashMap<Uuid, i64> {
     let mut out = HashMap::new();
     for r in replicas {
-        let waiting = match r.state.as_str() {
-            "healthy" => {
+        let waiting = match r.state {
+            ReplicaState::Healthy => {
                 r.replace_requested || heal.dead.contains(&r.id) || heal.zombie.contains(&r.id)
             }
-            "pending" | "starting" => jobs
+            ReplicaState::Pending => jobs
                 .get(&r.slurm_job_id)
                 .is_some_and(|j| plan::stuck_reason(j).is_some()),
             _ => false,
@@ -894,7 +894,7 @@ async fn adopt_lost_submits(
         };
         let log_path = format!("{}-{}.out", u.log_prefix, found_job.job_id);
         match obleth
-            .create_replica_with_log(
+            .create_replica(
                 spec.model_id,
                 &found_job.job_id,
                 u.port_base,
@@ -915,7 +915,7 @@ async fn adopt_lost_submits(
                     id,
                     model_id: spec.model_id,
                     slurm_job_id: found_job.job_id.clone(),
-                    state: "pending".into(),
+                    state: ReplicaState::Pending,
                     port_base: u.port_base,
                     log_path: Some(log_path),
                     ..Default::default()
@@ -962,7 +962,7 @@ async fn probe_model(
     let mut notes = HashMap::new();
     let expected = identity.served_names();
     for r in replicas {
-        if !matches!(r.state.as_str(), "pending" | "starting" | "healthy") {
+        if !r.state.is_live() {
             continue;
         }
         let Some(job) = jobs
@@ -1223,7 +1223,7 @@ mod tests {
             id: uuid::Uuid::new_v4(),
             model_id: uuid::Uuid::new_v4(),
             slurm_job_id: job.into(),
-            state: state.into(),
+            state: ReplicaState::parse(state).expect("a replica state"),
             age_secs: 60,
             updated_secs: 60,
             port_base: 8000,
@@ -1273,7 +1273,7 @@ mod tests {
     fn nothing_destructive(slurm: &FakeSlurm, obleth: &MockObleth) {
         assert!(slurm.cancelled.lock().unwrap().is_empty(), "no scancel");
         assert!(slurm.submitted.lock().unwrap().is_empty(), "no submit");
-        assert!(obleth.patched.lock().unwrap().is_empty(), "no state change");
+        assert!(obleth.state_changes().is_empty(), "no state change");
         assert!(
             obleth.deleted_replicas.lock().unwrap().is_empty(),
             "no delete"
@@ -1337,11 +1337,9 @@ mod tests {
         let warnings = run_tick(&slurm, &obleth).await.unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
         let lost = obleth
-            .patched
-            .lock()
-            .unwrap()
+            .state_changes()
             .iter()
-            .filter(|(_, s)| s.as_deref() == Some("lost"))
+            .filter(|(_, s)| *s == ReplicaState::Lost)
             .count();
         assert_eq!(lost, 2);
     }
@@ -1358,11 +1356,9 @@ mod tests {
         slurm.jobs.insert("2".into(), pending_job("2"));
         run_tick(&slurm, &obleth).await.unwrap();
         assert!(obleth
-            .patched
-            .lock()
-            .unwrap()
+            .state_changes()
             .iter()
-            .any(|(i, s)| *i == id && s.as_deref() == Some("lost")));
+            .any(|(i, s)| *i == id && *s == ReplicaState::Lost));
     }
 
     #[tokio::test]
@@ -1374,11 +1370,11 @@ mod tests {
         let gone_id = gone.id;
         *obleth.replicas.lock().unwrap() = vec![gone, replica("2", "pending")];
         run_tick(&slurm, &obleth).await.unwrap();
-        let patched = obleth.patched.lock().unwrap();
+        let patched = obleth.state_changes();
         assert!(
             patched
                 .iter()
-                .any(|(id, s)| *id == gone_id && s.as_deref() == Some("lost")),
+                .any(|(id, s)| *id == gone_id && *s == ReplicaState::Lost),
             "the vanished job's replica is marked lost: {patched:?}"
         );
     }
@@ -1410,11 +1406,9 @@ mod tests {
         *obleth.replicas.lock().unwrap() = vec![r];
         run_tick(&slurm, &obleth).await.unwrap();
         assert!(obleth
-            .patched
-            .lock()
-            .unwrap()
+            .state_changes()
             .iter()
-            .any(|(i, s)| *i == id && s.as_deref() == Some("lost")));
+            .any(|(i, s)| *i == id && *s == ReplicaState::Lost));
     }
 
     #[tokio::test]
@@ -1478,11 +1472,9 @@ mod tests {
         );
         // The replica is out of service and draining, so the cancel is retried.
         assert!(obleth
-            .patched
-            .lock()
-            .unwrap()
+            .state_changes()
             .iter()
-            .any(|(_, s)| s.as_deref() == Some("draining")));
+            .any(|(_, s)| *s == ReplicaState::Draining));
     }
 
     #[tokio::test]
