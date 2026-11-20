@@ -11309,6 +11309,7 @@ mod tests {
             &t.store,
             &reqwest::Client::new(),
             &doc,
+            "hello world",
             &obleth_config::BoonSettings::default().knowledge,
         )
         .await

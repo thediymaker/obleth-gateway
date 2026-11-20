@@ -210,7 +210,6 @@ pub struct KnowledgeDocument {
     pub title: String,
     pub filename: String,
     pub content_type: String,
-    pub content: String,
     pub byte_size: i64,
     pub status: String,
     pub error: Option<String>,
@@ -248,7 +247,12 @@ pub struct KnowledgeChunk {
     pub embedding: Vec<f32>,
 }
 
-const DOC_COLS: &str = "id, collection_id, title, filename, content_type, content, \
+/// Chunks per insert statement when a document's generation is committed.
+const CHUNK_INSERT_ROWS: usize = 500;
+
+/// A document's columns without its body: only the indexer reads the body, and
+/// takes it from `claim_pending_document`.
+const DOC_COLS: &str = "id, collection_id, title, filename, content_type, \
     byte_size, status, error, chunk_count, active_generation, indexed_embedding_model, \
     indexing_started_at, reindex_requested";
 
@@ -259,7 +263,6 @@ fn row_to_document(row: &sqlx::postgres::PgRow) -> KnowledgeDocument {
         title: row.get("title"),
         filename: row.get("filename"),
         content_type: row.get("content_type"),
-        content: row.get("content"),
         byte_size: row.get("byte_size"),
         status: row.get("status"),
         error: row.get("error"),
@@ -394,10 +397,11 @@ impl Store {
     /// with the same rows the other worker already committed. The loser's
     /// document is picked up again by a later claim, not by retrying this
     /// commit.
+    /// Returns the document with its body, the one read that loads it.
     pub async fn claim_pending_document(
         &self,
         stale_after_secs: i64,
-    ) -> Result<Option<KnowledgeDocument>> {
+    ) -> Result<Option<(KnowledgeDocument, String)>> {
         let row = sqlx::query(&format!(
             "update knowledge_documents
                 set status = 'indexing', indexing_started_at = now()
@@ -413,12 +417,12 @@ impl Store {
                    order by created_at
                    for update skip locked
                    limit 1
-              ) returning {DOC_COLS}"
+              ) returning {DOC_COLS}, content"
         ))
         .bind(stale_after_secs)
         .fetch_optional(self.pool())
         .await?;
-        Ok(row.as_ref().map(row_to_document))
+        Ok(row.map(|r| (row_to_document(&r), r.get("content"))))
     }
 
     /// Also clears `reindex_requested`: a queued reindex is only ever
@@ -556,22 +560,32 @@ impl Store {
             .bind(generation)
             .execute(&mut *tx)
             .await?;
-        for c in chunks {
+        // Chunks go in CHUNK_INSERT_ROWS at a time, one statement each.
+        for part in chunks.chunks(CHUNK_INSERT_ROWS) {
+            let ids: Vec<Uuid> = part.iter().map(|_| Uuid::new_v4()).collect();
+            let ordinals: Vec<i32> = part.iter().map(|c| c.ordinal).collect();
+            let texts: Vec<&str> = part.iter().map(|c| c.text.as_str()).collect();
+            let tokens: Vec<i32> = part.iter().map(|c| c.token_count).collect();
+            let vectors: Vec<Vec<u8>> = part.iter().map(|c| encode_vector(&c.embedding)).collect();
+            let dims: Vec<i32> = part.iter().map(|c| c.embedding.len() as i32).collect();
             sqlx::query(
                 "insert into knowledge_chunks
                      (id, document_id, collection_id, generation, ordinal, text,
                       token_count, embedding, embedding_dim)
-                 values ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                 select c.id, $2, $3, $4, c.ordinal, c.text, c.token_count, c.embedding, c.dim
+                   from unnest($1::uuid[], $5::int[], $6::text[], $7::int[], $8::bytea[],
+                               $9::int[])
+                        as c(id, ordinal, text, token_count, embedding, dim)",
             )
-            .bind(Uuid::new_v4())
+            .bind(&ids)
             .bind(document_id)
             .bind(collection_id)
             .bind(generation)
-            .bind(c.ordinal)
-            .bind(&c.text)
-            .bind(c.token_count)
-            .bind(encode_vector(&c.embedding))
-            .bind(c.embedding.len() as i32)
+            .bind(&ordinals)
+            .bind(&texts)
+            .bind(&tokens)
+            .bind(&vectors)
+            .bind(&dims)
             .execute(&mut *tx)
             .await
             .map_err(|e| {
@@ -1277,6 +1291,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_large_document_commits_every_chunk_in_order() {
+        let Some((store, _serial)) = test_store().await else {
+            return;
+        };
+        let c = store
+            .create_collection(&format!("large-{}", uuid::Uuid::new_v4()), "", "embed-a")
+            .await
+            .expect("collection");
+        let d = store
+            .upsert_document(c.id, "Large", "large.md", "text/markdown", "a large body")
+            .await
+            .expect("doc");
+        // More than several insert statements' worth.
+        let chunks: Vec<super::ChunkInsert> = (0..6_000)
+            .map(|i| super::ChunkInsert {
+                ordinal: i,
+                text: format!("chunk {i}"),
+                token_count: 2,
+                embedding: vec![i as f32, 1.0],
+            })
+            .collect();
+        mark_indexing(&store, d.id).await;
+        store
+            .commit_document_generation(c.id, d.id, 1, "embed-a", 2, &chunks)
+            .await
+            .expect("commit");
+        let loaded = store.load_active_chunks(c.id).await.expect("load");
+        assert_eq!(loaded.len(), 6_000);
+        assert_eq!(loaded[5_999].text, "chunk 5999");
+        assert_eq!(loaded[5_999].embedding, vec![5_999.0, 1.0]);
+        // A retry of the same generation replaces what it wrote.
+        mark_indexing(&store, d.id).await;
+        let again = store
+            .commit_document_generation(c.id, d.id, 1, "embed-a", 2, &chunks[..1])
+            .await;
+        assert!(
+            again.is_ok(),
+            "a retry of the same generation replaces its own rows"
+        );
+        store.delete_collection(c.id).await.ok();
+    }
+
+    #[tokio::test]
     async fn indexing_a_second_document_preserves_the_first() {
         let Some((store, _serial)) = test_store().await else {
             return;
@@ -1609,7 +1666,9 @@ mod tests {
         // Oldest first: this must be `first`, and it becomes `indexing` with a
         // fresh `indexing_started_at`.
         let claimed = store.claim_pending_document(1_800).await.expect("claim");
-        assert_eq!(claimed.expect("claimed").id, first.id);
+        let (claimed, body) = claimed.expect("claimed");
+        assert_eq!(claimed.id, first.id);
+        assert!(!body.is_empty(), "the claim carries the document's body");
 
         // A FRESH claim must not be stealable. With a long window `first` is
         // excluded by its recent stamp, so the next-oldest of our own rows
@@ -1617,7 +1676,7 @@ mod tests {
         // anyone else's document.
         let next = store.claim_pending_document(1_800).await.expect("claim");
         assert_eq!(
-            next.expect("second").id,
+            next.expect("second").0.id,
             second.id,
             "a freshly claimed document must not be reclaimable"
         );
@@ -1628,7 +1687,7 @@ mod tests {
         // lost, and reclaim order is not ambiguous between our own two rows.
         let reclaimed = store.claim_pending_document(0).await.expect("reclaim");
         assert_eq!(
-            reclaimed.expect("reclaimed").id,
+            reclaimed.expect("reclaimed").0.id,
             first.id,
             "a stranded indexing row must be reclaimable on timeout"
         );

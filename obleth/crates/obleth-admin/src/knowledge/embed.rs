@@ -69,7 +69,7 @@ pub fn normalize(v: &mut [f32]) {
 pub async fn embed_batch(
     client: &reqwest::Client,
     target: &EmbedTarget,
-    inputs: &[String],
+    inputs: &[&str],
     timeout: Duration,
 ) -> Result<Vec<Vec<f32>>> {
     if inputs.is_empty() {
@@ -113,7 +113,7 @@ pub async fn embed_batch(
 pub async fn embed_in_batches(
     client: &reqwest::Client,
     target: &EmbedTarget,
-    inputs: &[String],
+    inputs: &[&str],
     batch_size: usize,
     timeout: Duration,
 ) -> Result<Vec<Vec<f32>>> {
@@ -298,7 +298,7 @@ mod tests {
         let vectors = embed_in_batches(
             &reqwest::Client::new(),
             &target,
-            &numbered(40),
+            &numbered(40).iter().map(String::as_str).collect::<Vec<_>>(),
             32,
             Duration::from_secs(5),
         )
@@ -322,7 +322,7 @@ mod tests {
         let err = embed_in_batches(
             &reqwest::Client::new(),
             &target,
-            &numbered(8),
+            &numbered(8).iter().map(String::as_str).collect::<Vec<_>>(),
             8,
             Duration::from_secs(5),
         )
@@ -338,7 +338,7 @@ mod tests {
         let err = embed_in_batches(
             &reqwest::Client::new(),
             &target,
-            &numbered(4),
+            &numbered(4).iter().map(String::as_str).collect::<Vec<_>>(),
             4,
             Duration::from_secs(5),
         )

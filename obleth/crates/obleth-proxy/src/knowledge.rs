@@ -292,11 +292,10 @@ pub async fn embed_query(
             return None;
         }
     };
-    let inputs = [query.to_string()];
     let vector = obleth_admin::knowledge::embed::embed_batch(
         &state.http,
         &target,
-        &inputs,
+        &[query],
         Duration::from_millis(settings.embed_timeout_ms),
     )
     .await
@@ -599,7 +598,7 @@ mod tests {
         let vectors = obleth_admin::knowledge::embed::embed_batch(
             &reqwest::Client::new(),
             &target,
-            &["query".to_string()],
+            &["query"],
             Duration::from_secs(5),
         )
         .await

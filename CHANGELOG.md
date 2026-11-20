@@ -6,6 +6,7 @@ workflow falls back to auto-generated notes.
 
 ## Unreleased
 
+- **Indexing writes a document's chunks 500 at a time, and an upload is held in memory once.** Committing a document wrote its chunks one statement each inside the transaction, 6,000 round trips for a large document; they now go in as one statement per 500. An upload kept the base64 text, the decoded bytes and a copy of them as text at once; the text now takes over the decoded bytes and the base64 is dropped after decoding. Document reads no longer load the body: listing, uploading and reindexing returned every document's full text to code that never read it, and only the indexer's claim reads it now. Chunk texts are lent to the embedding requests instead of copied.
 - **A batch claim reads only the items it takes, and one replica moves batches on per tick.** Claiming a batch's next items used an index ordered by retry time before line, so each claim read and sorted every due pending item of the batch; on a 50,000-line batch that was the whole batch, every few seconds, per runner. Postgres migration `0047` indexes pending items by batch and line, so a claim reads the 64 rows it takes, and drops the old index. Every replica also recounted every item of every active batch every 3 seconds; the tick now runs on one replica at a time, under an advisory lock, and recounts only batches with an item finished since their last progress (found through a second new index).
 
 ## v2.13.0

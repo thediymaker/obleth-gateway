@@ -30,14 +30,15 @@ pub const UPLOAD_BODY_LIMIT_BYTES: usize =
 /// Reject an upload before decoding, then require valid UTF-8. Binary formats
 /// are a later addition; today an undecodable file is a clear error rather
 /// than a corpus full of mojibake.
-pub fn validate_upload(bytes: &[u8], max_bytes: i64) -> std::result::Result<String, String> {
+/// Takes the decoded bytes, so valid text becomes the `String` without a copy.
+pub fn validate_upload(bytes: Vec<u8>, max_bytes: i64) -> std::result::Result<String, String> {
     if bytes.len() as i64 > max_bytes {
         return Err(format!(
             "file too large: {} bytes exceeds the {max_bytes}-byte limit",
             bytes.len()
         ));
     }
-    String::from_utf8(bytes.to_vec())
+    String::from_utf8(bytes)
         .map_err(|_| "file is not valid UTF-8 text; only .md, .txt and .csv are supported".into())
 }
 
@@ -371,7 +372,12 @@ pub async fn upload_document(
     headers: HeaderMap,
     Json(body): Json<UploadDocument>,
 ) -> Result<Json<DocumentView>> {
-    let title = body.title.trim();
+    let UploadDocument {
+        title,
+        filename,
+        content_base64,
+    } = body;
+    let title = title.trim();
     if title.is_empty() {
         return Err(AdminError::BadRequest("title is required".into()));
     }
@@ -394,7 +400,7 @@ pub async fn upload_document(
     // without ever allocating the full decoded buffer. The post-decode check
     // in `validate_upload` below remains authoritative (it accounts for the
     // ~33% inflation exactly); this is a cheap early-out, not a replacement.
-    let estimated_decoded_bytes = (body.content_base64.len() as i64 / 4) * 3;
+    let estimated_decoded_bytes = (content_base64.len() as i64 / 4) * 3;
     if estimated_decoded_bytes > max_bytes {
         return Err(AdminError::BadRequest(format!(
             "file too large: an estimated {estimated_decoded_bytes} bytes exceeds the {max_bytes}-byte limit"
@@ -402,19 +408,15 @@ pub async fn upload_document(
     }
 
     let bytes = base64::engine::general_purpose::STANDARD
-        .decode(&body.content_base64)
+        .decode(&content_base64)
         .map_err(|_| AdminError::BadRequest("content_base64 is not valid base64".into()))?;
-    let text = validate_upload(&bytes, max_bytes).map_err(AdminError::BadRequest)?;
+    // The encoded text is no longer needed; don't hold it beside the body.
+    drop(content_base64);
+    let text = validate_upload(bytes, max_bytes).map_err(AdminError::BadRequest)?;
 
     let doc = state
         .store
-        .upsert_document(
-            id,
-            title,
-            &body.filename,
-            content_type_for(&body.filename),
-            &text,
-        )
+        .upsert_document(id, title, &filename, content_type_for(&filename), &text)
         .await?;
     // Usually lands as `pending`; the background indexer picks it up within a
     // few seconds. The one exception is a re-upload of a document that is
@@ -605,11 +607,10 @@ pub async fn search_collection(
     // embedding -- not `index_timeout_ms`, which is the (looser) background
     // indexing timeout. This preview issues the same kind of call the
     // proxy's retrieval path will make later, not an indexing call.
-    let query_owned = query.to_string();
     let query_vec = embed::embed_batch(
         &state.health.http,
         &target,
-        std::slice::from_ref(&query_owned),
+        &[query],
         std::time::Duration::from_millis(settings.embed_timeout_ms),
     )
     .await
@@ -949,19 +950,19 @@ mod tests {
     fn upload_rejects_oversized_files_before_decoding() {
         // Checking the cap before UTF-8 decoding keeps a hostile upload from
         // costing a full-size allocation.
-        let err = validate_upload(&vec![0u8; 2048], 1024).expect_err("too big");
+        let err = validate_upload(vec![0u8; 2048], 1024).expect_err("too big");
         assert!(err.contains("too large"));
     }
 
     #[test]
     fn upload_rejects_non_utf8() {
         let bytes = vec![0xff, 0xfe, 0xfd];
-        assert!(validate_upload(&bytes, 1024).is_err());
+        assert!(validate_upload(bytes, 1024).is_err());
     }
 
     #[test]
     fn upload_accepts_utf8_within_the_cap() {
-        let text = validate_upload("policy text".as_bytes(), 1024).expect("ok");
+        let text = validate_upload(b"policy text".to_vec(), 1024).expect("ok");
         assert_eq!(text, "policy text");
     }
 

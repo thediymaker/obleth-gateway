@@ -49,11 +49,13 @@ pub fn check_chunk_cap(existing: i64, incoming: usize, cap: i64) -> Result<()> {
     Ok(())
 }
 
-/// Chunk, embed, and store one document as its own next generation.
+/// Chunk, embed, and store one document (`content` is its body) as its own next
+/// generation.
 pub async fn index_document(
     store: &Store,
     client: &reqwest::Client,
     doc: &KnowledgeDocument,
+    content: &str,
     settings: &KnowledgeBoonSettings,
 ) -> Result<()> {
     let collection = store.get_collection(doc.collection_id).await?;
@@ -87,7 +89,7 @@ pub async fn index_document(
 
     let tk = HeuristicTokenizer::new();
     let chunks = chunk_text(
-        &doc.content,
+        content,
         &doc.content_type,
         collection.chunk_tokens as u32,
         collection.chunk_overlap_tokens as u32,
@@ -108,7 +110,7 @@ pub async fn index_document(
     let target = resolve_target(store, &model).await?;
     let timeout = Duration::from_millis(settings.index_timeout_ms.max(1_000));
 
-    let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
+    let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
     let vectors = embed_in_batches(
         client,
         &target,
@@ -189,9 +191,11 @@ pub fn spawn_indexer(store: Store, client: reqwest::Client) {
                 .claim_pending_document(knowledge.index_stale_after_secs)
                 .await
             {
-                Ok(Some(doc)) => {
+                Ok(Some((doc, content))) => {
                     let id = doc.id;
-                    if let Err(e) = index_document(&store, &client, &doc, &knowledge).await {
+                    if let Err(e) =
+                        index_document(&store, &client, &doc, &content, &knowledge).await
+                    {
                         tracing::warn!(document = %id, error = %e, "knowledge indexing failed");
                         let _ = store.mark_document_failed(id, &e.to_string()).await;
                     }
