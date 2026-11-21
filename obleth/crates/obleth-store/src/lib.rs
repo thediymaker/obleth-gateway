@@ -3730,160 +3730,119 @@ impl Store {
             .collect()
     }
 
-    /// Load the persisted alert settings, or `None` if none have been saved.
-    pub async fn get_alert_settings(&self) -> Result<Option<obleth_config::AlertSettings>> {
-        let row = sqlx::query("select value from app_settings where key = 'alerts'")
-            .fetch_optional(&self.pool)
-            .await?;
-        match row {
-            Some(row) => {
-                let value: sqlx::types::Json<obleth_config::AlertSettings> =
-                    row.try_get("value")?;
-                Ok(Some(value.0))
-            }
-            None => Ok(None),
-        }
+    /// One `app_settings` row decoded as `T`, or `None` when it is unset.
+    async fn get_setting<T>(&self, key: &str) -> Result<Option<T>>
+    where
+        T: serde::de::DeserializeOwned + Send + Unpin + 'static,
+    {
+        let value: Option<sqlx::types::Json<T>> =
+            sqlx::query_scalar("select value from app_settings where key = $1")
+                .bind(key)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(value.map(|v| v.0))
     }
 
-    /// Persist the alert settings (upsert on the single `alerts` key).
-    pub async fn put_alert_settings(&self, settings: &obleth_config::AlertSettings) -> Result<()> {
+    /// Write one `app_settings` row (upsert on `key`).
+    async fn put_setting<T: serde::Serialize + Sync>(&self, key: &str, value: &T) -> Result<()> {
         sqlx::query(
             "insert into app_settings (key, value, updated_at)
-             values ('alerts', $1, now())
+             values ($1, $2, now())
              on conflict (key) do update set value = excluded.value, updated_at = now()",
         )
-        .bind(sqlx::types::Json(settings))
+        .bind(key)
+        .bind(sqlx::types::Json(value))
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// Load the persisted alert settings, or `None` if none have been saved.
+    pub async fn get_alert_settings(&self) -> Result<Option<obleth_config::AlertSettings>> {
+        self.get_setting("alerts").await
+    }
+
+    /// Persist the alert settings.
+    pub async fn put_alert_settings(&self, settings: &obleth_config::AlertSettings) -> Result<()> {
+        self.put_setting("alerts", settings).await
+    }
+
+    /// The global in-flight ceiling saved from the dashboard, or `None` when
+    /// none has been saved (`OBLETH_GLOBAL_MAX_IN_FLIGHT` applies).
+    pub async fn get_global_ceiling(&self) -> Result<Option<usize>> {
+        Ok(self
+            .get_setting::<GlobalCeiling>("capacity")
+            .await?
+            .map(|c| c.max_in_flight.max(1)))
+    }
+
+    /// Save the global in-flight ceiling.
+    pub async fn put_global_ceiling(&self, max_in_flight: usize) -> Result<()> {
+        self.put_setting("capacity", &GlobalCeiling { max_in_flight })
+            .await
+    }
+
+    /// Forget the saved ceiling, so `OBLETH_GLOBAL_MAX_IN_FLIGHT` applies.
+    pub async fn delete_global_ceiling(&self) -> Result<()> {
+        sqlx::query("delete from app_settings where key = 'capacity'")
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
     /// Load the advice state (snoozed findings), or `None` if never saved.
     /// Stored as plain JSON: the admin crate owns its shape.
     pub async fn get_advice_state(&self) -> Result<Option<serde_json::Value>> {
-        let row = sqlx::query("select value from app_settings where key = 'advice'")
-            .fetch_optional(&self.pool)
-            .await?;
-        match row {
-            Some(row) => {
-                let value: sqlx::types::Json<serde_json::Value> = row.try_get("value")?;
-                Ok(Some(value.0))
-            }
-            None => Ok(None),
-        }
+        self.get_setting("advice").await
     }
 
-    /// Persist the advice state (upsert on the single `advice` key).
+    /// Persist the advice state.
     pub async fn put_advice_state(&self, state: &serde_json::Value) -> Result<()> {
-        sqlx::query(
-            "insert into app_settings (key, value, updated_at)
-             values ('advice', $1, now())
-             on conflict (key) do update set value = excluded.value, updated_at = now()",
-        )
-        .bind(sqlx::types::Json(state))
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        self.put_setting("advice", state).await
     }
 
     /// Load the persisted `auto` router settings, or `None` if unset.
     pub async fn get_auto_router_settings(
         &self,
     ) -> Result<Option<obleth_config::AutoRouterSettings>> {
-        let row = sqlx::query("select value from app_settings where key = 'auto_router'")
-            .fetch_optional(&self.pool)
-            .await?;
-        match row {
-            Some(row) => {
-                let value: sqlx::types::Json<obleth_config::AutoRouterSettings> =
-                    row.try_get("value")?;
-                Ok(Some(value.0))
-            }
-            None => Ok(None),
-        }
+        self.get_setting("auto_router").await
     }
 
-    /// Persist the `auto` router settings (upsert on the single `auto_router` key).
+    /// Persist the `auto` router settings.
     pub async fn put_auto_router_settings(
         &self,
         settings: &obleth_config::AutoRouterSettings,
     ) -> Result<()> {
-        sqlx::query(
-            "insert into app_settings (key, value, updated_at)
-             values ('auto_router', $1, now())
-             on conflict (key) do update set value = excluded.value, updated_at = now()",
-        )
-        .bind(sqlx::types::Json(settings))
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        self.put_setting("auto_router", settings).await
     }
 
     /// Load the persisted model-"boons" settings, or `None` if unset.
     pub async fn get_boon_settings(&self) -> Result<Option<obleth_config::BoonSettings>> {
-        let row = sqlx::query("select value from app_settings where key = 'boons'")
-            .fetch_optional(&self.pool)
-            .await?;
-        match row {
-            Some(row) => {
-                let value: sqlx::types::Json<obleth_config::BoonSettings> = row.try_get("value")?;
-                Ok(Some(value.0))
-            }
-            None => Ok(None),
-        }
+        self.get_setting("boons").await
     }
 
-    /// Persist the model-"boons" settings (upsert on the single `boons` key).
+    /// Persist the model-"boons" settings.
     pub async fn put_boon_settings(&self, settings: &obleth_config::BoonSettings) -> Result<()> {
-        sqlx::query(
-            "insert into app_settings (key, value, updated_at)
-             values ('boons', $1, now())
-             on conflict (key) do update set value = excluded.value, updated_at = now()",
-        )
-        .bind(sqlx::types::Json(settings))
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        self.put_setting("boons", settings).await
     }
 
     /// Whether the Charo control-plane assistant is enabled in the dashboard UI.
     /// `None` means unset (callers should treat this as enabled by default).
     pub async fn get_charo_enabled(&self) -> Result<Option<bool>> {
-        let row = sqlx::query("select value from app_settings where key = 'charo_enabled'")
-            .fetch_optional(&self.pool)
-            .await?;
-        match row {
-            Some(row) => {
-                let value: sqlx::types::Json<bool> = row.try_get("value")?;
-                Ok(Some(value.0))
-            }
-            None => Ok(None),
-        }
+        self.get_setting("charo_enabled").await
     }
 
-    /// Persist the Charo assistant UI toggle (upsert on the `charo_enabled` key).
+    /// Persist the Charo assistant UI toggle (the legacy `charo_enabled` key).
     pub async fn set_charo_enabled(&self, enabled: bool) -> Result<()> {
-        sqlx::query(
-            "insert into app_settings (key, value, updated_at)
-             values ('charo_enabled', $1, now())
-             on conflict (key) do update set value = excluded.value, updated_at = now()",
-        )
-        .bind(sqlx::types::Json(enabled))
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        self.put_setting("charo_enabled", &enabled).await
     }
 
     /// Load the full Charo settings blob. Falls back to the legacy `charo_enabled`
     /// boolean (with defaults for the newer fields) when `charo_settings` is unset,
     /// so upgrades preserve the operator's existing show/hide choice.
     pub async fn get_charo_settings(&self) -> Result<obleth_config::CharoSettings> {
-        let row = sqlx::query("select value from app_settings where key = 'charo_settings'")
-            .fetch_optional(&self.pool)
-            .await?;
-        if let Some(row) = row {
-            let value: sqlx::types::Json<obleth_config::CharoSettings> = row.try_get("value")?;
-            return Ok(value.0);
+        if let Some(settings) = self.get_setting("charo_settings").await? {
+            return Ok(settings);
         }
         // Legacy fallback: synthesize from the old boolean key.
         let enabled = self.get_charo_enabled().await?.unwrap_or(true);
@@ -3893,34 +3852,21 @@ impl Store {
         })
     }
 
-    /// Persist the full Charo settings blob (upsert on `charo_settings`). Also keeps
-    /// the legacy `charo_enabled` key in sync so any remaining reader stays correct.
+    /// Persist the full Charo settings blob. Also keeps the legacy
+    /// `charo_enabled` key in sync, so a rollback to a release that reads
+    /// only that key keeps the operator's choice.
     pub async fn set_charo_settings(&self, settings: &obleth_config::CharoSettings) -> Result<()> {
-        sqlx::query(
-            "insert into app_settings (key, value, updated_at)
-             values ('charo_settings', $1, now())
-             on conflict (key) do update set value = excluded.value, updated_at = now()",
-        )
-        .bind(sqlx::types::Json(settings))
-        .execute(&self.pool)
-        .await?;
-        self.set_charo_enabled(settings.enabled).await?;
-        Ok(())
+        self.put_setting("charo_settings", settings).await?;
+        self.set_charo_enabled(settings.enabled).await
     }
 
     /// The saved key prefix (`app_settings.key_prefix`), or `None` when none
     /// is saved. A saved value that is no longer a valid prefix reads as none.
     pub async fn get_key_prefix_setting(&self) -> Result<Option<String>> {
-        let row = sqlx::query("select value from app_settings where key = 'key_prefix'")
-            .fetch_optional(&self.pool)
-            .await?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let value: sqlx::types::Json<serde_json::Value> = row.try_get("value")?;
+        let value: Option<serde_json::Value> = self.get_setting("key_prefix").await?;
         Ok(value
-            .0
-            .get("prefix")
+            .as_ref()
+            .and_then(|v| v.get("prefix"))
             .and_then(|p| p.as_str())
             .filter(|p| obleth_config::is_valid_key_prefix(p))
             .map(str::to_string))
@@ -3928,15 +3874,8 @@ impl Store {
 
     /// Save the prefix new keys start with. The caller validates it.
     pub async fn put_key_prefix_setting(&self, prefix: &str) -> Result<()> {
-        sqlx::query(
-            "insert into app_settings (key, value, updated_at)
-             values ('key_prefix', $1, now())
-             on conflict (key) do update set value = excluded.value, updated_at = now()",
-        )
-        .bind(sqlx::types::Json(serde_json::json!({ "prefix": prefix })))
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        self.put_setting("key_prefix", &serde_json::json!({ "prefix": prefix }))
+            .await
     }
 
     /// The prefix new keys start with: the saved setting, else
@@ -3953,15 +3892,13 @@ impl Store {
     /// that no longer validates is skipped as it is read, without hiding the
     /// rest.
     pub async fn named_networks(&self) -> Result<Vec<obleth_config::network::NamedNetwork>> {
-        let row = sqlx::query("select value from app_settings where key = 'named_networks'")
-            .fetch_optional(&self.pool)
-            .await?;
-        let Some(row) = row else {
+        let Some(value) = self
+            .get_setting::<serde_json::Value>("named_networks")
+            .await?
+        else {
             return Ok(Vec::new());
         };
-        let value: sqlx::types::Json<serde_json::Value> = row.try_get("value")?;
         let saved: Vec<obleth_config::network::NamedNetwork> = value
-            .0
             .get("networks")
             .and_then(|v| v.as_array())
             .map(|rows| {
@@ -3978,79 +3915,50 @@ impl Store {
         &self,
         networks: &[obleth_config::network::NamedNetwork],
     ) -> Result<()> {
-        sqlx::query(
-            "insert into app_settings (key, value, updated_at)
-             values ('named_networks', $1, now())
-             on conflict (key) do update set value = excluded.value, updated_at = now()",
+        self.put_setting(
+            "named_networks",
+            &serde_json::json!({ "networks": networks }),
         )
-        .bind(sqlx::types::Json(
-            serde_json::json!({ "networks": networks }),
-        ))
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        .await
     }
 
     /// Load the persisted raw-usage retention setting, or `None` if unset.
     pub async fn get_usage_retention_settings(
         &self,
     ) -> Result<Option<obleth_config::UsageRetentionSettings>> {
-        let row = sqlx::query("select value from app_settings where key = 'usage_retention'")
-            .fetch_optional(&self.pool)
-            .await?;
-        match row {
-            Some(row) => {
-                let value: sqlx::types::Json<obleth_config::UsageRetentionSettings> =
-                    row.try_get("value")?;
-                Ok(Some(value.0))
-            }
-            None => Ok(None),
-        }
+        self.get_setting("usage_retention").await
     }
 
-    /// Persist the raw-usage retention setting (upsert on `usage_retention`).
+    /// Persist the raw-usage retention setting.
     pub async fn put_usage_retention_settings(
         &self,
         settings: &obleth_config::UsageRetentionSettings,
     ) -> Result<()> {
-        sqlx::query(
-            "insert into app_settings (key, value, updated_at)
-             values ('usage_retention', $1, now())
-             on conflict (key) do update set value = excluded.value, updated_at = now()",
-        )
-        .bind(sqlx::types::Json(settings))
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        self.put_setting("usage_retention", settings).await
     }
 
     /// Load the system-wide Slurm settings, or `None` if never configured. The
     /// stored JWT and Hugging Face token are decrypted transparently
     /// (legacy/empty values pass through).
     pub async fn get_slurm_settings(&self) -> Result<Option<obleth_config::SlurmSettings>> {
-        let row = sqlx::query("select value from app_settings where key = 'slurm'")
-            .fetch_optional(&self.pool)
-            .await?;
-        match row {
-            Some(row) => {
-                let value: sqlx::types::Json<obleth_config::SlurmSettings> =
-                    row.try_get("value")?;
-                let mut settings = value.0;
-                if !settings.slurm_jwt.is_empty() {
-                    settings.slurm_jwt = cipher().decrypt(&settings.slurm_jwt)?;
-                }
-                if !settings.hf_token.is_empty() {
-                    settings.hf_token = cipher().decrypt(&settings.hf_token)?;
-                }
-                Ok(Some(settings))
-            }
-            None => Ok(None),
+        let Some(mut settings) = self
+            .get_setting::<obleth_config::SlurmSettings>("slurm")
+            .await?
+        else {
+            return Ok(None);
+        };
+        if !settings.slurm_jwt.is_empty() {
+            settings.slurm_jwt = cipher().decrypt(&settings.slurm_jwt)?;
         }
+        if !settings.hf_token.is_empty() {
+            settings.hf_token = cipher().decrypt(&settings.hf_token)?;
+        }
+        Ok(Some(settings))
     }
 
-    /// Persist the system-wide Slurm settings (upsert on the single `slurm`
-    /// key). The JWT and Hugging Face token are encrypted at rest with the same
-    /// envelope cipher used for upstream provider keys before they are written.
+    /// Persist the system-wide Slurm settings. The JWT and Hugging Face token
+    /// are encrypted at rest with the same envelope cipher used for upstream
+    /// provider keys before they are written.
     pub async fn put_slurm_settings(&self, settings: &obleth_config::SlurmSettings) -> Result<()> {
         let mut to_store = settings.clone();
         if !to_store.slurm_jwt.is_empty() {
@@ -4059,47 +3967,28 @@ impl Store {
         if !to_store.hf_token.is_empty() {
             to_store.hf_token = cipher().encrypt(&to_store.hf_token);
         }
-        sqlx::query(
-            "insert into app_settings (key, value, updated_at)
-             values ('slurm', $1, now())
-             on conflict (key) do update set value = excluded.value, updated_at = now()",
-        )
-        .bind(sqlx::types::Json(&to_store))
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        self.put_setting("slurm", &to_store).await
     }
 
     /// Load the persisted energy-accounting settings, or `None` if unset.
     pub async fn get_energy_settings(&self) -> Result<Option<obleth_config::EnergySettings>> {
-        let row = sqlx::query("select value from app_settings where key = 'energy'")
-            .fetch_optional(&self.pool)
-            .await?;
-        match row {
-            Some(row) => {
-                let value: sqlx::types::Json<obleth_config::EnergySettings> =
-                    row.try_get("value")?;
-                Ok(Some(value.0))
-            }
-            None => Ok(None),
-        }
+        self.get_setting("energy").await
     }
 
-    /// Persist the energy-accounting settings (upsert on the single `energy` key).
+    /// Persist the energy-accounting settings.
     pub async fn put_energy_settings(
         &self,
         settings: &obleth_config::EnergySettings,
     ) -> Result<()> {
-        sqlx::query(
-            "insert into app_settings (key, value, updated_at)
-             values ('energy', $1, now())
-             on conflict (key) do update set value = excluded.value, updated_at = now()",
-        )
-        .bind(sqlx::types::Json(settings))
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        self.put_setting("energy", settings).await
     }
+}
+
+/// The `capacity` row of `app_settings`: the global in-flight ceiling saved
+/// from the dashboard.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct GlobalCeiling {
+    max_in_flight: usize,
 }
 
 /// A single audit-log entry.
@@ -9595,6 +9484,44 @@ mod tests {
             resolved.route_bias, 1.0,
             "resolved-cache view must also see the neutral default, not 0.0"
         );
+    }
+
+    /// The settings helpers read back what they wrote, a second write
+    /// replaces the first, and the saved ceiling can be cleared.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn settings_and_the_global_ceiling_round_trip() {
+        let Some(url) = crate::test_support::test_db_url() else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        let before = store.get_global_ceiling().await.unwrap();
+
+        let key = format!("test_setting_{}", Uuid::new_v4().simple());
+        assert_eq!(store.get_setting::<Vec<u32>>(&key).await.unwrap(), None);
+        store.put_setting(&key, &vec![1u32, 2]).await.unwrap();
+        store.put_setting(&key, &vec![3u32]).await.unwrap();
+        assert_eq!(
+            store.get_setting::<Vec<u32>>(&key).await.unwrap(),
+            Some(vec![3])
+        );
+        sqlx::query("delete from app_settings where key = $1")
+            .bind(&key)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        store.put_global_ceiling(512).await.unwrap();
+        let saved = store.get_global_ceiling().await.unwrap();
+        store.delete_global_ceiling().await.unwrap();
+        let cleared = store.get_global_ceiling().await.unwrap();
+        if let Some(n) = before {
+            store.put_global_ceiling(n).await.unwrap();
+        }
+        assert_eq!(saved, Some(512));
+        assert_eq!(cleared, None);
     }
 
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.

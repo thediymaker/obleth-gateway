@@ -217,6 +217,15 @@ function runningDetail(running: number, slots: number, models: number | undefine
   return `${used} · the pools of ${formatNumber(models)} model${models === 1 ? "" : "s"} with servers, added up`;
 }
 
+/** The global ceiling across every pool and where it comes from, or null when the gateway does not say. */
+export function ceilingNote(raw: Pick<FairshareLiveView, "configured_hard_ceiling" | "hard_ceiling_source">): string | null {
+  if (raw.configured_hard_ceiling === undefined || raw.hard_ceiling_source === undefined) return null;
+  const ceiling = `Global ceiling: ${formatNumber(raw.configured_hard_ceiling)} requests in flight across every pool`;
+  return raw.hard_ceiling_source === "saved"
+    ? `${ceiling}, saved through the API. It is used instead of OBLETH_GLOBAL_MAX_IN_FLIGHT until it is cleared.`
+    : `${ceiling}, from OBLETH_GLOBAL_MAX_IN_FLIGHT.`;
+}
+
 function AllPools({ raw, pools, expanded, onExpand, onScope, onOpen, tenantTotal }: {
   raw: FairshareLiveView; pools: PoolRow[]; expanded: boolean; onExpand: () => void; onScope: (model: string) => void; onOpen: (id: string) => void; tenantTotal: number;
 }) {
@@ -228,6 +237,7 @@ function AllPools({ raw, pools, expanded, onExpand, onScope, onOpen, tenantTotal
   const busiest = pools.find((p) => p.cap > 0 && p.inFlight > 0);
   const visible = expanded ? pools : pools.slice(0, FIRST_POOLS);
   const idle = pools.filter((p) => p.state === "idle").length;
+  const ceiling = ceilingNote(raw);
 
   return (
     <>
@@ -237,6 +247,7 @@ function AllPools({ raw, pools, expanded, onExpand, onScope, onOpen, tenantTotal
         <Tile label="Tenants active" value={<>{formatNumber(active.length)} {tenantTotal > 0 && <span className="text-sm font-normal text-muted-foreground">of {formatNumber(tenantTotal)}</span>}</>} detail={borrowing ? `${borrowing} using idle capacity beyond their share` : "Everyone within their share"} />
         <Tile label="Busiest pool" value={busiest ? `${Math.round((busiest.inFlight / busiest.cap) * 100)}%` : "—"} detail={busiest ? `${busiest.model} · ${busiest.inFlight} of ${busiest.cap} slots` : "Every pool is idle"} />
       </div>
+      {ceiling && <p className="text-xs text-muted-foreground" data-testid="global-ceiling">{ceiling}</p>}
 
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_400px]">
         <Panel title="Model pools" subtitle="Every model has its own pool of slots, and fair share is decided inside each pool. Open one to see who holds its slots.">

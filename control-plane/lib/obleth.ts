@@ -1433,8 +1433,12 @@ export interface FairshareLiveView {
   /** Hard ceiling on global in-flight admission, independent of pool sums,
    *  as the answering gateway enforces it. */
   hard_ceiling?: number;
-  /** OBLETH_GLOBAL_MAX_IN_FLIGHT as configured. */
+  /** The global ceiling as configured: saved through the API, else
+   *  OBLETH_GLOBAL_MAX_IN_FLIGHT (see `hard_ceiling_source`). */
   configured_hard_ceiling?: number;
+  /** Where the global ceiling comes from: `saved` with PUT /capacity (it
+   *  wins over the environment until cleared) or `environment`. */
+  hard_ceiling_source?: "saved" | "environment";
   /** Enabled models' pool sizes as configured, summed: the cluster-wide
    *  capacity. */
   configured_max_in_flight?: number;

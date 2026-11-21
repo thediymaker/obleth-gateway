@@ -56,7 +56,8 @@ impl Resolver {
 
 /// What an invalidation message tells gateways to drop. The wire format is
 /// fixed, since replicas of different versions share the channel: a key's
-/// bare hash, `model:<name>`, `mcp:<name>`, or `*` for everything.
+/// bare hash, `model:<name>`, `mcp:<name>`, `settings:<name>`, or `*` for
+/// everything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Invalidation {
     Key(String),
@@ -67,6 +68,34 @@ pub enum Invalidation {
     /// its requests' strikes from now on (see `crash_recent_models`). Not a
     /// cache entry; older releases read it as an unknown key hash.
     CrashStrike(String),
+    /// Saved settings every replica holds in memory changed: re-read them
+    /// from Postgres. Older releases read it as an unknown key hash.
+    Settings(SavedSetting),
+}
+
+/// Settings each replica applies from memory, so a save on one replica must
+/// reach the others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SavedSetting {
+    /// Alert targets (Slack, email) and their interval.
+    Alerts,
+    /// The global in-flight ceiling.
+    Capacity,
+}
+
+impl SavedSetting {
+    fn as_str(self) -> &'static str {
+        match self {
+            SavedSetting::Alerts => "alerts",
+            SavedSetting::Capacity => "capacity",
+        }
+    }
+
+    fn parse(name: &str) -> Option<Self> {
+        [SavedSetting::Alerts, SavedSetting::Capacity]
+            .into_iter()
+            .find(|s| s.as_str() == name)
+    }
 }
 
 impl Invalidation {
@@ -77,6 +106,7 @@ impl Invalidation {
             Invalidation::Mcp(name) => format!("mcp:{name}"),
             Invalidation::All => "*".to_string(),
             Invalidation::CrashStrike(model) => format!("crash:{model}"),
+            Invalidation::Settings(setting) => format!("settings:{}", setting.as_str()),
         }
     }
 
@@ -91,6 +121,11 @@ impl Invalidation {
             Invalidation::Mcp(name.to_string())
         } else if let Some(model) = message.strip_prefix("crash:") {
             Invalidation::CrashStrike(model.to_string())
+        } else if let Some(setting) = message
+            .strip_prefix("settings:")
+            .and_then(SavedSetting::parse)
+        {
+            Invalidation::Settings(setting)
         } else {
             Invalidation::Key(message.to_string())
         }
@@ -168,11 +203,26 @@ mod tests {
             (Invalidation::Model("a:b".into()), "model:a:b"),
             (Invalidation::Mcp("search".into()), "mcp:search"),
             (Invalidation::All, "*"),
+            (Invalidation::CrashStrike("m".into()), "crash:m"),
+            (
+                Invalidation::Settings(SavedSetting::Alerts),
+                "settings:alerts",
+            ),
+            (
+                Invalidation::Settings(SavedSetting::Capacity),
+                "settings:capacity",
+            ),
         ];
         for (target, wire) in cases {
             assert_eq!(target.encode(), wire);
             assert_eq!(Invalidation::parse(wire), target);
         }
+        // A setting a newer release added reads as a key hash nothing has,
+        // as every unknown message does.
+        assert_eq!(
+            Invalidation::parse("settings:later"),
+            Invalidation::Key("settings:later".into())
+        );
     }
 
     #[test]

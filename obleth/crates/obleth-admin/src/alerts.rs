@@ -56,8 +56,15 @@ impl AlertDispatcher {
     }
 
     /// Atomically replace the active settings (applies to in-flight alerts).
-    pub fn update(&self, settings: AlertSettings) {
+    /// Settings equal to the active ones leave them untouched, so an
+    /// unchanged re-read does not churn the snapshot. Returns whether they
+    /// changed.
+    pub fn update(&self, settings: AlertSettings) -> bool {
+        if **self.inner.settings.load() == settings {
+            return false;
+        }
         self.inner.settings.store(Arc::new(settings));
+        true
     }
 
     /// True when at least one delivery channel is currently configured.
@@ -247,6 +254,21 @@ async fn send_email(email: &EmailSettings, subject: &str, body: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alert_settings_are_replaced_only_when_they_change() {
+        let alerts = AlertDispatcher::new(Client::new(), AlertSettings::default());
+        let before = alerts.current();
+        assert!(!alerts.update(AlertSettings::default()));
+        assert!(Arc::ptr_eq(&before, &alerts.current()));
+        let changed = AlertSettings {
+            slack_webhook_url: Some("https://hooks.example.test/x".into()),
+            ..AlertSettings::default()
+        };
+        assert!(alerts.update(changed.clone()));
+        assert_eq!(*alerts.current(), changed);
+        assert!(alerts.enabled());
+    }
 
     /// A webhook host that accepts the connection and never answers: the post
     /// gives up within the admin outbound bound instead of holding the alert

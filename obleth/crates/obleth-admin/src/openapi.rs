@@ -186,6 +186,7 @@ use obleth_config::{
         crate::get_daily_stats,
         crate::get_capacity,
         crate::set_capacity,
+        crate::clear_capacity,
         // settings
         crate::get_alert_settings,
         crate::put_alert_settings,
@@ -377,6 +378,7 @@ use obleth_config::{
         crate::batches::AdminBatchView,
         crate::batches::AdminBatchList,
         CapacityView,
+        crate::replica_settings::CeilingSource,
         SetCapacity,
         UsageRetentionView,
         KeyPrefixView,

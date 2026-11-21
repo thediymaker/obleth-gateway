@@ -14,6 +14,7 @@ use obleth_config::{
     pepper_is_set, BackupData, BackupEncryption, ConfigBackup, RestoreReport, BACKUP_FORMAT,
     BACKUP_VERSION,
 };
+use obleth_redis::SavedSetting;
 use obleth_store::CryptoError;
 
 use crate::ssrf::{SsrfPolicy, VERIFY_TEMPLATE_PLACEHOLDERS};
@@ -131,10 +132,12 @@ pub(crate) async fn restore_backup(
     // without waiting for its periodic refresh: the same pass as
     // POST /api/v1/resync, which also prunes entries the backup no longer has.
     resync_resolvers(&state).await?;
-    // Alert settings are pushed (not polled); reload them live. Auto-router,
-    // boons and retention are picked up by the proxy's poll loop.
-    if let Some(settings) = state.store.get_alert_settings().await? {
-        state.alerts.update(settings);
+    // Alert settings and the global ceiling apply from memory: reload them
+    // here and tell the other replicas. Auto-router, boons and retention are
+    // picked up by the proxy's poll loop.
+    state.replica_settings().reload_all().await;
+    for which in [SavedSetting::Alerts, SavedSetting::Capacity] {
+        crate::publish_setting(&state, which).await;
     }
 
     let mut detail = entity_counts(&body.data);

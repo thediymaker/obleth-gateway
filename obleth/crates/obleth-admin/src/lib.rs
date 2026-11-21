@@ -23,6 +23,7 @@ mod models_io;
 mod names;
 mod openapi;
 pub mod recipes;
+pub mod replica_settings;
 pub mod rewarm;
 pub mod router_readiness;
 pub mod slurm_resources;
@@ -56,10 +57,9 @@ use obleth_config::{
     TOOL_LOOP_MAX_DEADLINE_SECS, TOOL_LOOP_MAX_TURNS,
 };
 use obleth_fairshare::{
-    replica_share, FairShare, FairshareHistory, ModelPoolFairshare, PoolKey, SlotMode,
-    StaticCapacity, Stats,
+    replica_share, FairShare, FairshareHistory, ModelPoolFairshare, PoolKey, SlotMode, Stats,
 };
-use obleth_redis::{Invalidation, RedisStore, Resolver};
+use obleth_redis::{Invalidation, RedisStore, Resolver, SavedSetting};
 use obleth_store::{AuditEntry, Store};
 use obleth_tokenizer::Tokenizer;
 use rand::Rng;
@@ -106,7 +106,9 @@ where
 pub struct AdminState {
     pub store: Store,
     pub redis: RedisStore,
-    pub capacity: Arc<StaticCapacity>,
+    /// The global in-flight ceiling the scheduler reads, saved or from
+    /// `OBLETH_GLOBAL_MAX_IN_FLIGHT`.
+    pub ceiling: Arc<replica_settings::GlobalCeiling>,
     pub fairshare: FairShare,
     /// Per-model in-flight cap used for models that don't set their own
     /// `max_in_flight`, sourced from `cfg.default_model_max_in_flight`.
@@ -161,6 +163,17 @@ pub struct AdminState {
     pub usage_cache: Arc<usage_cache::UsageCache>,
     /// The client the Slurm connection test and resource reads share.
     pub slurm_http: slurm_settings::SlurmHttp,
+}
+
+impl AdminState {
+    /// What re-reads this replica's alert settings and global ceiling.
+    pub fn replica_settings(&self) -> replica_settings::ReplicaSettings {
+        replica_settings::ReplicaSettings::new(
+            self.store.clone(),
+            self.alerts.clone(),
+            self.ceiling.clone(),
+        )
+    }
 }
 
 /// A boxed call into the data plane's classifier: `(prompt, available_tags)`
@@ -455,7 +468,10 @@ pub fn router(state: AdminState) -> Router {
         .route("/api/v1/batches/:id", get(batches::get_batch))
         .route("/api/v1/batches/:id/cancel", post(batches::cancel_batch))
         .route("/api/v1/stats/daily", get(get_daily_stats))
-        .route("/api/v1/capacity", get(get_capacity).put(set_capacity))
+        .route(
+            "/api/v1/capacity",
+            get(get_capacity).put(set_capacity).delete(clear_capacity),
+        )
         .route(
             "/api/v1/settings/alerts",
             get(get_alert_settings).put(put_alert_settings),
@@ -845,7 +861,24 @@ pub struct SetCapacity {
 /// Total in-flight ceiling across all model pools, not a fairness budget.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct CapacityView {
+    /// The ceiling every replica enforces.
     pub max_in_flight: usize,
+    /// `saved` (with `PUT`; it wins over the environment until `DELETE`) or
+    /// `environment` (`OBLETH_GLOBAL_MAX_IN_FLIGHT`).
+    pub source: replica_settings::CeilingSource,
+    /// `OBLETH_GLOBAL_MAX_IN_FLIGHT` on this replica, which applies while
+    /// nothing is saved.
+    pub environment_max_in_flight: usize,
+}
+
+impl CapacityView {
+    fn of(ceiling: &replica_settings::GlobalCeiling) -> Self {
+        CapacityView {
+            max_in_flight: ceiling.max_in_flight(),
+            source: ceiling.source(),
+            environment_max_in_flight: ceiling.environment(),
+        }
+    }
 }
 
 /// Live counters of the answering gateway replica.
@@ -1032,11 +1065,14 @@ pub struct FairshareLiveView {
     /// servers right now, by name.
     pub models_without_servers: Vec<String>,
     /// Total in-flight ceiling across all pools as this replica enforces it:
-    /// `OBLETH_GLOBAL_MAX_IN_FLIGHT` in `shared` and `local` mode, this
-    /// replica's share of it in `split` and `fallback` mode.
+    /// the global ceiling in `shared` and `local` mode, this replica's share
+    /// of it in `split` and `fallback` mode.
     pub hard_ceiling: usize,
-    /// `OBLETH_GLOBAL_MAX_IN_FLIGHT` as configured.
+    /// The global ceiling as configured: saved with `PUT /api/v1/capacity`,
+    /// else `OBLETH_GLOBAL_MAX_IN_FLIGHT` (see `hard_ceiling_source`).
     pub configured_hard_ceiling: usize,
+    /// Where `configured_hard_ceiling` comes from: `saved` or `environment`.
+    pub hard_ceiling_source: replica_settings::CeilingSource,
     pub default_model_max_in_flight: usize,
     /// Live gateway replicas.
     pub replicas: usize,
@@ -3135,6 +3171,7 @@ async fn put_alert_settings(
 
     state.store.put_alert_settings(&settings).await?;
     state.alerts.update(settings.clone());
+    publish_setting(&state, SavedSetting::Alerts).await;
     state
         .store
         .record_audit(
@@ -7108,7 +7145,6 @@ pub(crate) fn aggregate_pools(
     responses((status = 200, body = LiveStats))
 )]
 async fn get_stats(State(state): State<AdminState>) -> Json<LiveStats> {
-    use obleth_fairshare::CapacityProvider;
     use std::sync::atomic::Ordering;
     // The live counters are the point of this endpoint; a database hiccup
     // should degrade the capacity number, not fail the poll.
@@ -7136,7 +7172,7 @@ async fn get_stats(State(state): State<AdminState>) -> Json<LiveStats> {
         max_in_flight: if capacity > 0 {
             capacity
         } else {
-            replica_share(state.capacity.max_in_flight(), divisor)
+            replica_share(state.ceiling.max_in_flight(), divisor)
         },
         replicas,
         mode: mode.as_str().into(),
@@ -7731,6 +7767,7 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
         },
         hard_ceiling: snap.max_in_flight,
         configured_hard_ceiling: snap.configured_max_in_flight,
+        hard_ceiling_source: state.ceiling.source(),
         default_model_max_in_flight: snap.default_model_max_in_flight,
         replicas: snap.replicas,
         mode: mode.as_str().into(),
@@ -10683,10 +10720,7 @@ async fn get_audit(
     responses((status = 200, body = CapacityView))
 )]
 async fn get_capacity(State(state): State<AdminState>) -> Json<CapacityView> {
-    use obleth_fairshare::CapacityProvider;
-    Json(CapacityView {
-        max_in_flight: state.capacity.max_in_flight(),
-    })
+    Json(CapacityView::of(&state.ceiling))
 }
 
 #[utoipa::path(
@@ -10699,7 +10733,14 @@ async fn set_capacity(
     headers: HeaderMap,
     Json(body): Json<SetCapacity>,
 ) -> Result<Json<CapacityView>> {
-    state.capacity.set(body.max_in_flight);
+    if body.max_in_flight == 0 {
+        return Err(AdminError::BadRequest(
+            "max_in_flight must be at least 1".into(),
+        ));
+    }
+    state.store.put_global_ceiling(body.max_in_flight).await?;
+    state.ceiling.apply(Some(body.max_in_flight));
+    publish_setting(&state, SavedSetting::Capacity).await;
     state
         .store
         .record_audit(
@@ -10710,9 +10751,45 @@ async fn set_capacity(
             serde_json::json!({ "max_in_flight": body.max_in_flight }),
         )
         .await?;
-    Ok(Json(CapacityView {
-        max_in_flight: body.max_in_flight,
-    }))
+    Ok(Json(CapacityView::of(&state.ceiling)))
+}
+
+#[utoipa::path(
+    delete, path = "/api/v1/capacity", tag = "capacity",
+    responses((status = 200, description = "The saved ceiling is forgotten; \
+        OBLETH_GLOBAL_MAX_IN_FLIGHT applies on every replica", body = CapacityView))
+)]
+async fn clear_capacity(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+) -> Result<Json<CapacityView>> {
+    state.store.delete_global_ceiling().await?;
+    state.ceiling.apply(None);
+    publish_setting(&state, SavedSetting::Capacity).await;
+    state
+        .store
+        .record_audit(
+            &audit_actor(&headers),
+            "clear_capacity",
+            "gateway",
+            "global",
+            serde_json::json!({ "max_in_flight": state.ceiling.environment() }),
+        )
+        .await?;
+    Ok(Json(CapacityView::of(&state.ceiling)))
+}
+
+/// Tell the other replicas a replica-wide setting changed, so they re-read
+/// it now. Best effort: the save stands, and they re-read it on their next
+/// registry tick (15 s) anyway.
+async fn publish_setting(state: &AdminState, which: SavedSetting) {
+    if let Err(e) = state
+        .redis
+        .publish_invalidation(&Invalidation::Settings(which))
+        .await
+    {
+        tracing::warn!(error = %e, ?which, "could not tell the other replicas a setting changed; they re-read it within 15 s");
+    }
 }
 
 // ---- sync helpers --------------------------------------------------------
@@ -11168,13 +11245,13 @@ mod tests {
         impl TestApp {
             /// A second gateway replica: its own in-process state (capacity,
             /// fairshare, alert targets) over the same Postgres and Redis.
-            pub(super) fn replica(&self) -> Router {
-                router(test_state(
+            pub(super) fn replica(&self) -> AdminState {
+                test_state(
                     self.store.clone(),
                     self.redis.clone(),
                     capacity_discovery::CapacityDiscovery::disabled(),
                     clickhouse::Client::default(),
-                ))
+                )
             }
         }
 
@@ -11185,7 +11262,7 @@ mod tests {
             capacity_discovery: capacity_discovery::CapacityDiscovery,
             clickhouse: clickhouse::Client,
         ) -> AdminState {
-            let capacity = Arc::new(StaticCapacity::new(64));
+            let capacity = Arc::new(obleth_fairshare::StaticCapacity::new(64));
             let fairshare = FairShare::start(
                 capacity.clone(),
                 obleth_config::FairshareAlgorithm::default(),
@@ -11196,7 +11273,7 @@ mod tests {
             AdminState {
                 store,
                 redis,
-                capacity,
+                ceiling: Arc::new(replica_settings::GlobalCeiling::new(capacity, 64)),
                 fairshare: fairshare.clone(),
                 fairshare_stats: fairshare.stats(),
                 default_model_max_in_flight: 32,
@@ -13029,6 +13106,150 @@ mod tests {
         assert_eq!(tested, StatusCode::BAD_REQUEST);
     }
 
+    /// Alert settings and the global ceiling saved on one replica reach
+    /// another as soon as it hears of it, and the ceiling outlives a restart
+    /// until it is cleared.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn alerts_and_the_ceiling_saved_on_one_replica_apply_on_every_replica() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let alerts_before = t.store.get_alert_settings().await.unwrap();
+        let ceiling_before = t.store.get_global_ceiling().await.unwrap();
+        // Another replica, listening on the invalidation channel as a gateway
+        // does.
+        let other = t.replica();
+        let (subscribed, ready) = tokio::sync::oneshot::channel();
+        let listener = tokio::spawn({
+            let redis = other.redis.clone();
+            let settings = other.replica_settings();
+            let mut subscribed = Some(subscribed);
+            async move {
+                redis
+                    .run_invalidation_listener(
+                        move |message| {
+                            if let Invalidation::Settings(which) = Invalidation::parse(&message) {
+                                let settings = settings.clone();
+                                tokio::spawn(async move { settings.reload(which).await });
+                            }
+                        },
+                        move |_| {
+                            if let Some(tx) = subscribed.take() {
+                                let _ = tx.send(());
+                            }
+                        },
+                    )
+                    .await
+            }
+        });
+        ready.await.expect("listener subscribed");
+        let call = |method: &str, path: &str, body: serde_json::Value| {
+            axum::http::Request::builder()
+                .method(method)
+                .uri(path)
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap()
+        };
+        let reached = |what: &'static str, done: Box<dyn Fn() -> bool + Send>| async move {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !done() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{what} did not reach the other replica"));
+        };
+
+        let (alerts_status, _) = send(
+            &t.app,
+            call(
+                "PUT",
+                "/api/v1/settings/alerts",
+                serde_json::json!({ "min_interval_secs": 4321 }),
+            ),
+        )
+        .await;
+        let (put_status, put) = send(
+            &t.app,
+            call(
+                "PUT",
+                "/api/v1/capacity",
+                serde_json::json!({ "max_in_flight": 777 }),
+            ),
+        )
+        .await;
+        let alerts = other.alerts.clone();
+        reached(
+            "the alert settings",
+            Box::new(move || alerts.current().min_interval_secs == 4321),
+        )
+        .await;
+        let ceiling = other.ceiling.clone();
+        reached(
+            "the ceiling",
+            Box::new(move || ceiling.max_in_flight() == 777),
+        )
+        .await;
+        // A replica started now reads the saved ceiling over its environment.
+        let restarted = t.replica();
+        restarted.replica_settings().reload_all().await;
+        let restarted_ceiling = (
+            restarted.ceiling.max_in_flight(),
+            restarted.ceiling.source(),
+        );
+        // Clearing it returns every replica to its environment value.
+        let (cleared_status, cleared) = send(
+            &t.app,
+            call("DELETE", "/api/v1/capacity", serde_json::json!({})),
+        )
+        .await;
+        let ceiling = other.ceiling.clone();
+        reached(
+            "the cleared ceiling",
+            Box::new(move || ceiling.max_in_flight() == 64),
+        )
+        .await;
+        let (zero, _) = send(
+            &t.app,
+            call(
+                "PUT",
+                "/api/v1/capacity",
+                serde_json::json!({ "max_in_flight": 0 }),
+            ),
+        )
+        .await;
+
+        listener.abort();
+        if let Some(a) = alerts_before {
+            let _ = t.store.put_alert_settings(&a).await;
+        }
+        let _ = match ceiling_before {
+            Some(n) => t.store.put_global_ceiling(n).await,
+            None => t.store.delete_global_ceiling().await,
+        };
+
+        assert_eq!(alerts_status, StatusCode::OK);
+        assert_eq!(put_status, StatusCode::OK);
+        assert_eq!(put["max_in_flight"], 777);
+        assert_eq!(put["source"], "saved");
+        assert_eq!(put["environment_max_in_flight"], 64);
+        assert_eq!(
+            restarted_ceiling,
+            (777, replica_settings::CeilingSource::Saved)
+        );
+        assert_eq!(cleared_status, StatusCode::OK);
+        assert_eq!(cleared["max_in_flight"], 64);
+        assert_eq!(cleared["source"], "environment");
+        assert_eq!(
+            other.ceiling.source(),
+            replica_settings::CeilingSource::Environment
+        );
+        assert_eq!(zero, StatusCode::BAD_REQUEST);
+    }
+
     /// What the provisioner reports about slurmrestd with its tick is kept in
     /// Redis, so every replica shows it, and only for the server it was about.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -13080,14 +13301,14 @@ mod tests {
         let (status, _) = send(&t.app, poll(Some(&server))).await;
         assert_eq!(status, StatusCode::OK);
         // Another replica, which took no part in the poll, shows the facts.
-        let view = read(t.replica()).await;
+        let view = read(router(t.replica())).await;
         // A tick that does not carry them (an error tick) keeps the last ones.
         send(&t.app, poll(None)).await;
-        let kept = read(t.replica()).await;
+        let kept = read(router(t.replica())).await;
         // Settings for another server show none of them.
         settings.slurmrestd_url = "http://other.obleth-test.invalid:6820".into();
         t.store.put_slurm_settings(&settings).await.unwrap();
-        let other = read(t.replica()).await;
+        let other = read(router(t.replica())).await;
 
         let _ = t.store.put_slurm_settings(&original).await;
         let _ = t.redis.set_provisioner_tick_status("{}", 1).await;

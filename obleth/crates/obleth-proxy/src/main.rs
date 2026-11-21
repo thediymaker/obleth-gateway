@@ -125,7 +125,19 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ---- fairshare scheduler + capacity ----
+    // The ceiling saved from the API wins; OBLETH_GLOBAL_MAX_IN_FLIGHT
+    // applies while none is saved.
     let capacity = Arc::new(StaticCapacity::new(cfg.global_max_in_flight));
+    let ceiling = Arc::new(obleth_admin::replica_settings::GlobalCeiling::new(
+        capacity.clone(),
+        cfg.global_max_in_flight,
+    ));
+    match store.get_global_ceiling().await {
+        Ok(saved) => ceiling.apply(saved),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load the saved global ceiling; using OBLETH_GLOBAL_MAX_IN_FLIGHT")
+        }
+    }
     let fairshare = FairShare::start(
         capacity.clone(),
         cfg.fairshare_algorithm,
@@ -227,11 +239,12 @@ async fn main() -> anyhow::Result<()> {
             if let Some(warning) = obleth_admin::ceiling_check(
                 &models,
                 cfg.default_model_max_in_flight,
-                cfg.global_max_in_flight,
+                ceiling.max_in_flight(),
                 divided_by,
             ) {
                 tracing::warn!(
                     ceiling = warning.ceiling,
+                    ceiling_source = ?ceiling.source(),
                     pool_sum = warning.pool_sum,
                     replicas,
                     "{}",
@@ -397,6 +410,11 @@ async fn main() -> anyhow::Result<()> {
     if alerts.enabled() {
         tracing::info!("alerting enabled");
     }
+    let replica_settings = obleth_admin::replica_settings::ReplicaSettings::new(
+        store.clone(),
+        alerts.clone(),
+        ceiling.clone(),
+    );
 
     // JWT bearer auth: trusted issuers from OBLETH_JWT_ISSUERS. JWKS URLs pass
     // the same destination policy as any operator-supplied upstream, discovery
@@ -604,7 +622,7 @@ async fn main() -> anyhow::Result<()> {
             classifier: classifier.clone(),
             boons: boons.clone(),
             energy: energy.clone(),
-            alerts: alerts.clone(),
+            replica: replica_settings.clone(),
         },
         cfg.upstream_read_timeout_secs,
     );
@@ -670,6 +688,7 @@ async fn main() -> anyhow::Result<()> {
             variants: variant_cache.clone(),
             mcp: mcp_cache.clone(),
             crash_guard: app_state.crash_guard.clone(),
+            settings: Some(replica_settings.clone()),
         },
         redis_reconnected.clone(),
     );
@@ -719,7 +738,7 @@ async fn main() -> anyhow::Result<()> {
     let admin_state = obleth_admin::AdminState {
         store: store.clone(),
         redis: redis.clone(),
-        capacity: capacity.clone(),
+        ceiling: ceiling.clone(),
         fairshare: fairshare.clone(),
         fairshare_stats: fairshare.stats(),
         default_model_max_in_flight: cfg.default_model_max_in_flight,
@@ -1087,14 +1106,16 @@ struct SavedSettings {
     classifier: classifier::Classifier,
     boons: boons::BoonEngine,
     energy: energy::EnergyEngine,
-    alerts: obleth_admin::AlertDispatcher,
+    /// Alert targets and the global ceiling; also re-read when another
+    /// replica says they changed (see [`InvalidationCaches::apply`]).
+    replica: obleth_admin::replica_settings::ReplicaSettings,
 }
 
 /// Periodically rebuild the `auto`-router candidate list so enable/disable,
 /// metadata edits, and health/maintenance transitions take effect without a
 /// restart. Also refreshes the settings saved from the control plane
-/// (classifier, boons, energy, alerts) so they propagate to every replica
-/// within one interval. Runs every 15s; failures are logged and retried next
+/// (classifier, boons, energy, alerts, the global ceiling) so they propagate
+/// to every replica within one interval. Runs every 15s; failures are logged and retried next
 /// tick.
 fn spawn_model_registry_refresh(
     store: Store,
@@ -1107,7 +1128,7 @@ fn spawn_model_registry_refresh(
         classifier,
         boons,
         energy,
-        alerts,
+        replica,
     } = saved;
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(15));
@@ -1157,30 +1178,9 @@ fn spawn_model_registry_refresh(
                 Ok(None) => {}
                 Err(e) => tracing::warn!(error = %e, "energy settings refresh failed"),
             }
-            match store.get_alert_settings().await {
-                Ok(Some(settings)) => apply_alert_settings(&alerts, settings),
-                Ok(None) => {}
-                Err(e) => tracing::warn!(error = %e, "alert settings refresh failed"),
-            }
+            replica.reload_all().await;
         }
     });
-}
-
-/// Hand freshly read alert settings to the dispatcher, but only when they
-/// differ from what it already holds: a save on another replica must reach
-/// this one, while an unchanged row must not replace the live settings every
-/// tick. The dispatcher keeps its cooldown state across updates either way.
-fn apply_alert_settings(
-    alerts: &obleth_admin::AlertDispatcher,
-    settings: obleth_config::AlertSettings,
-) {
-    if *alerts.current() != settings {
-        tracing::info!(
-            enabled = settings.any_channel_enabled(),
-            "alert settings reloaded"
-        );
-        alerts.update(settings);
-    }
 }
 
 /// Sample the scheduler every `FAIRSHARE_HISTORY_INTERVAL_MS` into the
@@ -1299,6 +1299,9 @@ struct InvalidationCaches {
     variants: Cache<String, Arc<obleth_config::ResolvedModel>>,
     mcp: Cache<String, Arc<obleth_config::ResolvedMcpServer>>,
     crash_guard: crash_guard::CrashGuard,
+    /// Alert targets and the global ceiling, re-read when another replica
+    /// saves them. `None` in tests that exercise the caches alone.
+    settings: Option<obleth_admin::replica_settings::ReplicaSettings>,
 }
 
 impl InvalidationCaches {
@@ -1325,6 +1328,11 @@ impl InvalidationCaches {
             Invalidation::CrashStrike(model) => self
                 .crash_guard
                 .note_strike(&model, crash_guard::STRIKE_TTL),
+            Invalidation::Settings(which) => {
+                if let Some(settings) = &self.settings {
+                    settings.reload(which).await;
+                }
+            }
             Invalidation::Key(hash) => {
                 self.keys.invalidate(&hash).await;
                 // A key with this hash may have just been created or restored.
@@ -1568,6 +1576,7 @@ mod registry_refresh_tests {
             variants: Cache::builder().build(),
             mcp: Cache::builder().build(),
             crash_guard: crash_guard::CrashGuard::disabled(),
+            settings: None,
         };
         let lookups = std::sync::atomic::AtomicUsize::new(0);
         let lookup = || async {
@@ -1591,27 +1600,6 @@ mod registry_refresh_tests {
             .await
             .unwrap();
         assert_eq!(lookups.load(std::sync::atomic::Ordering::SeqCst), 2);
-    }
-
-    /// A row that differs from the live settings replaces them; an identical
-    /// row leaves the live snapshot untouched, so an unchanged save on another
-    /// replica does not churn the dispatcher every tick.
-    #[test]
-    fn alert_settings_are_replaced_only_when_they_change() {
-        let alerts = obleth_admin::AlertDispatcher::new(
-            reqwest::Client::new(),
-            obleth_config::AlertSettings::default(),
-        );
-        let before = alerts.current();
-        apply_alert_settings(&alerts, obleth_config::AlertSettings::default());
-        assert!(Arc::ptr_eq(&before, &alerts.current()));
-        let changed = obleth_config::AlertSettings {
-            slack_webhook_url: Some("https://hooks.example.test/x".into()),
-            ..obleth_config::AlertSettings::default()
-        };
-        apply_alert_settings(&alerts, changed.clone());
-        assert_eq!(*alerts.current(), changed);
-        assert!(alerts.enabled());
     }
 
     #[test]

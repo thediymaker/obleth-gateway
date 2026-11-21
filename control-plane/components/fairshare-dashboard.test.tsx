@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   appendHistoryTail,
   buildHistoryChart,
+  ceilingNote,
   FairshareDashboard,
   fetchHistory,
   limitsNote,
@@ -425,5 +426,17 @@ describe("history", () => {
     } finally {
       globalThis.fetch = originalFetch;
     }
+  });
+});
+
+describe("global ceiling", () => {
+  it("says whether the ceiling was saved or comes from the environment", () => {
+    expect(ceilingNote({ configured_hard_ceiling: 512, hard_ceiling_source: "saved" })).toBe(
+      "Global ceiling: 512 requests in flight across every pool, saved through the API. It is used instead of OBLETH_GLOBAL_MAX_IN_FLIGHT until it is cleared.",
+    );
+    expect(ceilingNote({ configured_hard_ceiling: 4096, hard_ceiling_source: "environment" })).toBe(
+      "Global ceiling: 4,096 requests in flight across every pool, from OBLETH_GLOBAL_MAX_IN_FLIGHT.",
+    );
+    expect(ceilingNote({ configured_hard_ceiling: 4096 })).toBeNull();
   });
 });

@@ -21,7 +21,7 @@ pub use obleth_config::config::RedisTimeouts;
 use obleth_config::{CachedResponse, ResolvedKey, ResolvedMcpServer, ResolvedModel};
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use redis::AsyncCommands;
-pub use resolver::{Invalidation, Resolver};
+pub use resolver::{Invalidation, Resolver, SavedSetting};
 use uuid::Uuid;
 
 /// Lua scripts are wrapped in `redis::Script` once (constructing one SHA-1
