@@ -247,9 +247,8 @@ pub(crate) async fn put_snoozed(
     });
     save_snoozed(&state, &all).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             if body.until_ms.is_some() {
                 "snooze_advice"
             } else {
@@ -281,9 +280,8 @@ pub(crate) async fn delete_snoozed(
     }
     save_snoozed(&state, &all).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "restore_advice",
             "advice",
             &key,

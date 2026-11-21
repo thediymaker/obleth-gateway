@@ -14,6 +14,7 @@ import {
   changeLine,
   dayLabel,
   fieldChanges,
+  recordedChanges,
   groupBursts,
   isPerson,
   KIND_LABEL,
@@ -85,7 +86,7 @@ function Detail({ e, prev }: { e: AuditEntry; prev: AuditEntry | undefined }) {
         ))
       )}
       <div className="flex flex-wrap justify-between gap-2 pt-1.5 text-[11.5px] text-muted-foreground">
-        <span>{prev ? `Compared with the change before it, ${dateTime(prev.ts)}` : "No earlier change to compare with in view"} · event #{e.id}</span>
+        <span>{recordedChanges(e) ? "Changes as the gateway recorded them" : prev ? `Compared with the change before it, ${dateTime(prev.ts)}` : "No earlier change to compare with in view"} · event #{e.id}</span>
         <button type="button" onClick={() => setRaw((v) => !v)} className="text-secondary-foreground underline underline-offset-[3px] hover:text-foreground">{raw ? "Fields" : "Raw JSON"}</button>
       </div>
     </div>

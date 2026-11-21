@@ -17,7 +17,7 @@ use uuid::Uuid;
 use crate::error::AdminError;
 
 type Result<T> = std::result::Result<T, AdminError>;
-use crate::{audit_actor, AdminState};
+use crate::AdminState;
 
 const STATUSES: &[&str] = &[
     "validating",
@@ -237,9 +237,8 @@ pub async fn cancel_batch(
         .ok_or(AdminError::NotFound)?;
     if b.status != before {
         state
-            .store
-            .record_audit(
-                &audit_actor(&headers),
+            .audit(
+                &headers,
                 "cancel_batch",
                 "batch",
                 &b.id,

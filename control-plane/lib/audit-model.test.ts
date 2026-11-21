@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { auditHref, buildNames, burstSummary, changeLine, fieldChanges, filtersFromParams, groupBursts, paramsFor, previousEntries, queryFor, tailOf, thingHref, verbOf } from "./audit-model";
+import { auditHref, buildNames, burstSummary, changeLine, fieldChanges, filtersFromParams, groupBursts, paramsFor, previousEntries, queryFor, recordedChanges, tailOf, thingHref, verbOf } from "./audit-model";
 import type { AuditEntry } from "./obleth";
 
 let id = 1000;
@@ -69,6 +69,19 @@ describe("what changed", () => {
     ]);
     expect(changeLine(after, before)).toBe("classifier model router-classifier-v1 → router-classifier-v2");
     expect(changeLine(before, undefined)).toBeNull();
+  });
+
+  it("uses the changes the gateway recorded with a model update", () => {
+    const update = ev({ detail: { model_name: "glm-5-3", changes: { max_in_flight: { before: 4, after: 9 }, description: { before: "", after: "now described" } } } });
+    const earlier = ev({ detail: { model_name: "glm-5-3" } });
+    expect(fieldChanges(update, earlier)).toEqual([
+      { field: "max_in_flight", before: "4", after: "9", changed: true },
+      { field: "description", before: "blank", after: "now described", changed: true },
+      { field: "model_name", after: "glm-5-3", changed: false },
+    ]);
+    expect(changeLine(update, undefined)).toBe("max in flight 4 → 9, description blank → now described");
+    // Rows written before the gateway recorded changes compare as before.
+    expect(recordedChanges(earlier)).toBeNull();
   });
 });
 

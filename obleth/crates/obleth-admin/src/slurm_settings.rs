@@ -778,9 +778,8 @@ pub async fn put_slurm_settings(
 
     state.store.put_slurm_settings(&settings).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "set_slurm_settings",
             "settings",
             "slurm",

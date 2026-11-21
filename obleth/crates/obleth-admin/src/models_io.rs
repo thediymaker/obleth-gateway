@@ -21,9 +21,7 @@ use obleth_store::ModelImportWrite;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 
-use crate::{
-    audit_actor, sync_model_from, validate_capacity_fields, AdminError, AdminState, Result,
-};
+use crate::{sync_model_from, validate_capacity_fields, AdminError, AdminState, Result};
 
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub(crate) struct ExportQuery {
@@ -112,9 +110,8 @@ pub(crate) async fn export_models(
     };
 
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "export_models",
             "gateway",
             "model_manifest",
@@ -384,9 +381,8 @@ pub(crate) async fn import_models(
     }
 
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "import_models",
             "gateway",
             "model_manifest",

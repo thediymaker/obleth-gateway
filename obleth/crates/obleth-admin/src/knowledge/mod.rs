@@ -6,7 +6,7 @@ pub mod indexer;
 
 use std::collections::HashMap;
 
-use crate::{audit_actor, sync_model, AdminError, AdminState, Result};
+use crate::{sync_model, AdminError, AdminState, Result};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
@@ -176,12 +176,11 @@ pub async fn create_collection(
         .await?;
     let view = CollectionView::from_collection(&collection, 0, 0);
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "create_knowledge_collection",
             "knowledge_collection",
-            &collection.id.to_string(),
+            collection.id,
             serde_json::to_value(&view).unwrap_or_default(),
         )
         .await?;
@@ -253,12 +252,11 @@ pub async fn update_collection(
         .await?;
     let view = view_with_size(&state, collection).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "update_knowledge_collection",
             "knowledge_collection",
-            &id.to_string(),
+            id,
             serde_json::to_value(&view).unwrap_or_default(),
         )
         .await?;
@@ -277,12 +275,11 @@ pub async fn delete_collection(
 ) -> Result<StatusCode> {
     state.store.delete_collection(id).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "delete_knowledge_collection",
             "knowledge_collection",
-            &id.to_string(),
+            id,
             serde_json::json!({}),
         )
         .await?;
@@ -418,12 +415,11 @@ pub async fn upload_document(
     // rather than a second worker claiming it right now.
     let view = DocumentView::from_document(&doc);
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "upload_knowledge_document",
             "knowledge_document",
-            &doc.id.to_string(),
+            doc.id,
             serde_json::to_value(&view).unwrap_or_default(),
         )
         .await?;
@@ -446,12 +442,11 @@ pub async fn delete_document(
     // some other write happens to touch the collection.
     state.store.bump_collection_version(collection_id).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "delete_knowledge_document",
             "knowledge_document",
-            &id.to_string(),
+            id,
             serde_json::json!({ "collection_id": collection_id }),
         )
         .await?;
@@ -472,12 +467,11 @@ pub async fn reindex_collection(
 ) -> Result<Json<ReindexResult>> {
     let documents_requeued = state.store.reindex_collection_documents(id).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "reindex_knowledge_collection",
             "knowledge_collection",
-            &id.to_string(),
+            id,
             serde_json::json!({ "documents_requeued": documents_requeued }),
         )
         .await?;
@@ -510,12 +504,11 @@ pub async fn reindex_document(
     let doc = state.store.reindex_document(id).await?;
     let view = DocumentView::from_document(&doc);
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "reindex_knowledge_document",
             "knowledge_document",
-            &id.to_string(),
+            id,
             serde_json::to_value(&view).unwrap_or_default(),
         )
         .await?;
@@ -737,12 +730,11 @@ pub async fn set_model_collections(
     // set on the model's next request, instead of waiting on the 15s refresh.
     sync_model(&state, &updated).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "set_model_knowledge_collections",
             "model",
-            &id.to_string(),
+            id,
             serde_json::json!({
                 "collection_ids": body.collection_ids,
                 "knowledge_boon_granted": updated.boons != model.boons,
@@ -910,9 +902,8 @@ pub async fn put_knowledge_settings(
     state.store.put_boon_settings(&settings).await?;
     let view = KnowledgeSettingsView::from_settings(&settings.knowledge);
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "set_knowledge_settings",
             "settings",
             "knowledge",

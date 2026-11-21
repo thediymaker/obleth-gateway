@@ -195,6 +195,30 @@ impl AdminState {
             self.ceiling.clone(),
         )
     }
+
+    /// Record an audit row for a change made by the request's caller (the
+    /// actor comes from its headers, see [`audit_actor`]). Action names are
+    /// `<verb>_<entity>` or, for one field, `set_<entity>_<field>`; stored
+    /// rows keep the names they were written with.
+    pub(crate) async fn audit(
+        &self,
+        headers: &HeaderMap,
+        action: &str,
+        entity_type: &str,
+        entity_id: impl std::fmt::Display,
+        detail: serde_json::Value,
+    ) -> Result<()> {
+        self.store
+            .record_audit(
+                &audit_actor(headers),
+                action,
+                entity_type,
+                &entity_id.to_string(),
+                detail,
+            )
+            .await?;
+        Ok(())
+    }
 }
 
 /// A boxed call into the data plane's classifier: `(prompt, available_tags)`
@@ -2137,12 +2161,11 @@ async fn create_tenant(
         tenant = state.store.set_tenant_synthetic(tenant.id, true).await?;
     }
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "create_tenant",
             "tenant",
-            &tenant.id.to_string(),
+            tenant.id,
             serde_json::to_value(&tenant).unwrap_or_default(),
         )
         .await?;
@@ -2191,12 +2214,11 @@ async fn update_tenant(
     // Name is denormalized into every resolved key; re-push the tenant's keys.
     sync_tenant_keys(&state, id).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "update_tenant",
             "tenant",
-            &id.to_string(),
+            id,
             serde_json::to_value(&tenant).unwrap_or_default(),
         )
         .await?;
@@ -2224,12 +2246,11 @@ async fn set_tenant_status(
     // Status gates admission in the data plane; refresh the cached keys.
     sync_tenant_keys(&state, id).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "set_tenant_status",
             "tenant",
-            &id.to_string(),
+            id,
             serde_json::json!({ "status": status }),
         )
         .await?;
@@ -2287,12 +2308,11 @@ async fn set_tenant_schedule(
     // Schedule gates admission in the data plane; refresh the cached keys.
     sync_tenant_keys(&state, id).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "set_tenant_schedule",
             "tenant",
-            &id.to_string(),
+            id,
             serde_json::json!({
                 "timezone": tenant.timezone,
                 "active_from": tenant.active_from,
@@ -2337,12 +2357,11 @@ async fn set_tenant_budget(
     // Budget gates admission in the data plane; refresh the cached keys.
     sync_tenant_keys(&state, id).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "set_tenant_budget",
             "tenant",
-            &id.to_string(),
+            id,
             serde_json::json!({
                 "budget_tokens": tenant.budget_tokens,
                 "budget_cost_usd": tenant.budget_cost_usd,
@@ -2378,12 +2397,11 @@ async fn set_tenant_allowlist(
     // Allowlist gates admission in the data plane; refresh the cached keys.
     sync_tenant_keys(&state, id).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "set_tenant_allowlist",
             "tenant",
-            &id.to_string(),
+            id,
             serde_json::json!({ "allowed_models": tenant.allowed_models }),
         )
         .await?;
@@ -2408,12 +2426,11 @@ async fn set_tenant_guardrails(
     // Guardrails gate data-plane behaviour; refresh the cached keys.
     sync_tenant_keys(&state, id).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "set_tenant_guardrails",
             "tenant",
-            &id.to_string(),
+            id,
             serde_json::json!({ "guardrails_policy": tenant.guardrails_policy }),
         )
         .await?;
@@ -2438,12 +2455,11 @@ async fn set_tenant_compression(
     // Compression gating reads the cached key; refresh it.
     sync_tenant_keys(&state, id).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "set_tenant_compression",
             "tenant",
-            &id.to_string(),
+            id,
             serde_json::json!({ "compression_policy": tenant.compression_policy }),
         )
         .await?;
@@ -3196,9 +3212,8 @@ async fn put_alert_settings(
     state.alerts.update(settings.clone());
     publish_setting(&state, SavedSetting::Alerts).await;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "set_alert_settings",
             "settings",
             "alerts",
@@ -3416,9 +3431,8 @@ async fn put_auto_router_settings(
 
     state.store.put_auto_router_settings(&settings).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "set_auto_router_settings",
             "settings",
             "auto_router",
@@ -4490,14 +4504,7 @@ async fn put_boon_settings(
             .map_err(|e| AdminError::BadRequest(format!("speculation_verify_url_template: {e}")))?;
     }
     state.store.put_boon_settings(&settings).await?;
-    state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
-            "set_boon_settings",
-            "settings",
-            "boons",
-            serde_json::json!({
+    state.audit(&headers, "set_boon_settings", "settings", "boons", serde_json::json!({
                 "vision_enabled": settings.vision.enabled,
                 "vision_fallback_model": settings.vision.fallback_model,
                 "vision_max_images": settings.vision.max_images,
@@ -4530,8 +4537,7 @@ async fn put_boon_settings(
                 "web_search_max_results": settings.web_search.max_results,
                 "web_search_max_searches_per_request": settings.web_search.max_searches_per_request,
                 "web_search_timeout_ms": settings.web_search.timeout_ms,
-            }),
-        )
+            }))
         .await?;
     Ok(Json(BoonSettingsView::from_settings(&settings)))
 }
@@ -4688,9 +4694,8 @@ async fn put_energy_settings(
     let settings = merge_energy_settings(&existing, &body)?;
     state.store.put_energy_settings(&settings).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "set_energy_settings",
             "settings",
             "energy",
@@ -5008,9 +5013,8 @@ async fn put_charo_settings(
     let settings: obleth_config::CharoSettings = body.into();
     state.store.set_charo_settings(&settings).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "set_charo_settings",
             "settings",
             "charo",
@@ -5054,12 +5058,11 @@ async fn delete_tenant(
     // The Postgres delete stands either way, so it is audited before an
     // eviction failure is reported.
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "delete_tenant",
             "tenant",
-            &id.to_string(),
+            id,
             serde_json::json!({ "keys_removed": hashes.len(), "cache_evicted": evicted.is_ok() }),
         )
         .await?;
@@ -5084,12 +5087,11 @@ async fn set_tenant_weight(
         .await?;
     sync_tenant_keys(&state, id).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "update_weight",
             "tenant",
-            &id.to_string(),
+            id,
             serde_json::json!({ "weight": body.weight }),
         )
         .await?;
@@ -5114,12 +5116,11 @@ async fn set_tenant_quota(
         .await?;
     sync_tenant_keys(&state, id).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "update_quota",
             "tenant",
-            &id.to_string(),
+            id,
             serde_json::json!({
                 "tokens_per_minute": body.tokens_per_minute,
                 "max_in_flight": body.max_in_flight
@@ -5193,12 +5194,11 @@ async fn create_key(
         push_key(&state, &hash, &resolved).await?;
     }
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "create_key",
             "api_key",
-            &key.id.to_string(),
+            key.id,
             serde_json::json!({
                 "tenant_id": tenant_id,
                 "prefix": key.key_prefix,
@@ -5588,12 +5588,11 @@ async fn update_key(
     // drops its local copy, so a narrowed list applies within moments.
     push_key(&state, &hash, &resolved).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "update_key",
             "api_key",
-            &id.to_string(),
+            id,
             serde_json::json!({
                 "tenant_id": key.tenant_id,
                 "prefix": key.key_prefix,
@@ -5625,12 +5624,11 @@ async fn delete_key(
     let evicted = evict_keys(&state, std::slice::from_ref(&hash), "the key").await;
     // Audited before an eviction failure is reported: the row is gone.
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "delete_key",
             "api_key",
-            &id.to_string(),
+            id,
             serde_json::json!({ "cache_evicted": evicted.is_ok() }),
         )
         .await?;
@@ -5676,12 +5674,11 @@ async fn set_key_flag(
         ),
     };
     state
-        .store
-        .record_audit(
-            &audit_actor(headers),
+        .audit(
+            headers,
             &action,
             "api_key",
-            &id.to_string(),
+            id,
             serde_json::json!({ flag.column(): on }),
         )
         .await?;
@@ -5705,15 +5702,7 @@ async fn move_key(
 ) -> Result<Json<ApiKey>> {
     let (hash, key, resolved, from) = state.store.move_api_key(id, body.tenant_id).await?;
     push_key(&state, &hash, &resolved).await?;
-    state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
-            "move_key",
-            "api_key",
-            &id.to_string(),
-            serde_json::json!({ "prefix": key.key_prefix, "from": from, "tenant_id": key.tenant_id }),
-        )
+    state.audit(&headers, "move_key", "api_key", id, serde_json::json!({ "prefix": key.key_prefix, "from": from, "tenant_id": key.tenant_id }))
         .await?;
     Ok(Json(key))
 }
@@ -5795,16 +5784,15 @@ async fn set_tenant_tracing_handler(
         .await?;
     sync_tenant_keys(&state, id).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             if body.tracing_enabled {
                 "enable_tenant_tracing"
             } else {
                 "disable_tenant_tracing"
             },
             "tenant",
-            &id.to_string(),
+            id,
             serde_json::json!({ "tracing_enabled": body.tracing_enabled }),
         )
         .await?;
@@ -5827,12 +5815,11 @@ async fn set_tenant_synthetic_handler(
     // The flag is denormalized into every resolved key; re-push the tenant's keys.
     sync_tenant_keys(&state, id).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "set_tenant_synthetic",
             "tenant",
-            &id.to_string(),
+            id,
             serde_json::json!({ "synthetic": body.synthetic }),
         )
         .await?;
@@ -6440,9 +6427,8 @@ async fn put_key_prefix(
     let previous = state.store.key_prefix().await?;
     state.store.put_key_prefix_setting(prefix).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "set_key_prefix",
             "settings",
             "key_prefix",
@@ -6550,9 +6536,8 @@ async fn put_network_settings(
     let previous = state.store.named_networks().await?;
     state.store.put_named_networks(&networks).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "set_named_networks",
             "settings",
             "named_networks",
@@ -6619,9 +6604,8 @@ async fn put_usage_retention(
     let settings = obleth_config::UsageRetentionSettings { days: body.days };
     state.store.put_usage_retention_settings(&settings).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "set_usage_retention",
             "settings",
             "usage_retention",
@@ -6651,9 +6635,8 @@ async fn compact_usage(
 ) -> Result<Json<CompactUsageResult>> {
     let result = usage_retention::compact_usage_now(&state).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "compact_usage",
             "usage",
             "usage",
@@ -7871,9 +7854,8 @@ async fn create_fairshare_group(
         .create_fairshare_group(&body.name, validate_weight(body.weight.unwrap_or(100))?)
         .await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "create_fairshare_group",
             "fairshare_group",
             &group.name,
@@ -7901,9 +7883,8 @@ async fn set_fairshare_group_weight(
         .await?;
     sync_group_keys(&state, &name).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "update_fairshare_group_weight",
             "fairshare_group",
             &name,
@@ -7931,12 +7912,11 @@ async fn set_tenant_group(
         .await?;
     sync_tenant_keys(&state, id).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "update_tenant_group",
             "tenant",
-            &id.to_string(),
+            id,
             serde_json::json!({ "fairshare_group": body.fairshare_group }),
         )
         .await?;
@@ -8009,9 +7989,8 @@ async fn resync_resolver_cache(
 ) -> Result<Json<ResyncReport>> {
     let report = resync_resolvers(&state).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "resync_resolver_cache",
             "gateway",
             "resolver_cache",
@@ -8517,12 +8496,11 @@ async fn create_model(
         .await?;
     sync_model(&state, &model).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "create_model",
             "model",
-            &model.id.to_string(),
+            model.id,
             serde_json::to_value(ModelRouteView::from(model.clone())).unwrap_or_default(),
         )
         .await?;
@@ -8714,17 +8692,46 @@ async fn update_model(
     }
     sync_model_from(&state, &model, Some(&existing)).await?;
     advice::invalidate();
+    let view = ModelRouteView::from(model);
+    let changes = changed_fields(&ModelRouteView::from(existing), &view);
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "update_model",
             "model",
-            &id.to_string(),
-            serde_json::json!({ "model_name": model.model_name }),
+            id,
+            serde_json::json!({ "model_name": view.model_name, "changes": changes }),
         )
         .await?;
-    Ok(Json(model.into()))
+    Ok(Json(view))
+}
+
+/// The top-level fields that differ between two serialized views, as
+/// `{field: {"before": .., "after": ..}}`, leaving out the row's timestamps.
+/// Audit details take it from the API's own view, so a secret the view hides
+/// (an upstream key, header values) never reaches the log.
+fn changed_fields<T: Serialize>(
+    before: &T,
+    after: &T,
+) -> serde_json::Map<String, serde_json::Value> {
+    let (Ok(serde_json::Value::Object(before)), Ok(serde_json::Value::Object(after))) =
+        (serde_json::to_value(before), serde_json::to_value(after))
+    else {
+        return serde_json::Map::new();
+    };
+    after
+        .into_iter()
+        .filter(|(field, _)| !matches!(field.as_str(), "created_at" | "updated_at"))
+        .filter_map(|(field, after)| {
+            let before = before.get(&field).cloned().unwrap_or_default();
+            (before != after).then(|| {
+                (
+                    field,
+                    serde_json::json!({ "before": before, "after": after }),
+                )
+            })
+        })
+        .collect()
 }
 
 #[utoipa::path(
@@ -8745,12 +8752,11 @@ async fn set_model_capacity(
         .await?;
     sync_model(&state, &model).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "set_model_capacity",
             "model",
-            &id.to_string(),
+            id,
             serde_json::json!({ "max_in_flight": model.max_in_flight }),
         )
         .await?;
@@ -8891,12 +8897,11 @@ async fn set_model_status(
     let model = state.store.set_model_lifecycle(id, &lifecycle).await?;
     sync_model(&state, &model).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "set_model_status",
             "model",
-            &id.to_string(),
+            id,
             serde_json::json!({
                 "model_name": model.model_name,
                 "status": lifecycle.status,
@@ -8939,12 +8944,11 @@ async fn set_model_reasoning(
     let model = state.store.set_model_reasoning(id, &body).await?;
     sync_model(&state, &model).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "set_model_reasoning",
             "model",
-            &id.to_string(),
+            id,
             serde_json::json!({
                 "model_name": model.model_name,
                 "reasoning": body,
@@ -8969,12 +8973,11 @@ async fn set_model_listing(
     let model = state.store.set_model_listed(id, body.listed).await?;
     sync_model(&state, &model).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "set_model_listing",
             "model",
-            &id.to_string(),
+            id,
             serde_json::json!({
                 "model_name": model.model_name,
                 "listed": body.listed,
@@ -9004,12 +9007,11 @@ async fn set_model_rejected_request_fields(
         .await?;
     sync_model(&state, &model).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "set_model_rejected_request_fields",
             "model",
-            &id.to_string(),
+            id,
             serde_json::json!({
                 "model_name": model.model_name,
                 "rejected_request_fields": model.rejected_request_fields,
@@ -9035,12 +9037,11 @@ async fn set_model_session_affinity(
     let model = state.store.set_model_session_affinity(id, &body).await?;
     sync_model(&state, &model).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "set_model_session_affinity",
             "model",
-            &id.to_string(),
+            id,
             serde_json::json!({
                 "model_name": model.model_name,
                 "session_affinity": body,
@@ -9154,12 +9155,11 @@ async fn create_model_family(
         .create_model_family(&name, &description, default_level, &members)
         .await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "create_model_family",
             "model_family",
-            &family.id.to_string(),
+            family.id,
             serde_json::json!({
                 "name": family.name,
                 "default_level": family.default_level,
@@ -9189,12 +9189,11 @@ async fn update_model_family(
         .update_model_family(id, &name, &description, default_level, &members)
         .await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "update_model_family",
             "model_family",
-            &id.to_string(),
+            id,
             serde_json::json!({
                 "name": family.name,
                 "default_level": family.default_level,
@@ -9218,12 +9217,11 @@ async fn delete_model_family(
     let family = state.store.get_model_family(id).await?;
     state.store.delete_model_family(id).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "delete_model_family",
             "model_family",
-            &id.to_string(),
+            id,
             serde_json::json!({ "name": family.name }),
         )
         .await?;
@@ -9267,12 +9265,11 @@ async fn set_model_capacity_mode(
         .await?;
     sync_model(&state, &model).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "set_model_capacity_mode",
             "model",
-            &id.to_string(),
+            id,
             serde_json::json!({
                 "capacity_mode": model.capacity_mode,
                 "capacity_source": model.capacity_source,
@@ -9307,12 +9304,11 @@ async fn autotune_model(
         .await
         .map_err(|e| AdminError::BadRequest(e.to_string()))?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "autotune_model",
             "model",
-            &id.to_string(),
+            id,
             serde_json::json!({
                 "recommended_max_in_flight": report.recommended_max_in_flight,
                 "knee_reason": report.knee_reason,
@@ -9353,12 +9349,11 @@ async fn apply_autotune_capacity(
         .await?;
     sync_model(&state, &model).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "apply_autotune_capacity",
             "model",
-            &id.to_string(),
+            id,
             serde_json::json!({
                 "max_in_flight": model.max_in_flight,
                 "capacity_mode": model.capacity_mode,
@@ -9386,12 +9381,11 @@ async fn set_model_weight(
         .await?;
     sync_model(&state, &model).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "set_model_weight",
             "model",
-            &id.to_string(),
+            id,
             serde_json::json!({ "admission_weight": model.admission_weight }),
         )
         .await?;
@@ -9416,12 +9410,11 @@ async fn set_model_cache(
         .await?;
     sync_model(&state, &model).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "set_model_cache",
             "model",
-            &id.to_string(),
+            id,
             serde_json::json!({
                 "cache_enabled": model.cache_enabled,
                 "cache_ttl_secs": model.cache_ttl_secs
@@ -9462,12 +9455,11 @@ async fn set_model_reliability(
         .await?;
     sync_model(&state, &model).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "set_model_reliability",
             "model",
-            &id.to_string(),
+            id,
             serde_json::json!({
                 "request_timeout_secs": model.request_timeout_secs,
                 "max_retries": model.max_retries,
@@ -9550,12 +9542,11 @@ async fn create_model_endpoint(
         .await?;
     sync_model(&state, &model).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "create_model_endpoint",
             "model_endpoint",
-            &endpoint.id.to_string(),
+            endpoint.id,
             serde_json::json!({
                 "model": model.model_name,
                 "name": endpoint.name,
@@ -9615,12 +9606,11 @@ async fn update_model_endpoint(
         .await?;
     sync_model(&state, &model).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "update_model_endpoint",
             "model_endpoint",
-            &endpoint.id.to_string(),
+            endpoint.id,
             serde_json::json!({
                 "model": model.model_name,
                 "name": endpoint.name,
@@ -9653,12 +9643,11 @@ async fn delete_model_endpoint(
         .await?;
     sync_model(&state, &model).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "delete_model_endpoint",
             "model_endpoint",
-            &endpoint_id.to_string(),
+            endpoint_id,
             serde_json::json!({ "model": model.model_name }),
         )
         .await?;
@@ -9737,12 +9726,11 @@ async fn put_managed_model(
         })
         .await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "put_managed_model",
             "managed_model",
-            &id.to_string(),
+            id,
             managed_model_audit(&spec),
         )
         .await?;
@@ -9797,12 +9785,11 @@ async fn delete_managed_model(
         .ok_or(obleth_store::StoreError::NotFound)?;
     state.store.delete_managed_model(id).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "delete_managed_model",
             "managed_model",
-            &id.to_string(),
+            id,
             managed_model_audit(&previous),
         )
         .await?;
@@ -9842,12 +9829,11 @@ async fn set_provision_error(
         .await?;
     if let Some(previous) = cleared {
         state
-            .store
-            .record_audit(
-                &audit_actor(&headers),
+            .audit(
+                &headers,
                 "clear_provision_error",
                 "managed_model",
-                &id.to_string(),
+                id,
                 serde_json::json!({ "cleared_error": previous }),
             )
             .await?;
@@ -9881,12 +9867,11 @@ async fn retry_managed_model(
     };
     state.store.clear_managed_backoff(id).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "retry_managed_model",
             "managed_model",
-            &id.to_string(),
+            id,
             serde_json::json!({
                 "paused_reason": before.paused_reason,
                 "failed_launches": before.failed_launches,
@@ -9916,12 +9901,11 @@ async fn roll_managed_model(
     }
     let n = state.store.request_model_roll(id).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "roll_managed_model",
             "managed_model",
-            &id.to_string(),
+            id,
             serde_json::json!({ "replicas": n }),
         )
         .await?;
@@ -9961,12 +9945,11 @@ async fn set_managed_backoff(
             .is_some_and(|m| m.paused_reason != body.paused_reason);
     if newly_paused {
         state
-            .store
-            .record_audit(
-                &audit_actor(&headers),
+            .audit(
+                &headers,
                 "pause_managed_model",
                 "managed_model",
-                &id.to_string(),
+                id,
                 serde_json::json!({
                     "paused_reason": body.paused_reason,
                     "paused_until": body.paused_until,
@@ -10014,12 +9997,11 @@ async fn create_replica(
         )
         .await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "create_replica",
             "model_replica",
-            &r.id.to_string(),
+            r.id,
             serde_json::to_value(&r).unwrap_or_default(),
         )
         .await?;
@@ -10076,12 +10058,11 @@ async fn patch_replica(
         .await?
         .ok_or(AdminError::NotFound)?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "patch_replica",
             "model_replica",
-            &id.to_string(),
+            id,
             serde_json::to_value(&current).unwrap_or_default(),
         )
         .await?;
@@ -10111,12 +10092,11 @@ async fn restart_replica(
     // only once the successor serves (or after the startup timeout).
     state.store.request_replica_replace(id).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "restart_replica",
             "model_replica",
-            &id.to_string(),
+            id,
             serde_json::json!({ "replace": true }),
         )
         .await?;
@@ -10150,12 +10130,11 @@ async fn delete_replica(
             // endpoint first) and let the clean-up drop the row once it ends.
             state.store.request_replica_cancel(id).await?;
             state
-                .store
-                .record_audit(
-                    &audit_actor(&headers),
+                .audit(
+                    &headers,
                     "cancel_replica",
                     "model_replica",
-                    &id.to_string(),
+                    id,
                     serde_json::json!({ "state": replica.state }),
                 )
                 .await?;
@@ -10172,12 +10151,11 @@ async fn delete_replica(
     }
     state.store.delete_replica(id).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "delete_replica",
             "model_replica",
-            &id.to_string(),
+            id,
             serde_json::json!({ "force": q.force }),
         )
         .await?;
@@ -10193,12 +10171,11 @@ pub async fn clear_lost_replicas(
 ) -> Result<Json<serde_json::Value>> {
     let n = state.store.delete_lost_replicas(id).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "clear_lost_replicas",
             "model",
-            &id.to_string(),
+            id,
             serde_json::json!({ "deleted": n }),
         )
         .await?;
@@ -10286,12 +10263,11 @@ async fn delete_model(
     }
     // Audited before an eviction failure is reported: the row is gone.
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "delete_model",
             "model",
-            &id.to_string(),
+            id,
             serde_json::json!({
                 "model_name": model.model_name,
                 "cache_evicted": evict_err.is_none(),
@@ -10330,12 +10306,11 @@ async fn create_mcp_server(
         .await?;
     sync_mcp_server(&state, &server).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "create_mcp_server",
             "mcp_server",
-            &server.id.to_string(),
+            server.id,
             serde_json::json!({
                 "name": server.name,
                 "upstream_url": server.upstream_url,
@@ -10455,14 +10430,7 @@ async fn update_mcp_server(
         regranted = models.into_iter().map(|m| m.model_name).collect();
     }
     sync_mcp_server(&state, &server).await?;
-    state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
-            "update_mcp_server",
-            "mcp_server",
-            &id.to_string(),
-            serde_json::json!({
+    state.audit(&headers, "update_mcp_server", "mcp_server", id, serde_json::json!({
                 "name": server.name,
                 "renamed_from": rename.as_ref().map(|_| existing.name.clone()),
                 "upstream_url": server.upstream_url,
@@ -10471,8 +10439,7 @@ async fn update_mcp_server(
                 "auth_header_set": server.auth_header.is_some(),
                 "auth_changed": body.auth_header.as_deref().is_some_and(|a| !a.trim().is_empty()) || (body.clear_auth && existing.auth_header.is_some()),
                 "models_regranted": regranted,
-            }),
-        )
+            }))
         .await?;
     Ok(Json(server.into()))
 }
@@ -10517,12 +10484,11 @@ async fn delete_mcp_server(
     }
     // Audited before a cache failure is reported: the rows are gone.
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "delete_mcp_server",
             "mcp_server",
-            &id.to_string(),
+            id,
             serde_json::json!({
                 "name": server.name,
                 "models_ungranted": stripped
@@ -10719,9 +10685,8 @@ async fn set_capacity(
     state.ceiling.apply(Some(body.max_in_flight));
     publish_setting(&state, SavedSetting::Capacity).await;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "set_capacity",
             "gateway",
             "global",
@@ -10744,9 +10709,8 @@ async fn clear_capacity(
     state.ceiling.apply(None);
     publish_setting(&state, SavedSetting::Capacity).await;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "clear_capacity",
             "gateway",
             "global",
@@ -11420,6 +11384,59 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    /// An `update_model` audit row lists the fields the update changed, with
+    /// their values before and after, and nothing it left alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn update_model_audit_lists_exactly_the_changed_fields() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let model = fixture_model(&t.store, &format!("audit-diff-{}", Uuid::new_v4()), 0.0).await;
+        let path = format!("/api/v1/models/{}", model.id);
+        let base = serde_json::json!({
+            "upstream_model": model.upstream_model,
+            "api_base": "http://127.0.0.1:1/v1",
+        });
+        let (status, body) = send(&t.app, json_request("PUT", &path, base.clone())).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let mut change = base.clone();
+        change.as_object_mut().unwrap().extend([
+            (
+                "description".to_string(),
+                serde_json::json!("now described"),
+            ),
+            ("max_in_flight".to_string(), serde_json::json!(9)),
+            ("tags".to_string(), serde_json::json!(["coding"])),
+        ]);
+        let (status, body) = send(&t.app, json_request("PUT", &path, change)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let rows = t
+            .store
+            .list_audit_filtered(&obleth_store::AuditFilter {
+                entity_id: Some(model.id.to_string()),
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let latest = rows
+            .iter()
+            .find(|r| r.action == "update_model")
+            .expect("an update_model row");
+        assert_eq!(
+            latest.detail["changes"],
+            serde_json::json!({
+                "description": { "before": "", "after": "now described" },
+                "max_in_flight": { "before": 4, "after": 9 },
+            }),
+        );
+        assert_eq!(latest.detail["model_name"], model.model_name.as_str());
+        let _ = t.store.delete_model(model.id).await;
     }
 
     /// Recipes follow the admin API's conventions: a delete answers 204 and

@@ -258,13 +258,37 @@ function show(v: unknown): string {
 
 const NOISE = new Set(["created_at", "updated_at", "id"]);
 
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
 /**
- * An event's fields, compared with the same thing's previous event when its
- * detail has the same shape: which values changed from what, then the rest.
+ * The field diff the gateway recorded with the event, when it did: an
+ * `update_model` detail carries `changes: { field: { before, after } }`.
+ */
+export function recordedChanges(e: AuditEntry): FieldChange[] | null {
+  const d = e.detail;
+  if (!isRecord(d) || !isRecord(d.changes)) return null;
+  return Object.entries(d.changes)
+    .filter((entry): entry is [string, Record<string, unknown>] => isRecord(entry[1]) && "after" in entry[1])
+    .map(([field, c]) => ({ field, before: show(c.before), after: show(c.after), changed: true }));
+}
+
+/**
+ * An event's fields: the changes the gateway recorded with it, or else a
+ * comparison with the same thing's previous event when its detail has the
+ * same shape. Which values changed from what, then the rest.
  */
 export function fieldChanges(e: AuditEntry, previous: AuditEntry | undefined): FieldChange[] {
   const d = (e.detail ?? {}) as Record<string, unknown>;
   if (typeof d !== "object" || Array.isArray(d)) return [{ field: "detail", after: show(d), changed: false }];
+  const recorded = recordedChanges(e);
+  if (recorded) {
+    const rest = Object.entries(d)
+      .filter(([k]) => k !== "changes" && !NOISE.has(k))
+      .map(([k, v]) => ({ field: k, after: show(v), changed: false }));
+    return [...recorded, ...rest];
+  }
   const p = previous && typeof previous.detail === "object" && previous.detail && !Array.isArray(previous.detail) ? (previous.detail as Record<string, unknown>) : null;
   const rows = Object.entries(d)
     .filter(([k]) => !NOISE.has(k))
@@ -276,7 +300,6 @@ export function fieldChanges(e: AuditEntry, previous: AuditEntry | undefined): F
   return rows.sort((a, b) => Number(b.changed) - Number(a.changed));
 }
 
-/** The same thing's previous event in the loaded rows (older), for comparing. */
 /**
  * Each entry's previous change to the same thing (for settings, the same
  * kind of change), by entry id, in one pass: what a line compares with.

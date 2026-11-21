@@ -44,7 +44,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::{audit_actor, AdminError, AdminState, Result};
+use crate::{AdminError, AdminState, Result};
 
 pub const HEALTH_GROUP: &str = "model-health";
 const CHECK_LIMIT: i64 = 50;
@@ -233,12 +233,11 @@ pub async fn activate(
         let model = state.store.set_model_enabled(id, true).await?;
         crate::sync_model(&state, &model).await?;
         state
-            .store
-            .record_audit(
-                &audit_actor(&headers),
+            .audit(
+                &headers,
                 "activate_model",
                 "model",
-                &id.to_string(),
+                id,
                 serde_json::json!({
                     "enabled": true,
                     "latency_ms": outcome.summary.last_latency_ms,
@@ -322,12 +321,11 @@ pub async fn update_config(
         )
         .await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "update_model_health_config",
             "model",
-            &id.to_string(),
+            id,
             serde_json::json!({
                 "checks_enabled": summary.checks_enabled,
                 "alerts_enabled": summary.alerts_enabled,

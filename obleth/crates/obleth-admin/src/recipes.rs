@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::{audit_actor, AdminError, AdminState, Result};
+use crate::{AdminError, AdminState, Result};
 
 #[derive(Serialize, ToSchema)]
 pub struct RecipeView {
@@ -79,14 +79,7 @@ pub async fn create_recipe(
             .await?,
     );
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
-            "create_recipe",
-            "recipe",
-            &r.id.to_string(),
-            audit_detail(&r),
-        )
+        .audit(&headers, "create_recipe", "recipe", r.id, audit_detail(&r))
         .await?;
     Ok(Json(r))
 }
@@ -118,14 +111,7 @@ pub async fn update_recipe(
             .await?,
     );
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
-            "update_recipe",
-            "recipe",
-            &r.id.to_string(),
-            audit_detail(&r),
-        )
+        .audit(&headers, "update_recipe", "recipe", r.id, audit_detail(&r))
         .await?;
     Ok(Json(r))
 }
@@ -140,12 +126,11 @@ pub async fn delete_recipe(
 ) -> Result<StatusCode> {
     state.store.delete_recipe(id).await?;
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "delete_recipe",
             "recipe",
-            &id.to_string(),
+            id,
             serde_json::json!({}),
         )
         .await?;

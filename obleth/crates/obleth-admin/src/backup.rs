@@ -18,7 +18,7 @@ use obleth_redis::SavedSetting;
 use obleth_store::CryptoError;
 
 use crate::ssrf::{SsrfPolicy, VERIFY_TEMPLATE_PLACEHOLDERS};
-use crate::{audit_actor, resync_resolvers, AdminError, AdminState, Result};
+use crate::{resync_resolvers, AdminError, AdminState, Result};
 
 #[utoipa::path(
     get, path = "/api/v1/backup/export", tag = "backup",
@@ -43,9 +43,8 @@ pub(crate) async fn export_backup(
     };
     // Audit counts only: the payload itself carries ciphertext and key hashes.
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
+        .audit(
+            &headers,
             "export_backup",
             "gateway",
             "backup",
@@ -153,14 +152,7 @@ pub(crate) async fn restore_backup(
         obj.insert("warnings".into(), serde_json::json!(report.warnings));
     }
     state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
-            "restore_backup",
-            "gateway",
-            "backup",
-            detail,
-        )
+        .audit(&headers, "restore_backup", "gateway", "backup", detail)
         .await?;
 
     Ok(Json(report))
