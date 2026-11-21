@@ -27,7 +27,8 @@
 //! request from the bucket and sends it through the ordinary pipeline in process, as
 //! the batch's owner, admitted to the model's background pool: it runs only
 //! while no interactive request waits for the model, and fills at most
-//! `OBLETH_BATCH_MAX_SHARE` of its slots (see `obleth_fairshare::PoolKey`).
+//! `OBLETH_BATCH_MAX_SHARE` of its slots (see `obleth_fairshare::PoolKey`),
+//! an item holding one slot per `OBLETH_BACKGROUND_SLOT_TOKENS` of prompt.
 //! Routing, guardrails, boons, budgets and the usage ledger apply as for any
 //! request; ledger rows carry `request_type = "batch"`.
 //!
@@ -260,6 +261,20 @@ pub(crate) fn background_share(batches: Option<&Batches>) -> f64 {
     batches
         .map(|b| b.cfg.share)
         .unwrap_or_else(|| *SHARE.get_or_init(share_from_env))
+}
+
+/// Prompt tokens per slot a background request holds in its model's pool,
+/// for batch items and background keys alike: `OBLETH_BACKGROUND_SLOT_TOKENS`,
+/// default 4096 (see `obleth_fairshare::background_slots`). 0 holds one slot
+/// per request whatever its prompt. Read from the environment once.
+pub(crate) fn background_slot_tokens() -> u32 {
+    static TOKENS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *TOKENS.get_or_init(|| {
+        env_num(
+            "OBLETH_BACKGROUND_SLOT_TOKENS",
+            obleth_fairshare::DEFAULT_BACKGROUND_SLOT_TOKENS,
+        )
+    })
 }
 
 /// `<n>h` or `<n>d` as a duration.

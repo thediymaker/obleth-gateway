@@ -227,6 +227,11 @@ obleth:
   # with batches off.
   batches:
     maxShare: "0.75"
+    # Prompt tokens per slot a background request holds: one with a 13,000
+    # token prompt holds 4 of the model's slots at 4096, so long prompts run
+    # fewer at once and slow interactive streams less. "0" holds one slot per
+    # request whatever its prompt.
+    slotTokens: "4096"
     maxLines: 50000
     maxFileBytes: 209715200
     maxActivePerKey: 10

@@ -330,6 +330,7 @@ async fn a_waited_on_interactive_pool_refuses_background_claims() {
         pool: interactive().slot_id(),
         tenant: Uuid::new_v4(),
         key: Uuid::new_v4(),
+        slots: 1,
         pool_cap: cap,
         global_cap: 100,
         sibling: Some(background().slot_id()),
@@ -474,4 +475,255 @@ async fn background_queue_counts_and_the_pools_only_snapshot_match_the_full_one(
     for w in waiting {
         admitted(w).await;
     }
+}
+
+// ---- background slots by prompt length ------------------------------------
+
+/// The background pool's requests and the slots they hold, from the live
+/// view: `(in_flight, slots)`.
+async fn bg_load(fs: &FairShare) -> (usize, usize) {
+    let snap = fs.snapshot().await.expect("snapshot");
+    snap.pools
+        .iter()
+        .find(|p| p.model == "m (background)")
+        .map_or((0, 0), |p| (p.in_flight, p.slots))
+}
+
+fn long(tenant: Uuid, cap: usize, slots: usize) -> AdmitRequest {
+    bg_req(tenant, cap, 0.5).slots(slots)
+}
+
+#[test]
+fn background_slots_follow_the_prompt() {
+    use obleth_fairshare::background_slots;
+    assert_eq!(background_slots(0, 4096), 1);
+    assert_eq!(background_slots(200, 4096), 1);
+    assert_eq!(background_slots(4096, 4096), 1);
+    assert_eq!(background_slots(4097, 4096), 2);
+    assert_eq!(background_slots(13_000, 4096), 4);
+    // Off: one slot whatever the prompt.
+    assert_eq!(background_slots(13_000, 0), 1);
+    assert_eq!(background_slots(u32::MAX, 0), 1);
+}
+
+/// A background request holds slots in proportion to its prompt, the
+/// background cap counts those slots rather than requests, and the
+/// interactive pool gives up exactly the slots background holds.
+#[tokio::test]
+async fn a_long_prompt_holds_slots_and_the_cap_counts_them() {
+    let fs = local(1024);
+    let t = Uuid::new_v4();
+    // 16 slots, half for background: 8.
+    let a = admit_now(&fs, background(), long(t, 16, 3)).await;
+    let b = admit_now(&fs, background(), long(t, 16, 3)).await;
+    assert_eq!((a.permit.slots(), b.permit.slots()), (3, 3));
+    assert_eq!(bg_load(&fs).await, (2, 6));
+    // Two requests run, but a third of 3 slots does not fit in the 2 left;
+    // a one-slot request behind it waits its turn rather than passing it.
+    let third = waiter(&fs, background(), long(t, 16, 3));
+    still_waiting(&third).await;
+    let small = waiter(&fs, background(), long(t, 16, 1));
+    still_waiting(&small).await;
+
+    // Interactive has the 10 slots background does not hold, and no more.
+    let mut people = Vec::new();
+    for _ in 0..10 {
+        people.push(admit_now(&fs, interactive(), req(Uuid::new_v4(), 16)).await);
+    }
+    assert!(people.iter().all(|p| p.permit.slots() == 1));
+    let eleventh = waiter(&fs, interactive(), req(Uuid::new_v4(), 16));
+    still_waiting(&eleventh).await;
+    // One background request ends: its 3 slots come back, and the waiting
+    // interactive request goes first (background yields while it waits).
+    drop(a);
+    let eleventh = admitted(eleventh).await;
+    still_waiting(&third).await;
+    drop(eleventh);
+    drop(people);
+    let third = admitted(third).await;
+    let small = admitted(small).await;
+    assert_eq!(bg_load(&fs).await, (3, 7));
+    drop((b, third, small));
+    assert_eq!(bg_load(&fs).await, (0, 0));
+}
+
+/// A prompt bigger than the whole background share holds the share and runs
+/// alone, once nothing else background runs, even with interactive work on
+/// the model; nothing background joins it meanwhile.
+#[tokio::test]
+async fn a_prompt_bigger_than_the_share_runs_alone() {
+    let fs = local(1024);
+    let t = Uuid::new_v4();
+    let small = admit_now(&fs, background(), long(t, 16, 1)).await;
+    let huge = waiter(&fs, background(), long(t, 16, 40));
+    still_waiting(&huge).await;
+    let person = admit_now(&fs, interactive(), req(Uuid::new_v4(), 16)).await;
+    drop(small);
+    let huge = admitted(huge).await;
+    assert_eq!(huge.permit.slots(), 8, "capped at the background share");
+    assert_eq!(bg_load(&fs).await, (1, 8));
+    let next = waiter(&fs, background(), long(t, 16, 1));
+    still_waiting(&next).await;
+    // The interactive pool still has what neither holds: 16 - 8 - 1.
+    let mut people = Vec::new();
+    for _ in 0..7 {
+        people.push(admit_now(&fs, interactive(), req(Uuid::new_v4(), 16)).await);
+    }
+    let over = waiter(&fs, interactive(), req(Uuid::new_v4(), 16));
+    still_waiting(&over).await;
+    drop((huge, person, people));
+    admitted(over).await;
+    admitted(next).await;
+}
+
+/// Every way a request ends gives back exactly the slots it held: a finished
+/// request, a caller that leaves while holding its slots, and one that leaves
+/// while still queued (which held none).
+#[tokio::test]
+async fn release_returns_exactly_what_was_held() {
+    let fs = local(1024);
+    let t = Uuid::new_v4();
+    // Finished.
+    let done = admit_now(&fs, background(), long(t, 16, 5)).await;
+    assert_eq!(bg_load(&fs).await, (1, 5));
+    drop(done);
+    assert_eq!(bg_load(&fs).await, (0, 0));
+
+    // A caller that goes away while holding (an aborted stream).
+    let holder = {
+        let fs = fs.clone();
+        tokio::spawn(async move {
+            let held = fs.admit_to(background(), long(t, 16, 4)).await;
+            std::future::pending::<()>().await;
+            drop(held);
+        })
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while bg_load(&fs).await != (1, 4) {
+        assert!(tokio::time::Instant::now() < deadline, "admitted");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // Queued behind it: 4 + 6 > 8.
+    let queued = waiter(&fs, background(), long(t, 16, 6));
+    still_waiting(&queued).await;
+    queued.abort();
+    holder.abort();
+    let _ = holder.await;
+    assert_eq!(bg_load(&fs).await, (0, 0));
+    // Nothing leaked: the whole share is there again.
+    let all = admit_now(&fs, background(), long(t, 16, 8)).await;
+    assert_eq!(bg_load(&fs).await, (1, 8));
+    drop(all);
+    assert_eq!(bg_load(&fs).await, (0, 0));
+}
+
+/// With slot tokens off every background request asks for one slot, and the
+/// share counts requests as before.
+#[tokio::test]
+async fn one_slot_per_request_when_slot_tokens_are_off() {
+    let fs = local(1024);
+    let t = Uuid::new_v4();
+    let one = obleth_fairshare::background_slots(13_000, 0);
+    let mut held = Vec::new();
+    for _ in 0..8 {
+        held.push(admit_now(&fs, background(), long(t, 16, one)).await);
+    }
+    assert_eq!(bg_load(&fs).await, (8, 8));
+    let ninth = waiter(&fs, background(), long(t, 16, one));
+    still_waiting(&ninth).await;
+    held.pop();
+    admitted(ninth).await;
+}
+
+/// Slots are a background matter: an interactive request holds one slot
+/// whatever it asks for.
+#[tokio::test]
+async fn interactive_requests_hold_one_slot_each() {
+    let fs = local(1024);
+    let mut held = Vec::new();
+    for _ in 0..4 {
+        held.push(admit_now(&fs, interactive(), req(Uuid::new_v4(), 4).slots(3)).await);
+    }
+    assert!(held.iter().all(|a| a.permit.slots() == 1));
+    let snap = fs.snapshot().await.expect("snapshot");
+    let fg = snap.pools.iter().find(|p| p.model == "m").expect("pool");
+    assert_eq!((fg.in_flight, fg.slots), (4, 4));
+    let fifth = waiter(&fs, interactive(), req(Uuid::new_v4(), 4));
+    still_waiting(&fifth).await;
+    held.pop();
+    admitted(fifth).await;
+}
+
+/// Across gateways the backend counts each gateway's multi-slot holds in the
+/// pool and one request each in the global count, they add up against the
+/// share, and they come back exactly on release and when a gateway dies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_slot_holds_add_up_across_gateways() {
+    let cluster = InMemoryCluster::new();
+    let gws = gateways(&cluster, 2, 4096);
+    for fs in &gws {
+        wait_for_shared(fs).await;
+    }
+    let pool = background().slot_id();
+    let t = Uuid::new_v4();
+    let a = admit_now(&gws[0], background(), long(t, 16, 4)).await;
+    let b = admit_now(&gws[1], background(), long(t, 16, 3)).await;
+    assert_eq!(cluster.pool_in_flight(&pool), 7);
+    assert_eq!(cluster.global_in_flight(), 2);
+    assert_eq!(
+        (cluster.held("gw-0", &pool), cluster.held("gw-1", &pool)),
+        (4, 3)
+    );
+    // 7 + 2 > 8 cluster-wide, though gw-0 alone holds only 4.
+    let more = waiter(&gws[0], background(), long(t, 16, 2));
+    still_waiting(&more).await;
+    drop(a);
+    let more = admitted(more).await;
+    assert_eq!(cluster.pool_in_flight(&pool), 5);
+    assert_eq!(cluster.global_in_flight(), 2);
+
+    // gw-1's heartbeat runs out: its 3 slots, and only those, come back.
+    cluster.kill("gw-1");
+    assert_eq!(cluster.pool_in_flight(&pool), 2);
+    assert_eq!(cluster.global_in_flight(), 1);
+    drop(b);
+    drop(more);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while cluster.pool_in_flight(&pool) != 0 || cluster.global_in_flight() != 0 {
+        assert!(tokio::time::Instant::now() < deadline, "released cleanly");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(bg_load(&gws[0]).await, (0, 0));
+}
+
+/// A claim that fails on a backend outage gives its local slots back before
+/// the gateway falls back to its split; the request admitted there is then
+/// written to the backend by the reconcile with all its slots, and its
+/// release clears them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_slot_holds_survive_a_backend_outage() {
+    let cluster = InMemoryCluster::new();
+    let gws = gateways(&cluster, 2, 4096);
+    for fs in &gws {
+        wait_for_shared(fs).await;
+    }
+    let pool = background().slot_id();
+    let t = Uuid::new_v4();
+    cluster.set_failing(true);
+    // The split gives this gateway 8 of 16, 4 of them background.
+    let held = admit_now(&gws[0], background(), long(t, 16, 4)).await;
+    assert_eq!(held.permit.slots(), 4);
+    assert_eq!(bg_load(&gws[0]).await, (1, 4));
+    assert_eq!(gws[0].stats().mode(), SlotMode::Fallback);
+    cluster.set_failing(false);
+    wait_for_shared(&gws[0]).await;
+    assert_eq!(cluster.held("gw-0", &pool), 4);
+    assert_eq!(cluster.global_in_flight(), 1);
+    drop(held);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while cluster.pool_in_flight(&pool) != 0 || cluster.global_in_flight() != 0 {
+        assert!(tokio::time::Instant::now() < deadline, "released cleanly");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(bg_load(&gws[0]).await, (0, 0));
 }

@@ -269,6 +269,8 @@ return { tokens, cost }
 // - the totals hash (`obleth:fairshare:slots`): the cluster-wide count per
 //   limit, `g` for every pool together, `p|<pool>` per pool, and
 //   `t|<pool>|<tenant>` and `k|<pool>|<key>` per tenant and key in a pool,
+//   all counting requests except `p|<pool>`, which counts slots: one per
+//   request, or more for a background request with a long prompt,
 //   plus wait markers (`w|<pool>`, and `w` for the global ceiling) holding
 //   the Redis time until which some replica is waiting for a slot there, and
 //   starving markers (`wa|<pool>`) until which a request there has waited
@@ -477,6 +479,8 @@ return out
 /// to this pool's when checking the pool cap
 /// ARGV[16] = '1' for a background claim: any refusal marks only its own
 /// pool as waited on, never the global ceiling
+/// ARGV[17] = slots the claim takes in the pool (missing: 1); the global,
+/// tenant and key counts take one whatever it is
 ///
 /// A replica whose heartbeat has expired may not take slots: its holdings
 /// are about to be (or have been) reclaimed. Held slots that ran out are
@@ -485,9 +489,12 @@ return out
 /// held slots other than its own. If a slot is still held under ARGV[12], the claim takes it
 /// over: its counts move into this replica's holdings and the totals stay as
 /// they are, since it never stopped counting. A claim for a held slot alone
-/// stops there when none is held. Otherwise, if the pool, the
-/// global count, the tenant and the key are all under their caps, all four
-/// counters are taken together, in the totals and in the holdings; if any is
+/// stops there when none is held. Otherwise, if the pool has room for
+/// ARGV[17] slots (or holds none at all and is not full with its other
+/// pool, so a claim bigger than the room runs alone), and the global count,
+/// the tenant and the key are all under their caps, all four counters are
+/// taken together, the pool's by ARGV[17] and the rest by one, in the
+/// totals and in the holdings; if any is
 /// at its cap nothing is taken and the pool (or, for the global ceiling, the
 /// ceiling) is marked as waited on, so the next release there publishes.
 /// A background claim (ARGV[16]) is refused as pool full while its model's
@@ -546,6 +553,7 @@ if ARGV[12] ~= '' then
 end
 
 local tcap, kcap = tonumber(ARGV[7]), tonumber(ARGV[8])
+local slots = math.max(1, tonumber(ARGV[17] or '1') or 1)
 local sib = 0
 if ARGV[15] ~= '' then
   sib = tonumber(redis.call('HGET', totals, 'p|' .. ARGV[15])) or 0
@@ -556,7 +564,9 @@ if ARGV[16] == '1' then
   local w = redis.call('HMGET', totals, 'w|' .. ARGV[15], 'w')
   yield = (tonumber(w[1]) or 0) > now or (tonumber(w[2]) or 0) > now
 end
-if yield or p + sib >= tonumber(ARGV[5]) then code = 0
+local pcap = tonumber(ARGV[5])
+local fits = p + sib + slots <= pcap or (p == 0 and sib < pcap)
+if yield or not fits then code = 0
 elseif g >= tonumber(ARGV[6]) then code = -1
 elseif tcap > 0 and tn >= tcap then code = -2
 elseif kcap > 0 and kn >= kcap then code = -3
@@ -568,23 +578,27 @@ if code ~= 1 then
   return { code, p, g }
 end
 
-for _, f in ipairs({ 'g', pf, tf, kf }) do
+for _, f in ipairs({ 'g', tf, kf }) do
   redis.call('HINCRBY', totals, f, 1)
   redis.call('HINCRBY', held, f, 1)
 end
-return { 1, p + 1, g + 1 }
+redis.call('HINCRBY', totals, pf, slots)
+redis.call('HINCRBY', held, pf, slots)
+return { 1, p + slots, g + 1 }
 "#
 );
 
-/// Give back one slot this replica holds.
+/// Give back one request's slots this replica holds.
 ///
 /// KEYS[1] = slot totals hash, KEYS[2] = this replica's holdings
 /// ARGV[1] = pool id, ARGV[2] = tenant, ARGV[3] = key, ARGV[4] = release
-/// channel, ARGV[5] = the same model's other pool ('' for none)
+/// channel, ARGV[5] = the same model's other pool ('' for none),
+/// ARGV[6] = the slots its claim took in the pool (missing: 1)
 ///
-/// Each counter is decremented only where this replica's holdings still
-/// record it, so a release after a reclaim or a reconcile that already
-/// dropped the slot frees nothing twice. Publishes the pool id when a slot
+/// The pool count drops by ARGV[6] and the global, tenant and key counts by
+/// one, each only as far as this replica's holdings still record it, so a
+/// release after a reclaim or a reconcile that already dropped the slot
+/// frees nothing twice. Publishes the pool id when a slot
 /// was freed and someone is waiting on the pool or the ceiling, and the
 /// other pool's id when someone is waiting there.
 ///
@@ -595,11 +609,15 @@ pub const SLOT_RELEASE: &str = concat!(
 local totals, held = KEYS[1], KEYS[2]
 local pool = ARGV[1]
 local pf = 'p|' .. pool
+local slots = math.max(1, tonumber(ARGV[6] or '1') or 1)
 local freed = 0
 for _, f in ipairs({ 'g', pf, 't|' .. pool .. '|' .. ARGV[2], 'k|' .. pool .. '|' .. ARGV[3] }) do
-  if (tonumber(redis.call('HGET', held, f)) or 0) > 0 then
-    adjust(held, f, -1)
-    adjust(totals, f, -1)
+  local h = tonumber(redis.call('HGET', held, f)) or 0
+  if h > 0 then
+    local n = 1
+    if f == pf then n = math.min(slots, h) end
+    adjust(held, f, -n)
+    adjust(totals, f, -n)
     if f == pf then freed = 1 end
   end
 end

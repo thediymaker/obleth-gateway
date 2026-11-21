@@ -70,6 +70,11 @@ pub struct ReplicaPoolView {
     /// The pool size as configured (cluster-wide).
     pub configured_cap: usize,
     pub in_flight: usize,
+    /// The pool slots those requests hold: `in_flight`, or more in a
+    /// background pool with long prompts. A replica that predates the field
+    /// sends none, read as `in_flight`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub slots: usize,
     pub queued: usize,
     /// Groups with a request running or waiting.
     #[serde(default)]
@@ -237,6 +242,7 @@ struct KeyAcc {
 struct PoolAcc {
     configured_cap: Option<usize>,
     in_flight: usize,
+    slots: usize,
     queued: usize,
     groups: BTreeMap<String, GroupAcc>,
     tenants: HashMap<Uuid, TenantAcc>,
@@ -272,6 +278,7 @@ pub fn merge_views(
             });
             acc.configured_cap.get_or_insert(p.configured_cap.max(1));
             acc.in_flight += p.in_flight;
+            acc.slots += p.slots.max(p.in_flight);
             acc.queued += p.queued;
             for g in &p.groups {
                 let e = acc.groups.entry(g.name.clone()).or_default();
@@ -372,7 +379,7 @@ fn merge_pool(
 
     // The same room the scheduler splits between groups: the pool, or less
     // when the global ceiling leaves less than that.
-    let effective = cap.min(acc.in_flight.saturating_add(headroom)).max(1);
+    let effective = cap.min(acc.slots.saturating_add(headroom)).max(1);
     let active_groups: Vec<(String, i64)> = shares
         .groups
         .keys()
@@ -445,6 +452,7 @@ fn merge_pool(
         cap,
         configured_cap: cap,
         in_flight: acc.in_flight,
+        slots: acc.slots,
         cluster_in_flight: None,
         queued: acc.queued,
         borrowed: groups.iter().map(|g| g.borrowed).sum(),

@@ -2410,6 +2410,7 @@ async fn run_pipeline(
             route: route.as_deref(),
             weight: effective_weight,
             cost: est.total(),
+            prompt_tokens: est.input_tokens,
             end_user: end_user.as_deref(),
             batch: batch.as_ref(),
             session_id: Some(req_meta.session_id.as_str()),
@@ -5113,6 +5114,7 @@ pub(crate) fn admit_request_for(
         session: None,
         affinity: Default::default(),
         background_share: None,
+        slots: 1,
     }
 }
 
@@ -7393,6 +7395,9 @@ pub(crate) struct Admit<'a> {
     pub route: Option<&'a ResolvedModel>,
     pub weight: i64,
     pub cost: u32,
+    /// The prompt's estimated tokens (the input part of `cost`): background
+    /// work holds slots of the model in proportion to it.
+    pub prompt_tokens: u32,
     pub end_user: Option<&'a str>,
     /// A batch item's own share and wait; interactive work has none.
     pub batch: Option<&'a BackgroundShare>,
@@ -7443,9 +7448,19 @@ pub(crate) async fn admit(
         spec.end_user,
     );
     // Background work keeps no session slots: a slot held idle for a
-    // session's next step would hold back interactive requests.
+    // session's next step would hold back interactive requests. It holds a
+    // slot per `OBLETH_BACKGROUND_SLOT_TOKENS` of prompt, since a long
+    // prompt's prefill slows every stream on the replica that runs it.
     match (&background, spec.session_id) {
-        (Some(b), _) => admit_req = admit_req.background_share(b.share),
+        (Some(b), _) => {
+            admit_req =
+                admit_req
+                    .background_share(b.share)
+                    .slots(obleth_fairshare::background_slots(
+                        spec.prompt_tokens,
+                        crate::batches::background_slot_tokens(),
+                    ))
+        }
         (None, Some(session)) if route_keeps_sessions(spec.route) => {
             admit_req = admit_req.session(session)
         }
@@ -11082,8 +11097,8 @@ mod lifecycle_tests {
             .find("letadmit_wait=background.map(|b|b.wait).unwrap_or_else(admission_timeout);")
             .expect("background work waits longer");
         let share = h
-            .find("(Some(b),_)=>admit_req=admit_req.background_share(b.share),(None,Some(session))ifroute_keeps_sessions(spec.route)=>")
-            .expect("background work keeps no session");
+            .find("(Some(b),_)=>{admit_req=admit_req.background_share(b.share).slots(obleth_fairshare::background_slots(spec.prompt_tokens,crate::batches::background_slot_tokens(),))}(None,Some(session))ifroute_keeps_sessions(spec.route)=>")
+            .expect("background work keeps no session and holds slots by its prompt");
         let admit = h
             .find("state.fairshare.admit_to(pool,admit_req)")
             .expect("admission");

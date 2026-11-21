@@ -123,6 +123,7 @@ spec:
             {{- end }}
             {{- end }}
             - { name: OBLETH_BATCH_MAX_SHARE, value: {{ .Values.obleth.batches.maxShare | quote }} }
+            - { name: OBLETH_BACKGROUND_SLOT_TOKENS, value: {{ .Values.obleth.batches.slotTokens | quote }} }
             - { name: OBLETH_BATCH_MAX_LINES, value: {{ .Values.obleth.batches.maxLines | int64 | quote }} }
             - { name: OBLETH_BATCH_MAX_FILE_BYTES, value: {{ .Values.obleth.batches.maxFileBytes | int64 | quote }} }
             - { name: OBLETH_BATCH_MAX_ACTIVE_PER_KEY, value: {{ .Values.obleth.batches.maxActivePerKey | int64 | quote }} }

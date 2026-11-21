@@ -262,6 +262,7 @@ async fn handle(
             route: Some(&route),
             weight,
             cost: 0,
+            prompt_tokens: 0,
             end_user: end_user.as_deref(),
             batch: None,
             session_id: None,

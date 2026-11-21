@@ -135,7 +135,8 @@ pub enum PoolKey {
     /// priority) for a model. It has its own queues and fairness, and shares
     /// the model's slots with [`PoolKey::Model`]: it is served only while the
     /// model has no interactive request waiting, and only up to a share of
-    /// the model's pool (see [`AdmitRequest::background_share`]).
+    /// the model's pool (see [`AdmitRequest::background_share`]). A request
+    /// here holds slots by its prompt length (see [`AdmitRequest::slots`]).
     Background(String),
     /// One pool shared by every request that did not resolve to a route, so
     /// arbitrary model strings cannot each mint a pool of their own.
@@ -193,6 +194,23 @@ impl PoolKey {
 /// The share of a model's pool, and of the global ceiling, that background
 /// work may fill when the request does not say.
 pub const DEFAULT_BACKGROUND_SHARE: f64 = 0.75;
+
+/// Prompt tokens per slot a background request holds when the gateway does
+/// not say (`OBLETH_BACKGROUND_SLOT_TOKENS`).
+pub const DEFAULT_BACKGROUND_SLOT_TOKENS: u32 = 4096;
+
+/// The slots a background request with a prompt of `prompt_tokens` asks to
+/// hold in its model's pool: one per `slot_tokens` of prompt, rounded up, and
+/// at least one. A long prompt is prefilled in pieces that hold up every
+/// stream on the replica, so it takes room in proportion. `slot_tokens` 0
+/// is one slot whatever the prompt. The scheduler caps it at the
+/// background share of the pool (see [`AdmitRequest::slots`]).
+pub fn background_slots(prompt_tokens: u32, slot_tokens: u32) -> usize {
+    if slot_tokens == 0 {
+        return 1;
+    }
+    (prompt_tokens.div_ceil(slot_tokens) as usize).max(1)
+}
 
 /// `share` of `cap`, rounded down, for a background limit.
 pub fn background_cap(cap: usize, share: f64) -> usize {
@@ -302,9 +320,15 @@ pub struct ModelPoolFairshare {
     pub configured_cap: usize,
     /// This replica's in-flight requests in the pool.
     pub in_flight: usize,
-    /// Cluster-wide in-flight requests in the pool as last reported by the
-    /// shared slot backend; `None` outside shared mode or before this
-    /// replica has heard.
+    /// The pool slots those requests hold here: `in_flight` for an
+    /// interactive pool; in a background pool a request with a long prompt
+    /// holds several (see [`background_slots`]), and the pool's cap counts
+    /// slots.
+    #[serde(default)]
+    pub slots: usize,
+    /// Cluster-wide slots held in the pool as last reported by the shared
+    /// slot backend (requests, apart from background pools; see `slots`);
+    /// `None` outside shared mode or before this replica has heard.
     #[serde(default)]
     pub cluster_in_flight: Option<usize>,
     pub queued: usize,
@@ -405,6 +429,11 @@ pub struct AdmitRequest {
     /// global ceiling its work may fill. `None` is
     /// [`DEFAULT_BACKGROUND_SHARE`]. Ignored for other pools.
     pub background_share: Option<f64>,
+    /// For a background pool: the slots the request asks to hold, from its
+    /// prompt length (see [`background_slots`]). Capped at the background
+    /// share of the pool when it is admitted, so a prompt bigger than that
+    /// still runs, alone. Every other pool takes one slot per request.
+    pub slots: usize,
 }
 
 /// Where a pool's session affinity setting comes from.
@@ -443,12 +472,20 @@ impl AdmitRequest {
             session: None,
             affinity: PoolAffinity::Scheduler,
             background_share: None,
+            slots: 1,
         }
     }
 
     /// The share of the model's pool a background request may fill.
     pub fn background_share(mut self, share: f64) -> Self {
         self.background_share = Some(share);
+        self
+    }
+
+    /// The slots a background request asks to hold (see
+    /// [`AdmitRequest::slots`]).
+    pub fn slots(mut self, slots: usize) -> Self {
+        self.slots = slots.max(1);
         self
     }
 
@@ -518,6 +555,16 @@ pub struct Permit {
     key: Uuid,
     pool: PoolKey,
     session: Option<String>,
+    /// The pool slots it holds; all of them go back together.
+    slots: usize,
+}
+
+impl Permit {
+    /// The pool slots this admission holds: one, or more for background
+    /// work with a long prompt (see [`AdmitRequest::slots`]).
+    pub fn slots(&self) -> usize {
+        self.slots
+    }
 }
 
 impl Drop for Permit {
@@ -528,6 +575,7 @@ impl Drop for Permit {
                 key: self.key,
                 pool: std::mem::replace(&mut self.pool, PoolKey::Unrouted),
                 session: self.session.take(),
+                slots: self.slots,
             });
         }
     }
@@ -552,6 +600,7 @@ enum Ctl {
         key: Uuid,
         pool: PoolKey,
         session: Option<String>,
+        slots: usize,
     },
     Snapshot {
         /// Include each pool's tenants and keys.
@@ -721,8 +770,9 @@ impl FairShare {
     }
 
     /// Cluster-wide in-flight requests read from the shared backend: every
-    /// pool together, then each of `pools`. `None` unless this replica is in
-    /// shared mode and the backend answers.
+    /// pool together, then each of `pools` in slots (a background pool counts
+    /// them by prompt length; see [`background_slots`]). `None` unless this
+    /// replica is in shared mode and the backend answers.
     pub async fn cluster_in_flight(&self, pools: &[PoolKey]) -> Option<(usize, Vec<usize>)> {
         if self.stats.mode() != SlotMode::Shared {
             return None;
@@ -768,6 +818,7 @@ impl FairShare {
                     cap,
                     configured_cap: cap,
                     in_flight: 0,
+                    slots: 0,
                     cluster_in_flight: None,
                     queued: 0,
                     borrowed: 0,
@@ -896,6 +947,9 @@ struct Waiter {
     tenant_max_in_flight: Option<usize>,
     key_max_in_flight: Option<usize>,
     cost: u32,
+    /// The pool slots it asks for; once taken, the slots it holds (capped
+    /// by [`Pool::slots_for`]).
+    slots: usize,
     end_user: Option<EndUser>,
     session: Option<String>,
     /// Session affinity put it ahead of an older request when it was taken.
@@ -958,6 +1012,8 @@ struct Grant {
     session: Option<String>,
     /// It went ahead of an older request.
     jumped: bool,
+    /// The pool slots it holds.
+    slots: usize,
 }
 
 impl Grant {
@@ -967,7 +1023,13 @@ impl Grant {
             key,
             session,
             jumped,
+            slots: 1,
         }
+    }
+
+    fn holding(mut self, slots: usize) -> Self {
+        self.slots = slots.max(1);
+        self
     }
 }
 
@@ -1037,7 +1099,12 @@ struct Pool {
     /// What the configured limits are divided by: the live replica count in
     /// split mode, 1 otherwise.
     divisor: usize,
+    /// Requests holding slots here (claims out with the backend included).
     in_flight: usize,
+    /// The slots they hold: `in_flight`, or more in a background pool where
+    /// a request with a long prompt holds several. Pool limits count these;
+    /// tenant and key limits count requests.
+    slots: usize,
     queued_total: usize,
     tenant_in_flight: HashMap<Uuid, usize>,
     tenant_group: HashMap<Uuid, String>,
@@ -1135,6 +1202,7 @@ impl Pool {
             configured_cap: cap.max(1),
             divisor: 1,
             in_flight: 0,
+            slots: 0,
             queued_total: 0,
             tenant_in_flight: HashMap::new(),
             tenant_group: HashMap::new(),
@@ -1614,7 +1682,7 @@ impl Pool {
     /// hands the largest group a cap it can never reach, and it then never
     /// has to yield a freed slot to a smaller group.
     fn effective_cap(&self, cap: usize, headroom: usize) -> usize {
-        cap.min(self.in_flight.saturating_add(headroom)).max(1)
+        cap.min(self.slots.saturating_add(headroom)).max(1)
     }
 
     /// The pool's size as views report it, `(cap, configured_cap)`. A
@@ -1633,15 +1701,17 @@ impl Pool {
         }
     }
 
-    /// The slots this pool may fill now, given what the same model's other
-    /// pool holds (`sibling_in_flight`) and has waiting (`sibling_queued`),
-    /// and the replica's in-flight total against its ceiling.
+    /// The slots this pool may fill now, given the slots the same model's
+    /// other pool holds (`sibling_in_flight`) and what it has waiting
+    /// (`sibling_queued`), and the replica's in-flight total against its
+    /// ceiling.
     ///
     /// An interactive pool gives up the slots background work holds. A
     /// background pool takes nothing new while an interactive request waits,
     /// and fills at most its share of the pool and of the ceiling, both
     /// counting every request in flight; the rest stays free for
-    /// interactive arrivals.
+    /// interactive arrivals. See [`Pool::fits`] for a request of several
+    /// slots.
     fn effective_with(
         &self,
         headroom: usize,
@@ -1654,15 +1724,32 @@ impl Pool {
             return self
                 .cap
                 .saturating_sub(sibling_in_flight)
-                .min(self.in_flight.saturating_add(headroom))
+                .min(self.slots.saturating_add(headroom))
                 .max(1);
         }
         if sibling_queued > 0 {
-            return self.in_flight;
+            return self.slots;
         }
         let pool_room = background_cap(self.cap, self.share).saturating_sub(sibling_in_flight);
         let global_room = background_cap(ceiling, self.share).saturating_sub(replica_in_flight);
-        pool_room.min(self.in_flight.saturating_add(global_room))
+        pool_room.min(self.slots.saturating_add(global_room))
+    }
+
+    /// The slots a request asking for `asked` holds here: one in an
+    /// interactive pool; in a background pool what it asks, capped at the
+    /// background share of the pool so it can still run.
+    fn slots_for(&self, asked: usize) -> usize {
+        if !self.key.is_background() {
+            return 1;
+        }
+        asked.clamp(1, background_cap(self.cap, self.share).max(1))
+    }
+
+    /// Whether a request holding `slots` fits under `effective`: in the room
+    /// left, or alone, with nothing else holding a slot here and some room,
+    /// so a request as big as the whole share is not starved by smaller ones.
+    fn fits(&self, slots: usize, effective: usize) -> bool {
+        self.slots.saturating_add(slots) <= effective || (self.slots == 0 && effective > 0)
     }
 
     fn compute_group_caps(&self, effective: usize) -> HashMap<String, usize> {
@@ -1670,7 +1757,7 @@ impl Pool {
     }
 
     fn can_grant_immediately(&self, req: &AdmitRequest, effective: usize) -> bool {
-        if self.in_flight >= effective || self.queued_total > 0 {
+        if !self.fits(self.slots_for(req.slots), effective) || self.queued_total > 0 {
             return false;
         }
         if !self.tenant_has_slot(&req.tenant) || !self.key_has_slot(&req.key) {
@@ -1686,8 +1773,9 @@ impl Pool {
         }
     }
 
-    fn occupy(&mut self, tenant: Uuid, key: Uuid, cost: u32) {
+    fn occupy(&mut self, tenant: Uuid, key: Uuid, cost: u32, slots: usize) {
         self.in_flight += 1;
+        self.slots += slots;
         *self.tenant_in_flight.entry(tenant).or_insert(0) += 1;
         let slots = self.key_in_flight.entry(key).or_insert(0);
         *slots += 1;
@@ -1886,6 +1974,7 @@ impl Pool {
                 key: grant.key,
                 pool: self.key.clone(),
                 session: grant.session,
+                slots: grant.slots,
             },
             admission,
             waited,
@@ -1918,8 +2007,9 @@ impl Pool {
     }
 
     fn grant_fast(&mut self, req: AdmitRequest, respond: oneshot::Sender<Admitted>) {
-        self.occupy(req.tenant, req.key, req.cost);
-        let grant = Grant::new(req.tenant, req.key, req.session, false);
+        let slots = self.slots_for(req.slots);
+        self.occupy(req.tenant, req.key, req.cost, slots);
+        let grant = Grant::new(req.tenant, req.key, req.session, false).holding(slots);
         self.send(grant, respond, Admission::Fast, Duration::ZERO);
     }
 
@@ -1970,6 +2060,7 @@ impl Pool {
                 tenant_max_in_flight: req.tenant_max_in_flight,
                 key_max_in_flight: req.key_max_in_flight,
                 cost: req.cost,
+                slots: req.slots,
                 end_user: req.end_user,
                 session: req.session,
                 jumped: false,
@@ -1995,7 +2086,7 @@ impl Pool {
             return (false, dropped);
         };
         let waited = waiter.enqueued.elapsed();
-        let grant = Grant::new(tenant, key, waiter.session, waiter.jumped);
+        let grant = Grant::new(tenant, key, waiter.session, waiter.jumped).holding(waiter.slots);
         self.send(grant, waiter.respond, Admission::Queued, waited);
         (true, dropped)
     }
@@ -2016,7 +2107,7 @@ impl Pool {
     fn take(&mut self, effective: usize, claim: bool) -> (Option<(Uuid, Uuid, Waiter)>, usize) {
         let mut dropped = 0;
         loop {
-            if self.in_flight >= effective || self.queued_total == 0 {
+            if !self.fits(1, effective) || self.queued_total == 0 {
                 return (None, dropped);
             }
             let Some(tenant) = self.pick_tenant(effective) else {
@@ -2031,6 +2122,13 @@ impl Pool {
                     .map(|w| (w.session.as_deref(), w.enqueued, w.passed)),
                 Instant::now(),
             );
+            // The pick waits for room for all its slots rather than letting
+            // smaller requests past, which would starve a long prompt.
+            let picked = &self.queues[&tenant].keys[&key][at];
+            let slots = self.slots_for(picked.slots);
+            if !picked.respond.is_closed() && !self.fits(slots, effective) {
+                return (None, dropped);
+            }
             let mut waiter = {
                 let queue = self.queues.get_mut(&tenant).expect("picked tenant exists");
                 let waiter = queue.pop_at(&key, at).expect("picked waiter exists");
@@ -2047,8 +2145,9 @@ impl Pool {
                 continue;
             }
             self.track_waiter_meta(tenant, key, &waiter);
+            waiter.slots = slots;
             self.charging = claim.then_some((tenant, key));
-            self.occupy(tenant, key, waiter.cost);
+            self.occupy(tenant, key, waiter.cost, slots);
             self.charging = None;
             waiter.charged_moves = Some(self.key_moves_of(&key));
             waiter.charged_rebases = Some(self.tenant_rebases_of(&tenant));
@@ -2082,6 +2181,7 @@ impl Pool {
             pool: self.key.slot_id(),
             tenant,
             key,
+            slots: waiter.slots,
             pool_cap,
             global_cap,
             sibling: self.key.sibling().map(|k| k.slot_id()),
@@ -2118,6 +2218,7 @@ impl Pool {
             mut waiter,
         } = claim;
         self.in_flight = self.in_flight.saturating_sub(1);
+        self.slots = self.slots.saturating_sub(waiter.slots);
         for (map, id) in [
             (&mut self.tenant_in_flight, tenant),
             (&mut self.key_in_flight, key),
@@ -2183,6 +2284,7 @@ impl Pool {
         Some(PoolHoldings {
             pool: self.key.slot_id(),
             in_flight: self.in_flight,
+            slots: self.slots,
             tenants: self
                 .tenant_in_flight
                 .iter()
@@ -2468,8 +2570,10 @@ impl Pool {
         }
     }
 
-    fn release(&mut self, tenant: Uuid, key: Uuid) {
+    /// Give back one request's `slots`.
+    fn release(&mut self, tenant: Uuid, key: Uuid, slots: usize) {
         self.in_flight = self.in_flight.saturating_sub(1);
+        self.slots = self.slots.saturating_sub(slots);
         if let Some(n) = self.tenant_in_flight.get_mut(&tenant) {
             *n = n.saturating_sub(1);
             if *n == 0 {
@@ -2500,8 +2604,13 @@ impl Pool {
         tenant: Uuid,
         key: Uuid,
         session: Option<&str>,
+        slots: usize,
         hold_in: HoldIn,
     ) -> StepEnd {
+        // A hold keeps one slot; a request holding more gives them all back.
+        if slots > 1 {
+            return StepEnd::Release;
+        }
         let now = Instant::now();
         let (Some(step), Some(session)) = (self.affinity.finished(session, now), session) else {
             return StepEnd::Release;
@@ -2550,8 +2659,9 @@ impl Pool {
         waiter.probed = true;
         waiter.jumped = oldest.is_some_and(|t| t < waiter.enqueued);
         self.track_waiter_meta(tenant, key, &waiter);
+        waiter.slots = self.slots_for(waiter.slots);
         self.charging = Some((tenant, key));
-        self.occupy(tenant, key, waiter.cost);
+        self.occupy(tenant, key, waiter.cost, waiter.slots);
         self.charging = None;
         waiter.charged_moves = Some(self.key_moves_of(&key));
         waiter.charged_rebases = Some(self.tenant_rebases_of(&tenant));
@@ -2796,7 +2906,7 @@ impl Pool {
     }
 
     fn is_idle(&self) -> bool {
-        self.in_flight == 0 && self.queued_total == 0
+        self.in_flight == 0 && self.slots == 0 && self.queued_total == 0
     }
 
     /// Record whether the pool is in use, resetting its share history the
@@ -2996,6 +3106,7 @@ impl Pool {
             pool: self.key.slot_id(),
             configured_cap: self.reported_caps().1,
             in_flight: self.in_flight,
+            slots: self.slots,
             queued: self.queued_total,
             groups,
             tenants,
@@ -3139,6 +3250,7 @@ impl Pool {
             cap,
             configured_cap,
             in_flight: self.in_flight,
+            slots: self.slots,
             cluster_in_flight: self.cluster_in_flight,
             queued: self.queued_total,
             borrowed: groups.iter().map(|g| g.borrowed).sum(),
@@ -3262,7 +3374,7 @@ impl Scheduler {
     fn sibling_load(&self, key: &PoolKey) -> (usize, usize) {
         key.sibling()
             .and_then(|s| self.pools.get(&s))
-            .map(|p| (p.in_flight, p.queued_total))
+            .map(|p| (p.slots, p.queued_total))
             .unwrap_or((0, 0))
     }
 
@@ -3350,6 +3462,16 @@ impl Scheduler {
                 enqueued,
             } => {
                 let mut req = *req;
+                req.slots = if key.is_background() {
+                    req.slots.max(1)
+                } else {
+                    1
+                };
+                if req.slots > 1 {
+                    // A slot held for a session's next step is one slot: a
+                    // request asking for several keeps no session.
+                    req.session = None;
+                }
                 let affinity = match req.affinity {
                     PoolAffinity::Scheduler => self.session_affinity,
                     PoolAffinity::Model(config) => config,
@@ -3429,6 +3551,7 @@ impl Scheduler {
                 key,
                 pool: pool_key,
                 session,
+                slots,
             } => {
                 // In shared mode the slot is the backend's, so a hold is kept
                 // there, where the session's next step can take it from any
@@ -3439,12 +3562,12 @@ impl Scheduler {
                     _ => HoldIn::Pool,
                 };
                 let end = match self.pools.get_mut(&pool_key) {
-                    Some(pool) => pool.finish_step(tenant, key, session.as_deref(), hold_in),
+                    Some(pool) => pool.finish_step(tenant, key, session.as_deref(), slots, hold_in),
                     None => StepEnd::Release,
                 };
                 match end {
                     StepEnd::Held => {}
-                    StepEnd::Release => self.release_slot(&pool_key, tenant, key),
+                    StepEnd::Release => self.release_slot(&pool_key, tenant, key, slots),
                     StepEnd::HoldInBackend { session, arrived } => {
                         self.hold_in_backend(&pool_key, tenant, key, &session, arrived)
                     }
@@ -3531,7 +3654,7 @@ impl Scheduler {
                     }
                 }
                 for (key, hold) in given_up {
-                    self.release_slot(&key, hold.tenant, hold.key);
+                    self.release_slot(&key, hold.tenant, hold.key, 1);
                 }
                 self.dispatch_all();
                 self.publish_stats();
@@ -3607,12 +3730,12 @@ impl Scheduler {
         }
     }
 
-    /// Give back one slot of `tenant` and `key` in `pool_key`: locally, and
-    /// to the shared backend when it records the slot.
-    fn release_slot(&mut self, pool_key: &PoolKey, tenant: Uuid, key: Uuid) {
+    /// Give back one request's `slots` of `tenant` and `key` in `pool_key`:
+    /// locally, and to the shared backend when it records them.
+    fn release_slot(&mut self, pool_key: &PoolKey, tenant: Uuid, key: Uuid, slots: usize) {
         self.in_flight = self.in_flight.saturating_sub(1);
         if let Some(pool) = self.pools.get_mut(pool_key) {
-            pool.release(tenant, key);
+            pool.release(tenant, key, slots);
             pool.settle_idle();
         }
         if self.mode == SlotMode::Shared || self.quiesced_reconcile_running() {
@@ -3620,6 +3743,7 @@ impl Scheduler {
                 pool: pool_key.slot_id(),
                 tenant,
                 key,
+                slots,
                 sibling: pool_key.sibling().map(|k| k.slot_id()),
             });
         } else {
@@ -3646,7 +3770,7 @@ impl Scheduler {
             .get_mut(pool_key)
             .and_then(|p| Some((p.affinity.config()?, p)))
         else {
-            self.release_slot(pool_key, tenant, key);
+            self.release_slot(pool_key, tenant, key, 1);
             return;
         };
         let hold = SlotHold {
@@ -3657,7 +3781,7 @@ impl Scheduler {
             remember: cfg.warm_ttl,
             max_run: cfg.max_jumps,
         };
-        pool.release(tenant, key);
+        pool.release(tenant, key, 1);
         pool.settle_idle();
         self.in_flight = self.in_flight.saturating_sub(1);
         self.publish_model_load(pool_key);
@@ -3669,6 +3793,7 @@ impl Scheduler {
             pool: pool_key.slot_id(),
             tenant,
             key,
+            slots: 1,
             sibling: pool_key.sibling().map(|k| k.slot_id()),
         };
         let fut = s.backend.hold(slot, hold);
@@ -3708,7 +3833,7 @@ impl Scheduler {
             }
         }
         for (key, hold) in expired {
-            self.release_slot(&key, hold.tenant, hold.key);
+            self.release_slot(&key, hold.tenant, hold.key, 1);
         }
     }
 
@@ -3736,7 +3861,7 @@ impl Scheduler {
             }
         }
         for (key, hold) in given_up {
-            self.release_slot(&key, hold.tenant, hold.key);
+            self.release_slot(&key, hold.tenant, hold.key, 1);
         }
     }
 
@@ -4055,7 +4180,8 @@ impl Scheduler {
                     Admission::Queued
                 };
                 let waited = waiter.enqueued.elapsed();
-                let grant = Grant::new(tenant, key_id, waiter.session, waiter.jumped);
+                let grant =
+                    Grant::new(tenant, key_id, waiter.session, waiter.jumped).holding(waiter.slots);
                 pool.send(grant, waiter.respond, admission, waited);
                 if let Some(s) = self.shared.as_mut() {
                     s.cluster_in_flight = Some(counts.global);
@@ -4283,7 +4409,7 @@ impl Scheduler {
         }
         let given_up = pool.affinity.configure(config, stats);
         for hold in given_up {
-            self.release_slot(key, hold.tenant, hold.key);
+            self.release_slot(key, hold.tenant, hold.key, 1);
         }
     }
 
@@ -4597,12 +4723,12 @@ mod tests {
         for _ in 0..4 {
             let t = Uuid::new_v4();
             pool.track_meta(&AdmitRequest::new(t, "m", 10).group("many", 100));
-            pool.occupy(t, t, 10);
+            pool.occupy(t, t, 10, 1);
         }
         let solo = Uuid::new_v4();
         pool.track_meta(&AdmitRequest::new(solo, "m", 10).group("one", 100));
         for _ in 0..4 {
-            pool.occupy(solo, solo, 10);
+            pool.occupy(solo, solo, 10, 1);
         }
 
         let service = pool.group_service();
@@ -4658,7 +4784,7 @@ mod tests {
         fn grant(&mut self) -> Uuid {
             if self.running.len() >= self.pool.cap {
                 let (tenant, key) = self.running.pop_front().expect("pool is full");
-                self.pool.release(tenant, key);
+                self.pool.release(tenant, key, 1);
             }
             let (next, _) = self.pool.take_next(self.pool.cap);
             let (tenant, key, _) = next.expect("a request can be granted");
@@ -4674,7 +4800,7 @@ mod tests {
             let (tenant, key) = (req.tenant, req.key);
             let (respond, _admitted) = oneshot::channel();
             self.pool.grant_fast(req, respond);
-            self.pool.release(tenant, key);
+            self.pool.release(tenant, key, 1);
         }
 
         fn is_running(&self, key: Uuid) -> bool {
@@ -4707,7 +4833,7 @@ mod tests {
         sim.grant();
         sim.grant();
         while let Some((t, k)) = sim.running.pop_front() {
-            sim.pool.release(t, k);
+            sim.pool.release(t, k, 1);
         }
         // Quiet, with no slot and nothing queued, but ahead of the clock: kept.
         sim.pool.forget_quiet_tenants();
@@ -4764,7 +4890,7 @@ mod tests {
             }
             if step % 7 == 0 {
                 if let Some((tenant, key)) = sim.running.pop_front() {
-                    sim.pool.release(tenant, key);
+                    sim.pool.release(tenant, key, 1);
                 }
             }
             for (_, key) in &keys {
@@ -5059,7 +5185,7 @@ mod tests {
                 // before the freed slot is handed on.
                 let at = sim.running.iter().position(|(_, k)| *k == light).unwrap();
                 let (t, k) = sim.running.remove(at).unwrap();
-                sim.pool.release(t, k);
+                sim.pool.release(t, k, 1);
                 sim.queue(tenant, light, 100);
                 let (next, _) = sim.pool.take_next(sim.pool.cap);
                 let (t, k, _) = next.unwrap();
@@ -5130,7 +5256,7 @@ mod tests {
                 .position(|r| *r == (tenant, key))
                 .unwrap();
             sim.running.remove(at);
-            sim.pool.release(tenant, key);
+            sim.pool.release(tenant, key, 1);
         }
         let tracked = sim.pool.key_tenant.contains_key(&moved);
         let kept = sim
@@ -5166,7 +5292,7 @@ mod tests {
         sim.queue(old, moved, 500);
         while sim.running.len() >= sim.pool.cap {
             let (t, k) = sim.running.pop_front().unwrap();
-            sim.pool.release(t, k);
+            sim.pool.release(t, k, 1);
         }
         let mut taken = None;
         while taken.is_none() {
@@ -5177,7 +5303,7 @@ mod tests {
             } else {
                 sim.running.push_back((t, k));
                 let (t, k) = sim.running.pop_front().unwrap();
-                sim.pool.release(t, k);
+                sim.pool.release(t, k, 1);
             }
         }
         let (tenant, key, waiter) = taken.unwrap();
@@ -5399,7 +5525,7 @@ mod tests {
             sim.grant();
         }
         while let Some((t, k)) = sim.running.pop_front() {
-            sim.pool.release(t, k);
+            sim.pool.release(t, k, 1);
         }
         let claim = loop {
             let (next, _) = sim.pool.take_next(sim.pool.cap);
@@ -5411,7 +5537,7 @@ mod tests {
                     waiter,
                 };
             }
-            sim.pool.release(tenant, key);
+            sim.pool.release(tenant, key, 1);
         };
         // The key's queued requests drain, then it moves to b with a request
         // that is granted straight away, so nothing is queued under b.
@@ -5485,7 +5611,7 @@ mod tests {
         let (a, b, key) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
         let session = affinity::scoped(key, "loop");
         pool.track_meta(&AdmitRequest::new(a, "m", 10).key(key, 100));
-        pool.occupy(a, key, 10);
+        pool.occupy(a, key, 10, 1);
         pool.affinity.hold(&session, a, key, Instant::now());
         let mut step = AdmitRequest::new(a, "m", 10).key(key, 100);
         step.session = Some(session.clone());
@@ -5624,7 +5750,7 @@ mod tests {
             sim.grant();
         }
         while let Some((t, k)) = sim.running.pop_front() {
-            sim.pool.release(t, k);
+            sim.pool.release(t, k, 1);
         }
         sim.queue(a, moved, 100);
         let take_until = |sim: &mut Sim, tenant: Uuid| loop {
@@ -5637,7 +5763,7 @@ mod tests {
                     waiter: w,
                 };
             }
-            sim.pool.release(t, k);
+            sim.pool.release(t, k, 1);
         };
         let claim = take_until(&mut sim, a);
         sim.queue(b, moved, 100);
@@ -5645,9 +5771,9 @@ mod tests {
         for _ in 0..50 {
             let (next, _) = sim.pool.take_next(sim.pool.cap);
             let (t, k, _) = next.expect("a request can be taken");
-            sim.pool.release(t, k);
+            sim.pool.release(t, k, 1);
         }
-        sim.pool.release(b, moved);
+        sim.pool.release(b, moved, 1);
         assert!(sim.pool.tenant_weight.contains_key(&b), "b was forgotten");
         sim.pool.requeue(claim);
         sim.queue(b, moved, 100);
@@ -5703,7 +5829,7 @@ mod tests {
             sim.queue_req(at(from));
             sim.grant();
             let (t, k) = sim.running.pop_front().unwrap();
-            sim.pool.release(t, k);
+            sim.pool.release(t, k, 1);
             sim.queue_req(at(from));
             sim.queue_req(at(from));
             sim.grant();
@@ -5759,7 +5885,7 @@ mod tests {
         let claim = loop {
             if sim.running.len() >= sim.pool.cap {
                 let (t, k) = sim.running.pop_front().unwrap();
-                sim.pool.release(t, k);
+                sim.pool.release(t, k, 1);
             }
             let (next, _) = sim.pool.take_next(sim.pool.cap);
             let (tenant, key, waiter) = next.expect("a request can be taken");
@@ -5808,7 +5934,7 @@ mod tests {
             let (next, _) = sim.pool.take_next(sim.pool.cap);
             let (t, k, _) = next.expect("a request can be taken");
             assert_eq!(sim.pool.tenant_weight[&tenant], 300);
-            sim.pool.release(t, k);
+            sim.pool.release(t, k, 1);
         }
     }
 
@@ -5976,7 +6102,7 @@ mod tests {
             sim.grant();
         }
         while let Some((t, k)) = sim.running.pop_front() {
-            sim.pool.release(t, k);
+            sim.pool.release(t, k, 1);
         }
         sim.queue(a, moved, 100);
         let take = |sim: &mut Sim, tenant: Uuid| loop {
@@ -5985,7 +6111,7 @@ mod tests {
             if t == tenant && k == moved {
                 break;
             }
-            sim.pool.release(t, k);
+            sim.pool.release(t, k, 1);
         };
         take(&mut sim, a);
         sim.queue(b, moved, 100);
@@ -5993,11 +6119,11 @@ mod tests {
         for _ in 0..50 {
             let (next, _) = sim.pool.take_next(sim.pool.cap);
             let (t, k, _) = next.expect("a request can be taken");
-            sim.pool.release(t, k);
+            sim.pool.release(t, k, 1);
         }
-        sim.pool.release(b, moved);
+        sim.pool.release(b, moved, 1);
         assert!(sim.pool.served.contains_key(&b), "kept while its key runs");
-        sim.pool.release(a, moved);
+        sim.pool.release(a, moved, 1);
         assert!(!sim.pool.served.contains_key(&b), "forgotten once it ends");
     }
 

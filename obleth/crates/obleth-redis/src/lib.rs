@@ -2402,6 +2402,7 @@ mod tests {
             pool: pool.into(),
             tenant: Uuid::new_v4(),
             key: Uuid::new_v4(),
+            slots: 1,
             pool_cap,
             global_cap,
             tenant_cap: None,
@@ -2599,6 +2600,7 @@ mod tests {
             pool: c.pool.clone(),
             tenant: c.tenant,
             key: c.key,
+            slots: 1,
             sibling: None,
         };
         // b holds nothing, so its release frees nothing.
@@ -2631,6 +2633,7 @@ mod tests {
             pool: c.pool.clone(),
             tenant: c.tenant,
             key: c.key,
+            slots: 1,
             sibling: None,
         }
     }
@@ -2867,6 +2870,7 @@ mod tests {
             pool: starving.pool.clone(),
             tenant: starving.tenant,
             key: starving.key,
+            slots: 1,
             sibling: None,
         };
         let (held, counts) = store.slot_hold(&keys, "b", &next, &hold).await.unwrap();
@@ -2919,6 +2923,7 @@ mod tests {
             pool: held[0].pool.clone(),
             tenant: held[0].tenant,
             key: held[0].key,
+            slots: 1,
             sibling: None,
         };
         let (freed, _) = store.slot_release(&keys, "b", &slot).await.unwrap();
@@ -2970,6 +2975,7 @@ mod tests {
         let truth = vec![PoolHoldings {
             pool: "m:p".into(),
             in_flight: 1,
+            slots: 1,
             tenants: vec![(tenant, 1)],
             keys: vec![(key, 1)],
         }];
@@ -3088,6 +3094,7 @@ mod tests {
             pool: c.pool.clone(),
             tenant: c.tenant,
             key: c.key,
+            slots: 1,
             sibling: Some("m:s".into()),
         };
         let (freed, _) = store.slot_release(&keys, "a", &slot).await.unwrap();
@@ -3119,6 +3126,7 @@ mod tests {
                     pool: last.pool.clone(),
                     tenant: last.tenant,
                     key: last.key,
+                    slots: 1,
                     sibling: Some("b:s".into()),
                 },
             )
@@ -3136,6 +3144,7 @@ mod tests {
                     pool: c.pool.clone(),
                     tenant: c.tenant,
                     key: c.key,
+                    slots: 1,
                     sibling: Some("m:s".into()),
                 },
             )
@@ -3194,6 +3203,7 @@ mod tests {
             pool: c.pool.clone(),
             tenant: c.tenant,
             key: c.key,
+            slots: 1,
             sibling: None,
         };
         store.slot_release(&keys, "a", &slot).await.unwrap();
@@ -3232,6 +3242,178 @@ mod tests {
         assert_eq!(totals_field(&store, &keys, "p|m:p").await, 0);
         assert_eq!(held_field(&store, &keys, "a", "p|m:p").await, 0);
         drop_test_keys(&store, &keys, &["a"]).await;
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    /// Background claims take slots by prompt length: each replica's
+    /// multi-slot holds add up in the pool count (one request each in the
+    /// global, tenant and key counts), a claim bigger than the room left
+    /// runs only alone, a release frees exactly what it took, and a replica
+    /// whose heartbeat runs out has exactly its slots reclaimed.
+    #[tokio::test]
+    async fn multi_slot_background_claims_add_up_and_release_cleanly() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let keys = replica_test_key();
+        let ttl = std::time::Duration::from_millis(400);
+        store.replica_heartbeat_in(&keys, "a", ttl).await.unwrap();
+        store.replica_heartbeat_in(&keys, "b", ttl).await.unwrap();
+        let bg = |slots| SlotClaim {
+            slots,
+            sibling: Some("m:x".into()),
+            background: true,
+            ..claim("b:x", 8, 100)
+        };
+        let release = |c: &SlotClaim| SlotRelease {
+            pool: c.pool.clone(),
+            tenant: c.tenant,
+            key: c.key,
+            slots: c.slots,
+            sibling: c.sibling.clone(),
+        };
+        // Interactive work on the model holds 2 through a.
+        for _ in 0..2 {
+            take_slot(
+                &store,
+                &keys,
+                "a",
+                &SlotClaim {
+                    sibling: Some("b:x".into()),
+                    ..claim("m:x", 16, 100)
+                },
+            )
+            .await;
+        }
+        let on_a = bg(4);
+        let (outcome, counts) = store.slot_acquire(&keys, "a", &on_a).await.unwrap();
+        assert_eq!(outcome, AcquireOutcome::Granted);
+        assert_eq!((counts.pool, counts.global), (4, 3));
+        // 4 + 2 interactive + 3 > 8: refused; 2 fits exactly.
+        let (outcome, _) = store.slot_acquire(&keys, "b", &bg(3)).await.unwrap();
+        assert_eq!(outcome, AcquireOutcome::Denied(SlotDenial::Pool));
+        let on_b = bg(2);
+        let (outcome, counts) = store.slot_acquire(&keys, "b", &on_b).await.unwrap();
+        assert_eq!(outcome, AcquireOutcome::Granted);
+        assert_eq!((counts.pool, counts.global), (6, 4));
+        assert_eq!(held_field(&store, &keys, "a", "p|b:x").await, 4);
+        assert_eq!(held_field(&store, &keys, "b", "p|b:x").await, 2);
+        assert_eq!(held_field(&store, &keys, "b", "g").await, 1);
+        assert_eq!(
+            totals_field(&store, &keys, &format!("t|b:x|{}", on_b.tenant)).await,
+            1
+        );
+        assert_books_balance(&store, &keys, &["a", "b"]).await;
+
+        // a's release frees its 4 and its one request.
+        let (freed, counts) = store
+            .slot_release(&keys, "a", &release(&on_a))
+            .await
+            .unwrap();
+        assert!(freed);
+        assert_eq!((counts.pool, counts.global), (2, 3));
+        assert_eq!(held_field(&store, &keys, "a", "p|b:x").await, 0);
+        // The whole share does not fit while b holds 2, nor run alone.
+        let (outcome, _) = store.slot_acquire(&keys, "a", &bg(8)).await.unwrap();
+        assert_eq!(outcome, AcquireOutcome::Denied(SlotDenial::Pool));
+
+        // b's heartbeat runs out: exactly its slots come back.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        store.replica_heartbeat_in(&keys, "a", ttl).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert_eq!(
+            store.replica_heartbeat_in(&keys, "a", ttl).await.unwrap(),
+            1
+        );
+        assert_eq!(totals_field(&store, &keys, "p|b:x").await, 0);
+        assert_eq!(totals_field(&store, &keys, "g").await, 2);
+        // Alone now, the whole share runs although interactive holds 2.
+        let whole = bg(8);
+        let (outcome, counts) = store.slot_acquire(&keys, "a", &whole).await.unwrap();
+        assert_eq!(outcome, AcquireOutcome::Granted);
+        assert_eq!(counts.pool, 8);
+        assert_books_balance(&store, &keys, &["a", "b"]).await;
+        store
+            .slot_release(&keys, "a", &release(&whole))
+            .await
+            .unwrap();
+        assert_eq!(totals_field(&store, &keys, "p|b:x").await, 0);
+
+        // A reconcile writes slots to the pool and requests to the rest.
+        let tenant = Uuid::new_v4();
+        let truth = vec![PoolHoldings {
+            pool: "b:x".into(),
+            in_flight: 2,
+            slots: 7,
+            tenants: vec![(tenant, 2)],
+            keys: vec![(tenant, 2)],
+        }];
+        store.slot_reconcile(&keys, "a", &truth).await.unwrap();
+        assert_eq!(totals_field(&store, &keys, "p|b:x").await, 7);
+        assert_eq!(totals_field(&store, &keys, "g").await, 2);
+        assert_books_balance(&store, &keys, &["a", "b"]).await;
+        drop_test_keys(&store, &keys, &["a", "b"]).await;
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    /// Two gateways' schedulers on one Redis: background requests holding
+    /// several slots each add up against the share cluster-wide, a waiter
+    /// gets in once enough slots are freed, and every slot comes back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gateways_add_up_multi_slot_background_holds_through_redis() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let keys = replica_test_key();
+        let (a, la) = slot_gateway(&store, &keys, "a", 2, slot_config()).await;
+        let (b, lb) = slot_gateway(&store, &keys, "b", 2, slot_config()).await;
+        for fs in [&a, &b] {
+            wait_for_slot_mode(fs, SlotMode::Shared).await;
+        }
+        let pool = obleth_fairshare::PoolKey::Background("shared-model".into());
+        let field = format!("p|{}", pool.slot_id());
+        let long = |slots| {
+            obleth_fairshare::AdmitRequest::new(Uuid::new_v4(), "shared-model", 1)
+                .model_cap(16)
+                .background_share(0.5)
+                .slots(slots)
+        };
+        let admit = |fs: &FairShare, req| {
+            let (fs, pool) = (fs.clone(), pool.clone());
+            tokio::spawn(async move { fs.admit_to(pool, req).await })
+        };
+        let in_time = |h: tokio::task::JoinHandle<Option<obleth_fairshare::Admitted>>| async {
+            tokio::time::timeout(std::time::Duration::from_secs(3), h)
+                .await
+                .expect("admitted in time")
+                .unwrap()
+                .expect("scheduler alive")
+        };
+        let on_a = in_time(admit(&a, long(4))).await;
+        let on_b = in_time(admit(&b, long(3))).await;
+        assert_eq!((on_a.permit.slots(), on_b.permit.slots()), (4, 3));
+        assert_eq!(totals_field(&store, &keys, &field).await, 7);
+        assert_eq!(totals_field(&store, &keys, "g").await, 2);
+        // b alone holds 3, but the share is 8 cluster-wide: 7 + 2 waits.
+        let more = admit(&b, long(2));
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(!more.is_finished(), "admitted past the share");
+        drop(on_a);
+        let more = in_time(more).await;
+        assert_eq!(totals_field(&store, &keys, &field).await, 5);
+        assert_eq!(held_field(&store, &keys, "b", &field).await, 5);
+        drop((on_b, more));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while totals_field(&store, &keys, &field).await != 0
+            || totals_field(&store, &keys, "g").await != 0
+        {
+            assert!(tokio::time::Instant::now() < deadline, "released cleanly");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_books_balance(&store, &keys, &["a", "b"]).await;
+        la.abort();
+        lb.abort();
+        drop_test_keys(&store, &keys, &["a", "b"]).await;
     }
 
     fn slot_config() -> SharedSlotsConfig {

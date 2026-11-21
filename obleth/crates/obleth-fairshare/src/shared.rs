@@ -73,6 +73,12 @@ pub struct SlotClaim {
     pub pool: String,
     pub tenant: Uuid,
     pub key: Uuid,
+    /// Slots the claim takes in its pool: one, or more for background work
+    /// with a long prompt (see [`crate::background_slots`]). The global,
+    /// tenant and key counts take one whatever this is. A claim bigger than
+    /// the room left fits only while its pool holds nothing, so a request
+    /// larger than the whole share can still run alone.
+    pub slots: usize,
     pub pool_cap: usize,
     pub global_cap: usize,
     /// The same model's other pool (see [`crate::PoolKey::sibling`]): its
@@ -126,6 +132,10 @@ pub struct SlotRelease {
     pub pool: String,
     pub tenant: Uuid,
     pub key: Uuid,
+    /// The pool slots its claim took ([`SlotClaim::slots`]). Only a
+    /// one-slot request can be held for a session's next step; a hold of
+    /// more is released instead.
+    pub slots: usize,
     /// The same model's other pool: a freed slot is room for its waiters
     /// too, so they are woken as well.
     pub sibling: Option<String>,
@@ -167,7 +177,11 @@ pub struct ClusterCounts {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PoolHoldings {
     pub pool: String,
+    /// Requests: what the global count holds for the pool.
     pub in_flight: usize,
+    /// Slots the requests take in the pool: `in_flight`, or more where
+    /// background requests hold several each.
+    pub slots: usize,
     pub tenants: Vec<(Uuid, usize)>,
     pub keys: Vec<(Uuid, usize)>,
 }
@@ -648,6 +662,14 @@ impl SharedSlots for InMemorySlots {
         let marked = |s: &MemState, mark: &str| s.waiting.get(mark).is_some_and(|t| *t > now);
         let yield_to_interactive = claim.background
             && (claim.sibling.as_deref().is_some_and(|sib| marked(&s, sib)) || marked(&s, ""));
+        let slots = claim.slots.max(1);
+        let own = s.count(&pf);
+        let used = own
+            + claim
+                .sibling
+                .as_deref()
+                .map_or(0, |sib| s.count(&pool_field(sib)));
+        let fits = used + slots <= claim.pool_cap || (own == 0 && used < claim.pool_cap);
         let outcome = if !live {
             AcquireOutcome::NotRegistered
         } else if let Some(id) = held {
@@ -656,14 +678,7 @@ impl SharedSlots for InMemorySlots {
             AcquireOutcome::Redeemed
         } else if claim.redeem_only {
             AcquireOutcome::NotHeld
-        } else if yield_to_interactive
-            || s.count(&pf)
-                + claim
-                    .sibling
-                    .as_deref()
-                    .map_or(0, |sib| s.count(&pool_field(sib)))
-                >= claim.pool_cap
-        {
+        } else if yield_to_interactive || !fits {
             AcquireOutcome::Denied(SlotDenial::Pool)
         } else if s.count(GLOBAL_FIELD) >= claim.global_cap {
             AcquireOutcome::Denied(SlotDenial::Global)
@@ -672,9 +687,10 @@ impl SharedSlots for InMemorySlots {
         } else if claim.key_cap.is_some_and(|c| s.count(&kf) >= c) {
             AcquireOutcome::Denied(SlotDenial::Key)
         } else {
-            for f in [GLOBAL_FIELD, &pf, &tf, &kf] {
+            for f in [GLOBAL_FIELD, &tf, &kf] {
                 s.add(&self.instance, f, 1);
             }
+            s.add(&self.instance, &pf, slots as isize);
             AcquireOutcome::Granted
         };
         if let AcquireOutcome::Denied(denial) = outcome {
@@ -717,7 +733,8 @@ impl SharedSlots for InMemorySlots {
             .any(|p| s.waiting.get(*p).is_some_and(|until| *until > now));
         let run = s.chain.get(&hold.id).copied().unwrap_or(0);
         let starving = s.starving.get(&slot.pool).is_some_and(|until| *until > now);
-        let can = chained
+        let can = slot.slots <= 1
+            && chained
             && !starving
             && (!waited || run < hold.max_run)
             && s.count(&hf) < hold.max_held
@@ -781,8 +798,9 @@ impl SharedSlots for InMemorySlots {
                     .get(&self.instance)
                     .and_then(|h| h.get(&f).copied())
                     .unwrap_or(0);
+                let n = if f == pf { slot.slots.max(1) } else { 1 };
                 if held > 0 {
-                    s.add(&self.instance, &f, -1);
+                    s.add(&self.instance, &f, -(n.min(held) as isize));
                 }
             }
             (
@@ -814,7 +832,7 @@ impl SharedSlots for InMemorySlots {
             }
             let freed = s.reclaim(&self.instance);
             for h in &holdings {
-                s.add(&self.instance, &pool_field(&h.pool), h.in_flight as isize);
+                s.add(&self.instance, &pool_field(&h.pool), h.slots as isize);
                 s.add(&self.instance, GLOBAL_FIELD, h.in_flight as isize);
                 for (t, n) in &h.tenants {
                     s.add(&self.instance, &tenant_field(&h.pool, t), *n as isize);

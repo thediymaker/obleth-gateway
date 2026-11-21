@@ -992,6 +992,7 @@ async fn handler_inner(
             route: Some(&route),
             weight: effective_weight,
             cost: est.total(),
+            prompt_tokens: est.input_tokens,
             end_user: end_user.as_deref(),
             batch: None,
             session_id: None,

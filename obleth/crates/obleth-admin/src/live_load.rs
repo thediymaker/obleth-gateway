@@ -247,6 +247,7 @@ mod tests {
             cap,
             configured_cap: cap,
             in_flight,
+            slots: in_flight,
             cluster_in_flight: None,
             queued,
             borrowed: 0,

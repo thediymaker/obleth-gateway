@@ -159,8 +159,9 @@ fn parse_peer_views(reply: redis::Value) -> Result<PeerViews, SlotError> {
     })
 }
 
-/// The totals-hash fields a pool's holdings occupy: every pool together, the
-/// pool, and each tenant and key in it. Must match the slot scripts.
+/// The totals-hash fields a pool's holdings occupy: every pool together (in
+/// requests), the pool (in slots), and each tenant and key in it (in
+/// requests). Must match the slot scripts.
 fn holding_fields(holdings: &[PoolHoldings]) -> Vec<(String, usize)> {
     let mut fields = Vec::new();
     let global: usize = holdings.iter().map(|h| h.in_flight).sum();
@@ -168,8 +169,8 @@ fn holding_fields(holdings: &[PoolHoldings]) -> Vec<(String, usize)> {
         fields.push(("g".to_string(), global));
     }
     for h in holdings {
-        if h.in_flight > 0 {
-            fields.push((format!("p|{}", h.pool), h.in_flight));
+        if h.slots > 0 {
+            fields.push((format!("p|{}", h.pool), h.slots));
         }
         for (tenant, n) in &h.tenants {
             fields.push((format!("t|{}|{tenant}", h.pool), *n));
@@ -216,6 +217,7 @@ impl RedisStore {
             .arg(if claim.starving { "1" } else { "0" })
             .arg(claim.sibling.as_deref().unwrap_or(""))
             .arg(if claim.background { "1" } else { "0" })
+            .arg(claim.slots.max(1) as u64)
             .invoke_async(&mut conn)
             .await?;
         let outcome = match code {
@@ -237,7 +239,7 @@ impl RedisStore {
         ))
     }
 
-    /// Give back one slot `instance` holds. Returns whether one was freed
+    /// Give back one request's slots `instance` holds. Returns whether any was freed
     /// (not when its holdings no longer record it) and the counts after.
     pub async fn slot_release(
         &self,
@@ -254,6 +256,7 @@ impl RedisStore {
             .arg(slot.key.to_string())
             .arg(&keys.channel)
             .arg(slot.sibling.as_deref().unwrap_or(""))
+            .arg(slot.slots.max(1) as u64)
             .invoke_async(&mut conn)
             .await?;
         Ok((
@@ -275,6 +278,10 @@ impl RedisStore {
         slot: &SlotRelease,
         hold: &SlotHold,
     ) -> crate::Result<(bool, ClusterCounts)> {
+        // A hold keeps one slot; a request holding more gives them back.
+        if slot.slots > 1 {
+            return self.slot_release(keys, instance, slot).await;
+        }
         let mut conn = self.conn.clone();
         let (code, pool, global): (i64, i64, i64) = crate::slot_hold_script()
             .key(&keys.totals)

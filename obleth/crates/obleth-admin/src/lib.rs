@@ -14552,6 +14552,7 @@ mod tests {
                 pool: PoolKey::Model("shared".into()).slot_id(),
                 tenant: Uuid::new_v4(),
                 key: Uuid::new_v4(),
+                slots: 1,
                 pool_cap: 9,
                 global_cap: 64,
                 tenant_cap: None,

@@ -302,6 +302,7 @@ mod tests {
             cap,
             configured_cap: cap,
             in_flight,
+            slots: in_flight,
             cluster_in_flight: None,
             queued,
             borrowed: 0,
@@ -359,6 +360,7 @@ mod tests {
                     pool: pool.into(),
                     configured_cap: 64,
                     in_flight,
+                    slots: in_flight,
                     queued,
                     groups: groups
                         .into_iter()
