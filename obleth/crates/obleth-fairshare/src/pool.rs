@@ -731,7 +731,12 @@ impl Pool {
         names
             .into_iter()
             .map(|name| {
-                let weight = self.group_weight.get(&name).copied().unwrap_or(100).max(1);
+                let weight = self
+                    .group_weight
+                    .get(&name)
+                    .copied()
+                    .unwrap_or(DEFAULT_GROUP_WEIGHT)
+                    .max(1);
                 (name, weight)
             })
             .collect()
@@ -1435,8 +1440,13 @@ impl Pool {
                 .tenant_group
                 .get(tenant)
                 .cloned()
-                .unwrap_or_else(|| "default".into());
-            let group_weight = self.group_weight.get(&group).copied().unwrap_or(100).max(1) as f64;
+                .unwrap_or_else(|| DEFAULT_GROUP.into());
+            let group_weight = self
+                .group_weight
+                .get(&group)
+                .copied()
+                .unwrap_or(DEFAULT_GROUP_WEIGHT)
+                .max(1) as f64;
             let group_score =
                 served_by_group.get(group.as_str()).copied().unwrap_or(0.0) / group_weight;
             borrowable.push((*tenant, group_score));
@@ -1574,7 +1584,7 @@ impl Pool {
                 .tenant_group
                 .get(tenant)
                 .map(String::as_str)
-                .unwrap_or("default"),
+                .unwrap_or(DEFAULT_GROUP),
         }
     }
 
@@ -2047,7 +2057,7 @@ impl Pool {
     /// The share split of this pool (see [`pool_shares`]), over `ids` (every
     /// tenant with state) and `key_ids`.
     fn shares(&self, ids: &HashSet<Uuid>, key_ids: &HashSet<Uuid>) -> PoolShares {
-        let default_group = "default".to_string();
+        let default_group = DEFAULT_GROUP.to_string();
         let tenants: Vec<ShareTenant<'_>> = ids
             .iter()
             .map(|id| ShareTenant {
@@ -2102,7 +2112,7 @@ impl Pool {
                     .tenant_group
                     .get(id)
                     .cloned()
-                    .unwrap_or_else(|| "default".into()),
+                    .unwrap_or_else(|| DEFAULT_GROUP.into()),
                 weight: self.tenant_weight.get(id).copied().unwrap_or(1).max(1),
                 cap: self.tenant_cap.get(id).copied(),
                 in_flight: self.tenant_in_flight.get(id).copied().unwrap_or(0),
@@ -2153,7 +2163,7 @@ impl Pool {
                     .group_weight
                     .get(&g.name)
                     .copied()
-                    .unwrap_or(100)
+                    .unwrap_or(DEFAULT_GROUP_WEIGHT)
                     .max(1),
                 served: service.get(g.name.as_str()).copied().unwrap_or(0.0),
                 name: g.name,
@@ -2222,7 +2232,12 @@ impl Pool {
         let mut groups: Vec<GroupFairshare> = names
             .into_iter()
             .map(|name| {
-                let weight = self.group_weight.get(&name).copied().unwrap_or(100).max(1);
+                let weight = self
+                    .group_weight
+                    .get(&name)
+                    .copied()
+                    .unwrap_or(DEFAULT_GROUP_WEIGHT)
+                    .max(1);
                 let (in_flight, queued) =
                     group_totals.get(name.as_str()).copied().unwrap_or((0, 0));
                 let served_tokens = group_service.get(name.as_str()).copied().unwrap_or(0.0);
@@ -2256,7 +2271,7 @@ impl Pool {
                     .tenant_group
                     .get(&tenant_id)
                     .cloned()
-                    .unwrap_or_else(|| "default".into());
+                    .unwrap_or_else(|| DEFAULT_GROUP.into());
                 let served_tokens = self.served.get(&tenant_id).copied().unwrap_or(0.0);
                 TenantFairshare {
                     tenant_id,

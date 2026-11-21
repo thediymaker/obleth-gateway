@@ -68,7 +68,13 @@ pub fn pool_shares(
     keys: &[ShareKey],
 ) -> PoolShares {
     let mut shares = PoolShares::default();
-    let group_weight = |g: &str| group_weights.get(g).copied().unwrap_or(100).max(1);
+    let group_weight = |g: &str| {
+        group_weights
+            .get(g)
+            .copied()
+            .unwrap_or(crate::DEFAULT_GROUP_WEIGHT)
+            .max(1)
+    };
 
     let mut active_groups: HashMap<&str, i64> = HashMap::new();
     let mut active_in_group: HashMap<&str, i64> = HashMap::new();

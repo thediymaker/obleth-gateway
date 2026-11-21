@@ -364,7 +364,12 @@ fn merge_pool(
     let mut group_weights: HashMap<String, i64> = acc
         .groups
         .iter()
-        .map(|(name, g)| (name.clone(), g.weight.unwrap_or(100).max(1)))
+        .map(|(name, g)| {
+            (
+                name.clone(),
+                g.weight.unwrap_or(crate::DEFAULT_GROUP_WEIGHT).max(1),
+            )
+        })
         .collect();
     for t in acc.tenants.values() {
         group_weights.entry(t.group.clone()).or_insert(100);
@@ -398,7 +403,10 @@ fn merge_pool(
         .groups
         .keys()
         .map(|name| {
-            let weight = group_weights.get(name).copied().unwrap_or(100);
+            let weight = group_weights
+                .get(name)
+                .copied()
+                .unwrap_or(crate::DEFAULT_GROUP_WEIGHT);
             (name.clone(), weight)
         })
         .collect();
@@ -408,7 +416,7 @@ fn merge_pool(
         .groups
         .iter()
         .map(|(name, g)| {
-            let weight = g.weight.unwrap_or(100).max(1);
+            let weight = g.weight.unwrap_or(crate::DEFAULT_GROUP_WEIGHT).max(1);
             let slot_cap = group_caps.get(name).copied().unwrap_or(0);
             GroupFairshare {
                 name: name.clone(),

@@ -109,6 +109,11 @@ use uuid::Uuid;
 /// Pool size for a model that has no explicit `max_in_flight`.
 pub const DEFAULT_MODEL_MAX_IN_FLIGHT: usize = 32;
 
+/// The fair-share group of a tenant that names none.
+pub const DEFAULT_GROUP: &str = "default";
+/// A group's weight when none is known.
+pub const DEFAULT_GROUP_WEIGHT: i64 = 100;
+
 /// Display name of the shared pool for requests with no resolved route.
 pub const UNROUTED_POOL: &str = "(unrouted)";
 
@@ -297,8 +302,8 @@ impl AdmitRequest {
             key: tenant,
             weight: 100,
             key_weight: 100,
-            group: "default".into(),
-            group_weight: 100,
+            group: DEFAULT_GROUP.into(),
+            group_weight: DEFAULT_GROUP_WEIGHT,
             model: model.into(),
             model_max_in_flight: None,
             tenant_max_in_flight: None,
@@ -326,7 +331,7 @@ impl AdmitRequest {
     }
 
     pub fn weighted(tenant: Uuid, weight: i64, cost: u32) -> Self {
-        Self::new(tenant, "default", cost).weight(weight)
+        Self::new(tenant, DEFAULT_GROUP, cost).weight(weight)
     }
 
     pub fn weight(mut self, weight: i64) -> Self {

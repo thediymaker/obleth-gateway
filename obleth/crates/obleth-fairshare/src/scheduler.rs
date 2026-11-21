@@ -549,13 +549,7 @@ impl Scheduler {
             pool.settle_idle();
         }
         if self.mode == SlotMode::Shared || self.quiesced_reconcile_running() {
-            self.release_shared(SlotRelease {
-                pool: pool_key.slot_id(),
-                tenant,
-                key,
-                slots,
-                sibling: pool_key.sibling().map(|k| k.slot_id()),
-            });
+            self.release_shared(SlotRelease::of(pool_key, tenant, key, slots));
         } else {
             self.note_unrecorded();
         }
@@ -599,20 +593,11 @@ impl Scheduler {
             return;
         };
         s.ops += 1;
-        let slot = SlotRelease {
-            pool: pool_key.slot_id(),
-            tenant,
-            key,
-            slots: 1,
-            sibling: pool_key.sibling().map(|k| k.slot_id()),
-        };
+        let slot = SlotRelease::of(pool_key, tenant, key, 1);
         let fut = s.backend.hold(slot, hold);
-        let timeout = s.config.op_timeout;
-        let tx = self.ctl_tx.clone();
         let pool = pool_key.clone();
-        tokio::spawn(async move {
-            let result = bounded(timeout, fut).await;
-            let _ = tx.send(Ctl::HoldDone { pool, result });
+        spawn_op(&self.ctl_tx, s.config.op_timeout, fut, move |result| {
+            Ctl::HoldDone { pool, result }
         });
     }
 
@@ -756,11 +741,8 @@ impl Scheduler {
         s.publishing_view = true;
         s.next_view = Instant::now() + s.config.view_interval;
         let fut = s.backend.publish_view(view, s.config.view_ttl());
-        let timeout = s.config.op_timeout;
-        let tx = self.ctl_tx.clone();
-        tokio::spawn(async move {
-            let result = bounded(timeout, fut).await;
-            let _ = tx.send(Ctl::ViewPublished { result });
+        spawn_op(&self.ctl_tx, s.config.op_timeout, fut, move |result| {
+            Ctl::ViewPublished { result }
         });
     }
 
@@ -921,11 +903,8 @@ impl Scheduler {
         };
         s.ops += 1;
         let fut = s.backend.acquire(claim);
-        let timeout = s.config.op_timeout;
-        let tx = self.ctl_tx.clone();
-        tokio::spawn(async move {
-            let result = bounded(timeout, fut).await;
-            let _ = tx.send(Ctl::AcquireDone { pool, id, result });
+        spawn_op(&self.ctl_tx, s.config.op_timeout, fut, move |result| {
+            Ctl::AcquireDone { pool, id, result }
         });
     }
 
@@ -947,11 +926,8 @@ impl Scheduler {
         s.ops += 1;
         let pool = PoolKey::from_slot_id(&slot.pool).unwrap_or(PoolKey::Unrouted);
         let fut = s.backend.release(slot);
-        let timeout = s.config.op_timeout;
-        let tx = self.ctl_tx.clone();
-        tokio::spawn(async move {
-            let result = bounded(timeout, fut).await;
-            let _ = tx.send(Ctl::ReleaseDone { pool, result });
+        spawn_op(&self.ctl_tx, s.config.op_timeout, fut, move |result| {
+            Ctl::ReleaseDone { pool, result }
         });
     }
 
@@ -1149,11 +1125,8 @@ impl Scheduler {
             unrecorded_at: s.unrecorded,
         });
         let fut = s.backend.reconcile(holdings);
-        let timeout = s.config.op_timeout;
-        let tx = self.ctl_tx.clone();
-        tokio::spawn(async move {
-            let result = bounded(timeout, fut).await;
-            let _ = tx.send(Ctl::ReconcileDone { result });
+        spawn_op(&self.ctl_tx, s.config.op_timeout, fut, move |result| {
+            Ctl::ReconcileDone { result }
         });
     }
 
@@ -1506,6 +1479,34 @@ pub const CLUSTER_READ_TIMEOUT: Duration = Duration::from_secs(1);
 /// Far enough ahead to stand for "never" in a `sleep_until`.
 fn far_future() -> Instant {
     Instant::now() + Duration::from_secs(86_400)
+}
+
+/// Run a backend call bounded by `timeout` and send its result to the
+/// scheduler as the message `done` makes of it.
+fn spawn_op<T: Send + 'static>(
+    tx: &mpsc::UnboundedSender<Ctl>,
+    timeout: Duration,
+    fut: SlotFuture<T>,
+    done: impl FnOnce(Result<T, SlotError>) -> Ctl + Send + 'static,
+) {
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let _ = tx.send(done(bounded(timeout, fut).await));
+    });
+}
+
+impl SlotRelease {
+    /// `slots` of `tenant` and `key` in `pool_key` (and its sibling pool's
+    /// shared model cap, if it has one).
+    fn of(pool_key: &PoolKey, tenant: Uuid, key: Uuid, slots: usize) -> Self {
+        SlotRelease {
+            pool: pool_key.slot_id(),
+            tenant,
+            key,
+            slots,
+            sibling: pool_key.sibling().map(|k| k.slot_id()),
+        }
+    }
 }
 
 /// A backend call bounded by `timeout`; running past it is a failure.
