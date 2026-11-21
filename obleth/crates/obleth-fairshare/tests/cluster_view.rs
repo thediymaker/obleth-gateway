@@ -432,3 +432,56 @@ async fn pools_from_other_gateways_and_idle_ones_are_listed() {
     let idle = pool(&snap, "idle-here");
     assert_eq!((idle.cap, idle.in_flight, idle.queued), (3, 0, 0));
 }
+
+/// With the work on one gateway the merged view is its own snapshot: the
+/// same tenant and key rows in the same order with the same scores,
+/// including tenants placed at the clock when they joined, whose scores tie.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cluster_snapshot_of_one_busy_gateway_matches_its_own_row_for_row() {
+    let cluster = InMemoryCluster::new();
+    let gws = gateways(&cluster, 2, config());
+    shared(&gws).await;
+    let fs = &gws[0];
+    let req = |tenant: Uuid, cost: u32| {
+        AdmitRequest::new(tenant, MODEL, cost)
+            .key(Uuid::new_v4(), 100)
+            .model_cap(64)
+    };
+    let (early, busy) = (Uuid::new_v4(), Uuid::new_v4());
+    let mut permits = vec![
+        admit_now(fs, req(early, 10)).await,
+        admit_now(fs, req(busy, 30)).await,
+        admit_now(fs, req(busy, 30)).await,
+    ];
+    // Placed at the clock on joining, and tied with each other.
+    for _ in 0..3 {
+        permits.push(admit_now(fs, req(Uuid::new_v4(), 5)).await);
+    }
+    let own = fs.snapshot().await.expect("scheduler alive");
+    let merged = fs.cluster_snapshot().await.expect("backend answers");
+    let (own, merged) = (&own.pools[0], pool(&merged, MODEL));
+    let tenants = |p: &ModelPoolFairshare| {
+        p.tenants
+            .iter()
+            .map(|t| {
+                (
+                    t.tenant_id,
+                    t.in_flight,
+                    t.queued,
+                    t.served_tokens,
+                    t.share_score,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let keys = |p: &ModelPoolFairshare| {
+        p.keys
+            .iter()
+            .map(|k| (k.key_id, k.in_flight, k.served_tokens, k.share_score))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(tenants(own).len(), 5);
+    assert_eq!(tenants(merged), tenants(own));
+    assert_eq!(keys(merged), keys(own));
+    drop(permits);
+}

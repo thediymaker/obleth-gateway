@@ -74,13 +74,16 @@ impl FairshareSample {
         }
     }
 
-    /// A sample summed over replica views: this replica's own plus the ones
-    /// its peers last published, as [`crate::FairShare::cluster_snapshot`]
-    /// gathers them. Group totals are never trimmed from a view, so the
-    /// sums are exact.
-    pub fn from_views(ts_ms: i64, views: &[&ReplicaView]) -> Self {
-        let mut pools: BTreeMap<String, PoolSample> = BTreeMap::new();
-        for view in views {
+    /// This replica's sample with the views its peers last published added
+    /// in, as [`crate::FairShare::cluster_sample`] gathers them. Group
+    /// totals are never trimmed from a view, so the sums are exact.
+    pub fn with_peers(self, peers: &[&ReplicaView]) -> Self {
+        let mut pools: BTreeMap<String, PoolSample> = self
+            .pools
+            .into_iter()
+            .map(|p| (p.model.clone(), p))
+            .collect();
+        for view in peers {
             for p in &view.pools {
                 let model = match PoolKey::from_slot_id(&p.pool) {
                     Some(key) => key.display_name().to_string(),
@@ -118,7 +121,7 @@ impl FairshareSample {
             })
             .collect();
         FairshareSample {
-            ts_ms,
+            ts_ms: self.ts_ms,
             global_in_flight: pools.iter().map(|p| p.in_flight).sum(),
             global_queued: pools.iter().map(|p| p.queued).sum(),
             pools,
@@ -382,20 +385,39 @@ mod tests {
     }
 
     #[test]
-    fn from_views_sums_pools_and_groups_across_replicas() {
-        let a = replica(vec![(
-            "m:flash",
-            20,
-            5,
-            vec![("default", 18, 5), ("teaching", 2, 0)],
-        )]);
+    fn with_peers_sums_pools_and_groups_across_replicas() {
+        let own = FairshareSample {
+            ts_ms: 5_000,
+            global_in_flight: 20,
+            global_queued: 5,
+            pools: vec![PoolSample {
+                model: "flash".into(),
+                cap: 64,
+                in_flight: 20,
+                queued: 5,
+                groups: vec![
+                    GroupSample {
+                        name: "teaching".into(),
+                        in_flight: 2,
+                        queued: 0,
+                    },
+                    GroupSample {
+                        name: "default".into(),
+                        in_flight: 18,
+                        queued: 5,
+                    },
+                ],
+            }],
+            cluster: false,
+        };
         let b = replica(vec![
             ("m:flash", 22, 8, vec![("default", 22, 8)]),
             ("u", 1, 0, vec![("default", 1, 0)]),
         ]);
         let c = replica(vec![("m:flash", 22, 4, vec![("default", 22, 4)])]);
-        let s = FairshareSample::from_views(5_000, &[&a, &b, &c]);
+        let s = own.with_peers(&[&b, &c]);
         assert!(s.cluster);
+        assert_eq!(s.ts_ms, 5_000);
         assert_eq!((s.global_in_flight, s.global_queued), (65, 17));
         let flash = s.pools.iter().find(|p| p.model == "flash").expect("flash");
         assert_eq!((flash.cap, flash.in_flight, flash.queued), (64, 64, 17));

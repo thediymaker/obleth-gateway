@@ -279,6 +279,9 @@ pub struct TenantFairshare {
     pub max_in_flight: Option<usize>,
     pub in_flight: usize,
     pub queued: usize,
+    /// The score the scheduler ranks the tenant by: service in this busy
+    /// period plus the virtual time it was placed at on joining. Summed over
+    /// replicas in a cluster view.
     pub served_tokens: f64,
     pub share_score: f64,
     pub weight_share: f64,
@@ -774,15 +777,38 @@ impl FairShare {
     /// them by prompt length; see [`background_slots`]). `None` unless this
     /// replica is in shared mode and the backend answers.
     pub async fn cluster_in_flight(&self, pools: &[PoolKey]) -> Option<(usize, Vec<usize>)> {
-        if self.stats.mode() != SlotMode::Shared {
-            return None;
-        }
-        let backend = self.shared.get()?;
+        let backend = self.shared_backend().ok()?;
         let ids = pools.iter().map(PoolKey::slot_id).collect();
-        match tokio::time::timeout(Duration::from_secs(1), backend.totals(ids)).await {
-            Ok(Ok(totals)) => Some(totals),
-            _ => None,
+        bounded(CLUSTER_READ_TIMEOUT, backend.totals(ids))
+            .await
+            .ok()
+    }
+
+    /// The shared backend, while this replica is in shared mode: the one
+    /// gate for every cluster-wide read.
+    fn shared_backend(&self) -> Result<Arc<dyn SharedSlots>, SlotError> {
+        if self.stats.mode() != SlotMode::Shared {
+            return Err(SlotError("this replica is not in shared slot mode".into()));
         }
+        self.shared
+            .get()
+            .cloned()
+            .ok_or_else(|| SlotError("shared slots are not enabled".into()))
+    }
+
+    /// This replica's part of a cluster-wide read, asked of the scheduler
+    /// with `ask`, and the views every other live replica last published.
+    async fn with_peer_views<T>(
+        &self,
+        ask: impl FnOnce(oneshot::Sender<T>) -> Ctl,
+    ) -> Result<(T, PeerViews), SlotError> {
+        let backend = self.shared_backend()?;
+        let (respond, rx) = oneshot::channel();
+        let gone = || SlotError("the fairshare scheduler is not running".into());
+        self.ctl.send(ask(respond)).map_err(|_| gone())?;
+        let local = rx.await.map_err(|_| gone())?;
+        let peers = bounded(CLUSTER_READ_TIMEOUT, backend.peer_views()).await?;
+        Ok((local, peers))
     }
 
     /// Shared mode: this replica's scheduler state merged with the state
@@ -791,20 +817,13 @@ impl FairShare {
     /// `cap` is its configured size and its `cluster_in_flight` is `None`
     /// (read the slot counts with [`FairShare::cluster_in_flight`]).
     ///
-    /// Fails when shared slots are not enabled or the backend does not
-    /// answer within a second; a caller then has only
+    /// Fails outside shared mode or when the backend does not answer within
+    /// [`CLUSTER_READ_TIMEOUT`]; a caller then has only
     /// [`FairShare::snapshot`], this replica's own.
     pub async fn cluster_snapshot(&self) -> Result<ClusterSnapshot, SlotError> {
-        let backend = self
-            .shared
-            .get()
-            .cloned()
-            .ok_or_else(|| SlotError("shared slots are not enabled".into()))?;
-        let (respond, rx) = oneshot::channel();
-        let gone = || SlotError("the fairshare scheduler is not running".into());
-        self.ctl.send(Ctl::View { respond }).map_err(|_| gone())?;
-        let local = rx.await.map_err(|_| gone())?;
-        let peers = bounded(Duration::from_secs(1), backend.peer_views()).await?;
+        let (local, peers) = self
+            .with_peer_views(|respond| Ctl::View { respond })
+            .await?;
         let mut views: Vec<&ReplicaView> = vec![&local.view];
         views.extend(peers.views.iter().map(|p| &p.view));
         let reporting = views.len();
@@ -914,28 +933,18 @@ impl FairShare {
     }
 
     /// Shared mode: a history sample counted across every live replica,
-    /// from this replica's view and the views its peers last published (the
-    /// same state [`FairShare::cluster_snapshot`] reads). `None` outside
-    /// shared mode or when the backend does not answer within a second; the
-    /// sampler then records [`FairShare::sample`], this replica's own.
+    /// from this replica's own sample and the views its peers last published
+    /// (the same state [`FairShare::cluster_snapshot`] reads). `None` outside
+    /// shared mode or when the backend does not answer within
+    /// [`CLUSTER_READ_TIMEOUT`]; the sampler then records
+    /// [`FairShare::sample`], this replica's own.
     pub async fn cluster_sample(&self) -> Option<FairshareSample> {
-        if self.stats.mode() != SlotMode::Shared {
-            return None;
-        }
-        let backend = self.shared.get().cloned()?;
-        let (respond, rx) = oneshot::channel();
-        self.ctl.send(Ctl::View { respond }).ok()?;
-        let local = rx.await.ok()?;
-        let peers = bounded(Duration::from_secs(1), backend.peer_views())
+        let (local, peers) = self
+            .with_peer_views(|respond| Ctl::Sample { respond })
             .await
             .ok()?;
-        let mut views: Vec<&ReplicaView> = vec![&local.view];
-        views.extend(peers.views.iter().map(|p| &p.view));
-        let ts_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        Some(FairshareSample::from_views(ts_ms, &views))
+        let peers: Vec<&ReplicaView> = peers.views.iter().map(|p| &p.view).collect();
+        Some(local.with_peers(&peers))
     }
 }
 
@@ -3032,22 +3041,18 @@ impl Pool {
             .collect();
         let mut tenants: Vec<ReplicaTenantView> = active
             .iter()
-            .map(|id| {
-                let served = self.served.get(id).copied().unwrap_or(0.0);
-                let base = self.served_base.get(id).copied().unwrap_or(0.0);
-                ReplicaTenantView {
-                    id: *id,
-                    group: self
-                        .tenant_group
-                        .get(id)
-                        .cloned()
-                        .unwrap_or_else(|| "default".into()),
-                    weight: self.tenant_weight.get(id).copied().unwrap_or(1).max(1),
-                    cap: self.tenant_cap.get(id).copied(),
-                    in_flight: self.tenant_in_flight.get(id).copied().unwrap_or(0),
-                    queued: self.queues.get(id).map(|q| q.len).unwrap_or(0),
-                    served: (served - base).max(0.0),
-                }
+            .map(|id| ReplicaTenantView {
+                id: *id,
+                group: self
+                    .tenant_group
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| "default".into()),
+                weight: self.tenant_weight.get(id).copied().unwrap_or(1).max(1),
+                cap: self.tenant_cap.get(id).copied(),
+                in_flight: self.tenant_in_flight.get(id).copied().unwrap_or(0),
+                queued: self.queues.get(id).map(|q| q.len).unwrap_or(0),
+                served: self.served.get(id).copied().unwrap_or(0.0),
             })
             .collect();
         let limit = view::VIEW_MAX_TENANTS_PER_POOL.min(budget.tenants);
@@ -3212,9 +3217,7 @@ impl Pool {
             })
             .collect();
         tenants.sort_by(|a, b| {
-            a.share_score
-                .partial_cmp(&b.share_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            view::share_order(a.share_score, a.tenant_id, b.share_score, b.tenant_id)
         });
 
         let mut keys: Vec<KeyFairshare> = key_ids
@@ -3239,11 +3242,7 @@ impl Pool {
                 })
             })
             .collect();
-        keys.sort_by(|a, b| {
-            a.share_score
-                .partial_cmp(&b.share_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        keys.sort_by(|a, b| view::share_order(a.share_score, a.key_id, b.share_score, b.key_id));
 
         ModelPoolFairshare {
             model: self.model.clone(),
@@ -4685,6 +4684,13 @@ impl Scheduler {
         }
     }
 }
+
+/// Bound on each cluster-wide read ([`FairShare::cluster_snapshot`],
+/// [`FairShare::cluster_sample`], [`FairShare::cluster_in_flight`]): a
+/// dashboard poll or the history sampler gives up on a stalled backend and
+/// shows this replica's own state. Fixed, unlike the scheduler's
+/// configurable `op_timeout`, which bounds the calls admission waits on.
+pub const CLUSTER_READ_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Far enough ahead to stand for "never" in a `sleep_until`.
 fn far_future() -> Instant {

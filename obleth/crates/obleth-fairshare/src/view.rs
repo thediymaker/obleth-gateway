@@ -117,8 +117,9 @@ pub struct ReplicaTenantView {
     pub cap: Option<usize>,
     pub in_flight: usize,
     pub queued: usize,
-    /// Service the tenant received here in this busy period, excluding the
-    /// virtual time it was placed at.
+    /// The tenant's score here, the `served_tokens` of this replica's own
+    /// snapshot: service in this busy period plus the virtual time it was
+    /// placed at.
     #[serde(default)]
     pub served: f64,
 }
@@ -249,6 +250,18 @@ struct PoolAcc {
     keys: HashMap<Uuid, KeyAcc>,
 }
 
+/// The order of a pool's tenant and key rows, in a replica's snapshot and a
+/// merged one alike: lowest share score first (next in line), ties by id so
+/// equal scores keep their places between polls.
+pub(crate) fn share_order(
+    a_score: f64,
+    a_id: Uuid,
+    b_score: f64,
+    b_id: Uuid,
+) -> std::cmp::Ordering {
+    a_score.total_cmp(&b_score).then(a_id.cmp(&b_id))
+}
+
 /// Merge replica views into one set of pools (see the module docs).
 ///
 /// Counts and service add up across the views. Weights, groups, caps and
@@ -260,9 +273,10 @@ struct PoolAcc {
 ///
 /// Each merged pool's `cap` is its configured size, the size every replica
 /// enforces in shared mode, and `cluster_in_flight` is `None`. A tenant's
-/// `served_tokens` (and so its `share_score`) is its service over the
-/// views, excluding virtual-time placement; a key's is the sum of its
-/// per-replica scores. Who goes next is still decided per replica.
+/// and a key's `served_tokens` (and so `share_score`) is the sum of the
+/// scores each replica ranks it by, the same field a replica's own snapshot
+/// gives; a group's is its service, as there. Who goes next is still
+/// decided per replica.
 pub fn merge_views(
     algorithm: FairshareAlgorithm,
     views: &[&ReplicaView],
@@ -411,7 +425,6 @@ fn merge_pool(
         .collect();
     groups.sort_by(|a, b| a.name.cmp(&b.name));
 
-    let by_score = |a: f64, b: f64| a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal);
     let mut tenants: Vec<TenantFairshare> = acc
         .tenants
         .iter()
@@ -427,8 +440,7 @@ fn merge_pool(
             weight_share: shares.tenant(id),
         })
         .collect();
-    tenants
-        .sort_by(|a, b| by_score(a.share_score, b.share_score).then(a.tenant_id.cmp(&b.tenant_id)));
+    tenants.sort_by(|a, b| share_order(a.share_score, a.tenant_id, b.share_score, b.tenant_id));
     let mut keys: Vec<KeyFairshare> = acc
         .keys
         .iter()
@@ -445,7 +457,7 @@ fn merge_pool(
             end_user: k.end_user.clone(),
         })
         .collect();
-    keys.sort_by(|a, b| by_score(a.share_score, b.share_score).then(a.key_id.cmp(&b.key_id)));
+    keys.sort_by(|a, b| share_order(a.share_score, a.key_id, b.share_score, b.key_id));
 
     ModelPoolFairshare {
         model,
