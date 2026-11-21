@@ -534,42 +534,31 @@ async fn dispatch(
     Ok(resp)
 }
 
-/// Longest silence tolerated between two chunks of a boon-driven upstream
-/// stream — the same effective read timeout the shared client applies to the
-/// main upstream path (`0` disables). Mirrors
-/// `obleth_config::Config::upstream_read_timeout_secs`'s own fallback: an
-/// explicit `OBLETH_UPSTREAM_READ_TIMEOUT_SECS` wins, otherwise the upstream
-/// request timeout floored at 120s. Computed from the env directly, rather
-/// than threaded through `AppState`, because `main.rs` builds `Config` before
-/// `AppState` exists. A zombie backend that stops sending mid-stream would
-/// otherwise hold the request, and its fairshare permit, until the client
-/// gives up.
-pub(crate) fn stream_idle_timeout() -> Option<Duration> {
-    static IDLE: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
-    *IDLE.get_or_init(|| {
-        let secs = idle_timeout_secs(
-            std::env::var("OBLETH_UPSTREAM_READ_TIMEOUT_SECS")
-                .ok()
-                .as_deref(),
-            std::env::var("OBLETH_UPSTREAM_TIMEOUT_SECS")
-                .ok()
-                .as_deref(),
-        );
-        (secs > 0).then(|| Duration::from_secs(secs))
-    })
+static STREAM_IDLE: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+
+/// Use the gateway's upstream read timeout (`Config::upstream_read_timeout_secs`,
+/// `0` = none) between the chunks of boon-driven upstream streams. Called
+/// once at start.
+pub(crate) fn install_stream_idle_timeout(secs: u64) {
+    if STREAM_IDLE
+        .set((secs > 0).then(|| Duration::from_secs(secs)))
+        .is_err()
+    {
+        tracing::warn!("the stream idle timeout was already in use; keeping it");
+    }
 }
 
-/// Pure parse behind [`stream_idle_timeout`], split out so the fallback chain
-/// can be unit tested without racing the `OnceLock` across test threads.
-fn idle_timeout_secs(read_raw: Option<&str>, request_raw: Option<&str>) -> u64 {
-    read_raw
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or_else(|| {
-            let request_timeout_secs = request_raw
-                .and_then(|v| v.trim().parse::<u64>().ok())
-                .unwrap_or(300);
-            request_timeout_secs.max(120)
-        })
+/// Longest silence tolerated between two chunks of a boon-driven upstream
+/// stream: the read timeout the shared client applies to the main upstream
+/// path. A zombie backend that stops sending mid-stream would otherwise hold
+/// the request, and its fairshare permit, until the client gives up. Before
+/// [`install_stream_idle_timeout`] (a test), the default read timeout.
+pub(crate) fn stream_idle_timeout() -> Option<Duration> {
+    *STREAM_IDLE.get_or_init(|| {
+        Some(Duration::from_secs(
+            obleth_config::Config::DEFAULT_UPSTREAM_READ_TIMEOUT_SECS,
+        ))
+    })
 }
 
 /// The next item of `stream`, or an error once it has been silent for `idle`.
@@ -1042,18 +1031,6 @@ pub(crate) fn done() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn idle_timeout_secs_matches_the_upstream_read_timeout_fallback() {
-        // Same fallback chain as `obleth_config::Config::upstream_read_timeout_secs`:
-        // an explicit read timeout wins; otherwise the request timeout,
-        // floored at 120s; with the same defaults when neither is set.
-        assert_eq!(idle_timeout_secs(None, None), 300);
-        assert_eq!(idle_timeout_secs(None, Some("30")), 120);
-        assert_eq!(idle_timeout_secs(Some("45"), None), 45);
-        assert_eq!(idle_timeout_secs(Some("0"), None), 0);
-        assert_eq!(idle_timeout_secs(Some("x"), Some("600")), 600);
-    }
 
     #[tokio::test]
     async fn next_within_gives_up_on_a_silent_stream() {

@@ -31,8 +31,9 @@ pub const DEFAULT_COUNTRY_HEADER: &str = "cf-ipcountry";
 
 /// How the gateway works out a request's client, as the environment sets
 /// it: `OBLETH_TRUSTED_PROXIES`, `OBLETH_CLIENT_ADDRESS_HEADER` and
-/// `OBLETH_CLIENT_COUNTRY_HEADER`. Header names are lower-cased.
-#[derive(Debug, Clone, Default)]
+/// `OBLETH_CLIENT_COUNTRY_HEADER` (read into `Config::client_address`).
+/// Header names are lower-cased.
+#[derive(Debug, Clone)]
 pub struct ClientAddressSettings {
     pub trusted: Vec<IpNet>,
     /// The trusted list was set (not the default). Only then does the
@@ -47,6 +48,13 @@ pub struct ClientAddressSettings {
     /// The header a trusted proxy names the client's country in. `None`
     /// when turned off.
     pub country_header: Option<String>,
+}
+
+impl Default for ClientAddressSettings {
+    /// As with none of the three variables set.
+    fn default() -> Self {
+        Self::from_settings(None, None, None)
+    }
 }
 
 impl ClientAddressSettings {
@@ -77,15 +85,6 @@ impl ClientAddressSettings {
             address_header: address_header.and_then(header),
             country_header: header(country_header.unwrap_or(DEFAULT_COUNTRY_HEADER)),
         }
-    }
-
-    pub fn from_env() -> Self {
-        let var = |k: &str| std::env::var(k).ok();
-        Self::from_settings(
-            var("OBLETH_TRUSTED_PROXIES").as_deref(),
-            var("OBLETH_CLIENT_ADDRESS_HEADER").as_deref(),
-            var("OBLETH_CLIENT_COUNTRY_HEADER").as_deref(),
-        )
     }
 }
 

@@ -132,19 +132,6 @@ fn is_http_url(s: &str) -> bool {
     s.starts_with("https://") || s.starts_with("http://")
 }
 
-/// Read `OBLETH_JWT_ISSUERS`. A trust anchor that fails to parse must not
-/// silently disable itself, so any error aborts boot.
-pub fn jwt_issuers_from_env() -> Vec<JwtIssuerConfig> {
-    let raw = std::env::var("OBLETH_JWT_ISSUERS").unwrap_or_default();
-    match parse_jwt_issuers(&raw) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("fatal: {e}");
-            std::process::exit(2);
-        }
-    }
-}
-
 /// Bound the token's device claim before it reaches the usage ledger: at most
 /// [`DEVICE_ID_MAX_LEN`] characters from `[A-Za-z0-9_-]`, otherwise empty.
 pub fn sanitize_device_id(raw: Option<&str>) -> String {

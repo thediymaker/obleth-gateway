@@ -60,32 +60,25 @@ const CONN_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 /// Message of the 503 for a model lookup Redis could not answer.
 const MODEL_REGISTRY_UNAVAILABLE: &str = "model registry unavailable; try again shortly";
 
-/// Default bound on a request's wait in the fairshare queue
-/// (`OBLETH_ADMISSION_TIMEOUT_SECS`). Without one, a saturated pool parks
-/// callers indefinitely.
-const DEFAULT_ADMISSION_TIMEOUT: Duration = Duration::from_secs(60);
 /// `Retry-After` sent with a 503 the client should retry: an admission
 /// timeout, or a registry lookup Redis could not answer (see [`unavailable`]).
 pub(crate) const ADMISSION_RETRY_AFTER_SECS: &str = "5";
 
-/// Parse `OBLETH_ADMISSION_TIMEOUT_SECS`; unset, unparseable, or zero falls
-/// back to the default.
-fn parse_admission_timeout(raw: Option<&str>) -> Duration {
-    raw.and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|s| *s > 0)
-        .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_ADMISSION_TIMEOUT)
+static ADMISSION_TIMEOUT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+
+/// Use the gateway's bound on a request's wait in the fairshare queue
+/// (`Config::admission_timeout`). Called once at start.
+pub(crate) fn install_admission_timeout(timeout: Duration) {
+    if ADMISSION_TIMEOUT.set(timeout).is_err() {
+        tracing::warn!("the admission timeout was already in use; keeping it");
+    }
 }
 
+/// The bound on a request's wait in the fairshare queue: without one, a
+/// saturated pool parks callers indefinitely. 60 s before
+/// [`install_admission_timeout`] (a test).
 pub(crate) fn admission_timeout() -> Duration {
-    static TIMEOUT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
-    *TIMEOUT.get_or_init(|| {
-        parse_admission_timeout(
-            std::env::var("OBLETH_ADMISSION_TIMEOUT_SECS")
-                .ok()
-                .as_deref(),
-        )
-    })
+    *ADMISSION_TIMEOUT.get_or_init(|| Duration::from_secs(60))
 }
 
 /// The canonical spelling of a request path, when it differs from the request's.
@@ -7462,7 +7455,7 @@ pub(crate) async fn admit(
     let admission_start = crate::tracer::now_ms();
     let pool = admission_pool(spec.route);
     let background = background_admission(spec.route, spec.batch, spec.resolved, || {
-        crate::batches::background_share(state.batches.as_ref())
+        crate::batches::background_share()
     });
     let pool = match (pool, &background) {
         (obleth_fairshare::PoolKey::Model(m), Some(_)) => obleth_fairshare::PoolKey::Background(m),
@@ -11136,7 +11129,7 @@ mod lifecycle_tests {
             .find("state.fairshare.admit_to(pool,admit_req)")
             .expect("admission");
         assert!(plan < pool && pool < wait && wait < share && share < admit);
-        assert!(h.contains("crate::batches::background_share(state.batches.as_ref())"));
+        assert!(h.contains("crate::batches::background_share()"));
     }
 
     #[test]
@@ -11300,23 +11293,6 @@ mod lifecycle_tests {
             .is_some();
         assert!(drop_impl, "an armed hold must release itself on drop");
         assert!(src.contains("fnhand_off(mutself){self.armed=false;}"));
-    }
-
-    #[test]
-    fn admission_timeout_defaults_and_parses() {
-        assert_eq!(parse_admission_timeout(None), DEFAULT_ADMISSION_TIMEOUT);
-        assert_eq!(
-            parse_admission_timeout(Some("abc")),
-            DEFAULT_ADMISSION_TIMEOUT
-        );
-        assert_eq!(
-            parse_admission_timeout(Some("0")),
-            DEFAULT_ADMISSION_TIMEOUT
-        );
-        assert_eq!(
-            parse_admission_timeout(Some(" 12 ")),
-            Duration::from_secs(12)
-        );
     }
 
     #[test]

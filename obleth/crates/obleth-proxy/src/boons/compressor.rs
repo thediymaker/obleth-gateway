@@ -9,7 +9,7 @@
 
 /// HTTP client for the optional compressor scoring sidecar.
 ///
-/// Construct with [`CompressorClient::from_env`] or [`parse_config`].
+/// Construct with [`CompressorClient::new`] from the gateway's settings.
 /// The caller supplies the shared [`reqwest::Client`] on each [`score`] call so
 /// no internal client is held.
 #[derive(Clone)]
@@ -125,41 +125,15 @@ impl Breaker {
     }
 }
 
-/// Build a `CompressorClient` from explicit values.
-///
-/// Returns `Some` only when `url` is `Some` and non-empty after trimming.
-/// Strips a single trailing `/` from the URL. `timeout_ms` is parsed as `u64`
-/// milliseconds; unparseable or absent values default to 800 ms.
-fn parse_config(url: Option<&str>, timeout_ms: Option<&str>) -> Option<CompressorClient> {
-    let raw_url = url?;
-    let trimmed = raw_url.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let base_url = trimmed.trim_end_matches('/').to_string();
-    let timeout = timeout_ms
-        .and_then(|s| s.parse::<u64>().ok())
-        .map(std::time::Duration::from_millis)
-        .unwrap_or_else(|| std::time::Duration::from_millis(800));
-    Some(CompressorClient {
-        base_url,
-        timeout,
-        breaker: std::sync::Arc::default(),
-    })
-}
-
 impl CompressorClient {
-    /// Construct from environment variables.
-    ///
-    /// Reads `OBLETH_COMPRESSOR_URL` and `OBLETH_COMPRESSOR_TIMEOUT_MS`.
-    /// Returns `None` when the URL variable is unset or empty.
-    pub fn from_env() -> Option<CompressorClient> {
-        parse_config(
-            std::env::var("OBLETH_COMPRESSOR_URL").ok().as_deref(),
-            std::env::var("OBLETH_COMPRESSOR_TIMEOUT_MS")
-                .ok()
-                .as_deref(),
-        )
+    /// The client for the sidecar `config` names (`Config::compressor`), or
+    /// `None` when none is set up.
+    pub fn new(config: &obleth_config::CompressorConfig) -> Option<CompressorClient> {
+        Some(CompressorClient {
+            base_url: config.url.clone()?,
+            timeout: config.timeout,
+            breaker: std::sync::Arc::default(),
+        })
     }
 
     /// Most sentences one `/score` call may carry: what the sidecar can score
@@ -479,7 +453,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let client = parse_config(Some(&url), Some("50")).unwrap();
+        let client = client(&url, 50);
         let http = reqwest::Client::new();
         let batches = vec![vec!["one".to_owned(), "two".to_owned()]];
         for _ in 0..BREAKER_AFTER {
@@ -533,7 +507,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let client = parse_config(Some(&url), Some("750")).unwrap();
+        let client = client(&url, 750);
         let http = reqwest::Client::new();
         let batches = vec![vec!["one".to_owned()]];
         for _ in 0..(BREAKER_AFTER + 1) {
@@ -553,34 +527,27 @@ mod tests {
 
     #[test]
     fn the_sentence_budget_follows_the_timeout() {
-        let at = |ms: &str| {
-            parse_config(Some("http://c"), Some(ms))
-                .unwrap()
-                .sentence_budget()
-        };
-        assert_eq!(at("800"), 24);
-        assert_eq!(at("3000"), 90);
-        assert_eq!(at("50"), MIN_SENTENCE_BUDGET);
+        let at = |ms| client("http://c", ms).sentence_budget();
+        assert_eq!(at(800), 24);
+        assert_eq!(at(3000), 90);
+        assert_eq!(at(50), MIN_SENTENCE_BUDGET);
     }
 
     use std::collections::HashSet;
 
-    #[test]
-    fn parse_config_none_without_url() {
-        assert!(parse_config(None, None).is_none());
-        assert!(parse_config(Some("   "), Some("1000")).is_none());
+    fn client(url: &str, timeout_ms: u64) -> CompressorClient {
+        CompressorClient::new(&obleth_config::CompressorConfig {
+            url: Some(url.into()),
+            timeout: std::time::Duration::from_millis(timeout_ms),
+        })
+        .unwrap()
     }
 
     #[test]
-    fn parse_config_trims_and_defaults_timeout() {
-        let c = parse_config(Some("http://k:8080/"), None).unwrap();
+    fn a_client_exists_only_with_a_sidecar_url() {
+        assert!(CompressorClient::new(&Default::default()).is_none());
+        let c = client("http://k:8080", 1200);
         assert_eq!(c.base_url, "http://k:8080");
-        assert_eq!(c.timeout, std::time::Duration::from_millis(800));
-    }
-
-    #[test]
-    fn parse_config_reads_timeout_ms() {
-        let c = parse_config(Some("http://k:8080"), Some("1200")).unwrap();
         assert_eq!(c.timeout, std::time::Duration::from_millis(1200));
     }
 

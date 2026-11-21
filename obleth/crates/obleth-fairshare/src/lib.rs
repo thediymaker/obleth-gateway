@@ -192,12 +192,10 @@ impl PoolKey {
 }
 
 /// The share of a model's pool, and of the global ceiling, that background
-/// work may fill when the request does not say.
-pub const DEFAULT_BACKGROUND_SHARE: f64 = 0.75;
-
-/// Prompt tokens per slot a background request holds when the gateway does
-/// not say (`OBLETH_BACKGROUND_SLOT_TOKENS`).
-pub const DEFAULT_BACKGROUND_SLOT_TOKENS: u32 = 4096;
+/// work may fill when the request does not say; and the prompt tokens per
+/// slot a background request holds when the gateway does not say. Defined
+/// with the settings that override them.
+pub use obleth_config::{DEFAULT_BACKGROUND_SHARE, DEFAULT_BACKGROUND_SLOT_TOKENS};
 
 /// The slots a background request with a prompt of `prompt_tokens` asks to
 /// hold in its model's pool: one per `slot_tokens` of prompt, rounded up, and

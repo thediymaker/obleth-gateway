@@ -181,11 +181,8 @@ pub struct CrashGuard {
 pub(crate) const RECENT_REFRESH: Duration = Duration::from_secs(60);
 
 impl CrashGuard {
-    pub fn new(discovery: Option<CapacityDiscovery>) -> Self {
-        let enabled = std::env::var("OBLETH_CRASH_GUARD")
-            .ok()
-            .and_then(|v| obleth_config::config::parse_bool(&v))
-            .unwrap_or(true);
+    /// The guard, on unless `enabled` is false (`Config::crash_guard`).
+    pub fn new(enabled: bool, discovery: Option<CapacityDiscovery>) -> Self {
         CrashGuard {
             enabled,
             discovery,

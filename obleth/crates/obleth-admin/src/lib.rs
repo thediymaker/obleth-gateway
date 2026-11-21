@@ -163,6 +163,12 @@ pub struct AdminState {
     pub usage_cache: Arc<usage_cache::UsageCache>,
     /// The client the Slurm connection test and resource reads share.
     pub slurm_http: slurm_settings::SlurmHttp,
+    /// How the gateway finds a request's client (`Config::client_address`),
+    /// shown on the network settings.
+    pub client_address: obleth_config::network::ClientAddressSettings,
+    /// The prompt-compressor sidecar (`Config::compressor`), probed by the
+    /// compressor status.
+    pub compressor: obleth_config::CompressorConfig,
 }
 
 impl AdminState {
@@ -4896,14 +4902,10 @@ pub struct CompressorStatusView {
     get, path = "/api/v1/settings/compressor", tag = "settings",
     responses((status = 200, body = CompressorStatusView))
 )]
-async fn get_compressor_status() -> Result<Json<CompressorStatusView>> {
-    let url = std::env::var("OBLETH_COMPRESSOR_URL")
-        .unwrap_or_default()
-        .trim()
-        .trim_end_matches('/')
-        .to_string();
-
-    if url.is_empty() {
+async fn get_compressor_status(
+    State(state): State<AdminState>,
+) -> Result<Json<CompressorStatusView>> {
+    let Some(url) = state.compressor.url.clone() else {
         return Ok(Json(CompressorStatusView {
             configured: false,
             url: String::new(),
@@ -4912,16 +4914,14 @@ async fn get_compressor_status() -> Result<Json<CompressorStatusView>> {
             revision: None,
             error: None,
         }));
-    }
+    };
 
-    // Give the settings probe a little more room than the 800ms request-path
-    // timeout — a cold sidecar can be slow to answer its first /health.
-    let timeout_ms = std::env::var("OBLETH_COMPRESSOR_TIMEOUT_MS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|ms| *ms > 0)
-        .unwrap_or(2000)
-        .max(2000);
+    // Give the settings probe more room than the request path's timeout: a
+    // cold sidecar can be slow to answer its first /health.
+    let timeout = state
+        .compressor
+        .timeout
+        .max(std::time::Duration::from_secs(2));
 
     let unreachable = |url: String, error: String| {
         Json(CompressorStatusView {
@@ -4934,10 +4934,7 @@ async fn get_compressor_status() -> Result<Json<CompressorStatusView>> {
         })
     };
 
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(timeout_ms))
-        .build()
-    {
+    let client = match reqwest::Client::builder().timeout(timeout).build() {
         Ok(c) => c,
         Err(e) => return Ok(unreachable(url, e.to_string())),
     };
@@ -6516,18 +6513,20 @@ pub struct UpdateNamedNetworks {
     pub networks: Vec<NamedNetwork>,
 }
 
-fn network_settings_view(networks: Vec<NamedNetwork>) -> NetworkSettingsView {
-    let env = obleth_config::network::ClientAddressSettings::from_env();
+fn network_settings_view(
+    networks: Vec<NamedNetwork>,
+    env: &obleth_config::network::ClientAddressSettings,
+) -> NetworkSettingsView {
     NetworkSettingsView {
         networks,
         client_address: ClientAddressView {
             trusted_proxies: env.trusted.iter().map(|n| n.to_string()).collect(),
             trusted_proxies_default: !env.explicit,
             walks_past_proxies: env.explicit,
-            invalid_trusted_proxies: env.invalid,
+            invalid_trusted_proxies: env.invalid.clone(),
             countries_admit: env.explicit && env.country_header.is_some(),
-            address_header: env.address_header,
-            country_header: env.country_header,
+            address_header: env.address_header.clone(),
+            country_header: env.country_header.clone(),
         },
     }
 }
@@ -6541,6 +6540,7 @@ async fn get_network_settings(
 ) -> Result<Json<NetworkSettingsView>> {
     Ok(Json(network_settings_view(
         state.store.named_networks().await?,
+        &state.client_address,
     )))
 }
 
@@ -6572,7 +6572,7 @@ async fn put_network_settings(
             serde_json::json!({ "networks": networks, "previous": previous }),
         )
         .await?;
-    Ok(Json(network_settings_view(networks)))
+    Ok(Json(network_settings_view(networks, &state.client_address)))
 }
 
 /// View of the persisted raw-usage retention window.
@@ -11290,6 +11290,8 @@ mod tests {
                 live_catalog: Default::default(),
                 usage_cache: Default::default(),
                 slurm_http: Default::default(),
+                client_address: Default::default(),
+                compressor: Default::default(),
                 health: ModelHealthRuntime {
                     scheduled_enabled: false,
                     default_interval_secs: 60,
@@ -11301,7 +11303,7 @@ mod tests {
                     catalogs: Default::default(),
                 },
                 usage_retention_default_days: 30,
-                ssrf: ssrf::SsrfPolicy::from_env(),
+                ssrf: ssrf::SsrfPolicy::default(),
                 alerts,
                 local_cache_tx: None,
             }
@@ -15817,7 +15819,8 @@ mod tests {
         .expect("legacy and group rows parse");
         let networks =
             obleth_config::network::normalize_named_networks(&body.networks).expect("valid");
-        let view = serde_json::to_value(network_settings_view(networks)).expect("serialize");
+        let view = serde_json::to_value(network_settings_view(networks, &Default::default()))
+            .expect("serialize");
         assert_eq!(
             view["networks"],
             serde_json::json!([

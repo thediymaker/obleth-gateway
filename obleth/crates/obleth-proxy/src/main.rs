@@ -60,12 +60,19 @@ use crate::state::AppState;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cfg = Config::from_env();
+    let cfg = Config::from_env()?;
     let otel_provider = init_telemetry(&cfg);
     tracing::info!(?cfg.proxy_listen, ?cfg.admin_listen, "starting obleth gateway");
     for warning in &cfg.warnings {
         tracing::warn!("{warning}");
     }
+    // Settings read deep in the request path, from the one configuration.
+    client::install(cfg.client_address.clone());
+    batches::install(cfg.batches.clone());
+    boons::tool_stream::install_stream_idle_timeout(cfg.upstream_read_timeout_secs);
+    proxy::install_admission_timeout(cfg.admission_timeout);
+    // One destination policy for every operator-supplied URL.
+    let ssrf = obleth_admin::ssrf::SsrfPolicy::new(&cfg.ssrf);
 
     // ---- connect dependencies (with simple boot-time retries) ----
     let store = retry("postgres", || {
@@ -425,7 +432,6 @@ async fn main() -> anyhow::Result<()> {
     let jwt = if cfg.jwt_issuers.is_empty() {
         None
     } else {
-        let ssrf = obleth_admin::ssrf::SsrfPolicy::from_env();
         let mut issuers = cfg.jwt_issuers.clone();
         for i in issuers.iter_mut() {
             if i.jwks_url.is_none() {
@@ -538,23 +544,19 @@ async fn main() -> anyhow::Result<()> {
         metrics: metrics.clone(),
         fail_open: cfg.fail_open,
         alerts: alerts.clone(),
-        session_id_derivation: std::env::var("OBLETH_SESSION_ID_DERIVATION")
-            .map(|v| {
-                !matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "0" | "false" | "no" | "off"
-                )
-            })
-            .unwrap_or(true),
+        session_id_derivation: cfg.session_id_derivation,
         session_affinity: cfg.fairshare_session_affinity,
         session_affinity_settings: cfg.fairshare_session_affinity_settings,
-        compressor: crate::boons::compressor::CompressorClient::from_env(),
+        compressor: crate::boons::compressor::CompressorClient::new(&cfg.compressor),
         energy: energy.clone(),
         jwt,
         knowledge: knowledge.clone(),
         jobs: jobs::JobStore::new(store.clone(), cfg.job_scope),
         load,
-        crash_guard: crate::crash_guard::CrashGuard::new(Some(capacity_discovery.clone())),
+        crash_guard: crate::crash_guard::CrashGuard::new(
+            cfg.crash_guard,
+            Some(capacity_discovery.clone()),
+        ),
         batches: objects.map(|o| batches::Batches::new(store.clone(), o)),
     };
     tracing::info!(
@@ -562,7 +564,7 @@ async fn main() -> anyhow::Result<()> {
         "video jobs are private to their {}",
         cfg.job_scope.as_str()
     );
-    jobs::spawn_job_pruner(app_state.jobs.clone());
+    jobs::spawn_job_pruner(app_state.jobs.clone(), cfg.video_job_retention);
     // Created here so the batch runner can watch it; the signal listener that
     // sends on it starts once the listeners are bound.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -750,7 +752,7 @@ async fn main() -> anyhow::Result<()> {
         admin_token: cfg.admin_token.clone(),
         health: health_runtime,
         usage_retention_default_days: cfg.usage_retention_days,
-        ssrf: obleth_admin::ssrf::SsrfPolicy::from_env(),
+        ssrf: ssrf.clone(),
         alerts: alerts.clone(),
         local_cache_tx: Some(local_cache_tx),
         output_stats: output_stats.clone(),
@@ -787,6 +789,8 @@ async fn main() -> anyhow::Result<()> {
         live_catalog: Default::default(),
         usage_cache: Default::default(),
         slurm_http: Default::default(),
+        client_address: cfg.client_address.clone(),
+        compressor: cfg.compressor.clone(),
     };
     obleth_admin::advice::spawn_output_stats_refresher(
         admin_state.clickhouse.clone(),

@@ -1456,7 +1456,7 @@ mod pipeline {
         let Some(mut gw) = gateway().await else {
             return;
         };
-        gw.state.crash_guard = crate::crash_guard::CrashGuard::new(None);
+        gw.state.crash_guard = crate::crash_guard::CrashGuard::new(true, None);
         let (up, base) = spawn_upstream().await;
         gw.register(route("engine-dies", &base)).await;
         let (secret, key) = gw.tenant().await;
@@ -1534,7 +1534,7 @@ mod pipeline {
         let Some(mut gw) = gateway().await else {
             return;
         };
-        gw.state.crash_guard = crate::crash_guard::CrashGuard::new(None);
+        gw.state.crash_guard = crate::crash_guard::CrashGuard::new(true, None);
         let (_up, base) = spawn_upstream().await;
         gw.register(route("engine-dies", &base)).await;
         let mut key = crate::boons::test_support::test_key();

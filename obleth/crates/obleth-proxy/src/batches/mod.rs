@@ -53,7 +53,7 @@ use axum::http::{header, HeaderMap, Method, Request, Response, StatusCode};
 use axum::response::IntoResponse;
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, TryStreamExt};
-use obleth_config::{JobScope, ResolvedKey};
+use obleth_config::{parse_window, BatchSettings, JobScope, ResolvedKey};
 use obleth_store::batches::{
     BatchFile, BatchOutput, BatchRecord, ClaimedItem, NewBatch, NewBatchFile, NewBatchItem,
     OutputRow, PURPOSE_BATCH, PURPOSE_BATCH_ERROR, PURPOSE_BATCH_OUTPUT,
@@ -151,142 +151,48 @@ pub(crate) const MAX_ADMISSION_WAIT: Duration = Duration::from_secs(3600);
 /// without a limit a request that never ends would hold its item forever.
 const ITEM_RUN_LIMIT: Duration = Duration::from_secs(2 * 3600);
 
-/// Batch settings, from the environment.
+/// Batch settings (`Config::batches`) and this process's name in item leases.
 #[derive(Debug, Clone)]
 pub struct BatchConfig {
-    pub max_file_bytes: usize,
-    pub max_lines: usize,
-    pub max_active_per_key: i64,
-    pub window_min: Duration,
-    pub window_max: Duration,
-    pub max_attempts: i32,
-    pub runner: bool,
-    pub concurrency: usize,
-    /// How long a batch and its answers are kept after it ends; also how
-    /// long an uploaded file waits for a batch to read it.
-    pub retention: Duration,
-    pub scope: JobScope,
-    pub share: f64,
+    settings: BatchSettings,
     /// This process's name in item leases, unique per process.
     pub instance: String,
 }
 
-fn env(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
-}
-
-fn env_num<T: std::str::FromStr>(name: &str, default: T) -> T {
-    env(name)
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(default)
-}
-
-fn truthy(v: &str) -> bool {
-    matches!(
-        v.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
-}
-
-/// `OBLETH_BATCH_RETENTION` (`<n>h` or `<n>d`), default 24 hours. The
-/// older `OBLETH_BATCH_RETENTION_DAYS` is read when it is unset.
-fn retention_from_env() -> Duration {
-    const DEFAULT: Duration = Duration::from_secs(24 * 3600);
-    if let Some(raw) = env("OBLETH_BATCH_RETENTION") {
-        return parse_window(&raw).unwrap_or_else(|| {
-            tracing::warn!(value = %raw, "OBLETH_BATCH_RETENTION is not <n>h or <n>d; using 24h");
-            DEFAULT
-        });
-    }
-    match env("OBLETH_BATCH_RETENTION_DAYS").and_then(|v| v.parse::<u64>().ok()) {
-        Some(days) => {
-            tracing::warn!(
-                days,
-                "OBLETH_BATCH_RETENTION_DAYS is deprecated; set OBLETH_BATCH_RETENTION (e.g. 72h) instead"
-            );
-            Duration::from_secs(days.max(1) * 86400)
-        }
-        None => DEFAULT,
+impl std::ops::Deref for BatchConfig {
+    type Target = BatchSettings;
+    fn deref(&self) -> &BatchSettings {
+        &self.settings
     }
 }
 
-impl BatchConfig {
-    pub fn from_env() -> Self {
-        let window = |name: &str, default: Duration| {
-            env(name).and_then(|v| parse_window(&v)).unwrap_or(default)
-        };
-        let scope = match JobScope::parse(env("OBLETH_BATCH_SCOPE").as_deref()) {
-            Ok(s) => s,
-            Err(bad) => {
-                tracing::warn!(value = %bad, "OBLETH_BATCH_SCOPE is not key or tenant; using key");
-                JobScope::Key
-            }
-        };
-        // The host name plus a random suffix, as for shared slots: a process
-        // that restarts under the same name must not take over (and keep
-        // renewing) the leases of the one before it.
-        let instance = crate::replicas::instance_id();
-        BatchConfig {
-            max_file_bytes: env_num("OBLETH_BATCH_MAX_FILE_BYTES", 200 * 1024 * 1024),
-            max_lines: env_num("OBLETH_BATCH_MAX_LINES", 50_000),
-            max_active_per_key: env_num("OBLETH_BATCH_MAX_ACTIVE_PER_KEY", 10),
-            window_min: window("OBLETH_BATCH_WINDOW_MIN", Duration::from_secs(3600)),
-            window_max: window("OBLETH_BATCH_WINDOW_MAX", Duration::from_secs(7 * 86400)),
-            max_attempts: env_num("OBLETH_BATCH_MAX_ATTEMPTS", 5).max(1),
-            runner: env("OBLETH_BATCH_RUNNER").is_none_or(|v| truthy(&v)),
-            concurrency: env_num("OBLETH_BATCH_RUNNER_CONCURRENCY", 64).max(1),
-            retention: retention_from_env(),
-            scope,
-            share: share_from_env(),
-            instance,
-        }
+static SETTINGS: std::sync::OnceLock<BatchSettings> = std::sync::OnceLock::new();
+
+/// Use the gateway's batch and background settings (`Config::batches`).
+/// Called once at start, before any request is served.
+pub(crate) fn install(settings: BatchSettings) {
+    if SETTINGS.set(settings).is_err() {
+        tracing::warn!("batch settings were already in use; keeping them");
     }
 }
 
-/// The share of a model's slots, and of the global ceiling, background work
-/// may fill: `OBLETH_BATCH_MAX_SHARE`, else the scheduler's default.
-fn share_from_env() -> f64 {
-    env_num(
-        "OBLETH_BATCH_MAX_SHARE",
-        obleth_fairshare::DEFAULT_BACKGROUND_SHARE,
-    )
-    .clamp(0.0, 1.0)
+/// The installed settings; the defaults when none were (a test).
+fn settings() -> &'static BatchSettings {
+    SETTINGS.get_or_init(BatchSettings::default)
 }
 
 /// The share a background key's requests may fill: the batch runner's, so
-/// both kinds of background work stop at the same line. Read from the
-/// environment once when batches are off.
-pub(crate) fn background_share(batches: Option<&Batches>) -> f64 {
-    static SHARE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    batches
-        .map(|b| b.cfg.share)
-        .unwrap_or_else(|| *SHARE.get_or_init(share_from_env))
+/// both kinds of background work stop at the same line.
+pub(crate) fn background_share() -> f64 {
+    settings().share
 }
 
 /// Prompt tokens per slot a background request holds in its model's pool,
-/// for batch items and background keys alike: `OBLETH_BACKGROUND_SLOT_TOKENS`,
-/// default 4096 (see `obleth_fairshare::background_slots`). 0 holds one slot
-/// per request whatever its prompt. Read from the environment once.
+/// for batch items and background keys alike (see
+/// `obleth_fairshare::background_slots`). 0 holds one slot per request
+/// whatever its prompt.
 pub(crate) fn background_slot_tokens() -> u32 {
-    static TOKENS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *TOKENS.get_or_init(|| {
-        env_num(
-            "OBLETH_BACKGROUND_SLOT_TOKENS",
-            obleth_fairshare::DEFAULT_BACKGROUND_SLOT_TOKENS,
-        )
-    })
-}
-
-/// `<n>h` or `<n>d` as a duration.
-pub(crate) fn parse_window(raw: &str) -> Option<Duration> {
-    let raw = raw.trim().to_ascii_lowercase();
-    let (n, unit) = raw.split_at(raw.len().checked_sub(1)?);
-    let n: u64 = n.parse().ok().filter(|n| *n > 0)?;
-    match unit {
-        "h" => Some(Duration::from_secs(n * 3600)),
-        "d" => Some(Duration::from_secs(n * 86400)),
-        _ => None,
-    }
+    settings().slot_tokens
 }
 
 /// The batch store, bucket and settings the data plane carries when
@@ -316,13 +222,18 @@ fn result_key(batch_id: &str, line: i32, attempt: i32) -> String {
 }
 
 impl Batches {
-    /// Batches keeping their bytes in `bucket`, with settings from the
-    /// environment.
+    /// Batches keeping their bytes in `bucket`, with the installed settings.
     pub(crate) fn new(store: obleth_store::Store, bucket: ObjectStore) -> Self {
         Batches {
             store,
             bucket,
-            cfg: Arc::new(BatchConfig::from_env()),
+            cfg: Arc::new(BatchConfig {
+                settings: settings().clone(),
+                // The host name plus a random suffix, as for shared slots: a
+                // process that restarts under the same name must not take
+                // over (and keep renewing) the leases of the one before it.
+                instance: crate::replicas::instance_id(),
+            }),
         }
     }
 

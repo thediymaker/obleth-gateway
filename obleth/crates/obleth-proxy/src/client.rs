@@ -64,10 +64,6 @@ impl ClientAddressConfig {
         ))
     }
 
-    fn from_env() -> Self {
-        Self::from(network::ClientAddressSettings::from_env())
-    }
-
     /// What the request's headers and peer say about its client.
     pub(crate) fn resolve(
         &self,
@@ -122,12 +118,6 @@ impl ClientAddressConfig {
 
 impl From<network::ClientAddressSettings> for ClientAddressConfig {
     fn from(s: network::ClientAddressSettings) -> Self {
-        if !s.invalid.is_empty() {
-            tracing::warn!(
-                entries = ?s.invalid,
-                "OBLETH_TRUSTED_PROXIES has entries that are not CIDR ranges; ignoring them"
-            );
-        }
         let header = |name: Option<String>, var: &str| {
             let name = name?;
             match HeaderName::from_bytes(name.as_bytes()) {
@@ -150,9 +140,20 @@ impl From<network::ClientAddressSettings> for ClientAddressConfig {
 /// Longest request path kept on a rejection row.
 const PATH_MAX_CHARS: usize = 256;
 
+static CONFIG: OnceLock<ClientAddressConfig> = OnceLock::new();
+
+/// Use the gateway's client-address settings (`Config::client_address`).
+/// Called once at start, before any request is served.
+pub(crate) fn install(settings: network::ClientAddressSettings) {
+    if CONFIG.set(ClientAddressConfig::from(settings)).is_err() {
+        tracing::warn!("client address settings were already in use; keeping them");
+    }
+}
+
+/// The installed settings; the defaults when none were (a test calling a
+/// handler directly).
 fn config() -> &'static ClientAddressConfig {
-    static CONFIG: OnceLock<ClientAddressConfig> = OnceLock::new();
-    CONFIG.get_or_init(ClientAddressConfig::from_env)
+    CONFIG.get_or_init(|| ClientAddressConfig::from(network::ClientAddressSettings::default()))
 }
 
 /// Where one request came from. A request that reached a handler without

@@ -64,24 +64,13 @@ impl Default for SsrfPolicy {
 }
 
 impl SsrfPolicy {
-    /// Build the policy from the environment.
-    ///
-    /// `OBLETH_BLOCK_PRIVATE_NETWORKS` (truthy) switches to strict mode where
-    /// private/internal targets are rejected unless explicitly listed in
-    /// `OBLETH_ALLOWED_PRIVATE_CIDRS`.
-    pub fn from_env() -> Self {
+    /// The policy the gateway's settings ask for: with
+    /// `block_private_networks`, private/internal targets are rejected unless
+    /// listed in `allowed_private_cidrs`.
+    pub fn new(config: &obleth_config::SsrfConfig) -> Self {
         Self {
-            allow: parse_cidrs(&std::env::var("OBLETH_ALLOWED_PRIVATE_CIDRS").unwrap_or_default()),
-            allow_private: !env_flag("OBLETH_BLOCK_PRIVATE_NETWORKS"),
-        }
-    }
-
-    /// Parse a comma-separated list of CIDRs (extra allowed ranges). Invalid
-    /// entries are ignored. Private targets remain allowed by default.
-    pub fn parse(raw: &str) -> Self {
-        Self {
-            allow: parse_cidrs(raw),
-            allow_private: true,
+            allow: config.allowed_private_cidrs.clone(),
+            allow_private: !config.block_private_networks,
         }
     }
 
@@ -253,27 +242,6 @@ fn unmap(ip: IpAddr) -> IpAddr {
     ip
 }
 
-/// Parse a comma-separated list of CIDRs, ignoring blank/invalid entries.
-fn parse_cidrs(raw: &str) -> Vec<IpNet> {
-    raw.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .filter_map(|s| s.parse::<IpNet>().ok())
-        .collect()
-}
-
-/// Read a boolean-ish environment flag (`1`/`true`/`yes`/`on` => true).
-fn env_flag(name: &str) -> bool {
-    std::env::var(name)
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
-}
-
 /// Private/internal ranges that are safe to permit for a local-first deployment:
 /// RFC1918, loopback, CGNAT and IPv6 unique-local. Deliberately excludes the
 /// link-local/cloud-metadata range, the unspecified address, and
@@ -327,6 +295,10 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
 mod tests {
     use super::*;
 
+    fn cidrs(raw: &str) -> Vec<IpNet> {
+        raw.split(',').map(|c| c.parse().unwrap()).collect()
+    }
+
     /// Strict (locked-down) policy: private/internal targets rejected unless
     /// listed. Mirrors `OBLETH_BLOCK_PRIVATE_NETWORKS=1`.
     fn strict() -> SsrfPolicy {
@@ -357,7 +329,7 @@ mod tests {
     async fn allowlists_cannot_reopen_metadata_addresses() {
         for allow_private in [true, false] {
             let policy = SsrfPolicy {
-                allow: parse_cidrs("0.0.0.0/0,::/0,169.254.0.0/16,fe80::/10"),
+                allow: cidrs("0.0.0.0/0,::/0,169.254.0.0/16,fe80::/10"),
                 allow_private,
             };
             for url in [
@@ -437,7 +409,7 @@ mod tests {
         ));
 
         let listed = SsrfPolicy {
-            allow: parse_cidrs("10.0.0.0/8"),
+            allow: cidrs("10.0.0.0/8"),
             allow_private: false,
         };
         assert!(listed.validate("http://10.1.2.3:8080/mcp").await.is_ok());

@@ -118,12 +118,6 @@ const LIST_LIMIT: i64 = 1000;
 /// deployment, not only the caller's.
 const LIST_BODY_MAX: usize = 8 * 1024 * 1024;
 
-/// How long a job record is kept. The backend forgets a finished job an hour
-/// after it completes (two for one that never finished), so a day is well past
-/// the last moment a follow-up could succeed. `OBLETH_VIDEO_JOB_RETENTION_HOURS`
-/// overrides it.
-const DEFAULT_JOB_RETENTION: Duration = Duration::from_secs(24 * 3600);
-
 /// How often each replica prunes expired job records.
 const PRUNE_INTERVAL: Duration = Duration::from_secs(3600);
 
@@ -269,22 +263,9 @@ fn no_such_job(kind: JobKind) -> Response<Body> {
     )
 }
 
-/// Record retention, from `OBLETH_VIDEO_JOB_RETENTION_HOURS`.
-fn parse_retention(raw: Option<&str>) -> Duration {
-    raw.and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|h| *h > 0)
-        .map(|h| Duration::from_secs(h.saturating_mul(3600)))
-        .unwrap_or(DEFAULT_JOB_RETENTION)
-}
-
-/// Prune job records past their retention, once an hour, on every replica.
+/// Prune job records older than `retention` (`Config::video_job_retention`), once an hour, on every replica.
 /// Concurrent prunes are harmless: each deletes by age.
-pub(crate) fn spawn_job_pruner(jobs: JobStore) {
-    let retention = parse_retention(
-        std::env::var("OBLETH_VIDEO_JOB_RETENTION_HOURS")
-            .ok()
-            .as_deref(),
-    );
+pub(crate) fn spawn_job_pruner(jobs: JobStore, retention: Duration) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(PRUNE_INTERVAL);
         loop {
@@ -886,14 +867,6 @@ mod tests {
             follow_up_path(JobKind::Mesh, FollowUp::Content("mesh_1")),
             "/v1/meshes/mesh_1/content"
         );
-    }
-
-    #[test]
-    fn retention_defaults_to_a_day_and_parses_hours() {
-        assert_eq!(parse_retention(None), DEFAULT_JOB_RETENTION);
-        assert_eq!(parse_retention(Some("0")), DEFAULT_JOB_RETENTION);
-        assert_eq!(parse_retention(Some("soon")), DEFAULT_JOB_RETENTION);
-        assert_eq!(parse_retention(Some(" 6 ")), Duration::from_secs(6 * 3600));
     }
 
     #[test]
