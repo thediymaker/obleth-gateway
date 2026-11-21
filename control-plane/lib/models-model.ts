@@ -491,22 +491,6 @@ export function snapshotForm(data: FormData): FormSnapshot {
   return out;
 }
 
-/** Field names whose submitted value differs. A checkbox that submits nothing when clear counts as changed when it flips. */
-export function changedFields(base: FormSnapshot, next: FormSnapshot): string[] {
-  const names = new Set([...base.keys(), ...next.keys()]);
-  return [...names].filter((n) => fieldSection(n) !== null && (base.get(n) ?? "") !== (next.get(n) ?? "")).sort();
-}
-
-export function changedSections(fields: string[]): string[] {
-  return [...new Set(fields.map(fieldSection).filter((s): s is NonNullable<typeof s> => s !== null))];
-}
-
-/** The save bar's summary: distinct labels, in page order. */
-export function changeSummary(fields: string[]): string[] {
-  const order = FIELD_LABELS.map(([, label]) => label);
-  return [...new Set(fields.map(fieldLabel))].sort((a, b) => order.indexOf(a) - order.indexOf(b));
-}
-
 /** Whether any of a setting's fields (exact names, or prefixes ending in `_`) changed. */
 export function touches(changed: string[], fields: string[]): boolean {
   return changed.some((c) => fields.some((f) => (f.endsWith("_") ? c.startsWith(f) : c === f)));

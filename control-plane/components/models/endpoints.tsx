@@ -1,5 +1,6 @@
 "use client";
 
+import { SettingsCard } from "@/components/ui/settings-card";
 import { memo, useRef, useState, useTransition } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Plus, Trash2 } from "lucide-react";
@@ -58,20 +59,13 @@ export const EndpointsSection = memo(function EndpointsSection({ model, endpoint
     });
 
   return (
-    <section id="endpoints" data-section="endpoints" aria-label="Endpoints" className="scroll-mt-24 rounded-xl border border-border bg-card">
+    <SettingsCard id="endpoints" title="Endpoints" description={endpoints.length ? "More upstreams serving this model. Changes here apply at once." : "Requests go to the API base above. Add an endpoint to spread them over more upstreams."}
+      action={!adding && <Button type="button" size="sm" variant="outline" onClick={() => setAdding(true)}><Plus className="h-3.5 w-3.5" />Add endpoint</Button>}
+    >
       {confirmElement}
-      <header className="flex flex-wrap items-start justify-between gap-3 px-[18px] pb-3 pt-4">
-        <div>
-          <h2 className="text-sm font-semibold">Endpoints</h2>
-          <p className="mt-0.5 text-xs text-muted-foreground">
-            {endpoints.length ? "More upstreams serving this model. Changes here apply at once." : "Requests go to the API base above. Add an endpoint to spread them over more upstreams."}
-          </p>
-        </div>
-        {!adding && <Button type="button" size="sm" variant="outline" onClick={() => setAdding(true)}><Plus className="h-3.5 w-3.5" />Add endpoint</Button>}
-      </header>
-      {error && <p role="alert" className="mx-[18px] mb-3 rounded-lg border border-foreground/60 px-3 py-2 text-[12.5px]">{error}</p>}
+      {error && <p role="alert" className="mx-[18px] my-3 rounded-lg border border-foreground/60 px-3 py-2 text-[12.5px]">{error}</p>}
       {endpoints.length > 0 && (
-        <div className="overflow-x-auto border-t border-border">
+        <div className="overflow-x-auto">
           <table className="w-full min-w-[720px] text-left text-[13px]">
             <thead>
               <tr className="border-b border-border text-[10.5px] uppercase tracking-[0.07em] text-muted-foreground">
@@ -136,7 +130,7 @@ export const EndpointsSection = memo(function EndpointsSection({ model, endpoint
         </div>
       )}
       {adding && (
-        <form ref={addForm} action={add} className="border-t border-border px-[18px] py-4">
+        <form ref={addForm} action={add} className={cn("px-[18px] py-4", endpoints.length > 0 && "border-t border-border")}>
           <div className="grid gap-3 md:grid-cols-2">
             <Field label="Name" name="name" placeholder="cluster-b" required />
             <Field label="API base URL" name="api_base" placeholder="http://cluster-b/v1" required className="[&_input]:font-mono" />
@@ -153,6 +147,6 @@ export const EndpointsSection = memo(function EndpointsSection({ model, endpoint
           </div>
         </form>
       )}
-    </section>
+    </SettingsCard>
   );
 });

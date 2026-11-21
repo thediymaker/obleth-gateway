@@ -6,7 +6,8 @@ import { Button } from "@/components/ui/button";
 import { snapshotForm, type FormSnapshot } from "@/lib/models-model";
 import { cn } from "@/lib/utils";
 
-export type SaveResult = { ok: true } | { ok: false; error: string; saved: string[] };
+/** A save's answer: done (with anything the caller should know), or what failed and which sections saved anyway. */
+export type SaveResult = { ok: true; warnings?: string[] } | { ok: false; error: string; saved: string[] };
 
 /**
  * One form, one save bar. It snapshots the form as first painted, watches
@@ -14,7 +15,8 @@ export type SaveResult = { ok: true } | { ok: false; error: string; saved: strin
  * event), and marks each changed setting through `ChangesContext`. Save
  * sends the whole form with `id` and the changed `sections`; whatever saved
  * becomes the new baseline, and a refusal leaves the rest marked. Discard
- * remounts the form from the stored values. Leaving with changes asks first.
+ * remounts the form, and any state its children hold, from the stored values.
+ * Leaving with changes asks first. The save bar names the changes in page order.
  */
 export function SettingsForm({
   id,
@@ -25,6 +27,8 @@ export function SettingsForm({
   confirmSave,
   onSaved,
   onDirtyChange,
+  adopt,
+  clearOnSave,
   children,
   bar = "floating",
   className,
@@ -42,6 +46,14 @@ export function SettingsForm({
   confirmSave?: (data: FormData, sections: string[]) => Promise<boolean>;
   onSaved?: (data: FormData) => void;
   onDirtyChange?: (sections: string[], count: number) => void;
+  /**
+   * Fields that arrive after the first paint (a list that loads on its own)
+   * join the baseline here instead of reading as edits: return the baseline
+   * to keep, the same object when nothing joins.
+   */
+  adopt?: (baseline: FormSnapshot, now: FormSnapshot) => FormSnapshot;
+  /** Fields blanked once their section saves, such as a write-only secret. */
+  clearOnSave?: (savedSections: string[]) => string[];
   children: ReactNode;
   /** `floating` sits over the page's bottom edge; `panel` is a footer inside a panel. */
   bar?: "floating" | "panel";
@@ -53,7 +65,7 @@ export function SettingsForm({
   const [baseline, setBaseline] = useState<FormSnapshot | null>(null);
   const [changed, setChanged] = useState<string[]>([]);
   const [pending, start] = useTransition();
-  const [result, setResult] = useState<{ ok: boolean; text: string } | null>(null);
+  const [result, setResult] = useState<{ ok: boolean; text: string; warnings?: string[] } | null>(null);
   const frame = useRef(0);
   const baseRef = useRef<FormSnapshot | null>(null);
   baseRef.current = baseline;
@@ -68,12 +80,17 @@ export function SettingsForm({
     cancelAnimationFrame(frame.current);
     frame.current = requestAnimationFrame(() => {
       const next = read();
-      const base = baseRef.current;
+      let base = baseRef.current;
       if (!next || !base) return;
-      const fields = diff(base, next);
+      const adopted = adopt?.(base, next) ?? base;
+      if (adopted !== base) {
+        base = baseRef.current = adopted;
+        setBaseline(adopted);
+      }
+      const fields = inPageOrder(form.current, diff(base, next));
       setChanged((prev) => (prev.join("|") === fields.join("|") ? prev : fields));
     });
-  }, [read, diff]);
+  }, [read, diff, adopt]);
 
   useEffect(() => {
     setBaseline(read());
@@ -116,8 +133,9 @@ export function SettingsForm({
     };
   }, [changed.length]);
 
+  // A plain "Saved." clears itself; warnings and errors stay until dismissed.
   useEffect(() => {
-    if (!result?.ok) return;
+    if (!result?.ok || result.warnings?.length) return;
     const t = setTimeout(() => setResult(null), 2500);
     return () => clearTimeout(t);
   }, [result]);
@@ -140,6 +158,11 @@ export function SettingsForm({
     start(async () => {
       const res = await save(data);
       const done = res.ok ? sections : res.saved;
+      const cleared = clearOnSave?.(done) ?? [];
+      for (const name of cleared) {
+        const field = el.elements.namedItem(name);
+        if (field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement) field.value = "";
+      }
       setBaseline((base) => {
         if (!base) return base;
         const next = new Map(base);
@@ -149,15 +172,16 @@ export function SettingsForm({
           if (submitted.has(name)) next.set(name, submitted.get(name)!);
           else next.delete(name);
         }
+        for (const name of cleared) next.set(name, "");
         return next;
       });
-      setResult(res.ok ? { ok: true, text: "Saved." } : { ok: false, text: res.saved.length ? `${res.error} The other changes were saved.` : res.error });
+      setResult(res.ok ? { ok: true, text: "Saved.", warnings: res.warnings } : { ok: false, text: res.saved.length ? `${res.error} The other changes were saved.` : res.error });
       recompute();
       if (res.ok || res.saved.length) onSaved?.(data);
     });
   }
 
-  const context = useMemo(() => ({ changed, initial: baseline }), [changed, baseline]);
+  const context = useMemo(() => ({ changed, initial: baseline, saving: pending }), [changed, baseline, pending]);
   const show = changed.length > 0 || result;
 
   return (
@@ -191,10 +215,15 @@ export function SettingsForm({
                 <span className="min-w-0 truncate text-secondary-foreground">{labels.join(" · ")}</span>
               </>
             )}
-            {result && <span role="status" className={cn(result.ok ? "text-secondary-foreground" : "font-medium text-foreground")}>{result.text}</span>}
+            {result && (
+              <span role="status" className={cn("min-w-0", result.ok ? "text-secondary-foreground" : "font-medium text-foreground")}>
+                {result.text}
+                {result.warnings?.map((w) => <span key={w} className="block text-xs text-muted-foreground">{w}</span>)}
+              </span>
+            )}
           </div>
           <div className="flex items-center gap-2">
-            {result && !result.ok && changed.length === 0 && <Button type="button" size="sm" variant="ghost" onClick={() => setResult(null)}>Dismiss</Button>}
+            {result && (!result.ok || result.warnings?.length) && changed.length === 0 && <Button type="button" size="sm" variant="ghost" onClick={() => setResult(null)}>Dismiss</Button>}
             {changed.length > 0 && (
               <>
                 <Button type="button" size="sm" variant="outline" disabled={pending} onClick={() => { setResult(null); setVersion((v) => v + 1); }}>Discard</Button>
@@ -206,4 +235,16 @@ export function SettingsForm({
       )}
     </ChangesContext.Provider>
   );
+}
+
+/** Changed field names in the order the form shows them; fields no longer on the page go last. */
+function inPageOrder(form: HTMLFormElement | null, fields: string[]): string[] {
+  if (!form || fields.length < 2) return fields;
+  const at = new Map<string, number>();
+  [...form.elements].forEach((el, i) => {
+    const name = (el as HTMLInputElement).name;
+    if (name && !at.has(name)) at.set(name, i);
+  });
+  const pos = (f: string) => at.get(f) ?? Number.MAX_SAFE_INTEGER;
+  return [...fields].sort((a, b) => pos(a) - pos(b) || a.localeCompare(b));
 }

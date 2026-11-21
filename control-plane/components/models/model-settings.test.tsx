@@ -39,12 +39,14 @@ let root: Root;
 let host: HTMLDivElement;
 const frame = () => act(async () => { await new Promise((r) => requestAnimationFrame(() => r(null))); });
 
+let states: { dirty: string[]; count: number }[] = [];
+
 async function render(m: ModelRoute = model) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, enabled: false } } });
   await act(async () => {
     root.render(
       <QueryClientProvider client={client}>
-        <ModelSettings model={m} summary={summary} checks={[]} mcpServers={[]} modelNames={["m"]} boonBlockers={{}} onStateChange={() => {}} />
+        <ModelSettings model={m} summary={summary} checks={[]} mcpServers={[]} modelNames={["m"]} boonBlockers={{}} onStateChange={(st) => states.push(st)} />
       </QueryClientProvider>,
     );
   });
@@ -70,6 +72,7 @@ beforeEach(() => {
   document.body.append(host);
   root = createRoot(host);
   vi.mocked(saveModelSettingsAction).mockClear();
+  states = [];
 });
 afterEach(async () => {
   await act(async () => root.unmount());
@@ -168,6 +171,60 @@ describe("the model settings form", () => {
     expect(bar()!.textContent).toContain("1 unsaved");
     expect(bar()!.textContent).toContain("Retries");
     expect(bar()!.textContent).not.toContain("Description");
+  });
+
+  it("tells the page which cards hold changes", async () => {
+    await render();
+    await act(async () => type("description", "new words"));
+    await act(async () => type("max_in_flight", "32"));
+    await frame();
+    expect(states.at(-1)).toEqual({ dirty: ["general", "capacity"], count: 2 });
+  });
+
+  it("shows what the upstream says after a save, until dismissed", async () => {
+    vi.mocked(saveModelSettingsAction).mockResolvedValueOnce({ ok: true, warnings: ["up does not list model up."] });
+    await render();
+    await act(async () => type("description", "new words"));
+    await frame();
+    await act(async () => button("Save changes").click());
+    await frame();
+    expect(bar()!.textContent).toContain("Saved, but the upstream disagrees: up does not list model up.");
+    await act(async () => { await new Promise((r) => setTimeout(r, 2600)); });
+    expect(bar()).not.toBeNull();
+    await act(async () => button("Dismiss").click());
+    expect(bar()).toBeNull();
+  });
+
+  it("blanks the upstream key once it saves", async () => {
+    await render();
+    await act(async () => type("api_key", "sk-new"));
+    await frame();
+    await act(async () => button("Save changes").click());
+    await frame();
+    expect((vi.mocked(saveModelSettingsAction).mock.calls[0][0] as FormData).get("api_key")).toBe("sk-new");
+    expect(host.querySelector<HTMLInputElement>('[name="api_key"]')!.value).toBe("");
+    expect(bar()!.textContent).not.toContain("unsaved");
+  });
+
+  it("keeps an edit when the page's live data refreshes", async () => {
+    await render();
+    await act(async () => type("description", "new words"));
+    await frame();
+    await render({ ...model, updated_at: "later", max_in_flight: 20 });
+    expect(host.querySelector<HTMLInputElement>('[name="description"]')!.value).toBe("new words");
+    expect(bar()!.textContent).toContain("1 unsaved");
+  });
+
+  it("puts a controlled setting back on Discard too", async () => {
+    await render();
+    await act(async () => type("route_bias", "2.5"));
+    await frame();
+    expect(host.textContent).toContain("×2.5");
+    await act(async () => button("Discard").click());
+    await frame();
+    expect(host.querySelector<HTMLInputElement>('[name="route_bias"]')!.value).toBe("1");
+    expect(host.textContent).toContain("×1.0");
+    expect(bar()).toBeNull();
   });
 
   it("shows a price per million and submits it per token", async () => {

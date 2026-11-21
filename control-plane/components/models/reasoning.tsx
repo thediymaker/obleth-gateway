@@ -1,5 +1,6 @@
 "use client";
 
+import { SettingsCard } from "@/components/ui/settings-card";
 import { memo, useState, useTransition } from "react";
 import { setModelReasoningAction } from "@/app/actions";
 import { SelectField, Setting, TextArea } from "@/components/models/fields";
@@ -102,20 +103,15 @@ export const ReasoningSection = memo(function ReasoningSection({ model, onChange
   }
 
   return (
-    <section id="reasoning" data-section="reasoning" aria-label="Reasoning" className="scroll-mt-24 rounded-xl border border-border bg-card">
-      <header className="flex flex-wrap items-start justify-between gap-3 px-[18px] pb-3 pt-4">
-        <div>
-          <h2 className="text-sm font-semibold">Reasoning</h2>
-          <p className="mt-0.5 text-xs text-muted-foreground">
-            Callers ask for one of four effort levels: none, low, medium or high. Model servers take effort in different ways, so choose what each level becomes for this one. Saved on its own, and applies within a few seconds.
-          </p>
-        </div>
+    <SettingsCard id="reasoning" title="Reasoning" description="Callers ask for one of four effort levels: none, low, medium or high. Model servers take effort in different ways, so choose what each level becomes for this one. Saved on its own, and applies within a few seconds."
+      action={
         <div className="flex items-center gap-2">
           {dirty && <Button type="button" size="sm" variant="ghost" onClick={reset} disabled={busy}>Discard</Button>}
           <Button type="button" size="sm" onClick={save} disabled={!dirty || busy}>{busy ? "Saving…" : "Save reasoning"}</Button>
         </div>
-      </header>
-      {error && <p role="alert" className="mx-[18px] mb-3 rounded-lg border border-foreground/60 px-3 py-2 text-[12.5px]">{error}</p>}
+      }
+    >
+      {error && <p role="alert" className="mx-[18px] my-3 rounded-lg border border-foreground/60 px-3 py-2 text-[12.5px]">{error}</p>}
 
       <Setting label="Effort on requests" hint="What obleth does with the effort a caller asks for before the request reaches this model.">
         <div role="radiogroup" aria-label="How the model takes effort" className="flex flex-col gap-1.5">
@@ -175,7 +171,7 @@ export const ReasoningSection = memo(function ReasoningSection({ model, onChange
           </ul>
         )}
       </Setting>
-    </section>
+    </SettingsCard>
   );
 });
 

@@ -1,5 +1,6 @@
 "use client";
 
+import { SettingsCard } from "@/components/ui/settings-card";
 import { memo, useState, useTransition } from "react";
 import Link from "next/link";
 import { setModelStatusAction } from "@/app/actions";
@@ -135,21 +136,16 @@ export const LifecycleSection = memo(function LifecycleSection({
   }
 
   return (
-    <section id="lifecycle" data-section="lifecycle" aria-label="Lifecycle" className="scroll-mt-24 rounded-xl border border-border bg-card">
-      {confirmElement}
-      <header className="flex flex-wrap items-start justify-between gap-3 px-[18px] pb-3 pt-4">
-        <div>
-          <h2 className="text-sm font-semibold">Lifecycle</h2>
-          <p className="mt-0.5 text-xs text-muted-foreground">
-            Stage a new model to test it before anyone can find it, then make it active. Take one out of service without surprising anyone: deprecate it with a date and a replacement, then let it retire. Saved on its own, and applies within a few seconds.
-          </p>
-        </div>
+    <SettingsCard id="lifecycle" title="Lifecycle" description="Stage a new model to test it before anyone can find it, then make it active. Take one out of service without surprising anyone: deprecate it with a date and a replacement, then let it retire. Saved on its own, and applies within a few seconds."
+      action={
         <div className="flex items-center gap-2">
           {dirty && <Button type="button" size="sm" variant="ghost" onClick={reset} disabled={busy}>Discard</Button>}
           <Button type="button" size="sm" onClick={save} disabled={!dirty || busy}>{busy ? "Saving…" : "Save lifecycle"}</Button>
         </div>
-      </header>
-      {error && <p role="alert" className="mx-[18px] mb-3 rounded-lg border border-foreground/60 px-3 py-2 text-[12.5px]">{error}</p>}
+      }
+    >
+      {confirmElement}
+      {error && <p role="alert" className="mx-[18px] my-3 rounded-lg border border-foreground/60 px-3 py-2 text-[12.5px]">{error}</p>}
 
       <Setting label="Status" hint={STATUSES.find((s) => s.value === status)?.hint}>
         <span role="radiogroup" aria-label="Lifecycle status" className="inline-flex items-center gap-0.5 self-start rounded-lg border border-border p-[3px]">
@@ -246,6 +242,6 @@ export const LifecycleSection = memo(function LifecycleSection({
           </ul>
         )}
       </Setting>
-    </section>
+    </SettingsCard>
   );
 });

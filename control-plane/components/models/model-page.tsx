@@ -1,5 +1,6 @@
 "use client";
 
+import { SettingsCard } from "@/components/ui/settings-card";
 import { memo, useCallback, useEffect, useMemo, useRef, useState, useTransition } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
@@ -409,17 +410,10 @@ export function ModelPage({
 const DeploymentSection = memo(function DeploymentSection({ model, managed, runs }: { model: ModelRoute; managed: boolean; runs: ReturnType<typeof runsOn> }) {
   const watched = runs === "kubernetes";
   return (
-    <section id="deployment" data-section="deployment" aria-label="Deployment" className="scroll-mt-24 rounded-xl border border-border bg-card">
-      <header className="flex flex-wrap items-start justify-between gap-3 px-[18px] pb-3 pt-4">
-        <div className="min-w-0">
-          <h2 className="text-sm font-semibold">Deployment</h2>
-          <p className="mt-0.5 text-xs text-muted-foreground">Where the replicas come from.</p>
-        </div>
-        {(managed || watched) && (
-          <Button asChild variant="outline" size="sm"><Link href={deploymentHref(model.model_name)}>Open its deployment ›</Link></Button>
-        )}
-      </header>
-      <div className="border-t border-border px-[18px] py-4">
+    <SettingsCard id="deployment" title="Deployment" description="Where the replicas come from."
+      action={(managed || watched) && <Button asChild variant="outline" size="sm"><Link href={deploymentHref(model.model_name)}>Open its deployment ›</Link></Button>}
+    >
+      <div className="px-[18px] py-4">
         {managed ? (
           <p className="text-[13px] text-secondary-foreground">obleth launches this model as jobs on Slurm and keeps it at its replica count. Its replicas, script and placement are on its deployment page.</p>
         ) : watched ? (
@@ -433,6 +427,6 @@ const DeploymentSection = memo(function DeploymentSection({ model, managed, runs
           </p>
         )}
       </div>
-    </section>
+    </SettingsCard>
   );
 });

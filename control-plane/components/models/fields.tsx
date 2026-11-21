@@ -113,7 +113,8 @@ export const VARIANTS_HINT =
 // ---------------------------------------------------------------------------
 
 /** What the surrounding settings form has changed, so each setting can mark itself. */
-export const ChangesContext = createContext<{ changed: string[]; initial: FormSnapshot | null }>({ changed: [], initial: null });
+/** The settings form's changed fields, its baseline, and whether a save is running. */
+export const ChangesContext = createContext<{ changed: string[]; initial: FormSnapshot | null; saving?: boolean }>({ changed: [], initial: null });
 
 function wasLabel(initial: FormSnapshot | null, field: string, checkbox: boolean): string | null {
   if (!initial) return null;

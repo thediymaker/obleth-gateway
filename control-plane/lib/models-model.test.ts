@@ -3,18 +3,15 @@ import {
   acceptsImages,
   awaitingFirstPass,
   buildModelRows,
-  changedFields,
-  changedSections,
-  changeSummary,
   contextLabel,
   EMPTY_FILTERS,
+  fieldLabel,
   fieldSection,
   filterRows,
   modelStatus,
   priceLabel,
   runsOn,
   searchSettings,
-  snapshotForm,
   sortRows,
   statusLine,
   touches,
@@ -190,24 +187,6 @@ describe("finding a setting", () => {
 });
 
 describe("tracking changes on the settings form", () => {
-  const snap = (entries: [string, string][]) => {
-    const fd = new FormData();
-    for (const [k, v] of entries) fd.append(k, v);
-    return snapshotForm(fd);
-  };
-
-  it("sees a checkbox that was cleared, which submits nothing", () => {
-    const before = snap([["auto_eligible", "on"], ["has_routing", "1"], ["route_bias", "1"]]);
-    const after = snap([["has_routing", "1"], ["route_bias", "1"]]);
-    expect(changedFields(before, after)).toEqual(["auto_eligible"]);
-  });
-
-  it("compares a repeated field as a whole and ignores the markers", () => {
-    const before = snap([["knowledge_collection", "a"], ["knowledge_collection", "b"], ["has_tags", "1"]]);
-    const after = snap([["knowledge_collection", "a"]]);
-    expect(changedFields(before, after)).toEqual(["knowledge_collection"]);
-  });
-
   it("sends each change to the call that owns it", () => {
     expect(fieldSection("max_retries")).toBe("reliability");
     expect(fieldSection("capacity_headroom")).toBe("capacity");
@@ -216,12 +195,10 @@ describe("tracking changes on the settings form", () => {
     expect(fieldSection("maintenance_note")).toBe("health");
     expect(fieldSection("tag_level_coding")).toBe("model");
     expect(fieldSection("has_tags")).toBeNull();
-    expect(changedSections(["route_bias", "tag_coding", "max_in_flight"])).toEqual(["model", "capacity"]);
   });
 
-  it("summarises the changes once each, in page order", () => {
-    expect(changeSummary(["route_bias", "tag_level_math", "tag_math", "description"])).toEqual(["Description", "Router tags", "Routing bias"]);
-    expect(changeSummary(["route_bias", "variants", "aliases"])).toEqual(["Aliases", "Variants", "Routing bias"]);
+  it("names a change once per setting", () => {
+    expect(["route_bias", "tag_level_math", "tag_math", "description"].map(fieldLabel)).toEqual(["Routing bias", "Router tags", "Router tags", "Description"]);
     expect(fieldSection("variants")).toBe("model");
   });
 
