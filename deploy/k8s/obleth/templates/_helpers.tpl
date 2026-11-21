@@ -57,6 +57,39 @@ value in place still needs a manual restart of the pods that read it.
 {{- end -}}
 
 {{/*
+Gateway env entries for optional values: each renders only when its key is
+present, so a release upgraded with --reuse-values from a chart without the
+key keeps the gateway's own default and an unchanged pod spec. Renders a YAML
+list (or nothing) for the caller to indent.
+*/}}
+{{- define "obleth.gatewayOptionalEnv" -}}
+{{- $o := .Values.obleth -}}
+{{- $classifier := dig "autoClassifier" dict $o -}}
+{{- $rows := list
+  (list "OBLETH_FAIRSHARE_ALGORITHM" $o "fairshareAlgorithm")
+  (list "OBLETH_UPSTREAM_POOL_IDLE_SECS" $o "upstreamPoolIdleSecs")
+  (list "OBLETH_UPSTREAM_TCP_KEEPALIVE_SECS" $o "upstreamTcpKeepaliveSecs")
+  (list "OBLETH_SESSION_ID_DERIVATION" $o "sessionIdDerivation")
+  (list "OBLETH_CRASH_GUARD" $o "crashGuard")
+  (list "OBLETH_AUTO_CLASSIFIER_ENABLED" $classifier "enabled")
+  (list "OBLETH_AUTO_CLASSIFIER_MODEL" $classifier "model")
+  (list "OBLETH_AUTO_CLASSIFIER_TIMEOUT_MS" $classifier "timeoutMs")
+  (list "OBLETH_BATCH_MAX_ATTEMPTS" $o.batches "maxAttempts")
+  (list "OBLETH_BATCH_RUNNER" $o.batches "runner")
+-}}
+{{- if .Values.compressor.enabled -}}
+{{- $rows = append $rows (list "OBLETH_COMPRESSOR_TIMEOUT_MS" .Values.compressor "timeoutMs") -}}
+{{- end -}}
+{{- range $rows -}}
+{{- $vals := index . 1 -}}
+{{- $key := index . 2 -}}
+{{- if and (kindIs "map" $vals) (hasKey $vals $key) }}
+- { name: {{ index . 0 }}, value: {{ index $vals $key | quote }} }
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Pod anti-affinity for the obleth data plane, driven by .Values.affinity.antiAffinity
 ("soft" preferred | "hard" required | "" disabled). Emits the full `affinity:` key
 so callers can `{{ include "obleth.antiAffinity" . | nindent 6 }}` under a pod spec.

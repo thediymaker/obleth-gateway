@@ -137,7 +137,14 @@ spec:
             {{- if .Values.compressor.enabled }}
             - { name: OBLETH_COMPRESSOR_URL, value: "http://{{ .Release.Name }}-compressor:8080" }
             {{- end }}
-            - { name: RUST_LOG, value: "info,obleth=info" }
+            {{- with include "obleth.gatewayOptionalEnv" . | trim }}
+            {{- . | nindent 12 }}
+            {{- end }}
+            - { name: RUST_LOG, value: {{ dig "logLevel" "info,obleth=info" .Values.obleth | quote }} }
+            {{- /* Last, so an entry here wins over one the chart sets above. */}}
+            {{- with (dig "extraEnv" list .Values.obleth) }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           envFrom:
             - secretRef:
                 name: {{ include "obleth.secretName" . }}

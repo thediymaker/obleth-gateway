@@ -126,6 +126,7 @@ services:
       # key (default): a video job is private to the key that created it; tenant: shared tenant-wide.
       OBLETH_VIDEO_JOB_SCOPE: ${OBLETH_VIDEO_JOB_SCOPE:-key}
       OBLETH_SESSION_ID_DERIVATION: ${OBLETH_SESSION_ID_DERIVATION:-true}
+      OBLETH_CRASH_GUARD: ${OBLETH_CRASH_GUARD:-}
       # GET /v1/load: each model's live load for callers. false answers 404.
       OBLETH_LOAD_ENDPOINT: ${OBLETH_LOAD_ENDPOINT:-true}
       # Object storage: an S3 or S3-compatible bucket; empty = off. The Files
@@ -138,6 +139,16 @@ services:
       OBLETH_BATCH_RETENTION: ${OBLETH_BATCH_RETENTION:-24h}
       OBLETH_BATCH_MAX_SHARE: ${OBLETH_BATCH_MAX_SHARE:-0.75}
       OBLETH_BACKGROUND_SLOT_TOKENS: ${OBLETH_BACKGROUND_SLOT_TOKENS:-4096}
+      # Empty = the gateway's default; see .env.example.
+      OBLETH_BATCH_SCOPE: ${OBLETH_BATCH_SCOPE:-}
+      OBLETH_BATCH_MAX_LINES: ${OBLETH_BATCH_MAX_LINES:-}
+      OBLETH_BATCH_MAX_FILE_BYTES: ${OBLETH_BATCH_MAX_FILE_BYTES:-}
+      OBLETH_BATCH_MAX_ACTIVE_PER_KEY: ${OBLETH_BATCH_MAX_ACTIVE_PER_KEY:-}
+      OBLETH_BATCH_WINDOW_MIN: ${OBLETH_BATCH_WINDOW_MIN:-}
+      OBLETH_BATCH_WINDOW_MAX: ${OBLETH_BATCH_WINDOW_MAX:-}
+      OBLETH_BATCH_MAX_ATTEMPTS: ${OBLETH_BATCH_MAX_ATTEMPTS:-}
+      OBLETH_BATCH_RUNNER: ${OBLETH_BATCH_RUNNER:-}
+      OBLETH_BATCH_RUNNER_CONCURRENCY: ${OBLETH_BATCH_RUNNER_CONCURRENCY:-}
       # Boot-time seed only; the dashboard's routing settings win once saved.
       OBLETH_AUTO_CLASSIFIER_ENABLED: ${OBLETH_AUTO_CLASSIFIER_ENABLED:-false}
       OBLETH_AUTO_CLASSIFIER_MODEL: ${OBLETH_AUTO_CLASSIFIER_MODEL:-}
@@ -145,6 +156,8 @@ services:
       OBLETH_UPSTREAM_CONNECT_TIMEOUT_SECS: ${OBLETH_UPSTREAM_CONNECT_TIMEOUT_SECS:-5}
       # Empty = the upstream request timeout (OBLETH_UPSTREAM_TIMEOUT_SECS).
       OBLETH_UPSTREAM_READ_TIMEOUT_SECS: ${OBLETH_UPSTREAM_READ_TIMEOUT_SECS:-}
+      OBLETH_UPSTREAM_POOL_IDLE_SECS: ${OBLETH_UPSTREAM_POOL_IDLE_SECS:-}
+      OBLETH_UPSTREAM_TCP_KEEPALIVE_SECS: ${OBLETH_UPSTREAM_TCP_KEEPALIVE_SECS:-}
       # Keep below stop_grace_period (below) minus the telemetry flush.
       OBLETH_SHUTDOWN_GRACE_SECS: ${OBLETH_SHUTDOWN_GRACE_SECS:-300}
       OBLETH_CLICKHOUSE_URL: http://clickhouse:8123
@@ -195,7 +208,7 @@ services:
       OBLETH_CAPACITY_DISCOVERY_INTERVAL_SECS: ${OBLETH_CAPACITY_DISCOVERY_INTERVAL_SECS:-15}
       OBLETH_CAPACITY_DISCOVERY_NAMESPACES: ""
       OBLETH_CAPACITY_DEFAULT_SERVICE: ""
-      OBLETH_FAIRSHARE_ALGORITHM: hierarchical
+      OBLETH_FAIRSHARE_ALGORITHM: ${OBLETH_FAIRSHARE_ALGORITHM:-hierarchical}
       OBLETH_FAIL_OPEN: ${OBLETH_FAIL_OPEN:-true}
       OBLETH_SCHEMA_VERIFY_ONLY: ${OBLETH_SCHEMA_VERIFY_ONLY:-false}
       # Fail-open telemetry WAL: usage batches spill here while ClickHouse is
@@ -229,7 +242,7 @@ services:
       # http://compressor:8080 and start the `compressor` profile to enable.
       OBLETH_COMPRESSOR_URL: ${OBLETH_COMPRESSOR_URL:-}
       OBLETH_COMPRESSOR_TIMEOUT_MS: ${OBLETH_COMPRESSOR_TIMEOUT_MS:-}
-      RUST_LOG: info,obleth=debug
+      RUST_LOG: ${OBLETH_LOG_LEVEL:-info,obleth=debug}
     # host 8088 -> container 8080 (8080 may be taken by other local stacks);
     # internal networking + HAProxy still use 8080.
     ports: ["8088:8080", "127.0.0.1:9180:9180", "127.0.0.1:9091:9091"]

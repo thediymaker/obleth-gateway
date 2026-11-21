@@ -33,6 +33,9 @@ spec:
       containers:
         - name: postgres
           image: {{ .Values.postgres.image }}
+          {{- with (dig "maxConnections" "" .Values.postgres) }}
+          args: ["postgres", "-c", "max_connections={{ . | int }}"]
+          {{- end }}
           env:
             - { name: POSTGRES_USER, value: {{ .Values.postgres.user | quote }} }
             - name: POSTGRES_PASSWORD
