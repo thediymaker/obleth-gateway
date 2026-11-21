@@ -244,7 +244,7 @@ mod tests {
             eprintln!("skipping: set OBLETH_TEST_REDIS_URL to run");
             return;
         };
-        let _serial = crate::RESOLVER_TEST_LOCK.lock().await;
+        let _serial = crate::test_util::RESOLVER_TEST_LOCK.lock().await;
         let store = RedisStore::connect(&url).await.expect("connect");
         let tag = uuid::Uuid::new_v4();
         let entries: Vec<(String, serde_json::Value)> = (0..10_000)

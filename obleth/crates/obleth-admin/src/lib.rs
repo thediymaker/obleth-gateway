@@ -10570,7 +10570,9 @@ pub struct DailyStatsView {
 }
 
 /// Daily usage counters the proxy keeps in Redis: MCP calls per server and
-/// knowledge searches per collection. Best-effort and about 40 days deep.
+/// knowledge searches per collection. Best-effort and about 40 days deep: the
+/// counters carry a TTL, so Redis can evict past days under memory pressure
+/// and the chart then shows gaps.
 #[utoipa::path(
     get, path = "/api/v1/stats/daily", tag = "usage",
     params(DailyStatsQuery),

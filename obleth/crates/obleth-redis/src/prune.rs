@@ -188,7 +188,7 @@ mod tests {
             eprintln!("skipping: set OBLETH_TEST_REDIS_URL to run");
             return;
         };
-        let _serial = crate::RESOLVER_TEST_LOCK.lock().await;
+        let _serial = crate::test_util::RESOLVER_TEST_LOCK.lock().await;
         let store = RedisStore::connect(&url).await.expect("connect");
         prune_removes_only_the_unlisted_entry(&store, Namespace::Keys).await;
     }
@@ -200,7 +200,7 @@ mod tests {
             eprintln!("skipping: set OBLETH_TEST_REDIS_URL to run");
             return;
         };
-        let _serial = crate::RESOLVER_TEST_LOCK.lock().await;
+        let _serial = crate::test_util::RESOLVER_TEST_LOCK.lock().await;
         let store = RedisStore::connect(&url).await.expect("connect");
         prune_removes_only_the_unlisted_entry(&store, Namespace::Models).await;
         prune_removes_only_the_unlisted_entry(&store, Namespace::McpServers).await;
@@ -228,7 +228,7 @@ mod tests {
             eprintln!("skipping: set OBLETH_TEST_REDIS_URL to run");
             return;
         };
-        let _serial = crate::RESOLVER_TEST_LOCK.lock().await;
+        let _serial = crate::test_util::RESOLVER_TEST_LOCK.lock().await;
         let store = RedisStore::connect(&url).await.expect("connect");
         let mut conn = store.conn.clone();
         let resolvers = [Resolver::Keys, Resolver::Models, Resolver::McpServers];

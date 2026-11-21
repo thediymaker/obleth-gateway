@@ -479,9 +479,13 @@ redis:
   # Redis's own memory ceiling (--maxmemory). Keep it at about 80% of
   # resources.limits.memory so Redis evicts before the kernel OOM-kills it.
   # Eviction is volatile-lru: only entries with a TTL are evicted (response
-  # cache, compression originals, rate-limit windows, in-flight budget
-  # reservations); API keys, model routes, and committed term-budget usage have
-  # no TTL and are never evicted. When the ceiling is reached with nothing left
+  # cache, compression originals and compacted forms, vision descriptions,
+  # cached knowledge query vectors, rate-limit windows, in-flight budget
+  # reservations, daily MCP and knowledge stats, crash-guard strikes, and auto
+  # routing records); API keys, model routes, shared fairshare slots, and
+  # committed term-budget usage have no TTL and are never evicted. Past days
+  # of the daily stats are read rarely, so they go first: the stats charts can
+  # show gaps once the cache fills memory. When the ceiling is reached with nothing left
   # to evict, Redis rejects writes with an out-of-memory error until memory is
   # freed, which the gateway handles as a Redis failure (see failOpen).
   maxmemory: 400mb

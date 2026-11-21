@@ -656,7 +656,7 @@ mod tests {
         // cold-start the cache — and two embedders must never share an entry.
         // `query_cache_key` itself returns only the hash portion: the
         // `obleth:knowledge:q:` namespace prefix is owned by `RedisStore`
-        // (mirroring `compress_key`), since the proxy has no access to the
+        // (as with the compression originals), since the proxy has no access to the
         // private const that names it.
         let a = query_cache_key("embed-a", "refund policy");
         let b = query_cache_key("embed-b", "refund policy");
