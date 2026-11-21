@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-obleth-config = { path = "../obleth-config" }
+obleth-config.workspace = true
 tokio = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
