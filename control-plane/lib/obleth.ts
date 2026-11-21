@@ -1397,6 +1397,9 @@ export interface ModelPoolView {
   /** In-flight requests in the view's `scope`: every gateway's in cluster
    *  scope, the answering gateway's otherwise. */
   in_flight: number;
+  /** Pool slots those requests hold, in the same scope: `in_flight`, or more
+   *  in a background pool with long prompts. `cap` counts slots. */
+  slots?: number;
   /** In-flight requests across every gateway from the shared slot counts
    *  (shared mode only). */
   cluster_in_flight?: number | null;

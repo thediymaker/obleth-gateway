@@ -987,6 +987,10 @@ pub struct ModelPoolView {
     /// replica's in `cluster` scope, the answering replica's in `replica`
     /// scope.
     pub in_flight: usize,
+    /// The pool slots those requests hold, in the same scope: `in_flight`,
+    /// or more in a background pool, where a request holds one slot per
+    /// `OBLETH_BACKGROUND_SLOT_TOKENS` of prompt. `cap` counts slots.
+    pub slots: usize,
     /// In-flight requests in the pool across every replica, read from the
     /// shared slot counts at the time of the request. `null` outside
     /// `shared` mode.
@@ -7366,6 +7370,8 @@ pub(crate) struct LiveNames<'a> {
 pub(crate) struct PoolCounts {
     /// In flight in the view's scope.
     pub(crate) in_flight: usize,
+    /// The pool slots those requests hold in the view's scope.
+    pub(crate) slots: usize,
     /// Waiting for a slot in the view's scope.
     pub(crate) queued: usize,
     /// In flight across every replica, from the shared slots.
@@ -7393,6 +7399,9 @@ pub(crate) fn pool_counts(
         .unwrap_or((0, 0));
     PoolCounts {
         in_flight: p.in_flight.saturating_sub(h_in),
+        // A probe holds one slot. A snapshot without slot counts reads as
+        // one slot per request.
+        slots: p.slots.max(p.in_flight).saturating_sub(h_in),
         queued: p.queued.saturating_sub(h_q),
         // Cluster-wide slot counts include every replica's health probes,
         // which are not told apart from traffic there. Without a fresh read,
@@ -7424,6 +7433,7 @@ pub(crate) fn live_pool_view(
         cap,
         configured_cap: p.configured_cap,
         in_flight: counts.in_flight,
+        slots: counts.slots,
         cluster_in_flight: counts.cluster_in_flight,
         queued: counts.queued,
         borrowed: p.borrowed,
@@ -16605,6 +16615,7 @@ mod tests {
             cap,
             configured_cap: cap,
             in_flight,
+            slots: in_flight,
             cluster_in_flight: None,
             queued: 0,
             borrowed: 0,
@@ -16776,6 +16787,58 @@ mod tests {
         let own = live_pool_view(&local[0], local.first(), None, &names);
         assert_eq!((own.in_flight, own.queued), (96, 209));
         assert_eq!((own.replica_in_flight, own.replica_queued), (96, 209));
+    }
+
+    /// A background pool's requests hold a slot per
+    /// `OBLETH_BACKGROUND_SLOT_TOKENS` of prompt: the live view sends the
+    /// slots they hold beside the request count, merged across replicas, and
+    /// an ordinary pool's slots are its requests.
+    #[test]
+    fn live_pool_view_sends_the_slots_a_background_pool_holds() {
+        let (tenant, key) = (Uuid::new_v4(), Uuid::new_v4());
+        let background = |in_flight: usize, slots: usize| {
+            let mut v = replica_view(tenant, key, in_flight, 0);
+            v.pools[0].pool = PoolKey::Model(format!(
+                "glm-5-2{}",
+                obleth_fairshare::BACKGROUND_POOL_SUFFIX
+            ))
+            .slot_id();
+            v.pools[0].configured_cap = 12;
+            v.pools[0].slots = slots;
+            v
+        };
+        // Two replicas: 3 requests on 9 slots, 1 request on 3.
+        let views = [background(3, 9), background(1, 3)];
+        let algorithm = obleth_config::FairshareAlgorithm::Hierarchical;
+        let merged =
+            obleth_fairshare::merge_views(algorithm, &views.iter().collect::<Vec<_>>(), 4096);
+        let local = obleth_fairshare::merge_views(algorithm, &[&views[0]], 4096);
+        let (tenants, keys) = (Default::default(), Default::default());
+        let (enabled, serving) = (Default::default(), Default::default());
+        let names = LiveNames {
+            tenants: &tenants,
+            keys: &keys,
+            enabled: &enabled,
+            serving: &serving,
+        };
+        let view = live_pool_view(&merged[0], local.first(), None, &names);
+        assert!(view
+            .model
+            .ends_with(obleth_fairshare::BACKGROUND_POOL_SUFFIX));
+        assert_eq!((view.in_flight, view.slots, view.cap), (4, 12, 12));
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(
+            (json["in_flight"].clone(), json["slots"].clone()),
+            (4.into(), 12.into())
+        );
+        let own = live_pool_view(&local[0], local.first(), None, &names);
+        assert_eq!((own.in_flight, own.slots), (3, 9));
+
+        // An ordinary pool, or a replica that sends no slot count: a slot per
+        // request.
+        let plain =
+            obleth_fairshare::merge_views(algorithm, &[&replica_view(tenant, key, 5, 0)], 4096);
+        assert_eq!(live_pool_view(&plain[0], None, None, &names).slots, 5);
     }
 
     /// The health prober is left out of every level of a merged pool and of
