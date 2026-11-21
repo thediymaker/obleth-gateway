@@ -27,7 +27,7 @@ function setup(result: "ok" | "not-found" | "last-admin" = "ok") {
 describe("setUserStatusAction", () => {
   it("refuses to deactivate the caller's own account", async () => {
     const { setUserStatus } = setup();
-    const { setUserStatusAction } = await import("./users-actions");
+    const { setUserStatusAction } = await import("./users");
     const res = await setUserStatusAction(ADMIN_ID, "pending");
     expect(res).toEqual({ ok: false, error: "You cannot remove admin access from your own account" });
     expect(setUserStatus).not.toHaveBeenCalled();
@@ -35,7 +35,7 @@ describe("setUserStatusAction", () => {
 
   it("reports the last-admin refusal and does not revalidate", async () => {
     const { setUserStatus, revalidatePath } = setup("last-admin");
-    const { setUserStatusAction } = await import("./users-actions");
+    const { setUserStatusAction } = await import("./users");
     const res = await setUserStatusAction(OTHER_ID, "pending");
     expect(res).toEqual({ ok: false, error: "Cannot remove the last active admin" });
     expect(setUserStatus).toHaveBeenCalledWith(OTHER_ID, "pending");
@@ -44,7 +44,7 @@ describe("setUserStatusAction", () => {
 
   it("deactivates another user", async () => {
     const { setUserStatus, revalidatePath } = setup("ok");
-    const { setUserStatusAction } = await import("./users-actions");
+    const { setUserStatusAction } = await import("./users");
     const res = await setUserStatusAction(OTHER_ID, "pending");
     expect(res.ok).toBe(true);
     expect(setUserStatus).toHaveBeenCalledWith(OTHER_ID, "pending");
@@ -55,7 +55,7 @@ describe("setUserStatusAction", () => {
 describe("assignUserAction", () => {
   it("refuses to demote the caller's own account", async () => {
     const { assignUser } = setup();
-    const { assignUserAction } = await import("./users-actions");
+    const { assignUserAction } = await import("./users");
     const res = await assignUserAction({ id: ADMIN_ID, role: "user", tenantId: "" });
     expect(res.ok).toBe(false);
     expect(assignUser).not.toHaveBeenCalled();
@@ -63,14 +63,14 @@ describe("assignUserAction", () => {
 
   it("reports the last-admin refusal", async () => {
     setup("last-admin");
-    const { assignUserAction } = await import("./users-actions");
+    const { assignUserAction } = await import("./users");
     const res = await assignUserAction({ id: OTHER_ID, role: "user", tenantId: "" });
     expect(res).toEqual({ ok: false, error: "Cannot remove the last active admin" });
   });
 
   it("lets an admin reassign their own tenant while staying admin", async () => {
     const { assignUser } = setup("ok");
-    const { assignUserAction } = await import("./users-actions");
+    const { assignUserAction } = await import("./users");
     const res = await assignUserAction({ id: ADMIN_ID, role: "admin", tenantId: "" });
     expect(res.ok).toBe(true);
     expect(assignUser).toHaveBeenCalledWith(ADMIN_ID, "admin", null);
@@ -78,7 +78,7 @@ describe("assignUserAction", () => {
 
   it("reports an unknown user", async () => {
     setup("not-found");
-    const { assignUserAction } = await import("./users-actions");
+    const { assignUserAction } = await import("./users");
     const res = await assignUserAction({ id: OTHER_ID, role: "user", tenantId: "" });
     expect(res).toEqual({ ok: false, error: "User not found" });
   });

@@ -4,7 +4,7 @@ import { useMemo, useState, useTransition } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useInfiniteQuery } from "@tanstack/react-query";
-import { cancelBatchAction } from "@/app/(dashboard)/batches/batches-actions";
+import { cancelBatchAction } from "@/app/actions/batches";
 import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { BATCH_FILTERS, batchName, batchState, doneOf, filterCount, isActive, ownerOf, percentOf, type BatchFilter, type BatchTone } from "@/lib/batches-model";

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 afterEach(() => vi.resetModules());
 
-// Same mocking approach as the other actions tests: actions.ts pulls in
+// Same mocking approach as the other actions tests: app/actions/ pulls in
 // "next/cache", "@/lib/obleth" and "@/lib/auth/roles", none of which run
 // under vitest.
 function mockAdmin() {

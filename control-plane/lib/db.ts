@@ -4,7 +4,7 @@ let pool: Pool | null = null;
 
 /**
  * Lazily-created Postgres pool used ONLY for better-auth's tables. Everything
- * else in the control plane goes through the Management API (lib/obleth.ts).
+ * else in the control plane goes through the Management API (lib/obleth/).
  * Lazy so `next build` (which evaluates server modules without a database)
  * does not fail.
  */

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 afterEach(() => vi.resetModules());
 
-// actions.ts imports from:
+// app/actions/ imports from:
 //   "next/cache"     -> revalidatePath
 //   "@/lib/obleth"   -> obleth, OblethApiError
 //   "@/lib/auth/roles" -> requireAdmin

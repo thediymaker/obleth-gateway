@@ -3,11 +3,11 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { BatchesView } from "./batches-view";
-import { cancelBatchAction } from "@/app/(dashboard)/batches/batches-actions";
+import { cancelBatchAction } from "@/app/actions/batches";
 import type { AdminBatch, AdminBatchList } from "@/lib/obleth";
 
 vi.mock("next/navigation", () => ({ useRouter: () => ({ replace: vi.fn() }), usePathname: () => "/batches" }));
-vi.mock("@/app/(dashboard)/batches/batches-actions", () => ({ cancelBatchAction: vi.fn(async () => ({ ok: true })) }));
+vi.mock("@/app/actions/batches", () => ({ cancelBatchAction: vi.fn(async () => ({ ok: true })) }));
 
 const batch = (n: number): AdminBatch => ({
   id: `batch_${String(n).padStart(3, "0")}`, tenant_id: "t", tenant_name: "team", key_id: "k", key_name: "key", model: "m", endpoint: "/v1/chat/completions",

@@ -3,10 +3,10 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { PortalKeys } from "./portal-keys";
-import { createPortalKey, deletePortalKey, disablePortalKey } from "@/app/(portal)/portal-actions";
+import { createPortalKey, deletePortalKey, disablePortalKey } from "@/app/actions/portal";
 import type { ApiKey } from "@/lib/obleth";
 
-vi.mock("@/app/(portal)/portal-actions", () => ({
+vi.mock("@/app/actions/portal", () => ({
   createPortalKey: vi.fn(),
   deletePortalKey: vi.fn(),
   disablePortalKey: vi.fn(),

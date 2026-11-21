@@ -21,7 +21,7 @@ it("deletePortalKey refuses a key that belongs to another tenant", async () => {
       deleteKey: vi.fn(),
     },
   }));
-  const { deletePortalKey } = await import("./portal-actions");
+  const { deletePortalKey } = await import("./portal");
   const res = await deletePortalKey("k-OTHER");
   expect(res.ok).toBe(false);
 });
@@ -35,7 +35,7 @@ it("deletePortalKey does NOT call obleth.deleteKey when ownership check fails", 
       deleteKey: deleteKeyMock,
     },
   }));
-  const { deletePortalKey } = await import("./portal-actions");
+  const { deletePortalKey } = await import("./portal");
   await deletePortalKey("k-OTHER");
   expect(deleteKeyMock).not.toHaveBeenCalled();
 });
@@ -49,7 +49,7 @@ it("disablePortalKey refuses a key that belongs to another tenant", async () => 
       setKeyDisabled: setKeyDisabledMock,
     },
   }));
-  const { disablePortalKey } = await import("./portal-actions");
+  const { disablePortalKey } = await import("./portal");
   const res = await disablePortalKey("k-OTHER");
   expect(res.ok).toBe(false);
   expect(setKeyDisabledMock).not.toHaveBeenCalled();
@@ -64,7 +64,7 @@ it("deletePortalKey succeeds for an owned key", async () => {
     },
   }));
   vi.doMock("next/cache", () => ({ revalidatePath: vi.fn() }));
-  const { deletePortalKey } = await import("./portal-actions");
+  const { deletePortalKey } = await import("./portal");
   const res = await deletePortalKey("k-A");
   expect(res.ok).toBe(true);
 });
@@ -78,7 +78,7 @@ it("createPortalKey returns the secret on success", async () => {
     },
   }));
   vi.doMock("next/cache", () => ({ revalidatePath: vi.fn() }));
-  const { createPortalKey } = await import("./portal-actions");
+  const { createPortalKey } = await import("./portal");
   const res = await createPortalKey("My Key");
   expect(res.ok).toBe(true);
   if (res.ok) expect(res.secret).toBe("sk-supersecret");
@@ -92,7 +92,7 @@ it("createPortalKey returns the secret on success", async () => {
 it("createPortalKey rejects a blank name", async () => {
   mockPortalUser();
   vi.doMock("@/lib/obleth", () => ({ obleth: { createKey: vi.fn() } }));
-  const { createPortalKey } = await import("./portal-actions");
+  const { createPortalKey } = await import("./portal");
   const res = await createPortalKey("   ");
   expect(res.ok).toBe(false);
 });
@@ -107,7 +107,7 @@ it("disablePortalKey disables an owned key", async () => {
     },
   }));
   vi.doMock("next/cache", () => ({ revalidatePath: vi.fn() }));
-  const { disablePortalKey } = await import("./portal-actions");
+  const { disablePortalKey } = await import("./portal");
   const res = await disablePortalKey("k-A");
   expect(res.ok).toBe(true);
   expect(setKeyDisabledMock).toHaveBeenCalledWith("k-A", true, { auditActor: "user-a@example.com" });

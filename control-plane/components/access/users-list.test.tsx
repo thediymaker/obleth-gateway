@@ -2,11 +2,11 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { assignUserAction } from "@/app/(dashboard)/users/users-actions";
+import { assignUserAction } from "@/app/actions/users";
 import { UsersList } from "./users-list";
 import type { AdminUser } from "@/lib/auth/users";
 
-vi.mock("@/app/(dashboard)/users/users-actions", () => ({
+vi.mock("@/app/actions/users", () => ({
   assignUserAction: vi.fn(async () => ({ ok: true })),
   setUserStatusAction: vi.fn(async () => ({ ok: true })),
 }));

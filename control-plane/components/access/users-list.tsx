@@ -4,7 +4,7 @@ import { memo, useCallback, useDeferredValue, useMemo, useState, useTransition }
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { MoreHorizontal } from "lucide-react";
-import { assignUserAction, setUserStatusAction } from "@/app/(dashboard)/users/users-actions";
+import { assignUserAction, setUserStatusAction } from "@/app/actions/users";
 import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";

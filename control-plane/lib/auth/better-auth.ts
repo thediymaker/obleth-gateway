@@ -130,7 +130,7 @@ function trustedOrigins(): string[] {
  * module-scope const) because it calls `getDb()` and `secret()`, both of which
  * throw when `DATABASE_URL` / the session secret are absent. Next.js evaluates
  * server modules during `next build` without those env vars, so an eager
- * instance would break the build (the same hazard `lib/obleth.ts` avoids for its
+ * instance would break the build (the same hazard `lib/obleth/` avoids for its
  * admin token).
  *
  * A `pg.Pool` does not connect on construction, so `getDb()` here only risks its

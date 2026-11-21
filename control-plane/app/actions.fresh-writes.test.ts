@@ -10,7 +10,7 @@ async function setup(overrides: (actual: typeof import("@/lib/obleth")) => Recor
   vi.doMock("next/cache", () => ({ revalidatePath: vi.fn() }));
   vi.doMock("@/lib/auth/roles", () => ({ requireAdmin: async () => ({ email: "admin@example.com" }) }));
   // One instance of the real module: the error class the mock throws must be
-  // the one actions.ts checks with instanceof.
+  // the one the actions check with instanceof.
   const actual = await vi.importActual<typeof import("@/lib/obleth")>("@/lib/obleth");
   const obleth = { getModel: vi.fn(async () => model), updateModel: vi.fn(async () => model), ...overrides(actual) };
   vi.doMock("@/lib/obleth", () => ({ ...actual, obleth }));

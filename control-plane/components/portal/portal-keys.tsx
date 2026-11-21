@@ -2,7 +2,7 @@
 
 import { useMemo, useState, useTransition } from "react";
 import { Plus } from "lucide-react";
-import { createPortalKey, deletePortalKey, disablePortalKey } from "@/app/(portal)/portal-actions";
+import { createPortalKey, deletePortalKey, disablePortalKey } from "@/app/actions/portal";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
