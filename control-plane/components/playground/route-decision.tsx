@@ -5,7 +5,7 @@ import { AlertTriangle, ArrowRight, ChevronDown, ChevronRight } from "lucide-rea
 import { Button } from "@/components/ui/button";
 import type { RouteExplainView, ScoredCandidateView } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
-import { Pill } from "./ui";
+import { Pill } from "@/components/ui/pill";
 
 const fmt = (n: number) => n.toFixed(3);
 const fmt2 = (n: number) => n.toFixed(2);

@@ -2,9 +2,7 @@
 
 import { useCallback, useState, useTransition } from "react";
 import { setSlurmSettingsAction, testSlurmConnectionAction } from "@/app/actions";
-import { SettingsForm, type SaveResult } from "@/components/access/settings-form";
-import { Setting, Switch, TextField } from "@/components/models/fields";
-import { Notice, Sheet } from "@/components/models/ui";
+import { Setting, TextField } from "@/components/models/fields";
 import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { MINT_TOKEN, START_PROVISIONER, tokenExpiry } from "@/lib/deployments-model";
@@ -12,6 +10,10 @@ import { cn } from "@/lib/utils";
 import type { NodeAlias, SlurmHealthView, SlurmSettingsView, UpdateSlurmSettings } from "@/lib/obleth";
 import { StatusDot } from "@/components/ui/status";
 import { dateTime, secsAgo } from "@/lib/format";
+import { Notice } from "@/components/ui/notice";
+import { Sheet } from "@/components/ui/sheet";
+import { type SaveResult, SettingsForm } from "@/components/ui/settings-form";
+import { Switch } from "@/components/ui/switch";
 
 const FIELDS = ["enabled", "url", "api_version", "user", "jwt", "aliases", "cache_dir", "images_dir", "images", "log_dir", "setup", "hf_token", "hf_clear"];
 const LABELS: Record<string, string> = { enabled: "Slurm", url: "slurmrestd URL", api_version: "API version", user: "Slurm user", jwt: "JWT", aliases: "Node addresses", cache_dir: "Weight cache", images_dir: "Images folder", images: "Image per engine", log_dir: "Job logs", setup: "Load before launch", hf_token: "Hugging Face token", hf_clear: "Hugging Face token" };

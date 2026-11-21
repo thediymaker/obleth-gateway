@@ -46,12 +46,6 @@ export function ModelAvatar({ name, size = "sm", className }: { name: string; si
   );
 }
 
-/** Uppercase section label used across every settings panel. */
-export function SectionLabel({ children, className, htmlFor }: { children: ReactNode; className?: string; htmlFor?: string }) {
-  const cls = cn("text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground", className);
-  return htmlFor ? <label htmlFor={htmlFor} className={cls}>{children}</label> : <div className={cls}>{children}</div>;
-}
-
 /**
  * The right-hand settings column every mode shares. Beside the work surface on
  * wide screens; below `lg` it floats over the surface instead of squeezing it.
@@ -113,50 +107,6 @@ export function RunError({ message }: { message: string }) {
         </details>
       )}
     </div>
-  );
-}
-
-/** A row of mutually exclusive buttons. */
-export function Segmented<T extends string>({ value, options, onChange, label, className }: {
-  value: T; options: { value: T; label: string }[]; onChange: (value: T) => void; label: string; className?: string;
-}) {
-  return (
-    <div role="group" aria-label={label} className={cn("flex gap-0.5 rounded-lg border border-border p-[3px]", className)}>
-      {options.map((o) => (
-        <button
-          key={o.value}
-          type="button"
-          aria-pressed={value === o.value}
-          onClick={() => onChange(o.value)}
-          className={cn(
-            "flex h-7 flex-1 items-center justify-center whitespace-nowrap rounded-md px-2 text-xs transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
-            value === o.value ? "bg-secondary text-foreground" : "text-muted-foreground hover:text-foreground",
-          )}
-        >
-          {o.label}
-        </button>
-      ))}
-    </div>
-  );
-}
-
-/** On/off switch, monochrome. */
-export function Switch({ checked, onChange, label, disabled }: { checked: boolean; onChange: (checked: boolean) => void; label: string; disabled?: boolean }) {
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={checked}
-      aria-label={label}
-      disabled={disabled}
-      onClick={() => onChange(!checked)}
-      className={cn(
-        "relative inline-block h-[18px] w-8 shrink-0 rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50",
-        checked ? "bg-foreground" : "bg-muted",
-      )}
-    >
-      <span className={cn("absolute top-0.5 h-3.5 w-3.5 rounded-full transition-all", checked ? "left-4 bg-background" : "left-0.5 bg-muted-foreground")} />
-    </button>
   );
 }
 

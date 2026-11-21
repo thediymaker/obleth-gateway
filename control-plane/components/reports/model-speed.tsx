@@ -4,7 +4,7 @@ import { useState } from "react";
 import Link from "next/link";
 import { useQuery } from "@tanstack/react-query";
 import { ChevronRight } from "lucide-react";
-import { Panel, Segmented } from "@/components/overview/ui";
+import { Panel } from "@/components/overview/ui";
 import type { ModelSpeedPoint } from "@/lib/obleth";
 import { linkTime, type LogsLink } from "@/lib/log-links";
 import { modelHref } from "@/lib/model-links";
@@ -33,6 +33,7 @@ import {
 import { cn, getJson } from "@/lib/utils";
 import { readFailed, ReadFailedNote } from "@/components/ui/read-state";
 import { seriesCurrent, seriesPrevious, seriesRest } from "@/lib/chart-style";
+import { Segmented } from "@/components/ui/segmented";
 
 const COLUMNS = "grid grid-cols-[minmax(12rem,250px)_76px_104px_84px_minmax(0,1fr)_20px] gap-x-3.5";
 const CHART_W = 1400;

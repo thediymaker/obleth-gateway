@@ -3,7 +3,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Download } from "lucide-react";
-import { Sheet } from "@/components/models/ui";
 import { Button } from "@/components/ui/button";
 import { Select } from "@/components/ui/select";
 import type { UsageDailyGroupBy, UsageDailyRow } from "@/lib/obleth";
@@ -20,6 +19,8 @@ import {
 import { ALL_COLUMNS, COLUMN_LABELS, exportCell, type ExportColumn } from "@/lib/usage-export";
 import { cn, getJson } from "@/lib/utils";
 import { formatNumber } from "@/lib/format";
+import { Sheet } from "@/components/ui/sheet";
+import { SectionLabel } from "@/components/ui/section-label";
 
 const PREVIEW_ROWS = 5;
 
@@ -116,7 +117,7 @@ export function ExportSheet({
       }
     >
       <section className="flex flex-col gap-2.5 px-6 pb-5">
-        <p className="text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">Start from</p>
+        <SectionLabel>Start from</SectionLabel>
         <div className="grid gap-2.5 sm:grid-cols-2 lg:grid-cols-4">
           {EXPORT_PRESETS.map((p) => (
             <button key={p.id} type="button" aria-pressed={preset === p.id} onClick={() => pick(p.id)} className={cn("flex min-h-[88px] flex-col gap-1 rounded-[10px] border px-3.5 py-3 text-left transition-colors", preset === p.id ? "border-foreground bg-secondary" : "border-border hover:border-muted-foreground/60")}>
@@ -134,7 +135,7 @@ export function ExportSheet({
 
       <section className="flex flex-col gap-3 border-t border-border px-6 py-5">
         <div className="flex justify-between">
-          <p className="text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">Columns</p>
+          <SectionLabel>Columns</SectionLabel>
           <p className="text-xs text-muted-foreground">{ordered.length} chosen · click to add or remove</p>
         </div>
         {COLUMN_GROUPS.map((g) => (
@@ -157,7 +158,7 @@ export function ExportSheet({
 
       <section className="flex flex-col gap-2.5 border-t border-border px-6 py-5">
         <div className="flex justify-between">
-          <p className="text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">Preview</p>
+          <SectionLabel>Preview</SectionLabel>
           <p className="text-xs text-muted-foreground">{count === undefined ? "Counting rows…" : `first ${Math.min(PREVIEW_ROWS, count)} of ${formatNumber(count)} rows`}</p>
         </div>
         <div className="overflow-x-auto rounded-xl border border-border">

@@ -3,9 +3,7 @@
 import { Fragment, memo, useCallback, useEffect, useMemo, useState, useTransition } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { Download, Search, X } from "lucide-react";
-import { Tile } from "@/components/models/ui";
-import { Segmented } from "@/components/overview/ui";
+import { Download, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ListFooter } from "@/components/ui/list-footer";
 import { Select } from "@/components/ui/select";
@@ -37,6 +35,10 @@ import {
 import type { AuditEntry } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
 import { clock, clockSeconds, dateTime } from "@/lib/format";
+import { Segmented } from "@/components/ui/segmented";
+import { Tile } from "@/components/ui/tile";
+import { SearchBox } from "@/components/ui/search-box";
+import { SectionLabel } from "@/components/ui/section-label";
 
 function initials(actor: string): string {
   if (!isPerson(actor)) return actor.slice(0, 2);
@@ -230,10 +232,7 @@ export function AuditLog({ entries: initial, filters, names, alive: aliveIds, to
       </div>
 
       <div className="flex flex-wrap items-center gap-2">
-        <label className="flex h-9 min-w-[240px] max-w-[360px] flex-1 items-center gap-2 rounded-lg border border-border bg-background px-3 text-[13px] focus-within:border-muted-foreground">
-          <Search className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
-          <input value={query} onChange={(e) => setQuery(e.target.value)} aria-label="Search the audit log" placeholder="A name, id, or what changed" className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted-foreground" />
-        </label>
+        <SearchBox value={query} onChange={setQuery} label="Search the audit log" placeholder="A name, id, or what changed" className="max-w-[360px]" />
         <Segmented<AuditRange> label="Time" value={filters.range} onChange={(range) => go({ range })} options={(["24h", "7d", "30d", "all"] as const).map((r) => ({ value: r, label: RANGE_LABEL[r] }))} />
         <Select aria-label="Who" value={filters.who} onValueChange={(who) => go({ who })} className={cn("h-9 w-auto min-w-[9rem] text-[12.5px]", filters.who && "border-foreground")} options={[{ value: "", label: "Anyone" }, ...whoOptions.map((a) => ({ value: a, label: actorLabel(a) }))]} />
         <Select aria-label="Kind" value={filters.kind} onValueChange={(kind) => go({ kind: kind as AuditKind | "" })} className={cn("h-9 w-auto min-w-[9rem] text-[12.5px]", filters.kind && "border-foreground")} options={[{ value: "", label: "Anything" }, ...(Object.keys(KIND_LABEL) as AuditKind[]).map((k) => ({ value: k, label: KIND_LABEL[k] }))]} />
@@ -253,7 +252,7 @@ export function AuditLog({ entries: initial, filters, names, alive: aliveIds, to
           const id = g.events[0].id;
           return (
             <Fragment key={id}>
-              {header && <div className="border-t border-border px-[18px] pb-1.5 pt-3.5 text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground first:border-t-0">{day}</div>}
+              {header && <SectionLabel className="border-t border-border px-[18px] pb-1.5 pt-3.5 first:border-t-0">{day}</SectionLabel>}
               <GroupLine g={g} names={names} alive={alive} previous={previous} open={open.has(id)} onToggle={toggle} />
             </Fragment>
           );

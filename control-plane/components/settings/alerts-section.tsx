@@ -2,12 +2,13 @@
 
 import { useState, useTransition } from "react";
 import { testAlertAction } from "@/app/actions";
-import { SettingsCard } from "@/components/access/ui";
-import { Setting, Switch, TextArea, TextField } from "@/components/models/fields";
-import { Pill } from "@/components/overview/ui";
+import { Setting, TextArea, TextField } from "@/components/models/fields";
 import { Button } from "@/components/ui/button";
 import type { AlertSettingsView, ChannelResult } from "@/lib/obleth";
 import { StatusDot, StatusPill } from "@/components/ui/status";
+import { Pill } from "@/components/ui/pill";
+import { SettingsCard } from "@/components/ui/settings-card";
+import { Switch } from "@/components/ui/switch";
 
 /** Where the gateway says a model is down, a pool is full, or Slurm has stalled. */
 export function AlertsSection({ settings }: { settings: AlertSettingsView }) {

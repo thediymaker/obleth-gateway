@@ -4,10 +4,10 @@ import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import { createTenantAction } from "@/app/actions";
 import { Field } from "@/components/models/fields";
-import { Sheet } from "@/components/models/ui";
 import { Button } from "@/components/ui/button";
 import { tenantHref } from "@/lib/access-model";
 import type { Tenant } from "@/lib/obleth";
+import { Sheet } from "@/components/ui/sheet";
 
 /** The fairshare group a tenant starts in unless it is given another. */
 export const DEFAULT_FAIRSHARE_GROUP = "default";

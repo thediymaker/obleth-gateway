@@ -9,7 +9,6 @@ import { Configure } from "@/components/deployments/new/configure";
 import { Picker, type Picked, type PickerTab } from "@/components/deployments/new/picker";
 import { Review } from "@/components/deployments/new/review";
 import { SlurmConnection } from "@/components/deployments/slurm-connection";
-import { Notice } from "@/components/models/ui";
 import type { RecipeCard } from "@/components/recipes/recipe-card";
 import { baselineForm, formProblems, getField, setField, toOverrides, type DeployForm, type FieldPath } from "@/lib/deploy-form";
 import { deploymentHref, provisionerHealth, START_PROVISIONER } from "@/lib/deployments-model";
@@ -19,6 +18,7 @@ import { EMPTY_CLUSTER, resolveClusterTokens, type ClusterValues } from "@/lib/r
 import { savedName } from "@/lib/recipe-save";
 import { useClusterResources } from "@/lib/use-cluster-resources";
 import { cn } from "@/lib/utils";
+import { Notice } from "@/components/ui/notice";
 
 type Step = 1 | 2 | 3;
 

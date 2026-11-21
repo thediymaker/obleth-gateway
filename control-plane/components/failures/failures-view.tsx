@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { RefreshCw } from "lucide-react";
-import { Kpi, Meter, Panel, PanelLink, Segmented } from "@/components/overview/ui";
+import { Kpi, Meter, Panel, PanelLink } from "@/components/overview/ui";
 import { classLabel, ERROR_CLASSES, isErrorClass } from "@/lib/failure-classes";
 import {
   FAILURE_RANGES,
@@ -21,6 +21,7 @@ import { logsHref } from "@/lib/log-links";
 import { ago, compact, formatNumber } from "@/lib/format";
 import type { UsageFailureGroup, UsageFailureGroups, UsageLogHistogram } from "@/lib/obleth";
 import { cn, getJson } from "@/lib/utils";
+import { Segmented } from "@/components/ui/segmented";
 
 const POLL_MS: Record<FailureRange, number> = { "1h": 15_000, "24h": 30_000, "7d": 120_000 };
 /** Rows a side's panel lists before it points to the request log for the rest. */

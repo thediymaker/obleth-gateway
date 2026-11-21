@@ -14,8 +14,10 @@ import { Fleet, RightNow, type LiveCapacity } from "@/components/overview/fleet"
 import { FooterTiles, NeedsAttention, RecentChanges, TopTenants } from "@/components/overview/panels";
 import { ModelPeek } from "@/components/overview/model-peek";
 import { TrafficPanel } from "@/components/overview/traffic-panel";
-import { HealthGlyph, Kpi, Pill, Segmented } from "@/components/overview/ui";
+import { HealthGlyph, Kpi } from "@/components/overview/ui";
 import { capacityDiscoveryQuery, fairshareLiveQuery, modelRoutesQuery } from "@/lib/live-queries";
+import { Pill } from "@/components/ui/pill";
+import { Segmented } from "@/components/ui/segmented";
 
 const FAST_POLL_MS = 2_000;
 const STATS_POLL_MS = 5_000;

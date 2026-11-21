@@ -3,10 +3,8 @@
 import { memo, useCallback, useDeferredValue, useMemo, useState, useTransition } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { MoreHorizontal, Search } from "lucide-react";
+import { MoreHorizontal } from "lucide-react";
 import { assignUserAction, setUserStatusAction } from "@/app/(dashboard)/users/users-actions";
-import { Notice } from "@/components/models/ui";
-import { Pill, Segmented } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -18,6 +16,10 @@ import type { AdminUser } from "@/lib/auth/users";
 import { useLatestCallback } from "@/lib/use-latest-callback";
 import { cn } from "@/lib/utils";
 import { dateLabel } from "@/lib/format";
+import { Pill } from "@/components/ui/pill";
+import { Segmented } from "@/components/ui/segmented";
+import { Notice } from "@/components/ui/notice";
+import { SearchBox } from "@/components/ui/search-box";
 
 type Show = "everyone" | "admins" | "portal" | "none";
 
@@ -236,10 +238,7 @@ export function UsersList({ users, tenants, me }: { users: AdminUser[]; tenants:
       )}
 
       <div className="flex flex-wrap items-center gap-2">
-        <label className="flex h-9 min-w-[240px] max-w-[380px] flex-1 items-center gap-2 rounded-lg border border-border bg-background px-3 text-[13px] focus-within:border-muted-foreground">
-          <Search className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
-          <input value={query} onChange={(e) => setQuery(e.target.value)} aria-label="Search people" placeholder="Search email or tenant" className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted-foreground" />
-        </label>
+        <SearchBox value={query} onChange={setQuery} label="Search people" placeholder="Search email or tenant" className="max-w-[380px]" />
         <Segmented
           label="Show"
           value={show}

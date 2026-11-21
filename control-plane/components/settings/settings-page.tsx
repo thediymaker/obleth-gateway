@@ -1,12 +1,8 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import Link from "next/link";
+import { useCallback, useState } from "react";
 import { useRouter } from "next/navigation";
-import { Search } from "lucide-react";
 import { saveSettingsAction } from "@/app/actions";
-import { SettingsForm } from "@/components/access/settings-form";
-import { SettingsCard } from "@/components/access/ui";
 import { AlertsSection } from "@/components/settings/alerts-section";
 import { BoonsSection } from "@/components/settings/boons-section";
 import { AboutSection, AssistantSection, DataSection, EnergySection, KeysSection, type VersionInfo } from "@/components/settings/other-sections";
@@ -31,7 +27,9 @@ import type {
   UsageRetentionView,
 } from "@/lib/obleth";
 import { BOONS, needsYou, sectionOfField } from "@/lib/settings-model";
-import { cn } from "@/lib/utils";
+import { SettingsCard } from "@/components/ui/settings-card";
+import { SettingsForm } from "@/components/ui/settings-form";
+import { jumpTo, SettingsNav, type FindItem, type NavItem } from "@/components/ui/settings-nav";
 
 export interface SettingsData {
   /** What the last day of requests says to change; null when it could not be read. */
@@ -53,7 +51,7 @@ export interface SettingsData {
   version: VersionInfo;
 }
 
-const SEARCH: { id: string; label: string; words: string }[] = [
+const SEARCH: FindItem[] = [
   { id: "set-slack", label: "Slack alerts", words: "webhook alert notify" },
   { id: "set-email", label: "Email alerts", words: "smtp mail alert notify recipients" },
   { id: "set-quiet", label: "Quiet period", words: "cooldown interval repeat alert" },
@@ -80,71 +78,6 @@ const SEARCH: { id: string; label: string; words: string }[] = [
   { id: "about", label: "Versions", words: "version about provisioner compressor" },
 ];
 
-function jump(id: string) {
-  const el = document.getElementById(id);
-  if (!el) return;
-  el.scrollIntoView({ behavior: "smooth", block: id.startsWith("set-") || id.startsWith("boon-") ? "center" : "start" });
-  if (id.startsWith("set-") || id.startsWith("boon-")) {
-    el.classList.remove("setting-flash");
-    void el.offsetWidth;
-    el.classList.add("setting-flash");
-    setTimeout(() => el.classList.remove("setting-flash"), 1800);
-  }
-}
-
-function FindSetting() {
-  const [query, setQuery] = useState("");
-  const [open, setOpen] = useState(false);
-  const [index, setIndex] = useState(0);
-  const input = useRef<HTMLInputElement>(null);
-  const results = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    return q ? SEARCH.filter((s) => `${s.label} ${s.words}`.toLowerCase().includes(q)).slice(0, 6) : [];
-  }, [query]);
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); input.current?.focus(); input.current?.select(); }
-    };
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, []);
-  const choose = (id: string) => { setOpen(false); setQuery(""); input.current?.blur(); jump(id); };
-  return (
-    <div className="relative">
-      <label className="flex h-9 items-center gap-2 rounded-lg border border-border bg-background px-2.5 text-[12.5px] focus-within:border-muted-foreground">
-        <Search className="h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-hidden />
-        <input
-          ref={input}
-          value={query}
-          onChange={(e) => { setQuery(e.target.value); setIndex(0); setOpen(true); }}
-          onFocus={() => setOpen(true)}
-          onBlur={() => setTimeout(() => setOpen(false), 120)}
-          onKeyDown={(e) => {
-            if (e.key === "ArrowDown") { e.preventDefault(); setIndex((i) => Math.min(i + 1, results.length - 1)); }
-            if (e.key === "ArrowUp") { e.preventDefault(); setIndex((i) => Math.max(i - 1, 0)); }
-            if (e.key === "Enter" && results[index]) { e.preventDefault(); choose(results[index].id); }
-            if (e.key === "Escape") { setQuery(""); input.current?.blur(); }
-          }}
-          placeholder="Find a setting"
-          aria-label="Find a setting"
-          role="combobox"
-          aria-expanded={open && results.length > 0}
-          aria-controls="settings-search-results"
-          className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted-foreground"
-        />
-        <kbd className="rounded border border-border px-1 font-mono text-[10.5px] text-muted-foreground">⌘K</kbd>
-      </label>
-      {open && query.trim() !== "" && (
-        <div id="settings-search-results" role="listbox" aria-label="Matching settings" className="absolute left-0 top-10 z-40 w-[min(300px,calc(100vw-2rem))] rounded-[10px] border border-border bg-[hsl(240_5%_9%)] p-1.5 shadow-2xl">
-          {results.length === 0 ? <p className="px-2.5 py-2 text-xs text-muted-foreground">No setting matches “{query}”.</p> : results.map((r, i) => (
-            <button key={r.id} type="button" role="option" aria-selected={i === index} onMouseDown={(e) => e.preventDefault()} onClick={() => choose(r.id)} onMouseEnter={() => setIndex(i)} className={cn("flex w-full rounded-md px-2.5 py-2 text-left text-[13px]", i === index && "bg-secondary")}>{r.label}</button>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
 function Unreadable({ id, title }: { id: string; title: string }) {
   return (
     <SettingsCard id={id} title={title}>
@@ -153,30 +86,19 @@ function Unreadable({ id, title }: { id: string; title: string }) {
   );
 }
 
+/** Settings that live on other pages, linked below the sections. */
+const ELSEWHERE: NavItem[] = [
+  { id: "slurm", label: "Slurm ›", count: "Deployments", href: "/deployments?slurm=1" },
+  { id: "retrieval", label: "Retrieval ›", count: "Knowledge", href: "/knowledge?tab=retrieval" },
+];
+
 export function SettingsPage({ data, anchor }: { data: SettingsData; anchor?: string }) {
   const router = useRouter();
   const { confirm, confirmElement } = useConfirm();
-  const [active, setActive] = useState("needs");
   const [dirty, setDirty] = useState<string[]>([]);
   const findings = needsYou({ alerts: data.alerts, boons: data.boons, knowledge: data.knowledge, models: data.models, readiness: data.readiness, slurm: data.slurm, compressor: data.compressor, router: data.router });
   const needsCount = needsYouCount(findings, data.advice);
   const boonsOn = data.boons ? BOONS.filter((b) => data.boons![b.enabled]).length : null;
-
-  useEffect(() => {
-    const id = anchor || window.location.hash.slice(1);
-    if (id) requestAnimationFrame(() => jump(id));
-  }, [anchor]);
-
-  useEffect(() => {
-    const ids = ["needs", "alerts", "routing", "boons", "energy", "assistant", "data", "about"];
-    const els = ids.map((id) => document.getElementById(id)).filter((e): e is HTMLElement => !!e);
-    const observer = new IntersectionObserver((entries) => {
-      const visible = entries.filter((e) => e.isIntersecting).sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
-      if (visible[0]) setActive(visible[0].target.id);
-    }, { rootMargin: "-20% 0px -65% 0px" });
-    els.forEach((e) => observer.observe(e));
-    return () => observer.disconnect();
-  }, []);
 
   const confirmSave = useCallback(async (form: FormData, sections: string[]) => {
     if (sections.includes("retention") && data.retention) {
@@ -192,7 +114,7 @@ export function SettingsPage({ data, anchor }: { data: SettingsData; anchor?: st
     return true;
   }, [confirm, data.alerts, data.retention]);
 
-  const nav: { id: string; label: string; count?: string | number; href?: string }[] = [
+  const nav: NavItem[] = [
     { id: "needs", label: "Needs you", count: needsCount || undefined },
     { id: "alerts", label: "Alerts", count: data.alerts ? (data.alerts.slack_webhook_set || data.alerts.email ? "on" : "none") : undefined },
     { id: "routing", label: "Routing", count: data.router ? (data.router.classifier_enabled ? "auto on" : "heuristics") : undefined },
@@ -221,21 +143,10 @@ export function SettingsPage({ data, anchor }: { data: SettingsData; anchor?: st
       </div>
 
       <div className="grid items-start gap-6 lg:grid-cols-[200px_minmax(0,1fr)]">
-        <nav aria-label="Settings sections" className="flex flex-col gap-0.5 lg:sticky lg:top-0">
-          <div className="mb-2"><FindSetting /></div>
-          {nav.map((n) => (
-            <a key={n.id} href={`#${n.id}`} onClick={(e) => { e.preventDefault(); jump(n.id); history.replaceState(null, "", `#${n.id}`); }} aria-current={active === n.id ? "true" : undefined} className={cn("flex h-8 items-center justify-between rounded-lg px-2.5 text-[13px] transition-colors", active === n.id ? "bg-secondary text-foreground" : "text-muted-foreground hover:bg-muted/40 hover:text-foreground")}>
-              {n.label}
-              <span className="flex items-center gap-1.5 text-[11.5px] text-muted-foreground">{n.count}{dirty.includes(n.id) && <span aria-label="unsaved changes" className="h-1.5 w-1.5 rounded-full bg-foreground" />}</span>
-            </a>
-          ))}
-          <div className="mx-1 my-2 h-px bg-border" />
-          <Link href="/deployments?slurm=1" className="flex h-8 items-center justify-between rounded-lg px-2.5 text-[13px] text-muted-foreground hover:bg-muted/40 hover:text-foreground">Slurm ›<span className="text-[11.5px]">Deployments</span></Link>
-          <Link href="/knowledge?tab=retrieval" className="flex h-8 items-center justify-between rounded-lg px-2.5 text-[13px] text-muted-foreground hover:bg-muted/40 hover:text-foreground">Retrieval ›<span className="text-[11.5px]">Knowledge</span></Link>
-        </nav>
+        <SettingsNav label="Settings sections" items={nav} after={ELSEWHERE} find={SEARCH} findId="settings-search-results" dirty={dirty} anchor={anchor} />
 
         <div className="flex min-w-0 flex-col gap-4">
-          <NeedsYouSection findings={findings} advice={data.advice} jump={jump} />
+          <NeedsYouSection findings={findings} advice={data.advice} jump={jumpTo} />
 
           <SettingsForm id="settings" sectionOf={sectionOf} labelOf={labelOf} save={saveSettingsAction} confirmSave={confirmSave} onSaved={() => router.refresh()} onDirtyChange={onDirty} className="flex flex-col gap-4" ariaLabel="Gateway settings">
             {data.alerts ? <AlertsSection settings={data.alerts} /> : <Unreadable id="alerts" title="Alerts" />}

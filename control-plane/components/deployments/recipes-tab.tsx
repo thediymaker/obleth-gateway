@@ -4,8 +4,6 @@ import { useState, useTransition } from "react";
 import Link from "next/link";
 import { Plus } from "lucide-react";
 import { deleteTemplateAction } from "@/app/actions";
-import { Notice } from "@/components/models/ui";
-import { Pill } from "@/components/overview/ui";
 import { testedSentence, type RecipeCard } from "@/components/recipes/recipe-card";
 import { TemplateEditor } from "@/components/recipes/template-editor";
 import { engineName } from "@/components/deployments/new/picker";
@@ -14,6 +12,7 @@ import { useConfirm } from "@/components/ui/confirm-dialog";
 import { deploymentHref } from "@/lib/deployments-model";
 import type { ManagedModelSpec, ModelRoute } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
+import { Notice } from "@/components/ui/notice";
 
 const COLS = "grid-cols-[minmax(0,1.7fr)_90px_minmax(0,1.2fr)_minmax(0,1fr)_190px]";
 

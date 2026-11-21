@@ -1,7 +1,6 @@
 "use client";
 
 import { useState } from "react";
-import { Notice } from "@/components/models/ui";
 import type { RecipeCard } from "@/components/recipes/recipe-card";
 import { Button } from "@/components/ui/button";
 import type { DeployForm, Problem } from "@/lib/deploy-form";
@@ -10,6 +9,8 @@ import { renderScript, type ClusterValues } from "@/lib/recipe-inputs";
 import { stripSbatchDirectives } from "@/lib/sbatch-directives";
 import { MODEL_TYPE_NAMES } from "@/lib/models-model";
 import { cn } from "@/lib/utils";
+import { Notice } from "@/components/ui/notice";
+import { SectionLabel } from "@/components/ui/section-label";
 
 /** The script as the job will run it, env exports included, for the review.
  *  Its #SBATCH lines are left out: their values are the job settings, sent as fields. */
@@ -69,13 +70,13 @@ export function Review({ card, form, cv, script, onScript, problems, slurmOn, pe
           </>
         )}
         <div className="flex flex-col gap-1 border-t border-border pt-3">
-          <span className="text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">Sent to Slurm as</span>
+          <SectionLabel>Sent to Slurm as</SectionLabel>
           <p className="break-all font-mono text-[11.5px] leading-relaxed text-secondary-foreground">{sent}</p>
         </div>
       </section>
 
       <aside aria-label="Launch" className="flex flex-col gap-4 rounded-xl border border-border bg-card px-5 py-5">
-        <span className="text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">When you launch</span>
+        <SectionLabel>When you launch</SectionLabel>
         <ol className="flex flex-col gap-3 text-[13px] leading-relaxed text-secondary-foreground">
           <li className="grid grid-cols-[20px_minmax(0,1fr)] gap-2"><span className="font-mono text-muted-foreground">1</span><span>Adds <span className="font-mono">{form.name || "…"}</span> to Models ({MODEL_TYPE_NAMES[p.modelType] ?? p.modelType}) as staged. Callers can use it by name, but it isn&apos;t listed in /v1/models and auto never picks it until you make it live on its page. Requests get 503 until a replica is healthy.</span></li>
           <li className="grid grid-cols-[20px_minmax(0,1fr)] gap-2"><span className="font-mono text-muted-foreground">2</span><span>Submits {target} job{target === 1 ? "" : "s"} to {s.partition || "the cluster's default partition"}{s.nodes > 1 ? `, ${s.nodes} nodes each` : ""}{s.account ? ` as ${s.account}${s.qos ? ` / ${s.qos}` : ""}` : ""}{minutes ? `, ${walltimeLabel(minutes)} each` : ""}.</span></li>

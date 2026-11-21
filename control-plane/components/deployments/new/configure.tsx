@@ -3,7 +3,6 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import Link from "next/link";
 import { X } from "lucide-react";
-import { Pill, Segmented } from "@/components/overview/ui";
 import type { RecipeCard } from "@/components/recipes/recipe-card";
 import { Button } from "@/components/ui/button";
 import { Select } from "@/components/ui/select";
@@ -14,6 +13,7 @@ import type { Learned, Suggestion } from "@/lib/launch-learning";
 import type { ClusterResources } from "@/lib/obleth";
 import { inputDefault, inputSource, type ClusterValues, type RecipeInput } from "@/lib/recipe-inputs";
 import { cn } from "@/lib/utils";
+import { Segmented } from "@/components/ui/segmented";
 
 const SOURCE_LABEL: Record<Source, string> = { recipe: "Recipe", cluster: "Cluster default", learned: "Learned", changed: "Changed", default: "Slurm default" };
 

@@ -2,13 +2,15 @@
 
 import { useState } from "react";
 import Link from "next/link";
-import { SettingsCard } from "@/components/access/ui";
-import { SelectField, Setting, Switch, TextField } from "@/components/models/fields";
-import { Pill } from "@/components/overview/ui";
+import { SelectField, Setting, TextField } from "@/components/models/fields";
 import type { AutoRouterSettingsView, ModelRoute, RouterReadinessView } from "@/lib/obleth";
 import { ROUTER_PROFILES, routerProfileOf, routerValues, type RouterValues } from "@/lib/settings-model";
 import { cn } from "@/lib/utils";
 import { StatusPill } from "@/components/ui/status";
+import { Pill } from "@/components/ui/pill";
+import { SettingsCard } from "@/components/ui/settings-card";
+import { Switch } from "@/components/ui/switch";
+import { ProfileCards } from "@/components/ui/profile-cards";
 
 const WEIGHTS: { key: "capacity_weight" | "cost_weight" | "tag_weight"; label: string; means: string }[] = [
   { key: "capacity_weight", label: "Free capacity", means: "prefers a model with open slots" },
@@ -62,18 +64,7 @@ export function RoutingSection({ settings, models, readiness }: { settings: Auto
       <input type="hidden" name="routing.soft_cap" value={String(v.soft_cap)} />
       <input type="hidden" name="routing.tier_source" value={v.tier_source} />
       <Setting id="set-router-profile" label="Profile" hint="Sets the weights below; change any after." fields={["routing.capacity_weight", "routing.cost_weight", "routing.tag_weight", "routing.temperature", "routing.soft_cap", "routing.difficulty", "routing.tier_source"]}>
-        <div className="grid gap-2 lg:grid-cols-4">
-          {ROUTER_PROFILES.map((p) => (
-            <button key={p.key} type="button" aria-pressed={profile === p.key} onClick={() => setV(p.values)} className={cn("flex flex-col gap-0.5 rounded-lg border px-3 py-2 text-left", profile === p.key ? "border-foreground bg-secondary" : "border-border hover:border-muted-foreground/60")}>
-              <span className="text-[12.5px] font-medium">{p.label}</span>
-              <span className="text-[11.5px] leading-snug text-muted-foreground">{p.blurb}</span>
-            </button>
-          ))}
-          <button type="button" aria-pressed={profile === "custom"} onClick={() => setAdvanced(true)} className={cn("flex flex-col gap-0.5 rounded-lg border px-3 py-2 text-left", profile === "custom" ? "border-foreground bg-secondary" : "border-border hover:border-muted-foreground/60")}>
-            <span className="text-[12.5px] font-medium">Custom</span>
-            <span className="text-[11.5px] leading-snug text-muted-foreground">Your own weights.</span>
-          </button>
-        </div>
+        <ProfileCards className="grid gap-2 lg:grid-cols-4" profiles={ROUTER_PROFILES} value={profile} onPick={(key) => setV(ROUTER_PROFILES.find((p) => p.key === key)!.values)} custom={{ blurb: "Your own weights.", onPick: () => setAdvanced(true) }} />
       </Setting>
       <Setting id="set-router-weights" label="What matters" hint="How much each counts when two models could take a request." fields={["routing.capacity_weight", "routing.cost_weight", "routing.tag_weight"]}>
         {WEIGHTS.map((w) => (

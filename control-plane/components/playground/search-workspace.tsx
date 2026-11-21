@@ -8,8 +8,8 @@ import { Select } from "@/components/ui/select";
 import type { ModelRoute } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
 import type { PlaygroundSession } from "./playground";
-import { Segmented } from "./ui";
 import { useStoppable } from "./use-stoppable";
+import { Segmented } from "@/components/ui/segmented";
 
 export interface SearchResult {
   title: string;
@@ -158,7 +158,7 @@ export function SearchWorkspace({ session, update, models, loading }: {
               </div>
               <div className="space-y-1.5">
                 <span className="text-[12.5px] font-medium text-secondary-foreground">Published within</span>
-                <Segmented label="Published within" value={timeRange} options={TIME_RANGES.map((t) => ({ value: t.value, label: t.label }))}
+                <Segmented stretch label="Published within" value={timeRange} options={TIME_RANGES.map((t) => ({ value: t.value, label: t.label }))}
                   onChange={(value) => update({ searchTimeRange: value === "" ? undefined : (value as PlaygroundSession["searchTimeRange"]) })} />
               </div>
               <label className="block space-y-1.5">

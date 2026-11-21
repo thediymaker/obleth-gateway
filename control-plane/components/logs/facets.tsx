@@ -6,6 +6,7 @@ import { failuresOnly as onlyFailures, HTTP_REASONS, listOf, pickOne, type LogFi
 import type { UsageLogFacet, UsageLogFacets } from "@/lib/obleth";
 import { compact, formatNumber } from "@/lib/format";
 import { cn } from "@/lib/utils";
+import { SectionLabel } from "@/components/ui/section-label";
 
 const SHOWN = 5;
 
@@ -34,7 +35,7 @@ function List({
   const shown = all ? facets : facets.slice(0, SHOWN);
   return (
     <div className="min-w-0">
-      <p className="pb-1.5 text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">{title}</p>
+      <SectionLabel className="pb-1.5">{title}</SectionLabel>
       {facets.length === 0 && <p className="text-xs text-muted-foreground">—</p>}
       {shown.map((f) => {
         const on = active(f);
@@ -102,7 +103,7 @@ export function Facets({ facets, filters, onPatch, loading, failed = null }: { f
         <div className="flex flex-col gap-4">
           {facets.failures.length > 0 && (
             <div>
-              <p className="pb-1.5 text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">Most common failures</p>
+              <SectionLabel className="pb-1.5">Most common failures</SectionLabel>
               <div className="grid gap-1 sm:grid-cols-2 xl:grid-cols-4">
                 {facets.failures.slice(0, 8).map((f) => {
                   const on = filters.statusCode === String(f.status_code) && filters.model === f.model;

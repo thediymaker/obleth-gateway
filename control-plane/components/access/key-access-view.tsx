@@ -5,7 +5,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { ChevronDown, ChevronRight, RefreshCw, Search } from "lucide-react";
-import { Kpi, Panel, PanelLink, Pill, Segmented } from "@/components/overview/ui";
+import { Kpi, Panel, PanelLink } from "@/components/overview/ui";
 import { Input } from "@/components/ui/input";
 import { ListFooter } from "@/components/ui/list-footer";
 import { Select } from "@/components/ui/select";
@@ -28,6 +28,8 @@ import { logsHref } from "@/lib/log-links";
 import { ago, compact, formatNumber, fullDateTime } from "@/lib/format";
 import type { KeyRejectionAgg, KeySource } from "@/lib/obleth";
 import { cn, getJson } from "@/lib/utils";
+import { Pill } from "@/components/ui/pill";
+import { Segmented } from "@/components/ui/segmented";
 
 interface KeyAccessData {
   sinceMs: number;

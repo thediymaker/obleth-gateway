@@ -13,9 +13,11 @@ import { StreamingPlayer } from "@/lib/playground/speech-player";
 import { WavParseError, WavStreamParser, pcm16Bytes, wavBlob, type WavFormat } from "@/lib/playground/wav-stream";
 import { cn, getJson } from "@/lib/utils";
 import { SPEECH_TEXT_MAX_LENGTH, type PlaygroundSession } from "./playground";
-import { ModelAvatar, Pill, RunError, SectionLabel, SettingsPanel } from "./ui";
+import { ModelAvatar, RunError, SettingsPanel } from "./ui";
 import { formatNumber, money, perMillion } from "@/lib/format";
 import { useQuery } from "@tanstack/react-query";
+import { Pill } from "@/components/ui/pill";
+import { SectionLabel } from "@/components/ui/section-label";
 
 // Rows longer than this start clamped, with a "Show all" toggle.
 const CLAMP_CHARS = 280;

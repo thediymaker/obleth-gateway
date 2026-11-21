@@ -8,9 +8,8 @@ import type { BenchResult } from "@/lib/charo/bench/types";
 import { Rail, MicroLabel } from "@/components/charo/rail";
 import { tip } from "@/components/chart-tooltip";
 import { axisTick, chartGrid, timeCursor } from "@/lib/chart-style";
-import { Pill } from "@/components/overview/ui";
 import { cn } from "@/lib/utils";
-
+import { Pill } from "@/components/ui/pill";
 
 // Validated against the dark card surface (#111113): the three panel leads clear
 // every all-pairs gate, and p99/p50 are one hue at two steps because they are the

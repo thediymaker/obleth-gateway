@@ -5,7 +5,10 @@ import { ChevronDown } from "lucide-react";
 import { modelTypeLabel, RANGE_LABEL, type FleetTile, type OverviewRange } from "@/lib/overview-model";
 import { clock, compact, formatMs, formatNumber } from "@/lib/format";
 import { cn } from "@/lib/utils";
-import { HealthGlyph, Meter, Panel, PanelLink, Pill, SectionLabel, Segmented } from "./ui";
+import { HealthGlyph, Meter, Panel, PanelLink } from "./ui";
+import { Pill } from "@/components/ui/pill";
+import { SectionLabel } from "@/components/ui/section-label";
+import { Segmented } from "@/components/ui/segmented";
 
 const FIRST_PAGE = 24;
 

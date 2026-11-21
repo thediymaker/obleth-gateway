@@ -7,6 +7,7 @@ import { Meter, Panel } from "@/components/overview/ui";
 import type { AuditEntry, ModelRoute, UsageLogHistogram } from "@/lib/obleth";
 import { getJson } from "@/lib/utils";
 import { clock, dateTime } from "@/lib/format";
+import { SectionLabel } from "@/components/ui/section-label";
 
 const DAY_MS = 86_400_000;
 
@@ -32,7 +33,7 @@ export function PoolNowTile({ model }: { model: ModelRoute }) {
   const { load: { inFlight, cap, queued } } = usePoolLoad(model);
   return (
     <div className="flex min-w-0 flex-col gap-1 rounded-xl border border-border bg-card px-4 py-3">
-      <span className="text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">Pool now</span>
+      <SectionLabel>Pool now</SectionLabel>
       <span className="text-[24px] font-semibold leading-tight tabular-nums">{inFlight} <span className="text-[13px] font-normal text-muted-foreground">{cap ? `of ${cap}` : "in flight"}</span></span>
       <Meter value={inFlight} max={cap} strong={cap > 0 && inFlight >= cap} />
       <span className="text-xs text-muted-foreground">{queued ? `${queued} waiting` : "none waiting"}</span>

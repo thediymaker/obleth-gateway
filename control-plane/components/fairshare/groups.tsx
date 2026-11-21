@@ -8,10 +8,11 @@ import { ChevronDown, ChevronRight } from "lucide-react";
 import { setGroupWeightAction } from "@/app/actions";
 import type { FairshareGroup, Tenant } from "@/lib/obleth";
 import { GROUP_TONES, OTHER_TONE, groupShares } from "@/lib/fairshare-model";
-import { Meter, Panel, Pill } from "@/components/overview/ui";
+import { Meter, Panel } from "@/components/overview/ui";
 import { cn } from "@/lib/utils";
 import { FAIRSHARE_POLL_MS, useFairshareLive } from "./hooks";
 import { percent } from "@/lib/format";
+import { Pill } from "@/components/ui/pill";
 
 /**
  * Group weights, with what an edit would do before it is saved: each group's

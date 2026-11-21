@@ -5,8 +5,9 @@ import { Area, Bar, BarChart, ComposedChart, Line, ResponsiveContainer, Tooltip,
 import { TooltipRow, TooltipShell } from "@/components/chart-tooltip";
 import { BUCKET_LABEL, PREVIOUS_LABEL, RANGE_BUCKET_MS, RANGE_LABEL, type OverviewRange, type SeriesPoint } from "@/lib/overview-model";
 import { clock, compact, formatDate, formatMs, formatNumber } from "@/lib/format";
-import { Panel, Segmented } from "./ui";
+import { Panel } from "./ui";
 import { activeDot, axisTick, barCursor, chartGrid, seriesCurrent, seriesPrevious, timeCursor } from "@/lib/chart-style";
+import { Segmented } from "@/components/ui/segmented";
 
 type Measure = "requests" | "tokens" | "latency";
 

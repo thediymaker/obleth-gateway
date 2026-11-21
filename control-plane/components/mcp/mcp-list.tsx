@@ -7,13 +7,15 @@ import { Plus } from "lucide-react";
 import { createMcpServerAction } from "@/app/actions";
 import { McpStateMark, ServerSheet } from "@/components/mcp/server-sheet";
 import { Field } from "@/components/models/fields";
-import { Notice, Sheet, Tile } from "@/components/models/ui";
 import { Button } from "@/components/ui/button";
 import type { McpServerTestRow } from "@/lib/charo/mcp/types";
 import { buildMcpRows, mcpLine, probeLatency, toolCapable } from "@/lib/mcp-model";
 import type { DailyStatsView, McpServer, ModelRoute } from "@/lib/obleth";
 import { compact } from "@/lib/format";
 import { cn, getJson } from "@/lib/utils";
+import { Notice } from "@/components/ui/notice";
+import { Sheet } from "@/components/ui/sheet";
+import { Tile } from "@/components/ui/tile";
 
 const COLS = "grid-cols-[minmax(0,1.1fr)_150px_70px_minmax(0,1.4fr)_110px_minmax(0,1.2fr)_96px]";
 

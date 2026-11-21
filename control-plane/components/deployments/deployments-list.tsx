@@ -4,13 +4,12 @@ import { useMemo, useState } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
-import { Plus, Search } from "lucide-react";
+import { Plus } from "lucide-react";
 import { RecipesTab } from "@/components/deployments/recipes-tab";
 import { SlurmConnection } from "@/components/deployments/slurm-connection";
 import { ReplicaDots, StateMark } from "@/components/deployments/ui";
 import { useFairshareLive } from "@/components/fairshare/hooks";
-import { Tile } from "@/components/models/ui";
-import { Meter, Pill, Segmented } from "@/components/overview/ui";
+import { Meter } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
 import { Select } from "@/components/ui/select";
 import type { RecipeCard } from "@/components/recipes/recipe-card";
@@ -39,6 +38,10 @@ import { useClusterResources } from "@/lib/use-cluster-resources";
 import { cn, getJson } from "@/lib/utils";
 import { ReadNotice } from "@/components/ui/read-state";
 import { StatusDot } from "@/components/ui/status";
+import { Pill } from "@/components/ui/pill";
+import { Segmented } from "@/components/ui/segmented";
+import { Tile } from "@/components/ui/tile";
+import { SearchBox } from "@/components/ui/search-box";
 
 const COLS = "grid-cols-[minmax(0,1.4fr)_minmax(130px,0.9fr)_150px_minmax(0,1.4fr)_130px_84px_84px]";
 
@@ -236,10 +239,7 @@ export function DeploymentsList({ initial, recipes: initialRecipes, tab: initial
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            <label className="flex h-9 min-w-[240px] max-w-[380px] flex-1 items-center gap-2 rounded-lg border border-border bg-background px-3 text-[13px] focus-within:border-muted-foreground">
-              <Search className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
-              <input value={query} onChange={(e) => setQuery(e.target.value)} aria-label="Search deployments" placeholder="Model, Service, partition or job" className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted-foreground" />
-            </label>
+            <SearchBox value={query} onChange={setQuery} label="Search deployments" placeholder="Model, Service, partition or job" className="max-w-[380px]" />
             <Segmented
               label="Runs on"
               value={runs}

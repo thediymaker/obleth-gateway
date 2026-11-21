@@ -5,9 +5,8 @@ import { useQuery } from "@tanstack/react-query";
 import Link from "next/link";
 import { Area, ComposedChart, Line, ResponsiveContainer, Tooltip, XAxis, YAxis, CartesianGrid } from "recharts";
 import { TooltipRow, TooltipShell } from "@/components/chart-tooltip";
-import { Meter, Panel, Segmented } from "@/components/overview/ui";
+import { Meter, Panel } from "@/components/overview/ui";
 import { usePoolLoad } from "@/components/fairshare/hooks";
-import { Tile } from "@/components/models/ui";
 import { MODEL_SERIES_BUCKET_MS, priceLabel, RUNS_LABELS, tagLabels, type ModelOverviewData, type RunsOn } from "@/lib/models-model";
 import type { ModelCapacityStatus, ModelHealthCheck, ModelHealthSummary, ModelRoute, UsageLogHistogram } from "@/lib/obleth";
 import { logsHref } from "@/lib/log-links";
@@ -18,6 +17,8 @@ import { auditHref } from "@/lib/audit-model";
 import { boonsWaitingOnFunctionCalling } from "@/lib/boon-availability";
 import { readFailed, ReadFailedNote, type LiveRead } from "@/components/ui/read-state";
 import { activeDot, axisTick, chartGrid, seriesCurrent, seriesPrevious, timeCursor } from "@/lib/chart-style";
+import { Segmented } from "@/components/ui/segmented";
+import { Tile } from "@/components/ui/tile";
 
 const DAY_MS = 86_400_000;
 

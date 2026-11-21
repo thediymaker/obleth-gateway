@@ -5,7 +5,6 @@ import { useRouter } from "next/navigation";
 import { Plus } from "lucide-react";
 import { deleteModelFamilyAction, saveModelFamilyAction } from "@/app/actions";
 import { Field, SelectField } from "@/components/models/fields";
-import { Sheet } from "@/components/models/ui";
 import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import {
@@ -21,6 +20,7 @@ import {
   type FamilyDraft,
 } from "@/lib/models-model";
 import type { ModelFamily, ModelRoute, ReasoningLevel } from "@/lib/obleth";
+import { Sheet } from "@/components/ui/sheet";
 
 /** The family being edited: a new one, or one from the list. */
 type Editing = { family: ModelFamily | null } | null;

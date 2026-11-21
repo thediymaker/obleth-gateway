@@ -1,16 +1,15 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState, useTransition } from "react";
+import { useCallback, useState, useTransition } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
-import { ChevronDown, MoreHorizontal, Search } from "lucide-react";
+import { ChevronDown, MoreHorizontal } from "lucide-react";
 import { deleteTenantAction, setTenantStatusAction } from "@/app/actions";
 import { TenantSettings } from "@/components/access/tenant-settings";
 import { BudgetBar, TENANT_STATUS_LABEL, tenantGlyph } from "@/components/access/ui";
 import { useFairshareLive } from "@/components/fairshare/hooks";
-import { Notice, Tile } from "@/components/models/ui";
-import { Meter, Panel, Pill, Segmented } from "@/components/overview/ui";
+import { Meter, Panel } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
@@ -31,6 +30,12 @@ import type { ApiKey, BudgetUsage, Tenant } from "@/lib/obleth";
 import { compact, dateLabel, dateTime, formatDate, money } from "@/lib/format";
 import { cn, getJson } from "@/lib/utils";
 import { StatusDot } from "@/components/ui/status";
+import { Pill } from "@/components/ui/pill";
+import { Segmented } from "@/components/ui/segmented";
+import { Notice } from "@/components/ui/notice";
+import { Tile } from "@/components/ui/tile";
+import { jumpTo, SettingsNav, type FindItem, type NavItem } from "@/components/ui/settings-nav";
+import { SectionLabel } from "@/components/ui/section-label";
 
 type NavId = "overview" | "profile" | "limits" | "hours" | "budget" | "models" | "guardrails" | "compression" | "advanced" | "keys" | "people" | "activity";
 
@@ -70,104 +75,7 @@ const CARD_LABEL: Record<NavId, string> = {
   activity: "Activity",
 };
 
-function flash(el: HTMLElement) {
-  el.classList.remove("setting-flash");
-  void el.offsetWidth;
-  el.classList.add("setting-flash");
-  setTimeout(() => el.classList.remove("setting-flash"), 1800);
-}
-
-function jumpTo(id: string) {
-  const el = document.getElementById(id);
-  if (!el) return;
-  el.scrollIntoView({ behavior: "smooth", block: id.startsWith("set-") ? "center" : "start" });
-  if (id.startsWith("set-")) {
-    flash(el);
-    el.querySelector<HTMLElement>("input:not([type=hidden]):not([disabled]), textarea, button[role=switch], [role=combobox], button")?.focus({ preventScroll: true });
-  }
-}
-
-function FindSetting() {
-  const [query, setQuery] = useState("");
-  const [open, setOpen] = useState(false);
-  const [index, setIndex] = useState(0);
-  const input = useRef<HTMLInputElement>(null);
-  const results = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    if (!q) return [];
-    return SETTINGS.filter((s) => `${s.label} ${s.words} ${CARD_LABEL[s.card]}`.toLowerCase().includes(q)).slice(0, 6);
-  }, [query]);
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
-        e.preventDefault();
-        input.current?.focus();
-        input.current?.select();
-      }
-    };
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, []);
-
-  const choose = (id: string) => {
-    setOpen(false);
-    setQuery("");
-    input.current?.blur();
-    jumpTo(id);
-  };
-
-  return (
-    <div className="relative">
-      <label className="flex h-9 items-center gap-2 rounded-lg border border-border bg-background px-2.5 text-[12.5px] focus-within:border-muted-foreground">
-        <Search className="h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-hidden />
-        <input
-          ref={input}
-          value={query}
-          onChange={(e) => { setQuery(e.target.value); setIndex(0); setOpen(true); }}
-          onFocus={() => setOpen(true)}
-          onBlur={() => setTimeout(() => setOpen(false), 120)}
-          onKeyDown={(e) => {
-            if (e.key === "ArrowDown") { e.preventDefault(); setIndex((i) => Math.min(i + 1, results.length - 1)); }
-            if (e.key === "ArrowUp") { e.preventDefault(); setIndex((i) => Math.max(i - 1, 0)); }
-            if (e.key === "Enter" && results[index]) { e.preventDefault(); choose(results[index].id); }
-            if (e.key === "Escape") { setQuery(""); input.current?.blur(); }
-          }}
-          placeholder="Find a setting"
-          aria-label="Find a setting"
-          role="combobox"
-          aria-expanded={open && results.length > 0}
-          aria-controls="tenant-setting-results"
-          className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted-foreground"
-        />
-        <kbd className="rounded border border-border px-1 font-mono text-[10.5px] text-muted-foreground">⌘K</kbd>
-      </label>
-      {open && query.trim() !== "" && (
-        <div id="tenant-setting-results" role="listbox" aria-label="Matching settings" className="absolute left-0 top-10 z-40 w-[min(320px,calc(100vw-2rem))] rounded-[10px] border border-border bg-[hsl(240_5%_9%)] p-1.5 shadow-2xl">
-          {results.length === 0 ? (
-            <p className="px-2.5 py-2 text-xs text-muted-foreground">No setting matches “{query}”.</p>
-          ) : (
-            results.map((r, i) => (
-              <button
-                key={r.id}
-                type="button"
-                role="option"
-                aria-selected={i === index}
-                onMouseDown={(e) => e.preventDefault()}
-                onClick={() => choose(r.id)}
-                onMouseEnter={() => setIndex(i)}
-                className={cn("flex w-full items-center justify-between gap-3 rounded-md px-2.5 py-2 text-left text-[13px]", i === index && "bg-secondary")}
-              >
-                <span className="truncate">{r.label}</span>
-                <span className="shrink-0 font-mono text-[11px] text-muted-foreground">{CARD_LABEL[r.card]}</span>
-              </button>
-            ))
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
+const FIND: FindItem[] = SETTINGS.map((s) => ({ id: s.id, label: s.label, words: s.words, hint: CARD_LABEL[s.card] }));
 
 type Measure = "requests" | "spend" | "tokens";
 
@@ -251,7 +159,6 @@ export function TenantPage({
   const { confirm, confirmElement } = useConfirm();
   const [pending, start] = useTransition();
   const [notice, setNotice] = useState<{ text: string; strong?: boolean } | null>(null);
-  const [active, setActive] = useState<NavId>("overview");
   const [dirty, setDirty] = useState<string[]>([]);
   // Only this tenant's row: the rest of the view changing does not re-render the page.
   const fairshare = useFairshareLive({ select: (view) => view.tenants.find((t) => t.tenant_id === tenant.id) ?? null });
@@ -309,26 +216,7 @@ export function TenantPage({
     else router.refresh();
   }, [router, tenant.name]);
 
-  useEffect(() => {
-    const ids: NavId[] = ["overview", "profile", "limits", "hours", "budget", "models", "guardrails", "compression", "advanced", "keys", "people", "activity"];
-    const els = ids.map((id) => document.getElementById(id)).filter((e): e is HTMLElement => !!e);
-    const observer = new IntersectionObserver(
-      (entries) => {
-        const visible = entries.filter((e) => e.isIntersecting).sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
-        if (visible[0]) setActive(visible[0].target.id as NavId);
-      },
-      { rootMargin: "-20% 0px -65% 0px" },
-    );
-    els.forEach((e) => observer.observe(e));
-    return () => observer.disconnect();
-  }, []);
-
-  useEffect(() => {
-    const id = window.location.hash.slice(1);
-    if (id) requestAnimationFrame(() => jumpTo(id));
-  }, []);
-
-  const nav: { id: NavId; count?: string | number }[] = [
+  const nav: NavItem[] = ([
     { id: "overview" },
     { id: "profile" },
     { id: "limits" },
@@ -340,7 +228,7 @@ export function TenantPage({
     { id: "advanced" },
     { id: "keys", count: keys.length },
     { id: "people", count: people.length },
-  ];
+  ] as { id: NavId; count?: string | number }[]).map((n) => ({ ...n, label: CARD_LABEL[n.id] }));
 
   const failShare = data && data.requests24h ? data.failed24h / data.requests24h : 0;
   const pct = (x: number) => (x >= 0.1 ? `${Math.round(x * 100)}%` : `${(x * 100).toFixed(1)}%`);
@@ -399,26 +287,7 @@ export function TenantPage({
       {notice && <Notice onDismiss={() => setNotice(null)} strong={notice.strong}>{notice.text}</Notice>}
 
       <div className="grid items-start gap-6 lg:grid-cols-[200px_minmax(0,1fr)]">
-        <nav aria-label="Tenant sections" className="flex flex-col gap-0.5 lg:sticky lg:top-0">
-          <div className="mb-2"><FindSetting /></div>
-          {nav.map((n) => (
-            <a
-              key={n.id}
-              href={`#${n.id}`}
-              onClick={(e) => { e.preventDefault(); jumpTo(n.id); history.replaceState(null, "", `#${n.id}`); }}
-              aria-current={active === n.id ? "true" : undefined}
-              className={cn("flex h-8 items-center justify-between rounded-lg px-2.5 text-[13px] transition-colors", active === n.id ? "bg-secondary text-foreground" : "text-muted-foreground hover:bg-muted/40 hover:text-foreground")}
-            >
-              {CARD_LABEL[n.id]}
-              <span className="flex items-center gap-1.5 text-[11.5px] text-muted-foreground">
-                {n.count}
-                {dirty.includes(n.id) && <span aria-label="unsaved changes" className="h-1.5 w-1.5 rounded-full bg-foreground" />}
-              </span>
-            </a>
-          ))}
-          <div className="mx-1 my-2 h-px bg-border" />
-          <a href="#activity" onClick={(e) => { e.preventDefault(); jumpTo("activity"); }} className={cn("flex h-8 items-center rounded-lg px-2.5 text-[13px] transition-colors", active === "activity" ? "bg-secondary text-foreground" : "text-muted-foreground hover:bg-muted/40 hover:text-foreground")}>Activity</a>
-        </nav>
+        <SettingsNav label="Tenant sections" items={nav} after={[{ id: "activity", label: "Activity" }]} find={FIND} findId="tenant-setting-results" dirty={dirty} />
 
         <div className="flex min-w-0 flex-col gap-4">
           <div id="overview" className="flex scroll-mt-24 flex-col gap-4">
@@ -437,7 +306,7 @@ export function TenantPage({
                 detail={data?.failed24h ? `${pct(failShare)}${data.topFailure ? ` · mostly ${data.topFailure.status_code} on ${data.topFailure.model}` : ""}` : data ? "none" : null}
               />
               <div className={cn("flex min-w-0 flex-col gap-1 rounded-xl border bg-card px-4 py-3", budget && budget.share >= 0.8 ? "border-muted-foreground" : "border-border")}>
-                <span className="text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">Budget{usage?.period === "monthly" ? ` · ${formatDate(new Date(), { month: "long" })}` : ""}</span>
+                <SectionLabel>Budget{usage?.period === "monthly" ? ` · ${formatDate(new Date(), { month: "long" })}` : ""}</SectionLabel>
                 {budget ? (
                   <>
                     <span className="truncate text-[15px] font-semibold leading-[30px]">{budget.label}</span>

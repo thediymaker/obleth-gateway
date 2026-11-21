@@ -11,10 +11,12 @@ import { setTenantMaxInFlightAction, setWeightAction } from "@/app/actions";
 import type { FairshareLiveView, KeyFairshareView, TenantFairshareView } from "@/lib/obleth";
 import { belowShareInPools } from "@/lib/fairshare";
 import { keyRowLabel, previewTenantWeight, tenantKeys, tenantPools } from "@/lib/fairshare-model";
-import { Pill, SectionLabel, Sparkline } from "@/components/overview/ui";
+import { Sparkline } from "@/components/overview/ui";
 import { cn } from "@/lib/utils";
 import type { TenantSeriesRow } from "./hooks";
 import { formatNumber } from "@/lib/format";
+import { Pill } from "@/components/ui/pill";
+import { SectionLabel } from "@/components/ui/section-label";
 
 const slots = (n: number) => formatNumber(n >= 10 ? Math.round(n) : Math.round(n * 10) / 10);
 

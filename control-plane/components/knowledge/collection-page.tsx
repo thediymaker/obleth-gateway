@@ -4,16 +4,12 @@ import { useCallback, useEffect, useMemo, useRef, useState, useTransition } from
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { MoreHorizontal, Search } from "lucide-react";
+import { MoreHorizontal } from "lucide-react";
 import { attachCollectionAction } from "@/app/actions";
-import { SettingsForm, type SaveResult } from "@/components/access/settings-form";
-import { SettingsCard } from "@/components/access/ui";
 import { ChangesList } from "@/components/deployments/detail-ui";
 import { DocumentUpload } from "@/components/knowledge/document-upload";
 import { StatusMark } from "@/components/knowledge/knowledge-list";
 import { SelectField, Setting, TextField } from "@/components/models/fields";
-import { Notice, Tile } from "@/components/models/ui";
-import { Pill } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
@@ -24,6 +20,12 @@ import { COLLECTION_STATUS_LABEL, collectionGlyph, collectionHref, collectionSta
 import { modelHref } from "@/lib/models-model";
 import type { AuditEntry, DailyStatsView, KnowledgeCollection, KnowledgeDocument, KnowledgeHit, KnowledgeSettingsView, ModelRoute } from "@/lib/obleth";
 import { cn, getJson } from "@/lib/utils";
+import { Pill } from "@/components/ui/pill";
+import { Notice } from "@/components/ui/notice";
+import { Tile } from "@/components/ui/tile";
+import { SettingsCard } from "@/components/ui/settings-card";
+import { type SaveResult, SettingsForm } from "@/components/ui/settings-form";
+import { SearchBox } from "@/components/ui/search-box";
 
 const DOC_COLS = "grid-cols-[minmax(0,1fr)_90px_70px_minmax(110px,160px)_150px]";
 
@@ -76,10 +78,7 @@ function SearchPanel({ collection, documents, settings }: { collection: Knowledg
         <p className="mt-3 text-[12.5px] text-secondary-foreground">Nothing is indexed yet. Upload a document and wait for it to show Indexed.</p>
       ) : (
         <form className="my-3 flex gap-2" onSubmit={(e) => { e.preventDefault(); run(); }}>
-          <label className="flex h-9 flex-1 items-center gap-2 rounded-lg border border-border bg-background px-3 text-[13px] focus-within:border-muted-foreground">
-            <Search className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
-            <input value={query} onChange={(e) => setQuery(e.target.value)} aria-label="A question this collection should answer" placeholder="A question this collection should answer" className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted-foreground" />
-          </label>
+          <SearchBox value={query} onChange={setQuery} label="A question this collection should answer" placeholder="A question this collection should answer" />
           <Button type="submit" size="sm" className="h-9" disabled={pending || !query.trim()}>{pending ? "Searching…" : "Search"}</Button>
         </form>
       )}

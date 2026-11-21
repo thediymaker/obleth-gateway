@@ -2,16 +2,19 @@
 
 import { useCallback, useState, useTransition } from "react";
 import { deleteMcpServerAction, saveMcpServerAction, setMcpServerEnabledAction, setMcpServerTenantAction, setModelToolServerAction } from "@/app/actions";
-import { SettingsForm, type SaveResult } from "@/components/access/settings-form";
-import { Setting, Switch, TextField } from "@/components/models/fields";
-import { Notice, Sheet } from "@/components/models/ui";
-import { Pill } from "@/components/overview/ui";
+import { Setting, TextField } from "@/components/models/fields";
 import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { MCP_STATE_LABEL, probeLatency, type McpRow, type McpState } from "@/lib/mcp-model";
 import type { ModelRoute } from "@/lib/obleth";
 import { compact } from "@/lib/format";
 import { StatusPill } from "@/components/ui/status";
+import { Pill } from "@/components/ui/pill";
+import { Notice } from "@/components/ui/notice";
+import { Sheet } from "@/components/ui/sheet";
+import { type SaveResult, SettingsForm } from "@/components/ui/settings-form";
+import { Switch } from "@/components/ui/switch";
+import { SectionLabel } from "@/components/ui/section-label";
 
 /** Filled dot answering, half dot old-style or checking, dashed off, the attention pill not answering. */
 export function McpStateMark({ state }: { state: McpState }) {
@@ -143,7 +146,7 @@ export function ServerSheet({ row, models, tenants = [], onClose, onCheck, onCha
 
           <section aria-label="Models that can use it">
             <div className="flex flex-wrap items-baseline justify-between gap-2 pb-1">
-              <span className="text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">Models that can use it · {granted.size}</span>
+              <SectionLabel>Models that can use it · {granted.size}</SectionLabel>
               <span className="text-xs text-muted-foreground">Only models with Function calling on are listed</span>
             </div>
             {models.length === 0 && <p className="py-2 text-[12.5px] text-muted-foreground">No chat model has Function calling on yet.</p>}
@@ -158,7 +161,7 @@ export function ServerSheet({ row, models, tenants = [], onClose, onCheck, onCha
 
           <section aria-label="Tenants that can call it directly">
             <div className="flex flex-wrap items-baseline justify-between gap-2 pb-1">
-              <span className="text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">Tenants that can call it directly · {opened.size}</span>
+              <SectionLabel>Tenants that can call it directly · {opened.size}</SectionLabel>
               <span className="text-xs text-muted-foreground">With their own keys, at <span className="font-mono">/mcp/{s.name}</span></span>
             </div>
             <p className="pb-1 text-[12.5px] text-muted-foreground">{opened.size ? "A direct call uses the key you saved for this server, so open it only to tenants you would give that key." : "No tenant can call this server directly. Models granted its tools still can."}</p>
@@ -173,7 +176,7 @@ export function ServerSheet({ row, models, tenants = [], onClose, onCheck, onCha
           </section>
 
           <section aria-label="Its tools">
-            <span className="text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">Its tools · {row.tools ?? "unknown until it answers"}</span>
+            <SectionLabel>Its tools · {row.tools ?? "unknown until it answers"}</SectionLabel>
             {(allTools ? tools : tools.slice(0, SHOWN)).map((t) => (
               <div key={t.name} className="grid grid-cols-[200px_minmax(0,1fr)] gap-3 border-t border-border py-2 text-[12.5px] first:mt-1">
                 <span className="truncate font-mono">{t.name}</span>
@@ -185,7 +188,7 @@ export function ServerSheet({ row, models, tenants = [], onClose, onCheck, onCha
         </div>
 
         <SettingsForm id={s.id} sectionOf={sectionOf} labelOf={labelOf} save={save} bar="panel" ariaLabel={`${s.name} connection`}>
-          <p className="px-6 pb-1 text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">Connection</p>
+          <SectionLabel className="px-6 pb-1">Connection</SectionLabel>
           <Setting label="Name" hint="Renaming keeps every model's grant; clients must use the new path." fields={["name"]} was={{ field: "name" }} className="px-6">
             <TextField name="name" label="Name" required defaultValue={s.name} mono />
           </Setting>

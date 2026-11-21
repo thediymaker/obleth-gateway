@@ -7,14 +7,14 @@ import { Field, SelectField } from "@/components/models/fields";
 import { AllowedCountriesField } from "@/components/access/allowed-countries-field";
 import { AllowedNetworksField } from "@/components/access/allowed-networks-field";
 import { COUNTRIES_HINT, NETWORKS_HINT } from "@/lib/key-networks";
-import { Sheet } from "@/components/models/ui";
-import { Segmented } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Select } from "@/components/ui/select";
 import { PERIOD_OPTIONS, tenantHref } from "@/lib/access-model";
 import type { ApiKey, KeyListQuery, NamedNetwork, Tenant } from "@/lib/obleth";
 import { formatNumber } from "@/lib/format";
+import { Segmented } from "@/components/ui/segmented";
+import { Sheet } from "@/components/ui/sheet";
 
 /** " 2 failed: a (why); b (why)" after a bulk key action's count, or "" when none did. */
 export function bulkFailures(r: BulkKeyResult): string {

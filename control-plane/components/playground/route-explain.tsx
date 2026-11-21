@@ -4,7 +4,7 @@ import { useState } from "react";
 import { AlertTriangle, ChevronDown, ChevronRight } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { RouteExplainView } from "@/lib/obleth";
-import { Pill } from "./ui";
+import { Pill } from "@/components/ui/pill";
 
 const fmt = (n: number) => n.toFixed(3);
 

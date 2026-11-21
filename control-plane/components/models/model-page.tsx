@@ -8,13 +8,11 @@ import { MoreHorizontal, Search } from "lucide-react";
 import { activateModelAction, checkModelHealthAction, deleteModelAction, setModelEnabledAction } from "@/app/actions";
 import { useCapacityDiscovery, usePoolLoad } from "@/components/fairshare/hooks";
 import { EndpointsSection } from "@/components/models/endpoints";
-import { Switch } from "@/components/models/fields";
 import { LifecycleSection, type LifecycleCandidate } from "@/components/models/lifecycle";
 import { ModelOverview } from "@/components/models/model-overview";
 import { ModelSettings, type SettingsState } from "@/components/models/model-settings";
 import { ReasoningSection } from "@/components/models/reasoning";
-import { Notice, ProviderMark, StatusMark } from "@/components/models/ui";
-import { Pill } from "@/components/overview/ui";
+import { ProviderMark, StatusMark } from "@/components/models/ui";
 import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
@@ -24,6 +22,9 @@ import { awaitingFirstPass, contextLabel, lifecycleLabel, lifecycleStatus, MODEL
 import type { CapacityDiscoveryView, McpServer, ModelEndpoint, ModelHealthCheck, ModelHealthDetail, ModelHealthSummary, ModelRoute, UsageLogFacet } from "@/lib/obleth";
 import { cn, getJson } from "@/lib/utils";
 import { ReadNotice } from "@/components/ui/read-state";
+import { Pill } from "@/components/ui/pill";
+import { Notice } from "@/components/ui/notice";
+import { Switch } from "@/components/ui/switch";
 
 type NavId = "overview" | SettingsSectionId | "lifecycle" | "activity";
 

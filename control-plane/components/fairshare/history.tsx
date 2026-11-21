@@ -4,9 +4,10 @@ import { memo, useMemo, useState } from "react";
 import { Area, AreaChart, Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { TooltipRow, TooltipShell } from "@/components/chart-tooltip";
 import { GROUP_TONES, MAX_CHART_ROWS, OTHER_TONE, thinHistory, type GroupHistoryPoint, type GroupKey } from "@/lib/fairshare-model";
-import { Panel, Segmented } from "@/components/overview/ui";
+import { Panel } from "@/components/overview/ui";
 import { clock, compact, formatNumber } from "@/lib/format";
 import { axisTick, barCursor, chartGrid, timeCursor } from "@/lib/chart-style";
+import { Segmented } from "@/components/ui/segmented";
 
 type Window = "15m" | "1h";
 const WINDOW_MS: Record<Window, number> = { "15m": 900_000, "1h": 3_600_000 };

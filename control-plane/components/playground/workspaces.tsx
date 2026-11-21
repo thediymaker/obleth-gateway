@@ -15,8 +15,10 @@ import { cn } from "@/lib/utils";
 import type { PendingAction, PlaygroundSession } from "./playground";
 import { conversationRows } from "./conversation-rows";
 import { MAX_LANES, ModelPicker } from "./model-picker";
-import { ModelAvatar, Pill, SectionLabel, SettingsPanel, SliderField, capabilities, modelLabel } from "./ui";
+import { ModelAvatar, SettingsPanel, SliderField, capabilities, modelLabel } from "./ui";
 import { compact, formatMs, formatNumber, money, perMillion } from "@/lib/format";
+import { Pill } from "@/components/ui/pill";
+import { SectionLabel } from "@/components/ui/section-label";
 
 type Stream = ReturnType<typeof useCharoStream>;
 

@@ -1,16 +1,16 @@
 "use client";
 
-import { memo, useCallback, useEffect, useMemo, useRef, useState, useTransition } from "react";
+import { memo, useCallback, useEffect, useMemo, useState, useTransition } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
-import { Check, ChevronDown, Download, Plus, Search, Upload, X } from "lucide-react";
+import { Check, ChevronDown, Download, Plus, Upload, X } from "lucide-react";
 import { checkModelsHealthAction, deleteModelsAction, setModelsEnabledAction, type BulkModelResult } from "@/app/actions";
 import { useCapacityDiscovery, useFairshareLive, usePoolLoad } from "@/components/fairshare/hooks";
 import { AddModelSheet, type AddMode } from "@/components/models/add-model";
 import { FamiliesSection } from "@/components/models/families";
-import { Notice, ProviderMark, StatusMark, Tile } from "@/components/models/ui";
-import { Meter, Segmented } from "@/components/overview/ui";
+import { ProviderMark, StatusMark } from "@/components/models/ui";
+import { Meter } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
@@ -21,6 +21,10 @@ import { compact, formatMs } from "@/lib/format";
 import { logsHref } from "@/lib/log-links";
 import { cn, getJson } from "@/lib/utils";
 import { ReadNotice, readFailed } from "@/components/ui/read-state";
+import { Segmented } from "@/components/ui/segmented";
+import { Notice } from "@/components/ui/notice";
+import { Tile } from "@/components/ui/tile";
+import { SearchBox } from "@/components/ui/search-box";
 
 const DAY_MS = 86_400_000;
 
@@ -56,7 +60,6 @@ export function ModelsList({
   const [adding, setAdding] = useState<AddMode | null>(initialAdd ?? null);
   const [notice, setNotice] = useState<{ text: string; failed: BulkModelResult["failed"] } | null>(null);
   const [pending, start] = useTransition();
-  const search = useRef<HTMLInputElement>(null);
 
   const healthQuery = useQuery({
     queryKey: ["models-health"],
@@ -90,17 +93,6 @@ export function ModelsList({
       return next.size === prev.size ? prev : next;
     });
   }, [models]);
-
-  // "/" jumps to the search box, as it does in most lists.
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "/" || (e.target instanceof Element && e.target.closest("input, textarea, select, [contenteditable=true]"))) return;
-      e.preventDefault();
-      search.current?.focus();
-    };
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, []);
 
   const set = <K extends keyof ModelFilters>(key: K, value: ModelFilters[K]) => setFilters((f) => ({ ...f, [key]: value }));
   const down = real.filter((r) => r.status === "down");
@@ -214,22 +206,7 @@ export function ModelsList({
 
       <div className="flex flex-col gap-3">
         <div className="flex flex-wrap items-center gap-2">
-          <label className="flex h-9 min-w-[16rem] flex-1 items-center gap-2 rounded-lg border border-border bg-background px-3 text-[13px] focus-within:border-muted-foreground lg:max-w-md">
-            <Search className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
-            <input
-              ref={search}
-              value={filters.query}
-              onChange={(e) => set("query", e.target.value)}
-              placeholder="Search name, alias, upstream or tag"
-              aria-label="Search models"
-              className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted-foreground"
-            />
-            {filters.query ? (
-              <button type="button" onClick={() => set("query", "")} aria-label="Clear search" className="text-muted-foreground hover:text-foreground"><X className="h-3.5 w-3.5" /></button>
-            ) : (
-              <kbd className="rounded border border-border px-1.5 font-mono text-[11px] text-muted-foreground">/</kbd>
-            )}
-          </label>
+          <SearchBox slash value={filters.query} onChange={(query) => set("query", query)} label="Search models" placeholder="Search name, alias, upstream or tag" className="min-w-[16rem] lg:max-w-md" />
           <Segmented<TypeGroup | "all">
             label="Model type"
             value={filters.group}

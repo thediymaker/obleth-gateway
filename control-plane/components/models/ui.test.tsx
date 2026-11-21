@@ -1,7 +1,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { Sheet } from "./ui";
+import { Sheet } from "@/components/ui/sheet";
 
 let root: Root;
 let host: HTMLDivElement;

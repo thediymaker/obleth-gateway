@@ -5,26 +5,7 @@ import { useRouter } from "next/navigation";
 import { saveModelSettingsAction } from "@/app/actions";
 import { usePoolLoad } from "@/components/fairshare/hooks";
 import { AutotuneButton, CapacityDiscoveryFields, capacityMode, CapacityModeToggle, type CapacityMode } from "@/components/models/capacity";
-import {
-  ALIASES_HINT,
-  ChangesContext,
-  ChatCapabilityFields,
-  MODEL_TYPE_OPTIONS,
-  fromPerMillion,
-  QUANTIZATION_HINT,
-  QUANTIZATION_OPTIONS,
-  RoutingTagsField,
-  SelectField,
-  Setting,
-  Switch,
-  toPerMillion,
-  TextArea,
-  TextField,
-  toPlainDecimal,
-  UPSTREAM_HEADERS_HINT,
-  VARIANTS_HINT,
-  VariantsField,
-} from "@/components/models/fields";
+import { ALIASES_HINT, ChangesContext, ChatCapabilityFields, MODEL_TYPE_OPTIONS, fromPerMillion, QUANTIZATION_HINT, QUANTIZATION_OPTIONS, RoutingTagsField, SelectField, Setting, toPerMillion, TextArea, TextField, toPlainDecimal, UPSTREAM_HEADERS_HINT, VARIANTS_HINT, VariantsField } from "@/components/models/fields";
 import { Button } from "@/components/ui/button";
 import type { BoonBlockers } from "@/lib/boon-availability";
 import { changedFields, changedSections, changeSummary, checkStatusLabel, fieldSection, type FormSnapshot, type SettingsSectionId, snapshotForm } from "@/lib/models-model";
@@ -32,6 +13,7 @@ import type { McpServer, ModelHealthCheck, ModelHealthSummary, ModelRoute } from
 import { upstreamHeadersText } from "@/lib/upstream-headers";
 import { cn } from "@/lib/utils";
 import { dateTime } from "@/lib/format";
+import { Switch } from "@/components/ui/switch";
 
 /** A settings card on the model page; `data-section` lets the page find which cards hold changes. */
 function Section({ id, title, description, children }: { id: SettingsSectionId; title: string; description?: ReactNode; children: ReactNode }) {

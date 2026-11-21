@@ -1,11 +1,13 @@
 "use client";
 
 import { useState } from "react";
-import { Setting, Switch } from "@/components/models/fields";
-import { Segmented } from "@/components/overview/ui";
+import { Setting } from "@/components/models/fields";
 import { Select } from "@/components/ui/select";
 import type { CompressionPolicy, GuardrailsAction, GuardrailsPolicy } from "@/lib/obleth";
-import { cn } from "@/lib/utils";
+import { Segmented } from "@/components/ui/segmented";
+import { Switch } from "@/components/ui/switch";
+import { ProfileCards } from "@/components/ui/profile-cards";
+import { ToggleChip } from "@/components/ui/toggle-chip";
 
 const ACTIONS: { value: GuardrailsAction; label: string; hint: string }[] = [
   { value: "block", label: "Block", hint: "Reject flagged requests and responses with an error." },
@@ -81,20 +83,6 @@ export function guardrailsProblem(json: string): string | null {
   }
 }
 
-function Chip({ on, onClick, children, title }: { on: boolean; onClick: () => void; children: React.ReactNode; title?: string }) {
-  return (
-    <button
-      type="button"
-      aria-pressed={on}
-      title={title}
-      onClick={onClick}
-      className={cn("inline-flex h-7 items-center rounded-full border px-2.5 text-[12px] transition-colors", on ? "border-muted-foreground bg-secondary text-foreground" : "border-border text-muted-foreground hover:text-foreground")}
-    >
-      {children}
-    </button>
-  );
-}
-
 /**
  * The guardrails policy as settings rows. It submits `guardrails_policy` as
  * JSON, blank when off.
@@ -121,29 +109,13 @@ export function GuardrailsFields({ policy, models }: { policy: GuardrailsPolicy 
       {on && (
         <>
           <Setting id="set-guardrails-profile" label="Profile" hint="Start from one, then change anything below." fields={fields}>
-            <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
-              {PRESETS.map((x) => (
-                <button
-                  key={x.id}
-                  type="button"
-                  aria-pressed={preset === x.id && !custom}
-                  onClick={() => { setP(x.policy); setKeywords(""); setCustom(false); }}
-                  className={cn("flex flex-col gap-0.5 rounded-lg border px-3 py-2 text-left", preset === x.id && !custom ? "border-foreground bg-secondary" : "border-border hover:border-muted-foreground/60")}
-                >
-                  <span className="text-[12.5px] font-medium">{x.label}</span>
-                  <span className="text-[11.5px] leading-snug text-muted-foreground">{x.blurb}</span>
-                </button>
-              ))}
-              <button
-                type="button"
-                aria-pressed={preset === "custom" || custom}
-                onClick={() => setCustom(true)}
-                className={cn("flex flex-col gap-0.5 rounded-lg border px-3 py-2 text-left", preset === "custom" || custom ? "border-foreground bg-secondary" : "border-border hover:border-muted-foreground/60")}
-              >
-                <span className="text-[12.5px] font-medium">Custom</span>
-                <span className="text-[11.5px] leading-snug text-muted-foreground">Pick the action, scanners and keywords yourself.</span>
-              </button>
-            </div>
+            <ProfileCards
+              className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4"
+              profiles={PRESETS.map((x) => ({ key: x.id, label: x.label, blurb: x.blurb }))}
+              value={custom ? "custom" : preset}
+              onPick={(key) => { setP(PRESETS.find((x) => x.id === key)!.policy); setKeywords(""); setCustom(false); }}
+              custom={{ blurb: "Pick the action, scanners and keywords yourself.", onPick: () => setCustom(true) }}
+            />
           </Setting>
           {(custom || preset === "custom") && (
             <>
@@ -152,12 +124,12 @@ export function GuardrailsFields({ policy, models }: { policy: GuardrailsPolicy 
               </Setting>
               <Setting label="Scan requests" hint="Before they reach the model." fields={fields}>
                 <div className="flex flex-wrap gap-1.5">
-                  {INPUT_SCANNERS.map((s) => <Chip key={s} on={current.input_scanners.includes(s)} onClick={() => toggle("input_scanners", s)} title={SCANNERS[s].hint}>{SCANNERS[s].label}</Chip>)}
+                  {INPUT_SCANNERS.map((s) => <ToggleChip key={s} on={current.input_scanners.includes(s)} onClick={() => toggle("input_scanners", s)} title={SCANNERS[s].hint}>{SCANNERS[s].label}</ToggleChip>)}
                 </div>
               </Setting>
               <Setting label="Scan responses" hint="Blocking or redacting a response waits for the whole reply." fields={fields}>
                 <div className="flex flex-wrap gap-1.5">
-                  {OUTPUT_SCANNERS.map((s) => <Chip key={s} on={current.output_scanners.includes(s)} onClick={() => toggle("output_scanners", s)} title={SCANNERS[s].hint}>{SCANNERS[s].label}</Chip>)}
+                  {OUTPUT_SCANNERS.map((s) => <ToggleChip key={s} on={current.output_scanners.includes(s)} onClick={() => toggle("output_scanners", s)} title={SCANNERS[s].hint}>{SCANNERS[s].label}</ToggleChip>)}
                 </div>
               </Setting>
               {usesKeywords && (

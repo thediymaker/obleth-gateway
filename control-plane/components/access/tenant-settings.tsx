@@ -3,14 +3,16 @@
 import { useCallback, useMemo, useState } from "react";
 import { saveTenantSettingsAction, type TenantSettingsSection } from "@/app/actions";
 import { CompressionFields, GuardrailsFields, guardrailsProblem } from "@/components/access/policy-fields";
-import { SettingsForm } from "@/components/access/settings-form";
-import { BudgetBar, SettingsCard } from "@/components/access/ui";
+import { BudgetBar } from "@/components/access/ui";
 import { WeekGrid } from "@/components/access/week-grid";
-import { SelectField, Setting, Switch, TextArea, TextField } from "@/components/models/fields";
+import { SelectField, Setting, TextArea, TextField } from "@/components/models/fields";
 import { clockIn, groupShare, isTimeZone, PERIOD_OPTIONS, utcToZoned, zonedToUtc, type BudgetView } from "@/lib/access-model";
 import { dateLabel, money } from "@/lib/format";
 import type { Tenant } from "@/lib/obleth";
-import { cn } from "@/lib/utils";
+import { SettingsCard } from "@/components/ui/settings-card";
+import { SettingsForm } from "@/components/ui/settings-form";
+import { Switch } from "@/components/ui/switch";
+import { ToggleChip } from "@/components/ui/toggle-chip";
 
 /** The save call that owns each field; null for fields that never save. */
 export function tenantFieldSection(name: string): TenantSettingsSection | null {
@@ -184,15 +186,7 @@ function ModelsField({ tenant, models }: { tenant: Tenant; models: string[] }) {
             {shown.map((m) => {
               const on = picked.includes(m);
               return (
-                <button
-                  key={m}
-                  type="button"
-                  aria-pressed={on}
-                  onClick={() => setPicked(on ? picked.filter((x) => x !== m) : [...picked, m])}
-                  className={cn("inline-flex h-7 items-center rounded-full border px-2.5 font-mono text-[11.5px]", on ? "border-muted-foreground bg-secondary text-foreground" : "border-border text-muted-foreground hover:text-foreground")}
-                >
-                  {m}
-                </button>
+                <ToggleChip key={m} mono on={on} onClick={() => setPicked(on ? picked.filter((x) => x !== m) : [...picked, m])}>{m}</ToggleChip>
               );
             })}
           </div>

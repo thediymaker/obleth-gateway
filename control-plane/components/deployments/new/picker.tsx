@@ -1,10 +1,7 @@
 "use client";
 
 import { useMemo, useState, useTransition } from "react";
-import { Search } from "lucide-react";
 import { lookupHfModelAction } from "@/app/actions";
-import { Notice } from "@/components/models/ui";
-import { Pill, Segmented } from "@/components/overview/ui";
 import { testedSentence, type RecipeCard } from "@/components/recipes/recipe-card";
 import { Button } from "@/components/ui/button";
 import { gresCount, memToMb, partitionFits } from "@/lib/deployments-model";
@@ -12,6 +9,10 @@ import type { EngineId, HfModel } from "@/lib/hf-model";
 import type { LaunchRecord } from "@/lib/launch-learning";
 import type { ClusterResources } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
+import { Pill } from "@/components/ui/pill";
+import { Segmented } from "@/components/ui/segmented";
+import { Notice } from "@/components/ui/notice";
+import { SearchBox } from "@/components/ui/search-box";
 
 export type PickerTab = "saved" | "library" | "hf";
 
@@ -89,10 +90,7 @@ export function Picker({ recipes, launches, resources, tab, onTab, picked, onPic
         <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
           <div className="flex min-w-0 flex-col gap-3">
             <div className="flex flex-wrap items-center gap-2">
-              <label className="flex h-9 min-w-[220px] flex-1 items-center gap-2 rounded-lg border border-border bg-background px-3 text-[13px] focus-within:border-muted-foreground">
-                <Search className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
-                <input value={query} onChange={(e) => setQuery(e.target.value)} aria-label={tab === "saved" ? "Search saved recipes" : "Search the library"} placeholder="Model, engine or recipe" className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted-foreground" />
-              </label>
+              <SearchBox value={query} onChange={setQuery} label={tab === "saved" ? "Search saved recipes" : "Search the library"} placeholder="Model, engine or recipe" className="min-w-[220px]" />
               {engineOptions.length > 1 && <Segmented label="Engine" value={engine} onChange={setEngine} options={[{ value: "all", label: "Any engine" }, ...engineOptions.map((e) => ({ value: e, label: engineName(e) }))]} />}
               {resources.partitions.length > 0 && (
                 <button type="button" aria-pressed={fitsOnly} onClick={() => setFitsOnly((x) => !x)} className={cn("inline-flex h-8 items-center rounded-full border px-3 text-[12.5px]", fitsOnly ? "border-foreground bg-secondary text-foreground" : "border-border text-muted-foreground hover:text-foreground")}>Fits a partition</button>

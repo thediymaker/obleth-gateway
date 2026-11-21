@@ -4,10 +4,7 @@ import { useMemo, useState, useTransition } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useInfiniteQuery } from "@tanstack/react-query";
-import { Search } from "lucide-react";
 import { cancelBatchAction } from "@/app/(dashboard)/batches/batches-actions";
-import { Tile } from "@/components/models/ui";
-import { Segmented } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
 import { BATCH_FILTERS, batchName, batchState, doneOf, filterCount, isActive, ownerOf, percentOf, type BatchFilter, type BatchTone } from "@/lib/batches-model";
 import { tenantHref } from "@/lib/access-model";
@@ -19,6 +16,9 @@ import { cn, getJson } from "@/lib/utils";
 import { ListFooter } from "@/components/ui/list-footer";
 import { ReadNotice } from "@/components/ui/read-state";
 import { StatusText, type StatusGlyph } from "@/components/ui/status";
+import { Segmented } from "@/components/ui/segmented";
+import { Tile } from "@/components/ui/tile";
+import { SearchBox } from "@/components/ui/search-box";
 
 const COLS = "grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)_minmax(0,0.9fr)_minmax(220px,1.6fr)_minmax(0,1.3fr)_88px]";
 
@@ -127,10 +127,7 @@ export function BatchesView({ initial, initialFilter }: { initial: AdminBatchLis
       </div>
 
       <div className="flex flex-wrap items-center gap-2">
-        <label className="flex h-9 min-w-[240px] max-w-[380px] flex-1 items-center gap-2 rounded-lg border border-border bg-background px-3 text-[13px] focus-within:border-muted-foreground">
-          <Search className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
-          <input value={query} onChange={(e) => setQuery(e.target.value)} aria-label="Search batches" placeholder="Batch, model, tenant or key" className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted-foreground" />
-        </label>
+        <SearchBox value={query} onChange={setQuery} label="Search batches" placeholder="Batch, model, tenant or key" className="max-w-[380px]" />
         <Segmented
           label="Show"
           value={filter}

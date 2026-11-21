@@ -11,8 +11,7 @@ import { TooltipRow, TooltipShell } from "@/components/chart-tooltip";
 import { ExportSheet } from "@/components/reports/export-sheet";
 import { ModelSpeed } from "@/components/reports/model-speed";
 import { ReportsTabs } from "@/components/reports/reports-tabs";
-import { Meter, Panel, Segmented } from "@/components/overview/ui";
-import { Tile } from "@/components/models/ui";
+import { Meter, Panel } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
 import { Calendar } from "@/components/ui/calendar";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -47,6 +46,8 @@ import { toBreakdownRows } from "@/lib/usage-breakdown";
 import { cn, getJson } from "@/lib/utils";
 import { ReadNotice, readFailed, ReadFailedNote, readProblem } from "@/components/ui/read-state";
 import { axisTick, barCursor, chartGrid, seriesCurrent, seriesPrevious } from "@/lib/chart-style";
+import { Segmented } from "@/components/ui/segmented";
+import { Tile } from "@/components/ui/tile";
 
 function energy(wh: number) {
   return wh >= 1000 ? `${oneDecimal(wh / 1000)} kWh` : `${Math.round(wh)} Wh`;

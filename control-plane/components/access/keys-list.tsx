@@ -3,13 +3,11 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState, useTransition } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
-import { Plus, Search } from "lucide-react";
+import { Plus } from "lucide-react";
 import { deleteKeysAction, setKeysDisabledAction, type KeyTarget } from "@/app/actions";
 import { BudgetDialog, bulkFailures, MoveDialog, NewKeySheet, type KeysByFilter } from "@/components/access/key-dialogs";
 import { KeyPanel } from "@/components/access/key-panel";
 import { BudgetBar, SecretBanner } from "@/components/access/ui";
-import { Notice, Tile } from "@/components/models/ui";
-import { Pill } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { ListFooter } from "@/components/ui/list-footer";
@@ -31,6 +29,10 @@ import type { ApiKey, KeyStats, NamedNetwork, Tenant } from "@/lib/obleth";
 import { compact, formatNumber, money } from "@/lib/format";
 import { cn, getJson } from "@/lib/utils";
 import { StatusDot } from "@/components/ui/status";
+import { Pill } from "@/components/ui/pill";
+import { Notice } from "@/components/ui/notice";
+import { Tile } from "@/components/ui/tile";
+import { SearchBox } from "@/components/ui/search-box";
 
 const SORTS: { value: KeySort; label: string }[] = [
   { value: "last-used", label: "Sort: last used" },
@@ -359,10 +361,7 @@ export function KeysList({
       </div>
 
       <div className="flex flex-wrap items-center gap-2">
-        <label className="flex h-9 min-w-[240px] max-w-[380px] flex-1 items-center gap-2 rounded-lg border border-border bg-background px-3 text-[13px] focus-within:border-muted-foreground">
-          <Search className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
-          <input value={filters.query} onChange={(e) => patch({ query: e.target.value })} aria-label="Search keys" placeholder="Name, prefix, tenant or identity" className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted-foreground" />
-        </label>
+        <SearchBox value={filters.query} onChange={(query) => patch({ query })} label="Search keys" placeholder="Name, prefix, tenant or identity" className="max-w-[380px]" />
         <Select aria-label="Tenant" value={filters.tenantId} onValueChange={(v) => patch({ tenantId: v })} searchPlaceholder="Find a tenant" className={cn("h-9 w-auto min-w-[9rem] text-[12.5px]", filters.tenantId && "border-foreground")} options={tenantOptions} />
         <Select aria-label="Status" value={filters.status} onValueChange={(v) => patch({ status: v as KeyFilters["status"] })} className={cn("h-9 w-auto min-w-[7rem] text-[12.5px]", filters.status !== "all" && "border-foreground")} options={[{ value: "all", label: "Any status" }, { value: "on", label: "On" }, { value: "off", label: "Off" }]} />
         {(stats?.identity ?? 0) > 0 && <Select aria-label="Kind" value={filters.kind} onValueChange={(v) => patch({ kind: v as KeyFilters["kind"] })} className={cn("h-9 w-auto min-w-[8rem] text-[12.5px]", filters.kind !== "all" && "border-foreground")} options={[{ value: "all", label: "Secret or identity" }, { value: "secret", label: "Secret keys" }, { value: "identity", label: "Identity keys" }]} />}
@@ -457,4 +456,3 @@ export function KeysList({
     </div>
   );
 }
-

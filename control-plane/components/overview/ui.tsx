@@ -6,6 +6,7 @@ import { ArrowRight } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { HealthState } from "@/lib/overview-model";
 import { AttentionPill, StatusDot } from "@/components/ui/status";
+import { SectionLabel } from "@/components/ui/section-label";
 
 /** The Overview's card: one border, one radius, one header shape. */
 export function Panel({ title, subtitle, action, children, className, label }: {
@@ -27,22 +28,6 @@ export function Panel({ title, subtitle, action, children, className, label }: {
   );
 }
 
-export function SectionLabel({ children, className }: { children: ReactNode; className?: string }) {
-  return <div className={cn("text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground", className)}>{children}</div>;
-}
-
-export function Pill({ children, inverted, className }: { children: ReactNode; inverted?: boolean; className?: string }) {
-  return (
-    <span className={cn(
-      "inline-flex h-[22px] shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full border px-2 text-[11.5px] font-medium",
-      inverted ? "border-foreground bg-foreground text-background" : "border-border text-secondary-foreground",
-      className,
-    )}>
-      {children}
-    </span>
-  );
-}
-
 const HEALTH_GLYPH = { healthy: "on", unknown: "none", maintenance: "off" } as const;
 const HEALTH_WORD = { healthy: "Healthy", unknown: "No health data", maintenance: "In maintenance" } as const;
 
@@ -59,29 +44,6 @@ export function Meter({ value, max, className, strong }: { value: number; max: n
     <span className={cn("block h-1.5 overflow-hidden rounded-full bg-muted", className)} aria-hidden="true">
       <span className={cn("block h-full rounded-full", strong ? "bg-foreground" : "bg-secondary-foreground")} style={{ width: `${pct}%` }} />
     </span>
-  );
-}
-
-export function Segmented<T extends string>({ value, options, onChange, label, className }: {
-  value: T; options: { value: T; label: ReactNode }[]; onChange: (value: T) => void; label: string; className?: string;
-}) {
-  return (
-    <div role="group" aria-label={label} className={cn("inline-flex flex-wrap gap-0.5 rounded-[9px] border border-border p-[3px]", className)}>
-      {options.map((o) => (
-        <button
-          key={o.value}
-          type="button"
-          aria-pressed={value === o.value}
-          onClick={() => onChange(o.value)}
-          className={cn(
-            "inline-flex h-7 items-center justify-center whitespace-nowrap rounded-md px-2.5 text-[12.5px] transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
-            value === o.value ? "bg-secondary text-foreground" : "text-muted-foreground hover:text-foreground",
-          )}
-        >
-          {o.label}
-        </button>
-      ))}
-    </div>
   );
 }
 

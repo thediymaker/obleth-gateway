@@ -2,12 +2,12 @@
 
 import { useState } from "react";
 import { Plus, X } from "lucide-react";
-import { SettingsCard } from "@/components/access/ui";
 import { Setting } from "@/components/models/fields";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import type { NamedNetwork, NetworkSettingsView } from "@/lib/obleth";
 import { cleanNamedNetworks, NETWORK_NAME_MAX, namedNetworkProblems, rangeCount, rangeLines } from "@/lib/named-networks";
+import { SettingsCard } from "@/components/ui/settings-card";
 
 function Line({ label, children }: { label: string; children: React.ReactNode }) {
   return (

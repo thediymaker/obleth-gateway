@@ -10,8 +10,10 @@ import type { ModelRoute } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
 import type { PlaygroundSession } from "./playground";
 import { MeshViewer } from "./mesh-viewer";
-import { ModelAvatar, RunError, SectionLabel, Segmented, SettingsPanel } from "./ui";
+import { ModelAvatar, RunError, SettingsPanel } from "./ui";
 import { money } from "@/lib/format";
+import { SectionLabel } from "@/components/ui/section-label";
+import { Segmented } from "@/components/ui/segmented";
 
 export const MESH_QUALITIES = [
   { value: "512", label: "Fast", hint: "512 voxels: about a third of the time, softer detail" },
@@ -350,19 +352,19 @@ export function MeshWorkspace({
 
           <section className="space-y-2.5">
             <SectionLabel>Quality</SectionLabel>
-            <Segmented label="Quality" value={quality} onChange={(v) => update({ meshResolution: v as Quality })} options={MESH_QUALITIES.map((q) => ({ value: q.value, label: q.label }))} />
+            <Segmented stretch label="Quality" value={quality} onChange={(v) => update({ meshResolution: v as Quality })} options={MESH_QUALITIES.map((q) => ({ value: q.value, label: q.label }))} />
             <p className="text-[11.5px] leading-snug text-muted-foreground">{MESH_QUALITIES.find((q) => q.value === quality)?.hint}</p>
           </section>
 
           <section className="space-y-2.5">
             <SectionLabel>Detail</SectionLabel>
-            <Segmented label="Faces" value={String(faces)} onChange={(v) => update({ meshFaces: Number(v) })} options={FACES.map((n) => ({ value: String(n), label: fmtFaces(n) }))} />
+            <Segmented stretch label="Faces" value={String(faces)} onChange={(v) => update({ meshFaces: Number(v) })} options={FACES.map((n) => ({ value: String(n), label: fmtFaces(n) }))} />
             <p className="text-[11.5px] leading-snug text-muted-foreground">Triangles in the exported model. Fewer load faster in game engines; more keep fine detail.</p>
           </section>
 
           <section className="space-y-2.5">
             <SectionLabel>Texture</SectionLabel>
-            <Segmented label="Texture size" value={String(texture)} onChange={(v) => update({ meshTexture: Number(v) })} options={TEXTURES.map((n) => ({ value: String(n), label: `${n / 1024}K` }))} />
+            <Segmented stretch label="Texture size" value={String(texture)} onChange={(v) => update({ meshTexture: Number(v) })} options={TEXTURES.map((n) => ({ value: String(n), label: `${n / 1024}K` }))} />
           </section>
 
           <section className="space-y-1.5 border-t border-border pt-4">

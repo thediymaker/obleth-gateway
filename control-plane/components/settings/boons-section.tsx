@@ -3,13 +3,16 @@
 import { useState, type ReactNode } from "react";
 import Link from "next/link";
 import { Plus, X } from "lucide-react";
-import { SettingsCard } from "@/components/access/ui";
-import { SelectField, Setting, Switch, TextArea, TextField } from "@/components/models/fields";
-import { Pill } from "@/components/overview/ui";
+import { SelectField, Setting, TextArea, TextField } from "@/components/models/fields";
 import type { BoonSettingsView, CompressorStatusView, KnowledgeSettingsView, ModelRoute, SpeculationCategoryGate } from "@/lib/obleth";
 import { BOONS, boonSummary, modelsAsking, SPEC_PROFILES, specProfileOf, specValues, type BoonKey, type SpecValues } from "@/lib/settings-model";
 import { cn } from "@/lib/utils";
 import { StatusDot } from "@/components/ui/status";
+import { Pill } from "@/components/ui/pill";
+import { SettingsCard } from "@/components/ui/settings-card";
+import { Switch } from "@/components/ui/switch";
+import { ProfileCards } from "@/components/ui/profile-cards";
+import { SectionLabel } from "@/components/ui/section-label";
 
 function NumberField({ name, label, value, unit, className = "w-24" }: { name: string; label: string; value: number; unit?: string; className?: string }) {
   return (
@@ -77,7 +80,7 @@ function GatesEditor({ gates, onChange }: { gates: SpeculationCategoryGate[]; on
   const num = (v: string) => (v.trim() === "" ? undefined : Number(v));
   return (
     <div className="flex flex-col">
-      <div className="grid grid-cols-[minmax(0,1fr)_100px_90px_90px_28px] gap-2 pb-1 text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground"><span>Category</span><span>Try a draft</span><span>Agreement</span><span>Confidence</span><span /></div>
+      <SectionLabel className="grid grid-cols-[minmax(0,1fr)_100px_90px_90px_28px] gap-2 pb-1"><span>Category</span><span>Try a draft</span><span>Agreement</span><span>Confidence</span><span /></SectionLabel>
       {gates.map((g, i) => (
         <div key={i} className="grid grid-cols-[minmax(0,1fr)_100px_90px_90px_28px] items-center gap-2 border-t border-border py-1.5">
           <input value={g.tag} onChange={(e) => patch(i, { tag: e.target.value })} aria-label="Category" className="h-8 rounded-md border border-input bg-background px-2 font-mono text-[12px]" />
@@ -133,7 +136,7 @@ export function BoonsSection({ settings: b, models, knowledge, compressor }: { s
 
   return (
     <SettingsCard id="boons" title="Boons" description="Abilities the gateway adds to a model. A model opts in on its own page; the switch here turns the ability on for every model that asks." action={<Pill>{count} of {BOONS.length} on</Pill>}>
-      <div className="grid grid-cols-[44px_minmax(0,1.1fr)_minmax(0,1.5fr)_minmax(0,1fr)_84px] gap-3.5 px-[18px] py-2 text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground"><span /><span>Boon</span><span>What it&apos;s set to</span><span>Models asking</span><span /></div>
+      <SectionLabel className="grid grid-cols-[44px_minmax(0,1.1fr)_minmax(0,1.5fr)_minmax(0,1fr)_84px] gap-3.5 px-[18px] py-2"><span /><span>Boon</span><span>What it&apos;s set to</span><span>Models asking</span><span /></SectionLabel>
 
       {row("vision", <>
         <Setting label="Describer" hint="A vision model that describes each image in words." fields={["boons.vision_fallback_model"]} was={{ field: "boons.vision_fallback_model" }}>
@@ -203,18 +206,7 @@ export function BoonsSection({ settings: b, models, knowledge, compressor }: { s
       {row("speculation", <>
         <input type="hidden" name="boons.speculation_gates" value={JSON.stringify(spec.gates)} />
         <Setting label="Profile" hint="How eagerly it drafts." fields={["boons.speculation_gates", "boons.speculation_unlisted", "boons.speculation_agree_min", "boons.speculation_lp_min"]}>
-          <div className="grid gap-2 lg:grid-cols-3">
-            {SPEC_PROFILES.map((p) => (
-              <button key={p.key} type="button" aria-pressed={profile === p.key} onClick={() => setSpec(p.values)} className={cn("flex flex-col gap-0.5 rounded-lg border px-3 py-2 text-left", profile === p.key ? "border-foreground bg-secondary" : "border-border hover:border-muted-foreground/60")}>
-                <span className="text-[12.5px] font-medium">{p.label}</span>
-                <span className="text-[11.5px] leading-snug text-muted-foreground">{p.blurb}</span>
-              </button>
-            ))}
-            <div className={cn("flex flex-col gap-0.5 rounded-lg border px-3 py-2", profile === "custom" ? "border-foreground bg-secondary" : "border-border")}>
-              <span className="text-[12.5px] font-medium">Custom</span>
-              <span className="text-[11.5px] leading-snug text-muted-foreground">Your own rules below.</span>
-            </div>
-          </div>
+          <ProfileCards profiles={SPEC_PROFILES} value={profile} onPick={(key) => setSpec(SPEC_PROFILES.find((p) => p.key === key)!.values)} custom={{ blurb: "Your own rules below." }} />
         </Setting>
         <Setting label="Drafter · classifier" hint="The fast model that drafts, and the one that sorts questions into categories." fields={["boons.speculation_draft_model", "boons.speculation_classify_model"]}>
           <div className="flex flex-wrap gap-2">

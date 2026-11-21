@@ -6,9 +6,7 @@ import { useRouter } from "next/navigation";
 import { ChevronDown, Upload } from "lucide-react";
 import { applyModelManifestAction, createModelAction, listUpstreamModelsAction } from "@/app/actions";
 import { ManifestPreview, ManifestResultBanner } from "@/components/model-import-review";
-import { Field, fromPerMillion, MODEL_TYPE_OPTIONS, SelectField, Switch, TextArea, UPSTREAM_HEADERS_HINT } from "@/components/models/fields";
-import { Notice, Sheet } from "@/components/models/ui";
-import { Segmented } from "@/components/overview/ui";
+import { Field, fromPerMillion, MODEL_TYPE_OPTIONS, SelectField, TextArea, UPSTREAM_HEADERS_HINT } from "@/components/models/fields";
 import { ProviderImportWizard } from "@/components/provider-import-wizard";
 import { HelpTip } from "@/components/fairshare/help";
 import { Button } from "@/components/ui/button";
@@ -17,6 +15,10 @@ import { normalizeModelApiNameDraft, normalizeModelApiNameFinal } from "@/lib/mo
 import type { ModelImportReport, ModelRoute } from "@/lib/obleth";
 import type { UpstreamModel } from "@/lib/provider-import";
 import { cn } from "@/lib/utils";
+import { Segmented } from "@/components/ui/segmented";
+import { Notice } from "@/components/ui/notice";
+import { Sheet } from "@/components/ui/sheet";
+import { Switch } from "@/components/ui/switch";
 
 export type AddMode = "connect" | "provider" | "file";
 

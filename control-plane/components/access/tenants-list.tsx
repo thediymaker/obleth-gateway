@@ -3,12 +3,10 @@
 import { memo, useCallback, useDeferredValue, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { Plus, Search } from "lucide-react";
+import { Plus } from "lucide-react";
 import { BudgetBar, TENANT_STATUS_LABEL, tenantGlyph } from "@/components/access/ui";
 import { AddTenantSheet } from "@/components/access/add-tenant";
 import { useFairshareLive } from "@/components/fairshare/hooks";
-import { Tile } from "@/components/models/ui";
-import { Segmented } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
 import { ListFooter, useRowLimit } from "@/components/ui/list-footer";
 import { Select } from "@/components/ui/select";
@@ -32,6 +30,9 @@ import type { BudgetUsage, Tenant, UsageAgg } from "@/lib/obleth";
 import { compact, money } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { StatusDot } from "@/components/ui/status";
+import { Segmented } from "@/components/ui/segmented";
+import { Tile } from "@/components/ui/tile";
+import { SearchBox } from "@/components/ui/search-box";
 
 const HAS_OPTIONS: { value: TenantHas; label: string }[] = [
   { value: "any", label: "Has anything" },
@@ -189,10 +190,7 @@ export function TenantsList({
       </div>
 
       <div className="flex flex-wrap items-center gap-2">
-        <label className="flex h-9 min-w-[240px] max-w-[420px] flex-1 items-center gap-2 rounded-lg border border-border bg-background px-3 text-[13px] focus-within:border-muted-foreground">
-          <Search className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
-          <input value={query} onChange={(e) => setQuery(e.target.value)} aria-label="Search tenants" placeholder="Search name, organization or contact" className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted-foreground" />
-        </label>
+        <SearchBox value={query} onChange={setQuery} label="Search tenants" placeholder="Search name, organization or contact" className="max-w-[420px]" />
         <Segmented
           label="Status"
           value={status}

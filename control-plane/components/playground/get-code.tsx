@@ -8,7 +8,8 @@ import type { Conversation } from "@/lib/charo/conversation";
 import type { PlaygroundSession } from "./playground";
 import { DEFAULT_MAX_RESULTS, domainList } from "./search-workspace";
 import { buildQuestions, parseState } from "./verdicts-workspace";
-import { Segmented, modelLabel } from "./ui";
+import { modelLabel } from "./ui";
+import { Segmented } from "@/components/ui/segmented";
 
 type Lang = "curl" | "python" | "javascript";
 

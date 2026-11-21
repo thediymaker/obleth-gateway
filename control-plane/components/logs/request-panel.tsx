@@ -14,6 +14,8 @@ import type { SpanEntry, UsageLogEntry } from "@/lib/obleth";
 import { parseAttrs, parseRouteExplain, spanHint, spanLabel, timeline, type SpanNode } from "@/lib/trace-model";
 import { cn, getJson } from "@/lib/utils";
 import { clockSeconds, dateLabel, formatMs, formatNumber, money } from "@/lib/format";
+import { SectionLabel } from "@/components/ui/section-label";
+import { Sheet } from "@/components/ui/sheet";
 
 function title(row: UsageLogEntry): string {
   if (isFailure(row)) return classLabel(row.error_class) || HTTP_REASONS[row.status_code] || `Failed with HTTP ${row.status_code}`;
@@ -70,10 +72,10 @@ export function StepDetail({ node, onClose }: { node: SpanNode; onClose: () => v
       )}
       {rounds.length > 0 && (
         <div className="mt-3 space-y-1.5">
-          <p className="flex items-center gap-3 text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">
+          <SectionLabel className="flex items-center gap-3">
             Rounds
             <span className="flex items-center gap-1.5 font-normal normal-case tracking-normal"><span className="inline-block h-2 w-3 rounded-sm bg-foreground/80" />tools<span className="ml-1 inline-block h-2 w-3 rounded-sm bg-muted-foreground/60" />model</span>
-          </p>
+          </SectionLabel>
           {rounds.map((c) => {
             const a = parseAttrs(c.span.attributes);
             const raw = Object.fromEntries(a);
@@ -133,13 +135,12 @@ export function RequestPanel({
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.target instanceof Element && e.target.closest("input, textarea, [contenteditable=true]")) return;
-      if (e.key === "Escape") onClose();
       if (e.key === "ArrowUp" || e.key === "k") { e.preventDefault(); onStep(-1); }
       if (e.key === "ArrowDown" || e.key === "j") { e.preventDefault(); onStep(1); }
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [onClose, onStep]);
+  }, [onStep]);
 
   const failed = isFailure(row);
   // A failure's kind, in plain words; unknown to a gateway that predates classes.
@@ -153,42 +154,49 @@ export function RequestPanel({
   };
 
   return (
-    <aside role="dialog" aria-label={`Request ${row.request_id.slice(0, 8)}`} className="fixed inset-y-0 right-0 z-50 flex w-[min(700px,100vw)] flex-col border-l border-border bg-card shadow-2xl">
-      <div className="flex flex-col gap-2.5 border-b border-border px-6 pb-4 pt-5">
-        <div className="flex items-start justify-between gap-3">
-          <div className="flex min-w-0 flex-col gap-1.5">
-            <div className="flex items-center gap-2">
-              <span className={cn("inline-flex h-[22px] items-center rounded-full border px-2 font-mono text-[11.5px] font-semibold", failed ? "border-foreground bg-foreground text-background" : "border-border text-secondary-foreground")}>{row.status_code}</span>
-              <h2 className="truncate text-lg font-semibold">{title(row)}</h2>
+    <Sheet
+      open
+      modal={false}
+      onClose={onClose}
+      title={`Request ${row.request_id.slice(0, 8)}`}
+      width="w-[min(700px,100vw)]"
+      header={
+        <div className="flex flex-col gap-2.5 border-b border-border px-6 pb-4 pt-5">
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex min-w-0 flex-col gap-1.5">
+              <div className="flex items-center gap-2">
+                <span className={cn("inline-flex h-[22px] items-center rounded-full border px-2 font-mono text-[11.5px] font-semibold", failed ? "border-foreground bg-foreground text-background" : "border-border text-secondary-foreground")}>{row.status_code}</span>
+                <h2 className="truncate text-lg font-semibold">{title(row)}</h2>
+              </div>
+              <p className="truncate text-[12.5px] text-muted-foreground">
+                {`${dateLabel(row.ts_ms)}, ${clockSeconds(row.ts_ms)}`} · <span className="font-mono">{row.model}</span> · {row.tenant_name || row.tenant_id.slice(0, 8)}
+                {row.key_name && <> · {row.key_name} <span className="font-mono">{row.key_prefix}</span></>}
+              </p>
             </div>
-            <p className="truncate text-[12.5px] text-muted-foreground">
-              {`${dateLabel(row.ts_ms)}, ${clockSeconds(row.ts_ms)}`} · <span className="font-mono">{row.model}</span> · {row.tenant_name || row.tenant_id.slice(0, 8)}
-              {row.key_name && <> · {row.key_name} <span className="font-mono">{row.key_prefix}</span></>}
-            </p>
+            <div className="flex shrink-0 gap-1">
+              <Button type="button" variant="outline" size="icon" className="h-8 w-8" disabled={!canStep.newer} onClick={() => onStep(-1)} aria-label="Newer request"><ChevronUp className="h-4 w-4" /></Button>
+              <Button type="button" variant="outline" size="icon" className="h-8 w-8" disabled={!canStep.older} onClick={() => onStep(1)} aria-label="Older request"><ChevronDown className="h-4 w-4" /></Button>
+              <Button type="button" variant="outline" size="icon" className="h-8 w-8" onClick={onClose} aria-label="Close"><X className="h-4 w-4" /></Button>
+            </div>
           </div>
-          <div className="flex shrink-0 gap-1">
-            <Button type="button" variant="outline" size="icon" className="h-8 w-8" disabled={!canStep.newer} onClick={() => onStep(-1)} aria-label="Newer request"><ChevronUp className="h-4 w-4" /></Button>
-            <Button type="button" variant="outline" size="icon" className="h-8 w-8" disabled={!canStep.older} onClick={() => onStep(1)} aria-label="Older request"><ChevronDown className="h-4 w-4" /></Button>
-            <Button type="button" variant="outline" size="icon" className="h-8 w-8" onClick={onClose} aria-label="Close"><X className="h-4 w-4" /></Button>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button type="button" variant="outline" size="sm" onClick={copy}>
+              <Copy className="h-3.5 w-3.5" />
+              {copied ? "Copied" : <>Copy ID <span className="font-mono text-muted-foreground">{row.request_id.slice(0, 8)}…</span></>}
+            </Button>
+            {row.session_id && <Button type="button" variant="outline" size="sm" onClick={() => onFilter({ sessionId: row.session_id })}>This session</Button>}
+            {row.key_id && <Button type="button" variant="outline" size="sm" onClick={() => onFilter({ keyId: row.key_id, tenantId: row.tenant_id })}>More from this key</Button>}
+            {failed && row.error_class && (
+              <Button type="button" variant="outline" size="sm" onClick={() => onFilter({ errorClass: row.error_class, statusCode: String(row.status_code), model: row.model, keyId: row.key_id, tenantId: row.tenant_id, status: "" })}>Failures like this</Button>
+            )}
+            <Button asChild variant="outline" size="sm"><Link href={modelHref(row.model)}>Open {row.model}</Link></Button>
           </div>
         </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <Button type="button" variant="outline" size="sm" onClick={copy}>
-            <Copy className="h-3.5 w-3.5" />
-            {copied ? "Copied" : <>Copy ID <span className="font-mono text-muted-foreground">{row.request_id.slice(0, 8)}…</span></>}
-          </Button>
-          {row.session_id && <Button type="button" variant="outline" size="sm" onClick={() => onFilter({ sessionId: row.session_id })}>This session</Button>}
-          {row.key_id && <Button type="button" variant="outline" size="sm" onClick={() => onFilter({ keyId: row.key_id, tenantId: row.tenant_id })}>More from this key</Button>}
-          {failed && row.error_class && (
-            <Button type="button" variant="outline" size="sm" onClick={() => onFilter({ errorClass: row.error_class, statusCode: String(row.status_code), model: row.model, keyId: row.key_id, tenantId: row.tenant_id, status: "" })}>Failures like this</Button>
-          )}
-          <Button asChild variant="outline" size="sm"><Link href={modelHref(row.model)}>Open {row.model}</Link></Button>
-        </div>
-      </div>
-
-      <div className="min-h-0 flex-1 space-y-5 overflow-y-auto px-6 py-5">
+      }
+    >
+      <div className="space-y-5 px-6 py-5">
         <section aria-label="What happened" className="space-y-1.5">
-          <p className="text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">What happened</p>
+          <SectionLabel>What happened</SectionLabel>
           {row.has_trace && isLoading ? (
             <div className="skeleton h-10 rounded-lg" />
           ) : (
@@ -198,7 +206,7 @@ export function RequestPanel({
 
         {failed && row.error_class !== undefined && (
           <section aria-label="Why it failed" className="space-y-1.5">
-            <p className="text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">Why it failed</p>
+            <SectionLabel>Why it failed</SectionLabel>
             <p className="text-[13px]">
               <span className="font-semibold">{classLabel(row.error_class) || `HTTP ${row.status_code}`}</span>
               {kind && <span className="text-secondary-foreground">, on the {kind.side === "platform" ? "platform's" : "caller's"} side. </span>}
@@ -210,7 +218,7 @@ export function RequestPanel({
 
         <section aria-label="Timeline" className="space-y-2">
           <div className="flex items-baseline justify-between">
-            <p className="text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">Timeline</p>
+            <SectionLabel>Timeline</SectionLabel>
             <p className="text-[11.5px] text-muted-foreground">one scale · {formatMs(tl?.totalMs ?? row.total_ms)} in all{traced ? " · click a step for its details" : row.has_trace ? "" : " · not traced"}</p>
           </div>
           {tl ? (
@@ -259,7 +267,7 @@ export function RequestPanel({
         {helpers && helpers.length > 0 && (
           <section aria-label="Helper calls" className="space-y-1.5">
             <div className="flex items-baseline justify-between gap-3">
-              <p className="text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">Helper calls</p>
+              <SectionLabel>Helper calls</SectionLabel>
               <p className="text-[11.5px] text-muted-foreground">Calls the gateway made to other models while serving this request</p>
             </div>
             <ul className="space-y-0.5">
@@ -315,6 +323,6 @@ export function RequestPanel({
           <Fact label="Request ID" mono><span title={row.request_id}>{row.request_id}</span></Fact>
         </dl>
       </div>
-    </aside>
+    </Sheet>
   );
 }

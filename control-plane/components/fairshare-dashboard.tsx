@@ -26,7 +26,7 @@ import {
 } from "@/lib/fairshare-model";
 import type { FairshareLiveView } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
-import { HealthGlyph, Meter, Panel, PanelLink, Pill, SectionLabel } from "@/components/overview/ui";
+import { HealthGlyph, Meter, Panel, PanelLink } from "@/components/overview/ui";
 import { HelpTip } from "@/components/fairshare/help";
 import { RunningHistory } from "@/components/fairshare/history";
 import { TenantPanel } from "@/components/fairshare/tenant-panel";
@@ -46,6 +46,8 @@ export {
 } from "@/lib/fairshare-model";
 import { modelHref } from "@/lib/model-links";
 import { formatNumber } from "@/lib/format";
+import { Pill } from "@/components/ui/pill";
+import { SectionLabel } from "@/components/ui/section-label";
 export type { FairshareLiveView, GroupFairshareView, KeyFairshareView, ModelPoolView, TenantFairshareView } from "@/lib/obleth";
 
 const FIRST_POOLS = 8;
@@ -514,4 +516,3 @@ function WhyTip({ row, rows }: { row: PoolTenantRow; rows: PoolTenantRow[] }) {
     </HelpTip>
   );
 }
-

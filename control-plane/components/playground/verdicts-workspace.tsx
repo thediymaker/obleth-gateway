@@ -8,9 +8,9 @@ import { Select } from "@/components/ui/select";
 import type { ModelRoute } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
 import type { PlaygroundSession } from "./playground";
-import { Segmented } from "./ui";
 import { useStoppable } from "./use-stoppable";
 import { formatNumber } from "@/lib/format";
+import { Segmented } from "@/components/ui/segmented";
 
 type QuestionDraft = NonNullable<PlaygroundSession["verdictQuestions"]>[number];
 
@@ -166,7 +166,7 @@ function QuestionEditor({ draft, onChange, onRemove }: {
   return (
     <div className="space-y-2.5 rounded-xl border border-border bg-card/60 p-3">
       <div className="flex flex-wrap items-center gap-2">
-        <Segmented
+        <Segmented stretch
           label="Question type"
           value={draft.type}
           onChange={(type) => onChange({ ...draft, type })}

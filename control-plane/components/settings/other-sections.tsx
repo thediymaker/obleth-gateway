@@ -2,11 +2,8 @@
 
 import { useState, useTransition } from "react";
 import { compactUsageAction, resyncCacheAction, testEnergyQueryAction } from "@/app/actions";
-import { SettingsCard } from "@/components/access/ui";
 import { BackupRestore } from "@/components/backup-restore";
-import { SelectField, Setting, Switch, TextField } from "@/components/models/fields";
-import { Notice } from "@/components/models/ui";
-import { Pill } from "@/components/overview/ui";
+import { SelectField, Setting, TextField } from "@/components/models/fields";
 import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import type { CharoSettingsView, CompressorStatusView, EnergySettingsView, KeyPrefixView, ModelRoute, SlurmSettingsView, UsageRetentionView } from "@/lib/obleth";
@@ -15,6 +12,10 @@ import { describeEnergyTest, describeResync } from "@/lib/settings-model";
 import { cn } from "@/lib/utils";
 import { StatusPill } from "@/components/ui/status";
 import { dateLabel } from "@/lib/format";
+import { Pill } from "@/components/ui/pill";
+import { Notice } from "@/components/ui/notice";
+import { SettingsCard } from "@/components/ui/settings-card";
+import { Switch } from "@/components/ui/switch";
 
 /** Reads power from Prometheus to put watts, cost and CO₂ on Reports and the Overview. */
 export function EnergySection({ settings }: { settings: EnergySettingsView }) {

@@ -5,13 +5,10 @@ import Link from "next/link";
 import { useQuery } from "@tanstack/react-query";
 import { deleteKeyAction, replaceKeyAction, saveKeySettingsAction, setKeysDisabledAction } from "@/app/actions";
 import { PERIOD_OPTIONS } from "@/lib/access-model";
-import { SettingsForm } from "@/components/access/settings-form";
 import { BudgetBar } from "@/components/access/ui";
-import { SelectField, Setting, Switch, TextField } from "@/components/models/fields";
+import { SelectField, Setting, TextField } from "@/components/models/fields";
 import { AllowedCountriesField } from "@/components/access/allowed-countries-field";
 import { AllowedNetworksField } from "@/components/access/allowed-networks-field";
-import { Sheet } from "@/components/models/ui";
-import { Pill } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { describeIdentityKey } from "@/lib/key-kind";
@@ -22,6 +19,11 @@ import type { ApiKey, NamedNetwork, Tenant, UsageDailyRow } from "@/lib/obleth";
 import { compact, dateLabel, money } from "@/lib/format";
 import { cn, getJson } from "@/lib/utils";
 import { StatusDot } from "@/components/ui/status";
+import { Pill } from "@/components/ui/pill";
+import { Sheet } from "@/components/ui/sheet";
+import { SettingsForm } from "@/components/ui/settings-form";
+import { Switch } from "@/components/ui/switch";
+import { SectionLabel } from "@/components/ui/section-label";
 
 const DAY_MS = 86_400_000;
 
@@ -76,7 +78,7 @@ function Use({ row }: { row: KeyRow }) {
   return (
     <section aria-label="Use" className="flex flex-col gap-2.5">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <span className="text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">Use · 30 days</span>
+        <SectionLabel>Use · 30 days</SectionLabel>
         <span className="text-xs text-muted-foreground">
           {row.lastUsedMs ? `last used ${lastUsed(row.lastUsedMs)}${u?.last_model ? ` on ${u.last_model}` : ""}${u?.last_status_code ? ` · ${u.last_status_code}` : ""}` : "not used in 30 days"}
         </span>
@@ -215,7 +217,7 @@ export function KeyPanel({
           )}
 
           <section aria-label="Networks" className="flex flex-col gap-2">
-            <span className="text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">Networks</span>
+            <SectionLabel>Networks</SectionLabel>
             {k.allowed_networks?.length || k.allowed_countries?.length ? (
               <div className="flex flex-col gap-1.5">
                 <span className="text-[12.5px] text-secondary-foreground">
@@ -236,7 +238,7 @@ export function KeyPanel({
           <Use row={row} />
 
           <section aria-label="Budget" className="flex flex-col gap-2">
-            <span className="text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">Budget</span>
+            <SectionLabel>Budget</SectionLabel>
             {row.budget ? (
               <div className="flex flex-col gap-2 rounded-lg border border-border px-3.5 py-3">
                 <div className="flex flex-wrap items-baseline justify-between gap-2 text-[13px]">
@@ -264,7 +266,7 @@ export function KeyPanel({
           bar="panel"
           ariaLabel={`${k.name} settings`}
         >
-          <p className="px-6 pb-1 text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">Settings</p>
+          <SectionLabel className="px-6 pb-1">Settings</SectionLabel>
           <input type="hidden" name="budget_started_at" value={k.budget_started_at ?? ""} />
           <Setting label="Name" fields={["name"]} was={{ field: "name" }} className="px-6">
             <TextField name="name" label="Name" required defaultValue={k.name} />

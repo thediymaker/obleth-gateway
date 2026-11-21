@@ -3,13 +3,14 @@
 import { memo, useState, useTransition } from "react";
 import Link from "next/link";
 import { setModelStatusAction } from "@/app/actions";
-import { SelectField, Setting, Switch, TextArea } from "@/components/models/fields";
+import { SelectField, Setting, TextArea } from "@/components/models/fields";
 import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { logsHref } from "@/lib/log-links";
 import { dateInputValue, lifecycleDate, lifecycleStatus, retireAtFromInput, retiredMessage } from "@/lib/models-model";
 import type { LifecycleStatus, ModelRoute, UsageLogFacet } from "@/lib/obleth";
 import { formatNumber } from "@/lib/format";
+import { Switch } from "@/components/ui/switch";
 
 /** A model the replacement picker may offer. */
 export interface LifecycleCandidate {

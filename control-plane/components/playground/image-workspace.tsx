@@ -10,9 +10,12 @@ import { uuid } from "@/lib/uuid";
 import type { ModelRoute } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
 import type { PlaygroundSession } from "./playground";
-import { ModelAvatar, Pill, RunError, SectionLabel, Segmented, SettingsPanel } from "./ui";
+import { ModelAvatar, RunError, SettingsPanel } from "./ui";
 import { useStoppable } from "./use-stoppable";
 import { money } from "@/lib/format";
+import { Pill } from "@/components/ui/pill";
+import { SectionLabel } from "@/components/ui/section-label";
+import { Segmented } from "@/components/ui/segmented";
 
 // Sizes offered in the picker. Deliberately a superset of the boon's default
 // allowed list: the playground drives the image model directly, so it is not
@@ -370,7 +373,7 @@ export function ImageWorkspace({
 
           <section className="space-y-2.5">
             <SectionLabel>Images per run</SectionLabel>
-            <Segmented label="Images per run" value={String(count)} onChange={(v) => update({ imageCount: Number(v) })} options={COUNTS.map((n) => ({ value: String(n), label: String(n) }))} />
+            <Segmented stretch label="Images per run" value={String(count)} onChange={(v) => update({ imageCount: Number(v) })} options={COUNTS.map((n) => ({ value: String(n), label: String(n) }))} />
           </section>
 
           <section className="space-y-3 border-t border-border pt-4">

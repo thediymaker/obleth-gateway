@@ -2,11 +2,12 @@
 
 import { useCallback, useState } from "react";
 import { saveRetrievalSettingsAction } from "@/app/actions";
-import { SettingsForm } from "@/components/access/settings-form";
-import { SettingsCard } from "@/components/access/ui";
-import { Setting, Switch, TextField } from "@/components/models/fields";
+import { Setting, TextField } from "@/components/models/fields";
 import type { KnowledgeSettingsView } from "@/lib/obleth";
-import { cn } from "@/lib/utils";
+import { SettingsCard } from "@/components/ui/settings-card";
+import { SettingsForm } from "@/components/ui/settings-form";
+import { Switch } from "@/components/ui/switch";
+import { ProfileCards } from "@/components/ui/profile-cards";
 
 const PROFILES = [
   { key: "standard", label: "Standard", blurb: "5 chunks, score 0.35 or more, up to 1,500 tokens, from the last 2 turns. Right for most collections.", values: { top_k: 5, min_score: 0.35, max_context_tokens: 1500, query_turns: 2 } },
@@ -52,20 +53,7 @@ export function RetrievalSettings({ settings, onSaved }: { settings: KnowledgeSe
           <Switch name="enabled" label="Retrieval on" defaultChecked={settings.enabled} />
         </Setting>
         <Setting id="set-profile" label="Profile" hint="Sets the four values below; change any of them after." fields={["top_k", "min_score", "max_context_tokens", "query_turns"]}>
-          <div className="grid gap-2 lg:grid-cols-3">
-            {PROFILES.map((p) => (
-              <button
-                key={p.key}
-                type="button"
-                aria-pressed={active === p.key}
-                onClick={() => setTuning(Object.fromEntries(Object.entries(p.values).map(([k, v]) => [k, String(v)])) as Tuning)}
-                className={cn("flex flex-col gap-0.5 rounded-lg border px-3 py-2 text-left", active === p.key ? "border-foreground bg-secondary" : "border-border hover:border-muted-foreground/60")}
-              >
-                <span className="text-[12.5px] font-medium">{p.label}</span>
-                <span className="text-[11.5px] leading-snug text-muted-foreground">{p.blurb}</span>
-              </button>
-            ))}
-          </div>
+          <ProfileCards profiles={PROFILES} value={active} onPick={(key) => setTuning(Object.fromEntries(Object.entries(PROFILES.find((p) => p.key === key)!.values).map(([k, v]) => [k, String(v)])) as Tuning)} />
           {active === "custom" && <span className="text-xs text-muted-foreground">Custom values.</span>}
         </Setting>
         <Setting id="set-top-k" label="Chunks per question" hint="The most chunks handed to the model." fields={["top_k"]} was={{ field: "top_k" }}>

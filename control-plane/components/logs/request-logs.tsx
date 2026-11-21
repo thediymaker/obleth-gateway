@@ -2,10 +2,9 @@
 
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
-import { Bookmark, Search, X } from "lucide-react";
+import { Bookmark, X } from "lucide-react";
 import { Facets } from "@/components/logs/facets";
 import { RequestPanel } from "@/components/logs/request-panel";
-import { Segmented } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Select } from "@/components/ui/select";
@@ -15,6 +14,8 @@ import type { UsageLogEntry, UsageLogFacets, UsageLogHistogram } from "@/lib/obl
 import { cn, getJson } from "@/lib/utils";
 import { readFailed, readProblem } from "@/components/ui/read-state";
 import { clock, compact, dateLabel, dateTime, formatMs, formatNumber, fullDateTime, money, whenLogged } from "@/lib/format";
+import { Segmented } from "@/components/ui/segmented";
+import { SearchBox } from "@/components/ui/search-box";
 
 const PAGE = 50;
 const LIVE_MS = 5_000;
@@ -180,21 +181,11 @@ export function RequestLogs({
   const [views, setViews] = useState<SavedView[]>([]);
   const [naming, setNaming] = useState<string | null>(null);
   const [now, setNow] = useState(() => Date.now());
-  const search = useRef<HTMLInputElement>(null);
 
   useEffect(() => setViews(loadViews()), []);
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 5_000);
     return () => clearInterval(t);
-  }, []);
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "/" || (e.target instanceof Element && e.target.closest("input, textarea, select, [contenteditable=true]"))) return;
-      e.preventDefault();
-      search.current?.focus();
-    };
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
   }, []);
 
   const patch = useCallback((p: Partial<LogFilters>) => {
@@ -374,19 +365,15 @@ export function RequestLogs({
 
       <div className="flex flex-col gap-2.5">
         <div className="flex flex-wrap items-center gap-2">
-          <label className="flex h-9 min-w-[18rem] flex-1 items-center gap-2 rounded-lg border border-border bg-background px-3 text-[13px] focus-within:border-muted-foreground">
-            <Search className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
-            <input
-              ref={search}
-              value={draft}
-              onChange={(e) => setDraft(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter") runSearch(); if (e.key === "Escape") setDraft(""); }}
-              placeholder="Request ID, a key or team name, or model:, team:, key:, status:, fault:, class:, type:, session: (* for any characters)"
-              aria-label="Search requests"
-              className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted-foreground"
-            />
-            <kbd className="rounded border border-border px-1.5 font-mono text-[11px] text-muted-foreground">/</kbd>
-          </label>
+          <SearchBox
+            slash
+            value={draft}
+            onChange={setDraft}
+            onKeyDown={(e) => { if (e.key === "Enter") runSearch(); }}
+            label="Search requests"
+            placeholder="Request ID, a key or team name, or model:, team:, key:, status:, fault:, class:, type:, session: (* for any characters)"
+            className="min-w-[18rem]"
+          />
           <Segmented<LogWindowId | "custom">
             label="Time window"
             value={filters.window}

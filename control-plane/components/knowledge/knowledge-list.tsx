@@ -7,13 +7,15 @@ import { Plus } from "lucide-react";
 import { setKnowledgeEnabledAction } from "@/app/actions";
 import { RetrievalSettings } from "@/components/knowledge/retrieval-settings";
 import { Field, SelectField } from "@/components/models/fields";
-import { Notice, Sheet, Tile } from "@/components/models/ui";
 import { Button } from "@/components/ui/button";
 import { compact, formatBytes } from "@/lib/format";
 import type { KnowledgeData } from "@/lib/knowledge-data";
 import { COLLECTION_STATUS_LABEL, collectionGlyph, collectionHref, collectionStatus, retrievalUse } from "@/lib/knowledge-format";
 import { cn } from "@/lib/utils";
 import { StatusPill, type StatusGlyph } from "@/components/ui/status";
+import { Notice } from "@/components/ui/notice";
+import { Sheet } from "@/components/ui/sheet";
+import { Tile } from "@/components/ui/tile";
 
 const COLS = "grid-cols-[minmax(0,1.5fr)_130px_70px_70px_minmax(0,1fr)_minmax(0,1fr)_120px_90px]";
 

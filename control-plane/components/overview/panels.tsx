@@ -9,7 +9,9 @@ import { describeAudit, RANGE_LABEL, type AttentionItem, type OverviewRange } fr
 import { ago, compact, fullDateTime, money } from "@/lib/format";
 import { logsHref } from "@/lib/log-links";
 import { cn } from "@/lib/utils";
-import { HealthGlyph, Meter, Panel, PanelLink, Pill, SectionLabel } from "./ui";
+import { HealthGlyph, Meter, Panel, PanelLink } from "./ui";
+import { Pill } from "@/components/ui/pill";
+import { SectionLabel } from "@/components/ui/section-label";
 
 const HIDE_KEY = "obleth-overview:hidden";
 const HIDE_MS = 3_600_000;

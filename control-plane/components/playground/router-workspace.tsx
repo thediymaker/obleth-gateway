@@ -10,7 +10,11 @@ import type { RouteExplainView, SimulateRouteRequest } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
 import { RouteDecision } from "./route-decision";
 import { ROUTER_PROMPT_MAX_LENGTH, type PendingAction, type PlaygroundSession } from "./playground";
-import { Pill, SectionLabel, Segmented, SettingsPanel, SliderField, Switch } from "./ui";
+import { SettingsPanel, SliderField } from "./ui";
+import { Pill } from "@/components/ui/pill";
+import { SectionLabel } from "@/components/ui/section-label";
+import { Segmented } from "@/components/ui/segmented";
+import { Switch } from "@/components/ui/switch";
 
 const DEBOUNCE_MS = 300;
 const EPSILON = 1e-6;
@@ -305,7 +309,7 @@ export function RouterWorkspace({ session, update, settingsOpen = true, onOpenSe
 
           <section className="space-y-3 border-t border-border pt-4">
             <SectionLabel>Request</SectionLabel>
-            <Segmented
+            <Segmented stretch
               label="Effort"
               value={effort || "default"}
               onChange={(v) => update({ routerEffort: v === "default" ? undefined : v })}

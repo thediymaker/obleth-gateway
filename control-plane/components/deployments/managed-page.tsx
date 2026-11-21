@@ -16,13 +16,9 @@ import {
   setDeploymentReplicasAction,
   saveRecipeFromDeploymentAction,
 } from "@/app/actions";
-import { SettingsForm } from "@/components/access/settings-form";
-import { SettingsCard } from "@/components/access/ui";
 import { ChangesList, PoolChart, PoolNowTile, useModelDay } from "@/components/deployments/detail-ui";
 import { StateMark } from "@/components/deployments/ui";
 import { Setting, TextArea, TextField } from "@/components/models/fields";
-import { Notice, Tile } from "@/components/models/ui";
-import { Pill } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -66,6 +62,12 @@ import { useClusterResources } from "@/lib/use-cluster-resources";
 import { useLatestCallback } from "@/lib/use-latest-callback";
 import { cn, getJson } from "@/lib/utils";
 import { AttentionPill, StatusPill } from "@/components/ui/status";
+import { Pill } from "@/components/ui/pill";
+import { Notice } from "@/components/ui/notice";
+import { Tile } from "@/components/ui/tile";
+import { SettingsCard } from "@/components/ui/settings-card";
+import { SettingsForm } from "@/components/ui/settings-form";
+import { SectionLabel } from "@/components/ui/section-label";
 
 type Card = "script" | "placement" | "service";
 
@@ -745,7 +747,7 @@ export function ManagedPage({ modelId, initial, changes }: { modelId: string; in
               <details className="rounded-xl border border-border bg-card px-[18px] py-3" open={stopped}>
                 <summary className="cursor-pointer text-[13px] font-medium">Jobs that ended · {lost.length}{endedSplit(lost)}</summary>
                 <div className="mt-2">
-                  <div className="grid grid-cols-[100px_110px_minmax(0,1fr)_80px_90px] gap-3 py-2 text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground"><span>Job</span><span>Node</span><span>Last from Slurm</span><span>Ran</span><span>Ended</span></div>
+                  <SectionLabel className="grid grid-cols-[100px_110px_minmax(0,1fr)_80px_90px] gap-3 py-2"><span>Job</span><span>Node</span><span>Last from Slurm</span><span>Ran</span><span>Ended</span></SectionLabel>
                   {lost.slice(0, 10).map((r) => (
                     <div key={r.id} className="grid grid-cols-[100px_110px_minmax(0,1fr)_80px_90px] gap-3 border-t border-border py-2 text-[12.5px]">
                       <span className="font-mono text-[12px]">{r.slurm_job_id || "—"}</span>

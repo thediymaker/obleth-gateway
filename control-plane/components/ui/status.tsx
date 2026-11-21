@@ -2,8 +2,8 @@
 
 import type { ReactNode } from "react";
 import { AlertCircle } from "lucide-react";
-import { Pill } from "@/components/overview/ui";
 import { cn } from "@/lib/utils";
+import { Pill } from "@/components/ui/pill";
 
 /**
  * The dashboard's one status vocabulary, so a mark means the same on every page:

@@ -1,9 +1,7 @@
 "use client";
 
-import { useEffect, useRef, useState, type ReactNode } from "react";
-import Link from "next/link";
-import { X } from "lucide-react";
-import { HealthGlyph, SectionLabel } from "@/components/overview/ui";
+import { useState } from "react";
+import { HealthGlyph } from "@/components/overview/ui";
 import { STATUS_LABELS, type ModelStatus } from "@/lib/models-model";
 import { providerForModel } from "@/lib/model-providers";
 import { cn } from "@/lib/utils";
@@ -40,85 +38,5 @@ export function ProviderMark({ name, upstream, size = 20, className }: { name: s
         <span className="text-[10px] font-semibold text-muted-foreground">{letter}</span>
       )}
     </span>
-  );
-}
-
-/** A number tile; a button when it filters the list. */
-export function Tile({ label, value, detail, emphasis, onClick, pressed, href }: {
-  label: string; value: ReactNode; detail?: ReactNode; emphasis?: boolean; onClick?: () => void; pressed?: boolean;
-  /** Where the number's requests are: the tile becomes a link. */
-  href?: string;
-}) {
-  const cls = cn(
-    "flex min-w-0 flex-col gap-1 rounded-xl border bg-card px-4 py-3 text-left transition-colors",
-    emphasis ? "border-muted-foreground" : "border-border",
-    (onClick || href) && "hover:border-muted-foreground/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-    pressed && "border-foreground",
-  );
-  const body = (
-    <>
-      <SectionLabel className={cn(emphasis && "text-secondary-foreground")}>{label}</SectionLabel>
-      <span className="text-[24px] font-semibold leading-tight tracking-tight tabular-nums">{value}</span>
-      <span className={cn("min-h-4 truncate text-xs", emphasis ? "text-foreground" : "text-muted-foreground")}>{detail ?? " "}</span>
-    </>
-  );
-  if (href) return <Link href={href} className={cls}>{body}</Link>;
-  return onClick ? <button type="button" onClick={onClick} aria-pressed={pressed} className={cls}>{body}</button> : <div className={cls}>{body}</div>;
-}
-
-/** A one-line result under the toolbar: what a bulk action or import did. */
-export function Notice({ children, onDismiss, strong }: { children: ReactNode; onDismiss?: () => void; strong?: boolean }) {
-  return (
-    <div role="status" className={cn("flex items-start justify-between gap-3 rounded-lg border px-3.5 py-2.5 text-[13px]", strong ? "border-foreground" : "border-border")}>
-      <div className="min-w-0">{children}</div>
-      {onDismiss && <button type="button" onClick={onDismiss} aria-label="Dismiss" className="shrink-0 text-muted-foreground hover:text-foreground"><X className="h-4 w-4" /></button>}
-    </div>
-  );
-}
-
-/**
- * A panel that slides over the right of the page. Escape and the backdrop
- * close it; focus moves into it on open and back where it was on close.
- */
-export function Sheet({ open, onClose, title, description, children, footer, width = "w-[min(680px,100vw)]" }: {
-  open: boolean; onClose: () => void; title: string; description?: ReactNode; children: ReactNode; footer?: ReactNode; width?: string;
-}) {
-  const panel = useRef<HTMLDivElement>(null);
-  // The latest onClose, read at the moment Escape is pressed. Keeping it out of
-  // the effect's dependencies matters: callers often pass a new function each
-  // render, and re-running the effect would pull focus back to the first field
-  // (and away from whatever someone is typing in) on every parent refresh.
-  const close = useRef(onClose);
-  useEffect(() => {
-    close.current = onClose;
-  });
-  useEffect(() => {
-    if (!open) return;
-    const previous = document.activeElement as HTMLElement | null;
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") close.current(); };
-    document.addEventListener("keydown", onKey);
-    const frame = requestAnimationFrame(() => panel.current?.querySelector<HTMLElement>("input:not([type=hidden]), button, textarea")?.focus());
-    return () => {
-      document.removeEventListener("keydown", onKey);
-      cancelAnimationFrame(frame);
-      previous?.focus?.();
-    };
-  }, [open]);
-  if (!open) return null;
-  return (
-    <div className="fixed inset-0 z-50">
-      <div className="absolute inset-0 bg-black/60" onClick={onClose} aria-hidden />
-      <div ref={panel} role="dialog" aria-modal="true" aria-label={title} className={cn("absolute inset-y-0 right-0 flex flex-col border-l border-border bg-card shadow-2xl", width)}>
-        <div className="flex items-start justify-between gap-4 px-6 pb-4 pt-5">
-          <div className="min-w-0">
-            <h2 className="text-lg font-semibold">{title}</h2>
-            {description && <p className="mt-0.5 text-[12.5px] text-muted-foreground">{description}</p>}
-          </div>
-          <button type="button" onClick={onClose} aria-label="Close" className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground hover:bg-secondary hover:text-foreground"><X className="h-4 w-4" /></button>
-        </div>
-        <div className="min-h-0 flex-1 overflow-y-auto">{children}</div>
-        {footer && <div className="border-t border-border bg-background/40 px-6 py-3.5">{footer}</div>}
-      </div>
-    </div>
   );
 }

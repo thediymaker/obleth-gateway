@@ -7,6 +7,7 @@ import { cn } from "@/lib/utils";
 import type { PlaygroundSession } from "./playground";
 import { modeInfo, modelLabel } from "./ui";
 import { ago } from "@/lib/format";
+import { SectionLabel } from "@/components/ui/section-label";
 
 const DAY = 86_400_000;
 
@@ -85,7 +86,7 @@ export function SessionsRail({ sessions, active, onSelect, onCreate, onRemove, o
         {groups.length === 0 && <p className="px-2 py-3 text-xs text-muted-foreground">No sessions match “{query}”.</p>}
         {groups.map(([group, items]) => (
           <div key={group} className="mb-2">
-            <div className="px-2 pb-1.5 pt-2 text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">{group}</div>
+            <SectionLabel className="px-2 pb-1.5 pt-2">{group}</SectionLabel>
             <div className="space-y-0.5">
               {items.map((s) => {
                 const Icon = modeInfo(s.mode).icon;

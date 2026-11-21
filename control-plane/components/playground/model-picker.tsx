@@ -7,10 +7,12 @@ import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/compone
 import { lifecycleStatus } from "@/lib/models-model";
 import type { FairshareLiveView, ModelRoute } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
-import { ModelAvatar, Pill, SectionLabel, capabilities, modelLabel } from "./ui";
+import { ModelAvatar, capabilities, modelLabel } from "./ui";
 import { compact, money, perMillion } from "@/lib/format";
 import { fairshareLiveQuery } from "@/lib/live-queries";
 import { useQuery } from "@tanstack/react-query";
+import { Pill } from "@/components/ui/pill";
+import { SectionLabel } from "@/components/ui/section-label";
 
 export const MAX_LANES = 4;
 
