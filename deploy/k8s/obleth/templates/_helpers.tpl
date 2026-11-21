@@ -33,6 +33,30 @@ its own Secret instead.
 {{- end -}}
 
 {{/*
+Restart checksums that see only what a workload reads, so a change to one
+Secret key rolls only the pods that use it. With an existing Secret the chart
+cannot see the values, so the checksum follows the Secret's name: rotating a
+value in place still needs a manual restart of the pods that read it.
+*/}}
+{{- define "obleth.adminTokenChecksum" -}}
+{{- if .Values.obleth.existingSecret -}}
+{{ printf "existingSecret:%s" .Values.obleth.existingSecret | sha256sum }}
+{{- else -}}
+{{ .Values.obleth.adminToken | default "" | sha256sum }}
+{{- end -}}
+{{- end -}}
+
+{{- /* Takes (list $ password) for a bundled datastore's password. */ -}}
+{{- define "obleth.datastorePasswordChecksum" -}}
+{{- $root := index . 0 -}}
+{{- if $root.Values.obleth.existingSecret -}}
+{{ printf "existingSecret:%s" $root.Values.obleth.existingSecret | sha256sum }}
+{{- else -}}
+{{ index . 1 | default "" | sha256sum }}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Pod anti-affinity for the obleth data plane, driven by .Values.affinity.antiAffinity
 ("soft" preferred | "hard" required | "" disabled). Emits the full `affinity:` key
 so callers can `{{ include "obleth.antiAffinity" . | nindent 6 }}` under a pod spec.

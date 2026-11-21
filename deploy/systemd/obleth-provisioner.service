@@ -17,6 +17,10 @@ EnvironmentFile=-/etc/obleth/provisioner.env
 ExecStart=/usr/local/bin/obleth-provisioner
 Restart=on-failure
 RestartSec=5
+# On SIGTERM the provisioner finishes the tick in progress so a submitted job is
+# always recorded; a tick can run long (slurmrestd calls, node probes, submits).
+# Same budget as the chart and Compose.
+TimeoutStopSec=120
 
 [Install]
 WantedBy=multi-user.target

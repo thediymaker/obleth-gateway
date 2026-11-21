@@ -30,12 +30,14 @@ spec:
   template:
     metadata:
       labels: { app: {{ .Release.Name }}-control-plane }
-      {{- if not .Values.controlPlane.existingSecret }}
       annotations:
+        {{- if not .Values.controlPlane.existingSecret }}
         # The dashboard's Secret is rendered from controlPlane values, so a
         # change to any of them rolls the pods (they read it only at start).
         checksum/secret: {{ .Values.controlPlane | toJson | sha256sum }}
-      {{- end }}
+        {{- end }}
+        # OBLETH_ADMIN_TOKEN comes from the gateway's Secret, read at start.
+        checksum/admin-token: {{ include "obleth.adminTokenChecksum" . }}
     spec:
       securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:

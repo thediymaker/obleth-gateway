@@ -152,11 +152,9 @@ obleth:
   # reach the dashboard up to this long after a request finishes.
   telemetryFlushIntervalMs: 5000
   # On shutdown the gateway stops accepting and waits this long for in-flight
-  # requests (including streams). Keep it below the pod's
-  # terminationGracePeriodSeconds (345) minus the 5s preStop delay, the 20s
-  # telemetry drain and the 10s OTLP shutdown flush: if you raise this value,
-  # raise terminationGracePeriodSeconds (templates/obleth.yaml) by the same
-  # amount, or the kubelet SIGKILLs mid-flush instead of a clean exit.
+  # requests (including streams). The pod's terminationGracePeriodSeconds
+  # follows it: this value + 45 s (the 5 s preStop delay, the 20 s telemetry
+  # drain, the 10 s OTLP shutdown flush and a margin), 345 s at the default.
   shutdownGraceSecs: 300
   # Seconds between re-pushes of keys/models/MCP servers from Postgres into
   # Redis (also runs after every Redis reconnect). 0 disables the timer.
@@ -534,6 +532,10 @@ provisioner:
   # Probe results and drains are logged at info when they change; the
   # per-tick repeats are debug ("info,obleth_provisioner=debug" shows them).
   logLevel: "info"
+  # Seconds the pod gets after SIGTERM to finish its current tick (slurmrestd
+  # calls, node probes, submits) before it is killed. Compose and the systemd
+  # unit use the same 120 s.
+  terminationGracePeriodSeconds: 120
   resources:
     requests: { cpu: "50m", memory: "64Mi" }
     limits: { cpu: "500m", memory: "256Mi" }

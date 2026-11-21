@@ -46,15 +46,16 @@ artifact carries the values published with that version. Keep per-deployment
 settings in your own `-f` values file so they apply regardless of source.
 `--wait` blocks until the rolled resources report Ready.
 
-> When a value that renders into the chart's obleth Secret changes
-> (`adminToken`, the database URL, the Redis URL, `postgres.password`,
-> `redis.password`, `clickhouse.password`, `encryptionKey`, `apiKeyPepper`),
-> the gateway and the bundled Redis roll automatically (`checksum/secret` pod
-> annotation). Other pods do not: after changing `adminToken`, restart
-> `deployment/obleth-control-plane` (and `deployment/obleth-provisioner` if
-> enabled), and restart the control-plane if its `DATABASE_URL` changed. With
-> `obleth.existingSecret`, the chart cannot see Secret changes, so restart the
-> affected deployments yourself, e.g. `kubectl rollout restart
+> Each workload rolls only when a value it reads changes. The gateway rolls on
+> any change to the chart's obleth Secret (`checksum/secret`); the bundled
+> Redis and ClickHouse roll only when their own password changes
+> (`checksum/password`); the dashboard and the provisioner roll when
+> `adminToken` changes (`checksum/admin-token`), and the dashboard also on any
+> `controlPlane` value. Postgres reads its password only when it first creates
+> its data directory, so it never rolls for one. With `obleth.existingSecret`
+> (or `controlPlane.existingSecret`) the chart cannot see the values, so these
+> checksums follow only the Secret's name: after rotating a value in place,
+> restart the deployments that read it yourself, e.g. `kubectl rollout restart
 > deployment/obleth-obleth -n obleth` (the gateway is `<release>-obleth`).
 
 ### Upgrading to a release with Redis authentication

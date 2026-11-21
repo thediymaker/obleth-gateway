@@ -21,11 +21,10 @@ spec:
         # when obleth.existingSecret is set (restart manually in that mode).
         checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
     spec:
-      # Room for a 300s streaming response plus shutdown headroom before the
-      # pod is killed during a rollout or drain: shutdownGraceSecs (300) + 20s
-      # telemetry drain + 10s OTLP shutdown + margin. See values.yaml's
-      # obleth.shutdownGraceSecs comment before changing either number.
-      terminationGracePeriodSeconds: 345
+      # Room for shutdownGraceSecs of draining (streams included) before the
+      # pod is killed during a rollout or drain: + 5s preStop + 20s telemetry
+      # drain + 10s OTLP shutdown + 10s margin.
+      terminationGracePeriodSeconds: {{ add (int (dig "shutdownGraceSecs" 300 .Values.obleth | default 300)) 45 }}
       securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
       {{- if include "obleth.capacityDiscoveryRbac" . }}
       # The kubernetes capacity source reads Services' EndpointSlices with this

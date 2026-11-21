@@ -100,9 +100,9 @@ spec:
     metadata:
       labels: { app: {{ .Release.Name }}-redis }
       annotations:
-        # Restart Redis with the new --requirepass when the chart-rendered
-        # Secret changes, in step with the gateway.
-        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        # Restart Redis with the new --requirepass when its password changes;
+        # other Secret keys do not touch it.
+        checksum/password: {{ include "obleth.datastorePasswordChecksum" (list . .Values.redis.password) }}
     spec:
       {{- include "obleth.datastorePlacement" . | nindent 6 }}
       containers:
@@ -191,9 +191,9 @@ spec:
     metadata:
       labels: { app: {{ .Release.Name }}-clickhouse }
       annotations:
-        # Restart ClickHouse with the new CLICKHOUSE_PASSWORD when the
-        # chart-rendered Secret changes, in step with the gateway.
-        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        # Restart ClickHouse with the new CLICKHOUSE_PASSWORD when its
+        # password changes; other Secret keys do not touch it.
+        checksum/password: {{ include "obleth.datastorePasswordChecksum" (list . .Values.clickhouse.password) }}
         # ClickHouse reads its system log settings at startup.
         checksum/config: {{ include "obleth.clickhouseConfig" . | sha256sum }}
     spec:
