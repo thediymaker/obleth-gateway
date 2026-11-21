@@ -11,7 +11,6 @@ pub struct KeyName {
     pub key_prefix: String,
 }
 
-/// A single audit-log entry.
 /// What `list_keys_where` narrows to; every field is optional.
 #[derive(Debug, Clone, Default)]
 pub struct KeyListFilter {
@@ -204,7 +203,8 @@ enum KeyScope<'a> {
     Group(&'a str),
 }
 
-/// A key as the data plane sees it: the key, its tenant and its group.
+/// A key as the data plane sees it: the key, its tenant and its group. Every
+/// resolved-key read selects this and adds its own `where`.
 const RESOLVED_KEY_SELECT: &str = "select k.key_hash, k.id as key_id, k.tenant_id, k.disabled,
                     k.name as key_name, t.name as tenant_name, t.fairshare_group, g.weight as group_weight,
                     t.weight, t.tokens_per_minute, t.max_in_flight, t.status,
@@ -1024,62 +1024,20 @@ impl Store {
 
     /// Resolve a single key (joined with its tenant) by hash.
     pub async fn resolved_key_by_hash(&self, hash: &str) -> Result<Option<ResolvedKey>> {
-        let row = sqlx::query(
-            "select k.id as key_id, k.tenant_id, k.disabled,
-                    k.name as key_name, t.name as tenant_name, t.fairshare_group, g.weight as group_weight,
-                    t.weight, t.tokens_per_minute, t.max_in_flight, t.status,
-                    t.timezone, t.active_from, t.active_until, t.weekly_windows,
-                    t.budget_tokens, t.budget_cost_usd, t.budget_period, t.budget_started_at,
-                    k.budget_tokens as key_budget_tokens,
-                    k.budget_cost_usd as key_budget_cost_usd,
-                    k.budget_period as key_budget_period,
-                    k.budget_started_at as key_budget_started_at,
-                    k.weight as key_weight, k.max_in_flight as key_max_in_flight,
-                    k.end_user_fairshare, k.background, k.allowed_networks, k.allowed_countries,
-                    t.allowed_models,
-                    (k.tracing_enabled OR t.tracing_enabled) AS tracing_enabled,
-                    t.guardrails_policy,
-                    t.compression_policy,
-                    t.synthetic
-             from api_keys k
-             join tenants t on t.id = k.tenant_id
-             join fairshare_groups g on g.name = t.fairshare_group
-             where k.key_hash = $1",
-        )
-        .bind(hash)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = sqlx::query(&format!("{RESOLVED_KEY_SELECT} where k.key_hash = $1"))
+            .bind(hash)
+            .fetch_optional(&self.pool)
+            .await?;
         row.as_ref().map(resolved_from_row).transpose()
     }
 
     /// The resolved key with this id, for callers that act for a key later
     /// without its secret (the batch runner).
     pub async fn resolved_key_by_id(&self, id: Uuid) -> Result<Option<ResolvedKey>> {
-        let row = sqlx::query(
-            "select k.id as key_id, k.tenant_id, k.disabled,
-                    k.name as key_name, t.name as tenant_name, t.fairshare_group, g.weight as group_weight,
-                    t.weight, t.tokens_per_minute, t.max_in_flight, t.status,
-                    t.timezone, t.active_from, t.active_until, t.weekly_windows,
-                    t.budget_tokens, t.budget_cost_usd, t.budget_period, t.budget_started_at,
-                    k.budget_tokens as key_budget_tokens,
-                    k.budget_cost_usd as key_budget_cost_usd,
-                    k.budget_period as key_budget_period,
-                    k.budget_started_at as key_budget_started_at,
-                    k.weight as key_weight, k.max_in_flight as key_max_in_flight,
-                    k.end_user_fairshare, k.background, k.allowed_networks, k.allowed_countries,
-                    t.allowed_models,
-                    (k.tracing_enabled OR t.tracing_enabled) AS tracing_enabled,
-                    t.guardrails_policy,
-                    t.compression_policy,
-                    t.synthetic
-             from api_keys k
-             join tenants t on t.id = k.tenant_id
-             join fairshare_groups g on g.name = t.fairshare_group
-             where k.id = $1",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = sqlx::query(&format!("{RESOLVED_KEY_SELECT} where k.id = $1"))
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
         row.as_ref().map(resolved_from_row).transpose()
     }
 

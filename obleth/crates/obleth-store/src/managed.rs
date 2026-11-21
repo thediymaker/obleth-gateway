@@ -904,7 +904,7 @@ impl Store {
         // degraded endpoint — e.g. an id-format mismatch in /v1/models — can never
         // recover after one transient unhealthy read, and stays out of rotation
         // until a manual check). It still must not downgrade a confirmed `healthy`.
-        let row = sqlx::query(
+        let row = sqlx::query(&format!(
             "update model_endpoints set
                 health_status = case
                     when $2 = 'skipped' then health_status
@@ -921,11 +921,8 @@ impl Store {
                 last_message = $6,
                 updated_at = now()
              where id = $1
-             returning id, model_id, name, api_base, api_key, priority, weight, enabled, max_in_flight,
-                       health_status, consecutive_failures, alert_state,
-                       last_checked_at, last_latency_ms, last_http_status, last_message,
-                       created_at, updated_at",
-        )
+             returning {ENDPOINT_COLUMNS}"
+        ))
         .bind(id)
         .bind(status)
         .bind(failure_delta)

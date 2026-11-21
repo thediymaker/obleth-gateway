@@ -2,6 +2,15 @@
 
 use super::*;
 
+/// Every `model_endpoints` column `endpoint_from_row` reads, in one place
+/// for each select and `returning`.
+pub(crate) const ENDPOINT_COLUMNS: &str =
+    "id, model_id, name, api_base, api_key, priority, weight, enabled,
+     max_in_flight,
+     health_status, consecutive_failures, alert_state,
+     last_checked_at, last_latency_ms, last_http_status, last_message,
+     created_at, updated_at";
+
 pub(crate) fn resolved_endpoint_from_row(row: &PgRow) -> Result<ResolvedEndpoint> {
     let status: String = row.try_get("health_status")?;
     Ok(ResolvedEndpoint {
@@ -63,14 +72,11 @@ impl Store {
     }
 
     pub async fn list_model_endpoints(&self, model_id: Uuid) -> Result<Vec<ModelEndpoint>> {
-        let rows = sqlx::query(
-            "select id, model_id, name, api_base, api_key, priority, weight, enabled, max_in_flight,
-                    health_status, consecutive_failures, alert_state,
-                    last_checked_at, last_latency_ms, last_http_status, last_message,
-                    created_at, updated_at
+        let rows = sqlx::query(&format!(
+            "select {ENDPOINT_COLUMNS}
              from model_endpoints where model_id = $1
-             order by priority asc, created_at asc",
-        )
+             order by priority asc, created_at asc"
+        ))
         .bind(model_id)
         .fetch_all(&self.pool)
         .await?;
@@ -80,26 +86,20 @@ impl Store {
     /// List every endpoint across all models (used for cache warming and the
     /// per-endpoint health scheduler).
     pub async fn all_model_endpoints(&self) -> Result<Vec<ModelEndpoint>> {
-        let rows = sqlx::query(
-            "select id, model_id, name, api_base, api_key, priority, weight, enabled, max_in_flight,
-                    health_status, consecutive_failures, alert_state,
-                    last_checked_at, last_latency_ms, last_http_status, last_message,
-                    created_at, updated_at
-             from model_endpoints order by model_id, priority asc",
-        )
+        let rows = sqlx::query(&format!(
+            "select {ENDPOINT_COLUMNS}
+             from model_endpoints order by model_id, priority asc"
+        ))
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(endpoint_from_row).collect()
     }
 
     pub async fn get_model_endpoint(&self, id: Uuid) -> Result<ModelEndpoint> {
-        let row = sqlx::query(
-            "select id, model_id, name, api_base, api_key, priority, weight, enabled, max_in_flight,
-                    health_status, consecutive_failures, alert_state,
-                    last_checked_at, last_latency_ms, last_http_status, last_message,
-                    created_at, updated_at
-             from model_endpoints where id = $1",
-        )
+        let row = sqlx::query(&format!(
+            "select {ENDPOINT_COLUMNS}
+             from model_endpoints where id = $1"
+        ))
         .bind(id)
         .fetch_optional(&self.pool)
         .await?
@@ -120,15 +120,12 @@ impl Store {
         max_in_flight: Option<i64>,
     ) -> Result<ModelEndpoint> {
         let api_key = cipher().encrypt_opt(api_key);
-        let row = sqlx::query(
+        let row = sqlx::query(&format!(
             "insert into model_endpoints
                 (id, model_id, name, api_base, api_key, priority, weight, enabled, max_in_flight)
              values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-             returning id, model_id, name, api_base, api_key, priority, weight, enabled, max_in_flight,
-                       health_status, consecutive_failures, alert_state,
-                       last_checked_at, last_latency_ms, last_http_status, last_message,
-                       created_at, updated_at",
-        )
+             returning {ENDPOINT_COLUMNS}"
+        ))
         .bind(Uuid::new_v4())
         .bind(model_id)
         .bind(name)
@@ -186,16 +183,13 @@ impl Store {
         let row = match api_key {
             Some(secret) => {
                 let enc = cipher().encrypt_opt(Some(secret));
-                sqlx::query(
+                sqlx::query(&format!(
                     "update model_endpoints set name = $2, api_base = $3, api_key = $4,
                             priority = $5, weight = $6, enabled = $7, max_in_flight = $9,
                             updated_at = now()
                      where id = $1 and model_id = $8
-                     returning id, model_id, name, api_base, api_key, priority, weight, enabled, max_in_flight,
-                               health_status, consecutive_failures, alert_state,
-                               last_checked_at, last_latency_ms, last_http_status, last_message,
-                               created_at, updated_at",
-                )
+                     returning {ENDPOINT_COLUMNS}"
+                ))
                 .bind(id)
                 .bind(name)
                 .bind(api_base)
@@ -209,16 +203,13 @@ impl Store {
                 .await?
             }
             None => {
-                sqlx::query(
+                sqlx::query(&format!(
                     "update model_endpoints set name = $2, api_base = $3,
                             priority = $4, weight = $5, enabled = $6, max_in_flight = $8,
                             updated_at = now()
                      where id = $1 and model_id = $7
-                     returning id, model_id, name, api_base, api_key, priority, weight, enabled, max_in_flight,
-                               health_status, consecutive_failures, alert_state,
-                               last_checked_at, last_latency_ms, last_http_status, last_message,
-                               created_at, updated_at",
-                )
+                     returning {ENDPOINT_COLUMNS}"
+                ))
                 .bind(id)
                 .bind(name)
                 .bind(api_base)

@@ -15,7 +15,8 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::{
-    cipher, endpoint_from_row, model_from_row, serialize_tag_levels, Result, Store, MODEL_COLUMNS,
+    cipher, endpoint_from_row, model_from_row, serialize_tag_levels, Result, Store,
+    ENDPOINT_COLUMNS, MODEL_COLUMNS,
 };
 
 /// One model's resolved target state, ready to write.
@@ -38,12 +39,6 @@ pub struct ModelImportOutcome {
     /// Post-write endpoints, present only when the manifest listed any.
     pub endpoints: Option<Vec<ModelEndpoint>>,
 }
-
-const ENDPOINT_COLUMNS: &str = "id, model_id, name, api_base, api_key, priority, weight, enabled,
-     max_in_flight,
-     health_status, consecutive_failures, alert_state,
-     last_checked_at, last_latency_ms, last_http_status, last_message,
-     created_at, updated_at";
 
 impl Store {
     /// Apply a resolved manifest. Returns one outcome per write, in input
