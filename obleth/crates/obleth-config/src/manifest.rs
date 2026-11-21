@@ -34,14 +34,16 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use crate::reasoning::ModelReasoning;
 use crate::types::{
     is_valid_capacity_mode, is_valid_endpoint_selection_mode, is_valid_model_type,
     is_valid_quantization, merge_upstream_headers, normalize_aliases, normalize_boons,
     normalize_tool_servers, normalize_variants, parse_tag_level, upstream_header_names,
-    ModelEndpoint, ModelRoute, ModelVariant, UpstreamHeaders, UpstreamHeadersWrite, CAPACITY_MODES,
-    DEFAULT_CAPACITY_MODE, DEFAULT_CAPACITY_SOURCE, DEFAULT_ENDPOINT_SELECTION_MODE,
-    DEFAULT_MODEL_TYPE, DEFAULT_QUANTIZATION, DEFAULT_RETRY_BACKOFF_MS, ENDPOINT_SELECTION_MODES,
-    MAX_MODEL_ALIASES, MAX_MODEL_VARIANTS, MODEL_TYPES, QUANTIZATIONS,
+    ModelEndpoint, ModelRoute, ModelSessionAffinity, ModelVariant, UpstreamHeaders,
+    UpstreamHeadersWrite, CAPACITY_MODES, DEFAULT_CAPACITY_MODE, DEFAULT_CAPACITY_SOURCE,
+    DEFAULT_ENDPOINT_SELECTION_MODE, DEFAULT_MODEL_TYPE, DEFAULT_QUANTIZATION,
+    DEFAULT_RETRY_BACKOFF_MS, ENDPOINT_SELECTION_MODES, MAX_MODEL_ALIASES, MAX_MODEL_VARIANTS,
+    MODEL_TYPES, QUANTIZATIONS,
 };
 
 /// File-format discriminator for model manifests.
@@ -108,6 +110,7 @@ pub struct ManifestModel {
     /// replaced when present: a `null` value keeps the stored value for that
     /// name, and a stored name left out is removed. Absent leaves them alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<std::collections::BTreeMap<String, Option<String>>>)]
     pub upstream_headers: Option<UpstreamHeadersWrite>,
     /// Export-only: the names of the stored upstream headers. Ignored on
     /// import, like `has_api_key`.
@@ -130,7 +133,7 @@ pub struct ManifestModel {
     /// unsupported). Replaced as a whole when present; absent leaves the
     /// stored map alone. An invalid map is rejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning: Option<crate::reasoning::ModelReasoning>,
+    pub reasoning: Option<ModelReasoning>,
     /// Whether `/v1/models` and `/model/info` advertise the model. Absent
     /// leaves the stored value alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -145,7 +148,7 @@ pub struct ManifestModel {
     /// present; absent leaves the stored setting alone. Out-of-range values
     /// are rejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_affinity: Option<crate::types::ModelSessionAffinity>,
+    pub session_affinity: Option<ModelSessionAffinity>,
     /// Serving format from the fixed `QUANTIZATIONS` vocabulary. An
     /// unrecognized value is rejected rather than silently defaulted, on the
     /// same reasoning as `model_type`.
@@ -318,10 +321,10 @@ pub struct ModelConfig {
     pub description: String,
     pub aliases: Vec<String>,
     pub variants: Vec<ModelVariant>,
-    pub reasoning: crate::reasoning::ModelReasoning,
+    pub reasoning: ModelReasoning,
     pub listed: bool,
     pub rejected_request_fields: Vec<String>,
-    pub session_affinity: crate::types::ModelSessionAffinity,
+    pub session_affinity: ModelSessionAffinity,
     pub upstream_model: String,
     pub api_base: String,
     pub api_key: Option<String>,
@@ -1633,7 +1636,7 @@ mod tests {
 
         // `session_affinity` is replaced when present, checked, and exported
         // only when the model has a setting of its own.
-        let own = crate::types::ModelSessionAffinity {
+        let own = ModelSessionAffinity {
             enabled: Some(true),
             max_held_percent: Some(50),
             ..Default::default()
@@ -1643,7 +1646,7 @@ mod tests {
         let r = resolve_model(&affine, Some(&existing), &[]).unwrap();
         assert_eq!(r.config.session_affinity, own);
         assert!(r.changed_fields.contains(&"session_affinity".to_string()));
-        affine.session_affinity = Some(crate::types::ModelSessionAffinity {
+        affine.session_affinity = Some(ModelSessionAffinity {
             max_held_percent: Some(101),
             ..Default::default()
         });

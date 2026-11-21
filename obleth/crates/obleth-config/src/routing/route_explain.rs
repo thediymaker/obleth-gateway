@@ -8,6 +8,8 @@
 use serde::Serialize;
 use utoipa::ToSchema;
 
+use super::IntentSource;
+
 /// One candidate that survived every hard filter, with the score components
 /// that produced its rank. Emitted in the router's own descending-score order.
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -44,9 +46,9 @@ pub struct Rejection {
 pub struct RouteExplain {
     pub chosen: Option<String>,
     pub difficulty: u8,
-    pub difficulty_source: super::IntentSource,
+    pub difficulty_source: IntentSource,
     pub tags: Vec<String>,
-    pub tag_source: super::IntentSource,
+    pub tag_source: IntentSource,
     /// Milliseconds spent in the intent classifier. Only the proxy call site
     /// knows the real timing, so `explain_selection` always emits `0` and the
     /// data plane overwrites it before the span is recorded. A `0` here from

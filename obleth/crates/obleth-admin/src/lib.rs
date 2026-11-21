@@ -35,6 +35,16 @@ pub mod usage_retention;
 
 use std::sync::Arc;
 
+use crate::alerts::ChannelResult;
+use crate::autotune::{AutotuneReport, AutotuneRequest};
+use crate::capacity_discovery::{ModelCapacityStatus, ServiceSummary};
+use crate::replica_settings::CeilingSource;
+use crate::usage::{
+    CacheStats, CostAgg, KeyRejectionAgg, KeySource, KeyUsageSummary, ModelSpeedPoint,
+    ModelUsageTimePoint, OverviewTenantUsage, SpanEntry, TenantUsageTimePoint, UsageAgg,
+    UsageDailyRow, UsageFailureGroups, UsageKeyAgg, UsageKeyModelBreakdown, UsageLogFacets,
+    UsageLogHistogram, UsageLogRow, UsageModelAgg, UsageTimePoint,
+};
 use axum::extract::{Path, Query, State};
 use axum::http::{header::AUTHORIZATION, HeaderMap, Request, StatusCode};
 use axum::middleware::Next;
@@ -56,11 +66,16 @@ use obleth_config::{
     ToolLoopSettings, VisionBoonSettings, STRUCTURED_OUTPUT_MAX_REPAIR_ATTEMPTS,
     TOOL_LOOP_MAX_DEADLINE_SECS, TOOL_LOOP_MAX_TURNS,
 };
+use obleth_config::{
+    CompressionPolicy, FamilyMembers, GuardrailsPolicy, ManagedBackoff, ModelFamily,
+    ModelLifecycle, ModelReasoning, ModelSessionAffinity, ModelStatus, ModelVariant,
+    ReasoningLevel, WeeklyWindow,
+};
 use obleth_fairshare::{
     replica_share, FairShare, FairshareHistory, ModelPoolFairshare, PoolKey, SlotMode, Stats,
 };
 use obleth_redis::{Invalidation, RedisStore, Resolver, SavedSetting};
-use obleth_store::{AuditEntry, Store};
+use obleth_store::{AuditEntry, KeyFlag, Store};
 use obleth_tokenizer::Tokenizer;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -210,23 +225,35 @@ pub fn router(state: AdminState) -> Router {
             "/api/v1/tenants/:id",
             get(get_tenant).put(update_tenant).delete(delete_tenant),
         )
-        .route("/api/v1/tenants/:id/status", patch(patch_tenant_status))
-        .route("/api/v1/tenants/:id/schedule", patch(patch_tenant_schedule))
-        .route("/api/v1/tenants/:id/budget", patch(patch_tenant_budget))
+        .route(
+            "/api/v1/tenants/:id/status",
+            put(set_tenant_status).patch(set_tenant_status),
+        )
+        .route(
+            "/api/v1/tenants/:id/schedule",
+            put(set_tenant_schedule).patch(set_tenant_schedule),
+        )
+        .route(
+            "/api/v1/tenants/:id/budget",
+            put(set_tenant_budget).patch(set_tenant_budget),
+        )
         .route(
             "/api/v1/tenants/:id/allowlist",
-            patch(patch_tenant_allowlist),
+            put(set_tenant_allowlist).patch(set_tenant_allowlist),
         )
         .route(
             "/api/v1/tenants/:id/guardrails",
-            patch(patch_tenant_guardrails),
+            put(set_tenant_guardrails).patch(set_tenant_guardrails),
         )
         .route(
             "/api/v1/tenants/:id/compression",
-            patch(patch_tenant_compression),
+            put(set_tenant_compression).patch(set_tenant_compression),
         )
-        .route("/api/v1/tenants/:id/weight", patch(patch_weight))
-        .route("/api/v1/tenants/:id/quota", put(put_quota))
+        .route(
+            "/api/v1/tenants/:id/weight",
+            put(set_tenant_weight).patch(set_tenant_weight),
+        )
+        .route("/api/v1/tenants/:id/quota", put(set_tenant_quota))
         .route("/api/v1/tenants/:id/keys", post(create_key))
         .route(
             "/api/v1/tenants/:id/tracing",
@@ -299,9 +326,12 @@ pub fn router(state: AdminState) -> Router {
         )
         .route(
             "/api/v1/fairshare/groups/:name/weight",
-            patch(patch_fairshare_group_weight),
+            put(set_fairshare_group_weight).patch(set_fairshare_group_weight),
         )
-        .route("/api/v1/tenants/:id/group", patch(patch_tenant_group))
+        .route(
+            "/api/v1/tenants/:id/group",
+            put(set_tenant_group).patch(set_tenant_group),
+        )
         .route("/api/v1/models", post(create_model).get(list_models))
         .route(
             "/api/v1/models/health",
@@ -627,7 +657,7 @@ pub struct SetTenantSchedule {
     #[serde(default)]
     pub active_until: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default)]
-    pub weekly_windows: Option<Vec<obleth_config::WeeklyWindow>>,
+    pub weekly_windows: Option<Vec<WeeklyWindow>>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -656,13 +686,13 @@ pub struct SetTenantAllowlist {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetTenantGuardrails {
     /// `null` clears the guardrails policy (no scanning for this tenant).
-    pub policy: Option<obleth_config::GuardrailsPolicy>,
+    pub policy: Option<GuardrailsPolicy>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetTenantCompression {
     /// `null` clears the compression policy (tenant follows the global default).
-    pub policy: Option<obleth_config::CompressionPolicy>,
+    pub policy: Option<CompressionPolicy>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -871,7 +901,7 @@ pub struct CapacityView {
     pub max_in_flight: usize,
     /// `saved` (with `PUT`; it wins over the environment until `DELETE`) or
     /// `environment` (`OBLETH_GLOBAL_MAX_IN_FLIGHT`).
-    pub source: replica_settings::CeilingSource,
+    pub source: CeilingSource,
     /// `OBLETH_GLOBAL_MAX_IN_FLIGHT` on this replica, which applies while
     /// nothing is saved.
     pub environment_max_in_flight: usize,
@@ -1078,7 +1108,7 @@ pub struct FairshareLiveView {
     /// else `OBLETH_GLOBAL_MAX_IN_FLIGHT` (see `hard_ceiling_source`).
     pub configured_hard_ceiling: usize,
     /// Where `configured_hard_ceiling` comes from: `saved` or `environment`.
-    pub hard_ceiling_source: replica_settings::CeilingSource,
+    pub hard_ceiling_source: CeilingSource,
     pub default_model_max_in_flight: usize,
     /// Live gateway replicas.
     pub replicas: usize,
@@ -1262,7 +1292,7 @@ pub struct CreateModel {
     /// `PUT /models/{id}/status` makes it `active`. Omitted = `active`; a new
     /// model cannot start deprecated or retired.
     #[serde(default)]
-    pub status: Option<obleth_config::ModelStatus>,
+    pub status: Option<ModelStatus>,
     /// Top-level request body fields this model's backend cannot handle. A
     /// request carrying any of them (also inside `extra_body`) is refused
     /// with 400 before it is sent. Case-sensitive; at most 32; `model` cannot
@@ -1272,7 +1302,7 @@ pub struct CreateModel {
     /// The model's own session affinity setting. Omitted = follows the
     /// gateway.
     #[serde(default)]
-    pub session_affinity: Option<obleth_config::ModelSessionAffinity>,
+    pub session_affinity: Option<ModelSessionAffinity>,
 }
 
 /// One variant in a model write: a name that resolves to the model with extra
@@ -1400,7 +1430,7 @@ pub struct UpdateModel {
     /// Replaces the model's session affinity setting; omitted leaves it
     /// unchanged and `{}` makes the model follow the gateway again.
     #[serde(default)]
-    pub session_affinity: Option<obleth_config::ModelSessionAffinity>,
+    pub session_affinity: Option<ModelSessionAffinity>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1795,7 +1825,7 @@ pub struct SetModelStatus {
     /// `active`, `deprecated` (still served, with Deprecation/Sunset headers)
     /// or `retired` (refused with 410 Gone, or served by the replacement when
     /// `redirect` is on).
-    pub status: obleth_config::ModelStatus,
+    pub status: ModelStatus,
     /// `model_name` of a registered model of the same type to move callers to.
     #[serde(default)]
     pub replacement: Option<String>,
@@ -1840,10 +1870,10 @@ pub struct ModelFamilyWrite {
     #[serde(default)]
     pub description: Option<String>,
     /// The level a request that names none is served at.
-    pub default_level: obleth_config::ReasoningLevel,
+    pub default_level: ReasoningLevel,
     /// The chat model that answers at each level, by name or alias (stored
     /// as its `model_name`).
-    pub members: obleth_config::FamilyMembers,
+    pub members: FamilyMembers,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -2043,19 +2073,6 @@ pub struct AuditQuery {
     pub q: Option<String>,
 }
 
-/// OpenAPI shape for audit-log rows (`GET /api/v1/audit`).
-#[derive(Debug, Serialize, ToSchema)]
-pub struct AuditEntryView {
-    pub id: i64,
-    #[schema(value_type = String)]
-    pub ts: chrono::DateTime<chrono::Utc>,
-    pub actor: String,
-    pub action: String,
-    pub entity_type: String,
-    pub entity_id: String,
-    pub detail: serde_json::Value,
-}
-
 // ---- handlers ------------------------------------------------------------
 
 async fn health() -> &'static str {
@@ -2187,11 +2204,11 @@ async fn update_tenant(
 }
 
 #[utoipa::path(
-    patch, path = "/api/v1/tenants/{id}/status", tag = "tenants",
+    put, path = "/api/v1/tenants/{id}/status", tag = "tenants",
     request_body = SetTenantStatus,
     responses((status = 200, body = Tenant))
 )]
-async fn patch_tenant_status(
+async fn set_tenant_status(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
@@ -2220,11 +2237,11 @@ async fn patch_tenant_status(
 }
 
 #[utoipa::path(
-    patch, path = "/api/v1/tenants/{id}/schedule", tag = "tenants",
+    put, path = "/api/v1/tenants/{id}/schedule", tag = "tenants",
     request_body = SetTenantSchedule,
     responses((status = 200, body = Tenant))
 )]
-async fn patch_tenant_schedule(
+async fn set_tenant_schedule(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
@@ -2288,11 +2305,11 @@ async fn patch_tenant_schedule(
 }
 
 #[utoipa::path(
-    patch, path = "/api/v1/tenants/{id}/budget", tag = "tenants",
+    put, path = "/api/v1/tenants/{id}/budget", tag = "tenants",
     request_body = SetTenantBudget,
     responses((status = 200, body = Tenant))
 )]
-async fn patch_tenant_budget(
+async fn set_tenant_budget(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
@@ -2338,11 +2355,11 @@ async fn patch_tenant_budget(
 }
 
 #[utoipa::path(
-    patch, path = "/api/v1/tenants/{id}/allowlist", tag = "tenants",
+    put, path = "/api/v1/tenants/{id}/allowlist", tag = "tenants",
     request_body = SetTenantAllowlist,
     responses((status = 200, body = Tenant))
 )]
-async fn patch_tenant_allowlist(
+async fn set_tenant_allowlist(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
@@ -2374,11 +2391,11 @@ async fn patch_tenant_allowlist(
 }
 
 #[utoipa::path(
-    patch, path = "/api/v1/tenants/{id}/guardrails", tag = "tenants",
+    put, path = "/api/v1/tenants/{id}/guardrails", tag = "tenants",
     request_body = SetTenantGuardrails,
     responses((status = 200, body = Tenant))
 )]
-async fn patch_tenant_guardrails(
+async fn set_tenant_guardrails(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
@@ -2404,11 +2421,11 @@ async fn patch_tenant_guardrails(
 }
 
 #[utoipa::path(
-    patch, path = "/api/v1/tenants/{id}/compression", tag = "tenants",
+    put, path = "/api/v1/tenants/{id}/compression", tag = "tenants",
     request_body = SetTenantCompression,
     responses((status = 200, body = Tenant))
 )]
-async fn patch_tenant_compression(
+async fn set_tenant_compression(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
@@ -2459,17 +2476,17 @@ pub struct ModelRouteView {
     /// Opt-in names for this same route with extra boons on (added to the
     /// model's own). A variant shares the model's backend, capacity pool and
     /// prices; unlike an alias it is listed by the discovery endpoints.
-    pub variants: Vec<obleth_config::ModelVariant>,
+    pub variants: Vec<ModelVariant>,
     /// Active, deprecated or retired, with the replacement, retirement date
     /// and note callers are shown. Set with `PUT /api/v1/models/{id}/status`.
-    pub lifecycle: obleth_config::ModelLifecycle,
+    pub lifecycle: ModelLifecycle,
     /// The status in force now: a deprecated model past its retirement date
     /// reads `retired` here while `lifecycle.status` still says `deprecated`.
-    pub effective_status: obleth_config::ModelStatus,
+    pub effective_status: ModelStatus,
     /// How the model takes reasoning effort: pass-through, mapped (each of
     /// none/low/medium/high translated to fields its server understands), or
     /// unsupported. Set with `PUT /api/v1/models/{id}/reasoning`.
-    pub reasoning: obleth_config::ModelReasoning,
+    pub reasoning: ModelReasoning,
     /// Whether `/v1/models` and `/model/info` advertise the model. An
     /// unlisted model is still served by name. Set with
     /// `PUT /api/v1/models/{id}/listing`.
@@ -2480,7 +2497,7 @@ pub struct ModelRouteView {
     pub rejected_request_fields: Vec<String>,
     /// The model's own session affinity setting; `{}` follows the gateway.
     /// Set with `PUT /api/v1/models/{id}/session-affinity`.
-    pub session_affinity: obleth_config::ModelSessionAffinity,
+    pub session_affinity: ModelSessionAffinity,
     /// Human-facing summary for operators and dashboards.
     pub description: String,
     /// Value sent to the upstream in the `model` field.
@@ -5005,7 +5022,7 @@ async fn put_charo_settings(
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct TestAlertResult {
-    pub results: Vec<alerts::ChannelResult>,
+    pub results: Vec<ChannelResult>,
 }
 
 #[utoipa::path(
@@ -5051,11 +5068,11 @@ async fn delete_tenant(
 }
 
 #[utoipa::path(
-    patch, path = "/api/v1/tenants/{id}/weight", tag = "tenants",
+    put, path = "/api/v1/tenants/{id}/weight", tag = "tenants",
     request_body = UpdateWeight,
     responses((status = 200, body = Tenant))
 )]
-async fn patch_weight(
+async fn set_tenant_weight(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
@@ -5085,7 +5102,7 @@ async fn patch_weight(
     request_body = UpdateQuota,
     responses((status = 200, body = Tenant))
 )]
-async fn put_quota(
+async fn set_tenant_quota(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
@@ -5625,31 +5642,50 @@ async fn delete_key(
     put, path = "/api/v1/keys/{id}/disabled", tag = "keys",
     params(("id" = Uuid, Path, description = "API key id")),
     request_body = SetDisabled,
-    responses((status = 204), (status = 404))
+    responses((status = 200, body = ApiKey), (status = 404))
 )]
 async fn set_key_disabled(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(body): Json<SetDisabled>,
-) -> Result<StatusCode> {
-    let (hash, resolved) = state.store.set_key_disabled(id, body.disabled).await?;
-    push_key(&state, &hash, &resolved).await?;
+) -> Result<Json<ApiKey>> {
+    set_key_flag(&state, &headers, id, KeyFlag::Disabled, body.disabled).await
+}
+
+/// Turn one of a key's own on/off settings, push the key to Redis, audit the
+/// change, and answer the updated key. Disabling is audited as
+/// `disable_key`/`enable_key`; the others as `enable_key_<setting>` and
+/// `disable_key_<setting>`.
+async fn set_key_flag(
+    state: &AdminState,
+    headers: &HeaderMap,
+    id: Uuid,
+    flag: KeyFlag,
+    on: bool,
+) -> Result<Json<ApiKey>> {
+    let (hash, key, resolved) = state.store.set_key_flag(id, flag, on).await?;
+    push_key(state, &hash, &resolved).await?;
+    let action = match (flag, on) {
+        (KeyFlag::Disabled, true) => "disable_key".to_string(),
+        (KeyFlag::Disabled, false) => "enable_key".to_string(),
+        (_, on) => format!(
+            "{}_key_{}",
+            if on { "enable" } else { "disable" },
+            flag.column().trim_end_matches("_enabled")
+        ),
+    };
     state
         .store
         .record_audit(
-            &audit_actor(&headers),
-            if body.disabled {
-                "disable_key"
-            } else {
-                "enable_key"
-            },
+            &audit_actor(headers),
+            &action,
             "api_key",
             &id.to_string(),
-            serde_json::json!({ "disabled": body.disabled }),
+            serde_json::json!({ flag.column(): on }),
         )
         .await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(key))
 }
 
 /// Move a key to another tenant, keeping its secret and settings. From now
@@ -5686,34 +5722,15 @@ async fn move_key(
     put, path = "/api/v1/keys/{id}/tracing", tag = "keys",
     params(("id" = Uuid, Path, description = "API key id")),
     request_body = SetKeyTracing,
-    responses((status = 204), (status = 404))
+    responses((status = 200, body = ApiKey), (status = 404))
 )]
 async fn set_key_tracing_handler(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(body): Json<SetKeyTracing>,
-) -> Result<StatusCode> {
-    let (hash, resolved) = state
-        .store
-        .set_key_tracing(id, body.tracing_enabled)
-        .await?;
-    push_key(&state, &hash, &resolved).await?;
-    state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
-            if body.tracing_enabled {
-                "enable_key_tracing"
-            } else {
-                "disable_key_tracing"
-            },
-            "api_key",
-            &id.to_string(),
-            serde_json::json!({ "tracing_enabled": body.tracing_enabled }),
-        )
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
+) -> Result<Json<ApiKey>> {
+    set_key_flag(&state, &headers, id, KeyFlag::Tracing, body.tracing_enabled).await
 }
 
 /// Turn per-end-user fairshare on or off for one key. Its own route, like
@@ -5723,34 +5740,22 @@ async fn set_key_tracing_handler(
     put, path = "/api/v1/keys/{id}/end-user-fairshare", tag = "keys",
     params(("id" = Uuid, Path, description = "API key id")),
     request_body = SetKeyEndUserFairshare,
-    responses((status = 204), (status = 404))
+    responses((status = 200, body = ApiKey), (status = 404))
 )]
 async fn set_key_end_user_fairshare_handler(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(body): Json<SetKeyEndUserFairshare>,
-) -> Result<StatusCode> {
-    let (hash, resolved) = state
-        .store
-        .set_key_end_user_fairshare(id, body.end_user_fairshare)
-        .await?;
-    push_key(&state, &hash, &resolved).await?;
-    state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
-            if body.end_user_fairshare {
-                "enable_key_end_user_fairshare"
-            } else {
-                "disable_key_end_user_fairshare"
-            },
-            "api_key",
-            &id.to_string(),
-            serde_json::json!({ "end_user_fairshare": body.end_user_fairshare }),
-        )
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
+) -> Result<Json<ApiKey>> {
+    set_key_flag(
+        &state,
+        &headers,
+        id,
+        KeyFlag::EndUserFairshare,
+        body.end_user_fairshare,
+    )
+    .await
 }
 
 /// Turn background priority on or off for one key. Its own route, like
@@ -5761,46 +5766,30 @@ async fn set_key_end_user_fairshare_handler(
     put, path = "/api/v1/keys/{id}/background", tag = "keys",
     params(("id" = Uuid, Path, description = "API key id")),
     request_body = SetKeyBackground,
-    responses((status = 204), (status = 404))
+    responses((status = 200, body = ApiKey), (status = 404))
 )]
 async fn set_key_background_handler(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(body): Json<SetKeyBackground>,
-) -> Result<StatusCode> {
-    let (hash, resolved) = state.store.set_key_background(id, body.background).await?;
-    push_key(&state, &hash, &resolved).await?;
-    state
-        .store
-        .record_audit(
-            &audit_actor(&headers),
-            if body.background {
-                "enable_key_background"
-            } else {
-                "disable_key_background"
-            },
-            "api_key",
-            &id.to_string(),
-            serde_json::json!({ "background": body.background }),
-        )
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
+) -> Result<Json<ApiKey>> {
+    set_key_flag(&state, &headers, id, KeyFlag::Background, body.background).await
 }
 
 #[utoipa::path(
     put, path = "/api/v1/tenants/{id}/tracing", tag = "tenants",
     params(("id" = Uuid, Path, description = "Tenant id")),
     request_body = SetKeyTracing,
-    responses((status = 204), (status = 404))
+    responses((status = 200, body = Tenant), (status = 404))
 )]
 async fn set_tenant_tracing_handler(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(body): Json<SetKeyTracing>,
-) -> Result<StatusCode> {
-    state
+) -> Result<Json<Tenant>> {
+    let tenant = state
         .store
         .set_tenant_tracing(id, body.tracing_enabled)
         .await?;
@@ -5819,22 +5808,22 @@ async fn set_tenant_tracing_handler(
             serde_json::json!({ "tracing_enabled": body.tracing_enabled }),
         )
         .await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(tenant))
 }
 
 #[utoipa::path(
     put, path = "/api/v1/tenants/{id}/synthetic", tag = "tenants",
     params(("id" = Uuid, Path, description = "Tenant id")),
     request_body = SetTenantSynthetic,
-    responses((status = 204))
+    responses((status = 200, body = Tenant), (status = 404))
 )]
 async fn set_tenant_synthetic_handler(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(body): Json<SetTenantSynthetic>,
-) -> Result<StatusCode> {
-    state.store.set_tenant_synthetic(id, body.synthetic).await?;
+) -> Result<Json<Tenant>> {
+    let tenant = state.store.set_tenant_synthetic(id, body.synthetic).await?;
     // The flag is denormalized into every resolved key; re-push the tenant's keys.
     sync_tenant_keys(&state, id).await?;
     state
@@ -5847,30 +5836,30 @@ async fn set_tenant_synthetic_handler(
             serde_json::json!({ "synthetic": body.synthetic }),
         )
         .await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(tenant))
 }
 
 #[utoipa::path(
     get, path = "/api/v1/usage", tag = "usage",
     params(usage::UsageQuery),
-    responses((status = 200, body = [usage::UsageAgg]))
+    responses((status = 200, body = [UsageAgg]))
 )]
 async fn get_usage(
     State(state): State<AdminState>,
     Query(q): Query<usage::UsageQuery>,
-) -> Result<Json<Vec<usage::UsageAgg>>> {
+) -> Result<Json<Vec<UsageAgg>>> {
     Ok(Json(usage::query_usage(&state.clickhouse, q).await?))
 }
 
 #[utoipa::path(
     get, path = "/api/v1/usage/keys", tag = "usage",
     params(usage::UsageQuery),
-    responses((status = 200, body = [usage::UsageKeyAgg]))
+    responses((status = 200, body = [UsageKeyAgg]))
 )]
 async fn get_usage_keys(
     State(state): State<AdminState>,
     Query(q): Query<usage::UsageQuery>,
-) -> Result<Json<Vec<usage::UsageKeyAgg>>> {
+) -> Result<Json<Vec<UsageKeyAgg>>> {
     Ok(Json(usage::query_usage_by_key(&state.clickhouse, q).await?))
 }
 
@@ -5884,13 +5873,13 @@ async fn get_usage_keys(
         ("id" = Uuid, Path, description = "API key id"),
         usage::KeyUsageSummaryQuery
     ),
-    responses((status = 200, body = usage::KeyUsageSummary), (status = 404))
+    responses((status = 200, body = KeyUsageSummary), (status = 404))
 )]
 async fn get_key_usage(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     Query(q): Query<usage::KeyUsageSummaryQuery>,
-) -> Result<Json<usage::KeyUsageSummary>> {
+) -> Result<Json<KeyUsageSummary>> {
     // Validate the key exists (and recover its tenant for the never-used case)
     // before touching ClickHouse, so unknown ids are a clean 404.
     let key = state
@@ -5909,7 +5898,7 @@ async fn get_key_usage(
         q.include_internal,
     )
     .await?
-    .unwrap_or(usage::KeyUsageSummary {
+    .unwrap_or(KeyUsageSummary {
         key_id: id,
         tenant_id: key.tenant_id,
         last_used_ms: 0,
@@ -5941,7 +5930,7 @@ async fn get_key_usage(
     get, path = "/api/v1/usage/key-sources", tag = "usage",
     params(usage::KeyWatchQuery),
     responses(
-        (status = 200, body = [usage::KeySource], headers(
+        (status = 200, body = [KeySource], headers(
             ("x-obleth-truncated" = String, description = "`true` when more rows matched than the 10,000-row cap let through")
         )),
         (status = 400)
@@ -5950,7 +5939,7 @@ async fn get_key_usage(
 async fn get_usage_key_sources(
     State(state): State<AdminState>,
     Query(q): Query<usage::KeyWatchQuery>,
-) -> Result<(HeaderMap, Json<Vec<usage::KeySource>>)> {
+) -> Result<(HeaderMap, Json<Vec<KeySource>>)> {
     let (since, until) = q
         .window(chrono::Utc::now().timestamp_millis())
         .map_err(AdminError::BadRequest)?;
@@ -5992,7 +5981,7 @@ fn truncated_header(truncated: bool) -> HeaderMap {
     get, path = "/api/v1/usage/key-rejections", tag = "usage",
     params(usage::KeyWatchQuery),
     responses(
-        (status = 200, body = [usage::KeyRejectionAgg], headers(
+        (status = 200, body = [KeyRejectionAgg], headers(
             ("x-obleth-truncated" = String, description = "`true` when more rows matched than `limit` or the 10,000-row cap let through")
         )),
         (status = 400)
@@ -6001,7 +5990,7 @@ fn truncated_header(truncated: bool) -> HeaderMap {
 async fn get_usage_key_rejections(
     State(state): State<AdminState>,
     Query(q): Query<usage::KeyWatchQuery>,
-) -> Result<(HeaderMap, Json<Vec<usage::KeyRejectionAgg>>)> {
+) -> Result<(HeaderMap, Json<Vec<KeyRejectionAgg>>)> {
     let (since, until) = q
         .window(chrono::Utc::now().timestamp_millis())
         .map_err(AdminError::BadRequest)?;
@@ -6025,12 +6014,12 @@ async fn get_usage_key_rejections(
 #[utoipa::path(
     get, path = "/api/v1/usage/keys/summary", tag = "usage",
     params(usage::KeyUsageSummaryQuery),
-    responses((status = 200, body = [usage::KeyUsageSummary]))
+    responses((status = 200, body = [KeyUsageSummary]))
 )]
 async fn get_usage_keys_summary(
     State(state): State<AdminState>,
     Query(q): Query<usage::KeyUsageSummaryQuery>,
-) -> Result<Json<Vec<usage::KeyUsageSummary>>> {
+) -> Result<Json<Vec<KeyUsageSummary>>> {
     Ok(Json(
         usage::query_keys_usage_summary(&state.clickhouse, q).await?,
     ))
@@ -6039,12 +6028,12 @@ async fn get_usage_keys_summary(
 #[utoipa::path(
     get, path = "/api/v1/usage/models", tag = "usage",
     params(usage::UsageQuery),
-    responses((status = 200, body = [usage::UsageModelAgg]))
+    responses((status = 200, body = [UsageModelAgg]))
 )]
 async fn get_usage_models(
     State(state): State<AdminState>,
     Query(q): Query<usage::UsageQuery>,
-) -> Result<Json<Vec<usage::UsageModelAgg>>> {
+) -> Result<Json<Vec<UsageModelAgg>>> {
     Ok(Json(
         usage::query_usage_by_model(&state.clickhouse, q).await?,
     ))
@@ -6053,24 +6042,24 @@ async fn get_usage_models(
 #[utoipa::path(
     get, path = "/api/v1/usage/series", tag = "usage",
     params(usage::UsageSeriesQuery),
-    responses((status = 200, body = [usage::UsageTimePoint]))
+    responses((status = 200, body = [UsageTimePoint]))
 )]
 async fn get_usage_series(
     State(state): State<AdminState>,
     Query(q): Query<usage::UsageSeriesQuery>,
-) -> Result<Json<Vec<usage::UsageTimePoint>>> {
+) -> Result<Json<Vec<UsageTimePoint>>> {
     Ok(Json(usage::query_usage_series(&state.clickhouse, q).await?))
 }
 
 #[utoipa::path(
     get, path = "/api/v1/usage/series/tenants", tag = "usage",
     params(usage::UsageSeriesQuery),
-    responses((status = 200, body = [usage::TenantUsageTimePoint]))
+    responses((status = 200, body = [TenantUsageTimePoint]))
 )]
 async fn get_usage_series_tenants(
     State(state): State<AdminState>,
     Query(q): Query<usage::UsageSeriesQuery>,
-) -> Result<Json<Vec<usage::TenantUsageTimePoint>>> {
+) -> Result<Json<Vec<TenantUsageTimePoint>>> {
     Ok(Json(
         usage::query_usage_series_by_tenant(&state.clickhouse, q).await?,
     ))
@@ -6079,12 +6068,12 @@ async fn get_usage_series_tenants(
 #[utoipa::path(
     get, path = "/api/v1/usage/series/models", tag = "usage",
     params(usage::UsageSeriesQuery),
-    responses((status = 200, body = [usage::ModelUsageTimePoint]))
+    responses((status = 200, body = [ModelUsageTimePoint]))
 )]
 async fn get_usage_series_models(
     State(state): State<AdminState>,
     Query(q): Query<usage::UsageSeriesQuery>,
-) -> Result<Json<Vec<usage::ModelUsageTimePoint>>> {
+) -> Result<Json<Vec<ModelUsageTimePoint>>> {
     Ok(Json(
         usage::query_usage_series_by_model(&state.clickhouse, q).await?,
     ))
@@ -6093,12 +6082,12 @@ async fn get_usage_series_models(
 #[utoipa::path(
     get, path = "/api/v1/usage/speed", tag = "usage",
     params(usage::UsageSpeedQuery),
-    responses((status = 200, body = [usage::ModelSpeedPoint]))
+    responses((status = 200, body = [ModelSpeedPoint]))
 )]
 async fn get_usage_speed(
     State(state): State<AdminState>,
     Query(q): Query<usage::UsageSpeedQuery>,
-) -> Result<Json<Vec<usage::ModelSpeedPoint>>> {
+) -> Result<Json<Vec<ModelSpeedPoint>>> {
     if let Some(tz) = &q.tz {
         tz.parse::<chrono_tz::Tz>()
             .map_err(|_| AdminError::BadRequest(format!("unknown time zone: {tz}")))?;
@@ -6109,24 +6098,24 @@ async fn get_usage_speed(
 #[utoipa::path(
     get, path = "/api/v1/usage/cache", tag = "usage",
     params(usage::UsageQuery),
-    responses((status = 200, body = usage::CacheStats))
+    responses((status = 200, body = CacheStats))
 )]
 async fn get_cache_stats(
     State(state): State<AdminState>,
     Query(q): Query<usage::UsageQuery>,
-) -> Result<Json<usage::CacheStats>> {
+) -> Result<Json<CacheStats>> {
     Ok(Json(usage::query_cache_stats(&state.clickhouse, q).await?))
 }
 
 #[utoipa::path(
     get, path = "/api/v1/costs", tag = "usage",
     params(usage::UsageQuery),
-    responses((status = 200, body = [usage::CostAgg]))
+    responses((status = 200, body = [CostAgg]))
 )]
 async fn get_costs(
     State(state): State<AdminState>,
     Query(q): Query<usage::UsageQuery>,
-) -> Result<Json<Vec<usage::CostAgg>>> {
+) -> Result<Json<Vec<CostAgg>>> {
     let models = state.store.list_models().await?;
     let costs: Vec<(String, f64, f64)> = models
         .iter()
@@ -6146,10 +6135,10 @@ async fn get_costs(
 /// A request-log row enriched with the human-readable tenant and key names
 /// resolved from Postgres, so the live log view does not have to display bare
 /// UUIDs.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct UsageLogEntry {
     #[serde(flatten)]
-    pub row: usage::UsageLogRow,
+    pub row: UsageLogRow,
     pub tenant_name: String,
     pub key_name: String,
     pub key_prefix: String,
@@ -6171,8 +6160,7 @@ pub struct UsageLogEntry {
 #[utoipa::path(
     get, path = "/api/v1/usage/logs", tag = "usage",
     params(usage::UsageLogQuery),
-    responses((status = 200, body = [usage::UsageLogRow],
-        description = "Each row also includes tenant_name, key_name, and key_prefix resolved from Postgres",
+    responses((status = 200, body = [UsageLogEntry],
         headers(("x-obleth-truncated" = String, description = "`true` when rows past this page match"))))
 )]
 async fn get_usage_logs(
@@ -6229,12 +6217,12 @@ async fn get_usage_logs(
 #[utoipa::path(
     get, path = "/api/v1/usage/logs/facets", tag = "usage",
     params(usage::UsageLogQuery),
-    responses((status = 200, body = usage::UsageLogFacets))
+    responses((status = 200, body = UsageLogFacets))
 )]
 async fn get_usage_log_facets(
     State(state): State<AdminState>,
     Query(q): Query<usage::UsageLogQuery>,
-) -> Result<Json<usage::UsageLogFacets>> {
+) -> Result<Json<UsageLogFacets>> {
     let mut facets = usage::query_usage_log_facets(&state.clickhouse, q).await?;
     let ids = |values: &[usage::UsageLogFacet]| -> Vec<Uuid> {
         values
@@ -6274,12 +6262,12 @@ async fn get_usage_log_facets(
 #[utoipa::path(
     get, path = "/api/v1/usage/failures", tag = "usage",
     params(usage::UsageLogQuery),
-    responses((status = 200, body = usage::UsageFailureGroups))
+    responses((status = 200, body = UsageFailureGroups))
 )]
 async fn get_usage_failure_groups(
     State(state): State<AdminState>,
     Query(q): Query<usage::UsageLogQuery>,
-) -> Result<Json<usage::UsageFailureGroups>> {
+) -> Result<Json<UsageFailureGroups>> {
     let mut failures = usage::query_usage_failure_groups(&state.clickhouse, q).await?;
     let known = names::resolve_names(
         &state,
@@ -6304,25 +6292,25 @@ async fn get_usage_failure_groups(
 #[utoipa::path(
     get, path = "/api/v1/usage/logs/histogram", tag = "usage",
     params(usage::UsageLogQuery),
-    responses((status = 200, body = usage::UsageLogHistogram))
+    responses((status = 200, body = UsageLogHistogram))
 )]
 async fn get_usage_log_histogram(
     State(state): State<AdminState>,
     Query(q): Query<usage::UsageLogQuery>,
-) -> Result<Json<usage::UsageLogHistogram>> {
+) -> Result<Json<UsageLogHistogram>> {
     let (bucket_ms, buckets) = usage::query_usage_log_histogram(&state.clickhouse, q).await?;
-    Ok(Json(usage::UsageLogHistogram { bucket_ms, buckets }))
+    Ok(Json(UsageLogHistogram { bucket_ms, buckets }))
 }
 
 #[utoipa::path(
     get, path = "/api/v1/usage/logs/{request_id}/spans", tag = "usage",
     params(("request_id" = Uuid, Path, description = "Request id")),
-    responses((status = 200, body = [usage::SpanEntry]))
+    responses((status = 200, body = [SpanEntry]))
 )]
 async fn get_request_spans(
     State(state): State<AdminState>,
     Path(request_id): Path<Uuid>,
-) -> Result<Json<Vec<usage::SpanEntry>>> {
+) -> Result<Json<Vec<SpanEntry>>> {
     Ok(Json(
         usage::query_request_spans(&state.clickhouse, request_id).await?,
     ))
@@ -6331,10 +6319,10 @@ async fn get_request_spans(
 /// A per-model breakdown row enriched with human-readable tenant/key names and
 /// the tenant's fairshare group, resolved from Postgres so the model card's
 /// breakdown table does not have to display bare UUIDs.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct UsageBreakdownEntry {
     #[serde(flatten)]
-    pub row: usage::UsageKeyModelBreakdown,
+    pub row: UsageKeyModelBreakdown,
     pub tenant_name: String,
     pub fairshare_group: String,
     pub key_name: String,
@@ -6347,8 +6335,7 @@ pub struct UsageBreakdownEntry {
 #[utoipa::path(
     get, path = "/api/v1/usage/breakdown", tag = "usage",
     params(usage::UsageBreakdownQuery),
-    responses((status = 200, body = [usage::UsageKeyModelBreakdown],
-        description = "Each row also includes tenant_name, fairshare_group, key_name, and key_prefix resolved from Postgres"))
+    responses((status = 200, body = [UsageBreakdownEntry]))
 )]
 async fn get_usage_breakdown(
     State(state): State<AdminState>,
@@ -6391,12 +6378,12 @@ async fn get_usage_breakdown(
 #[utoipa::path(
     get, path = "/api/v1/usage/daily", tag = "usage",
     params(usage::UsageDailyQuery),
-    responses((status = 200, body = [usage::UsageDailyRow]))
+    responses((status = 200, body = [UsageDailyRow]))
 )]
 async fn get_usage_daily(
     State(state): State<AdminState>,
     Query(q): Query<usage::UsageDailyQuery>,
-) -> Result<Json<Vec<usage::UsageDailyRow>>> {
+) -> Result<Json<Vec<UsageDailyRow>>> {
     Ok(Json(usage::query_usage_daily(&state.clickhouse, q).await?))
 }
 
@@ -6751,12 +6738,12 @@ pub struct OverviewView {
     /// Totals of the previous window (counts as in `summary`).
     pub previous: OverviewSummaryView,
     /// Buckets over both windows, oldest first.
-    pub series: Vec<usage::UsageTimePoint>,
+    pub series: Vec<UsageTimePoint>,
     /// Per-model usage of the window, most tokens first.
-    pub models: Vec<usage::UsageModelAgg>,
+    pub models: Vec<UsageModelAgg>,
     /// Per-tenant usage of the window, most requests first.
-    pub tenants: Vec<usage::OverviewTenantUsage>,
-    pub cache: usage::CacheStats,
+    pub tenants: Vec<OverviewTenantUsage>,
+    pub cache: CacheStats,
 }
 
 /// The Overview in one read: totals of the window and the one before it,
@@ -6804,7 +6791,7 @@ async fn get_overview(
             .tenants
             .iter()
             .map(
-                |&(tenant_id, requests, total_tokens, cost_usd)| usage::OverviewTenantUsage {
+                |&(tenant_id, requests, total_tokens, cost_usd)| OverviewTenantUsage {
                     tenant_id,
                     name: names.tenant_name(&tenant_id).map(str::to_owned),
                     requests,
@@ -7220,7 +7207,7 @@ pub struct CapacityDiscoveryModelView {
     pub cluster_in_flight: Option<usize>,
     /// The answering replica's own in-flight requests for the model.
     pub in_flight: usize,
-    pub status: capacity_discovery::ModelCapacityStatus,
+    pub status: ModelCapacityStatus,
 }
 
 #[utoipa::path(
@@ -7234,13 +7221,12 @@ async fn get_capacity_discovery(
     let (mode, replicas, divisor) =
         enforcement(&state.fairshare_stats, state.fairshare_replica_aware);
     let local_in_flight = state.fairshare.model_load();
-    let statuses: std::collections::HashMap<String, capacity_discovery::ModelCapacityStatus> =
-        state
-            .capacity_discovery
-            .statuses()
-            .into_iter()
-            .map(|s| (s.model_name.clone(), s))
-            .collect();
+    let statuses: std::collections::HashMap<String, ModelCapacityStatus> = state
+        .capacity_discovery
+        .statuses()
+        .into_iter()
+        .map(|s| (s.model_name.clone(), s))
+        .collect();
     let discovered: Vec<obleth_config::ModelRoute> = state
         .store
         .list_models()
@@ -7271,7 +7257,7 @@ async fn get_capacity_discovery(
                 } else {
                     "waiting for the next discovery pass"
                 };
-                capacity_discovery::ModelCapacityStatus {
+                ModelCapacityStatus {
                     model_name: m.model_name.clone(),
                     source: m.capacity_source.clone(),
                     namespaces: Vec::new(),
@@ -7324,7 +7310,7 @@ async fn get_capacity_discovery(
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CapacityServicesView {
     /// Every Service with endpoints in the allowed namespaces.
-    pub services: Vec<capacity_discovery::ServiceSummary>,
+    pub services: Vec<ServiceSummary>,
     /// Why `services` is empty or incomplete, when it is.
     pub reason: Option<String>,
     /// Namespaces that could not be listed, with why.
@@ -7335,7 +7321,7 @@ pub struct CapacityServicesView {
     pub default_service: Option<String>,
     /// With `model`: that default Service, in the first allowed namespace
     /// that has it, as discovery would find it. `null` when none has it.
-    pub default_match: Option<capacity_discovery::ServiceSummary>,
+    pub default_match: Option<ServiceSummary>,
 }
 
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
@@ -7898,12 +7884,12 @@ async fn create_fairshare_group(
 }
 
 #[utoipa::path(
-    patch, path = "/api/v1/fairshare/groups/{name}/weight", tag = "fairshare",
+    put, path = "/api/v1/fairshare/groups/{name}/weight", tag = "fairshare",
     params(("name" = String, Path, description = "Fairshare group name")),
     request_body = UpdateGroupWeight,
     responses((status = 200, body = FairshareGroup))
 )]
-async fn patch_fairshare_group_weight(
+async fn set_fairshare_group_weight(
     State(state): State<AdminState>,
     Path(name): Path<String>,
     headers: HeaderMap,
@@ -7928,12 +7914,12 @@ async fn patch_fairshare_group_weight(
 }
 
 #[utoipa::path(
-    patch, path = "/api/v1/tenants/{id}/group", tag = "tenants",
+    put, path = "/api/v1/tenants/{id}/group", tag = "tenants",
     params(("id" = Uuid, Path, description = "Tenant id")),
     request_body = UpdateTenantGroup,
     responses((status = 200, body = Tenant))
 )]
-async fn patch_tenant_group(
+async fn set_tenant_group(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
@@ -8188,14 +8174,14 @@ fn check_variants(
     raw: &[ModelVariantWrite],
     model_name: &str,
     aliases: &[String],
-) -> Result<Vec<obleth_config::ModelVariant>> {
+) -> Result<Vec<ModelVariant>> {
     if raw.len() > obleth_config::MAX_MODEL_VARIANTS {
         return Err(AdminError::BadRequest(format!(
             "a model can have at most {} variants",
             obleth_config::MAX_MODEL_VARIANTS
         )));
     }
-    let mut out: Vec<obleth_config::ModelVariant> = Vec::with_capacity(raw.len());
+    let mut out: Vec<ModelVariant> = Vec::with_capacity(raw.len());
     for v in raw {
         let name = v.name.trim();
         if name.is_empty() {
@@ -8231,7 +8217,7 @@ fn check_variants(
                 obleth_config::MODEL_BOONS.join(", ")
             )));
         }
-        out.push(obleth_config::ModelVariant {
+        out.push(ModelVariant {
             name: name.to_string(),
             description: v
                 .description
@@ -8258,7 +8244,7 @@ async fn validate_variants(
     editing: Option<Uuid>,
     model_name: &str,
     aliases: &[String],
-) -> Result<Vec<obleth_config::ModelVariant>> {
+) -> Result<Vec<ModelVariant>> {
     let variants = check_variants(raw, model_name, aliases)?;
     for v in &variants {
         if let Some((owner_id, owner_name)) = state.store.model_name_owner(&v.name).await? {
@@ -8474,9 +8460,9 @@ async fn create_model(
         &[],
     )?;
     let model_type = validate_model_type(body.model_type.as_deref().unwrap_or("chat"))?;
-    let lifecycle = obleth_config::ModelLifecycle {
+    let lifecycle = ModelLifecycle {
         status: initial_status,
-        changed_at: (initial_status == obleth_config::ModelStatus::Staged).then(chrono::Utc::now),
+        changed_at: (initial_status == ModelStatus::Staged).then(chrono::Utc::now),
         ..Default::default()
     };
     // One insert: switched off, staged, restricted and scheduled for health
@@ -8774,10 +8760,8 @@ async fn set_model_capacity(
 /// The status a new model starts in: `active` unless the request asks for
 /// `staged`. Deprecating or retiring something nobody has called yet means
 /// nothing, so those are refused rather than stored.
-fn initial_model_status(
-    requested: Option<obleth_config::ModelStatus>,
-) -> Result<obleth_config::ModelStatus> {
-    use obleth_config::ModelStatus;
+fn initial_model_status(requested: Option<ModelStatus>) -> Result<ModelStatus> {
+    use ModelStatus;
     match requested.unwrap_or_default() {
         status @ (ModelStatus::Staged | ModelStatus::Active) => Ok(status),
         other => Err(AdminError::BadRequest(format!(
@@ -8795,7 +8779,7 @@ fn lifecycle_from_request(
     body: SetModelStatus,
     replacement: Option<&ModelRoute>,
     now: chrono::DateTime<chrono::Utc>,
-) -> Result<obleth_config::ModelLifecycle> {
+) -> Result<ModelLifecycle> {
     use obleth_config::{ModelLifecycle, ModelStatus};
     let changed_at = if body.status == existing.lifecycle.status {
         existing.lifecycle.changed_at.or(Some(now))
@@ -8893,11 +8877,7 @@ async fn set_model_status(
 ) -> Result<Json<ModelRouteView>> {
     let existing = state.store.get_model(id).await?;
     let replacement = match body.replacement.as_deref().map(str::trim).filter(|r| {
-        !r.is_empty()
-            && matches!(
-                body.status,
-                obleth_config::ModelStatus::Deprecated | obleth_config::ModelStatus::Retired
-            )
+        !r.is_empty() && matches!(body.status, ModelStatus::Deprecated | ModelStatus::Retired)
     }) {
         Some(name) => match state.store.get_model_by_name(name).await {
             Ok(m) => Some(m),
@@ -8931,7 +8911,7 @@ async fn set_model_status(
 
 /// Check a reasoning map for `model`: well formed, and only on a chat
 /// model unless it is pass-through.
-fn check_reasoning(model: &ModelRoute, reasoning: &obleth_config::ModelReasoning) -> Result<()> {
+fn check_reasoning(model: &ModelRoute, reasoning: &ModelReasoning) -> Result<()> {
     reasoning.validate().map_err(AdminError::BadRequest)?;
     if !reasoning.is_passthrough() && model.model_type != "chat" {
         return Err(AdminError::BadRequest(format!(
@@ -8945,14 +8925,14 @@ fn check_reasoning(model: &ModelRoute, reasoning: &obleth_config::ModelReasoning
 #[utoipa::path(
     put, path = "/api/v1/models/{id}/reasoning", tag = "models",
     params(("id" = Uuid, Path, description = "Model id")),
-    request_body = obleth_config::ModelReasoning,
+    request_body = ModelReasoning,
     responses((status = 200, body = ModelRouteView))
 )]
 async fn set_model_reasoning(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
-    Json(body): Json<obleth_config::ModelReasoning>,
+    Json(body): Json<ModelReasoning>,
 ) -> Result<Json<ModelRouteView>> {
     let existing = state.store.get_model(id).await?;
     check_reasoning(&existing, &body)?;
@@ -9042,14 +9022,14 @@ async fn set_model_rejected_request_fields(
 #[utoipa::path(
     put, path = "/api/v1/models/{id}/session-affinity", tag = "models",
     params(("id" = Uuid, Path, description = "Model id")),
-    request_body = obleth_config::ModelSessionAffinity,
+    request_body = ModelSessionAffinity,
     responses((status = 200, body = ModelRouteView), (status = 400), (status = 404))
 )]
 async fn set_model_session_affinity(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
-    Json(body): Json<obleth_config::ModelSessionAffinity>,
+    Json(body): Json<ModelSessionAffinity>,
 ) -> Result<Json<ModelRouteView>> {
     body.validate().map_err(AdminError::BadRequest)?;
     let model = state.store.set_model_session_affinity(id, &body).await?;
@@ -9088,12 +9068,7 @@ async fn check_family(
     state: &AdminState,
     body: ModelFamilyWrite,
     editing: Option<Uuid>,
-) -> Result<(
-    String,
-    String,
-    obleth_config::ReasoningLevel,
-    obleth_config::FamilyMembers,
-)> {
+) -> Result<(String, String, ReasoningLevel, FamilyMembers)> {
     let name = body.name.trim().to_string();
     if name.is_empty() {
         return Err(AdminError::BadRequest("name must not be empty".into()));
@@ -9130,8 +9105,8 @@ async fn check_family(
             obleth_config::reasoning::MAX_FAMILY_DESCRIPTION_CHARS
         )));
     }
-    let mut members = obleth_config::FamilyMembers::default();
-    for level in obleth_config::ReasoningLevel::ALL {
+    let mut members = FamilyMembers::default();
+    for level in ReasoningLevel::ALL {
         let raw = body.members.get(level).trim();
         if raw.is_empty() {
             return Err(AdminError::BadRequest(format!(
@@ -9157,24 +9132,22 @@ async fn check_family(
 
 #[utoipa::path(
     get, path = "/api/v1/model-families", tag = "models",
-    responses((status = 200, body = [obleth_config::ModelFamily]))
+    responses((status = 200, body = [ModelFamily]))
 )]
-async fn list_model_families(
-    State(state): State<AdminState>,
-) -> Result<Json<Vec<obleth_config::ModelFamily>>> {
+async fn list_model_families(State(state): State<AdminState>) -> Result<Json<Vec<ModelFamily>>> {
     Ok(Json(state.store.list_model_families().await?))
 }
 
 #[utoipa::path(
     post, path = "/api/v1/model-families", tag = "models",
     request_body = ModelFamilyWrite,
-    responses((status = 200, body = obleth_config::ModelFamily))
+    responses((status = 200, body = ModelFamily))
 )]
 async fn create_model_family(
     State(state): State<AdminState>,
     headers: HeaderMap,
     Json(body): Json<ModelFamilyWrite>,
-) -> Result<Json<obleth_config::ModelFamily>> {
+) -> Result<Json<ModelFamily>> {
     let (name, description, default_level, members) = check_family(&state, body, None).await?;
     let family = state
         .store
@@ -9201,14 +9174,14 @@ async fn create_model_family(
     put, path = "/api/v1/model-families/{id}", tag = "models",
     params(("id" = Uuid, Path, description = "Family id")),
     request_body = ModelFamilyWrite,
-    responses((status = 200, body = obleth_config::ModelFamily))
+    responses((status = 200, body = ModelFamily))
 )]
 async fn update_model_family(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(body): Json<ModelFamilyWrite>,
-) -> Result<Json<obleth_config::ModelFamily>> {
+) -> Result<Json<ModelFamily>> {
     state.store.get_model_family(id).await?;
     let (name, description, default_level, members) = check_family(&state, body, Some(id)).await?;
     let family = state
@@ -9320,15 +9293,15 @@ async fn set_model_capacity_mode(
     post,
     path = "/api/v1/models/{id}/autotune",
     tag = "models",
-    request_body = autotune::AutotuneRequest,
-    responses((status = 200, body = autotune::AutotuneReport))
+    request_body = AutotuneRequest,
+    responses((status = 200, body = AutotuneReport))
 )]
 async fn autotune_model(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
-    Json(body): Json<autotune::AutotuneRequest>,
-) -> Result<Json<autotune::AutotuneReport>> {
+    Json(body): Json<AutotuneRequest>,
+) -> Result<Json<AutotuneReport>> {
     let model = state.store.get_model(id).await?;
     let report = autotune::run_probe(&state.health.http, &model, &body)
         .await
@@ -9694,7 +9667,7 @@ async fn delete_model_endpoint(
 
 // ---- managed model spec --------------------------------------------------
 
-#[utoipa::path(get, path = "/api/v1/managed",
+#[utoipa::path(get, path = "/api/v1/managed", tag = "models",
     responses((status = 200, body = [ManagedModelSpec])))]
 async fn list_managed_models(
     State(state): State<AdminState>,
@@ -9702,7 +9675,7 @@ async fn list_managed_models(
     Ok(Json(state.store.list_managed_models().await?))
 }
 
-#[utoipa::path(get, path = "/api/v1/models/{id}/managed",
+#[utoipa::path(get, path = "/api/v1/models/{id}/managed", tag = "models",
     responses((status = 200, body = Option<ManagedModelSpec>)))]
 async fn get_managed_model(
     State(state): State<AdminState>,
@@ -9711,7 +9684,7 @@ async fn get_managed_model(
     Ok(Json(state.store.get_managed_model(id).await?))
 }
 
-#[utoipa::path(put, path = "/api/v1/models/{id}/managed",
+#[utoipa::path(put, path = "/api/v1/models/{id}/managed", tag = "models",
     request_body = PutManagedModel,
     responses((status = 200, body = ManagedModelSpec)))]
 async fn put_managed_model(
@@ -9809,14 +9782,19 @@ fn managed_model_audit(spec: &impl serde::Serialize) -> serde_json::Value {
     detail
 }
 
-#[utoipa::path(delete, path = "/api/v1/models/{id}/managed",
-    responses((status = 200)))]
+#[utoipa::path(delete, path = "/api/v1/models/{id}/managed", tag = "models",
+    params(("id" = Uuid, Path, description = "Model id")),
+    responses((status = 204), (status = 404, description = "The model has no launch spec")))]
 async fn delete_managed_model(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
-) -> Result<Json<serde_json::Value>> {
-    let previous = state.store.get_managed_model(id).await?;
+) -> Result<StatusCode> {
+    let previous = state
+        .store
+        .get_managed_model(id)
+        .await?
+        .ok_or(obleth_store::StoreError::NotFound)?;
     state.store.delete_managed_model(id).await?;
     state
         .store
@@ -9825,13 +9803,10 @@ async fn delete_managed_model(
             "delete_managed_model",
             "managed_model",
             &id.to_string(),
-            previous
-                .as_ref()
-                .map(managed_model_audit)
-                .unwrap_or_else(|| serde_json::json!({})),
+            managed_model_audit(&previous),
         )
         .await?;
-    Ok(Json(serde_json::json!({"deleted": true})))
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(serde::Deserialize, ToSchema)]
@@ -9840,7 +9815,7 @@ pub struct ProvisionErrorBody {
     pub error: Option<String>,
 }
 
-#[utoipa::path(patch, path = "/api/v1/models/{id}/managed/provision-error",
+#[utoipa::path(patch, path = "/api/v1/models/{id}/managed/provision-error", tag = "models",
     request_body = ProvisionErrorBody,
     responses((status = 200)))]
 async fn set_provision_error(
@@ -9894,7 +9869,7 @@ pub(crate) struct ManagedActionResult {
 /// "Try again": lift a pause set by the failure limit or a Slurm rejection,
 /// and reset the backoff, so the provisioner's next pass submits.
 #[utoipa::path(post, path = "/api/v1/models/{id}/managed/retry", tag = "slurm",
-    params(("id" = String, Path, description = "Model id")),
+    params(("id" = Uuid, Path, description = "Model id")),
     responses((status = 200, body = ManagedActionResult), (status = 404)))]
 async fn retry_managed_model(
     State(state): State<AdminState>,
@@ -9929,7 +9904,7 @@ async fn retry_managed_model(
 /// Replace every live replica one at a time, each replacement started before
 /// the old one is drained, so spec edits apply without an outage.
 #[utoipa::path(post, path = "/api/v1/models/{id}/managed/roll", tag = "slurm",
-    params(("id" = String, Path, description = "Model id")),
+    params(("id" = Uuid, Path, description = "Model id")),
     responses((status = 200, body = ManagedActionResult), (status = 404)))]
 async fn roll_managed_model(
     State(state): State<AdminState>,
@@ -9968,14 +9943,14 @@ async fn roll_managed_model(
 
 /// The provisioner records a managed model's failure count and pause state.
 #[utoipa::path(put, path = "/api/v1/models/{id}/managed/backoff", tag = "slurm",
-    params(("id" = String, Path, description = "Model id")),
-    request_body = obleth_config::ManagedBackoff,
+    params(("id" = Uuid, Path, description = "Model id")),
+    request_body = ManagedBackoff,
     responses((status = 200)))]
 async fn set_managed_backoff(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
-    Json(body): Json<obleth_config::ManagedBackoff>,
+    Json(body): Json<ManagedBackoff>,
 ) -> Result<Json<serde_json::Value>> {
     let before = state.store.get_managed_model(id).await?;
     state.store.set_managed_backoff(id, &body).await?;
@@ -10005,7 +9980,7 @@ async fn set_managed_backoff(
 
 // ---- replica registry ----------------------------------------------------
 
-#[utoipa::path(get, path = "/api/v1/models/{id}/replicas",
+#[utoipa::path(get, path = "/api/v1/models/{id}/replicas", tag = "models",
     responses((status = 200, body = [ModelReplica])))]
 async fn list_replicas(
     State(state): State<AdminState>,
@@ -10014,13 +9989,13 @@ async fn list_replicas(
     Ok(Json(state.store.list_replicas(id).await?))
 }
 
-#[utoipa::path(get, path = "/api/v1/replicas",
+#[utoipa::path(get, path = "/api/v1/replicas", tag = "models",
     responses((status = 200, body = [ModelReplica])))]
 async fn list_all_replicas(State(state): State<AdminState>) -> Result<Json<Vec<ModelReplica>>> {
     Ok(Json(state.store.all_replicas().await?))
 }
 
-#[utoipa::path(post, path = "/api/v1/models/{id}/replicas",
+#[utoipa::path(post, path = "/api/v1/models/{id}/replicas", tag = "models",
     request_body = CreateReplica,
     responses((status = 200, body = ModelReplica)))]
 async fn create_replica(
@@ -10051,7 +10026,7 @@ async fn create_replica(
     Ok(Json(r))
 }
 
-#[utoipa::path(patch, path = "/api/v1/replicas/{id}",
+#[utoipa::path(patch, path = "/api/v1/replicas/{id}", tag = "models",
     request_body = PatchReplica,
     responses((status = 200, body = ModelReplica)))]
 async fn patch_replica(
@@ -10113,7 +10088,7 @@ async fn patch_replica(
     Ok(Json(current))
 }
 
-#[utoipa::path(post, path = "/api/v1/replicas/{id}/restart",
+#[utoipa::path(post, path = "/api/v1/replicas/{id}/restart", tag = "models",
     responses((status = 200)))]
 async fn restart_replica(
     State(state): State<AdminState>,
@@ -10152,7 +10127,7 @@ async fn restart_replica(
     })))
 }
 
-#[utoipa::path(delete, path = "/api/v1/replicas/{id}",
+#[utoipa::path(delete, path = "/api/v1/replicas/{id}", tag = "models",
     params(DeleteReplicaQuery),
     responses(
         (status = 200, description = "The row was deleted (a lost replica, or `force`)"),
@@ -10209,7 +10184,7 @@ async fn delete_replica(
     Ok((StatusCode::OK, Json(serde_json::json!({"deleted": true}))))
 }
 
-#[utoipa::path(post, path = "/api/v1/models/{id}/replicas/clear-lost",
+#[utoipa::path(post, path = "/api/v1/models/{id}/replicas/clear-lost", tag = "models",
     responses((status = 200, body = serde_json::Value)))]
 pub async fn clear_lost_replicas(
     State(state): State<AdminState>,
@@ -10245,7 +10220,7 @@ pub struct DeploymentLaunchesQuery {
 /// Launch history of Slurm-backed replicas, newest first. Rows outlive the
 /// replica rows they describe; `queued_secs`, `load_secs` and `ran_secs` are
 /// computed (ran counts to now while the launch is still going).
-#[utoipa::path(get, path = "/api/v1/deployments/launches",
+#[utoipa::path(get, path = "/api/v1/deployments/launches", tag = "models",
     params(DeploymentLaunchesQuery),
     responses((status = 200, body = [DeploymentLaunch])))]
 async fn list_deployment_launches(
@@ -10597,7 +10572,7 @@ pub struct DailyStatsView {
 /// Daily usage counters the proxy keeps in Redis: MCP calls per server and
 /// knowledge searches per collection. Best-effort and about 40 days deep.
 #[utoipa::path(
-    get, path = "/api/v1/stats/daily", tag = "stats",
+    get, path = "/api/v1/stats/daily", tag = "usage",
     params(DailyStatsQuery),
     responses((status = 200, body = DailyStatsView))
 )]
@@ -10668,7 +10643,7 @@ async fn get_daily_stats(
 #[utoipa::path(
     get, path = "/api/v1/audit", tag = "audit",
     params(AuditQuery),
-    responses((status = 200, body = [AuditEntryView]))
+    responses((status = 200, body = [AuditEntry]))
 )]
 async fn get_audit(
     State(state): State<AdminState>,
@@ -11512,6 +11487,156 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// A key's and a tenant's on/off settings answer 200 with the updated row,
+    /// a missing id is 404, and the old `PATCH` verb on a tenant setter is
+    /// still served.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn toggles_answer_the_updated_row_and_a_missing_id_is_404() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let name = format!("toggles-{}", Uuid::new_v4());
+        let (_, tenant) = send(
+            &t.app,
+            json_request("POST", "/api/v1/tenants", serde_json::json!({"name": name})),
+        )
+        .await;
+        let tid = tenant["id"].as_str().expect("tenant id").to_string();
+        let (_, created) = send(
+            &t.app,
+            json_request(
+                "POST",
+                &format!("/api/v1/tenants/{tid}/keys"),
+                serde_json::json!({"name": "k"}),
+            ),
+        )
+        .await;
+        let kid = created["key"]["id"].as_str().expect("key id").to_string();
+        let missing = Uuid::new_v4();
+        for (route, field) in [
+            ("disabled", "disabled"),
+            ("tracing", "tracing_enabled"),
+            ("end-user-fairshare", "end_user_fairshare"),
+            ("background", "background"),
+        ] {
+            for on in [true, false] {
+                let (status, key) = send(
+                    &t.app,
+                    json_request(
+                        "PUT",
+                        &format!("/api/v1/keys/{kid}/{route}"),
+                        serde_json::json!({ field: on }),
+                    ),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{route}");
+                assert_eq!(
+                    (key["id"].as_str(), &key[field]),
+                    (Some(kid.as_str()), &serde_json::json!(on)),
+                    "{route}"
+                );
+            }
+            let (status, _) = send(
+                &t.app,
+                json_request(
+                    "PUT",
+                    &format!("/api/v1/keys/{missing}/{route}"),
+                    serde_json::json!({ field: true }),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{route}");
+        }
+        for (route, field) in [("tracing", "tracing_enabled"), ("synthetic", "synthetic")] {
+            let (status, row) = send(
+                &t.app,
+                json_request(
+                    "PUT",
+                    &format!("/api/v1/tenants/{tid}/{route}"),
+                    serde_json::json!({ field: true }),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{route}");
+            assert_eq!(
+                (row["id"].as_str(), &row[field]),
+                (Some(tid.as_str()), &serde_json::json!(true)),
+                "{route}"
+            );
+            let (status, _) = send(
+                &t.app,
+                json_request(
+                    "PUT",
+                    &format!("/api/v1/tenants/{missing}/{route}"),
+                    serde_json::json!({ field: true }),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{route}");
+        }
+        for method in ["PUT", "PATCH"] {
+            let (status, row) = send(
+                &t.app,
+                json_request(
+                    method,
+                    &format!("/api/v1/tenants/{tid}/weight"),
+                    serde_json::json!({"weight": 250}),
+                ),
+            )
+            .await;
+            assert_eq!(
+                (status, row["weight"].as_i64()),
+                (StatusCode::OK, Some(250)),
+                "{method}"
+            );
+        }
+        let (status, _) = send(
+            &t.app,
+            json_request(
+                "DELETE",
+                &format!("/api/v1/tenants/{tid}"),
+                serde_json::Value::Null,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    /// Deleting something that does not exist is 404 on every delete route.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn deleting_a_missing_id_is_404() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let m = Uuid::new_v4();
+        let mut wrong = Vec::new();
+        for path in [
+            format!("/api/v1/tenants/{m}"),
+            format!("/api/v1/keys/{m}"),
+            format!("/api/v1/models/{m}"),
+            format!("/api/v1/model-families/{m}"),
+            format!("/api/v1/models/{m}/endpoints/{m}"),
+            format!("/api/v1/models/{m}/managed"),
+            format!("/api/v1/replicas/{m}"),
+            format!("/api/v1/mcp-servers/{m}"),
+            format!("/api/v1/recipes/{m}"),
+            format!("/api/v1/knowledge/collections/{m}"),
+            format!("/api/v1/knowledge/documents/{m}"),
+        ] {
+            let (status, _) = send(
+                &t.app,
+                json_request("DELETE", &path, serde_json::Value::Null),
+            )
+            .await;
+            if status != StatusCode::NOT_FOUND {
+                wrong.push(format!("DELETE {path}: {status}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     /// Every model's endpoints come back in one read, each naming its model,
@@ -13653,7 +13778,7 @@ mod tests {
             serde_json::json!(false),
             "off by default"
         );
-        assert_eq!(on_status, StatusCode::NO_CONTENT);
+        assert_eq!(on_status, StatusCode::OK);
         assert_eq!(after_put["weight"], serde_json::json!(300));
         assert_eq!(
             after_put["end_user_fairshare"],
@@ -13665,7 +13790,7 @@ mod tests {
             Some(true),
             "the gateway's resolved key carries it"
         );
-        assert_eq!(off_status, StatusCode::NO_CONTENT);
+        assert_eq!(off_status, StatusCode::OK);
         assert_eq!(listed_off, Some(false));
     }
 
@@ -14282,7 +14407,7 @@ mod tests {
         );
         assert_eq!(anon_status, StatusCode::UNAUTHORIZED, "operator-only");
         assert_eq!(after_anon, Some(false), "a refused call changes nothing");
-        assert_eq!(on_status, StatusCode::NO_CONTENT);
+        assert_eq!(on_status, StatusCode::OK);
         assert_eq!(after_put["weight"], serde_json::json!(300));
         assert_eq!(
             after_put["background"],
@@ -14299,7 +14424,7 @@ mod tests {
             Some(serde_json::json!(true)),
             "the key list shows it"
         );
-        assert_eq!(off_status, StatusCode::NO_CONTENT);
+        assert_eq!(off_status, StatusCode::OK);
         assert_eq!(listed_off, Some(false));
         assert_eq!(missing_status, StatusCode::NOT_FOUND);
     }
@@ -14695,8 +14820,14 @@ mod tests {
                 .expect("key");
             keys.push(key);
         }
-        t.store.set_key_disabled(keys[1].id, true).await.unwrap();
-        t.store.set_key_disabled(keys[4].id, true).await.unwrap();
+        t.store
+            .set_key_flag(keys[1].id, KeyFlag::Disabled, true)
+            .await
+            .unwrap();
+        t.store
+            .set_key_flag(keys[4].id, KeyFlag::Disabled, true)
+            .await
+            .unwrap();
         let scope = format!("tenant_id={}", tenant.id);
         let created: Vec<Uuid> = keys.iter().map(|k| k.id).collect();
         let mut by_name = keys.clone();
@@ -15721,51 +15852,6 @@ mod tests {
             assert!(!msg.contains('\n'), "{msg:?}");
             assert!(!msg.contains("  "), "{msg:?}");
             assert!(msg.contains(RESYNC_ROUTE), "{msg:?}");
-        }
-    }
-
-    /// Handlers that once carried `#[utoipa::path]` (or none) without being
-    /// listed in `paths(...)`, plus the schemas their annotations reference.
-    #[test]
-    fn openapi_doc_exposes_previously_unregistered_handlers() {
-        use utoipa::OpenApi;
-        let doc = serde_json::to_value(ApiDoc::openapi()).expect("serialize the openapi doc");
-        for (path, method) in [
-            ("/api/v1/resync", "post"),
-            ("/api/v1/replicas/{id}/restart", "post"),
-            ("/api/v1/keys/{id}/tracing", "put"),
-            ("/api/v1/keys/{id}/end-user-fairshare", "put"),
-            ("/api/v1/keys/{id}/background", "put"),
-            ("/api/v1/usage/key-sources", "get"),
-            ("/api/v1/usage/key-rejections", "get"),
-            ("/api/v1/settings/networks", "get"),
-            ("/api/v1/settings/networks", "put"),
-            ("/api/v1/tenants/{id}/tracing", "put"),
-            ("/api/v1/usage/logs/{request_id}/spans", "get"),
-            ("/api/v1/models/{id}/managed/provision-error", "patch"),
-            ("/api/v1/models/{id}/rejected-request-fields", "put"),
-            ("/api/v1/models/{id}/session-affinity", "put"),
-        ] {
-            assert!(
-                doc["paths"][path][method].is_object(),
-                "{method} {path} is missing from paths(...)"
-            );
-        }
-        let schemas = &doc["components"]["schemas"];
-        for name in [
-            "ResyncReport",
-            "SetKeyTracing",
-            "SetKeyEndUserFairshare",
-            "SetKeyBackground",
-            "KeySource",
-            "KeyRejectionAgg",
-            "ProvisionErrorBody",
-            "SpanEntry",
-        ] {
-            assert!(
-                schemas.get(name).is_some(),
-                "{name} is not registered in components(...)"
-            );
         }
     }
 

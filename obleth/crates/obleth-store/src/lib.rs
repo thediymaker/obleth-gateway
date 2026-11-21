@@ -1342,116 +1342,46 @@ impl Store {
         Ok((hash, key, resolved, from))
     }
 
-    pub async fn set_key_disabled(
+    /// Turn one of a key's own on/off settings on or off (see [`KeyFlag`]).
+    /// Returns the key's hash, the updated key and its hot-path view.
+    pub async fn set_key_flag(
         &self,
         id: Uuid,
-        disabled: bool,
-    ) -> Result<(String, ResolvedKey)> {
+        flag: KeyFlag,
+        on: bool,
+    ) -> Result<(String, ApiKey, ResolvedKey)> {
         self.guard_reserved_key(id).await?;
-        let row = sqlx::query(
-            "update api_keys set disabled = $2, updated_at = now() where id = $1 returning key_hash",
-        )
-            .bind(id)
-            .bind(disabled)
-            .fetch_optional(&self.pool)
-            .await?
-            .ok_or(StoreError::NotFound)?;
-        let hash: String = row.try_get("key_hash")?;
-        let resolved = self
-            .resolved_key_by_hash(&hash)
-            .await?
-            .ok_or(StoreError::NotFound)?;
-        Ok((hash, resolved))
-    }
-
-    pub async fn set_key_tracing(
-        &self,
-        id: Uuid,
-        tracing_enabled: bool,
-    ) -> Result<(String, ResolvedKey)> {
-        self.guard_reserved_key(id).await?;
-        let row = sqlx::query(
-            "update api_keys set tracing_enabled = $2, updated_at = now() \
-             where id = $1 returning key_hash",
-        )
+        let row = sqlx::query(&format!(
+            "update api_keys k set {} = $2, updated_at = now() where k.id = $1
+             returning k.key_hash, {KEY_COLS}",
+            flag.column()
+        ))
         .bind(id)
-        .bind(tracing_enabled)
+        .bind(on)
         .fetch_optional(&self.pool)
         .await?
         .ok_or(StoreError::NotFound)?;
         let hash: String = row.try_get("key_hash")?;
+        let key = api_key_from_row(&row)?;
         let resolved = self
             .resolved_key_by_hash(&hash)
             .await?
             .ok_or(StoreError::NotFound)?;
-        Ok((hash, resolved))
+        Ok((hash, key, resolved))
     }
 
-    /// Turn per-end-user fairshare on or off for a key (see
-    /// `ApiKey::end_user_fairshare`). Its own call, like tracing, so the
-    /// whole-key `PUT` (which resets omitted fields) can never switch it off
-    /// by leaving it out.
-    pub async fn set_key_end_user_fairshare(
-        &self,
-        id: Uuid,
-        enabled: bool,
-    ) -> Result<(String, ResolvedKey)> {
-        self.guard_reserved_key(id).await?;
-        let row = sqlx::query(
-            "update api_keys set end_user_fairshare = $2, updated_at = now() \
-             where id = $1 returning key_hash",
-        )
-        .bind(id)
-        .bind(enabled)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(StoreError::NotFound)?;
-        let hash: String = row.try_get("key_hash")?;
-        let resolved = self
-            .resolved_key_by_hash(&hash)
-            .await?
-            .ok_or(StoreError::NotFound)?;
-        Ok((hash, resolved))
-    }
-
-    /// Turn background priority on or off for a key (see
-    /// `ApiKey::background`). Its own call, like per-end-user fairshare, so
-    /// the whole-key `PUT` (which resets omitted fields) can never switch it
-    /// off by leaving it out.
-    pub async fn set_key_background(
-        &self,
-        id: Uuid,
-        enabled: bool,
-    ) -> Result<(String, ResolvedKey)> {
-        self.guard_reserved_key(id).await?;
-        let row = sqlx::query(
-            "update api_keys set background = $2, updated_at = now() \
-             where id = $1 returning key_hash",
-        )
-        .bind(id)
-        .bind(enabled)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(StoreError::NotFound)?;
-        let hash: String = row.try_get("key_hash")?;
-        let resolved = self
-            .resolved_key_by_hash(&hash)
-            .await?
-            .ok_or(StoreError::NotFound)?;
-        Ok((hash, resolved))
-    }
-
-    pub async fn set_tenant_tracing(&self, id: Uuid, tracing_enabled: bool) -> Result<()> {
+    pub async fn set_tenant_tracing(&self, id: Uuid, tracing_enabled: bool) -> Result<Tenant> {
         Self::guard_reserved_tenant(id)?;
-        sqlx::query(
-            "update tenants set tracing_enabled = $2, updated_at = now() where id = $1 returning id",
-        )
+        let row = sqlx::query(&format!(
+            "update tenants set tracing_enabled = $2, updated_at = now() where id = $1
+             returning {TENANT_COLUMNS}"
+        ))
         .bind(id)
         .bind(tracing_enabled)
         .fetch_optional(&self.pool)
         .await?
         .ok_or(StoreError::NotFound)?;
-        Ok(())
+        tenant_from_row(&row)
     }
 
     /// Mark a tenant as synthetic (benchmark/test traffic) or real.
@@ -2687,11 +2617,16 @@ impl Store {
         managed_model_from_row(&row)
     }
 
+    /// Stop managing a model; `NotFound` when it has no launch spec.
     pub async fn delete_managed_model(&self, model_id: Uuid) -> Result<()> {
-        sqlx::query("delete from managed_models where model_id = $1")
+        let deleted = sqlx::query("delete from managed_models where model_id = $1")
             .bind(model_id)
             .execute(&self.pool)
-            .await?;
+            .await?
+            .rows_affected();
+        if deleted == 0 {
+            return Err(StoreError::NotFound);
+        }
         Ok(())
     }
 
@@ -4139,6 +4074,32 @@ fn contains_pattern(q: &str) -> String {
     out
 }
 
+/// A key's on/off settings that each have their own route, so a whole-key
+/// `PUT` can never switch one by leaving it out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyFlag {
+    /// `ApiKey::disabled`: the key is refused.
+    Disabled,
+    /// `ApiKey::tracing_enabled`.
+    Tracing,
+    /// `ApiKey::end_user_fairshare`.
+    EndUserFairshare,
+    /// `ApiKey::background`.
+    Background,
+}
+
+impl KeyFlag {
+    /// The `api_keys` column, which is also the `ApiKey` field.
+    pub fn column(self) -> &'static str {
+        match self {
+            KeyFlag::Disabled => "disabled",
+            KeyFlag::Tracing => "tracing_enabled",
+            KeyFlag::EndUserFairshare => "end_user_fairshare",
+            KeyFlag::Background => "background",
+        }
+    }
+}
+
 /// The columns `api_key_from_row` reads, from `api_keys` aliased `k`.
 const KEY_COLS: &str = "k.id, k.tenant_id, k.name, k.description, k.key_prefix,
     k.budget_tokens, k.budget_cost_usd, k.budget_period, k.budget_started_at,
@@ -4167,7 +4128,8 @@ pub struct AuditFilter {
     pub limit: i64,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+/// One row of the admin audit log (`GET /api/v1/audit`).
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct AuditEntry {
     pub id: i64,
     pub ts: DateTime<Utc>,
@@ -7645,7 +7607,9 @@ mod tests {
         let hash = hash_api_key(&secret);
         let resolved = store.resolved_key_by_hash(&hash).await.unwrap().unwrap();
         assert!(matches!(
-            store.set_key_disabled(resolved.key_id, true).await,
+            store
+                .set_key_flag(resolved.key_id, KeyFlag::Disabled, true)
+                .await,
             Err(StoreError::Protected(_))
         ));
         assert!(matches!(

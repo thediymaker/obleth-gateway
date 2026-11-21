@@ -10,6 +10,7 @@ serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+utoipa.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 obleth-config.workspace = true

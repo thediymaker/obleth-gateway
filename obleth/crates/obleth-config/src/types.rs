@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::reasoning::ModelReasoning;
+use crate::reasoning::{ModelFamily, ModelReasoning};
 
 /// How global concurrency is divided among tenants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
@@ -476,6 +476,7 @@ pub struct ModelRoute {
     /// the client's forwarded headers so the operator's value wins. Values
     /// are stored encrypted at rest and never returned by the Management API.
     #[serde(default)]
+    #[schema(value_type = std::collections::BTreeMap<String, String>)]
     pub upstream_headers: UpstreamHeaders,
     /// Modality from the fixed [`MODEL_TYPES`] vocabulary. Determines which
     /// OpenAI endpoint this model serves (`chat`, `embedding`,
@@ -3867,7 +3868,7 @@ pub struct BackupData {
     pub app_settings: Vec<AppSettingBackup>,
     /// Absent in backups taken before families existed.
     #[serde(default)]
-    pub model_families: Vec<crate::reasoning::ModelFamily>,
+    pub model_families: Vec<ModelFamily>,
     /// Slurm deployment specs (what to run and where). Absent in older backups.
     #[serde(default)]
     pub managed_models: Vec<ManagedModelBackup>,
@@ -4125,6 +4126,7 @@ pub struct ModelBackup {
     /// Upstream header values as stored (ciphertext on encrypted instances),
     /// like `api_key`. Absent in backups taken before the column existed.
     #[serde(default)]
+    #[schema(value_type = std::collections::BTreeMap<String, String>)]
     pub upstream_headers: UpstreamHeaders,
     #[serde(default = "default_model_type")]
     pub model_type: String,

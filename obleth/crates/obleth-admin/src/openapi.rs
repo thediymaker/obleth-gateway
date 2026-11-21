@@ -1,7 +1,8 @@
 //! OpenAPI document for the Management API (served at `/api/v1/openapi.json`).
 //!
-//! Keep the `paths(...)` list in sync with every handler that carries a
-//! `#[utoipa::path(...)]` attribute.
+//! Every route in `router()` needs a `#[utoipa::path(...)]` with one declared
+//! tag, an entry in `paths(...)`, and its types in `components(schemas(...))`;
+//! the tests below fail when one is missing.
 
 use utoipa::OpenApi;
 
@@ -19,10 +20,10 @@ use crate::usage::{
     UsageSeriesQuery, UsageSpeedQuery, UsageTimePoint,
 };
 use crate::{
-    AlertSettingsView, ApplyAutotuneCapacity, AuditEntryView, AuditQuery, AutoRouterSettingsView,
-    BoonSettingsView, CapacityDiscoveryModelView, CapacityDiscoveryView, CapacityView,
-    CharoSettingsView, CompactUsageResult, CompressorStatusView, CreateFairshareGroup, CreateKey,
-    CreateMcpServer, CreateModel, CreateModelEndpoint, CreateTenant, CreatedKey, EmailSettingsView,
+    AlertSettingsView, ApplyAutotuneCapacity, AuditQuery, AutoRouterSettingsView, BoonSettingsView,
+    CapacityDiscoveryModelView, CapacityDiscoveryView, CapacityView, CharoSettingsView,
+    CompactUsageResult, CompressorStatusView, CreateFairshareGroup, CreateKey, CreateMcpServer,
+    CreateModel, CreateModelEndpoint, CreateTenant, CreatedKey, EmailSettingsView,
     EnergySettingsView, EnergyTestResult, FairshareHistoryPointView, FairshareHistoryQuery,
     FairshareHistoryView, FairshareLiveView, GroupFairshareView, KeyFairshareView, KeyPrefixView,
     ListKeysQuery, LiveStats, McpServerView, ModelEndpointView, ModelPoolView, ModelPowerMatch,
@@ -49,7 +50,7 @@ use obleth_config::{
 #[openapi(
     info(
         title = "obleth Management API",
-        description = "Programmatic control plane: tenants, keys, models, usage, fairshare, and settings. Update bodies follow one rule: an omitted field keeps its stored value, and null clears a field that can be empty."
+        description = "Programmatic control plane: tenants, keys, models, usage, fairshare, and settings. Update bodies follow one rule: an omitted field keeps its stored value, and null clears a field that can be empty. A write to one setting of a resource (`/tenants/{id}/budget`, `/keys/{id}/disabled`, `/models/{id}/status`) is a PUT and answers 200 with the updated resource. A DELETE answers 204, or 404 when there is nothing by that id. The tenant and group setters also accept PATCH, their verb up to v2.13.0, for one release."
     ),
     paths(
         // meta
@@ -61,17 +62,17 @@ use obleth_config::{
         crate::get_tenant,
         crate::update_tenant,
         crate::delete_tenant,
-        crate::patch_tenant_status,
-        crate::patch_tenant_schedule,
-        crate::patch_tenant_budget,
-        crate::patch_tenant_allowlist,
-        crate::patch_tenant_guardrails,
-        crate::patch_tenant_compression,
+        crate::set_tenant_status,
+        crate::set_tenant_schedule,
+        crate::set_tenant_budget,
+        crate::set_tenant_allowlist,
+        crate::set_tenant_guardrails,
+        crate::set_tenant_compression,
         crate::set_tenant_synthetic_handler,
         crate::set_tenant_tracing_handler,
-        crate::patch_weight,
-        crate::put_quota,
-        crate::patch_tenant_group,
+        crate::set_tenant_weight,
+        crate::set_tenant_quota,
+        crate::set_tenant_group,
         // keys
         crate::create_key,
         crate::list_keys,
@@ -118,7 +119,7 @@ use obleth_config::{
         crate::get_fairshare_history,
         crate::list_fairshare_groups,
         crate::create_fairshare_group,
-        crate::patch_fairshare_group_weight,
+        crate::set_fairshare_group_weight,
         // models
         crate::create_model,
         crate::list_models,
@@ -374,7 +375,9 @@ use obleth_config::{
         CreateMcpServer,
         UpdateMcpServer,
         AuditQuery,
-        AuditEntryView,
+        obleth_store::AuditEntry,
+        crate::UsageLogEntry,
+        crate::UsageBreakdownEntry,
         crate::batches::AdminBatchView,
         crate::batches::AdminBatchList,
         CapacityView,
@@ -466,6 +469,22 @@ use obleth_config::{
         crate::usage::SpanEntry,
         crate::recipes::RecipeView,
         crate::recipes::UpsertRecipeBody,
+        crate::advice::AdviceReport,
+        crate::advice::AdviceFinding,
+        crate::advice::AdviceJudge,
+        crate::advice::AdviceEvidence,
+        crate::advice::AdviceFix,
+        crate::advice::AdviceJudgment,
+        crate::advice::AdviceLogs,
+        crate::advice::SnoozedAdvice,
+        crate::advice::SnoozeAdvice,
+        crate::knowledge::SearchQuery,
+        crate::knowledge::SearchHit,
+        crate::router_readiness::RouterReadiness,
+        crate::router_readiness::ReadinessFinding,
+        obleth_config::GuardrailsAction,
+        obleth_config::ManagedModelBackup,
+        obleth_config::RecipeBackup,
     )),
     tags(
         (name = "meta", description = "Gateway build/version identity and resolver-cache reconcile"),
@@ -491,6 +510,174 @@ pub struct ApiDoc;
 mod tests {
     use super::ApiDoc;
     use utoipa::OpenApi;
+
+    /// Routes the document leaves out on purpose: the liveness probe, the
+    /// document itself, and the control-plane key, which only the bundled
+    /// dashboard reads.
+    const UNDOCUMENTED: [(&str, &str); 3] = [
+        ("get", "/api/v1/health"),
+        ("get", "/api/v1/openapi.json"),
+        ("get", "/api/v1/system/control-plane-key"),
+    ];
+
+    /// Old verbs still routed beside the documented `PUT`, for one release.
+    const ALIASES: [(&str, &str); 9] = [
+        ("patch", "/api/v1/tenants/{id}/status"),
+        ("patch", "/api/v1/tenants/{id}/schedule"),
+        ("patch", "/api/v1/tenants/{id}/budget"),
+        ("patch", "/api/v1/tenants/{id}/allowlist"),
+        ("patch", "/api/v1/tenants/{id}/guardrails"),
+        ("patch", "/api/v1/tenants/{id}/compression"),
+        ("patch", "/api/v1/tenants/{id}/weight"),
+        ("patch", "/api/v1/tenants/{id}/group"),
+        ("patch", "/api/v1/fairshare/groups/{name}/weight"),
+    ];
+
+    /// Every `(method, path)` the router in lib.rs serves, with `:param`
+    /// written as `{param}` like the document.
+    fn routed() -> Vec<(String, String)> {
+        let src = include_str!("lib.rs");
+        let start = src.find("pub fn router(").expect("router()");
+        let end = start + src[start..].find("public.merge(").expect("router end");
+        let mut out = Vec::new();
+        let mut rest = &src[start..end];
+        while let Some(at) = rest.find(".route(") {
+            rest = &rest[at + ".route(".len()..];
+            // The call's arguments run to the parenthesis that closes `.route(`.
+            let mut depth = 1;
+            let close = rest
+                .char_indices()
+                .find(|&(_, c)| {
+                    depth += match c {
+                        '(' => 1,
+                        ')' => -1,
+                        _ => 0,
+                    };
+                    depth == 0
+                })
+                .expect("closed .route(")
+                .0;
+            let call = &rest[..close];
+            let path = call.split('"').nth(1).expect("route path");
+            let path = path
+                .split('/')
+                .map(|seg| match seg.strip_prefix(':') {
+                    Some(name) => format!("{{{name}}}"),
+                    None => seg.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join("/");
+            // A method router is `get(` at the start or after a `.`, never
+            // the tail of a handler name like `knowledge::get_collection(`.
+            for (at, _) in call.match_indices('(') {
+                let head = &call[..at];
+                let word_start = head
+                    .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .map_or(0, |i| i + 1);
+                let word = &head[word_start..];
+                let before = head[..word_start].trim_end().chars().last();
+                if ["get", "post", "put", "patch", "delete"].contains(&word)
+                    && matches!(before, Some(',' | '.'))
+                {
+                    out.push((word.to_string(), path.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn every_route_is_documented_with_a_declared_tag_and_its_path_parameters() {
+        let doc = serde_json::to_value(ApiDoc::openapi()).expect("serialize");
+        let tags: Vec<&str> = doc["tags"]
+            .as_array()
+            .expect("tags")
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        let routes = routed();
+        assert!(
+            routes.len() > 150,
+            "the route scan found only {}",
+            routes.len()
+        );
+        let mut problems = Vec::new();
+        for (method, path) in &routes {
+            if UNDOCUMENTED.contains(&(method.as_str(), path.as_str())) {
+                continue;
+            }
+            if ALIASES.contains(&(method.as_str(), path.as_str())) {
+                if !doc["paths"][path]["put"].is_object() {
+                    problems.push(format!("{method} {path}: an alias of an undocumented put"));
+                }
+                continue;
+            }
+            let op = &doc["paths"][path][method];
+            if !op.is_object() {
+                problems.push(format!("{method} {path}: not in paths(...)"));
+                continue;
+            }
+            match op["tags"].as_array().map(Vec::as_slice) {
+                Some([tag]) if tags.contains(&tag.as_str().unwrap_or_default()) => {}
+                other => problems.push(format!("{method} {path}: tags {other:?}")),
+            }
+            let params: Vec<&str> = op["parameters"]
+                .as_array()
+                .map(|ps| {
+                    ps.iter()
+                        .filter(|p| p["in"] == "path")
+                        .filter_map(|p| p["name"].as_str())
+                        .collect()
+                })
+                .unwrap_or_default();
+            for seg in path.split('/') {
+                if let Some(name) = seg.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+                    if !params.contains(&name) {
+                        problems.push(format!(
+                            "{method} {path}: path parameter {name} undocumented"
+                        ));
+                    }
+                }
+            }
+        }
+        // And nothing documented that no route serves.
+        for (path, item) in doc["paths"].as_object().expect("paths") {
+            for method in item.as_object().expect("path item").keys() {
+                if !routes.iter().any(|(m, p)| m == method && p == path) {
+                    problems.push(format!("{method} {path}: documented but not routed"));
+                }
+            }
+        }
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    #[test]
+    fn every_schema_the_document_references_is_registered() {
+        fn refs<'a>(v: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+            match v {
+                serde_json::Value::Object(m) => {
+                    if let Some(r) = m.get("$ref").and_then(|r| r.as_str()) {
+                        out.push(r);
+                    }
+                    m.values().for_each(|v| refs(v, out));
+                }
+                serde_json::Value::Array(a) => a.iter().for_each(|v| refs(v, out)),
+                _ => {}
+            }
+        }
+        let doc = serde_json::to_value(ApiDoc::openapi()).expect("serialize");
+        let mut all = Vec::new();
+        refs(&doc, &mut all);
+        let missing: std::collections::BTreeSet<&str> = all
+            .into_iter()
+            .filter_map(|r| r.strip_prefix("#/components/schemas/"))
+            .filter(|name| doc["components"]["schemas"].get(*name).is_none())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "referenced but not in components(...): {missing:?}"
+        );
+    }
 
     #[test]
     fn model_route_view_documents_its_fields() {

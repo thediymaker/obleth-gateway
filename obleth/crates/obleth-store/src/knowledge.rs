@@ -171,11 +171,16 @@ impl Store {
         Ok(row_to_collection(&row))
     }
 
+    /// Delete a collection and its documents; `NotFound` when there is none.
     pub async fn delete_collection(&self, id: Uuid) -> Result<()> {
-        sqlx::query("delete from knowledge_collections where id = $1")
+        let deleted = sqlx::query("delete from knowledge_collections where id = $1")
             .bind(id)
             .execute(self.pool())
-            .await?;
+            .await?
+            .rows_affected();
+        if deleted == 0 {
+            return Err(StoreError::NotFound);
+        }
         Ok(())
     }
 }

@@ -2618,7 +2618,7 @@ export const obleth = {
     }),
   setWeight: (id: string, weight: number, options?: AuditOptions) =>
     api<Tenant>(`/tenants/${seg(id)}/weight`, {
-      method: "PATCH",
+      method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ weight }),
     }),
@@ -2631,7 +2631,7 @@ export const obleth = {
     }),
   setFairshareGroupWeight: (name: string, weight: number, options?: AuditOptions) =>
     api<FairshareGroup>(`/fairshare/groups/${seg(name)}/weight`, {
-      method: "PATCH",
+      method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ weight }),
     }),
@@ -2663,7 +2663,7 @@ export const obleth = {
     }),
   setTenantStatus: (id: string, status: string, options?: AuditOptions) =>
     api<Tenant>(`/tenants/${seg(id)}/status`, {
-      method: "PATCH",
+      method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ status }),
     }),
@@ -2678,7 +2678,7 @@ export const obleth = {
     options?: AuditOptions,
   ) =>
     api<Tenant>(`/tenants/${seg(id)}/schedule`, {
-      method: "PATCH",
+      method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
@@ -2693,7 +2693,7 @@ export const obleth = {
     options?: AuditOptions,
   ) =>
     api<Tenant>(`/tenants/${seg(id)}/budget`, {
-      method: "PATCH",
+      method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
@@ -2703,7 +2703,7 @@ export const obleth = {
     options?: AuditOptions,
   ) =>
     api<Tenant>(`/tenants/${seg(id)}/allowlist`, {
-      method: "PATCH",
+      method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ allowed_models }),
     }),
@@ -2713,7 +2713,7 @@ export const obleth = {
     options?: AuditOptions,
   ) =>
     api<Tenant>(`/tenants/${seg(id)}/guardrails`, {
-      method: "PATCH",
+      method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ policy }),
     }),
@@ -2723,14 +2723,14 @@ export const obleth = {
     options?: AuditOptions,
   ) =>
     api<Tenant>(`/tenants/${seg(id)}/compression`, {
-      method: "PATCH",
+      method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ policy }),
     }),
   /** Move a tenant into another fairshare group (one with no weight shares at the default). */
   setTenantGroup: (id: string, fairshare_group: string, options?: AuditOptions) =>
     api<Tenant>(`/tenants/${seg(id)}/group`, {
-      method: "PATCH",
+      method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ fairshare_group }),
     }),
@@ -2830,25 +2830,25 @@ export const obleth = {
   /** These keys' budgets only (up to 200 ids). */
   keyBudgets: (ids: string[]) => api<BudgetUsage[]>(`/budgets/usage${qs({ ids: ids.join(",") })}`),
   setKeyDisabled: (id: string, disabled: boolean, options?: AuditOptions) =>
-    api<void>(`/keys/${seg(id)}/disabled`, {
+    api<ApiKey>(`/keys/${seg(id)}/disabled`, {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ disabled }),
     }),
   setKeyTracing: (id: string, tracing_enabled: boolean, options?: AuditOptions) =>
-    api<void>(`/keys/${seg(id)}/tracing`, {
+    api<ApiKey>(`/keys/${seg(id)}/tracing`, {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ tracing_enabled }),
     }),
   setKeyEndUserFairshare: (id: string, end_user_fairshare: boolean, options?: AuditOptions) =>
-    api<void>(`/keys/${seg(id)}/end-user-fairshare`, {
+    api<ApiKey>(`/keys/${seg(id)}/end-user-fairshare`, {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ end_user_fairshare }),
     }),
   setKeyBackground: (id: string, background: boolean, options?: AuditOptions) =>
-    api<void>(`/keys/${seg(id)}/background`, {
+    api<ApiKey>(`/keys/${seg(id)}/background`, {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ background }),
@@ -2858,7 +2858,7 @@ export const obleth = {
     tracing_enabled: boolean,
     options?: AuditOptions,
   ) =>
-    api<void>(`/tenants/${seg(id)}/tracing`, {
+    api<Tenant>(`/tenants/${seg(id)}/tracing`, {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ tracing_enabled }),
@@ -2868,7 +2868,7 @@ export const obleth = {
     synthetic: boolean,
     options?: AuditOptions,
   ) =>
-    api<void>(`/tenants/${seg(id)}/synthetic`, {
+    api<Tenant>(`/tenants/${seg(id)}/synthetic`, {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ synthetic }),

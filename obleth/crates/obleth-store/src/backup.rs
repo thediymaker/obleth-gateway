@@ -1112,11 +1112,11 @@ mod tests {
             .expect("create key");
         let hash = obleth_config::hash_api_key(&secret);
         store
-            .set_key_end_user_fairshare(key.id, true)
+            .set_key_flag(key.id, crate::KeyFlag::EndUserFairshare, true)
             .await
             .expect("turn on per-end-user fairshare");
         store
-            .set_key_background(key.id, true)
+            .set_key_flag(key.id, crate::KeyFlag::Background, true)
             .await
             .expect("turn on background priority");
 
