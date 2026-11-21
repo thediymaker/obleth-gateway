@@ -962,6 +962,7 @@ async fn run_pipeline(
                 *auto_note = Some(crate::sticky::Note {
                     model: chosen.model_name.clone(),
                     reason,
+                    why: crate::sticky::why(&intent, &features, pool.len()),
                 });
                 model = chosen.model_name.clone();
                 // Candidates are real models only, never variants.

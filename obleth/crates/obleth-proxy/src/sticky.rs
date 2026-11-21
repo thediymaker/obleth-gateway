@@ -14,6 +14,10 @@ use crate::state::AppState;
 pub(crate) const AUTO_MODEL_HEADER: &str = "x-obleth-auto-model";
 /// Response header saying why, when stickiness is on (see [`Reason`]).
 pub(crate) const AUTO_REASON_HEADER: &str = "x-obleth-auto-reason";
+/// Response header saying how the request was read to make the pick: its
+/// topics, how hard it looks and where that came from, what the model must be
+/// able to do, and how many models the pick was made among. See [`why`].
+pub(crate) const AUTO_WHY_HEADER: &str = "x-obleth-auto-why";
 /// Request header a client sends when it sees the model it was given failing:
 /// `tool_loop` (repeating itself) or `complaint` (the person said it is
 /// wrong). Either moves the conversation up a level, as the gateway's own
@@ -330,6 +334,62 @@ pub(crate) struct Note {
     pub model: String,
     /// `None` when stickiness is off.
     pub reason: Option<Reason>,
+    /// How the request was read, as [`why`] writes it.
+    pub why: String,
+}
+
+/// The value of [`AUTO_WHY_HEADER`]: `topics=coding+math; difficulty=2;
+/// from=heuristic; needs=tools+vision; candidates=4`. A part with nothing to
+/// say is left out (`topics` for a request with no topic, `needs` for one any
+/// model can take). Topic names are an operator's tags: only lowercase
+/// letters, digits, `-` and `_` are kept, and at most six topics, so the value
+/// is always a short ASCII header a client can split on `; `, `=` and `+`.
+pub(crate) fn why(
+    intent: &Intent,
+    features: &obleth_config::routing::RequestFeatures,
+    candidates: usize,
+) -> String {
+    let topics: Vec<String> = intent
+        .tags
+        .iter()
+        .map(|tag| {
+            tag.to_ascii_lowercase()
+                .chars()
+                .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-' || *c == '_')
+                .take(40)
+                .collect::<String>()
+        })
+        .filter(|tag| !tag.is_empty())
+        .take(6)
+        .collect();
+    let needs: Vec<&str> = [
+        (
+            features.needs_function_calling || features.needs_tool_choice,
+            "tools",
+        ),
+        (features.needs_vision, "vision"),
+        (features.needs_response_schema, "schema"),
+    ]
+    .into_iter()
+    .filter_map(|(needed, name)| needed.then_some(name))
+    .collect();
+    let from = match intent.source {
+        obleth_config::routing::IntentSource::Classifier => "classifier",
+        obleth_config::routing::IntentSource::Heuristic => "heuristic",
+        obleth_config::routing::IntentSource::Header => "header",
+        obleth_config::routing::IntentSource::Default => "default",
+    };
+    let mut parts = Vec::with_capacity(5);
+    if !topics.is_empty() {
+        parts.push(format!("topics={}", topics.join("+")));
+    }
+    parts.push(format!("difficulty={}", intent.difficulty));
+    parts.push(format!("from={from}"));
+    if !needs.is_empty() {
+        parts.push(format!("needs={}", needs.join("+")));
+    }
+    parts.push(format!("candidates={candidates}"));
+    parts.join("; ")
 }
 
 impl Note {
@@ -343,6 +403,9 @@ impl Note {
                 HeaderValue::from_static(reason.as_str()),
             );
         }
+        if let Ok(v) = HeaderValue::from_str(&self.why) {
+            resp.headers_mut().insert(AUTO_WHY_HEADER, v);
+        }
     }
 }
 
@@ -350,6 +413,62 @@ impl Note {
 mod tests {
     use super::*;
     use obleth_config::routing::IntentSource;
+
+    #[test]
+    fn why_says_how_the_request_was_read() {
+        let features = |tools, vision, schema| obleth_config::routing::RequestFeatures {
+            est_input_tokens: 100,
+            max_tokens: 0,
+            needs_function_calling: tools,
+            needs_tool_choice: false,
+            needs_response_schema: schema,
+            needs_vision: vision,
+        };
+        let intent = Intent {
+            tags: vec!["coding".into(), "Math & Stats".into(), "+;=".into()],
+            difficulty: 3,
+            source: IntentSource::Heuristic,
+        };
+        assert_eq!(
+            why(&intent, &features(true, true, false), 4),
+            "topics=coding+mathstats; difficulty=3; from=heuristic; needs=tools+vision; candidates=4"
+        );
+        // Nothing to say about topics or needs: those parts are left out.
+        assert_eq!(
+            why(&Intent::default(), &features(false, false, false), 1),
+            "difficulty=1; from=default; candidates=1"
+        );
+        assert_eq!(
+            why(
+                &Intent {
+                    tags: (0..9).map(|i| format!("t{i}")).collect(),
+                    difficulty: 2,
+                    source: IntentSource::Header,
+                },
+                &features(false, false, true),
+                12,
+            ),
+            "topics=t0+t1+t2+t3+t4+t5; difficulty=2; from=header; needs=schema; candidates=12"
+        );
+    }
+
+    #[test]
+    fn the_note_puts_the_model_the_reason_and_the_reading_on_the_response() {
+        let mut resp = Response::new(Body::empty());
+        Note {
+            model: "glm".into(),
+            reason: Some(Reason::Harder),
+            why: "difficulty=3; from=heuristic; candidates=2".into(),
+        }
+        .apply_headers(&mut resp);
+        let header = |name: &str| resp.headers().get(name).and_then(|v| v.to_str().ok());
+        assert_eq!(header(AUTO_MODEL_HEADER), Some("glm"));
+        assert_eq!(header(AUTO_REASON_HEADER), Some("harder"));
+        assert_eq!(
+            header(AUTO_WHY_HEADER),
+            Some("difficulty=3; from=heuristic; candidates=2")
+        );
+    }
 
     fn candidate(name: &str, level: u8) -> Candidate {
         let mut model = crate::boons::test_support::test_route();
