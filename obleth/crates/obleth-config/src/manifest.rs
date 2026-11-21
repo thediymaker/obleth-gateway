@@ -24,7 +24,8 @@
 //! # Coverage boundary
 //!
 //! The manifest covers exactly the operator-settable fields of
-//! [`ModelRoute`] — see [`ModelConfig`]. It does **not** carry per-model health
+//! [`ModelRoute`] — see [`ModelConfig`], including the lifecycle (status,
+//! replacement, retirement date, note, redirect). It does **not** carry per-model health
 //! *check* configuration or maintenance windows (managed from the health page,
 //! and not part of `ModelRoute`), nor derived state (`id`, `capacity_tuned_at`,
 //! timestamps, runtime health), nor the model's endpoints' health state. The
@@ -39,11 +40,11 @@ use crate::types::{
     is_valid_capacity_mode, is_valid_endpoint_selection_mode, is_valid_model_type,
     is_valid_quantization, merge_upstream_headers, normalize_aliases, normalize_boons,
     normalize_tool_servers, normalize_variants, parse_tag_level, upstream_header_names,
-    ModelEndpoint, ModelRoute, ModelSessionAffinity, ModelVariant, UpstreamHeaders,
-    UpstreamHeadersWrite, CAPACITY_MODES, DEFAULT_CAPACITY_MODE, DEFAULT_CAPACITY_SOURCE,
-    DEFAULT_ENDPOINT_SELECTION_MODE, DEFAULT_MODEL_TYPE, DEFAULT_QUANTIZATION,
-    DEFAULT_RETRY_BACKOFF_MS, ENDPOINT_SELECTION_MODES, MAX_MODEL_ALIASES, MAX_MODEL_VARIANTS,
-    MODEL_TYPES, QUANTIZATIONS,
+    ModelEndpoint, ModelLifecycle, ModelRoute, ModelSessionAffinity, ModelStatus, ModelVariant,
+    UpstreamHeaders, UpstreamHeadersWrite, CAPACITY_MODES, DEFAULT_CAPACITY_MODE,
+    DEFAULT_CAPACITY_SOURCE, DEFAULT_ENDPOINT_SELECTION_MODE, DEFAULT_MODEL_TYPE,
+    DEFAULT_QUANTIZATION, DEFAULT_RETRY_BACKOFF_MS, ENDPOINT_SELECTION_MODES, MAX_MODEL_ALIASES,
+    MAX_MODEL_VARIANTS, MODEL_TYPES, QUANTIZATIONS,
 };
 
 /// File-format discriminator for model manifests.
@@ -129,6 +130,12 @@ pub struct ManifestModel {
     /// Blank and duplicate names and unknown boons are dropped with a warning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub variants: Option<Vec<ModelVariant>>,
+    /// Staged, active, deprecated or retired, with the replacement, retirement
+    /// date, note and redirect, as `PUT /api/v1/models/{id}/status` takes
+    /// them. Replaced as a whole when present; absent leaves it alone.
+    /// `changed_at` is the gateway's: it moves when the status does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<ModelLifecycle>,
     /// How the model takes reasoning effort (pass-through, mapped or
     /// unsupported). Replaced as a whole when present; absent leaves the
     /// stored map alone. An invalid map is rejected.
@@ -321,6 +328,7 @@ pub struct ModelConfig {
     pub description: String,
     pub aliases: Vec<String>,
     pub variants: Vec<ModelVariant>,
+    pub lifecycle: ModelLifecycle,
     pub reasoning: ModelReasoning,
     pub listed: bool,
     pub rejected_request_fields: Vec<String>,
@@ -378,6 +386,7 @@ impl Default for ModelConfig {
             description: String::new(),
             aliases: Vec::new(),
             variants: Vec::new(),
+            lifecycle: Default::default(),
             reasoning: Default::default(),
             listed: true,
             rejected_request_fields: Vec::new(),
@@ -432,57 +441,118 @@ impl Default for ModelConfig {
 
 impl From<&ModelRoute> for ModelConfig {
     fn from(m: &ModelRoute) -> Self {
+        // Destructured so a field added to `ModelRoute` fails to compile here
+        // until it is either carried or named as left out.
+        let ModelRoute {
+            id: _,
+            model_name: _,
+            capacity_tuned_at: _,
+            created_at: _,
+            updated_at: _,
+            description,
+            aliases,
+            variants,
+            lifecycle,
+            reasoning,
+            listed,
+            rejected_request_fields,
+            session_affinity,
+            upstream_model,
+            api_base,
+            api_key,
+            upstream_headers,
+            model_type,
+            quantization,
+            input_cost_per_token,
+            output_cost_per_token,
+            cost_per_image,
+            cost_per_audio_second,
+            cost_per_character,
+            cost_per_video,
+            context_window,
+            admission_weight,
+            max_in_flight,
+            capacity_mode,
+            capacity_source,
+            capacity_namespace,
+            capacity_service,
+            per_replica_max_in_flight,
+            capacity_headroom,
+            supports_function_calling,
+            supports_system_messages,
+            supports_response_schema,
+            supports_tool_choice,
+            supports_vision,
+            enabled,
+            cache_enabled,
+            cache_ttl_secs,
+            tags,
+            boons,
+            tool_servers,
+            request_timeout_secs,
+            max_retries,
+            retry_backoff_ms,
+            endpoint_selection_mode,
+            debug_diagnostics,
+            energy_slots_per_node,
+            route_bias,
+            auto_eligible,
+            draft_model,
+            verify_api_base,
+            verify_upstream_model,
+        } = m;
         Self {
-            description: m.description.clone(),
-            aliases: m.aliases.clone(),
-            variants: m.variants.clone(),
-            reasoning: m.reasoning.clone(),
-            listed: m.listed,
-            rejected_request_fields: m.rejected_request_fields.clone(),
-            session_affinity: m.session_affinity,
-            upstream_model: m.upstream_model.clone(),
-            api_base: m.api_base.clone(),
-            api_key: m.api_key.clone(),
-            upstream_headers: m.upstream_headers.clone(),
-            model_type: m.model_type.clone(),
-            quantization: m.quantization.clone(),
-            input_cost_per_token: m.input_cost_per_token,
-            output_cost_per_token: m.output_cost_per_token,
-            cost_per_image: m.cost_per_image,
-            cost_per_audio_second: m.cost_per_audio_second,
-            cost_per_character: m.cost_per_character,
-            cost_per_video: m.cost_per_video,
-            context_window: m.context_window,
-            admission_weight: m.admission_weight,
-            max_in_flight: m.max_in_flight,
-            capacity_mode: m.capacity_mode.clone(),
-            capacity_source: m.capacity_source.clone(),
-            capacity_namespace: m.capacity_namespace.clone(),
-            capacity_service: m.capacity_service.clone(),
-            per_replica_max_in_flight: m.per_replica_max_in_flight,
-            capacity_headroom: m.capacity_headroom,
-            supports_function_calling: m.supports_function_calling,
-            supports_system_messages: m.supports_system_messages,
-            supports_response_schema: m.supports_response_schema,
-            supports_tool_choice: m.supports_tool_choice,
-            supports_vision: m.supports_vision,
-            enabled: m.enabled,
-            cache_enabled: m.cache_enabled,
-            cache_ttl_secs: m.cache_ttl_secs,
-            tags: m.tags.clone(),
-            boons: m.boons.clone(),
-            tool_servers: m.tool_servers.clone(),
-            request_timeout_secs: m.request_timeout_secs,
-            max_retries: m.max_retries,
-            retry_backoff_ms: m.retry_backoff_ms,
-            endpoint_selection_mode: m.endpoint_selection_mode.clone(),
-            debug_diagnostics: m.debug_diagnostics,
-            energy_slots_per_node: m.energy_slots_per_node,
-            route_bias: m.route_bias,
-            auto_eligible: m.auto_eligible,
-            draft_model: m.draft_model.clone(),
-            verify_api_base: m.verify_api_base.clone(),
-            verify_upstream_model: m.verify_upstream_model.clone(),
+            description: description.clone(),
+            aliases: aliases.clone(),
+            variants: variants.clone(),
+            lifecycle: lifecycle.clone(),
+            reasoning: reasoning.clone(),
+            listed: *listed,
+            rejected_request_fields: rejected_request_fields.clone(),
+            session_affinity: *session_affinity,
+            upstream_model: upstream_model.clone(),
+            api_base: api_base.clone(),
+            api_key: api_key.clone(),
+            upstream_headers: upstream_headers.clone(),
+            model_type: model_type.clone(),
+            quantization: quantization.clone(),
+            input_cost_per_token: *input_cost_per_token,
+            output_cost_per_token: *output_cost_per_token,
+            cost_per_image: *cost_per_image,
+            cost_per_audio_second: *cost_per_audio_second,
+            cost_per_character: *cost_per_character,
+            cost_per_video: *cost_per_video,
+            context_window: *context_window,
+            admission_weight: *admission_weight,
+            max_in_flight: *max_in_flight,
+            capacity_mode: capacity_mode.clone(),
+            capacity_source: capacity_source.clone(),
+            capacity_namespace: capacity_namespace.clone(),
+            capacity_service: capacity_service.clone(),
+            per_replica_max_in_flight: *per_replica_max_in_flight,
+            capacity_headroom: *capacity_headroom,
+            supports_function_calling: *supports_function_calling,
+            supports_system_messages: *supports_system_messages,
+            supports_response_schema: *supports_response_schema,
+            supports_tool_choice: *supports_tool_choice,
+            supports_vision: *supports_vision,
+            enabled: *enabled,
+            cache_enabled: *cache_enabled,
+            cache_ttl_secs: *cache_ttl_secs,
+            tags: tags.clone(),
+            boons: boons.clone(),
+            tool_servers: tool_servers.clone(),
+            request_timeout_secs: *request_timeout_secs,
+            max_retries: *max_retries,
+            retry_backoff_ms: *retry_backoff_ms,
+            endpoint_selection_mode: endpoint_selection_mode.clone(),
+            debug_diagnostics: *debug_diagnostics,
+            energy_slots_per_node: *energy_slots_per_node,
+            route_bias: *route_bias,
+            auto_eligible: *auto_eligible,
+            draft_model: draft_model.clone(),
+            verify_api_base: verify_api_base.clone(),
+            verify_upstream_model: verify_upstream_model.clone(),
         }
     }
 }
@@ -496,151 +566,123 @@ impl ModelConfig {
     /// report a real (if tiny) price edit as `unchanged`.
     #[allow(clippy::float_cmp)]
     pub fn diff(&self, other: &Self) -> Vec<String> {
+        // Destructured so a field added to `ModelConfig` fails to compile
+        // here, and a destructured field left out of `note!` is unused.
+        let Self {
+            description,
+            aliases,
+            variants,
+            lifecycle,
+            reasoning,
+            listed,
+            rejected_request_fields,
+            session_affinity,
+            upstream_model,
+            api_base,
+            api_key,
+            upstream_headers,
+            model_type,
+            quantization,
+            input_cost_per_token,
+            output_cost_per_token,
+            cost_per_image,
+            cost_per_audio_second,
+            cost_per_character,
+            cost_per_video,
+            context_window,
+            admission_weight,
+            max_in_flight,
+            capacity_mode,
+            capacity_source,
+            capacity_namespace,
+            capacity_service,
+            per_replica_max_in_flight,
+            capacity_headroom,
+            supports_function_calling,
+            supports_system_messages,
+            supports_response_schema,
+            supports_tool_choice,
+            supports_vision,
+            enabled,
+            cache_enabled,
+            cache_ttl_secs,
+            tags,
+            boons,
+            tool_servers,
+            request_timeout_secs,
+            max_retries,
+            retry_backoff_ms,
+            endpoint_selection_mode,
+            debug_diagnostics,
+            energy_slots_per_node,
+            route_bias,
+            auto_eligible,
+            draft_model,
+            verify_api_base,
+            verify_upstream_model,
+        } = self;
         let mut out: Vec<String> = Vec::new();
-        let mut note = |changed: bool, name: &str| {
-            if changed {
-                out.push(name.to_string());
-            }
-        };
-        note(self.description != other.description, "description");
-        note(self.aliases != other.aliases, "aliases");
-        note(self.variants != other.variants, "variants");
-        note(self.reasoning != other.reasoning, "reasoning");
-        note(self.listed != other.listed, "listed");
-        note(
-            self.rejected_request_fields != other.rejected_request_fields,
-            "rejected_request_fields",
-        );
-        note(
-            self.session_affinity != other.session_affinity,
-            "session_affinity",
-        );
-        note(
-            self.upstream_model != other.upstream_model,
-            "upstream_model",
-        );
-        note(self.api_base != other.api_base, "api_base");
-        note(self.api_key != other.api_key, "api_key");
-        note(
-            self.upstream_headers != other.upstream_headers,
-            "upstream_headers",
-        );
-        note(self.model_type != other.model_type, "model_type");
-        note(self.quantization != other.quantization, "quantization");
-        note(
-            self.input_cost_per_token != other.input_cost_per_token,
-            "input_cost_per_token",
-        );
-        note(
-            self.output_cost_per_token != other.output_cost_per_token,
-            "output_cost_per_token",
-        );
-        note(
-            self.cost_per_image != other.cost_per_image,
-            "cost_per_image",
-        );
-        note(
-            self.cost_per_audio_second != other.cost_per_audio_second,
-            "cost_per_audio_second",
-        );
-        note(
-            self.cost_per_character != other.cost_per_character,
-            "cost_per_character",
-        );
-        note(
-            self.cost_per_video != other.cost_per_video,
-            "cost_per_video",
-        );
-        note(
-            self.context_window != other.context_window,
-            "context_window",
-        );
-        note(
-            self.admission_weight != other.admission_weight,
-            "admission_weight",
-        );
-        note(self.max_in_flight != other.max_in_flight, "max_in_flight");
-        note(self.capacity_mode != other.capacity_mode, "capacity_mode");
-        note(
-            self.capacity_source != other.capacity_source,
-            "capacity_source",
-        );
-        note(
-            self.capacity_namespace != other.capacity_namespace,
-            "capacity_namespace",
-        );
-        note(
-            self.capacity_service != other.capacity_service,
-            "capacity_service",
-        );
-        note(
-            self.per_replica_max_in_flight != other.per_replica_max_in_flight,
-            "per_replica_max_in_flight",
-        );
-        note(
-            self.capacity_headroom != other.capacity_headroom,
-            "capacity_headroom",
-        );
-        note(
-            self.supports_function_calling != other.supports_function_calling,
-            "supports_function_calling",
-        );
-        note(
-            self.supports_system_messages != other.supports_system_messages,
-            "supports_system_messages",
-        );
-        note(
-            self.supports_response_schema != other.supports_response_schema,
-            "supports_response_schema",
-        );
-        note(
-            self.supports_tool_choice != other.supports_tool_choice,
-            "supports_tool_choice",
-        );
-        note(
-            self.supports_vision != other.supports_vision,
-            "supports_vision",
-        );
-        note(self.enabled != other.enabled, "enabled");
-        note(self.cache_enabled != other.cache_enabled, "cache_enabled");
-        note(
-            self.cache_ttl_secs != other.cache_ttl_secs,
-            "cache_ttl_secs",
-        );
-        note(self.tags != other.tags, "tags");
-        note(self.boons != other.boons, "boons");
-        note(self.tool_servers != other.tool_servers, "tool_servers");
-        note(
-            self.request_timeout_secs != other.request_timeout_secs,
-            "request_timeout_secs",
-        );
-        note(self.max_retries != other.max_retries, "max_retries");
-        note(
-            self.retry_backoff_ms != other.retry_backoff_ms,
-            "retry_backoff_ms",
-        );
-        note(
-            self.endpoint_selection_mode != other.endpoint_selection_mode,
-            "endpoint_selection_mode",
-        );
-        note(
-            self.debug_diagnostics != other.debug_diagnostics,
-            "debug_diagnostics",
-        );
-        note(
-            self.energy_slots_per_node != other.energy_slots_per_node,
-            "energy_slots_per_node",
-        );
-        note(self.route_bias != other.route_bias, "route_bias");
-        note(self.auto_eligible != other.auto_eligible, "auto_eligible");
-        note(self.draft_model != other.draft_model, "draft_model");
-        note(
-            self.verify_api_base != other.verify_api_base,
-            "verify_api_base",
-        );
-        note(
-            self.verify_upstream_model != other.verify_upstream_model,
-            "verify_upstream_model",
+        macro_rules! note {
+            ($($field:ident),* $(,)?) => {
+                $(
+                    if *$field != other.$field {
+                        out.push(stringify!($field).to_string());
+                    }
+                )*
+            };
+        }
+        note!(
+            description,
+            aliases,
+            variants,
+            lifecycle,
+            reasoning,
+            listed,
+            rejected_request_fields,
+            session_affinity,
+            upstream_model,
+            api_base,
+            api_key,
+            upstream_headers,
+            model_type,
+            quantization,
+            input_cost_per_token,
+            output_cost_per_token,
+            cost_per_image,
+            cost_per_audio_second,
+            cost_per_character,
+            cost_per_video,
+            context_window,
+            admission_weight,
+            max_in_flight,
+            capacity_mode,
+            capacity_source,
+            capacity_namespace,
+            capacity_service,
+            per_replica_max_in_flight,
+            capacity_headroom,
+            supports_function_calling,
+            supports_system_messages,
+            supports_response_schema,
+            supports_tool_choice,
+            supports_vision,
+            enabled,
+            cache_enabled,
+            cache_ttl_secs,
+            tags,
+            boons,
+            tool_servers,
+            request_timeout_secs,
+            max_retries,
+            retry_backoff_ms,
+            endpoint_selection_mode,
+            debug_diagnostics,
+            energy_slots_per_node,
+            route_bias,
+            auto_eligible,
+            draft_model,
+            verify_api_base,
+            verify_upstream_model,
         );
         out
     }
@@ -937,6 +979,9 @@ pub fn resolve_model(
             .map_err(|e| reject(format!("reasoning: {e}")))?;
         next.reasoning = r.clone();
     }
+    if let Some(l) = &entry.lifecycle {
+        next.lifecycle = resolve_lifecycle(name, l, &current.lifecycle).map_err(reject)?;
+    }
     if !next.reasoning.is_passthrough() && next.model_type != crate::types::DEFAULT_MODEL_TYPE {
         return Err(reject(format!(
             "reasoning: a `{}` model cannot take reasoning effort; only chat models can",
@@ -1161,6 +1206,45 @@ pub fn resolve_endpoint(
     })
 }
 
+/// A manifest's lifecycle for model `name`, checked and settled the way
+/// `PUT /api/v1/models/{id}/status` settles one: a staged or active model
+/// carries only its status, and `changed_at` moves only when the status does
+/// (a file's own `changed_at` is ignored). Whether the replacement exists and
+/// can stand in is checked by the importer, which sees the whole registry.
+pub fn resolve_lifecycle(
+    name: &str,
+    entry: &ModelLifecycle,
+    current: &ModelLifecycle,
+) -> Result<ModelLifecycle, String> {
+    let changed_at = if entry.status == current.status {
+        current.changed_at
+    } else {
+        Some(chrono::Utc::now())
+    };
+    let lifecycle = match entry.status {
+        ModelStatus::Staged | ModelStatus::Active => ModelLifecycle {
+            status: entry.status,
+            changed_at,
+            ..Default::default()
+        },
+        ModelStatus::Deprecated | ModelStatus::Retired => ModelLifecycle {
+            status: entry.status,
+            replacement: entry.replacement.trim().to_string(),
+            retire_at: entry.retire_at,
+            changed_at,
+            note: entry.note.trim().to_string(),
+            redirect: entry.redirect,
+        },
+    };
+    lifecycle
+        .validate()
+        .map_err(|e| format!("lifecycle: {e}"))?;
+    if lifecycle.replacement == name {
+        return Err("lifecycle: a model cannot be its own replacement".to_string());
+    }
+    Ok(lifecycle)
+}
+
 /// Render an endpoint as a manifest entry, with the credential replaced by a
 /// presence flag.
 pub fn endpoint_to_manifest_entry(e: &ModelEndpoint) -> ManifestEndpoint {
@@ -1188,69 +1272,132 @@ fn reject_negative(v: f64, field: &str) -> Result<f64, String> {
 /// by `has_api_key` and `upstream_header_names`, endpoints attached by the
 /// caller.
 pub fn model_to_manifest_entry(m: &ModelRoute) -> ManifestModel {
+    // Destructured so a field added to `ModelRoute` fails to compile here
+    // until it is either exported or named as left out.
+    let ModelRoute {
+        id: _,
+        capacity_tuned_at: _,
+        created_at: _,
+        updated_at: _,
+        model_name,
+        description,
+        aliases,
+        variants,
+        lifecycle,
+        reasoning,
+        listed,
+        rejected_request_fields,
+        session_affinity,
+        upstream_model,
+        api_base,
+        api_key,
+        upstream_headers,
+        model_type,
+        quantization,
+        input_cost_per_token,
+        output_cost_per_token,
+        cost_per_image,
+        cost_per_audio_second,
+        cost_per_character,
+        cost_per_video,
+        context_window,
+        admission_weight,
+        max_in_flight,
+        capacity_mode,
+        capacity_source,
+        capacity_namespace,
+        capacity_service,
+        per_replica_max_in_flight,
+        capacity_headroom,
+        supports_function_calling,
+        supports_system_messages,
+        supports_response_schema,
+        supports_tool_choice,
+        supports_vision,
+        enabled,
+        cache_enabled,
+        cache_ttl_secs,
+        tags,
+        boons,
+        tool_servers,
+        request_timeout_secs,
+        max_retries,
+        retry_backoff_ms,
+        endpoint_selection_mode,
+        debug_diagnostics,
+        energy_slots_per_node,
+        route_bias,
+        auto_eligible,
+        draft_model,
+        verify_api_base,
+        verify_upstream_model,
+    } = m;
     ManifestModel {
-        model_name: m.model_name.clone(),
-        description: Some(m.description.clone()),
-        aliases: Some(m.aliases.clone()),
-        variants: Some(m.variants.clone()),
+        model_name: model_name.clone(),
+        description: Some(description.clone()),
+        aliases: Some(aliases.clone()),
+        variants: Some(variants.clone()),
+        // Only a model that is not plainly active says so, keeping older
+        // files' shape.
+        lifecycle: (*lifecycle != ModelLifecycle::default()).then(|| lifecycle.clone()),
         // Left out while pass-through, so a file exported before anyone set
         // a map reads the same as one written before maps existed.
-        reasoning: (!m.reasoning.is_passthrough() || !m.reasoning.levels.is_empty())
-            .then(|| m.reasoning.clone()),
+        reasoning: (!reasoning.is_passthrough() || !reasoning.levels.is_empty())
+            .then(|| reasoning.clone()),
         // Only an unlisted model says so, keeping older files' shape.
-        listed: (!m.listed).then_some(false),
+        listed: (!*listed).then_some(false),
         // Only a model that refuses something says so, keeping older files'
         // shape.
-        rejected_request_fields: (!m.rejected_request_fields.is_empty())
-            .then(|| m.rejected_request_fields.clone()),
+        rejected_request_fields: (!rejected_request_fields.is_empty())
+            .then(|| rejected_request_fields.clone()),
         // Only a model with a setting of its own says so, keeping older
         // files' shape.
-        session_affinity: (!m.session_affinity.is_default()).then_some(m.session_affinity),
-        upstream_model: Some(m.upstream_model.clone()),
-        api_base: Some(m.api_base.clone()),
+        session_affinity: (!session_affinity.is_default()).then_some(*session_affinity),
+        upstream_model: Some(upstream_model.clone()),
+        api_base: Some(api_base.clone()),
         api_key: None,
-        has_api_key: Some(m.api_key.as_deref().is_some_and(|k| !k.is_empty())),
+        has_api_key: Some(api_key.as_deref().is_some_and(|k| !k.is_empty())),
         upstream_headers: None,
-        upstream_header_names: Some(upstream_header_names(&m.upstream_headers)),
-        model_type: Some(m.model_type.clone()),
-        quantization: Some(m.quantization.clone()),
-        input_cost_per_token: Some(m.input_cost_per_token),
-        output_cost_per_token: Some(m.output_cost_per_token),
-        cost_per_image: Some(m.cost_per_image),
-        cost_per_audio_second: Some(m.cost_per_audio_second),
-        cost_per_character: Some(m.cost_per_character),
-        cost_per_video: Some(m.cost_per_video),
-        context_window: Some(m.context_window),
-        admission_weight: Some(m.admission_weight),
-        max_in_flight: m.max_in_flight,
-        capacity_mode: Some(m.capacity_mode.clone()),
-        capacity_source: Some(m.capacity_source.clone()),
-        capacity_namespace: m.capacity_namespace.clone(),
-        capacity_service: m.capacity_service.clone(),
-        per_replica_max_in_flight: m.per_replica_max_in_flight,
-        capacity_headroom: Some(m.capacity_headroom),
-        supports_function_calling: Some(m.supports_function_calling),
-        supports_system_messages: Some(m.supports_system_messages),
-        supports_response_schema: Some(m.supports_response_schema),
-        supports_tool_choice: Some(m.supports_tool_choice),
-        supports_vision: Some(m.supports_vision),
-        enabled: Some(m.enabled),
-        cache_enabled: Some(m.cache_enabled),
-        cache_ttl_secs: Some(m.cache_ttl_secs),
-        tags: Some(m.tags.clone()),
-        boons: Some(m.boons.clone()),
-        tool_servers: Some(m.tool_servers.clone()),
-        request_timeout_secs: m.request_timeout_secs,
-        max_retries: Some(m.max_retries),
-        retry_backoff_ms: Some(m.retry_backoff_ms),
-        endpoint_selection_mode: Some(m.endpoint_selection_mode.clone()),
-        debug_diagnostics: Some(m.debug_diagnostics),
-        energy_slots_per_node: Some(m.energy_slots_per_node),
-        route_bias: Some(m.route_bias),
-        auto_eligible: Some(m.auto_eligible),
-        draft_model: Some(m.draft_model.clone()),
-        verify_api_base: Some(m.verify_api_base.clone()),
-        verify_upstream_model: Some(m.verify_upstream_model.clone()),
+        upstream_header_names: Some(upstream_header_names(upstream_headers)),
+        model_type: Some(model_type.clone()),
+        quantization: Some(quantization.clone()),
+        input_cost_per_token: Some(*input_cost_per_token),
+        output_cost_per_token: Some(*output_cost_per_token),
+        cost_per_image: Some(*cost_per_image),
+        cost_per_audio_second: Some(*cost_per_audio_second),
+        cost_per_character: Some(*cost_per_character),
+        cost_per_video: Some(*cost_per_video),
+        context_window: Some(*context_window),
+        admission_weight: Some(*admission_weight),
+        max_in_flight: *max_in_flight,
+        capacity_mode: Some(capacity_mode.clone()),
+        capacity_source: Some(capacity_source.clone()),
+        capacity_namespace: capacity_namespace.clone(),
+        capacity_service: capacity_service.clone(),
+        per_replica_max_in_flight: *per_replica_max_in_flight,
+        capacity_headroom: Some(*capacity_headroom),
+        supports_function_calling: Some(*supports_function_calling),
+        supports_system_messages: Some(*supports_system_messages),
+        supports_response_schema: Some(*supports_response_schema),
+        supports_tool_choice: Some(*supports_tool_choice),
+        supports_vision: Some(*supports_vision),
+        enabled: Some(*enabled),
+        cache_enabled: Some(*cache_enabled),
+        cache_ttl_secs: Some(*cache_ttl_secs),
+        tags: Some(tags.clone()),
+        boons: Some(boons.clone()),
+        tool_servers: Some(tool_servers.clone()),
+        request_timeout_secs: *request_timeout_secs,
+        max_retries: Some(*max_retries),
+        retry_backoff_ms: Some(*retry_backoff_ms),
+        endpoint_selection_mode: Some(endpoint_selection_mode.clone()),
+        debug_diagnostics: Some(*debug_diagnostics),
+        energy_slots_per_node: Some(*energy_slots_per_node),
+        route_bias: Some(*route_bias),
+        auto_eligible: Some(*auto_eligible),
+        draft_model: Some(draft_model.clone()),
+        verify_api_base: Some(verify_api_base.clone()),
+        verify_upstream_model: Some(verify_upstream_model.clone()),
         endpoints: None,
     }
 }
@@ -1565,6 +1712,69 @@ mod tests {
         let r = resolve_model(&entry("m"), Some(&existing), &[]).unwrap();
         assert_eq!(r.config.variants, existing.variants);
         assert!(!r.changed_fields.contains(&"variants".to_string()));
+    }
+
+    /// A lifecycle survives export and re-import unchanged, is settled the
+    /// way the status endpoint settles one, and is exported only when the
+    /// model is not plainly active.
+    #[test]
+    fn a_lifecycle_round_trips_and_is_settled_like_the_status_endpoint() {
+        let since = chrono::Utc::now() - chrono::Duration::days(3);
+        let deprecated = ModelLifecycle {
+            status: ModelStatus::Deprecated,
+            replacement: "m2".into(),
+            retire_at: Some(since + chrono::Duration::days(30)),
+            changed_at: Some(since),
+            note: "move to m2".into(),
+            redirect: true,
+        };
+        let mut stored = route("m");
+        stored.lifecycle = deprecated.clone();
+        let exported = model_to_manifest_entry(&stored);
+        assert_eq!(exported.lifecycle.as_ref(), Some(&deprecated));
+        let json = serde_json::to_string(&exported).unwrap();
+        let back: ManifestModel = serde_json::from_str(&json).unwrap();
+        let r = resolve_model(&back, Some(&stored), &[]).unwrap();
+        assert_eq!(r.config.lifecycle, deprecated);
+        assert!(r.changed_fields.is_empty(), "{:?}", r.changed_fields);
+        assert_eq!(model_to_manifest_entry(&route("m")).lifecycle, None);
+
+        // Onto an active model: the status changes, so `changed_at` moves to
+        // now whatever the file says.
+        let r = resolve_model(&back, Some(&route("m")), &[]).unwrap();
+        assert_eq!(r.changed_fields, vec!["lifecycle".to_string()]);
+        assert!(r.config.lifecycle.changed_at.unwrap() > since);
+        assert_eq!(r.config.lifecycle.replacement, "m2");
+
+        // An active model carries only its status.
+        let mut active = entry("m");
+        active.lifecycle = Some(ModelLifecycle {
+            note: "stray".into(),
+            replacement: "m2".into(),
+            ..Default::default()
+        });
+        let r = resolve_model(&active, Some(&stored), &[]).unwrap();
+        assert_eq!(r.config.lifecycle.status, ModelStatus::Active);
+        assert!(r.config.lifecycle.note.is_empty() && r.config.lifecycle.replacement.is_empty());
+
+        // What the lifecycle says on its own is checked.
+        let mut bad = entry("m");
+        bad.lifecycle = Some(ModelLifecycle {
+            redirect: true,
+            replacement: String::new(),
+            ..deprecated.clone()
+        });
+        assert!(resolve_model(&bad, Some(&stored), &[]).is_err());
+        bad.lifecycle = Some(ModelLifecycle {
+            replacement: "m".into(),
+            ..deprecated.clone()
+        });
+        assert!(resolve_model(&bad, Some(&stored), &[]).is_err());
+        bad.lifecycle = Some(ModelLifecycle {
+            note: "x".repeat(crate::types::MAX_LIFECYCLE_NOTE_CHARS + 1),
+            ..deprecated
+        });
+        assert!(resolve_model(&bad, Some(&stored), &[]).is_err());
     }
 
     #[test]

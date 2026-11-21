@@ -71,11 +71,11 @@ impl Store {
                     draft_model, verify_api_base, verify_upstream_model, aliases, quantization,
                     upstream_headers, cost_per_video, capacity_namespace, capacity_service,
                     per_replica_max_in_flight, capacity_source, capacity_headroom, variants,
-                    reasoning, listed, rejected_request_fields, session_affinity
+                    reasoning, listed, rejected_request_fields, session_affinity, lifecycle
                  ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
                     $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31,
                     $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47,
-                    $48, $49, $50, $51, $52)
+                    $48, $49, $50, $51, $52, $53)
                  on conflict (model_name) do update set
                     description = excluded.description,
                     upstream_model = excluded.upstream_model,
@@ -127,6 +127,7 @@ impl Store {
                     listed = excluded.listed,
                     rejected_request_fields = excluded.rejected_request_fields,
                     session_affinity = excluded.session_affinity,
+                    lifecycle = excluded.lifecycle,
                     updated_at = now()
                  returning {MODEL_COLUMNS}, (xmax = 0) as inserted"
             );
@@ -196,6 +197,7 @@ impl Store {
                     obleth_config::normalize_rejected_request_fields(&c.rejected_request_fields),
                 ))
                 .bind(sqlx::types::Json(&c.session_affinity))
+                .bind(sqlx::types::Json(&c.lifecycle))
                 .fetch_one(&mut *tx)
                 .await?;
 

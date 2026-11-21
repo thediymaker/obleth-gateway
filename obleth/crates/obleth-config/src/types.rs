@@ -892,6 +892,71 @@ pub struct ResolvedModel {
     pub endpoints: Vec<ResolvedEndpoint>,
 }
 
+impl Default for ResolvedModel {
+    /// A route with the gateway's defaults for every setting a new model
+    /// starts with, serving nothing yet: the base for fixtures and other
+    /// literals that set only what they are about.
+    fn default() -> Self {
+        Self {
+            model_name: String::new(),
+            aliases: Vec::new(),
+            variants: Vec::new(),
+            lifecycle: ModelLifecycle::default(),
+            reasoning: ModelReasoning::default(),
+            listed: true,
+            rejected_request_fields: Vec::new(),
+            session_affinity: ModelSessionAffinity::default(),
+            description: String::new(),
+            upstream_model: String::new(),
+            api_base: String::new(),
+            api_key: None,
+            upstream_headers: UpstreamHeaders::new(),
+            model_type: DEFAULT_MODEL_TYPE.to_string(),
+            quantization: DEFAULT_QUANTIZATION.to_string(),
+            admission_weight: 100,
+            max_in_flight: None,
+            capacity_mode: DEFAULT_CAPACITY_MODE.to_string(),
+            capacity_source: DEFAULT_CAPACITY_SOURCE.to_string(),
+            capacity_namespace: None,
+            capacity_service: None,
+            per_replica_max_in_flight: None,
+            capacity_headroom: 1.0,
+            enabled: true,
+            cache_enabled: false,
+            cache_ttl_secs: 0,
+            input_cost_per_token: 0.0,
+            output_cost_per_token: 0.0,
+            cost_per_image: 0.0,
+            cost_per_audio_second: 0.0,
+            cost_per_character: 0.0,
+            cost_per_video: 0.0,
+            context_window: 0,
+            supports_function_calling: false,
+            supports_system_messages: true,
+            supports_response_schema: false,
+            supports_tool_choice: false,
+            supports_vision: false,
+            tags: Vec::new(),
+            declared_levels: Vec::new(),
+            boons: Vec::new(),
+            tool_servers: Vec::new(),
+            knowledge_collections: Vec::new(),
+            request_timeout_secs: None,
+            max_retries: 0,
+            retry_backoff_ms: DEFAULT_RETRY_BACKOFF_MS,
+            endpoint_selection_mode: DEFAULT_ENDPOINT_SELECTION_MODE.to_string(),
+            debug_diagnostics: false,
+            energy_slots_per_node: 0,
+            route_bias: DEFAULT_ROUTE_BIAS,
+            auto_eligible: DEFAULT_AUTO_ELIGIBLE,
+            draft_model: String::new(),
+            verify_api_base: String::new(),
+            verify_upstream_model: String::new(),
+            endpoints: Vec::new(),
+        }
+    }
+}
+
 impl ResolvedModel {
     /// The model was granted `boon`.
     pub fn has_boon(&self, boon: Boon) -> bool {
@@ -1505,31 +1570,16 @@ pub struct UsageRetentionSettings {
 /// under key `charo_settings`. All fields have serde defaults so a blob written
 /// by an older build still loads.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct CharoSettings {
-    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Model name Charo thinks with. `None` → legacy mode (persona on subject).
-    #[serde(default)]
     pub brain_model: Option<String>,
     /// Per-tool enable/disable by tool name. Missing key → enabled.
-    #[serde(default)]
     pub tools_enabled: BTreeMap<String, bool>,
-    #[serde(default = "default_bench_max_concurrency")]
     pub bench_max_concurrency: u32,
-    #[serde(default = "default_bench_max_duration_s")]
     pub bench_max_duration_s: u32,
-    #[serde(default = "default_bench_max_requests")]
     pub bench_max_requests: u32,
-}
-
-fn default_bench_max_concurrency() -> u32 {
-    40
-}
-fn default_bench_max_duration_s() -> u32 {
-    120
-}
-fn default_bench_max_requests() -> u32 {
-    500
 }
 
 impl Default for CharoSettings {
@@ -1538,9 +1588,9 @@ impl Default for CharoSettings {
             enabled: true,
             brain_model: None,
             tools_enabled: BTreeMap::new(),
-            bench_max_concurrency: default_bench_max_concurrency(),
-            bench_max_duration_s: default_bench_max_duration_s(),
-            bench_max_requests: default_bench_max_requests(),
+            bench_max_concurrency: 40,
+            bench_max_duration_s: 120,
+            bench_max_requests: 500,
         }
     }
 }
@@ -1643,67 +1693,57 @@ fn default_slurm_api_version() -> String {
     crate::slurm::SLURM_API_VERSION_AUTO.to_string()
 }
 
-fn default_energy_poll_interval_secs() -> u64 {
-    60
-}
-
-fn default_pue() -> f64 {
-    1.0
-}
-
-fn default_model_power_label() -> String {
-    "model".to_string()
-}
-
 /// System-wide energy & carbon accounting settings, stored as a single
 /// `app_settings` row (key `energy`) like the other global settings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct EnergySettings {
     /// Master switch. When false the power poller no-ops and requests record
     /// zero energy.
-    #[serde(default)]
     pub enabled: bool,
     /// Base URL of the operator's Prometheus (e.g. `http://prometheus:9090`).
-    #[serde(default)]
     pub prometheus_url: String,
     /// Operator-supplied PromQL returning one power series (watts) per node.
     /// obleth derives cluster watts via `sum()` and node count via `count()`
     /// of this expression, so any exporter (Habana, DCGM, IPMI) works.
-    #[serde(default)]
     pub power_query: String,
     /// Operator-supplied PromQL returning one power series (watts) per
     /// model, named by the `model_power_label` label. A model whose name,
     /// capacity Service or upstream model matches a series is charged a
     /// share of that measured power, split across the requests it is
     /// serving cluster-wide, instead of the node slot share.
-    #[serde(default)]
     pub model_power_query: String,
     /// The label in `model_power_query`'s result that names the model.
-    #[serde(default = "default_model_power_label")]
     pub model_power_label: String,
     /// Optional PromQL returning how many requests each model's servers are
     /// handling, labelled like `model_power_query`. Set it when clients
     /// other than this gateway share the servers: a model's power is then
     /// split across the larger of the gateway's count and this one.
-    #[serde(default)]
     pub model_requests_query: String,
     /// Poll cadence in seconds.
-    #[serde(default = "default_energy_poll_interval_secs")]
     pub poll_interval_secs: u64,
     /// Electricity rate in USD per kWh.
-    #[serde(default)]
     pub energy_cost_per_kwh: f64,
     /// Grid carbon intensity in grams CO2 per kWh.
-    #[serde(default)]
     pub carbon_g_per_kwh: f64,
     /// Facility overhead multiplier (PUE). 1.0 = IT power only.
-    #[serde(default = "default_pue")]
     pub pue: f64,
 }
 
 impl Default for EnergySettings {
     fn default() -> Self {
-        serde_json::from_str("{}").expect("EnergySettings defaults")
+        EnergySettings {
+            enabled: false,
+            prometheus_url: String::new(),
+            power_query: String::new(),
+            model_power_query: String::new(),
+            model_power_label: "model".to_string(),
+            model_requests_query: String::new(),
+            poll_interval_secs: 60,
+            energy_cost_per_kwh: 0.0,
+            carbon_g_per_kwh: 0.0,
+            pue: 1.0,
+        }
     }
 }
 
@@ -1730,15 +1770,13 @@ impl EnergySettings {
 /// boot (falling back to environment defaults) and applies live updates without
 /// a restart.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct AlertSettings {
     /// Slack incoming-webhook URL. `None` disables Slack delivery.
-    #[serde(default)]
     pub slack_webhook_url: Option<String>,
     /// SMTP email delivery. `None` disables email alerts.
-    #[serde(default)]
     pub email: Option<EmailSettings>,
     /// Minimum seconds between repeat alerts for the same dedup key (cooldown).
-    #[serde(default = "default_alert_min_interval_secs")]
     pub min_interval_secs: u64,
 }
 
@@ -1765,10 +1803,6 @@ pub struct EmailSettings {
     pub starttls: bool,
 }
 
-fn default_alert_min_interval_secs() -> u64 {
-    300
-}
-
 fn default_smtp_port() -> u16 {
     587
 }
@@ -1782,7 +1816,7 @@ impl Default for AlertSettings {
         AlertSettings {
             slack_webhook_url: None,
             email: None,
-            min_interval_secs: default_alert_min_interval_secs(),
+            min_interval_secs: 300,
         }
     }
 }
@@ -2343,6 +2377,22 @@ pub struct ModelLifecycle {
 }
 
 impl ModelLifecycle {
+    /// Check what the lifecycle says on its own: a note within
+    /// [`MAX_LIFECYCLE_NOTE_CHARS`], and a redirect only with a replacement.
+    /// Whether the replacement exists and can stand in is the caller's to
+    /// check, against the registry.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.note.chars().count() > MAX_LIFECYCLE_NOTE_CHARS {
+            return Err(format!(
+                "note is longer than {MAX_LIFECYCLE_NOTE_CHARS} characters"
+            ));
+        }
+        if self.redirect && self.replacement.is_empty() {
+            return Err("redirect needs a replacement to send requests to".to_string());
+        }
+        Ok(())
+    }
+
     /// The status in force at `now`: the stored one, except that a
     /// deprecated model whose retirement date has passed is retired.
     pub fn status_at(&self, now: chrono::DateTime<chrono::Utc>) -> ModelStatus {
@@ -2607,73 +2657,45 @@ pub enum TierSource {
 /// from environment (classifier fields) or these defaults (scoring fields)
 /// on boot.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct AutoRouterSettings {
     /// When true, an `auto` request is first sent to the classifier model to
     /// derive intent tags. When false (or unavailable) the router falls back to
     /// cheap heuristics, then capacity/cost scoring.
-    #[serde(default)]
     pub classifier_enabled: bool,
     /// `model_name` of the registered model used as the classifier "brain"
     /// (e.g. a sub-1B model). `None` disables the model call regardless of
     /// `classifier_enabled`.
-    #[serde(default)]
     pub classifier_model: Option<String>,
     /// Hard timeout for the classifier call. On timeout the router falls back
     /// to heuristics so an `auto` request is never blocked on the brain.
-    #[serde(default = "default_classifier_timeout_ms")]
     pub classifier_timeout_ms: u64,
 
     /// Relative weight of spare capacity when scoring candidates.
-    #[serde(default = "default_capacity_weight")]
     pub capacity_weight: f64,
     /// Relative weight of cost when scoring candidates.
-    #[serde(default = "default_cost_weight")]
     pub cost_weight: f64,
     /// Weight of intent-tag match, layered over the capacity/cost base.
-    #[serde(default = "default_tag_weight")]
     pub tag_weight: f64,
     /// Assumed concurrency ceiling for models with no explicit `max_in_flight`.
-    #[serde(default = "default_soft_cap")]
     pub default_soft_cap: u32,
     /// 0.0 selects the highest-scoring candidate (deterministic argmax).
     /// Above 0.0, candidates are sampled from a softmax over their scores.
-    #[serde(default)]
     pub temperature: f64,
     /// When false, the difficulty tier filter is skipped entirely.
-    #[serde(default)]
     pub difficulty_enabled: bool,
-    #[serde(default)]
     pub tier_source: TierSource,
     /// When true, a conversation stays on the model that answered its last
     /// turn until there is evidence that model is not doing a good job, and
     /// then moves up a level (see `routing::sticky`).
-    #[serde(default)]
     pub sticky_enabled: bool,
     /// Model or alias served when a request on the Anthropic Messages surface
     /// names a model the gateway does not know (Claude Code sends Anthropic
     /// model ids). `None` means such requests get `not_found_error`.
-    #[serde(default)]
     pub messages_default_model: Option<String>,
     /// Model or alias a `/v1/verdicts` request is answered by when it names no
     /// model. `None` means such requests go to `auto`.
-    #[serde(default)]
     pub verdicts_default_model: Option<String>,
-}
-
-fn default_classifier_timeout_ms() -> u64 {
-    250
-}
-fn default_capacity_weight() -> f64 {
-    0.6
-}
-fn default_cost_weight() -> f64 {
-    0.4
-}
-fn default_tag_weight() -> f64 {
-    0.5
-}
-fn default_soft_cap() -> u32 {
-    8
 }
 
 impl Default for AutoRouterSettings {
@@ -2681,11 +2703,11 @@ impl Default for AutoRouterSettings {
         AutoRouterSettings {
             classifier_enabled: false,
             classifier_model: None,
-            classifier_timeout_ms: default_classifier_timeout_ms(),
-            capacity_weight: default_capacity_weight(),
-            cost_weight: default_cost_weight(),
-            tag_weight: default_tag_weight(),
-            default_soft_cap: default_soft_cap(),
+            classifier_timeout_ms: 250,
+            capacity_weight: 0.6,
+            cost_weight: 0.4,
+            tag_weight: 0.5,
+            default_soft_cap: 8,
             temperature: 0.0,
             difficulty_enabled: false,
             tier_source: TierSource::default(),
@@ -2727,93 +2749,64 @@ model that cannot see images. Describe this image in thorough, faithful detail: 
 all visible text (verbatim), UI elements, code, diagrams, charts, layout, and \
 any information needed to reason about it. Be concise but complete.";
 
-fn default_vision_describe_prompt() -> String {
-    DEFAULT_VISION_DESCRIBE_PROMPT.to_string()
-}
-
-fn default_vision_cache_ttl_secs() -> u64 {
-    6 * 60 * 60
-}
-
-fn default_vision_max_images() -> u32 {
-    6
-}
-
-fn default_vision_timeout_ms() -> u64 {
-    30_000
-}
-
 /// Runtime-editable configuration for the gateway's model "boons" — gateway-side
 /// capabilities granted to models that lack them natively. Persisted in
 /// `app_settings` under the `boons` key so it is editable from the control plane
 /// without a restart.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
 pub struct BoonSettings {
     /// The vision boon: relay images to a designated vision model for models
     /// that do not natively accept image input.
-    #[serde(default)]
     pub vision: VisionBoonSettings,
     /// The structured-output boon: enforce `response_format` JSON schemas for
     /// models without native support.
-    #[serde(default)]
     pub structured_output: StructuredOutputBoonSettings,
     /// The gateway tool loop: inject granted MCP-server tools into chat
     /// requests and execute the model's tool calls at the gateway.
-    #[serde(default)]
     pub tool_loop: ToolLoopSettings,
     /// The guardrails boon: content policy enforcement via Rust-native scanners
     /// and an optional registered guard model.
-    #[serde(default)]
     pub guardrails: GuardrailsBoonSettings,
     /// The compression boon: losslessly compact (and, in later phases,
     /// semantically compress) what the model reads before dispatch.
-    #[serde(default)]
     pub compression: CompressionBoonSettings,
     /// The knowledge boon: ground chat requests on admin-curated institutional
     /// documents retrieved from an in-process vector index.
-    #[serde(default)]
     pub knowledge: KnowledgeBoonSettings,
     /// The image-generation boon: inject a gateway-executed `generate_image`
     /// tool so a chat model can produce images through a registered image
     /// model.
-    #[serde(default)]
     pub image_generation: ImageGenerationBoonSettings,
     /// The speculation boon: answer with a fast drafter model when the target
     /// model verifies the draft; escalate to the target otherwise.
-    #[serde(default)]
     pub speculation: SpeculationBoonSettings,
     /// The web-search boon: inject a gateway-executed `web_search` tool so a
     /// chat model can search the web through a registered `search` route.
-    #[serde(default)]
     pub web_search: WebSearchBoonSettings,
 }
 
 /// Configuration for the vision boon (image-to-text relay).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct VisionBoonSettings {
     /// Master switch for the vision boon. When false, requests pass through
     /// unchanged (today's behavior).
-    #[serde(default)]
     pub enabled: bool,
     /// `model_name` of the registered vision model used to describe images.
     /// `None` disables the relay regardless of `enabled`.
-    #[serde(default)]
     pub fallback_model: Option<String>,
     /// Instruction sent to the vision model when asking it to describe an image.
-    #[serde(default = "default_vision_describe_prompt")]
     pub describe_prompt: String,
     /// Maximum number of images relayed per request (cost/latency guard).
     /// Images beyond this cap are left untouched.
-    #[serde(default = "default_vision_max_images")]
     pub max_images: u32,
     /// Hard timeout for each describe call, in milliseconds. On timeout the
     /// relay is abandoned and the original request passes through unchanged.
-    #[serde(default = "default_vision_timeout_ms")]
     pub timeout_ms: u64,
     /// How long a description is kept and reused, in seconds. A conversation
     /// sends its earlier images again on every turn; with this, each image is
     /// described once. 0 turns the reuse off.
-    #[serde(default = "default_vision_cache_ttl_secs")]
     pub cache_ttl_secs: u64,
 }
 
@@ -2822,10 +2815,10 @@ impl Default for VisionBoonSettings {
         VisionBoonSettings {
             enabled: false,
             fallback_model: None,
-            describe_prompt: default_vision_describe_prompt(),
-            max_images: default_vision_max_images(),
-            timeout_ms: default_vision_timeout_ms(),
-            cache_ttl_secs: default_vision_cache_ttl_secs(),
+            describe_prompt: DEFAULT_VISION_DESCRIBE_PROMPT.to_string(),
+            max_images: 6,
+            timeout_ms: 30_000,
+            cache_ttl_secs: 6 * 60 * 60,
         }
     }
 }
@@ -2866,48 +2859,27 @@ pub const DEFAULT_IMAGE_TOOL_DESCRIPTION: &str =
 /// configures (cost, latency, and response-size guard).
 pub const IMAGE_GENERATION_MAX_PER_REQUEST: u32 = 4;
 
-fn default_image_tool_description() -> String {
-    DEFAULT_IMAGE_TOOL_DESCRIPTION.to_string()
-}
-
-fn default_image_allowed_sizes() -> Vec<String> {
-    vec!["512x512".to_string(), "1024x1024".to_string()]
-}
-
-fn default_image_max_per_request() -> u32 {
-    2
-}
-
-fn default_image_timeout_ms() -> u64 {
-    120_000
-}
-
 /// Configuration for the image-generation boon (gateway-executed
 /// `generate_image` tool backed by a registered `image`-type model).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct ImageGenerationBoonSettings {
     /// Master switch. When false, no tool is injected and requests pass through
     /// unchanged.
-    #[serde(default)]
     pub enabled: bool,
     /// `model_name` of the registered `image`-type model that serves
     /// generations. `None` disables the boon regardless of `enabled`.
-    #[serde(default)]
     pub image_model: Option<String>,
     /// Tool description the model reads when deciding to call the tool.
-    #[serde(default = "default_image_tool_description")]
     pub tool_description: String,
     /// Sizes offered in the tool schema and accepted at execution. A requested
     /// size outside this list is clamped to the first entry.
-    #[serde(default = "default_image_allowed_sizes")]
     pub allowed_sizes: Vec<String>,
     /// Maximum images per tool call, clamped to
     /// [`IMAGE_GENERATION_MAX_PER_REQUEST`].
-    #[serde(default = "default_image_max_per_request")]
     pub max_images_per_request: u32,
     /// Hard timeout for one generation call, in milliseconds. On timeout the
     /// model is told the generation failed and answers in prose.
-    #[serde(default = "default_image_timeout_ms")]
     pub timeout_ms: u64,
 }
 
@@ -2916,10 +2888,10 @@ impl Default for ImageGenerationBoonSettings {
         ImageGenerationBoonSettings {
             enabled: false,
             image_model: None,
-            tool_description: default_image_tool_description(),
-            allowed_sizes: default_image_allowed_sizes(),
-            max_images_per_request: default_image_max_per_request(),
-            timeout_ms: default_image_timeout_ms(),
+            tool_description: DEFAULT_IMAGE_TOOL_DESCRIPTION.to_string(),
+            allowed_sizes: vec!["512x512".to_string(), "1024x1024".to_string()],
+            max_images_per_request: 2,
+            timeout_ms: 120_000,
         }
     }
 }
@@ -2953,48 +2925,27 @@ pub const WEB_SEARCH_MAX_PER_REQUEST: u32 = 8;
 /// Hard ceiling on results handed to the model per search (context guard).
 pub const WEB_SEARCH_MAX_RESULTS: u32 = 10;
 
-fn default_web_search_tool_description() -> String {
-    DEFAULT_WEB_SEARCH_TOOL_DESCRIPTION.to_string()
-}
-
-fn default_web_search_max_results() -> u32 {
-    5
-}
-
-fn default_web_search_max_per_request() -> u32 {
-    3
-}
-
-fn default_web_search_timeout_ms() -> u64 {
-    15_000
-}
-
 /// Configuration for the web-search boon (gateway-executed `web_search` tool
 /// backed by a registered `search`-type route).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct WebSearchBoonSettings {
     /// Master switch. When false, no tool is injected and requests pass through
     /// unchanged.
-    #[serde(default)]
     pub enabled: bool,
     /// `model_name` of the registered `search`-type route that runs the
     /// searches. `None` disables the boon regardless of `enabled`.
-    #[serde(default)]
     pub search_tool: Option<String>,
     /// Tool description the model reads when deciding to call the tool.
-    #[serde(default = "default_web_search_tool_description")]
     pub tool_description: String,
     /// Results handed to the model per search, clamped to
     /// [`WEB_SEARCH_MAX_RESULTS`].
-    #[serde(default = "default_web_search_max_results")]
     pub max_results: u32,
     /// Searches one request may run across all of its tool turns, clamped to
     /// [`WEB_SEARCH_MAX_PER_REQUEST`].
-    #[serde(default = "default_web_search_max_per_request")]
     pub max_searches_per_request: u32,
     /// Hard timeout for one search, in milliseconds. On timeout the model is
     /// told the search failed and answers from what it knows.
-    #[serde(default = "default_web_search_timeout_ms")]
     pub timeout_ms: u64,
 }
 
@@ -3003,10 +2954,10 @@ impl Default for WebSearchBoonSettings {
         WebSearchBoonSettings {
             enabled: false,
             search_tool: None,
-            tool_description: default_web_search_tool_description(),
-            max_results: default_web_search_max_results(),
-            max_searches_per_request: default_web_search_max_per_request(),
-            timeout_ms: default_web_search_timeout_ms(),
+            tool_description: DEFAULT_WEB_SEARCH_TOOL_DESCRIPTION.to_string(),
+            max_results: 5,
+            max_searches_per_request: 3,
+            timeout_ms: 15_000,
         }
     }
 }
@@ -3030,38 +2981,6 @@ fn default_spec_lp_min() -> f64 {
     -1.0
 }
 
-fn default_spec_abort_agree() -> f64 {
-    0.45
-}
-
-fn default_spec_abort_lp() -> f64 {
-    -1.6
-}
-
-fn default_spec_first_chunk_tokens() -> u32 {
-    80
-}
-
-fn default_spec_chunk_tokens() -> u32 {
-    250
-}
-
-fn default_spec_decide_by_tokens() -> u32 {
-    450
-}
-
-fn default_spec_max_draft_tokens() -> u32 {
-    2048
-}
-
-fn default_spec_pace_ms() -> u64 {
-    9
-}
-
-fn default_spec_timeout_ms() -> u64 {
-    45_000
-}
-
 /// Configuration for the speculation boon (draft-verify cascade).
 ///
 /// The drafter writes a candidate answer; the verifier — a deployment of the
@@ -3074,78 +2993,63 @@ fn default_spec_timeout_ms() -> u64 {
 /// abandoned and the target model answers; in between the decision is deferred
 /// while the draft grows (a draft's stylistic opening scores lowest).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct SpeculationBoonSettings {
     /// Master switch. When false, requests pass through unchanged.
-    #[serde(default)]
     pub enabled: bool,
     /// `model_name` of the registered chat model that drafts answers. Must be
     /// several times faster than the target for the boon to pay off. `None`
     /// disables the boon regardless of `enabled`.
-    #[serde(default)]
     pub draft_model: Option<String>,
     /// Ship floor: minimum fraction of draft tokens the verifier ranks #1.
-    #[serde(default = "default_spec_agree_min")]
     pub agree_min: f64,
     /// Ship floor: minimum mean log-probability over draft tokens.
-    #[serde(default = "default_spec_lp_min")]
     pub lp_min: f64,
     /// Abort floor (streaming): below this agreement, stop drafting and
     /// escalate immediately instead of deferring.
-    #[serde(default = "default_spec_abort_agree")]
     pub abort_agree: f64,
     /// Abort floor (streaming): below this mean log-probability, stop drafting
     /// and escalate immediately instead of deferring.
-    #[serde(default = "default_spec_abort_lp")]
     pub abort_lp: f64,
     /// Draft tokens accumulated before the FIRST verification. Small, so a
     /// passing draft starts streaming early and a failing one aborts cheaply.
-    #[serde(default = "default_spec_first_chunk_tokens")]
     pub first_chunk_tokens: u32,
     /// Draft tokens between subsequent verifications.
-    #[serde(default = "default_spec_chunk_tokens")]
     pub chunk_tokens: u32,
     /// Defer patience: if nothing has been released by this many draft tokens
     /// and the cumulative stats still sit below the gate, escalate — such
     /// drafts almost never recover, and every deferred token is added latency
     /// before the target model starts over.
-    #[serde(default = "default_spec_decide_by_tokens")]
     pub decide_by_tokens: u32,
     /// Cap on the drafter's `max_tokens` (a reasoning drafter can burn an
     /// unbounded budget producing nothing shippable).
-    #[serde(default = "default_spec_max_draft_tokens")]
     pub max_draft_tokens: u32,
     /// Milliseconds between released draft deltas, so verified spans play back
     /// as a continuous stream instead of bursts. 0 releases each span at once.
-    #[serde(default = "default_spec_pace_ms")]
     pub pace_ms: u64,
     /// `chat_template_kwargs` sent with DRAFT calls only (e.g.
     /// `{"reasoning": false}` on drafters whose template can skip thinking —
     /// measured both faster and more reliable than letting the drafter reason).
     /// Never forwarded to the verifier or the target.
-    #[serde(default)]
     pub draft_chat_template_kwargs: Option<serde_json::Value>,
     /// Wall-clock budget in milliseconds for the pre-release phase (drafting +
     /// verification before anything is sent to the client). On timeout the
     /// request falls through to the target model unchanged.
-    #[serde(default = "default_spec_timeout_ms")]
     pub timeout_ms: u64,
     /// `model_name` of a registered tiny model that classifies each request
     /// into one of the `category_gates` tags before drafting (the same
     /// mechanism as the auto-router's brain, with this boon's own vocabulary).
     /// `None` disables classification: the default gate applies to everything.
-    #[serde(default)]
     pub classify_model: Option<String>,
     /// Per-category gate overrides. Calibration shows the gate's precision is
     /// strongly category-dependent — and that some categories should never
     /// ship a draft at all (`speculate: false` abstains before the draft is
     /// even requested, costing nothing).
-    #[serde(default)]
     pub category_gates: Vec<SpeculationCategoryGate>,
     /// What happens when the request's category has no `category_gates` entry
     /// (including when classification is off or failed): `true` applies the
     /// default `agree_min`/`lp_min` gate, `false` abstains (the target model
     /// answers directly).
-    #[serde(default = "default_spec_unlisted_speculate")]
     pub unlisted_categories_speculate: bool,
     /// Fleet rule for locating a model's scoring endpoint when the model does
     /// not set its own `verify_api_base`: a URL with `{upstream}` and/or
@@ -3154,29 +3058,15 @@ pub struct SpeculationBoonSettings {
     /// once the fleet's backends can survive `prompt_logprobs` scoring —
     /// pointing it at unpatched pods kills them. Empty = models without their
     /// own endpoint cannot speculate.
-    #[serde(default)]
     pub verify_url_template: String,
     /// Per-call bound on a verifier call (tokenize, score), in milliseconds.
     /// Before anything is released the pre-release budget also applies; after
     /// the commit this is what ends a stalled scorer, so the committed stream
     /// ends instead of going silent.
-    #[serde(default = "default_spec_verify_timeout_ms")]
     pub verify_timeout_ms: u64,
     /// Largest verifier reply read, in bytes. A `prompt_logprobs` answer runs
     /// to a few hundred bytes per prompt token, so a long prompt is megabytes.
-    #[serde(default = "default_spec_verify_reply_max_bytes")]
     pub verify_reply_max_bytes: usize,
-}
-
-fn default_spec_verify_timeout_ms() -> u64 {
-    30_000
-}
-fn default_spec_verify_reply_max_bytes() -> usize {
-    64 * 1024 * 1024
-}
-
-fn default_spec_unlisted_speculate() -> bool {
-    true
 }
 
 fn default_spec_gate_speculate() -> bool {
@@ -3205,23 +3095,23 @@ impl Default for SpeculationBoonSettings {
         SpeculationBoonSettings {
             enabled: false,
             draft_model: None,
-            agree_min: default_spec_agree_min(),
-            lp_min: default_spec_lp_min(),
-            abort_agree: default_spec_abort_agree(),
-            abort_lp: default_spec_abort_lp(),
-            first_chunk_tokens: default_spec_first_chunk_tokens(),
-            chunk_tokens: default_spec_chunk_tokens(),
-            decide_by_tokens: default_spec_decide_by_tokens(),
-            max_draft_tokens: default_spec_max_draft_tokens(),
-            pace_ms: default_spec_pace_ms(),
+            agree_min: 0.5,
+            lp_min: -1.0,
+            abort_agree: 0.45,
+            abort_lp: -1.6,
+            first_chunk_tokens: 80,
+            chunk_tokens: 250,
+            decide_by_tokens: 450,
+            max_draft_tokens: 2048,
+            pace_ms: 9,
             draft_chat_template_kwargs: None,
-            timeout_ms: default_spec_timeout_ms(),
+            timeout_ms: 45_000,
             classify_model: None,
             category_gates: Vec::new(),
-            unlisted_categories_speculate: default_spec_unlisted_speculate(),
+            unlisted_categories_speculate: true,
             verify_url_template: String::new(),
-            verify_timeout_ms: default_spec_verify_timeout_ms(),
-            verify_reply_max_bytes: default_spec_verify_reply_max_bytes(),
+            verify_timeout_ms: 30_000,
+            verify_reply_max_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -3236,35 +3126,24 @@ impl SpeculationBoonSettings {
     }
 }
 
-fn default_structured_max_repair_attempts() -> u32 {
-    1
-}
-
-fn default_structured_timeout_ms() -> u64 {
-    30_000
-}
-
 /// Maximum repair attempts an operator may configure for the structured-output
 /// boon (cost guard).
 pub const STRUCTURED_OUTPUT_MAX_REPAIR_ATTEMPTS: u32 = 3;
 
 /// Configuration for the structured-output boon (JSON-schema enforcement).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct StructuredOutputBoonSettings {
     /// Master switch for the structured-output boon. When false, requests pass
     /// through unchanged.
-    #[serde(default)]
     pub enabled: bool,
     /// `model_name` of the registered model used to repair invalid JSON.
     /// `None` re-prompts the request's own model instead.
-    #[serde(default)]
     pub fixer_model: Option<String>,
     /// Maximum repair calls per request when validation fails
     /// (clamped to [`STRUCTURED_OUTPUT_MAX_REPAIR_ATTEMPTS`]).
-    #[serde(default = "default_structured_max_repair_attempts")]
     pub max_repair_attempts: u32,
     /// Hard timeout for each repair call, in milliseconds.
-    #[serde(default = "default_structured_timeout_ms")]
     pub timeout_ms: u64,
 }
 
@@ -3273,8 +3152,8 @@ impl Default for StructuredOutputBoonSettings {
         StructuredOutputBoonSettings {
             enabled: false,
             fixer_model: None,
-            max_repair_attempts: default_structured_max_repair_attempts(),
-            timeout_ms: default_structured_timeout_ms(),
+            max_repair_attempts: 1,
+            timeout_ms: 30_000,
         }
     }
 }
@@ -3284,18 +3163,6 @@ impl StructuredOutputBoonSettings {
     pub fn active(&self) -> bool {
         self.enabled
     }
-}
-
-fn default_tool_loop_max_turns() -> u32 {
-    4
-}
-
-fn default_tool_loop_timeout_ms() -> u64 {
-    30_000
-}
-
-fn default_tool_loop_deadline_secs() -> u64 {
-    300
 }
 
 /// Default system nudge injected alongside granted tools so under-eager models
@@ -3330,30 +3197,26 @@ pub const TOOL_LOOP_MAX_CALLS_PER_TURN: usize = 16;
 /// calls against the MCP upstream, and loops until the model produces a final
 /// answer. Clients that send their own `tools` are left untouched.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct ToolLoopSettings {
     /// Master switch for the gateway tool loop. When false, granted tool
     /// servers are ignored and requests pass through unchanged.
-    #[serde(default)]
     pub enabled: bool,
     /// Maximum model round trips per request before the loop stops and the
     /// last completion is returned as-is (clamped to [`TOOL_LOOP_MAX_TURNS`]).
-    #[serde(default = "default_tool_loop_max_turns")]
     pub max_turns: u32,
     /// Hard timeout for each MCP tool execution, in milliseconds.
-    #[serde(default = "default_tool_loop_timeout_ms")]
     pub tool_timeout_ms: u64,
     /// System instruction injected alongside the granted tools so the model
     /// actually calls them when a question needs external information. Tunable
     /// per deployment; injected only for plain chat clients (clients that bring
     /// their own `tools` manage their own tool-use policy and are left
     /// untouched). An empty string disables the nudge.
-    #[serde(default = "default_tool_loop_nudge")]
     pub nudge: String,
     /// Wall-clock budget for the whole loop of one request (every tool call
     /// and follow-up turn), in seconds. Per-call timeouts alone stack up to
     /// `max_turns` x calls x timeout of held upstream capacity; once this
     /// elapses the loop dispatches nothing further.
-    #[serde(default = "default_tool_loop_deadline_secs")]
     pub deadline_secs: u64,
 }
 
@@ -3361,10 +3224,10 @@ impl Default for ToolLoopSettings {
     fn default() -> Self {
         ToolLoopSettings {
             enabled: false,
-            max_turns: default_tool_loop_max_turns(),
-            tool_timeout_ms: default_tool_loop_timeout_ms(),
+            max_turns: 4,
+            tool_timeout_ms: 30_000,
             nudge: default_tool_loop_nudge(),
-            deadline_secs: default_tool_loop_deadline_secs(),
+            deadline_secs: 300,
         }
     }
 }
@@ -3376,88 +3239,57 @@ impl ToolLoopSettings {
     }
 }
 
-fn default_guardrails_timeout_ms() -> u64 {
-    5_000
-}
-
 /// Global tuning for the guardrails boon. There is intentionally no master
 /// `enabled` flag: guardrails are enabled per-tenant by the presence of a
 /// [`GuardrailsPolicy`], so a configured policy always takes effect.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+#[serde(default)]
 pub struct GuardrailsBoonSettings {
     /// Timeout for tier-2 guard model calls (ms). Does not apply to tier-1 scanners.
-    #[serde(default = "default_guardrails_timeout_ms")]
     pub timeout_ms: u64,
 }
 
 impl Default for GuardrailsBoonSettings {
     fn default() -> Self {
-        Self {
-            timeout_ms: default_guardrails_timeout_ms(),
-        }
+        Self { timeout_ms: 5_000 }
     }
-}
-
-fn default_compression_min_tokens() -> u32 {
-    128
-}
-fn default_compression_max_segments() -> u32 {
-    64
-}
-fn default_compression_original_ttl_secs() -> u64 {
-    3_600
-}
-fn default_compression_max_lossy_segments() -> u32 {
-    4
-}
-fn default_neural_keep_ratio() -> f32 {
-    0.5
 }
 
 /// Configuration for the compression boon: lossless structural/code compaction
 /// plus deterministic (model-free) lossy text compaction.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct CompressionBoonSettings {
     /// Master switch. When false, requests pass through unchanged.
-    #[serde(default)]
     pub enabled: bool,
     /// Skip any message segment whose estimated token count is below this
     /// floor (overhead would exceed savings).
-    #[serde(default = "default_compression_min_tokens")]
     pub min_tokens: u32,
     /// Cap on how many segments the lossless pass compacts per request. The
     /// pass also stops after reading 8 MB of segment text.
-    #[serde(default = "default_compression_max_segments")]
     pub max_segments: u32,
     /// Redis TTL for stashed originals (seconds); tuned to a session lifetime.
-    #[serde(default = "default_compression_original_ttl_secs")]
     pub original_ttl_secs: u64,
     /// Segments each reversible text pass (dedup, log, lossy) may replace
     /// per request; distinct from `max_segments`, which caps lossless
     /// compaction.
-    #[serde(default = "default_compression_max_lossy_segments")]
     pub max_lossy_segments: u32,
     /// Conservative, opt-in whitespace normalization of fenced code segments
     /// (strip trailing whitespace, collapse blank-line runs). Off by default.
-    #[serde(default)]
     pub code_compaction: bool,
     /// Cross-turn exact-duplicate dedup default. A per-tenant policy overrides
     /// this; tenants with no policy inherit it. Off by default.
-    #[serde(default)]
     pub dedup: bool,
     /// Near-lossless log template-collapse default (repeated log lines → one
     /// representative line + `(×N)`). A per-tenant policy overrides this;
     /// tenants with no policy inherit it. Off by default.
-    #[serde(default)]
     pub compact_logs: bool,
     /// Lossy text compaction default (salience-based prose line/sentence drop;
     /// uses the neural sidecar when deployed). A per-tenant policy overrides
     /// this; tenants with no policy inherit it. Off by default.
-    #[serde(default)]
     pub allow_lossy: bool,
     /// Fraction of sentences the compressor sidecar selects to keep during the
     /// neural extractive pass. Range `(0.0, 1.0]`; defaults to 0.5.
-    #[serde(default = "default_neural_keep_ratio")]
     pub neural_keep_ratio: f32,
 }
 
@@ -3465,15 +3297,15 @@ impl Default for CompressionBoonSettings {
     fn default() -> Self {
         CompressionBoonSettings {
             enabled: false,
-            min_tokens: default_compression_min_tokens(),
-            max_segments: default_compression_max_segments(),
-            original_ttl_secs: default_compression_original_ttl_secs(),
-            max_lossy_segments: default_compression_max_lossy_segments(),
+            min_tokens: 128,
+            max_segments: 64,
+            original_ttl_secs: 3_600,
+            max_lossy_segments: 4,
             code_compaction: false,
             dedup: false,
             compact_logs: false,
             allow_lossy: false,
-            neural_keep_ratio: default_neural_keep_ratio(),
+            neural_keep_ratio: 0.5,
         }
     }
 }
@@ -3485,85 +3317,39 @@ impl CompressionBoonSettings {
     }
 }
 
-fn default_knowledge_top_k() -> u32 {
-    5
-}
-fn default_knowledge_min_score() -> f32 {
-    0.35
-}
-fn default_knowledge_max_context_tokens() -> u32 {
-    1500
-}
-fn default_knowledge_embed_timeout_ms() -> u64 {
-    1500
-}
-fn default_knowledge_query_cache_ttl_s() -> u64 {
-    600
-}
-fn default_knowledge_query_turns() -> u32 {
-    2
-}
-fn default_knowledge_max_upload_bytes() -> i64 {
-    10 * 1024 * 1024
-}
-fn default_knowledge_max_chunks() -> i64 {
-    100_000
-}
-fn default_knowledge_index_batch_size() -> u32 {
-    32
-}
-fn default_knowledge_index_timeout_ms() -> u64 {
-    30_000
-}
-fn default_knowledge_index_stale_after_secs() -> i64 {
-    1_800
-}
-
 /// Configuration for the knowledge boon (institutional RAG).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct KnowledgeBoonSettings {
     /// Master switch. False leaves every request untouched.
-    #[serde(default)]
     pub enabled: bool,
     /// Chunks considered per request before thresholding.
-    #[serde(default = "default_knowledge_top_k")]
     pub top_k: u32,
     /// Cosine floor; a chunk below this is dropped even if it is the best match.
-    #[serde(default = "default_knowledge_min_score")]
     pub min_score: f32,
     /// Ceiling on injected tokens, before the context-window clamp.
-    #[serde(default = "default_knowledge_max_context_tokens")]
     pub max_context_tokens: u32,
     /// Hard bound on the request-path query-embedding call.
-    #[serde(default = "default_knowledge_embed_timeout_ms")]
     pub embed_timeout_ms: u64,
     /// Query-vector cache lifetime in Redis.
-    #[serde(default = "default_knowledge_query_cache_ttl_s")]
     pub query_cache_ttl_s: u64,
     /// How many trailing user messages form the retrieval query.
-    #[serde(default = "default_knowledge_query_turns")]
     pub query_turns: u32,
     /// Per-file upload cap, rejected before parsing.
-    #[serde(default = "default_knowledge_max_upload_bytes")]
     pub max_upload_bytes: i64,
     /// Per-collection chunk cap; indexing refuses past it.
-    #[serde(default = "default_knowledge_max_chunks")]
     pub max_chunks_per_collection: i64,
     /// Chunks per upstream embedding call during indexing.
-    #[serde(default = "default_knowledge_index_batch_size")]
     pub index_batch_size: u32,
     /// Timeout for indexing-time embedding calls (looser than the hot path).
-    #[serde(default = "default_knowledge_index_timeout_ms")]
     pub index_timeout_ms: u64,
     /// How long a claimed document may sit in `indexing` before another worker
     /// may reclaim it. Generous on purpose: it must exceed the worst-case
     /// embedding time for a large document, or a slow document gets embedded
     /// twice.
-    #[serde(default = "default_knowledge_index_stale_after_secs")]
     pub index_stale_after_secs: i64,
     /// Write retrieved chunk *text* into spans. Costs roughly 20x the default
     /// tracing tier, so it is opt-in and surfaced with a size warning.
-    #[serde(default)]
     pub debug_snapshot: bool,
 }
 
@@ -3571,17 +3357,17 @@ impl Default for KnowledgeBoonSettings {
     fn default() -> Self {
         Self {
             enabled: false,
-            top_k: default_knowledge_top_k(),
-            min_score: default_knowledge_min_score(),
-            max_context_tokens: default_knowledge_max_context_tokens(),
-            embed_timeout_ms: default_knowledge_embed_timeout_ms(),
-            query_cache_ttl_s: default_knowledge_query_cache_ttl_s(),
-            query_turns: default_knowledge_query_turns(),
-            max_upload_bytes: default_knowledge_max_upload_bytes(),
-            max_chunks_per_collection: default_knowledge_max_chunks(),
-            index_batch_size: default_knowledge_index_batch_size(),
-            index_timeout_ms: default_knowledge_index_timeout_ms(),
-            index_stale_after_secs: default_knowledge_index_stale_after_secs(),
+            top_k: 5,
+            min_score: 0.35,
+            max_context_tokens: 1500,
+            embed_timeout_ms: 1500,
+            query_cache_ttl_s: 600,
+            query_turns: 2,
+            max_upload_bytes: 10 * 1024 * 1024,
+            max_chunks_per_collection: 100_000,
+            index_batch_size: 32,
+            index_timeout_ms: 30_000,
+            index_stale_after_secs: 1_800,
             debug_snapshot: false,
         }
     }
@@ -4421,6 +4207,31 @@ mod tests {
     }
 
     use super::*;
+
+    /// Each runtime settings struct reads an empty object as its `Default`:
+    /// `impl Default` is the one source of every default, and a blob written
+    /// before a field existed loads with that field's default.
+    #[test]
+    fn an_empty_settings_object_reads_as_the_default() {
+        fn check<T: serde::de::DeserializeOwned + Default + PartialEq + std::fmt::Debug>() {
+            let read: T = serde_json::from_str("{}").unwrap();
+            assert_eq!(read, T::default(), "{}", std::any::type_name::<T>());
+        }
+        check::<CharoSettings>();
+        check::<EnergySettings>();
+        check::<AlertSettings>();
+        check::<AutoRouterSettings>();
+        check::<BoonSettings>();
+        check::<VisionBoonSettings>();
+        check::<ImageGenerationBoonSettings>();
+        check::<WebSearchBoonSettings>();
+        check::<SpeculationBoonSettings>();
+        check::<StructuredOutputBoonSettings>();
+        check::<ToolLoopSettings>();
+        check::<GuardrailsBoonSettings>();
+        check::<CompressionBoonSettings>();
+        check::<KnowledgeBoonSettings>();
+    }
 
     #[test]
     fn declared_levels_come_only_from_explicit_suffixes() {
@@ -5534,61 +5345,12 @@ mod tests {
 
     fn resolved_fixture() -> ResolvedModel {
         ResolvedModel {
-            description: String::new(),
             model_name: "glm-5-3".into(),
             aliases: vec!["glm-5-3-fp8".into(), "glm-5-3-mxfp4".into()],
-            lifecycle: Default::default(),
-            reasoning: Default::default(),
-            listed: true,
-            rejected_request_fields: Vec::new(),
-            session_affinity: Default::default(),
-            variants: Vec::new(),
             upstream_model: "glm-5-3-mxfp4".into(),
             api_base: "http://upstream/v1".into(),
-            api_key: None,
-            upstream_headers: Default::default(),
-            model_type: DEFAULT_MODEL_TYPE.to_string(),
             quantization: "mxfp4".into(),
-            admission_weight: 100,
-            max_in_flight: None,
-            capacity_mode: "static".into(),
-            capacity_source: "endpoints".into(),
-            capacity_namespace: None,
-            capacity_service: None,
-            per_replica_max_in_flight: None,
-            capacity_headroom: 1.0,
-            enabled: true,
-            cache_enabled: false,
-            cache_ttl_secs: 0,
-            input_cost_per_token: 0.0,
-            output_cost_per_token: 0.0,
-            cost_per_image: 0.0,
-            cost_per_audio_second: 0.0,
-            cost_per_character: 0.0,
-            cost_per_video: 0.0,
-            context_window: 0,
-            supports_function_calling: false,
-            supports_system_messages: true,
-            supports_response_schema: false,
-            supports_tool_choice: false,
-            supports_vision: false,
-            tags: Vec::new(),
-            declared_levels: Vec::new(),
-            boons: Vec::new(),
-            tool_servers: Vec::new(),
-            knowledge_collections: Vec::new(),
-            request_timeout_secs: None,
-            max_retries: 0,
-            retry_backoff_ms: DEFAULT_RETRY_BACKOFF_MS,
-            endpoint_selection_mode: DEFAULT_ENDPOINT_SELECTION_MODE.to_string(),
-            debug_diagnostics: false,
-            energy_slots_per_node: 0,
-            route_bias: 1.0,
-            auto_eligible: true,
-            draft_model: String::new(),
-            verify_api_base: String::new(),
-            verify_upstream_model: String::new(),
-            endpoints: Vec::new(),
+            ..Default::default()
         }
     }
 

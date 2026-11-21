@@ -67,7 +67,7 @@ impl RouterWeights {
             soft_cap: if s.default_soft_cap > 0 {
                 s.default_soft_cap as f64
             } else {
-                8.0
+                crate::AutoRouterSettings::default().default_soft_cap as f64
             },
             temperature: s.temperature.max(0.0),
             difficulty_enabled: s.difficulty_enabled,
@@ -1405,61 +1405,14 @@ mod tests {
 
     pub(super) fn model(name: &str) -> ResolvedModel {
         ResolvedModel {
-            description: String::new(),
             model_name: name.to_string(),
-            aliases: Vec::new(),
-            lifecycle: Default::default(),
-            reasoning: Default::default(),
-            listed: true,
-            rejected_request_fields: Vec::new(),
-            session_affinity: Default::default(),
-            variants: Vec::new(),
             upstream_model: name.to_string(),
             api_base: "http://upstream".to_string(),
-            api_key: None,
-            upstream_headers: Default::default(),
-            model_type: crate::DEFAULT_MODEL_TYPE.to_string(),
-            quantization: crate::DEFAULT_QUANTIZATION.to_string(),
-            admission_weight: 100,
-            max_in_flight: None,
-            capacity_mode: "static".into(),
-            capacity_source: "endpoints".into(),
-            capacity_namespace: None,
-            capacity_service: None,
-            per_replica_max_in_flight: None,
-            capacity_headroom: 1.0,
-            enabled: true,
-            cache_enabled: false,
-            cache_ttl_secs: 0,
-            input_cost_per_token: 0.0,
-            output_cost_per_token: 0.0,
-            cost_per_image: 0.0,
-            cost_per_audio_second: 0.0,
-            cost_per_character: 0.0,
-            cost_per_video: 0.0,
             context_window: 128_000,
             supports_function_calling: true,
-            supports_system_messages: true,
             supports_response_schema: true,
             supports_tool_choice: true,
-            supports_vision: false,
-            tags: Vec::new(),
-            declared_levels: Vec::new(),
-            boons: Vec::new(),
-            tool_servers: Vec::new(),
-            knowledge_collections: Vec::new(),
-            request_timeout_secs: None,
-            max_retries: 0,
-            retry_backoff_ms: crate::DEFAULT_RETRY_BACKOFF_MS,
-            endpoint_selection_mode: crate::DEFAULT_ENDPOINT_SELECTION_MODE.to_string(),
-            debug_diagnostics: false,
-            energy_slots_per_node: 0,
-            route_bias: 1.0,
-            auto_eligible: true,
-            draft_model: String::new(),
-            verify_api_base: String::new(),
-            verify_upstream_model: String::new(),
-            endpoints: Vec::new(),
+            ..Default::default()
         }
     }
 

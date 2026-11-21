@@ -602,7 +602,10 @@ impl Config {
             },
             auto_classifier_enabled: r.flag("OBLETH_AUTO_CLASSIFIER_ENABLED", false),
             auto_classifier_model: r.get("OBLETH_AUTO_CLASSIFIER_MODEL"),
-            auto_classifier_timeout_ms: r.parse("OBLETH_AUTO_CLASSIFIER_TIMEOUT_MS", 250),
+            auto_classifier_timeout_ms: r.parse(
+                "OBLETH_AUTO_CLASSIFIER_TIMEOUT_MS",
+                crate::AutoRouterSettings::default().classifier_timeout_ms,
+            ),
             load_endpoint: r.flag("OBLETH_LOAD_ENDPOINT", true),
             session_id_derivation: r.flag("OBLETH_SESSION_ID_DERIVATION", true),
             admission_timeout: Duration::from_secs(r.positive("OBLETH_ADMISSION_TIMEOUT_SECS", 60)),

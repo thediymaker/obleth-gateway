@@ -8805,12 +8805,6 @@ fn lifecycle_from_request(
         .map(str::trim)
         .unwrap_or("")
         .to_string();
-    if note.chars().count() > obleth_config::MAX_LIFECYCLE_NOTE_CHARS {
-        return Err(AdminError::BadRequest(format!(
-            "note is longer than {} characters",
-            obleth_config::MAX_LIFECYCLE_NOTE_CHARS
-        )));
-    }
     let replacement_name = body
         .replacement
         .as_deref()
@@ -8850,13 +8844,7 @@ fn lifecycle_from_request(
             ModelStatus::Active | ModelStatus::Deprecated => {}
         }
     }
-    let redirect = body.redirect.unwrap_or(false);
-    if redirect && replacement_name.is_empty() {
-        return Err(AdminError::BadRequest(
-            "redirect needs a replacement to send requests to".to_string(),
-        ));
-    }
-    Ok(ModelLifecycle {
+    let lifecycle = ModelLifecycle {
         status: body.status,
         // The canonical name, even when the body used an alias.
         replacement: replacement
@@ -8865,8 +8853,10 @@ fn lifecycle_from_request(
         retire_at: body.retire_at,
         changed_at,
         note,
-        redirect,
-    })
+        redirect: body.redirect.unwrap_or(false),
+    };
+    lifecycle.validate().map_err(AdminError::BadRequest)?;
+    Ok(lifecycle)
 }
 
 #[utoipa::path(
@@ -16764,6 +16754,62 @@ mod tests {
         );
         let v = serde_json::to_value(ModelRouteView::from(fixture_model_route("m"))).unwrap();
         assert_eq!(v["variants"], serde_json::json!([]));
+    }
+
+    /// An imported lifecycle's replacement must stand in once the import is
+    /// applied: registered or created by the file, of the same type, neither
+    /// staged nor retired.
+    #[test]
+    fn import_checks_a_lifecycle_replacement_against_the_post_import_registry() {
+        use obleth_config::{ModelLifecycle, ModelStatus};
+        use obleth_store::ModelImportWrite;
+        let now = chrono::Utc::now();
+        let mut retired = fixture_model_route("old");
+        retired.lifecycle.status = ModelStatus::Retired;
+        let mut embedder = fixture_model_route("embed");
+        embedder.model_type = "embedding".into();
+        let existing: std::collections::HashMap<String, ModelRoute> = [
+            ("old".to_string(), retired),
+            ("embed".to_string(), embedder),
+            ("live".to_string(), fixture_model_route("live")),
+        ]
+        .into();
+        let write = |name: &str, status: ModelStatus, replacement: &str| ModelImportWrite {
+            model_name: name.into(),
+            config: obleth_config::ModelConfig {
+                lifecycle: ModelLifecycle {
+                    status,
+                    replacement: replacement.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            endpoints: None,
+        };
+        let deprecated = ModelStatus::Deprecated;
+        let errors = crate::models_io::replacement_problems(
+            &existing,
+            &[
+                write("a", deprecated, "live"),
+                write("b", deprecated, "new"),
+                write("new", ModelStatus::Active, ""),
+                write("c", deprecated, "old"),
+                write("d", deprecated, "embed"),
+                write("e", deprecated, "missing"),
+                write("f", deprecated, "staged"),
+                write("staged", ModelStatus::Staged, ""),
+            ],
+            now,
+        );
+        assert_eq!(
+            errors,
+            vec![
+                "model 'c': replacement 'old' is itself retired",
+                "model 'd': replacement 'embed' is a 'embedding' model; it must be 'chat' like 'd'",
+                "model 'e': replacement 'missing' is not a registered model",
+                "model 'f': replacement 'staged' is staged, so callers cannot find it",
+            ]
+        );
     }
 
     #[test]

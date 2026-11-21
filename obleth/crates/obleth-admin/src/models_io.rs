@@ -317,6 +317,7 @@ pub(crate) async fn import_models(
 
     // ---- alias and variant uniqueness, judged against the post-import state ----
     errors.extend(name_conflicts(&existing, &writes));
+    errors.extend(replacement_problems(&existing, &writes, chrono::Utc::now()));
     let families: HashSet<String> = state
         .store
         .list_model_families()
@@ -424,6 +425,62 @@ pub(crate) fn family_conflicts(
             }
         }
     }
+    errors
+}
+
+/// Every lifecycle in `writes` whose replacement could not stand in once the
+/// import is applied, as one message each. The rules are the status
+/// endpoint's: the replacement is a registered model (or one this file
+/// creates) of the same type, neither staged nor retired.
+pub(crate) fn replacement_problems(
+    existing: &HashMap<String, ModelRoute>,
+    writes: &[ModelImportWrite],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<String> {
+    use obleth_config::{ModelLifecycle, ModelStatus};
+    let incoming: HashMap<&str, (&str, &ModelLifecycle)> = writes
+        .iter()
+        .map(|w| {
+            (
+                w.model_name.as_str(),
+                (w.config.model_type.as_str(), &w.config.lifecycle),
+            )
+        })
+        .collect();
+    let mut errors = Vec::new();
+    for w in writes {
+        let (model, wanted) = (&w.model_name, &w.config.lifecycle.replacement);
+        if wanted.is_empty() {
+            continue;
+        }
+        let target = incoming.get(wanted.as_str()).copied().or_else(|| {
+            existing
+                .get(wanted)
+                .map(|m| (m.model_type.as_str(), &m.lifecycle))
+        });
+        let Some((model_type, lifecycle)) = target else {
+            errors.push(format!(
+                "model '{model}': replacement '{wanted}' is not a registered model"
+            ));
+            continue;
+        };
+        if model_type != w.config.model_type {
+            errors.push(format!(
+                "model '{model}': replacement '{wanted}' is a '{model_type}' model; it must be '{}' like '{model}'",
+                w.config.model_type
+            ));
+        }
+        match lifecycle.status_at(now) {
+            ModelStatus::Retired => errors.push(format!(
+                "model '{model}': replacement '{wanted}' is itself retired"
+            )),
+            ModelStatus::Staged => errors.push(format!(
+                "model '{model}': replacement '{wanted}' is staged, so callers cannot find it"
+            )),
+            ModelStatus::Active | ModelStatus::Deprecated => {}
+        }
+    }
+    errors.sort();
     errors
 }
 
