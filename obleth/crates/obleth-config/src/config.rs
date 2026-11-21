@@ -190,6 +190,10 @@ pub struct Config {
     /// Batch and background-work settings.
     pub batches: BatchSettings,
 
+    /// The S3 or S3-compatible object store (`OBLETH_S3_*`); `None` when
+    /// `OBLETH_S3_BUCKET` is unset.
+    pub object_store: Option<ObjectStoreSettings>,
+
     /// Settings that were present but invalid and fell back to a safe
     /// default, one message each. Logged at startup once tracing is up (this
     /// crate does not log).
@@ -612,6 +616,7 @@ impl Config {
             client_address: client_address(&mut r),
             compressor: CompressorConfig::read(&mut r),
             batches: BatchSettings::read(&mut r),
+            object_store: ObjectStoreSettings::read(&r),
             warnings: Vec::new(),
         };
         if let Some(prefix) = r.get("OBLETH_KEY_PREFIX") {
@@ -625,6 +630,49 @@ impl Config {
             }
         }
         r.finish(config)
+    }
+}
+
+/// The object store's settings as given. Whether they are usable (a bucket
+/// name S3 accepts, a URL, both keys) is decided where the store is built,
+/// which turns object storage off with an error when they are not.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ObjectStoreSettings {
+    /// `OBLETH_S3_BUCKET`.
+    pub bucket: String,
+    /// `OBLETH_S3_ENDPOINT`; `None` for AWS S3 itself.
+    pub endpoint: Option<String>,
+    /// `OBLETH_S3_REGION`, default `us-east-1`.
+    pub region: String,
+    /// `OBLETH_S3_ACCESS_KEY_ID`.
+    pub access_key: Option<String>,
+    /// `OBLETH_S3_SECRET_ACCESS_KEY`.
+    pub secret_key: Option<String>,
+}
+
+impl ObjectStoreSettings {
+    fn read(r: &EnvReader) -> Option<Self> {
+        Some(ObjectStoreSettings {
+            bucket: r.get("OBLETH_S3_BUCKET")?,
+            endpoint: r.get("OBLETH_S3_ENDPOINT"),
+            region: r
+                .get("OBLETH_S3_REGION")
+                .unwrap_or_else(|| "us-east-1".into()),
+            access_key: r.get("OBLETH_S3_ACCESS_KEY_ID"),
+            secret_key: r.get("OBLETH_S3_SECRET_ACCESS_KEY"),
+        })
+    }
+}
+
+impl std::fmt::Debug for ObjectStoreSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObjectStoreSettings")
+            .field("bucket", &self.bucket)
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("access_key", &self.access_key.as_ref().map(|_| "(set)"))
+            .field("secret_key", &self.secret_key.as_ref().map(|_| "(set)"))
+            .finish()
     }
 }
 
@@ -1248,6 +1296,31 @@ mod tests {
         map.entry("OBLETH_ADMIN_TOKEN".into())
             .or_insert_with(|| "t".into());
         Config::from_lookup(&|k| map.get(k).cloned())
+    }
+
+    #[test]
+    fn object_storage_is_off_without_a_bucket_and_read_as_given_with_one() {
+        assert_eq!(config(&[]).unwrap().object_store, None);
+        assert_eq!(
+            config(&[("OBLETH_S3_BUCKET", " "), ("OBLETH_S3_REGION", "eu-west-1")])
+                .unwrap()
+                .object_store,
+            None
+        );
+        let c = config(&[
+            ("OBLETH_S3_BUCKET", "obleth"),
+            ("OBLETH_S3_ENDPOINT", "https://s3.example.edu"),
+            ("OBLETH_S3_ACCESS_KEY_ID", "id"),
+        ])
+        .unwrap();
+        let s = c.object_store.expect("on with a bucket");
+        assert_eq!(s.bucket, "obleth");
+        assert_eq!(s.endpoint.as_deref(), Some("https://s3.example.edu"));
+        assert_eq!(s.region, "us-east-1");
+        assert_eq!(s.access_key.as_deref(), Some("id"));
+        // A missing key is left for the store to refuse, by name.
+        assert_eq!(s.secret_key, None);
+        assert!(!format!("{s:?}").contains("\"id\""));
     }
 
     #[test]

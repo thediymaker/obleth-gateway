@@ -508,14 +508,18 @@ async fn main() -> anyhow::Result<()> {
 
     // The object store, for bytes that do not belong in Postgres. Features
     // that need it (batches) are off without it.
-    let objects = match object_store::ObjectStore::from_env() {
-        Ok(Some(o)) => {
+    let objects = match cfg
+        .object_store
+        .as_ref()
+        .map(object_store::ObjectStore::from_settings)
+    {
+        Some(Ok(o)) => {
             tracing::info!(bucket = %o.describe(), "object store on");
             o.spawn_check();
             Some(o)
         }
-        Ok(None) => None,
-        Err(e) => {
+        None => None,
+        Some(Err(e)) => {
             tracing::error!(error = %e, "object store off: its settings are not usable");
             None
         }

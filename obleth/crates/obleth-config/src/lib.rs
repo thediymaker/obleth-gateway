@@ -19,8 +19,8 @@ pub mod types;
 
 pub use config::{
     parse_window, BatchSettings, CapacityDiscoveryConfig, CompressorConfig, Config, ConfigError,
-    PgPoolSettings, SessionAffinityConfig, SlackAlertConfig, SsrfConfig, DEFAULT_BACKGROUND_SHARE,
-    DEFAULT_BACKGROUND_SLOT_TOKENS,
+    ObjectStoreSettings, PgPoolSettings, SessionAffinityConfig, SlackAlertConfig, SsrfConfig,
+    DEFAULT_BACKGROUND_SHARE, DEFAULT_BACKGROUND_SLOT_TOKENS,
 };
 pub use failure::{
     class_for_status, clean_reason, ledger_failure, reason_for_status, reason_from_body,

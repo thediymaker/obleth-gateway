@@ -73,13 +73,6 @@ pub(crate) struct ObjectStore {
     secret_key: String,
 }
 
-fn env(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-}
-
 /// S3's rule for bucket names, short of the corner cases: 3-63 lower-case
 /// letters, digits, '-' and '.'.
 fn check_bucket_name(bucket: &str) -> Result<(), String> {
@@ -97,21 +90,28 @@ fn check_bucket_name(bucket: &str) -> Result<(), String> {
 }
 
 impl ObjectStore {
-    /// The store from the environment: `None` when `OBLETH_S3_BUCKET` is
-    /// unset, an error when it is set but the rest of the settings are not
-    /// usable. Without `OBLETH_S3_ENDPOINT` the bucket is on AWS.
-    pub(crate) fn from_env() -> Result<Option<Self>, String> {
-        let Some(bucket) = env("OBLETH_S3_BUCKET") else {
-            return Ok(None);
-        };
-        let region = env("OBLETH_S3_REGION").unwrap_or_else(|| "us-east-1".into());
-        let endpoint = env("OBLETH_S3_ENDPOINT")
-            .unwrap_or_else(|| format!("https://s3.{region}.amazonaws.com"));
-        let access_key = env("OBLETH_S3_ACCESS_KEY_ID")
+    /// The store the settings describe, or why they are not usable. Without
+    /// `OBLETH_S3_ENDPOINT` the bucket is on AWS.
+    pub(crate) fn from_settings(s: &obleth_config::ObjectStoreSettings) -> Result<Self, String> {
+        let endpoint = s
+            .endpoint
+            .clone()
+            .unwrap_or_else(|| format!("https://s3.{}.amazonaws.com", s.region));
+        let access_key = s
+            .access_key
+            .clone()
             .ok_or("OBLETH_S3_BUCKET is set but OBLETH_S3_ACCESS_KEY_ID is not")?;
-        let secret_key = env("OBLETH_S3_SECRET_ACCESS_KEY")
+        let secret_key = s
+            .secret_key
+            .clone()
             .ok_or("OBLETH_S3_BUCKET is set but OBLETH_S3_SECRET_ACCESS_KEY is not")?;
-        Self::new(&endpoint, bucket, region, access_key, secret_key).map(Some)
+        Self::new(
+            &endpoint,
+            s.bucket.clone(),
+            s.region.clone(),
+            access_key,
+            secret_key,
+        )
     }
 
     pub(crate) fn new(
@@ -506,13 +506,19 @@ mod tests {
     /// `OBLETH_TEST_S3_SECRET_ACCESS_KEY`, under a fresh prefix so runs do
     /// not see each other's objects. None when the bucket is unset.
     pub(crate) fn test_store() -> Option<ObjectStore> {
-        let bucket = env("OBLETH_TEST_S3_BUCKET")?;
+        let env = |setting: &str| {
+            std::env::var(format!("OBLETH_TEST_S3_{setting}"))
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        let bucket = env("BUCKET")?;
         let store = ObjectStore::new(
-            &env("OBLETH_TEST_S3_ENDPOINT").expect("OBLETH_TEST_S3_ENDPOINT"),
+            &env("ENDPOINT").expect("OBLETH_TEST_S3_ENDPOINT"),
             bucket,
-            env("OBLETH_TEST_S3_REGION").unwrap_or_else(|| "us-east-1".into()),
-            env("OBLETH_TEST_S3_ACCESS_KEY_ID").expect("OBLETH_TEST_S3_ACCESS_KEY_ID"),
-            env("OBLETH_TEST_S3_SECRET_ACCESS_KEY").expect("OBLETH_TEST_S3_SECRET_ACCESS_KEY"),
+            env("REGION").unwrap_or_else(|| "us-east-1".into()),
+            env("ACCESS_KEY_ID").expect("OBLETH_TEST_S3_ACCESS_KEY_ID"),
+            env("SECRET_ACCESS_KEY").expect("OBLETH_TEST_S3_SECRET_ACCESS_KEY"),
         )
         .unwrap();
         Some(ObjectStore {
