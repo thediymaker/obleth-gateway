@@ -16,7 +16,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ .Release.Name }}-provisioner
-  labels: {{- include "obleth.labels" . | nindent 4 }}
+  labels: {{- include "obleth.componentLabels" (list . "provisioner") | nindent 4 }}
 spec:
   replicas: 1
   strategy:
@@ -24,7 +24,9 @@ spec:
   selector: { matchLabels: { app: {{ .Release.Name }}-provisioner } }
   template:
     metadata:
-      labels: { app: {{ .Release.Name }}-provisioner }
+      labels:
+        app: {{ .Release.Name }}-provisioner
+        {{- include "obleth.podLabels" (list . "provisioner") | nindent 8 }}
       annotations:
         # OBLETH_ADMIN_TOKEN comes from the gateway's Secret, read at start.
         checksum/admin-token: {{ include "obleth.adminTokenChecksum" . }}

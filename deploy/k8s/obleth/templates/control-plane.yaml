@@ -23,13 +23,15 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ .Release.Name }}-control-plane
-  labels: {{- include "obleth.labels" . | nindent 4 }}
+  labels: {{- include "obleth.componentLabels" (list . "control-plane") | nindent 4 }}
 spec:
   replicas: {{ .Values.controlPlane.replicas }}
   selector: { matchLabels: { app: {{ .Release.Name }}-control-plane } }
   template:
     metadata:
-      labels: { app: {{ .Release.Name }}-control-plane }
+      labels:
+        app: {{ .Release.Name }}-control-plane
+        {{- include "obleth.podLabels" (list . "control-plane") | nindent 8 }}
       annotations:
         {{- if not .Values.controlPlane.existingSecret }}
         # The dashboard's Secret is rendered from controlPlane values, so a
@@ -76,7 +78,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: {{ .Release.Name }}-control-plane
-  labels: {{- include "obleth.labels" . | nindent 4 }}
+  labels: {{- include "obleth.componentLabels" (list . "control-plane") | nindent 4 }}
 spec:
   type: ClusterIP
   selector: { app: {{ .Release.Name }}-control-plane }

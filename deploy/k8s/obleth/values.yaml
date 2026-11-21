@@ -550,6 +550,10 @@ benchmarkBackend:
   ttftMs: 20
   tokenMs: 3
   concurrency: 256
+  # The fixture is a small async server that only sleeps between tokens.
+  resources:
+    requests: { cpu: "50m", memory: "32Mi" }
+    limits: { cpu: "1", memory: "256Mi" }
 
 # Optional Slurm provisioner plugin. Off by default: enable only when serving
 # models on a Slurm cluster. It keeps enabled managed models at their target

@@ -11,6 +11,31 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end -}}
 
 {{/*
+Standard labels for one workload's pods, Deployment and Service. Takes
+(list $ "component"). app.kubernetes.io/name is `obleth` only for the gateway,
+whose Deployment, Service, PDB, anti-affinity and NetworkPolicies select on
+name + instance; every other workload is named after its component, so none of
+its pods can match a gateway selector. All carry part-of: obleth. Selectors
+are not changed (a Deployment's is immutable): they keep the labels they had.
+*/}}
+{{- define "obleth.podLabels" -}}
+{{- $root := index . 0 -}}
+{{- $component := index . 1 -}}
+app.kubernetes.io/name: {{ eq $component "gateway" | ternary "obleth" $component }}
+app.kubernetes.io/instance: {{ $root.Release.Name }}
+app.kubernetes.io/component: {{ $component }}
+app.kubernetes.io/part-of: obleth
+{{- end -}}
+
+{{- define "obleth.componentLabels" -}}
+{{- $root := index . 0 -}}
+helm.sh/chart: {{ printf "%s-%s" $root.Chart.Name $root.Chart.Version | replace "+" "_" }}
+{{ include "obleth.podLabels" . }}
+app.kubernetes.io/version: {{ $root.Chart.AppVersion | quote }}
+app.kubernetes.io/managed-by: {{ $root.Release.Service }}
+{{- end -}}
+
+{{/*
 Secret names are existingSecret-aware: production installs point the chart at a
 pre-created Secret so real credentials never live in values files or CLI history.
 When the corresponding existingSecret is empty, the chart renders and references

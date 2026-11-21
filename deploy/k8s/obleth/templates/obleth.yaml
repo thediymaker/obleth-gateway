@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ include "obleth.fullname" . }}
-  labels: {{- include "obleth.labels" . | nindent 4 }}
+  labels: {{- include "obleth.componentLabels" (list . "gateway") | nindent 4 }}
 spec:
   {{- if not .Values.hpa.enabled }}
   replicas: {{ .Values.obleth.replicas }}
@@ -13,9 +13,7 @@ spec:
       app.kubernetes.io/instance: {{ .Release.Name }}
   template:
     metadata:
-      labels:
-        app.kubernetes.io/name: obleth
-        app.kubernetes.io/instance: {{ .Release.Name }}
+      labels: {{- include "obleth.podLabels" (list . "gateway") | nindent 8 }}
       annotations:
         # Rolls the gateway when the chart-rendered Secret changes. Constant
         # when obleth.existingSecret is set (restart manually in that mode).
@@ -186,7 +184,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: {{ include "obleth.fullname" . }}
-  labels: {{- include "obleth.labels" . | nindent 4 }}
+  labels: {{- include "obleth.componentLabels" (list . "gateway") | nindent 4 }}
 spec:
   selector:
     app.kubernetes.io/name: obleth
@@ -247,6 +245,7 @@ spec:
     matchLabels:
       app.kubernetes.io/name: obleth
       app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: gateway
   endpoints:
     - port: metrics
       interval: 5s

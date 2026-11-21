@@ -19,7 +19,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ .Release.Name }}-postgres
-  labels: {{- include "obleth.labels" . | nindent 4 }}
+  labels: {{- include "obleth.componentLabels" (list . "postgres") | nindent 4 }}
 spec:
   replicas: 1
   # Recreate avoids a second pod attaching the same RWO PVC during a rollout.
@@ -27,7 +27,10 @@ spec:
     type: Recreate
   selector: { matchLabels: { app: {{ .Release.Name }}-postgres } }
   template:
-    metadata: { labels: { app: {{ .Release.Name }}-postgres } }
+    metadata:
+      labels:
+        app: {{ .Release.Name }}-postgres
+        {{- include "obleth.podLabels" (list . "postgres") | nindent 8 }}
     spec:
       {{- include "obleth.datastorePlacement" . | nindent 6 }}
       containers:
@@ -66,7 +69,9 @@ spec:
 ---
 apiVersion: v1
 kind: Service
-metadata: { name: {{ .Release.Name }}-postgres }
+metadata:
+  name: {{ .Release.Name }}-postgres
+  labels: {{- include "obleth.componentLabels" (list . "postgres") | nindent 4 }}
 spec:
   selector: { app: {{ .Release.Name }}-postgres }
   ports: [{ port: 5432, targetPort: 5432 }]
@@ -93,7 +98,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ .Release.Name }}-redis
-  labels: {{- include "obleth.labels" . | nindent 4 }}
+  labels: {{- include "obleth.componentLabels" (list . "redis") | nindent 4 }}
 spec:
   replicas: 1
   strategy:
@@ -101,7 +106,9 @@ spec:
   selector: { matchLabels: { app: {{ .Release.Name }}-redis } }
   template:
     metadata:
-      labels: { app: {{ .Release.Name }}-redis }
+      labels:
+        app: {{ .Release.Name }}-redis
+        {{- include "obleth.podLabels" (list . "redis") | nindent 8 }}
       annotations:
         # Restart Redis with the new --requirepass when its password changes;
         # other Secret keys do not touch it.
@@ -148,7 +155,9 @@ spec:
 ---
 apiVersion: v1
 kind: Service
-metadata: { name: {{ .Release.Name }}-redis }
+metadata:
+  name: {{ .Release.Name }}-redis
+  labels: {{- include "obleth.componentLabels" (list . "redis") | nindent 4 }}
 spec:
   selector: { app: {{ .Release.Name }}-redis }
   ports: [{ port: 6379, targetPort: 6379 }]
@@ -184,7 +193,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ .Release.Name }}-clickhouse
-  labels: {{- include "obleth.labels" . | nindent 4 }}
+  labels: {{- include "obleth.componentLabels" (list . "clickhouse") | nindent 4 }}
 spec:
   replicas: 1
   strategy:
@@ -192,7 +201,9 @@ spec:
   selector: { matchLabels: { app: {{ .Release.Name }}-clickhouse } }
   template:
     metadata:
-      labels: { app: {{ .Release.Name }}-clickhouse }
+      labels:
+        app: {{ .Release.Name }}-clickhouse
+        {{- include "obleth.podLabels" (list . "clickhouse") | nindent 8 }}
       annotations:
         # Restart ClickHouse with the new CLICKHOUSE_PASSWORD when its
         # password changes; other Secret keys do not touch it.
@@ -236,7 +247,9 @@ spec:
 ---
 apiVersion: v1
 kind: Service
-metadata: { name: {{ .Release.Name }}-clickhouse }
+metadata:
+  name: {{ .Release.Name }}-clickhouse
+  labels: {{- include "obleth.componentLabels" (list . "clickhouse") | nindent 4 }}
 spec:
   selector: { app: {{ .Release.Name }}-clickhouse }
   ports: [{ name: http, port: 8123, targetPort: 8123 }, { name: native, port: 9000, targetPort: 9000 }]
@@ -247,12 +260,15 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ .Release.Name }}-benchmark-backend
-  labels: {{- include "obleth.labels" . | nindent 4 }}
+  labels: {{- include "obleth.componentLabels" (list . "benchmark-backend") | nindent 4 }}
 spec:
   replicas: 1
   selector: { matchLabels: { app: {{ .Release.Name }}-benchmark-backend } }
   template:
-    metadata: { labels: { app: {{ .Release.Name }}-benchmark-backend } }
+    metadata:
+      labels:
+        app: {{ .Release.Name }}-benchmark-backend
+        {{- include "obleth.podLabels" (list . "benchmark-backend") | nindent 8 }}
     spec:
       securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
@@ -265,11 +281,23 @@ spec:
             - { name: BENCHMARK_BACKEND_TTFT_MS, value: {{ .Values.benchmarkBackend.ttftMs | quote }} }
             - { name: BENCHMARK_BACKEND_TOKEN_MS, value: {{ .Values.benchmarkBackend.tokenMs | quote }} }
             - { name: BENCHMARK_BACKEND_CONCURRENCY, value: {{ .Values.benchmarkBackend.concurrency | quote }} }
-          ports: [{ containerPort: 8081 }]
+          ports: [{ name: http, containerPort: 8081 }]
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          {{- with (dig "resources" (dict "requests" (dict "cpu" "50m" "memory" "32Mi") "limits" (dict "cpu" "1" "memory" "256Mi")) .Values.benchmarkBackend) }}
+          resources: {{- toYaml . | nindent 12 }}
+          {{- end }}
 ---
 apiVersion: v1
 kind: Service
-metadata: { name: {{ .Release.Name }}-benchmark-backend }
+metadata:
+  name: {{ .Release.Name }}-benchmark-backend
+  labels: {{- include "obleth.componentLabels" (list . "benchmark-backend") | nindent 4 }}
 spec:
   selector: { app: {{ .Release.Name }}-benchmark-backend }
   ports: [{ port: 8081, targetPort: 8081 }]
