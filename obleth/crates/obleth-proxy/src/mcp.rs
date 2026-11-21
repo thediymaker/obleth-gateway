@@ -221,10 +221,20 @@ async fn handle(
     };
 
     // ---- resolve the registered MCP server ----
-    let Some(server) = resolve_mcp(state, &params.server).await else {
-        ledger(&params.server, StatusCode::NOT_FOUND);
-        let msg = format!("mcp server '{}' is not registered", params.server);
-        return (error_json(StatusCode::NOT_FOUND, &msg), true);
+    let server = match try_resolve_mcp(state, &params.server).await {
+        Ok(Some(server)) => server,
+        Ok(None) => {
+            ledger(&params.server, StatusCode::NOT_FOUND);
+            let msg = format!("mcp server '{}' is not registered", params.server);
+            return (error_json(StatusCode::NOT_FOUND, &msg), true);
+        }
+        // Redis failed, not a miss: retryable, never "not registered".
+        Err(()) => {
+            ledger(&params.server, StatusCode::SERVICE_UNAVAILABLE);
+            let resp =
+                crate::proxy::unavailable("mcp server registry unavailable; try again shortly");
+            return (resp, true);
+        }
     };
     if !server.enabled {
         ledger(&server.name, StatusCode::FORBIDDEN);
@@ -401,19 +411,30 @@ pub struct McpPath {
     rest: Option<String>,
 }
 
-/// Resolve a registered MCP server via moka, falling back to Redis. Also used
-/// by the gateway tool loop to reach granted servers directly.
+/// Resolve a registered MCP server, `None` when it is not registered or Redis
+/// failed. Used by the gateway tool loop to reach granted servers directly;
+/// the client-facing route uses [`try_resolve_mcp`] to tell the two apart.
 pub(crate) async fn resolve_mcp(state: &AppState, name: &str) -> Option<Arc<ResolvedMcpServer>> {
+    try_resolve_mcp(state, name).await.ok().flatten()
+}
+
+/// Resolve a registered MCP server via moka, falling back to Redis:
+/// `Ok(None)` when it is not registered, `Err(())` when Redis failed (logged
+/// and alerted here).
+pub(crate) async fn try_resolve_mcp(
+    state: &AppState,
+    name: &str,
+) -> Result<Option<Arc<ResolvedMcpServer>>, ()> {
     if let Some(s) = state.mcp_cache.get(name).await {
-        return Some(s);
+        return Ok(Some(s));
     }
     match state.redis.get_resolved_mcp_server(name).await {
         Ok(Some(s)) => {
             let s = Arc::new(s);
             state.mcp_cache.insert(name.to_string(), s.clone()).await;
-            Some(s)
+            Ok(Some(s))
         }
-        Ok(None) => None,
+        Ok(None) => Ok(None),
         Err(e) => {
             tracing::warn!(error = %e, "mcp server lookup failed");
             state.alerts.issue(
@@ -421,7 +442,7 @@ pub(crate) async fn resolve_mcp(state: &AppState, name: &str) -> Option<Arc<Reso
                 "Redis MCP server lookup failed",
                 format!("server `{name}` lookup failed against Redis: {e}"),
             );
-            None
+            Err(())
         }
     }
 }
@@ -574,16 +595,16 @@ mod tests {
     #[test]
     fn every_mcp_answer_after_the_key_gate_reaches_the_ledger() {
         // Pinned at the source level for the same reason as the key gate
-        // test below. Past the gate, each of the four early answers (404, 403,
-        // 413, 502) and the server's own answer records its row, and none is
-        // handed back as unlogged.
+        // test below. Past the gate, each of the early answers (404, 503,
+        // 403, 429, 413, 502) and the server's own answer records its row,
+        // and none is handed back as unlogged.
         let src = include_str!("mcp.rs");
         let handler = &src[..src.find("\nmod tests {").expect("the test module")];
         let logged = &handler[handler
             .find("From here every answer is a row in the ledger")
             .expect("the marker")..];
-        assert_eq!(logged.matches("return (").count(), 6);
-        assert_eq!(logged.matches("ledger(&").count(), 7);
+        assert_eq!(logged.matches("return (").count(), 7);
+        assert_eq!(logged.matches("ledger(&").count(), 8);
         assert!(!logged.contains(", false)"));
     }
 

@@ -57,12 +57,15 @@ const NO_BUFFER_HEADER: (&str, &str) = ("x-accel-buffering", "no");
 /// upstream failure (a stale pooled keep-alive socket). Long enough to let a
 /// fresh connection replace the dead one, short enough to stay invisible in TTFT.
 const CONN_RETRY_BACKOFF: Duration = Duration::from_millis(50);
+/// Message of the 503 for a model lookup Redis could not answer.
+const MODEL_REGISTRY_UNAVAILABLE: &str = "model registry unavailable; try again shortly";
+
 /// Default bound on a request's wait in the fairshare queue
 /// (`OBLETH_ADMISSION_TIMEOUT_SECS`). Without one, a saturated pool parks
 /// callers indefinitely.
 const DEFAULT_ADMISSION_TIMEOUT: Duration = Duration::from_secs(60);
-/// `Retry-After` sent with an admission timeout. `pub(crate)` so other
-/// admission call sites (e.g. `verdicts`) send the same value.
+/// `Retry-After` sent with a 503 the client should retry: an admission
+/// timeout, or a registry lookup Redis could not answer (see [`unavailable`]).
 pub(crate) const ADMISSION_RETRY_AFTER_SECS: &str = "5";
 
 /// Parse `OBLETH_ADMISSION_TIMEOUT_SECS`; unset, unparseable, or zero falls
@@ -1611,6 +1614,8 @@ async fn run_pipeline(
     // shape (estimated context size, required capabilities) and live load. From
     // here on, everything downstream — admission, budgets, caching, telemetry,
     // upstream dispatch — sees the concrete model as if the client named it.
+    // Set when the model's registry lookup failed on Redis rather than missed.
+    let mut registry_unavailable = false;
     let (mut route, mut variant) = if model == crate::router::AUTO_MODEL_NAME {
         // Span bookkeeping for the routing decision. Only the traced branch
         // below reads it, so an untraced request does not pay for the clock
@@ -1851,7 +1856,9 @@ async fn run_pipeline(
     } else {
         // A variant resolves to its parent's route with the variant's boons
         // added (`serve_as`); an alias to the parent's route as it is.
-        let (route, variant) = match resolve_model(&state, &model).await {
+        let looked_up = try_resolve_model(&state, &model).await;
+        registry_unavailable = looked_up.is_err();
+        let (route, variant) = match looked_up.ok().flatten() {
             Some(r) => {
                 let (r, variant) = serve_variant(&state.variant_cache, r, &model).await;
                 (Some(r), variant)
@@ -1865,13 +1872,17 @@ async fn run_pipeline(
                             Ok(picked) => picked,
                             Err(msg) => return error_json(StatusCode::BAD_REQUEST, &msg),
                         };
-                    let Some(r) = resolve_model(&state, &member).await else {
-                        return error_json(
-                            StatusCode::NOT_FOUND,
-                            &format!(
-                                "model family '{model}' sends `{level}` to '{member}', which is not registered"
-                            ),
-                        );
+                    let r = match try_resolve_model(&state, &member).await {
+                        Ok(Some(r)) => r,
+                        Ok(None) => {
+                            return error_json(
+                                StatusCode::NOT_FOUND,
+                                &format!(
+                                    "model family '{model}' sends `{level}` to '{member}', which is not registered"
+                                ),
+                            )
+                        }
+                        Err(()) => return unavailable(MODEL_REGISTRY_UNAVAILABLE),
                     };
                     family_level = Some(level);
                     family_name = Some(family.name.clone());
@@ -1949,6 +1960,11 @@ async fn run_pipeline(
             return error_json(StatusCode::BAD_REQUEST, "model is required");
         }
         let Some(route) = route.as_ref() else {
+            // A Redis fault is not a missing model: a 404 would tell the
+            // client to stop asking for a model that is still there.
+            if registry_unavailable {
+                return unavailable(MODEL_REGISTRY_UNAVAILABLE);
+            }
             return error_json(
                 StatusCode::NOT_FOUND,
                 &format!("model '{model}' is not registered"),
@@ -5028,9 +5044,23 @@ pub async fn classify_for_simulate(
         .await
 }
 
+/// A model by name, or `None` when it is not registered or Redis could not
+/// be asked. For lookups where a Redis fault and a missing model mean the
+/// same thing (an optional helper model); a client's own model goes through
+/// [`try_resolve_model`] so a fault is answered as one.
 pub(crate) async fn resolve_model(state: &AppState, name: &str) -> Option<Arc<ResolvedModel>> {
+    try_resolve_model(state, name).await.ok().flatten()
+}
+
+/// A model by name: `Ok(None)` when it is not registered, `Err(())` when the
+/// cache missed and Redis failed (logged and alerted here), as
+/// [`try_resolve_key`] does for keys.
+pub(crate) async fn try_resolve_model(
+    state: &AppState,
+    name: &str,
+) -> Result<Option<Arc<ResolvedModel>>, ()> {
     if let Some(r) = state.model_cache.get(name).await {
-        return Some(r);
+        return Ok(Some(r));
     }
     let looked_up = state
         .model_misses
@@ -5040,9 +5070,9 @@ pub(crate) async fn resolve_model(state: &AppState, name: &str) -> Option<Arc<Re
         Ok(Some(r)) => {
             let r = Arc::new(r);
             state.model_cache.insert(name.to_string(), r.clone()).await;
-            Some(r)
+            Ok(Some(r))
         }
-        Ok(None) => None,
+        Ok(None) => Ok(None),
         Err(e) => {
             tracing::warn!(error = %e, "redis model lookup failed");
             state.alerts.issue(
@@ -5050,7 +5080,7 @@ pub(crate) async fn resolve_model(state: &AppState, name: &str) -> Option<Arc<Re
                 "Redis model lookup failed",
                 format!("model `{name}` lookup failed against Redis: {e}"),
             );
-            None
+            Err(())
         }
     }
 }
@@ -7477,15 +7507,7 @@ pub(crate) async fn admit(
         Ok(Some(a)) => a,
         Err(_) => {
             on_timeout((crate::tracer::now_ms() - admission_start) as u32);
-            let mut resp = error_json(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "timed out waiting for model capacity",
-            );
-            resp.headers_mut().insert(
-                header::RETRY_AFTER,
-                header::HeaderValue::from_static(ADMISSION_RETRY_AFTER_SECS),
-            );
-            return Err(resp);
+            return Err(unavailable("timed out waiting for model capacity"));
         }
         Ok(None) => {
             state.alerts.issue(
@@ -7674,6 +7696,17 @@ pub(crate) const GATEWAY_ERROR_TYPE: &str = "obleth_gateway_error";
 pub(crate) fn error_json(status: StatusCode, msg: &str) -> Response<Body> {
     let body = serde_json::json!({ "error": { "message": msg, "type": GATEWAY_ERROR_TYPE } });
     (status, axum::Json(body)).into_response()
+}
+
+/// A 503 with `Retry-After`: a passing condition (no capacity in time, Redis
+/// down), so clients and SDKs retry instead of giving up.
+pub(crate) fn unavailable(msg: &str) -> Response<Body> {
+    let mut resp = error_json(StatusCode::SERVICE_UNAVAILABLE, msg);
+    resp.headers_mut().insert(
+        header::RETRY_AFTER,
+        header::HeaderValue::from_static(ADMISSION_RETRY_AFTER_SECS),
+    );
+    resp
 }
 
 /// An error about the request itself on an OpenAI surface: a missing or

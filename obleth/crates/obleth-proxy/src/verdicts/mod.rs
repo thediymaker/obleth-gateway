@@ -2124,10 +2124,7 @@ mod settlement_tests {
             .find("Ok(None)=>{")
             .expect("the match ends before the admission is unpacked");
         let scope = &scope[..end];
-        assert!(scope.contains("StatusCode::SERVICE_UNAVAILABLE"));
-        assert!(scope.contains("\"timedoutwaitingformodelcapacity\""));
-        assert!(scope.contains("header::RETRY_AFTER"));
-        assert!(scope.contains("ADMISSION_RETRY_AFTER_SECS"));
+        assert!(scope.contains("unavailable(\"timedoutwaitingformodelcapacity\")"));
     }
 }
 

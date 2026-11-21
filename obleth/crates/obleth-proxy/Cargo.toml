@@ -56,5 +56,6 @@ hex = "0.4"
 hmac = "0.12"
 
 [dev-dependencies]
+redis.workspace = true
 ring = "0.17"
 tokio = { workspace = true, features = ["test-util"] }

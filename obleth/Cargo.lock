@@ -1780,6 +1780,7 @@ dependencies = [
  "opentelemetry_sdk",
  "prometheus",
  "rand 0.8.8",
+ "redis",
  "regex",
  "reqwest 0.12.28",
  "ring",

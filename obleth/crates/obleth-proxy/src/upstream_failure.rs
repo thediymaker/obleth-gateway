@@ -1335,6 +1335,66 @@ mod pipeline {
         })
     }
 
+    /// Store `value` raw under a registry key, so the gateway's Redis read
+    /// of it fails the way a Redis fault does.
+    async fn corrupt_registry_entry(key: &str) {
+        let url = std::env::var("OBLETH_TEST_REDIS_URL").expect("redis url");
+        let mut conn = redis::Client::open(url)
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+        let _: () = redis::AsyncCommands::set_ex(&mut conn, key, "not json", 60)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_registry_lookup_redis_cannot_answer_is_503_with_retry_after_and_a_miss_is_404() {
+        let Some(gw) = gateway().await else { return };
+        let (secret, _) = gw.tenant().await;
+        let model = format!("redis-fault-{}", Uuid::new_v4());
+        let server = format!("redis-fault-{}", Uuid::new_v4());
+        corrupt_registry_entry(&format!("obleth:model:{model}")).await;
+        corrupt_registry_entry(&format!("obleth:mcp:{server}")).await;
+        let app = Router::new()
+            .route("/mcp/:server", post(crate::mcp::mcp_handler))
+            .fallback(crate::proxy::proxy_handler)
+            .with_state(gw.state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let missing = format!("missing-{}", Uuid::new_v4());
+        for (path, body, status) in [
+            (
+                "/v1/chat/completions".to_string(),
+                request(&model, false),
+                503,
+            ),
+            (
+                "/v1/chat/completions".to_string(),
+                request(&missing, false),
+                404,
+            ),
+            (format!("/mcp/{server}"), json!({}), 503),
+            (format!("/mcp/{missing}"), json!({}), 404),
+        ] {
+            let resp = reqwest::Client::new()
+                .post(format!("http://{addr}{path}"))
+                .bearer_auth(&secret)
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status().as_u16(), status, "{path}");
+            assert_eq!(
+                resp.headers().get(header::RETRY_AFTER).is_some(),
+                status == 503,
+                "{path}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn an_error_event_inside_a_200_stream_is_a_failure_billed_for_its_output() {
         let Some(gw) = gateway().await else { return };
