@@ -7,7 +7,7 @@ import { useQuery } from "@tanstack/react-query";
 import type { DateRange } from "react-day-picker";
 import { Bar, CartesianGrid, ComposedChart, Line, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { ArrowDown, ArrowUp, Download, Search } from "lucide-react";
-import { axisTick, chartGrid } from "@/components/chart-tooltip";
+import { TooltipRow, TooltipShell } from "@/components/chart-tooltip";
 import { ExportSheet } from "@/components/reports/export-sheet";
 import { ModelSpeed } from "@/components/reports/model-speed";
 import { ReportsTabs } from "@/components/reports/reports-tabs";
@@ -46,8 +46,7 @@ import {
 import { toBreakdownRows } from "@/lib/usage-breakdown";
 import { cn, getJson } from "@/lib/utils";
 import { ReadNotice, readFailed, ReadFailedNote, readProblem } from "@/components/ui/read-state";
-
-const PREVIOUS = "hsl(240 4% 46%)";
+import { axisTick, barCursor, chartGrid, seriesCurrent, seriesPrevious } from "@/lib/chart-style";
 
 function energy(wh: number) {
   return wh >= 1000 ? `${oneDecimal(wh / 1000)} kWh` : `${Math.round(wh)} Wh`;
@@ -80,22 +79,16 @@ function ChartTip({ active, payload, label, measure, series }: { active?: boolea
   if (!active || !payload?.length) return null;
   const row = payload[0].payload;
   return (
-    <div className="min-w-48 rounded-lg border border-border bg-[hsl(240_5%_9%)] px-3 py-2 text-xs shadow-xl">
-      <p className="mb-1.5 font-mono text-muted-foreground">{String(row.label ?? label)}</p>
+    <TooltipShell title={String(row.label ?? label)} className="min-w-48">
       {series.length ? (
-        series.map((s) => (
-          <div key={s.id} className="flex justify-between gap-6">
-            <span className="inline-flex items-center gap-1.5"><span className="h-2 w-2 rounded-[2px]" style={{ background: s.color }} />{s.label}</span>
-            <span className="font-mono tabular-nums">{measureValue(measure, Number(row[s.id] ?? 0))}</span>
-          </div>
-        ))
+        series.map((s) => <TooltipRow key={s.id} swatch={s.color} label={s.label} value={measureValue(measure, Number(row[s.id] ?? 0))} />)
       ) : (
         <>
-          <div className="flex justify-between gap-6"><span>This period</span><span className="font-mono tabular-nums">{measureValue(measure, Number(row.value ?? 0))}</span></div>
-          {row.previous !== null && row.previous !== undefined && <div className="flex justify-between gap-6 text-muted-foreground"><span>Same day, previous period</span><span className="font-mono tabular-nums">{measureValue(measure, Number(row.previous))}</span></div>}
+          <TooltipRow label="This period" value={measureValue(measure, Number(row.value ?? 0))} />
+          {row.previous !== null && row.previous !== undefined && <TooltipRow muted label="Same day, previous period" value={measureValue(measure, Number(row.previous))} />}
         </>
       )}
-    </div>
+    </TooltipShell>
   );
 }
 
@@ -297,13 +290,13 @@ export function ReportsDashboard({ tenants, keys, models, retentionDays = null, 
                   <CartesianGrid {...chartGrid} vertical={false} />
                   <XAxis dataKey="tick" tick={axisTick} axisLine={false} tickLine={false} minTickGap={24} height={20} />
                   <YAxis tick={axisTick} axisLine={false} tickLine={false} width={52} tickFormatter={(v: number) => (measure === "spend" ? money(v) : measure === "ttft" ? formatMs(v) : compact(v))} />
-                  <Tooltip cursor={{ fill: "hsl(240 4% 16% / 0.5)" }} content={<ChartTip measure={measure} series={chart.series} />} />
+                  <Tooltip cursor={barCursor} content={<ChartTip measure={measure} series={chart.series} />} />
                   {chart.series.length ? (
                     chart.series.map((s, i) => <Bar key={s.id} dataKey={s.id} stackId="split" fill={s.color} isAnimationActive={false} radius={i === chart.series.length - 1 ? [3, 3, 0, 0] : 0} />)
                   ) : (
-                    <Bar dataKey="value" fill="hsl(240 5% 82%)" radius={[3, 3, 0, 0]} isAnimationActive={false} />
+                    <Bar dataKey="value" fill={seriesCurrent} radius={[3, 3, 0, 0]} isAnimationActive={false} />
                   )}
-                  {!chart.series.length && <Line type="step" dataKey="previous" stroke={PREVIOUS} strokeWidth={2} strokeDasharray="5 4" dot={false} isAnimationActive={false} connectNulls={false} />}
+                  {!chart.series.length && <Line type="step" dataKey="previous" stroke={seriesPrevious} strokeWidth={2} strokeDasharray="5 4" dot={false} isAnimationActive={false} connectNulls={false} />}
                 </ComposedChart>
               </ResponsiveContainer>
             </div>
@@ -311,7 +304,7 @@ export function ReportsDashboard({ tenants, keys, models, retentionDays = null, 
           <div className="flex flex-wrap gap-4 pt-3 text-xs text-secondary-foreground">
             {chart.series.length ? chart.series.map((s) => <span key={s.id} className="inline-flex items-center gap-1.5"><span className="h-2.5 w-2.5 rounded-[2px]" style={{ background: s.color }} />{s.label}</span>) : (
               <>
-                <span className="inline-flex items-center gap-1.5"><span className="h-2.5 w-2.5 rounded-[2px] bg-[hsl(240_5%_82%)]" />This period</span>
+                <span className="inline-flex items-center gap-1.5"><span className="h-2.5 w-2.5 rounded-[2px]" style={{ background: seriesCurrent }} />This period</span>
                 <span className="inline-flex items-center gap-1.5"><span className="w-4 border-t-2 border-dashed border-muted-foreground" />Same day, previous period</span>
               </>
             )}

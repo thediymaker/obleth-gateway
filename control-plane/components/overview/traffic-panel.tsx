@@ -2,15 +2,14 @@
 
 import { memo, useMemo, useState } from "react";
 import { Area, Bar, BarChart, ComposedChart, Line, ResponsiveContainer, Tooltip, XAxis, YAxis, CartesianGrid } from "recharts";
-import { axisTick, chartGrid, timeCursor } from "@/components/chart-tooltip";
+import { TooltipRow, TooltipShell } from "@/components/chart-tooltip";
 import { BUCKET_LABEL, PREVIOUS_LABEL, RANGE_BUCKET_MS, RANGE_LABEL, type OverviewRange, type SeriesPoint } from "@/lib/overview-model";
 import { compact, formatMs, formatNumber } from "@/lib/format";
 import { Panel, Segmented } from "./ui";
+import { activeDot, axisTick, barCursor, chartGrid, seriesCurrent, seriesPrevious, timeCursor } from "@/lib/chart-style";
 
 type Measure = "requests" | "tokens" | "latency";
 
-const CURRENT = "hsl(240 5% 90%)";
-const PREVIOUS = "hsl(240 4% 46%)";
 /** Callers' failures: the platform's bar colour, light. */
 const CALLER_OPACITY = 0.28;
 
@@ -29,19 +28,18 @@ function TrafficTooltip({ active, payload, measure, range, split }: { active?: b
   const fmt = (v: number | null) => (v === null ? "—" : measure === "latency" ? formatMs(v) : formatNumber(v));
   const end = timeLabel(row.t + RANGE_BUCKET_MS[range], range);
   return (
-    <div className="min-w-44 rounded-lg border border-border bg-[hsl(240_5%_9%)] px-3 py-2 text-xs shadow-xl">
-      <p className="mb-1.5 font-mono text-muted-foreground">{row.label}–{end}</p>
-      <div className="flex justify-between gap-6"><span>This window</span><span className="font-mono tabular-nums">{fmt(row.cur)}</span></div>
-      <div className="flex justify-between gap-6 text-muted-foreground"><span>{PREVIOUS_LABEL[range].replace(/^\w/, (c) => c.toUpperCase())}</span><span className="font-mono tabular-nums">{fmt(row.prev)}</span></div>
+    <TooltipShell title={`${row.label}–${end}`}>
+      <TooltipRow label="This window" value={fmt(row.cur)} />
+      <TooltipRow muted label={PREVIOUS_LABEL[range].replace(/^\w/, (c) => c.toUpperCase())} value={fmt(row.prev)} />
       {split ? (
         <>
-          <div className="mt-1 flex justify-between gap-6"><span>Failed on the platform</span><span className="font-mono tabular-nums">{formatNumber(row.platform)}</span></div>
-          <div className="flex justify-between gap-6 text-muted-foreground"><span>Failed from callers</span><span className="font-mono tabular-nums">{formatNumber(row.caller)}</span></div>
+          <TooltipRow className="mt-1" label="Failed on the platform" value={formatNumber(row.platform)} />
+          <TooltipRow muted label="Failed from callers" value={formatNumber(row.caller)} />
         </>
       ) : (
-        <div className="mt-1 flex justify-between gap-6 text-muted-foreground"><span>Failed</span><span className="font-mono tabular-nums">{formatNumber(row.errors)}</span></div>
+        <TooltipRow muted className="mt-1" label="Failed" value={formatNumber(row.errors)} />
       )}
-    </div>
+    </TooltipShell>
   );
 }
 
@@ -102,9 +100,9 @@ export const TrafficPanel = memo(function TrafficPanel({ series, range, hasError
                   <XAxis dataKey="label" hide />
                   <YAxis tick={axisTick} axisLine={false} tickLine={false} width={44} allowDecimals={false} tickFormatter={measure === "latency" ? (v: number) => formatMs(v) : compact} />
                   <Tooltip cursor={timeCursor} content={<TrafficTooltip measure={measure} range={range} split={split} />} />
-                  <Area type="monotone" dataKey="cur" name="This window" stroke="none" fill={CURRENT} fillOpacity={0.07} isAnimationActive={false} connectNulls={measure !== "latency"} />
-                  <Line type="monotone" dataKey="prev" name="Previous" stroke={PREVIOUS} strokeWidth={2} strokeDasharray="5 4" dot={false} activeDot={{ r: 4, strokeWidth: 2, stroke: "hsl(240 5% 7%)" }} isAnimationActive={false} connectNulls={measure !== "latency"} />
-                  <Line type="monotone" dataKey="cur" name="This window" stroke={CURRENT} strokeWidth={2} dot={false} activeDot={{ r: 4, strokeWidth: 2, stroke: "hsl(240 5% 7%)" }} isAnimationActive={false} connectNulls={measure !== "latency"} />
+                  <Area type="monotone" dataKey="cur" name="This window" stroke="none" fill={seriesCurrent} fillOpacity={0.07} isAnimationActive={false} connectNulls={measure !== "latency"} />
+                  <Line type="monotone" dataKey="prev" name="Previous" stroke={seriesPrevious} strokeWidth={2} strokeDasharray="5 4" dot={false} activeDot={activeDot} isAnimationActive={false} connectNulls={measure !== "latency"} />
+                  <Line type="monotone" dataKey="cur" name="This window" stroke={seriesCurrent} strokeWidth={2} dot={false} activeDot={activeDot} isAnimationActive={false} connectNulls={measure !== "latency"} />
                 </ComposedChart>
               </ResponsiveContainer>
             </div>
@@ -113,8 +111,8 @@ export const TrafficPanel = memo(function TrafficPanel({ series, range, hasError
                 Failed requests
                 {hasErrors && split && (
                   <span className="flex items-center gap-3 text-muted-foreground">
-                    <span className="inline-flex items-center gap-1.5"><span className="h-2 w-2 rounded-[2px]" style={{ background: CURRENT }} />Platform {formatNumber(totalPlatform)}</span>
-                    <span className="inline-flex items-center gap-1.5"><span className="h-2 w-2 rounded-[2px]" style={{ background: CURRENT, opacity: CALLER_OPACITY }} />Callers {formatNumber(totalErrors - totalPlatform)}</span>
+                    <span className="inline-flex items-center gap-1.5"><span className="h-2 w-2 rounded-[2px]" style={{ background: seriesCurrent }} />Platform {formatNumber(totalPlatform)}</span>
+                    <span className="inline-flex items-center gap-1.5"><span className="h-2 w-2 rounded-[2px]" style={{ background: seriesCurrent, opacity: CALLER_OPACITY }} />Callers {formatNumber(totalErrors - totalPlatform)}</span>
                   </span>
                 )}
               </span>
@@ -127,9 +125,9 @@ export const TrafficPanel = memo(function TrafficPanel({ series, range, hasError
                 <BarChart data={rows} syncId="overview-traffic" margin={{ top: 4, right: 4, left: 0, bottom: 0 }} barCategoryGap={2}>
                   <XAxis dataKey="label" tick={axisTick} axisLine={false} tickLine={false} minTickGap={48} height={20} />
                   <YAxis width={44} tick={false} axisLine={false} tickLine={false} allowDecimals={false} tickFormatter={compact} />
-                  <Tooltip cursor={{ fill: "hsl(240 4% 16% / 0.5)" }} content={<TrafficTooltip measure={measure} range={range} split={split} />} />
-                  <Bar dataKey="platform" name="Failed on the platform" stackId="failed" fill={CURRENT} isAnimationActive={false} minPointSize={0} />
-                  <Bar dataKey="caller" name="Failed from callers" stackId="failed" fill={CURRENT} fillOpacity={CALLER_OPACITY} radius={[2, 2, 0, 0]} isAnimationActive={false} minPointSize={0} />
+                  <Tooltip cursor={barCursor} content={<TrafficTooltip measure={measure} range={range} split={split} />} />
+                  <Bar dataKey="platform" name="Failed on the platform" stackId="failed" fill={seriesCurrent} isAnimationActive={false} minPointSize={0} />
+                  <Bar dataKey="caller" name="Failed from callers" stackId="failed" fill={seriesCurrent} fillOpacity={CALLER_OPACITY} radius={[2, 2, 0, 0]} isAnimationActive={false} minPointSize={0} />
                 </BarChart>
               </ResponsiveContainer>
             </div>

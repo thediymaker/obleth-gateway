@@ -32,6 +32,7 @@ import {
 } from "@/lib/speed-model";
 import { cn, getJson } from "@/lib/utils";
 import { readFailed, ReadFailedNote } from "@/components/ui/read-state";
+import { seriesCurrent, seriesPrevious, seriesRest } from "@/lib/chart-style";
 
 const COLUMNS = "grid grid-cols-[minmax(12rem,250px)_76px_104px_84px_minmax(0,1fr)_20px] gap-x-3.5";
 const CHART_W = 1400;
@@ -91,17 +92,17 @@ function Detail({ row, bucket, onModel, logsFor, single }: { row: SpeedRow; buck
       <div className="flex min-w-0 flex-col gap-1.5">
         <div className="relative h-[176px] border-l border-border">
           <svg role="img" aria-label={`${row.model}: median tokens a second ${bucket === "hour" ? "by hour" : "by day"}`} viewBox={`0 0 ${CHART_W} ${CHART_H}`} preserveAspectRatio="none" className="block h-[176px] w-full">
-            <path d={`M0 0.5 H${CHART_W} M0 ${CHART_H / 2} H${CHART_W} M0 ${CHART_H - 0.5} H${CHART_W}`} stroke="hsl(240 4% 16%)" strokeWidth={1} vectorEffect="non-scaling-stroke" fill="none" />
-            <path d={paths.usual} stroke="hsl(240 4% 34%)" strokeWidth={1} strokeDasharray="4 4" vectorEffect="non-scaling-stroke" fill="none" />
-            <path d={paths.band} fill="hsl(240 4% 26%)" fillOpacity={0.55} />
-            <path d={paths.median} stroke="hsl(240 5% 90%)" strokeWidth={2} vectorEffect="non-scaling-stroke" fill="none" strokeLinejoin="round" />
+            <path d={`M0 0.5 H${CHART_W} M0 ${CHART_H / 2} H${CHART_W} M0 ${CHART_H - 0.5} H${CHART_W}`} stroke="hsl(var(--chart-grid))" strokeWidth={1} vectorEffect="non-scaling-stroke" fill="none" />
+            <path d={paths.usual} stroke={seriesPrevious} strokeWidth={1} strokeDasharray="4 4" vectorEffect="non-scaling-stroke" fill="none" />
+            <path d={paths.band} fill={seriesRest} fillOpacity={0.55} />
+            <path d={paths.median} stroke={seriesCurrent} strokeWidth={2} vectorEffect="non-scaling-stroke" fill="none" strokeLinejoin="round" />
           </svg>
           <span className="absolute left-1 top-0.5 font-mono text-[10.5px] text-muted-foreground">{paths.top} tok/s</span>
           <span className="absolute left-1 top-[calc(50%+2px)] font-mono text-[10.5px] text-muted-foreground">{+(paths.top / 2).toFixed(1)}</span>
         </div>
         <div className="flex flex-wrap gap-4 text-[11.5px] text-secondary-foreground">
-          <span className="inline-flex items-center gap-1.5"><span className="h-0.5 w-4 bg-[hsl(240_5%_90%)]" />Median request</span>
-          <span className="inline-flex items-center gap-1.5"><span className="h-2.5 w-4 rounded-[2px] bg-[hsl(240_4%_26%)]" />Down to the slowest tenth</span>
+          <span className="inline-flex items-center gap-1.5"><span className="h-0.5 w-4" style={{ background: seriesCurrent }} />Median request</span>
+          <span className="inline-flex items-center gap-1.5"><span className="h-2.5 w-4 rounded-[2px]" style={{ background: seriesRest, opacity: 0.55 }} />Down to the slowest tenth</span>
           <span className="inline-flex items-center gap-1.5"><span className="w-4 border-t border-dashed border-muted-foreground" />Its usual speed</span>
           <span>Gaps are {bucket === "hour" ? "hours" : "days"} with no requests</span>
         </div>

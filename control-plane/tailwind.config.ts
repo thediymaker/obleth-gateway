@@ -40,6 +40,10 @@ const config: Config = {
           2: "hsl(var(--chart-2))",
           3: "hsl(var(--chart-3))",
           4: "hsl(var(--chart-4))",
+          rest: "hsl(var(--chart-rest))",
+          previous: "hsl(var(--chart-previous))",
+          grid: "hsl(var(--chart-grid))",
+          tooltip: "hsl(var(--chart-tooltip))",
         },
       },
       borderRadius: {

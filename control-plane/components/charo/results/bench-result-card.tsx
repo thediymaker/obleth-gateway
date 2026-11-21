@@ -7,7 +7,8 @@ import {
 } from "recharts";
 import type { BenchResult } from "@/lib/charo/bench/types";
 import { Rail, MicroLabel } from "@/components/charo/rail";
-import { axisTick, chartGrid, timeCursor, tip } from "@/components/chart-tooltip";
+import { tip } from "@/components/chart-tooltip";
+import { axisTick, chartGrid, timeCursor } from "@/lib/chart-style";
 
 const GRADE_TONE: Record<string, string> = {
   A: "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400",

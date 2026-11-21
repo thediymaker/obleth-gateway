@@ -2,10 +2,11 @@
 
 import { memo, useMemo, useState } from "react";
 import { Area, AreaChart, Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { axisTick, chartGrid, timeCursor } from "@/components/chart-tooltip";
+import { TooltipRow, TooltipShell } from "@/components/chart-tooltip";
 import { GROUP_TONES, MAX_CHART_ROWS, OTHER_TONE, thinHistory, type GroupHistoryPoint, type GroupKey } from "@/lib/fairshare-model";
 import { Panel, Segmented } from "@/components/overview/ui";
 import { compact, formatNumber } from "@/lib/format";
+import { axisTick, barCursor, chartGrid, timeCursor } from "@/lib/chart-style";
 
 type Window = "15m" | "1h";
 const WINDOW_MS: Record<Window, number> = { "15m": 900_000, "1h": 3_600_000 };
@@ -17,14 +18,13 @@ function HistoryTooltip({ active, payload, series }: { active?: boolean; payload
   if (!active || !row) return null;
   const total = series.reduce((n, s) => n + Number(row[s.key] ?? 0), 0);
   return (
-    <div className="min-w-44 rounded-lg border border-border bg-[hsl(240_5%_9%)] px-3 py-2 text-xs shadow-xl">
-      <p className="mb-1.5 font-mono text-muted-foreground">{row.time}</p>
+    <TooltipShell title={row.time}>
       {[...series].reverse().map((s) => (
-        <div key={s.key} className="flex items-center gap-2"><span className="h-2 w-2 rounded-sm" style={{ background: s.tone }} /><span className="text-muted-foreground">{s.name}</span><span className="ml-auto pl-6 font-mono tabular-nums">{formatNumber(Number(row[s.key] ?? 0))}</span></div>
+        <TooltipRow key={s.key} swatch={s.tone} label={<span className="text-muted-foreground">{s.name}</span>} value={formatNumber(Number(row[s.key] ?? 0))} />
       ))}
-      <div className="mt-1 flex justify-between gap-6 border-t border-border pt-1"><span>Running</span><span className="font-mono tabular-nums">{formatNumber(total)}</span></div>
-      <div className="flex justify-between gap-6 text-muted-foreground"><span>Waiting</span><span className="font-mono tabular-nums">{formatNumber(Number(row.queued))}</span></div>
-    </div>
+      <TooltipRow className="mt-1 border-t border-border pt-1" label="Running" value={formatNumber(total)} />
+      <TooltipRow muted label="Waiting" value={formatNumber(Number(row.queued))} />
+    </TooltipShell>
   );
 }
 
@@ -103,7 +103,7 @@ export const RunningHistory = memo(function RunningHistory({ history, groups, ol
                   <YAxis tick={axisTick} axisLine={false} tickLine={false} width={44} allowDecimals={false} tickFormatter={compact} />
                   <Tooltip cursor={timeCursor} content={<HistoryTooltip series={series} />} />
                   {series.map((s) => (
-                    <Area key={s.key} type="monotone" dataKey={s.key} name={s.name} stackId="running" stroke="hsl(240 5% 7%)" strokeWidth={2} fill={s.tone} fillOpacity={1} isAnimationActive={false} />
+                    <Area key={s.key} type="monotone" dataKey={s.key} name={s.name} stackId="running" stroke="hsl(var(--card))" strokeWidth={2} fill={s.tone} fillOpacity={1} isAnimationActive={false} />
                   ))}
                 </AreaChart>
               </ResponsiveContainer>
@@ -117,7 +117,7 @@ export const RunningHistory = memo(function RunningHistory({ history, groups, ol
                 <BarChart data={rows} syncId="fairshare-history" margin={{ top: 2, right: 4, left: 0, bottom: 0 }} barCategoryGap={1}>
                   <XAxis dataKey="time" tick={axisTick} axisLine={false} tickLine={false} minTickGap={56} height={20} />
                   <YAxis width={44} tick={false} axisLine={false} tickLine={false} />
-                  <Tooltip cursor={{ fill: "hsl(240 4% 16% / 0.5)" }} content={<HistoryTooltip series={series} />} />
+                  <Tooltip cursor={barCursor} content={<HistoryTooltip series={series} />} />
                   <Bar dataKey="queued" name="Waiting" fill={GROUP_TONES[0]} radius={[2, 2, 0, 0]} isAnimationActive={false} />
                 </BarChart>
               </ResponsiveContainer>

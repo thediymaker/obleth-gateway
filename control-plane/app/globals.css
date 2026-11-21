@@ -23,10 +23,19 @@
     --input: 240 4% 14%;
     --ring: 240 5% 40%;
     --radius: 0.5rem;
-    --chart-1: 240 5% 72%;
-    --chart-2: 160 8% 48%;
-    --chart-3: 35 12% 58%;
-    --chart-4: 220 8% 52%;
+    /* Charts: --chart-1..4 are series from brightest to dimmest (--chart-1 is
+       the current window), --chart-rest everything past them, --chart-previous
+       the dashed comparison line. components/chart-tooltip.tsx reads them. */
+    --chart-1: 240 5% 88%;
+    --chart-2: 240 4% 66%;
+    --chart-3: 240 4% 50%;
+    --chart-4: 240 4% 38%;
+    --chart-rest: 240 4% 24%;
+    --chart-previous: 240 4% 46%;
+    --chart-grid: 240 4% 16%;
+    --chart-axis: 240 6% 64%;
+    --chart-cursor: 240 5% 30%;
+    --chart-tooltip: 240 5% 9%;
   }
 
   * {

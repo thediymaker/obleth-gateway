@@ -4,7 +4,7 @@ import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import Link from "next/link";
 import { Area, ComposedChart, Line, ResponsiveContainer, Tooltip, XAxis, YAxis, CartesianGrid } from "recharts";
-import { axisTick, chartGrid, timeCursor } from "@/components/chart-tooltip";
+import { TooltipRow, TooltipShell } from "@/components/chart-tooltip";
 import { Meter, Panel, Segmented } from "@/components/overview/ui";
 import { usePoolLoad } from "@/components/fairshare/hooks";
 import { Tile } from "@/components/models/ui";
@@ -17,10 +17,9 @@ import { cn, getJson } from "@/lib/utils";
 import { auditHref } from "@/lib/audit-model";
 import { boonsWaitingOnFunctionCalling } from "@/lib/boon-availability";
 import { readFailed, ReadFailedNote, type LiveRead } from "@/components/ui/read-state";
+import { activeDot, axisTick, chartGrid, seriesCurrent, seriesPrevious, timeCursor } from "@/lib/chart-style";
 
 const DAY_MS = 86_400_000;
-const CURRENT = "hsl(240 5% 90%)";
-const PREVIOUS = "hsl(240 4% 46%)";
 
 type Measure = "requests" | "ttft" | "throughput";
 
@@ -62,11 +61,10 @@ function ChartTip({ active, payload, measure }: { active?: boolean; payload?: { 
   if (!active || !row) return null;
   const fmt = (v: number | null) => (v === null ? "—" : measure === "ttft" ? formatMs(v) : measure === "throughput" ? `${compact(v)} tok/s` : formatNumber(v));
   return (
-    <div className="min-w-40 rounded-lg border border-border bg-[hsl(240_5%_9%)] px-3 py-2 text-xs shadow-xl">
-      <p className="mb-1.5 font-mono text-muted-foreground">{row.label}</p>
-      <div className="flex justify-between gap-6"><span>Today</span><span className="font-mono tabular-nums">{fmt(row.cur)}</span></div>
-      <div className="flex justify-between gap-6 text-muted-foreground"><span>Yesterday</span><span className="font-mono tabular-nums">{fmt(row.prev)}</span></div>
-    </div>
+    <TooltipShell title={row.label} className="min-w-40">
+      <TooltipRow label="Today" value={fmt(row.cur)} />
+      <TooltipRow muted label="Yesterday" value={fmt(row.prev)} />
+    </TooltipShell>
   );
 }
 
@@ -108,9 +106,9 @@ function TrafficChart({ overview }: { overview: OverviewRead }) {
                 <XAxis dataKey="label" tick={axisTick} axisLine={false} tickLine={false} minTickGap={56} height={20} />
                 <YAxis tick={axisTick} axisLine={false} tickLine={false} width={44} allowDecimals={false} tickFormatter={measure === "ttft" ? (v: number) => formatMs(v) : compact} />
                 <Tooltip cursor={timeCursor} content={<ChartTip measure={measure} />} />
-                <Area type="monotone" dataKey="cur" stroke="none" fill={CURRENT} fillOpacity={0.07} isAnimationActive={false} connectNulls={measure === "requests"} />
-                <Line type="monotone" dataKey="prev" stroke={PREVIOUS} strokeWidth={2} strokeDasharray="5 4" dot={false} isAnimationActive={false} connectNulls={measure === "requests"} />
-                <Line type="monotone" dataKey="cur" stroke={CURRENT} strokeWidth={2} dot={false} activeDot={{ r: 4, strokeWidth: 2, stroke: "hsl(240 5% 7%)" }} isAnimationActive={false} connectNulls={measure === "requests"} />
+                <Area type="monotone" dataKey="cur" stroke="none" fill={seriesCurrent} fillOpacity={0.07} isAnimationActive={false} connectNulls={measure === "requests"} />
+                <Line type="monotone" dataKey="prev" stroke={seriesPrevious} strokeWidth={2} strokeDasharray="5 4" dot={false} isAnimationActive={false} connectNulls={measure === "requests"} />
+                <Line type="monotone" dataKey="cur" stroke={seriesCurrent} strokeWidth={2} dot={false} activeDot={activeDot} isAnimationActive={false} connectNulls={measure === "requests"} />
               </ComposedChart>
             </ResponsiveContainer>
           </div>

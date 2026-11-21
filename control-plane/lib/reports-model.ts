@@ -1,5 +1,6 @@
 import type { UsageDailyGroupBy, UsageDailyRow } from "@/lib/obleth";
 import type { ExportColumn } from "@/lib/usage-export";
+import { seriesRest, seriesTones } from "@/lib/chart-style";
 
 /**
  * The Reports page's pure logic: date ranges and the period before, totals,
@@ -185,8 +186,6 @@ export function measureOf(rows: UsageDailyRow[], m: Measure): number {
 }
 
 /** Grey steps, lightest for the largest share; "everyone else" darkest. */
-export const SPLIT_TONES = ["hsl(240 5% 88%)", "hsl(240 4% 66%)", "hsl(240 4% 50%)", "hsl(240 4% 38%)"];
-export const REST_TONE = "hsl(240 4% 24%)";
 export const SPLIT_TOP = 4;
 
 export interface ChartDay {
@@ -233,9 +232,9 @@ export function buildChart(
     }
   }
   const ranked = [...seriesTotals.entries()].sort((a, b) => b[1].value - a[1].value);
-  const top = ranked.slice(0, SPLIT_TOP).map(([id, v], i) => ({ id, label: v.label, color: SPLIT_TONES[i] }));
+  const top = ranked.slice(0, SPLIT_TOP).map(([id, v], i) => ({ id, label: v.label, color: seriesTones[i] }));
   const series: ChartSeries[] = splitting
-    ? [...top, ...(ranked.length > SPLIT_TOP ? [{ id: "__rest", label: `${ranked.length - SPLIT_TOP} more`, color: REST_TONE }] : [])]
+    ? [...top, ...(ranked.length > SPLIT_TOP ? [{ id: "__rest", label: `${ranked.length - SPLIT_TOP} more`, color: seriesRest }] : [])]
     : [];
   const topIds = new Set(top.map((s) => s.id));
   const splitByDay = new Map<string, UsageDailyRow[]>();
