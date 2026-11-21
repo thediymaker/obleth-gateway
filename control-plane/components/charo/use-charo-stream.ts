@@ -65,6 +65,13 @@ function capReasoning(text: string): string {
   return text.length > MAX_REASONING_CHARS ? `${text.slice(0, MAX_REASONING_CHARS)}\n\n[… thinking truncated]` : text;
 }
 
+type TurnPatch = { id: string; fn: (t: ChatTurn) => ChatTurn };
+
+/** Apply patches in order; a turn no patch names keeps its identity. */
+function applyPatches(turns: ChatTurn[], patches: TurnPatch[]): ChatTurn[] {
+  return turns.map((t) => patches.reduce((turn, p) => (p.id === t.id ? p.fn(turn) : turn), t));
+}
+
 function uid(): string {
   return Math.random().toString(36).slice(2);
 }
@@ -204,6 +211,28 @@ export function useCharoStream(options?: { model?: string; supportsVision?: bool
   const mounted = useRef(true);
   const [ready, setReady] = useState(!options?.storageKey);
   const [persistenceError, setPersistenceError] = useState<string | null>(null);
+  // Streamed text arrives a token at a time. Token patches wait in a queue and
+  // land together once per animation frame, so a fast stream renders at most
+  // once a frame. Every other change to the turns flushes the queue first, so
+  // patches keep their order and the end of a stream (or a stop, or an error)
+  // never leaves its last tokens unapplied.
+  const queuedTokens = useRef<TurnPatch[]>([]);
+  const tokenFrame = useRef<number | null>(null);
+  const dropTokens = useCallback(() => {
+    if (tokenFrame.current !== null) cancelAnimationFrame(tokenFrame.current);
+    tokenFrame.current = null;
+    queuedTokens.current = [];
+  }, []);
+  const flushTokens = useCallback(() => {
+    const patches = queuedTokens.current;
+    dropTokens();
+    if (patches.length) setMessages((prev) => applyPatches(prev, patches));
+  }, [dropTokens]);
+  const patchTokens = useCallback((id: string, fn: (t: ChatTurn) => ChatTurn) => {
+    queuedTokens.current.push({ id, fn });
+    tokenFrame.current ??= requestAnimationFrame(flushTokens);
+  }, [flushTokens]);
+
   const latest = useRef<Conversation | null>(null);
   latest.current = ready ? { messages, activeTarget, targetStart: targetStartRef.current } : null;
   const storageKey = options?.storageKey;
@@ -231,11 +260,15 @@ export function useCharoStream(options?: { model?: string; supportsVision?: bool
       abortRef.current?.abort();
       polls.forEach((c) => c.abort());
       polls.clear();
+      // Tokens still waiting for a frame belong in the saved conversation.
+      const unsaved = queuedTokens.current;
+      dropTokens();
       if (storageKey && latest.current) {
-        try { localStorage.setItem(storageKey, JSON.stringify(latest.current)); } catch { /* visible while mounted */ }
+        const conversation = { ...latest.current, messages: applyPatches(latest.current.messages, unsaved) };
+        try { localStorage.setItem(storageKey, JSON.stringify(conversation)); } catch { /* visible while mounted */ }
       }
     };
-  }, [storageKey]);
+  }, [storageKey, dropTokens]);
   useEffect(() => {
     if (!ready || !storageKey) return;
     const timer = setTimeout(() => {
@@ -246,9 +279,11 @@ export function useCharoStream(options?: { model?: string; supportsVision?: bool
   }, [messages, activeTarget, ready, storageKey]);
 
   const patchTurn = useCallback(
-    (id: string, fn: (t: ChatTurn) => ChatTurn) =>
-      setMessages((prev) => prev.map((m) => (m.id === id ? fn(m) : m))),
-    [],
+    (id: string, fn: (t: ChatTurn) => ChatTurn) => {
+      flushTokens();
+      setMessages((prev) => applyPatches(prev, [{ id, fn }]));
+    },
+    [flushTokens],
   );
 
   const reset = useCallback(() => {
@@ -258,10 +293,11 @@ export function useCharoStream(options?: { model?: string; supportsVision?: bool
     pollsRef.current.forEach((c) => c.abort());
     pollsRef.current.clear();
     targetStartRef.current = null;
+    dropTokens();
     setMessages([]);
     setBusy(false);
     setActiveTarget(null);
-  }, []);
+  }, [dropTokens]);
 
   // Halt the in-flight turn (a long/hung benchmark, or a slow stream) without
   // clearing the conversation, so the operator can immediately send again. The
@@ -353,14 +389,14 @@ export function useCharoStream(options?: { model?: string; supportsVision?: bool
           fieldReasoning += String(parsed.text ?? "");
           thinkingSince ??= performance.now();
           const inline = splitHiddenReasoning(raw).thinking;
-          patchTurn(assistantId, (m) => ({ ...m, reasoning: reasoningOf(inline) }));
+          patchTokens(assistantId, (m) => ({ ...m, reasoning: reasoningOf(inline) }));
         } else if (event === "token") {
           raw += String(parsed.text ?? "");
           const { visible, thinking } = splitHiddenReasoning(raw);
           if (thinking) thinkingSince ??= performance.now();
           if (visible.trim() && thinkingSince !== null && thoughtMs === undefined) thoughtMs = performance.now() - thinkingSince;
           const reasoning = reasoningOf(thinking);
-          patchTurn(assistantId, (m) => ({
+          patchTokens(assistantId, (m) => ({
             ...m,
             content: visible,
             ...(reasoning ? { reasoning } : {}),
@@ -393,7 +429,7 @@ export function useCharoStream(options?: { model?: string; supportsVision?: bool
         patchTurn(assistantId, (m) => ({ ...m, reasoningMs: ms }));
       }
     },
-    [patchTurn, pollTrace, options?.generation],
+    [patchTurn, patchTokens, pollTrace, options?.generation],
   );
 
   // Apply one agent/tool SSE event to the given assistant turn. Shared by the
@@ -408,7 +444,7 @@ export function useCharoStream(options?: { model?: string; supportsVision?: bool
     ) => {
       if (event === "token") {
         const t = String(parsed.text ?? "");
-        patchTurn(assistantId, (m) => ({ ...m, content: stripHiddenReasoning(m.content + t) }));
+        patchTokens(assistantId, (m) => ({ ...m, content: stripHiddenReasoning(m.content + t) }));
       } else if (event === "confirm") {
         const name = String(parsed.name ?? "");
         patchTurn(assistantId, (m) => ({
@@ -456,7 +492,7 @@ export function useCharoStream(options?: { model?: string; supportsVision?: bool
         }));
       }
     },
-    [patchTurn, pollTrace],
+    [patchTurn, patchTokens, pollTrace],
   );
 
   // Chat entry point. Plain chat drives Charo's brain through the agent loop,

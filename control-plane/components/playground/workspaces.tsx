@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import Link from "next/link";
 import { Activity, ArrowUp, Check, ChevronDown, Copy, Paperclip, Plus, RotateCcw, Square, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -107,7 +107,6 @@ export function UnifiedWorkspace({ storageKey, session, update, models, loading,
   const all = [first, second, third, fourth];
   const streams = all.slice(0, session.models.length);
   const recipients = session.recipients?.filter((i) => i < streams.length) ?? streams.map((_, i) => i);
-  const [text, setText] = useState("");
   const [image, setImage] = useState<string | undefined>();
   const [attachError, setAttachError] = useState<string | null>(null);
   const [picker, setPicker] = useState(false);
@@ -126,10 +125,10 @@ export function UnifiedWorkspace({ storageKey, session, update, models, loading,
     if (el && el.scrollHeight - el.scrollTop - el.clientHeight < 160) el.scrollTo({ top: el.scrollHeight });
   });
 
-  // A draft handed over from another mode (Router's "Open in Chat").
+  // A draft handed over from another mode (Router's "Open in Chat") starts
+  // the composer's text; it is read once per mount, so clear it.
   useEffect(() => {
-    if (session.chatDraft) { setText(session.chatDraft); update({ chatDraft: undefined }); }
-    // Read once per mount; the patch clears it.
+    if (session.chatDraft) update({ chatDraft: undefined });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -141,14 +140,15 @@ export function UnifiedWorkspace({ storageKey, session, update, models, loading,
     reader.onerror = () => setAttachError("Could not read this image.");
     reader.readAsDataURL(file);
   };
-  const send = (override?: string) => {
-    const body = override ?? text;
-    if (!ready || busy || (!body.trim() && !image)) return;
+  /** Send `body` to every recipient; false when nothing was sent. */
+  const send = (body: string) => {
+    if (!ready || busy || (!body.trim() && !image)) return false;
     const promptId = `2:${Date.now()}:${uuid()}`;
     recipients.forEach((i) => { void streams[i].send(body, image, undefined, promptId); });
     update(session.title === "Untitled session" ? { title: body.trim().slice(0, 60) || "Image conversation" } : {});
-    setText(""); setImage(undefined);
+    setImage(undefined);
     requestAnimationFrame(() => timeline.current?.scrollTo({ top: timeline.current.scrollHeight }));
+    return true;
   };
   const startActivity = (activity: string) => {
     const index = session.models.indexOf("charo");
@@ -272,64 +272,65 @@ export function UnifiedWorkspace({ storageKey, session, update, models, loading,
 
         <div className="px-4 pb-4 md:px-8">
           <div className={cn("mx-auto flex flex-col gap-2", multi ? "max-w-4xl" : "max-w-3xl")}>
-            <div className="rounded-2xl border border-border bg-card focus-within:border-muted-foreground/50">
-              {multi && (
-                <div className="flex flex-wrap items-center gap-1.5 px-3 pt-2.5">
-                  <span className="mr-1 text-xs text-muted-foreground">Send to</span>
-                  {lanes.map(({ name, i }) => {
-                    const on = recipients.includes(i);
-                    return (
-                      <button key={i} type="button" aria-pressed={on} disabled={busy} onClick={() => toggleRecipient(i)}
-                        className={cn("inline-flex h-[30px] items-center gap-1.5 rounded-lg border px-2.5 text-[12.5px] disabled:opacity-60", on ? "border-muted-foreground/40 bg-secondary text-foreground" : "border-border text-muted-foreground hover:text-foreground")}>
-                        <span className={cn("flex h-3.5 w-3.5 items-center justify-center rounded", on ? "bg-foreground text-background" : "border-[1.5px] border-muted-foreground/60")}>{on && <Check className="h-2.5 w-2.5" strokeWidth={3} />}</span>
-                        {modelLabel(name)}
+            <Composer
+              initialText={session.chatDraft}
+              placeholder={!ready ? (recipients.length ? "Loading…" : "Choose who to send to…") : multi ? `Message ${recipients.length} model${recipients.length === 1 ? "" : "s"}…` : `Message ${modelLabel(primary)}…`}
+              ready={ready}
+              busy={busy}
+              hasImage={!!image}
+              onSend={send}
+              onStop={() => streams.forEach((s) => s.stop())}
+              stopLabel={multi ? "Stop all" : "Stop"}
+              header={
+                <>
+                  {multi && (
+                    <div className="flex flex-wrap items-center gap-1.5 px-3 pt-2.5">
+                      <span className="mr-1 text-xs text-muted-foreground">Send to</span>
+                      {lanes.map(({ name, i }) => {
+                        const on = recipients.includes(i);
+                        return (
+                          <button key={i} type="button" aria-pressed={on} disabled={busy} onClick={() => toggleRecipient(i)}
+                            className={cn("inline-flex h-[30px] items-center gap-1.5 rounded-lg border px-2.5 text-[12.5px] disabled:opacity-60", on ? "border-muted-foreground/40 bg-secondary text-foreground" : "border-border text-muted-foreground hover:text-foreground")}>
+                            <span className={cn("flex h-3.5 w-3.5 items-center justify-center rounded", on ? "bg-foreground text-background" : "border-[1.5px] border-muted-foreground/60")}>{on && <Check className="h-2.5 w-2.5" strokeWidth={3} />}</span>
+                            {modelLabel(name)}
+                          </button>
+                        );
+                      })}
+                      <button type="button" onClick={() => setPicker(true)} disabled={busy || loading}
+                        className="inline-flex h-[30px] items-center gap-1.5 rounded-lg border border-dashed border-border px-2.5 text-[12.5px] text-secondary-foreground hover:bg-accent disabled:opacity-60">
+                        <Plus className="h-3.5 w-3.5" />Add model
                       </button>
-                    );
-                  })}
-                  <button type="button" onClick={() => setPicker(true)} disabled={busy || loading}
-                    className="inline-flex h-[30px] items-center gap-1.5 rounded-lg border border-dashed border-border px-2.5 text-[12.5px] text-secondary-foreground hover:bg-accent disabled:opacity-60">
-                    <Plus className="h-3.5 w-3.5" />Add model
-                  </button>
-                  <span className="ml-auto text-[11.5px] text-muted-foreground">{recipients.length} of {MAX_LANES}</span>
-                </div>
-              )}
-              {image && (
-                <div className="flex items-center gap-2 px-4 pt-3">
-                  {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img src={image} alt="Shared attachment" className="h-12 rounded" />
-                  <Button variant="ghost" size="sm" onClick={() => setImage(undefined)}>Remove image</Button>
-                </div>
-              )}
-              <textarea
-                aria-label="Message"
-                rows={2}
-                className="block w-full resize-none bg-transparent px-4 pb-1 pt-3.5 text-sm leading-relaxed outline-none placeholder:text-muted-foreground"
-                value={text}
-                onChange={(e) => setText(e.target.value)}
-                onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); send(); } }}
-                placeholder={!ready ? (recipients.length ? "Loading…" : "Choose who to send to…") : multi ? `Message ${recipients.length} model${recipients.length === 1 ? "" : "s"}…` : `Message ${modelLabel(primary)}…`}
-              />
-              <div className="flex items-center gap-1.5 px-2.5 pb-2.5 pt-2">
-                {!multi && (
-                  <>
-                    <button type="button" onClick={() => setPicker(true)} disabled={busy || loading} aria-label={`Model: ${modelLabel(primary)}. Change model`}
-                      className="inline-flex h-[30px] min-w-0 items-center gap-1.5 rounded-lg border border-border px-2.5 text-[12.5px] text-secondary-foreground hover:bg-accent disabled:opacity-60">
-                      <ModelAvatar name={primary} size="xs" /><span className="truncate">{modelLabel(primary)}</span><ChevronDown className="h-3.5 w-3.5 shrink-0" />
-                    </button>
-                    <button type="button" onClick={() => setPicker(true)} disabled={busy || loading}
-                      className="inline-flex h-[30px] items-center gap-1.5 rounded-lg border border-border px-2.5 text-[12.5px] text-secondary-foreground hover:bg-accent disabled:opacity-60">
-                      <Plus className="h-3.5 w-3.5" />Compare
-                    </button>
-                  </>
-                )}
-                <input ref={filePicker} type="file" accept="image/*" className="hidden" onChange={(e) => { attachFile(e.target.files?.[0]); e.target.value = ""; }} />
-                <Button variant="ghost" size="icon" className="h-[30px] w-[30px] text-muted-foreground" title="Attach image" aria-label="Attach image" onClick={() => filePicker.current?.click()}><Paperclip className="h-4 w-4" /></Button>
-                <div className="flex-1" />
-                {busy
-                  ? <Button variant="outline" className="h-9" onClick={() => streams.forEach((s) => s.stop())}><Square className="h-3 w-3" />{multi ? "Stop all" : "Stop"}</Button>
-                  : <Button size="icon" className="h-9 w-9 rounded-[10px]" aria-label="Send" title="Send" disabled={!ready || (!text.trim() && !image)} onClick={() => send()}><ArrowUp className="h-4 w-4" /></Button>}
-              </div>
-            </div>
+                      <span className="ml-auto text-[11.5px] text-muted-foreground">{recipients.length} of {MAX_LANES}</span>
+                    </div>
+                  )}
+                  {image && (
+                    <div className="flex items-center gap-2 px-4 pt-3">
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img src={image} alt="Shared attachment" className="h-12 rounded" />
+                      <Button variant="ghost" size="sm" onClick={() => setImage(undefined)}>Remove image</Button>
+                    </div>
+                  )}
+                </>
+              }
+              tools={
+                <>
+                  {!multi && (
+                    <>
+                      <button type="button" onClick={() => setPicker(true)} disabled={busy || loading} aria-label={`Model: ${modelLabel(primary)}. Change model`}
+                        className="inline-flex h-[30px] min-w-0 items-center gap-1.5 rounded-lg border border-border px-2.5 text-[12.5px] text-secondary-foreground hover:bg-accent disabled:opacity-60">
+                        <ModelAvatar name={primary} size="xs" /><span className="truncate">{modelLabel(primary)}</span><ChevronDown className="h-3.5 w-3.5 shrink-0" />
+                      </button>
+                      <button type="button" onClick={() => setPicker(true)} disabled={busy || loading}
+                        className="inline-flex h-[30px] items-center gap-1.5 rounded-lg border border-border px-2.5 text-[12.5px] text-secondary-foreground hover:bg-accent disabled:opacity-60">
+                        <Plus className="h-3.5 w-3.5" />Compare
+                      </button>
+                    </>
+                  )}
+                  <input ref={filePicker} type="file" accept="image/*" className="hidden" onChange={(e) => { attachFile(e.target.files?.[0]); e.target.value = ""; }} />
+                  <Button variant="ghost" size="icon" className="h-[30px] w-[30px] text-muted-foreground" title="Attach image" aria-label="Attach image" onClick={() => filePicker.current?.click()}><Paperclip className="h-4 w-4" /></Button>
+                </>
+              }
+            />
             {attachError && <p role="alert" className="text-xs text-destructive">{attachError}</p>}
             <p className="flex flex-wrap items-center justify-center gap-x-3 text-center text-xs text-muted-foreground">
               <span>Enter to send · Shift + Enter for a new line</span>
@@ -358,6 +359,41 @@ export function UnifiedWorkspace({ storageKey, session, update, models, loading,
         locked={locked}
         onChoose={choose}
       />
+    </div>
+  );
+}
+
+/**
+ * The message box. It keeps the draft's text itself, so typing re-renders the
+ * box and not the conversation above it.
+ */
+function Composer({ initialText, placeholder, ready, busy, hasImage, onSend, onStop, stopLabel, header, tools }: {
+  initialText?: string; placeholder: string; ready: boolean; busy: boolean; hasImage: boolean;
+  /** Sends the text; false when nothing was sent, so the draft is kept. */
+  onSend: (text: string) => boolean;
+  onStop: () => void; stopLabel: string; header: ReactNode; tools: ReactNode;
+}) {
+  const [text, setText] = useState(initialText ?? "");
+  const send = () => { if (onSend(text)) setText(""); };
+  return (
+    <div className="rounded-2xl border border-border bg-card focus-within:border-muted-foreground/50">
+      {header}
+      <textarea
+        aria-label="Message"
+        rows={2}
+        className="block w-full resize-none bg-transparent px-4 pb-1 pt-3.5 text-sm leading-relaxed outline-none placeholder:text-muted-foreground"
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); send(); } }}
+        placeholder={placeholder}
+      />
+      <div className="flex items-center gap-1.5 px-2.5 pb-2.5 pt-2">
+        {tools}
+        <div className="flex-1" />
+        {busy
+          ? <Button variant="outline" className="h-9" onClick={onStop}><Square className="h-3 w-3" />{stopLabel}</Button>
+          : <Button size="icon" className="h-9 w-9 rounded-[10px]" aria-label="Send" title="Send" disabled={!ready || (!text.trim() && !hasImage)} onClick={send}><ArrowUp className="h-4 w-4" /></Button>}
+      </div>
     </div>
   );
 }
@@ -393,7 +429,7 @@ function Answer({ card, name, model, temperature, stream, messages, stats, badge
       <Activity className="h-3.5 w-3.5" />Trace
     </Link>
   );
-  const body = <CharoPanel stream={{ ...stream, messages }} />;
+  const body = <CharoPanel turns={messages} busy={stream.busy} actions={stream} />;
 
   if (!card) {
     return (
