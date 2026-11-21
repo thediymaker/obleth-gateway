@@ -1,5 +1,6 @@
 import { act, useState } from "react";
-import { createRoot, type Root } from "react-dom/client";
+import type { Root } from "react-dom/client";
+import { queryRoot } from "@/components/query-root.test-util";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ModelRoute } from "@/lib/obleth";
 import type { PlaygroundSession } from "./playground";
@@ -48,7 +49,7 @@ beforeEach(() => {
   localStorage.clear();
   host = document.createElement("div");
   document.body.appendChild(host);
-  root = createRoot(host);
+  root = queryRoot(host);
   vi.stubGlobal("fetch", vi.fn(async () => new Response("{}", { status: 200 })));
 });
 

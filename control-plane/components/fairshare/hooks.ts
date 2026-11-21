@@ -5,6 +5,7 @@ import { useQuery } from "@tanstack/react-query";
 import type { CapacityDiscoveryView, FairshareHistoryPoint, FairshareLiveView, ModelRoute } from "@/lib/obleth";
 import { appendHistoryTail, buildHistoryChart, fetchHistory } from "@/lib/fairshare-model";
 import { discoveredPool, occupancyOf, type Occupancy } from "@/lib/occupancy";
+import { capacityDiscoveryQuery, fairshareLiveQuery, modelRoutesQuery } from "@/lib/live-queries";
 
 /** How often the Fairshare pages poll the scheduler: the gateway samples every 2 s. */
 export const FAIRSHARE_POLL_MS = 2000;
@@ -25,12 +26,7 @@ export function useFairshareLive<T = FairshareLiveView>({
   select,
 }: { intervalMs?: number; select?: (view: FairshareLiveView) => T } = {}) {
   return useQuery({
-    queryKey: ["fairshare-live"],
-    queryFn: async () => {
-      const res = await fetch("/api/live/fairshare");
-      if (!res.ok) throw new Error("fairshare unavailable");
-      return (await res.json()) as FairshareLiveView;
-    },
+    ...fairshareLiveQuery,
     refetchInterval: intervalMs,
     select,
   });
@@ -38,12 +34,7 @@ export function useFairshareLive<T = FairshareLiveView>({
 
 export function useModelRoutes() {
   return useQuery({
-    queryKey: ["model-routes"],
-    queryFn: async () => {
-      const res = await fetch("/api/live/models");
-      if (!res.ok) throw new Error("models unavailable");
-      return (await res.json()) as ModelRoute[];
-    },
+    ...modelRoutesQuery,
     refetchInterval: ROUTES_POLL_MS,
   });
 }
@@ -51,12 +42,7 @@ export function useModelRoutes() {
 /** Pool sizes and cluster-wide counts for models the answering gateway has not served yet. */
 export function useCapacityDiscovery<T = CapacityDiscoveryView>({ select }: { select?: (view: CapacityDiscoveryView) => T } = {}) {
   return useQuery({
-    queryKey: ["capacity-discovery"],
-    queryFn: async () => {
-      const res = await fetch("/api/live/capacity/discovery");
-      if (!res.ok) throw new Error("capacity discovery unavailable");
-      return (await res.json()) as CapacityDiscoveryView;
-    },
+    ...capacityDiscoveryQuery,
     refetchInterval: DISCOVERY_POLL_MS,
     retry: false,
     select,

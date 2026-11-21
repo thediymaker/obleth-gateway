@@ -1,5 +1,6 @@
 import { act } from "react";
-import { createRoot, type Root } from "react-dom/client";
+import type { Root } from "react-dom/client";
+import { queryRoot } from "@/components/query-root.test-util";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Playground, SESSIONS_SAVE_DELAY_MS } from "./playground";
 
@@ -31,7 +32,7 @@ beforeEach(async () => {
   localStorage.clear();
   host = document.createElement("div");
   document.body.appendChild(host);
-  root = createRoot(host);
+  root = queryRoot(host);
   vi.stubGlobal(
     "fetch",
     vi.fn(async () => ({ ok: true, status: 200, json: async () => models }) as unknown as Response),

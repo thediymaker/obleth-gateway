@@ -11,10 +11,11 @@ import { uuid } from "@/lib/uuid";
 import type { ModelRoute } from "@/lib/obleth";
 import { StreamingPlayer } from "@/lib/playground/speech-player";
 import { WavParseError, WavStreamParser, pcm16Bytes, wavBlob, type WavFormat } from "@/lib/playground/wav-stream";
-import { cn } from "@/lib/utils";
+import { cn, getJson } from "@/lib/utils";
 import { SPEECH_TEXT_MAX_LENGTH, type PlaygroundSession } from "./playground";
 import { ModelAvatar, Pill, RunError, SectionLabel, SettingsPanel } from "./ui";
 import { formatNumber, money, perMillion } from "@/lib/format";
+import { useQuery } from "@tanstack/react-query";
 
 // Rows longer than this start clamped, with a "Show all" toggle.
 const CLAMP_CHARS = 280;
@@ -49,7 +50,14 @@ interface Run extends RunParams {
   at: number;
 }
 
-type VoiceList = { model: string; state: "loading" | "ready" | "unsupported" | "error"; voices: string[] };
+type VoiceList = { state: "ready" | "unsupported" | "error"; voices: string[] };
+
+/** The voices a speech model's own server lists; none when it cannot list them. */
+async function readVoices(model: string, signal: AbortSignal): Promise<VoiceList> {
+  const json = await getJson<{ voices?: unknown }>(`/api/live/playground/voices?model=${encodeURIComponent(model)}`, { signal });
+  const voices = Array.isArray(json.voices) ? json.voices.filter((v): v is string => typeof v === "string") : [];
+  return { state: voices.length ? "ready" : "unsupported", voices };
+}
 
 /** "0.42 s", "6.1 s", "3 min 12 s". */
 export function formatSeconds(s: number): string {
@@ -107,7 +115,6 @@ export function SpeechWorkspace({
   settingsOpen?: boolean;
 }) {
   const [runs, setRuns] = useState<Run[]>([]);
-  const [voiceList, setVoiceList] = useState<VoiceList | null>(null);
   const timeline = useRef<HTMLDivElement>(null);
   const active = useRef<{ id: string; abort: AbortController; player: StreamingPlayer | null } | null>(null);
   const urls = useRef(new Set<string>());
@@ -124,22 +131,15 @@ export function SpeechWorkspace({
   const chars = text.trim().length;
 
   // Voices come from the model's own server, when it can list them.
-  useEffect(() => {
-    if (!target) return;
-    const ac = new AbortController();
-    setVoiceList({ model: target, state: "loading", voices: [] });
-    fetch(`/api/live/playground/voices?model=${encodeURIComponent(target)}`, { signal: ac.signal })
-      .then(async (res) => {
-        const json = (await res.json().catch(() => null)) as { voices?: unknown; unsupported?: boolean } | null;
-        if (!res.ok || !json) { setVoiceList({ model: target, state: "error", voices: [] }); return; }
-        const voices = Array.isArray(json.voices) ? json.voices.filter((v): v is string => typeof v === "string") : [];
-        setVoiceList({ model: target, state: voices.length ? "ready" : "unsupported", voices });
-      })
-      .catch(() => { if (!ac.signal.aborted) setVoiceList({ model: target, state: "error", voices: [] }); });
-    return () => ac.abort();
-  }, [target]);
-  const voices = voiceList?.model === target ? voiceList : null;
-  const voicesLoading = Boolean(target) && (!voices || voices.state === "loading");
+  const voiceQuery = useQuery({
+    queryKey: ["speech-voices", target],
+    queryFn: ({ signal }) => readVoices(target, signal),
+    enabled: Boolean(target),
+    staleTime: 5 * 60_000,
+    retry: false,
+  });
+  const voices: VoiceList | null = voiceQuery.isError ? { state: "error", voices: [] } : voiceQuery.data ?? null;
+  const voicesLoading = Boolean(target) && voiceQuery.isPending;
   const listed = voices?.state === "ready" ? voices.voices : null;
   const voiceOptions = listed
     ? [{ value: "", label: "Server default" }, ...(voice && !listed.includes(voice) ? [voice] : []).concat(listed).map((v) => ({ value: v, label: v }))]

@@ -12,7 +12,7 @@ import { modelHref } from "@/lib/model-links";
 import { describeRequest, effortText, helperCallsParams, helperPurpose, HTTP_REASONS, isFailure, servedRequest, timeSplit, type LogFilters } from "@/lib/logs-model";
 import type { SpanEntry, UsageLogEntry } from "@/lib/obleth";
 import { parseAttrs, parseRouteExplain, spanHint, spanLabel, timeline, type SpanNode } from "@/lib/trace-model";
-import { cn } from "@/lib/utils";
+import { cn, getJson } from "@/lib/utils";
 import { formatMs, formatNumber, money } from "@/lib/format";
 
 function stamp(ms: number) {
@@ -121,10 +121,7 @@ export function RequestPanel({
   const [copied, setCopied] = useState(false);
   const { data: spans, isLoading } = useQuery({
     queryKey: ["spans", row.request_id],
-    queryFn: async () => {
-      const res = await fetch(`/api/live/usage/logs/${row.request_id}/spans`);
-      return res.ok ? ((await res.json()) as SpanEntry[]) : [];
-    },
+    queryFn: () => getJson<SpanEntry[]>(`/api/live/usage/logs/${row.request_id}/spans`),
     staleTime: 60_000,
     enabled: row.has_trace,
   });
@@ -133,11 +130,7 @@ export function RequestPanel({
   const served = servedRequest(row);
   const { data: helpers } = useQuery({
     queryKey: ["helper-calls", row.request_id],
-    queryFn: async () => {
-      const res = await fetch(`/api/live/usage/logs?${helperCallsParams(row)}`);
-      const rows = res.ok ? ((await res.json()) as UsageLogEntry[]) : [];
-      return rows.sort((a, b) => a.ts_ms - b.ts_ms);
-    },
+    queryFn: async () => (await getJson<UsageLogEntry[]>(`/api/live/usage/logs?${helperCallsParams(row)}`)).sort((a, b) => a.ts_ms - b.ts_ms),
     staleTime: 60_000,
     enabled: !served && row.parent_request_id !== undefined,
   });

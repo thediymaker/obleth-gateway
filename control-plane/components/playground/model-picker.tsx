@@ -9,6 +9,8 @@ import type { FairshareLiveView, ModelRoute } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
 import { ModelAvatar, Pill, SectionLabel, capabilities, modelLabel } from "./ui";
 import { compact, money, perMillion } from "@/lib/format";
+import { fairshareLiveQuery } from "@/lib/live-queries";
+import { useQuery } from "@tanstack/react-query";
 
 export const MAX_LANES = 4;
 
@@ -22,20 +24,9 @@ interface Entry {
   model?: ModelRoute;
 }
 
-/** Live in-flight counts per model, read once each time the picker opens. */
-function useLoad(open: boolean) {
-  const [load, setLoad] = useState<{ inFlight: Record<string, number>; defaultCap?: number } | null>(null);
-  useEffect(() => {
-    if (!open) return;
-    let cancelled = false;
-    fetch("/api/live/fairshare")
-      .then((r) => (r.ok ? (r.json() as Promise<FairshareLiveView>) : null))
-      .then((view) => { if (!cancelled && view) setLoad({ inFlight: view.model_in_flight ?? {}, defaultCap: view.default_model_max_in_flight }); })
-      .catch(() => { /* load is a nicety; the picker works without it */ });
-    return () => { cancelled = true; };
-  }, [open]);
-  return load;
-}
+/** Live in-flight counts per model, read when the picker opens. The load is a
+ * nicety: the picker works the same without it. */
+const pickLoad = (view: FairshareLiveView) => ({ inFlight: view.model_in_flight ?? {}, defaultCap: view.default_model_max_in_flight });
 
 /**
  * Choose the model(s) a chat session talks to. One highlighted row fills the
@@ -56,7 +47,7 @@ export function ModelPicker({ open, onOpenChange, models, selected, locked, onCh
   const [ticked, setTicked] = useState<string[]>(selected);
   const [highlight, setHighlight] = useState<string>(selected[0] ?? "auto");
   const list = useRef<HTMLDivElement>(null);
-  const load = useLoad(open);
+  const load = useQuery({ ...fairshareLiveQuery, enabled: open, select: pickLoad }).data ?? null;
 
   useEffect(() => {
     if (open) { setTicked(selected); setHighlight(selected[0] ?? "auto"); setQuery(""); setFilter("all"); }

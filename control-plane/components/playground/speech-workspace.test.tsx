@@ -1,5 +1,6 @@
 import { act } from "react";
-import { createRoot, type Root } from "react-dom/client";
+import type { Root } from "react-dom/client";
+import { queryRoot } from "@/components/query-root.test-util";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SpeechWorkspace, formatSeconds, formatSpeed } from "./speech-workspace";
 import type { PlaygroundSession } from "./playground";
@@ -54,7 +55,7 @@ function completeWav(rate = 8000): Uint8Array<ArrayBuffer> {
   return out;
 }
 
-const flush = () => act(async () => { await new Promise((r) => setTimeout(r, 0)); });
+const flush = () => act(async () => { for (let i = 0; i < 3; i++) await new Promise((r) => setTimeout(r, 0)); });
 
 function render(s: PlaygroundSession, update: (patch: Partial<PlaygroundSession>) => void = () => {}, list = models) {
   act(() => {
@@ -80,7 +81,7 @@ beforeEach(() => {
   speechReply = () => new Response(completeWav(), { status: 200, headers: { "content-type": "audio/wav" } });
   host = document.createElement("div");
   document.body.appendChild(host);
-  root = createRoot(host);
+  root = queryRoot(host);
   // jsdom has no object URLs (and no Web Audio, so nothing plays live here).
   Object.assign(URL, { createObjectURL: vi.fn(() => `blob:test-${++objectUrls}`), revokeObjectURL: vi.fn() });
   vi.stubGlobal(
@@ -313,7 +314,7 @@ describe("SpeechWorkspace", () => {
     await flush();
     act(() => root.unmount());
     expect(vi.mocked(URL.revokeObjectURL)).toHaveBeenLastCalledWith("blob:test-3");
-    root = createRoot(host);
+    root = queryRoot(host);
   });
 });
 

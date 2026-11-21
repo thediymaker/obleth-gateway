@@ -15,6 +15,7 @@ import { FooterTiles, NeedsAttention, RecentChanges, TopTenants } from "@/compon
 import { ModelPeek } from "@/components/overview/model-peek";
 import { TrafficPanel } from "@/components/overview/traffic-panel";
 import { HealthGlyph, Kpi, Pill, Segmented } from "@/components/overview/ui";
+import { capacityDiscoveryQuery, fairshareLiveQuery, modelRoutesQuery } from "@/lib/live-queries";
 
 const FAST_POLL_MS = 2_000;
 const STATS_POLL_MS = 5_000;
@@ -70,13 +71,13 @@ export function OverviewDashboard({
     refetchInterval: WINDOW_POLL_MS[range],
   });
   const contextQuery = useQuery({ queryKey: ["overview-context"], queryFn: () => getJson<OverviewContext>("/api/live/overview/context"), initialData: initialContext, refetchInterval: SLOW_POLL_MS });
-  const fairshareQuery = useQuery({ queryKey: ["fairshare-live"], queryFn: () => getJson<FairshareLiveView>("/api/live/fairshare"), initialData: initialFairshare, refetchInterval: FAST_POLL_MS });
+  const fairshareQuery = useQuery({ ...fairshareLiveQuery, initialData: initialFairshare, refetchInterval: FAST_POLL_MS });
   // The stats are only what liveCapacity falls back to when the fairshare view
   // cannot be read, so they are polled only then.
   const statsQuery = useQuery({ queryKey: ["gateway-stats"], queryFn: () => getJson<LiveStats>("/api/live/stats"), initialData: initialStats, refetchInterval: STATS_POLL_MS, enabled: !fairshareQuery.data || fairshareQuery.isError });
-  const modelsQuery = useQuery({ queryKey: ["model-routes"], queryFn: () => getJson<ModelRoute[]>("/api/live/models"), initialData: initialModels, refetchInterval: SLOW_POLL_MS });
+  const modelsQuery = useQuery({ ...modelRoutesQuery, initialData: initialModels, refetchInterval: SLOW_POLL_MS });
   // Pool sizes and cluster-wide counts for models the answering gateway has not served yet.
-  const discoveryQuery = useQuery({ queryKey: ["capacity-discovery"], queryFn: () => getJson<CapacityDiscoveryView>("/api/live/capacity/discovery"), refetchInterval: STATS_POLL_MS, retry: false });
+  const discoveryQuery = useQuery({ ...capacityDiscoveryQuery, refetchInterval: STATS_POLL_MS, retry: false });
   const healthQuery = useQuery({ queryKey: ["model-health"], queryFn: () => getJson<ModelHealthSummary[]>("/api/live/models/health"), initialData: initialHealth, refetchInterval: HEALTH_POLL_MS });
 
   const win = windowQuery.data ?? initialWindow;
