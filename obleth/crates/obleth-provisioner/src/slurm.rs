@@ -37,11 +37,6 @@ pub trait SlurmClient: Send + Sync {
     /// accounts/QoS. A sub-read that fails is named in `error` (and `partial`
     /// is set when others worked), so the launcher can say why a list is empty.
     async fn discover_resources(&self) -> anyhow::Result<ClusterResources>;
-    /// One cheap authenticated read, so a rejected token or an API version
-    /// the server does not serve shows up even when nothing else calls Slurm.
-    async fn check_auth(&self) -> anyhow::Result<()> {
-        Ok(())
-    }
     /// Live (pending or running) jobs of the configured user with exactly
     /// this name, from the accounting database. Used to find a job whose
     /// submit answer was lost. Empty when the cluster has no accounting
@@ -330,6 +325,28 @@ fn no_answer(base: &str, what: &str, e: &reqwest::Error) -> SlurmApiError {
 // API version discovery
 // ---------------------------------------------------------------------------
 
+/// What the provisioner learned about the slurmrestd it talks to, reported
+/// with each tick so every gateway replica shows the same values on the Slurm
+/// settings sheet. The URL and user say which settings it belongs to.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SlurmServer {
+    pub url: String,
+    pub user: String,
+    /// The API version the tick used (a pin the server no longer serves has
+    /// already fallen back to the newest one it does).
+    pub api_version: String,
+    /// The API versions the server offers; empty when they could not be read.
+    #[serde(default)]
+    pub available_api_versions: Vec<String>,
+    /// The Slurm release, e.g. `25.05.1`, when the server names it.
+    #[serde(default)]
+    pub slurm_release: Option<String>,
+}
+
+/// The header the provisioner's settings fetch carries [`SlurmServer`] in,
+/// as JSON.
+pub const SLURM_SERVER_HEADER: &str = "x-obleth-provisioner-slurm";
+
 /// The API versions a slurmrestd serves and the one obleth uses with it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ApiVersions {
@@ -437,16 +454,41 @@ pub fn no_supported_version_message(available: &[String]) -> String {
 
 const API_VERSION_CACHE_TTL: Duration = Duration::from_secs(600);
 
-type VersionCache = Mutex<HashMap<(String, String), (Instant, String)>>;
+type VersionCache = Mutex<HashMap<(String, String), (Instant, ApiVersions)>>;
 
 fn version_cache() -> &'static VersionCache {
     static CACHE: OnceLock<VersionCache> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// [`discover_api_versions`], cached per URL and user for ten minutes once
+/// the server offers a version this build supports.
+pub async fn api_versions(
+    http: &reqwest::Client,
+    base: &str,
+    user: &str,
+    jwt: &str,
+) -> Result<ApiVersions, SlurmApiError> {
+    let key = (base.trim_end_matches('/').to_string(), user.to_string());
+    if let Ok(cache) = version_cache().lock() {
+        if let Some((at, v)) = cache.get(&key) {
+            if at.elapsed() < API_VERSION_CACHE_TTL {
+                return Ok(v.clone());
+            }
+        }
+    }
+    let found = discover_api_versions(http, base, user, jwt).await?;
+    // A server with no version this build supports is asked again next time.
+    if found.resolved.is_some() {
+        if let Ok(mut cache) = version_cache().lock() {
+            cache.insert(key, (Instant::now(), found.clone()));
+        }
+    }
+    Ok(found)
+}
+
 /// The API version to use: the configured one, or for `auto` (or empty) the
-/// newest supported version the server offers, cached per URL and user for
-/// ten minutes.
+/// newest supported version the server offers (see [`api_versions`]).
 pub async fn resolve_api_version(
     http: &reqwest::Client,
     base: &str,
@@ -457,26 +499,14 @@ pub async fn resolve_api_version(
     if !slurm_values::is_auto_api_version(setting) {
         return Ok(setting.trim().to_string());
     }
-    let key = (base.trim_end_matches('/').to_string(), user.to_string());
-    if let Ok(cache) = version_cache().lock() {
-        if let Some((at, v)) = cache.get(&key) {
-            if at.elapsed() < API_VERSION_CACHE_TTL {
-                return Ok(v.clone());
-            }
-        }
-    }
-    let found = discover_api_versions(http, base, user, jwt).await?;
-    let Some(v) = found.resolved else {
-        return Err(SlurmApiError::new(
+    let found = api_versions(http, base, user, jwt).await?;
+    found.resolved.ok_or_else(|| {
+        SlurmApiError::new(
             SlurmErrorKind::NotServed,
             None,
             no_supported_version_message(&found.available),
-        ));
-    };
-    if let Ok(mut cache) = version_cache().lock() {
-        cache.insert(key, (Instant::now(), v.clone()));
-    }
-    Ok(v)
+        )
+    })
 }
 
 /// Forget cached resolutions, so the next call reads the server again.
@@ -1379,12 +1409,13 @@ impl Slurmrestd {
     }
 
     /// An authenticated read (the partition list) that fails when the token
-    /// is not accepted. Returns the number of partitions.
-    pub async fn check_token(&self) -> Result<usize, SlurmApiError> {
+    /// is not accepted, or the API version is not served. Returns the Slurm
+    /// release the answer names.
+    pub async fn check_token(&self) -> Result<Option<String>, SlurmApiError> {
         let v = self
             .get_json(self.url("slurm", "partitions"), "reading partitions")
             .await?;
-        Ok(parse_partitions(&v).len())
+        Ok(slurm_release(&v))
     }
 
     async fn read_nodes(&self) -> Result<Vec<NodeInfo>, SlurmApiError> {
@@ -1491,32 +1522,8 @@ impl SlurmClient for Slurmrestd {
     }
 
     async fn discover_resources(&self) -> anyhow::Result<ClusterResources> {
-        let mut out = ClusterResources::default();
-        let mut failed: Vec<String> = Vec::new();
-        let mut worked = 0;
-        match self
-            .get_json(self.url("slurm", "partitions"), "reading partitions")
-            .await
-        {
-            Ok(v) => {
-                worked += 1;
-                if out.slurm_release.is_none() {
-                    out.slurm_release = slurm_release(&v);
-                }
-                out.partitions = parse_partitions(&v);
-            }
-            Err(e) => failed.push(e.message),
-        }
-        match self
-            .get_json(self.url("slurm", "nodes"), "reading nodes")
-            .await
-        {
-            Ok(v) => {
-                worked += 1;
-                out.nodes = parse_nodes(&v);
-            }
-            Err(e) => failed.push(e.message),
-        }
+        // Three independent reads, sent together: against a slow or down
+        // slurmrestd the page waits one timeout, not three.
         let assoc_url = self.url("slurmdb", "associations");
         let rb = if self.user.is_empty() {
             self.http.get(&assoc_url)
@@ -1526,7 +1533,30 @@ impl SlurmClient for Slurmrestd {
                 .query(&[("user", self.user.as_str())])
         };
         let what = "reading your accounts from the accounting database";
-        match self.send(rb, what).await {
+        let (partitions, nodes, associations) = tokio::join!(
+            self.get_json(self.url("slurm", "partitions"), "reading partitions"),
+            self.get_json(self.url("slurm", "nodes"), "reading nodes"),
+            self.send(rb, what),
+        );
+        let mut out = ClusterResources::default();
+        let mut failed: Vec<String> = Vec::new();
+        let mut worked = 0;
+        match partitions {
+            Ok(v) => {
+                worked += 1;
+                out.slurm_release = slurm_release(&v);
+                out.partitions = parse_partitions(&v);
+            }
+            Err(e) => failed.push(e.message),
+        }
+        match nodes {
+            Ok(v) => {
+                worked += 1;
+                out.nodes = parse_nodes(&v);
+            }
+            Err(e) => failed.push(e.message),
+        }
+        match associations {
             Ok((status, body)) if (200..300).contains(&status) => {
                 match serde_json::from_slice::<serde_json::Value>(&body) {
                     Ok(v) => {
@@ -1555,11 +1585,6 @@ impl SlurmClient for Slurmrestd {
             out.error = Some(failed.join(" "));
         }
         Ok(out)
-    }
-
-    async fn check_auth(&self) -> anyhow::Result<()> {
-        self.check_token().await?;
-        Ok(())
     }
 
     async fn find_live_jobs_by_name(&self, name: &str) -> anyhow::Result<Vec<JobInfo>> {
@@ -1870,6 +1895,38 @@ pub fn parse_associations(v: &serde_json::Value) -> (Vec<String>, Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A slurmrestd that answers every request with `{}` after `delay`.
+    async fn slow_slurmrestd(delay: Duration) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    tokio::time::sleep(delay).await;
+                    let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                                Content-Length: 2\r\nConnection: close\r\n\r\n{}";
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn resource_reads_are_sent_together() {
+        let delay = Duration::from_millis(300);
+        let base = slow_slurmrestd(delay).await;
+        let client = Slurmrestd::new(reqwest::Client::new(), &base, "v0.0.42", "obleth", "jwt");
+        let started = Instant::now();
+        let out = client.discover_resources().await.unwrap();
+        // Three reads one after another would take three delays.
+        assert!(started.elapsed() < delay * 2, "{:?}", started.elapsed());
+        assert_eq!(out.error, None);
+    }
 
     fn time_limit_to_minutes(raw: &str) -> Option<i64> {
         match slurm_values::parse_time_limit(raw) {

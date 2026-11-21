@@ -1,5 +1,6 @@
 use crate::config::ProvisionerConfig;
 use crate::domain::{ReplicaState, ReplicaView};
+use crate::slurm::{SlurmServer, SLURM_SERVER_HEADER};
 use async_trait::async_trait;
 use obleth_config::{ManagedBackoff, ManagedModelSpec, SlurmSettings};
 use std::collections::HashMap;
@@ -271,6 +272,8 @@ pub struct TickReport {
     /// Things an operator should know even when the tick worked, as plain
     /// sentences ("2 cancels failed: ...", "The Slurm token expires in 2 days.").
     pub warnings: Vec<String>,
+    /// What a tick that reached slurmrestd learned about it.
+    pub server: Option<SlurmServer>,
 }
 
 impl TickReport {
@@ -279,6 +282,7 @@ impl TickReport {
             status: "ok",
             detail: String::new(),
             warnings: Vec::new(),
+            server: None,
         }
     }
     pub fn idle(reason: &str) -> Self {
@@ -286,6 +290,7 @@ impl TickReport {
             status: "idle",
             detail: reason.to_string(),
             warnings: Vec::new(),
+            server: None,
         }
     }
     pub fn error(detail: &str) -> Self {
@@ -293,11 +298,17 @@ impl TickReport {
             status: "error",
             detail: detail.to_string(),
             warnings: Vec::new(),
+            server: None,
         }
     }
     /// The same report carrying `warnings`.
     pub fn with_warnings(mut self, warnings: Vec<String>) -> Self {
         self.warnings = warnings;
+        self
+    }
+    /// The same report carrying what the tick learned about slurmrestd.
+    pub fn with_server(mut self, server: SlurmServer) -> Self {
+        self.server = Some(server);
         self
     }
 }
@@ -318,6 +329,17 @@ fn warnings_header(warnings: &[String]) -> Option<String> {
         return None;
     }
     serde_json::to_string(&list).ok()
+}
+
+/// The server facts as JSON, or `None` when they do not fit in a header value
+/// the gateway can read (a non-ASCII URL or user): a bad header would fail
+/// the whole fetch.
+fn server_header(server: &SlurmServer) -> Option<String> {
+    serde_json::to_string(server).ok().filter(|json| {
+        json.len() <= 4096
+            && json.is_ascii()
+            && reqwest::header::HeaderValue::from_str(json).is_ok()
+    })
 }
 
 /// Longest tick detail we put on the wire. Error chains can be long; the
@@ -440,6 +462,9 @@ impl OblethClient for HttpObleth {
             }
             if let Some(w) = warnings_header(&t.warnings) {
                 req = req.header("X-Obleth-Provisioner-Tick-Warnings", w);
+            }
+            if let Some(server) = t.server.as_ref().and_then(server_header) {
+                req = req.header(SLURM_SERVER_HEADER, server);
             }
         }
         let s: SlurmSettings = req.send().await?.error_for_status()?.json().await?;
@@ -823,6 +848,24 @@ mod tests {
         let many: Vec<String> = (0..20).map(|i| format!("w{i}")).collect();
         let parsed: Vec<String> = serde_json::from_str(&warnings_header(&many).unwrap()).unwrap();
         assert_eq!(parsed.len(), TICK_WARNINGS_MAX);
+    }
+
+    #[test]
+    fn slurm_server_facts_travel_as_json_unless_they_cannot_be_a_header() {
+        let server = SlurmServer {
+            url: "http://slurm:6820".into(),
+            user: "obleth".into(),
+            api_version: "v0.0.42".into(),
+            available_api_versions: vec!["v0.0.42".into()],
+            slurm_release: Some("25.05.1".into()),
+        };
+        let json = server_header(&server).unwrap();
+        assert_eq!(serde_json::from_str::<SlurmServer>(&json).unwrap(), server);
+        let odd = SlurmServer {
+            user: "ölbeth".into(),
+            ..server
+        };
+        assert_eq!(server_header(&odd), None);
     }
 
     #[tokio::test]

@@ -767,6 +767,7 @@ async fn main() -> anyhow::Result<()> {
         })),
         live_catalog: Default::default(),
         usage_cache: Default::default(),
+        slurm_http: Default::default(),
     };
     obleth_admin::advice::spawn_output_stats_refresher(
         admin_state.clickhouse.clone(),

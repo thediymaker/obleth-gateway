@@ -39,12 +39,8 @@ pub async fn get_slurm_resources(
             "The slurmrestd URL is not allowed as a destination: {e}."
         )));
     }
-    let http = crate::ssrf::upstream_client_builder()
-        .timeout(std::time::Duration::from_secs(8))
-        .build()
-        .map_err(|e| crate::AdminError::Internal(e.to_string()))?;
     let client = match Slurmrestd::connect(
-        http,
+        state.slurm_http.client(),
         &s.slurmrestd_url,
         &s.slurmrestd_api_version,
         &s.slurm_user,
@@ -55,17 +51,10 @@ pub async fn get_slurm_resources(
         Ok(c) => c,
         Err(e) => return Ok(failed(e.message)),
     };
-    let resources = match client.discover_resources().await {
-        Ok(r) => r,
-        Err(e) => return Ok(failed(e.to_string())),
-    };
-    crate::slurm_settings::remember_resolved(
-        &s.slurmrestd_url,
-        &s.slurm_user,
-        client.version(),
-        resources.slurm_release.clone(),
-    );
-    Ok(Json(resources))
+    match client.discover_resources().await {
+        Ok(r) => Ok(Json(r)),
+        Err(e) => Ok(failed(e.to_string())),
+    }
 }
 
 #[cfg(test)]

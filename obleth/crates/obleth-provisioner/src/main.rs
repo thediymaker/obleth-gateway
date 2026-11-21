@@ -18,7 +18,7 @@ use domain::{Action, EndpointView, JobInfo, JobState, ReplicaState, ReplicaView}
 use futures::stream::{self, StreamExt};
 use obleth_client::{HttpObleth, ModelIdentity, OblethClient, ReplicaPatch, TickReport};
 use obleth_config::{ManagedBackoff, ManagedModelSpec};
-use obleth_provisioner::slurm::{SlurmClient, SlurmErrorKind, Slurmrestd};
+use obleth_provisioner::slurm::{SlurmClient, SlurmErrorKind, SlurmServer, Slurmrestd};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use uuid::Uuid;
@@ -26,8 +26,9 @@ use uuid::Uuid;
 /// Outcome of one loop iteration, so the loop can log idle/active transitions
 /// without spamming a line every tick.
 enum Tick {
-    /// A reconcile tick ran; carries warnings for the operator.
-    Ran(Vec<String>),
+    /// A reconcile tick ran; carries warnings for the operator and what it
+    /// learned about slurmrestd.
+    Ran(Vec<String>, SlurmServer),
     Idle(&'static str),
 }
 
@@ -171,8 +172,8 @@ async fn main() -> anyhow::Result<()> {
     loop {
         let started = std::time::Instant::now();
         match run_once(&cfg, &obleth, &http, &resolver, &mut mem).await {
-            Ok(Tick::Ran(warnings)) => {
-                obleth.set_last_tick(TickReport::ok().with_warnings(warnings));
+            Ok(Tick::Ran(warnings, server)) => {
+                obleth.set_last_tick(TickReport::ok().with_warnings(warnings).with_server(server));
                 if last_idle.take().is_some() || last_error.take().is_some() {
                     tracing::info!("slurm active; reconciling managed models");
                 }
@@ -313,7 +314,7 @@ async fn run_once(
     // error tick even when no replica would otherwise call Slurm.
     let token_warning =
         slurm::token_expiry_warning(&settings.slurm_jwt, chrono::Utc::now().timestamp());
-    let mut auth = slurm.check_auth().await;
+    let mut auth = slurm.check_token().await.map_err(anyhow::Error::from);
     // A pinned API version the server no longer serves (an old default kept
     // across a Slurm upgrade) falls back to the newest one it does serve, with
     // a warning, instead of failing every tick. A pin that works is kept.
@@ -345,21 +346,42 @@ async fn run_once(
             slurm = fallback
                 .with_hf_token(&settings.hf_token)
                 .with_job_name_prefix(&cfg.job_name_prefix);
-            auth = slurm.check_auth().await;
+            auth = slurm.check_token().await.map_err(anyhow::Error::from);
         }
     }
-    if let Err(e) = auth {
-        // A rejected token that has also expired says so.
-        let rejected = slurm::slurm_api_error(&e)
-            .is_some_and(|se| se.kind == slurm::SlurmErrorKind::TokenRejected);
-        match token_warning.filter(|_| rejected) {
-            Some(w) => anyhow::bail!("{e} {w}"),
-            None => return Err(e),
+    let slurm_release = match auth {
+        Ok(release) => release,
+        Err(e) => {
+            // A rejected token that has also expired says so.
+            let rejected = slurm::slurm_api_error(&e)
+                .is_some_and(|se| se.kind == slurm::SlurmErrorKind::TokenRejected);
+            match token_warning.filter(|_| rejected) {
+                Some(w) => anyhow::bail!("{e} {w}"),
+                None => return Err(e),
+            }
         }
-    }
+    };
+    // Cached for ten minutes (and already read for `auto`); a server that
+    // will not list its versions leaves the list empty, not the tick failed.
+    let available_api_versions = slurm::api_versions(
+        http,
+        settings.slurmrestd_url.trim(),
+        settings.slurm_user.trim(),
+        settings.slurm_jwt.trim(),
+    )
+    .await
+    .map(|v| v.available)
+    .unwrap_or_default();
+    let server = SlurmServer {
+        url: settings.slurmrestd_url.trim().to_string(),
+        user: settings.slurm_user.trim().to_string(),
+        api_version: slurm.version().to_string(),
+        available_api_versions,
+        slurm_release,
+    };
     let mut warnings: Vec<String> = version_warning.into_iter().chain(token_warning).collect();
     warnings.extend(tick(cfg, &slurm, obleth, http, resolver, mem).await?);
-    Ok(Tick::Ran(warnings))
+    Ok(Tick::Ran(warnings, server))
 }
 
 /// Jobs behind live replicas that Slurm no longer knows, when that is every

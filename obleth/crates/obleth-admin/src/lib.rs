@@ -159,6 +159,8 @@ pub struct AdminState {
     /// The footer totals and the Overview's usage, re-read at most every
     /// [`usage_cache::USAGE_CACHE_TTL`].
     pub usage_cache: Arc<usage_cache::UsageCache>,
+    /// The client the Slurm connection test and resource reads share.
+    pub slurm_http: slurm_settings::SlurmHttp,
 }
 
 /// A boxed call into the data plane's classifier: `(prompt, available_tags)`
@@ -11078,6 +11080,7 @@ mod tests {
             /// Same ring the router's `AdminState` holds, so a test can seed
             /// samples and read them back through the handler.
             pub(super) fairshare_history: Arc<FairshareHistory>,
+            pub(super) redis: RedisStore,
             /// Keeps this test's exclusive claim on the shared test database
             /// alive for the test's full duration (see `serial()`).
             _serial: tokio::sync::MutexGuard<'static, ()>,
@@ -11151,23 +11154,53 @@ mod tests {
             store.migrate().await.expect("migrate");
             let redis = RedisStore::connect(redis_url).await.expect("connect redis");
 
+            let state = test_state(store.clone(), redis.clone(), capacity_discovery, clickhouse);
+            Some(TestApp {
+                fairshare: state.fairshare.clone(),
+                fairshare_history: state.fairshare_history.clone(),
+                app: router(state),
+                store,
+                redis,
+                _serial: guard,
+            })
+        }
+
+        impl TestApp {
+            /// A second gateway replica: its own in-process state (capacity,
+            /// fairshare, alert targets) over the same Postgres and Redis.
+            pub(super) fn replica(&self) -> Router {
+                router(test_state(
+                    self.store.clone(),
+                    self.redis.clone(),
+                    capacity_discovery::CapacityDiscovery::disabled(),
+                    clickhouse::Client::default(),
+                ))
+            }
+        }
+
+        /// One replica's `AdminState` over the given datastores.
+        fn test_state(
+            store: Store,
+            redis: RedisStore,
+            capacity_discovery: capacity_discovery::CapacityDiscovery,
+            clickhouse: clickhouse::Client,
+        ) -> AdminState {
             let capacity = Arc::new(StaticCapacity::new(64));
             let fairshare = FairShare::start(
                 capacity.clone(),
                 obleth_config::FairshareAlgorithm::default(),
                 32,
             );
-            let fairshare_history = Arc::new(FairshareHistory::new(1800));
             let http = reqwest::Client::new();
             let alerts = AlertDispatcher::new(http.clone(), AlertSettings::default());
-            let state = AdminState {
-                store: store.clone(),
+            AdminState {
+                store,
                 redis,
                 capacity,
                 fairshare: fairshare.clone(),
                 fairshare_stats: fairshare.stats(),
                 default_model_max_in_flight: 32,
-                fairshare_history: fairshare_history.clone(),
+                fairshare_history: Arc::new(FairshareHistory::new(1800)),
                 fairshare_history_secs: 3600,
                 fairshare_replica_aware: true,
                 fairshare_shared_slots: false,
@@ -11179,6 +11212,7 @@ mod tests {
                 judge: None,
                 live_catalog: Default::default(),
                 usage_cache: Default::default(),
+                slurm_http: Default::default(),
                 health: ModelHealthRuntime {
                     scheduled_enabled: false,
                     default_interval_secs: 60,
@@ -11193,14 +11227,7 @@ mod tests {
                 ssrf: ssrf::SsrfPolicy::from_env(),
                 alerts,
                 local_cache_tx: None,
-            };
-            Some(TestApp {
-                app: router(state),
-                store,
-                fairshare,
-                fairshare_history,
-                _serial: guard,
-            })
+            }
         }
 
         pub(super) async fn send(
@@ -13000,6 +13027,80 @@ mod tests {
         assert_eq!(enabled_unresolvable, StatusCode::BAD_REQUEST);
         assert_eq!(enabled_blocked, StatusCode::BAD_REQUEST);
         assert_eq!(tested, StatusCode::BAD_REQUEST);
+    }
+
+    /// What the provisioner reports about slurmrestd with its tick is kept in
+    /// Redis, so every replica shows it, and only for the server it was about.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn slurm_server_facts_from_the_provisioner_reach_every_replica() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let original = t
+            .store
+            .get_slurm_settings()
+            .await
+            .expect("read slurm settings")
+            .unwrap_or_default();
+        let mut settings = original.clone();
+        settings.slurmrestd_url = "http://slurm.obleth-test.invalid:6820".into();
+        settings.slurm_user = "obleth".into();
+        settings.slurmrestd_api_version = "auto".into();
+        t.store
+            .put_slurm_settings(&settings)
+            .await
+            .expect("seed slurm settings");
+        let server = obleth_provisioner::slurm::SlurmServer {
+            url: settings.slurmrestd_url.clone(),
+            user: "obleth".into(),
+            api_version: "v0.0.42".into(),
+            available_api_versions: vec!["v0.0.41".into(), "v0.0.42".into()],
+            slurm_release: Some("25.05.1".into()),
+        };
+        let poll = |server: Option<&obleth_provisioner::slurm::SlurmServer>| {
+            let mut req = axum::http::Request::get("/api/v1/settings/slurm/resolved")
+                .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+                .header("x-obleth-provisioner-tick-status", "ok");
+            if let Some(server) = server {
+                req = req.header(
+                    obleth_provisioner::slurm::SLURM_SERVER_HEADER,
+                    serde_json::to_string(server).unwrap(),
+                );
+            }
+            req.body(axum::body::Body::empty()).unwrap()
+        };
+        let read = |app: Router| async move {
+            let req = axum::http::Request::get("/api/v1/settings/slurm")
+                .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            send(&app, req).await.1
+        };
+        let (status, _) = send(&t.app, poll(Some(&server))).await;
+        assert_eq!(status, StatusCode::OK);
+        // Another replica, which took no part in the poll, shows the facts.
+        let view = read(t.replica()).await;
+        // A tick that does not carry them (an error tick) keeps the last ones.
+        send(&t.app, poll(None)).await;
+        let kept = read(t.replica()).await;
+        // Settings for another server show none of them.
+        settings.slurmrestd_url = "http://other.obleth-test.invalid:6820".into();
+        t.store.put_slurm_settings(&settings).await.unwrap();
+        let other = read(t.replica()).await;
+
+        let _ = t.store.put_slurm_settings(&original).await;
+        let _ = t.redis.set_provisioner_tick_status("{}", 1).await;
+
+        assert_eq!(view["resolved_api_version"], "v0.0.42");
+        assert_eq!(
+            view["available_api_versions"],
+            serde_json::json!(["v0.0.41", "v0.0.42"])
+        );
+        assert_eq!(view["slurm_release"], "25.05.1");
+        assert_eq!(kept["slurm_release"], "25.05.1");
+        assert!(other["resolved_api_version"].is_null(), "{other}");
+        assert!(other["slurm_release"].is_null(), "{other}");
     }
 
     /// A key delete whose Redis eviction fails must not report success: the

@@ -15,11 +15,40 @@ use axum::Json;
 use chrono::{DateTime, Utc};
 use obleth_config::slurm as slurm_values;
 use obleth_config::{ClusterDefaults, NodeAlias, SlurmSettings};
-use obleth_provisioner::slurm::{self as slurm_client, SlurmErrorKind, Slurmrestd};
+use obleth_provisioner::slurm::{
+    self as slurm_client, SlurmErrorKind, SlurmServer, Slurmrestd, SLURM_SERVER_HEADER,
+};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::{audit_actor, AdminError, AdminState, Result};
+
+/// One HTTP client for the gateway's own slurmrestd calls (the connection
+/// test and the launcher's resource reads), so they reuse connections. No
+/// redirects: the token must not follow one to another host.
+#[derive(Clone)]
+pub struct SlurmHttp(reqwest::Client);
+
+impl SlurmHttp {
+    /// A handle to the shared client.
+    pub fn client(&self) -> reqwest::Client {
+        self.0.clone()
+    }
+}
+
+impl Default for SlurmHttp {
+    fn default() -> Self {
+        Self(
+            crate::ssrf::upstream_client_builder()
+                .timeout(SLURM_CALL_TIMEOUT)
+                .build()
+                .unwrap_or_default(),
+        )
+    }
+}
+
+/// How long one slurmrestd call from the gateway may take.
+const SLURM_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Masked view of the saved Slurm settings for the dashboard. The JWT and the
 /// Hugging Face token are never returned; their presence and last 4 chars are
@@ -75,12 +104,13 @@ pub struct SlurmSettingsView {
     pub jwt_expires_in_secs: Option<i64>,
     /// The Slurm user the token was minted for (its `sun` claim).
     pub jwt_user: Option<String>,
-    /// The API version in use: the configured one, or what `auto` resolved
-    /// to when last checked. Null when not known yet.
+    /// The API version in use: what the provisioner's last tick used, else
+    /// the configured one. Null for `auto` until the provisioner has reported.
     pub resolved_api_version: Option<String>,
-    /// API versions the server offered when last checked.
+    /// API versions the server offered at the provisioner's last tick; empty
+    /// until it has reported.
     pub available_api_versions: Vec<String>,
-    /// The Slurm release, when last checked.
+    /// The Slurm release at the provisioner's last tick, or null.
     pub slurm_release: Option<String>,
     /// False when `OBLETH_ENCRYPTION_KEY` is unset and tokens are stored in
     /// plaintext.
@@ -136,81 +166,37 @@ impl SlurmSettingsView {
             provisioner_warnings: Vec::new(),
             warnings: Vec::new(),
         }
-        .with_token_and_discovery(s)
+        .with_token(s)
+        .with_server(s, None)
     }
 
-    /// Fill the token claims and the last discovery for these settings.
-    fn with_token_and_discovery(mut self, s: &SlurmSettings) -> Self {
+    /// Fill the token's expiry and user.
+    fn with_token(mut self, s: &SlurmSettings) -> Self {
         let jwt = jwt_health(&s.slurm_jwt);
         self.jwt_expires_at = jwt.expires_at;
         self.jwt_expires_in_secs = jwt.expires_in_secs;
         self.jwt_user = slurm_values::slurm_jwt_claims(&s.slurm_jwt).and_then(|c| c.sun);
-        let found = recall_discovery(&s.slurmrestd_url, &s.slurm_user);
-        let pinned = s.slurmrestd_api_version.trim();
-        self.resolved_api_version = if slurm_values::is_auto_api_version(pinned) {
-            found.as_ref().and_then(|d| d.resolved.clone())
-        } else {
-            match found.as_ref() {
-                // A pin the server doesn't serve: the provisioner uses the
-                // newest version it does serve.
-                Some(d) if !d.available.is_empty() && !d.available.iter().any(|v| v == pinned) => {
-                    slurm_values::pick_api_version(&d.available)
-                }
-                _ => Some(pinned.to_string()),
-            }
-        };
-        if let Some(d) = found {
-            self.available_api_versions = d.available;
-            self.slurm_release = d.release;
-        }
         self
     }
-}
 
-/// What the last connection test (or resource read) learned about a server.
-#[derive(Debug, Clone, Default)]
-struct Discovery {
-    url: String,
-    user: String,
-    available: Vec<String>,
-    resolved: Option<String>,
-    release: Option<String>,
-}
-
-static DISCOVERY: std::sync::Mutex<Option<Discovery>> = std::sync::Mutex::new(None);
-
-fn remember_discovery(d: Discovery) {
-    if let Ok(mut slot) = DISCOVERY.lock() {
-        *slot = Some(d);
+    /// Fill the API version, version list and release from what the
+    /// provisioner last reported, when it was for these settings' server and
+    /// user. Without a report the version is the pin, or unknown for `auto`.
+    fn with_server(mut self, s: &SlurmSettings, server: Option<&SlurmServer>) -> Self {
+        let server =
+            server.filter(|r| r.url == s.slurmrestd_url.trim() && r.user == s.slurm_user.trim());
+        let pinned = s.slurmrestd_api_version.trim();
+        self.resolved_api_version = match server {
+            Some(r) => Some(r.api_version.clone()),
+            None if slurm_values::is_auto_api_version(pinned) => None,
+            None => Some(pinned.to_string()),
+        };
+        self.available_api_versions = server
+            .map(|r| r.available_api_versions.clone())
+            .unwrap_or_default();
+        self.slurm_release = server.and_then(|r| r.slurm_release.clone());
+        self
     }
-}
-
-/// Merge what a resource read learned (version in use, release) into the
-/// stored discovery for the same server.
-pub(crate) fn remember_resolved(url: &str, user: &str, version: &str, release: Option<String>) {
-    if let Ok(mut slot) = DISCOVERY.lock() {
-        let mut d = slot
-            .take()
-            .filter(|d| d.url == url.trim() && d.user == user.trim())
-            .unwrap_or_else(|| Discovery {
-                url: url.trim().to_string(),
-                user: user.trim().to_string(),
-                ..Default::default()
-            });
-        d.resolved = Some(version.to_string());
-        if release.is_some() {
-            d.release = release;
-        }
-        *slot = Some(d);
-    }
-}
-
-fn recall_discovery(url: &str, user: &str) -> Option<Discovery> {
-    DISCOVERY
-        .lock()
-        .ok()?
-        .clone()
-        .filter(|d| d.url == url.trim() && d.user == user.trim())
 }
 
 /// How long a token may have left before saving it warns.
@@ -301,6 +287,10 @@ pub struct ProvisionerTick {
     /// Warnings the provisioner reported with the tick.
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// What the last tick that reached slurmrestd learned about it, kept
+    /// across ticks that did not.
+    #[serde(default)]
+    pub server: Option<SlurmServer>,
 }
 
 /// What the tick-status merge decided about alerting.
@@ -341,6 +331,7 @@ fn merge_tick(
             last_ok_at: Some(now),
             since: 0,
             warnings: Vec::new(),
+            server: prev.and_then(|p| p.server.clone()),
         };
         let transition = if was_held {
             TickTransition::Recovered
@@ -361,6 +352,7 @@ fn merge_tick(
         last_ok_at: prev.and_then(|p| p.last_ok_at),
         since,
         warnings: Vec::new(),
+        server: prev.and_then(|p| p.server.clone()),
     };
     let transition = if now - since >= HELD_ALERT_SECS {
         TickTransition::Held
@@ -656,6 +648,7 @@ pub async fn get_slurm_settings(
         view.provisioner_tick_detail = tick.detail;
         view.provisioner_tick_status = Some(tick.status);
         view.provisioner_warnings = tick.warnings;
+        view = view.with_server(&settings, tick.server.as_ref());
     }
     view.stored_encrypted = state.store.cipher_enabled();
     view.warnings = settings_warnings(&settings, Utc::now().timestamp(), view.stored_encrypted);
@@ -857,10 +850,7 @@ pub async fn test_slurm_settings(State(state): State<AdminState>) -> Result<Json
     state.ssrf.validate(&url).await?;
     let jwt = jwt_health(&settings.slurm_jwt);
     let jwt_user = slurm_values::slurm_jwt_claims(&settings.slurm_jwt).and_then(|c| c.sun);
-    let http = crate::ssrf::upstream_client_builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| AdminError::Internal(e.to_string()))?;
+    let http = state.slurm_http.client();
     let user = settings.slurm_user.trim();
     let token = settings.slurm_jwt.trim();
 
@@ -949,13 +939,6 @@ pub async fn test_slurm_settings(State(state): State<AdminState>) -> Result<Json
         && auth.ok
         && slurmctld.as_deref() != Some("DOWN");
 
-    remember_discovery(Discovery {
-        url: url.clone(),
-        user: user.to_string(),
-        available: api.available.clone(),
-        resolved: api.resolved.clone(),
-        release: slurm_release.clone(),
-    });
     Ok(Json(SlurmHealthView {
         jwt,
         ping,
@@ -1038,6 +1021,11 @@ pub async fn get_slurm_settings_resolved(
         tick.warnings = header_str("x-obleth-provisioner-tick-warnings")
             .and_then(|w| serde_json::from_str::<Vec<String>>(&w).ok())
             .unwrap_or_default();
+        if let Some(server) = header_str(SLURM_SERVER_HEADER)
+            .and_then(|json| serde_json::from_str::<SlurmServer>(&json).ok())
+        {
+            tick.server = Some(server);
+        }
         if settings.enabled {
             match transition {
                 TickTransition::Held => state.alerts.issue(
@@ -1098,6 +1086,59 @@ mod tests {
         assert_eq!(view("header.payload.sig-éèêë").as_deref(), Some("éèêë"));
         assert_eq!(view("abcdef").as_deref(), Some("cdef"));
         assert_eq!(view("aé").as_deref(), None);
+    }
+
+    #[test]
+    fn the_api_version_shown_is_the_provisioners_for_the_same_server_else_the_pin() {
+        let settings = |version: &str| SlurmSettings {
+            slurmrestd_url: " http://slurm:6820 ".into(),
+            slurm_user: "obleth".into(),
+            slurmrestd_api_version: version.into(),
+            ..Default::default()
+        };
+        let server = SlurmServer {
+            url: "http://slurm:6820".into(),
+            user: "obleth".into(),
+            api_version: "v0.0.42".into(),
+            available_api_versions: vec!["v0.0.42".into()],
+            slurm_release: Some("25.05.1".into()),
+        };
+        let view = |s: &SlurmSettings, r: Option<&SlurmServer>| {
+            SlurmSettingsView::from_settings(s).with_server(s, r)
+        };
+        // A pin the server dropped: the provisioner fell back, and says so.
+        let v = view(&settings("v0.0.40"), Some(&server));
+        assert_eq!(v.resolved_api_version.as_deref(), Some("v0.0.42"));
+        assert_eq!(v.available_api_versions, vec!["v0.0.42".to_string()]);
+        assert_eq!(v.slurm_release.as_deref(), Some("25.05.1"));
+        // No report: the pin, or unknown for auto.
+        let v = view(&settings("v0.0.40"), None);
+        assert_eq!(v.resolved_api_version.as_deref(), Some("v0.0.40"));
+        assert!(v.available_api_versions.is_empty());
+        assert_eq!(view(&settings("auto"), None).resolved_api_version, None);
+        // A report about another user is not shown.
+        let mut elsewhere = settings("auto");
+        elsewhere.slurm_user = "someone".into();
+        let v = view(&elsewhere, Some(&server));
+        assert_eq!(v.resolved_api_version, None);
+        assert_eq!(v.slurm_release, None);
+    }
+
+    #[test]
+    fn a_tick_keeps_the_last_server_facts() {
+        let server = SlurmServer {
+            api_version: "v0.0.42".into(),
+            ..Default::default()
+        };
+        let (prev, _) = merge_tick(None, "ok", None, 100);
+        let prev = ProvisionerTick {
+            server: Some(server.clone()),
+            ..prev
+        };
+        for status in ["ok", "error"] {
+            let (tick, _) = merge_tick(Some(&prev), status, None, 200);
+            assert_eq!(tick.server.as_ref(), Some(&server), "{status}");
+        }
     }
 
     #[test]
