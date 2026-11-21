@@ -12,7 +12,7 @@ export default async function KeysPage({ searchParams }: { searchParams: Promise
   const [tenants, keys, usage, budgets, networks] = await Promise.all([
     safe(obleth.listTenants(), [] as Tenant[]),
     safe(obleth.listKeys(), [] as ApiKey[]),
-    safe(obleth.keyUsageForDashboard({ sinceMs: Date.now() - KEY_USAGE_WINDOW_MS, limit: KEY_USAGE_LIMIT }), []),
+    safe(obleth.usageKeysSummary({ sinceMs: Date.now() - KEY_USAGE_WINDOW_MS, limit: KEY_USAGE_LIMIT }), []),
     safe(obleth.budgetUsage(), [] as BudgetUsage[]),
     safe(obleth.getNetworkSettings(), null),
   ]);

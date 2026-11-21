@@ -2,9 +2,8 @@
 // the scroll *methods*, so any component that calls `el.scrollTo(...)` in an
 // effect throws on mount under test — which is a property of the environment,
 // not of the component. Several timelines here keep themselves pinned to the
-// newest message that way (workspaces.tsx, image-workspace.tsx,
-// charo-panel.tsx), so stub it centrally rather than reshaping each of them
-// around the test runner.
+// newest message that way (workspaces.tsx, image-workspace.tsx), so stub it
+// centrally rather than reshaping each of them around the test runner.
 //
 // The stub moves scrollTop so assertions about scroll position still mean
 // something; jsdom has no layout, so scrollHeight is 0 and nothing observable

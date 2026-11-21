@@ -784,17 +784,6 @@ export interface UsageAgg {
   cost_usd?: number;
 }
 
-export interface UsageKeyAgg {
-  key_id: string;
-  tenant_id: string;
-  requests: number;
-  input_tokens: number;
-  output_tokens: number;
-  total_tokens: number;
-}
-
-/// Per-key activity summary: last-used metadata plus rolling usage totals.
-/// `last_used_ms` is `0` when the key has no requests in the queried range.
 /** `GET /budgets/usage`: one capped budget and how much of its current period is used. */
 export interface BudgetUsage {
   scope: "tenant" | "key";
@@ -875,6 +864,8 @@ const keyWatchQuery = (p: KeyWatchParams) =>
     per_key: p.perKey,
   });
 
+/// Per-key activity summary: last-used metadata plus rolling usage totals.
+/// `last_used_ms` is `0` when the key has no requests in the queried range.
 export interface KeyUsageSummary {
   key_id: string;
   tenant_id: string;
@@ -1052,7 +1043,6 @@ export interface UsageLogParams {
   model?: string;
   requestType?: string;
   sessionId?: string;
-  deviceId?: string;
   status?: UsageLogStatus;
   /** One exact HTTP status, e.g. 502. */
   statusCode?: number;
@@ -1243,16 +1233,6 @@ export interface UsageDailyParams {
   tenantId?: string;
   keyId?: string;
   model?: string;
-}
-
-export interface CostAgg {
-  model: string;
-  requests: number;
-  input_tokens: number;
-  output_tokens: number;
-  input_cost: number;
-  output_cost: number;
-  total_cost: number;
 }
 
 export interface LiveStats {
@@ -2510,7 +2490,6 @@ function logFilterQuery(params: UsageLogParams) {
     model: params.model,
     request_type: params.requestType,
     session_id: params.sessionId,
-    device_id: params.deviceId,
     status: params.status,
     status_code: params.statusCode,
     fault: params.fault,
@@ -2903,16 +2882,6 @@ export const obleth = {
       headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
-  setModelWeight: (
-    id: string,
-    admission_weight: number,
-    options?: AuditOptions,
-  ) =>
-    api<ModelRoute>(`/models/${seg(id)}/weight`, {
-      method: "PUT",
-      headers: auditActorHeaders(options),
-      body: JSON.stringify({ admission_weight }),
-    }),
   setModelStatus: (id: string, body: SetModelStatus, options?: AuditOptions) =>
     api<ModelRoute>(`/models/${seg(id)}/status`, {
       method: "PUT",
@@ -3182,10 +3151,6 @@ export const obleth = {
     }),
   usage: (filter: UsageFilter = {}) =>
     api<UsageAgg[]>(`/usage${usageQs(filter)}`),
-  usageByKey: (sinceMs?: number, limit?: number) =>
-    api<UsageKeyAgg[]>(`/usage/keys${qs({ since_ms: sinceMs, limit })}`),
-  keyUsage: (id: string, sinceMs?: number) =>
-    api<KeyUsageSummary>(`/keys/${seg(id)}/usage${qs({ since_ms: sinceMs })}`),
   usageKeysSummary: (
     params: { tenantId?: string; sinceMs?: number; limit?: number } = {},
   ) =>
@@ -3196,41 +3161,8 @@ export const obleth = {
         limit: params.limit,
       })}`,
     ),
-  /** Bulk per-key summary with automatic fallback to `/usage/keys` while summary is rolling out. */
-  keyUsageForDashboard: async (
-    params: { sinceMs?: number; limit?: number } = {},
-  ) => {
-    try {
-      return await api<KeyUsageSummary[]>(
-        `/usage/keys/summary${qs({ since_ms: params.sinceMs, limit: params.limit })}`,
-      );
-    } catch {
-      const legacy = await api<UsageKeyAgg[]>(
-        `/usage/keys${qs({ since_ms: params.sinceMs, limit: params.limit })}`,
-      ).catch(() => [] as UsageKeyAgg[]);
-      return legacy.map((u) => ({
-        key_id: u.key_id,
-        tenant_id: u.tenant_id,
-        last_used_ms: 0,
-        last_model: "",
-        last_status_code: 0,
-        requests: u.requests,
-        input_tokens: u.input_tokens,
-        output_tokens: u.output_tokens,
-        total_tokens: u.total_tokens,
-        cost_usd: 0,
-        energy_wh: 0,
-        energy_cost_usd: 0,
-        co2_g: 0,
-      }));
-    }
-  },
   usageByModel: (filter: UsageFilter = {}) =>
     api<UsageModelAgg[]>(`/usage/models${usageQs(filter)}`),
-  usageSeries: (bucketMs = 300_000, sinceMs?: number) =>
-    api<UsageTimePoint[]>(
-      `/usage/series${qs({ bucket_ms: bucketMs, since_ms: sinceMs })}`,
-    ),
   usageSeriesByTenant: (bucketMs = 10_000, sinceMs?: number) =>
     api<TenantUsageTimePoint[]>(
       `/usage/series/tenants${qs({ bucket_ms: bucketMs, since_ms: sinceMs })}`,
@@ -3247,8 +3179,6 @@ export const obleth = {
     api<UsageBreakdownEntry[]>(
       `/usage/breakdown${qs({ model, since_ms: sinceMs, limit })}`,
     ),
-  costs: (sinceMs?: number) =>
-    api<CostAgg[]>(`/costs${qs({ since_ms: sinceMs })}`),
   usageSpeed: (params: UsageSpeedParams) =>
     api<ModelSpeedPoint[]>(
       `/usage/speed${qs({
@@ -3351,7 +3281,6 @@ export const obleth = {
     api<AdminBatchList>(
       `/batches${qs({ status: params.status, tenant_id: params.tenantId, model: params.model, after: params.after, limit: params.limit })}`,
     ),
-  getBatch: (id: string) => api<AdminBatch>(`/batches/${seg(id)}`),
   /** Stops a batch's queued requests; running ones finish. */
   cancelBatch: (id: string, options?: AuditOptions) =>
     api<AdminBatch>(`/batches/${seg(id)}/cancel`, {

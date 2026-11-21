@@ -3,7 +3,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { restoreConversation, retryTurn, type Conversation } from "@/lib/charo/conversation";
 import type { GenerationSettings } from "@/lib/charo/chat-request";
-import type { CharoState } from "./sprite";
 import type { TraceSummary } from "@/lib/charo/trace";
 import type { StepOutcome } from "@/lib/charo/bench/types";
 import { ensureActivitiesRegistered, getActivity } from "@/lib/charo/activities";
@@ -187,7 +186,6 @@ async function readSSE(
 
 export function useCharoStream(options?: { model?: string; supportsVision?: boolean; generation?: GenerationSettings; storageKey?: string }) {
   const [messages, setMessages] = useState<ChatTurn[]>([]);
-  const [state, setState] = useState<CharoState>("idle");
   const [busy, setBusy] = useState(false);
   // Set when the operator is chatting with a specific model directly (bypassing
   // the brain/agent loop), e.g. via the chat_with_model activity.
@@ -261,7 +259,6 @@ export function useCharoStream(options?: { model?: string; supportsVision?: bool
     pollsRef.current.clear();
     targetStartRef.current = null;
     setMessages([]);
-    setState("idle");
     setBusy(false);
     setActiveTarget(null);
   }, []);
@@ -284,7 +281,6 @@ export function useCharoStream(options?: { model?: string; supportsVision?: bool
       }));
     }
     setBusy(false);
-    setState("idle");
   }, [patchTurn]);
 
   // Poll the trace endpoint until the receipt flushes (or we give up and clear
@@ -332,7 +328,7 @@ export function useCharoStream(options?: { model?: string; supportsVision?: bool
       assistantId: string,
       signal: AbortSignal,
       opts?: { bare?: boolean },
-    ): Promise<boolean> => {
+    ): Promise<void> => {
       const res = await fetch("/api/charo/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -340,7 +336,6 @@ export function useCharoStream(options?: { model?: string; supportsVision?: bool
         signal,
       });
       if (!res.ok || !res.body) throw new Error(`request failed (${res.status})`);
-      let sawError = false;
       // Thinking arrives two ways: the reasoning field (relayed as its own
       // event) and, from models served without a reasoning parser, <think>
       // blocks inside the content. Both are kept, apart from the answer.
@@ -385,7 +380,6 @@ export function useCharoStream(options?: { model?: string; supportsVision?: bool
             void pollTrace(assistantId, parsed.requestId);
           }
         } else if (event === "error") {
-          sawError = true;
           patchTurn(assistantId, (m) => ({
             ...m,
             error: String(parsed.message ?? "request failed"),
@@ -398,7 +392,6 @@ export function useCharoStream(options?: { model?: string; supportsVision?: bool
         const ms = performance.now() - thinkingSince;
         patchTurn(assistantId, (m) => ({ ...m, reasoningMs: ms }));
       }
-      return sawError;
     },
     [patchTurn, pollTrace, options?.generation],
   );
@@ -411,7 +404,7 @@ export function useCharoStream(options?: { model?: string; supportsVision?: bool
       event: string,
       parsed: Record<string, unknown>,
       onNoBrain: () => void,
-      flags: { sawError: boolean; noBrain: boolean; openActivity?: string | null },
+      flags: { noBrain: boolean; openActivity?: string | null },
     ) => {
       if (event === "token") {
         const t = String(parsed.text ?? "");
@@ -456,7 +449,6 @@ export function useCharoStream(options?: { model?: string; supportsVision?: bool
           onNoBrain();
           return;
         }
-        flags.sawError = true;
         patchTurn(assistantId, (m) => ({
           ...m,
           error: String(parsed.message ?? "request failed"),
@@ -483,7 +475,6 @@ export function useCharoStream(options?: { model?: string; supportsVision?: bool
       ]);
 
       setBusy(true);
-      setState("thinking");
       activeTurnRef.current = assistantId;
       const ac = new AbortController();
       abortRef.current = ac;
@@ -504,9 +495,8 @@ export function useCharoStream(options?: { model?: string; supportsVision?: bool
           const convo = (startIdx >= 0 ? history.slice(startIdx + 1) : history)
             .filter((m) => !m.showLauncher && !m.workflowActivityId && !m.pendingConfirm);
           const targetWire = toWire(convo, targetVision);
-          const sawError = await runLegacyChat(target, targetWire, assistantId, ac.signal, { bare: true });
+          await runLegacyChat(target, targetWire, assistantId, ac.signal, { bare: true });
           patchTurn(assistantId, (m) => (m.pendingConfirm ? m : { ...m, streaming: false }));
-          setState(sawError ? "error" : "result");
         } else {
           const res = await fetch("/api/charo/agent", {
             method: "POST",
@@ -515,7 +505,7 @@ export function useCharoStream(options?: { model?: string; supportsVision?: bool
             signal: ac.signal,
           });
           if (!res.ok || !res.body) throw new Error(`request failed (${res.status})`);
-          const flags = { sawError: false, noBrain: false, openActivity: null as string | null };
+          const flags = { noBrain: false, openActivity: null as string | null };
           await readSSE(res, ac.signal, (event, parsed) =>
             applyAgentEvent(assistantId, event, parsed, () => {}, flags),
           );
@@ -529,12 +519,10 @@ export function useCharoStream(options?: { model?: string; supportsVision?: bool
                 "No agent model is configured yet, so I can't free-chat — set one under Settings → Assistant, or pick an activity above and I'll run it.",
               streaming: false,
             }));
-            setState("result");
           } else {
             patchTurn(assistantId, (m) =>
               m.pendingConfirm ? m : { ...m, streaming: false },
             );
-            setState(flags.sawError ? "error" : "result");
 
             if (flags.openActivity != null) {
               ensureActivitiesRegistered();
@@ -555,7 +543,6 @@ export function useCharoStream(options?: { model?: string; supportsVision?: bool
       } catch (e) {
         if (!ac.signal.aborted) {
           patchTurn(assistantId, (m) => ({ ...m, error: String(e), streaming: false }));
-          setState("error");
         }
       } finally {
         // Only tear down if we still own the active request: stop()/Clear or a
@@ -592,7 +579,6 @@ export function useCharoStream(options?: { model?: string; supportsVision?: bool
         { id: assistantId, role: "assistant", content: "", streaming: true, liveSteps: [], toolResults: [] },
       ]);
       setBusy(true);
-      setState("thinking");
       activeTurnRef.current = assistantId;
       const ac = new AbortController();
       abortRef.current = ac;
@@ -605,16 +591,14 @@ export function useCharoStream(options?: { model?: string; supportsVision?: bool
           signal: ac.signal,
         });
         if (!res.ok || !res.body) throw new Error(`tool run failed (${res.status})`);
-        const flags = { sawError: false, noBrain: false, openActivity: null as string | null };
+        const flags = { noBrain: false, openActivity: null as string | null };
         await readSSE(res, ac.signal, (event, parsed) =>
           applyAgentEvent(assistantId, event, parsed, () => {}, flags),
         );
         patchTurn(assistantId, (m) => ({ ...m, streaming: false }));
-        setState(flags.sawError ? "error" : "result");
       } catch (e) {
         if (!ac.signal.aborted) {
           patchTurn(assistantId, (m) => ({ ...m, error: String(e), streaming: false }));
-          setState("error");
         }
       } finally {
         // Only tear down if we still own the active request: stop()/Clear or a
@@ -653,7 +637,6 @@ export function useCharoStream(options?: { model?: string; supportsVision?: bool
         { id: assistantId, role: "assistant", content: "", streaming: true, liveSteps: [], toolResults: [] },
       ]);
       setBusy(true);
-      setState("thinking");
       activeTurnRef.current = assistantId;
       const ac = new AbortController();
       abortRef.current = ac;
@@ -666,7 +649,6 @@ export function useCharoStream(options?: { model?: string; supportsVision?: bool
           signal: ac.signal,
         });
         if (!res.ok || !res.body) throw new Error(`tool run failed (${res.status})`);
-        let sawError = false;
         let lastResult: { type: string; data: unknown } | null = null;
         await readSSE(res, ac.signal, (event, parsed) => {
           if (event === "tool_progress" && parsed.kind === "bench_step" && parsed.step) {
@@ -686,7 +668,6 @@ export function useCharoStream(options?: { model?: string; supportsVision?: bool
               toolResults: [...(m.toolResults ?? []), parsed as { type: string; data: unknown }],
             }));
           } else if (event === "error") {
-            sawError = true;
             patchTurn(assistantId, (m) => ({
               ...m,
               error: String(parsed.message ?? "tool error"),
@@ -695,12 +676,10 @@ export function useCharoStream(options?: { model?: string; supportsVision?: bool
           }
         });
         patchTurn(assistantId, (m) => ({ ...m, streaming: false }));
-        setState(sawError ? "error" : "result");
         return lastResult;
       } catch (e) {
         if (!ac.signal.aborted) {
           patchTurn(assistantId, (m) => ({ ...m, error: String(e), streaming: false }));
-          setState("error");
         }
         return null;
       } finally {
@@ -740,7 +719,6 @@ export function useCharoStream(options?: { model?: string; supportsVision?: bool
         { id: assistantId, role: "assistant", content: "", streaming: true },
       ]);
       setBusy(true);
-      setState("thinking");
       activeTurnRef.current = assistantId;
       const ac = new AbortController();
       abortRef.current = ac;
@@ -762,7 +740,7 @@ export function useCharoStream(options?: { model?: string; supportsVision?: bool
           signal: ac.signal,
         });
         if (!res.ok || !res.body) throw new Error(`verdict failed (${res.status})`);
-        const flags = { sawError: false, noBrain: false };
+        const flags = { noBrain: false };
         await readSSE(res, ac.signal, (event, parsed) =>
           applyAgentEvent(assistantId, event, parsed, () => {}, flags),
         );
@@ -814,20 +792,6 @@ export function useCharoStream(options?: { model?: string; supportsVision?: bool
     [runToolDirect, requestVerdict],
   );
 
-  // Exit target mode: back to talking with Charo's brain.
-  const clearTarget = useCallback(() => {
-    setActiveTarget((cur) => {
-      if (cur) {
-        setMessages((prev) => [
-          ...prev,
-          { id: uid(), role: "assistant", content: "Back with me. What next?" },
-        ]);
-      }
-      return null;
-    });
-    targetStartRef.current = null;
-  }, []);
-
   const cancelActivity = useCallback((turnId: string) => {
     setMessages((prev) => prev.filter((m) => m.id !== turnId));
   }, []);
@@ -838,18 +802,15 @@ export function useCharoStream(options?: { model?: string; supportsVision?: bool
     selectTarget: (model: string | null) => { reset(); setActiveTarget(model); },
     retry: () => { const last = retryTurn(messages); if (last) return send(last.turn.content, last.turn.image, last.index); },
     messages,
-    state,
     busy,
     activeTarget,
     send,
     stop,
     reset,
-    runToolDirect,
     confirmRun,
     confirmCancel,
     startActivity,
     submitActivity,
     cancelActivity,
-    clearTarget,
   };
 }

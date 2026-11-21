@@ -5,6 +5,7 @@ import Link from "next/link";
 import { Activity, ArrowUp, Check, ChevronDown, Copy, Paperclip, Plus, RotateCcw, Square, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { ActivityCards } from "@/components/charo/activity-launcher";
 import { CharoPanel } from "@/components/charo/charo-panel";
 import { useCharoStream, type ChatTurn } from "@/components/charo/use-charo-stream";
 import { uuid } from "@/lib/uuid";
@@ -17,7 +18,6 @@ import { conversationRows } from "./conversation-rows";
 import { MAX_LANES, ModelPicker } from "./model-picker";
 import { ModelAvatar, Pill, SectionLabel, SettingsPanel, SliderField, capabilities, formatCost, formatTokens, modelLabel, perMillion } from "./ui";
 
-const noop = () => {};
 type Stream = ReturnType<typeof useCharoStream>;
 
 /** Per-answer numbers pulled off the last assistant turn of a lane. */
@@ -210,7 +210,13 @@ export function UnifiedWorkspace({ storageKey, session, update, models, loading,
             {!rows.length && (
               <div className="m-auto flex max-w-lg flex-col items-center gap-3 py-10 text-center">
                 {session.models.includes("charo") && recipients.includes(session.models.indexOf("charo")) ? (
-                  <CharoPanel inline embedded open expanded stream={streams[session.models.indexOf("charo")]} onClose={noop} onExpand={noop} onCollapse={noop} />
+                  <div className="flex w-full flex-col items-center gap-4 px-2 py-6">
+                    <p className="text-[15px] font-semibold text-foreground">What can I help with?</p>
+                    <div className="w-full max-w-sm">
+                      <ActivityCards onPick={(a) => startActivity(a.id)} />
+                    </div>
+                    <p className="text-[11.5px] text-muted-foreground/70">…or just start typing.</p>
+                  </div>
                 ) : (
                   <>
                     <h2 className="text-lg font-medium">{multi ? "One question, several answers." : "Ready when you are."}</h2>
@@ -387,7 +393,7 @@ function Answer({ card, name, model, temperature, stream, messages, stats, badge
       <Activity className="h-3.5 w-3.5" />Trace
     </Link>
   );
-  const body = <CharoPanel inline embedded hideComposer hideTrace variant="plain" open expanded stream={{ ...stream, messages }} onClose={noop} onExpand={noop} onCollapse={noop} />;
+  const body = <CharoPanel stream={{ ...stream, messages }} />;
 
   if (!card) {
     return (

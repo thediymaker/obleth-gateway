@@ -107,29 +107,6 @@ export const ALIASES_HINT =
 export const VARIANTS_HINT =
   "A variant is another name for this model with extra boons turned on: `glm-5-3-spec` could be this model with Speculation. It reaches the same deployment and shares its capacity and price. Its boons are added to the model's own and never turn one off, so callers opt in by asking for the variant while the plain name keeps working as before. A boon that is off in Settings → Boons does nothing here either.";
 
-export function modelTypeHint(type: string): string {
-  switch (type) {
-    case "chat":
-      return "Serves /v1/chat/completions and /v1/completions. Billed per token; eligible for `auto` routing.";
-    case "embedding":
-      return "Serves /v1/embeddings. Billed per input token.";
-    case "audio_transcription":
-      return "Serves /v1/audio/transcriptions and /v1/audio/translations (multipart audio upload).";
-    case "audio_speech":
-      return "Serves /v1/audio/speech. Billed per input character.";
-    case "image":
-      return "Serves /v1/images/generations, /v1/images/edits and /v1/images/variations (multipart image upload). Billed per image.";
-    case "video":
-      return "Serves the /v1/videos job API: create (JSON or multipart reference image), poll, download, delete, list. Billed a flat price per created job; polls and downloads are free. Health is catalog-only.";
-    case "mesh":
-      return "Serves the /v1/meshes job API: create from an image (multipart upload or JSON), poll, download the binary glTF, delete, list. Billed a flat price per created job; polls and downloads are free. Health is catalog-only.";
-    case "search":
-      return "A web search tool, not a model: serves POST /v1/search (the Perplexity Search API shape, as LiteLLM does) and is listed on GET /v1/search/tools, not /v1/models. The API base is a SearXNG instance's root, with JSON output enabled in its settings. Searches are free.";
-    default:
-      return "";
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Change highlighting
 // ---------------------------------------------------------------------------
@@ -553,15 +530,12 @@ export function ChatCapabilityFields({
   modelNames = [],
   selfName = "",
   boonBlockers = {},
-  layout = "stack",
 }: {
   model?: ModelRoute;
   mcpServers: McpServer[];
   modelNames?: string[];
   selfName?: string;
   boonBlockers?: BoonBlockers;
-  /** `rows` renders each group as a Setting row, for the model page. */
-  layout?: "stack" | "rows";
 }) {
   const [fnCalling, setFnCalling] = useState(model?.supports_function_calling ?? false);
   const [toolChoice, setToolChoice] = useState(model?.supports_tool_choice ?? false);
@@ -759,38 +733,19 @@ export function ChatCapabilityFields({
     );
 
   const marker = <input type="hidden" name="has_capabilities" value="1" />;
-  if (layout === "rows") {
-    return (
-      <>
-        <Setting id="set-native" label="Native" hint="What the model does itself. Gates request features and routing." fields={["supports_"]}>
-          {marker}
-          {native}
-        </Setting>
-        <Setting id="set-boons" label="Boons" hint="Gateway features that fill in what the model lacks." fields={["boon_", "draft_model", "verify_api_base", "verify_upstream_model", "knowledge_collection"]}>
-          {boons}
-        </Setting>
-        <Setting id="set-tools" label="Tool servers" hint="MCP servers whose tools the gateway's tool loop may call for this model." fields={["tool_server_"]}>
-          {tools}
-        </Setting>
-      </>
-    );
-  }
   return (
-    <div className="space-y-4">
-      {marker}
-      <Group label="Native capabilities">{native}</Group>
-      <Group label="Boons">{boons}</Group>
-      <Group label="Tools">{tools}</Group>
-    </div>
-  );
-}
-
-function Group({ label, children }: { label: string; children: ReactNode }) {
-  return (
-    <div className="space-y-2">
-      <p className="text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">{label}</p>
-      {children}
-    </div>
+    <>
+      <Setting id="set-native" label="Native" hint="What the model does itself. Gates request features and routing." fields={["supports_"]}>
+        {marker}
+        {native}
+      </Setting>
+      <Setting id="set-boons" label="Boons" hint="Gateway features that fill in what the model lacks." fields={["boon_", "draft_model", "verify_api_base", "verify_upstream_model", "knowledge_collection"]}>
+        {boons}
+      </Setting>
+      <Setting id="set-tools" label="Tool servers" hint="MCP servers whose tools the gateway's tool loop may call for this model." fields={["tool_server_"]}>
+        {tools}
+      </Setting>
+    </>
   );
 }
 

@@ -2062,7 +2062,7 @@ export async function saveSettingsAction(formData: FormData): Promise<SettingsSa
   return { ok: true };
 }
 
-export async function setAlertSettingsAction(
+async function setAlertSettingsAction(
   body: UpdateAlertSettings,
 ): Promise<ActionResult> {
   const session = await requireAdmin();
@@ -2178,7 +2178,7 @@ export async function attachCollectionAction(modelId: string, collectionId: stri
   return { ok: true };
 }
 
-export async function setKnowledgeSettingsAction(
+async function setKnowledgeSettingsAction(
   body: UpdateKnowledgeSettings,
 ): Promise<ActionResult> {
   const session = await requireAdmin();
@@ -2192,7 +2192,7 @@ export async function setKnowledgeSettingsAction(
   return { ok: true };
 }
 
-export async function setEnergySettingsAction(
+async function setEnergySettingsAction(
   body: UpdateEnergySettings,
 ): Promise<ActionResult> {
   const session = await requireAdmin();
@@ -2217,7 +2217,7 @@ export async function testEnergyQueryAction(
   }
 }
 
-export async function setCharoSettingsAction(
+async function setCharoSettingsAction(
   next: CharoSettingsView,
 ): Promise<ActionResult> {
   const session = await requireAdmin();
@@ -2263,7 +2263,7 @@ export async function testSlurmConnectionAction(): Promise<
   }
 }
 
-export async function setNamedNetworksAction(rows: NamedNetwork[]): Promise<ActionResult> {
+async function setNamedNetworksAction(rows: NamedNetwork[]): Promise<ActionResult> {
   const session = await requireAdmin();
   const problem = namedNetworksProblem(rows);
   if (problem) return { ok: false, error: problem };
@@ -2277,7 +2277,7 @@ export async function setNamedNetworksAction(rows: NamedNetwork[]): Promise<Acti
   return { ok: true };
 }
 
-export async function setKeyPrefixAction(prefix: string): Promise<ActionResult> {
+async function setKeyPrefixAction(prefix: string): Promise<ActionResult> {
   const session = await requireAdmin();
   const problem = keyPrefixProblem(prefix);
   if (problem) return { ok: false, error: problem };
@@ -2291,7 +2291,7 @@ export async function setKeyPrefixAction(prefix: string): Promise<ActionResult> 
   return { ok: true };
 }
 
-export async function setUsageRetentionAction(
+async function setUsageRetentionAction(
   days: number,
 ): Promise<ActionResult> {
   const session = await requireAdmin();
@@ -2496,14 +2496,6 @@ function datetimeOrNull(v: FormDataEntryValue | null): string | null {
   if (!s) return null;
   const date = new Date(s);
   return Number.isNaN(date.getTime()) ? null : date.toISOString();
-}
-
-export async function clearLostReplicasAction(modelId: string): Promise<ActionResult> {
-  const session = await requireAdmin();
-  try { await obleth.clearLostReplicas(modelId, { auditActor: session.email }); }
-  catch (e) { return actionError(e); }
-  refreshDeployments();
-  return { ok: true };
 }
 
 /**
@@ -2819,29 +2811,6 @@ export async function lookupHfModelAction(input: string): Promise<{ ok: true; mo
   } catch (e) {
     return { ok: false, error: (e as Error).message };
   }
-}
-
-export async function deployRecipeAction(
-  id: string,
-  overrides?: DeployOverrides,
-): Promise<ActionResult> {
-  const session = await requireAdmin();
-  const recipe = await resolveRecipeById(id);
-  if (!recipe) return { ok: false, error: `recipe "${id}" not found` };
-  if (!recipe.valid) return { ok: false, error: recipe.error ?? "recipe is invalid" };
-
-  try {
-    const { createBody, managedBody } = buildManagedFromRecipe(recipe, overrides, await clusterValues());
-    // A launched model starts staged, like one added by hand: it is made
-    // active on its page once it has been tried. It can already do what the
-    // recipe's flags turned on, e.g. function calling.
-    const created = await obleth.createModel({ ...createBody, status: "staged" }, { auditActor: session.email });
-    await obleth.putManagedModel(created.id, managedBody, { auditActor: session.email });
-  } catch (e) {
-    return actionError(e);
-  }
-  revalidatePath("/models");
-  return { ok: true };
 }
 
 // ----------------------------------------------------------------------------

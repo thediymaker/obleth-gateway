@@ -393,7 +393,7 @@ export const ModelSettings = memo(function ModelSettings({
             <Setting id="set-context" label="Context window" hint="Tokens per request, prompt and reply together." fields={["context_window"]} was={{ field: "context_window" }}>
               <TextField name="context_window" label="Context window" type="number" min={1} className="max-w-[12rem]" defaultValue={String(model.context_window)} />
             </Setting>
-            {chat && <ChatCapabilityFields model={model} mcpServers={mcpServers} modelNames={modelNames} selfName={model.model_name} boonBlockers={boonBlockers} layout="rows" />}
+            {chat && <ChatCapabilityFields model={model} mcpServers={mcpServers} modelNames={modelNames} selfName={model.model_name} boonBlockers={boonBlockers} />}
           </Section>
         )}
 

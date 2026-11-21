@@ -24,7 +24,6 @@ vi.mock("@/app/actions", () => ({
   retryDeploymentAction: vi.fn(async () => ({ ok: true })),
   rollDeploymentAction: vi.fn(async () => ({ ok: true })),
   setModelStatusAction: vi.fn(async () => ({ ok: true })),
-  clearLostReplicasAction: vi.fn(async () => ({ ok: true })),
   deleteTemplateAction: vi.fn(async () => ({ ok: true })),
   saveTemplateAction: vi.fn(async () => ({ ok: true })),
   setSlurmSettingsAction: vi.fn(async () => ({ ok: true })),

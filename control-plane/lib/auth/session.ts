@@ -26,14 +26,3 @@ export const getSession = cache(async (): Promise<SessionUser | null> => {
     tenantId: (u.tenantId as string | null) ?? null,
   };
 });
-
-/**
- * Authorize the current request. Server Actions are POST routes that the Next.js
- * proxy does not reliably cover, so every privileged action must call this to
- * fail closed when the caller is unauthenticated.
- */
-export async function requireSession(): Promise<SessionUser> {
-  const s = await getSession();
-  if (!s) throw new Error("Unauthorized");
-  return s;
-}

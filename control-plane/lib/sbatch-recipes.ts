@@ -444,7 +444,7 @@ export async function resolveRecipeText(id: string): Promise<string | null> {
 /** Resolve a recipe by id across both sources, mirroring `loadRecipeCards`:
  *  file recipes (filename stem) first, then DB templates (UUID id) fetched from
  *  the admin API. Saved templates live only in the database, so callers that
- *  deploy by id (e.g. `deployRecipeAction`) must use this rather than `getRecipe`
+ *  deploy by id (e.g. `launchRecipeAction`) must use this rather than `getRecipe`
  *  alone — otherwise a DB recipe's UUID never matches a `*.recipe` file and the
  *  deploy fails with "recipe not found". Returns null when neither source has it
  *  (the DB lookup is wrapped so an unreachable admin API yields null, not throw). */

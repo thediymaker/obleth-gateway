@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import type { UsageDailyRow } from "@/lib/obleth";
-import { formatUsd, toBreakdownRows, type NameLookups } from "./usage-breakdown";
+import { toBreakdownRows, type NameLookups } from "./usage-breakdown";
 
 const T1 = "11111111-1111-1111-1111-111111111111";
 const K1 = "22222222-2222-2222-2222-222222222222";
@@ -82,17 +82,5 @@ describe("toBreakdownRows", () => {
   it("model grouping labels unknown models", () => {
     const out = toBreakdownRows([makeRow({ model: "" })], "model", lookups());
     expect(out[0].label).toBe("(unknown)");
-  });
-});
-
-describe("formatUsd", () => {
-  it("em-dash for zero", () => {
-    expect(formatUsd(0)).toBe("—");
-  });
-  it("floors tiny values", () => {
-    expect(formatUsd(0.005)).toBe("< $0.01");
-  });
-  it("two decimals otherwise", () => {
-    expect(formatUsd(1.234)).toBe("$1.23");
   });
 });

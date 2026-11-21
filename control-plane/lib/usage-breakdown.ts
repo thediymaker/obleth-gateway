@@ -52,12 +52,3 @@ export function toBreakdownRows(
   }
   return labeled.sort((a, b) => b.cost_usd - a.cost_usd);
 }
-
-/// Aggregate-spend formatter for report tables/KPIs: em-dash for zero (matches
-/// the energy/CO₂ cells) and 2-decimal dollars. Per-request costs elsewhere use
-/// lib/utils.ts formatCurrency, which keeps up to 6 decimals for tiny amounts.
-export function formatUsd(v: number): string {
-  if (v <= 0) return "—";
-  if (v < 0.01) return "< $0.01";
-  return `$${v.toFixed(2)}`;
-}
