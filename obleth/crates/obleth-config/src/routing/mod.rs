@@ -805,6 +805,37 @@ pub fn select_model(
     uniform: f64,
     difficulty: u8,
 ) -> Option<Arc<ResolvedModel>> {
+    select_model_among(
+        candidates,
+        features,
+        busyness,
+        expected_output,
+        allowed_models,
+        desired_tags,
+        grants,
+        weights,
+        uniform,
+        difficulty,
+    )
+    .0
+}
+
+/// [`select_model`], and how many models the pick was made among: those that
+/// passed the hard filters and the difficulty floor and so were scored. That
+/// count is what `x-obleth-auto-why` reports, not the size of the registry.
+#[allow(clippy::too_many_arguments)]
+pub fn select_model_among(
+    candidates: &[Candidate],
+    features: &RequestFeatures,
+    busyness: &HashMap<String, usize>,
+    expected_output: &HashMap<String, f64>,
+    allowed_models: Option<&[String]>,
+    desired_tags: &[String],
+    grants: BoonGrants,
+    weights: &RouterWeights,
+    uniform: f64,
+    difficulty: u8,
+) -> (Option<Arc<ResolvedModel>>, usize) {
     let ev = evaluate(
         candidates,
         features,
@@ -818,7 +849,10 @@ pub fn select_model(
         difficulty,
         Narration::Off,
     );
-    ev.chosen.map(|i| ev.ordered[i].cand.model.clone())
+    (
+        ev.chosen.map(|i| ev.ordered[i].cand.model.clone()),
+        ev.ordered.len(),
+    )
 }
 
 /// Serve *and* explain one `auto` request from a single evaluation.
@@ -3045,6 +3079,20 @@ mod tests {
                 picked.as_ref().map(|m| m.model_name.clone()),
                 "the explanation must never disagree with the real selection [{label}]"
             );
+            // The count auto-why reports is the scored rows, not the registry.
+            let (_, among) = select_model_among(
+                &cands,
+                &RequestFeatures::default(),
+                &HashMap::new(),
+                &HashMap::new(),
+                k.allowed.as_deref(),
+                &k.tags,
+                BoonGrants::default(),
+                &k.weights,
+                k.uniform,
+                k.difficulty,
+            );
+            assert_eq!(among, ex.scored.len(), "[{label}]");
             assert_self_consistent(&ex);
             outcomes.push(ex.chosen);
         }

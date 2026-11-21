@@ -880,7 +880,9 @@ async fn run_pipeline(
         // sample that was served. Untraced requests call `select_model` instead,
         // which asks for `Narration::Off` and builds no rejection/score data —
         // that is the whole cost story for this feature: zero by default.
-        let picked = if let Some(ref mut t) = tracer {
+        // `among`: how many models the pick was made among (those scored), for
+        // `x-obleth-auto-why`.
+        let (picked, among) = if let Some(ref mut t) = tracer {
             let (picked, mut explain) = crate::router::route(
                 pool,
                 &features,
@@ -894,6 +896,7 @@ async fn run_pipeline(
                 &intent,
             );
             explain.classifier_ms = classifier_ms;
+            let among = explain.scored.len();
             let mut span = serde_json::to_value(&explain).unwrap_or_else(|_| {
                 serde_json::json!({
                     "chosen": explain.chosen,
@@ -923,9 +926,9 @@ async fn run_pipeline(
                 "ok",
                 span,
             );
-            picked
+            (picked, among)
         } else {
-            crate::router::select_model(
+            crate::router::select_model_among(
                 pool,
                 &features,
                 &busyness,
@@ -962,7 +965,7 @@ async fn run_pipeline(
                 *auto_note = Some(crate::sticky::Note {
                     model: chosen.model_name.clone(),
                     reason,
-                    why: crate::sticky::why(&intent, &features, pool.len()),
+                    why: crate::sticky::why(&intent, &features, among),
                 });
                 model = chosen.model_name.clone();
                 // Candidates are real models only, never variants.

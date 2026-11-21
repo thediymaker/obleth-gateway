@@ -341,7 +341,9 @@ pub(crate) struct Note {
 /// The value of [`AUTO_WHY_HEADER`]: `topics=coding+math; difficulty=2;
 /// from=heuristic; needs=tools+vision; candidates=4`. A part with nothing to
 /// say is left out (`topics` for a request with no topic, `needs` for one any
-/// model can take). Topic names are an operator's tags: only lowercase
+/// model can take). `candidates` counts the models the pick was scored among:
+/// those that could serve the request and cleared its difficulty floor, not
+/// every model the gateway knows. Topic names are an operator's tags: only lowercase
 /// letters, digits, `-` and `_` are kept, and at most six topics, so the value
 /// is always a short ASCII header a client can split on `; `, `=` and `+`.
 pub(crate) fn why(
