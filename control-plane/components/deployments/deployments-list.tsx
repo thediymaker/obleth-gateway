@@ -11,7 +11,6 @@ import { ReplicaDots, StateMark } from "@/components/deployments/ui";
 import { useFairshareLive } from "@/components/fairshare/hooks";
 import { Meter } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
-import { Select } from "@/components/ui/select";
 import type { RecipeCard } from "@/components/recipes/recipe-card";
 import type { DeploymentRequests, DeploymentsData } from "@/lib/deployments-data";
 import {
@@ -35,15 +34,16 @@ import { MODEL_TYPE_NAMES } from "@/lib/models-model";
 import { compact, secsAgo } from "@/lib/format";
 import { poolOccupancy } from "@/lib/occupancy";
 import { useClusterResources } from "@/lib/use-cluster-resources";
-import { cn, getJson } from "@/lib/utils";
+import { getJson } from "@/lib/utils";
 import { ReadNotice } from "@/components/ui/read-state";
 import { StatusDot } from "@/components/ui/status";
 import { Pill } from "@/components/ui/pill";
 import { Segmented } from "@/components/ui/segmented";
 import { Tile } from "@/components/ui/tile";
-import { SearchBox } from "@/components/ui/search-box";
+import { FilterBar, FilterSelect } from "@/components/ui/filter-bar";
+import { Cell, DataRow, DataTable, RowTitle } from "@/components/ui/data-table";
+import { Tabs } from "@/components/ui/tabs";
 
-const COLS = "grid-cols-[minmax(0,1.4fr)_minmax(130px,0.9fr)_150px_minmax(0,1.4fr)_130px_84px_84px]";
 
 /** The 24 h request counts come from ClickHouse, so they refresh once a minute
  *  while the fleet itself refreshes every 15 seconds. */
@@ -137,20 +137,12 @@ export function DeploymentsList({ initial, recipes: initialRecipes, tab: initial
         </div>
       </div>
 
-      <div role="tablist" aria-label="Deployments" className="flex gap-1 border-b border-border">
-        {(["deployments", "recipes"] as const).map((t) => (
-          <button
-            key={t}
-            type="button"
-            role="tab"
-            aria-selected={tab === t}
-            onClick={() => switchTab(t)}
-            className={cn("-mb-px border-b-2 px-3 py-2.5 text-[13.5px]", tab === t ? "border-foreground text-foreground" : "border-transparent text-muted-foreground hover:text-foreground")}
-          >
-            {t === "deployments" ? `Deployments · ${rows.length}` : recipes ? `Recipes · ${recipes.length}` : "Recipes"}
-          </button>
-        ))}
-      </div>
+      <Tabs
+        label="Deployments"
+        value={tab}
+        onChange={switchTab}
+        tabs={[{ value: "deployments", label: "Deployments", count: rows.length }, { value: "recipes", label: "Recipes", count: recipes?.length }]}
+      />
 
       {tab === "recipes" ? (
         recipes ? (
@@ -238,8 +230,7 @@ export function DeploymentsList({ initial, recipes: initialRecipes, tab: initial
             />
           </div>
 
-          <div className="flex flex-wrap items-center gap-2">
-            <SearchBox value={query} onChange={setQuery} label="Search deployments" placeholder="Model, Service, partition or job" className="max-w-[380px]" />
+          <FilterBar search={{ value: query, onChange: setQuery, label: "Search deployments", placeholder: "Model, Service, partition or job" }}>
             <Segmented
               label="Runs on"
               value={runs}
@@ -251,68 +242,59 @@ export function DeploymentsList({ initial, recipes: initialRecipes, tab: initial
                 { value: "attention", label: `Needs you ${attention.length}` },
               ]}
             />
-            <Select aria-label="Sort" value={sort} onValueChange={(v) => setSort(v as DeploySort)} className="h-9 w-auto min-w-[10rem] text-[12.5px]" options={[{ value: "requests", label: "Sort: most requests" }, { value: "attention", label: "Sort: problems first" }, { value: "replicas", label: "Sort: most replicas" }, { value: "name", label: "Sort: name" }]} />
-          </div>
+            <FilterSelect label="Sort" value={sort} onChange={setSort} options={[{ value: "requests", label: "Sort: most requests" }, { value: "attention", label: "Sort: problems first" }, { value: "replicas", label: "Sort: most replicas" }, { value: "name", label: "Sort: name" }]} />
+          </FilterBar>
 
-          <section aria-label="Deployments" className="overflow-hidden rounded-xl border border-border bg-card">
-            <div className="overflow-x-auto">
-              <div className="min-w-[1000px]">
-                <div className={cn("grid items-center gap-3.5 px-[18px] py-2.5 text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground", COLS)}>
-                  <span>Model</span><span>Status</span><span>Replicas</span><span>Runs on</span><span>Pool now</span><span className="text-right">Req · 24h</span><span className="text-right">Per replica</span>
-                </div>
-                {shown.length === 0 && (
-                  <p className="border-t border-border px-[18px] py-8 text-center text-[13px] text-muted-foreground">
-                    {rows.length ? "Nothing matches these filters." : <>Nothing deployed yet. <Link href="/deployments/new" className="text-foreground underline underline-offset-2">Launch a recipe</Link>{" "}or point a model&apos;s capacity at a Kubernetes Service.</>}
-                  </p>
-                )}
-                {shown.map((r) => {
-                  const c = countReplicas(r.replicas);
-                  const { inFlight, cap } = pool(r);
-                  const href = deploymentHref(r.model.model_name);
-                  return (
-                    <div
-                      key={r.model.id}
-                      onClick={(e) => { if (e.target instanceof Element && e.target.closest("a, button")) return; router.push(href); }}
-                      className={cn("grid min-h-[52px] cursor-pointer items-center gap-3.5 border-t border-border px-[18px] py-2 text-[13px] hover:bg-muted/30", COLS)}
-                    >
-                      <span className="flex min-w-0 flex-col">
-                        <Link href={href} className="truncate font-mono text-[12.5px] font-medium text-foreground hover:underline">{r.model.model_name}</Link>
-                        <span className="truncate text-[11.5px] text-muted-foreground">{[r.engine, MODEL_TYPE_NAMES[r.model.model_type]?.toLowerCase() ?? r.model.model_type].filter(Boolean).join(" · ")}</span>
-                      </span>
-                      <span className="flex min-w-0 flex-col items-start gap-0.5">
-                        <StateMark state={r.view.state} />
-                        {r.view.why && <span className="max-w-full truncate text-[11.5px] text-muted-foreground" title={r.view.why}>{r.view.why}</span>}
-                      </span>
-                      <span className="flex items-center gap-2">
-                        <ReplicaDots ready={r.ready} starting={c.queued + c.running} wanted={r.wanted} />
-                        <span className="font-mono text-[12px] text-secondary-foreground">{r.kind === "slurm" ? `${r.ready} / ${r.wanted}` : r.ready}</span>
-                      </span>
-                      <span className="flex min-w-0 flex-col">
-                        <span className="text-[12.5px]">{r.kind === "slurm" ? "Slurm" : "Kubernetes"}</span>
-                        <span className="truncate font-mono text-[11.5px] text-muted-foreground" title={r.where}>{r.where}</span>
-                      </span>
-                      <span className="flex flex-col gap-1">
-                        <span className="font-mono text-[12px]">{cap ? `${inFlight} of ${cap}` : "—"}</span>
-                        <Meter value={inFlight} max={cap} strong={cap > 0 && inFlight >= cap} />
-                      </span>
-                      {!requests.data ? (
-                        <span className="text-right font-mono text-[12px] text-muted-foreground">—</span>
-                      ) : r.requests24h ? (
-                        <Link href={logsHref({ model: r.model.model_name, window: "24h" })} title="See these requests" className="text-right font-mono text-[12px] underline decoration-muted-foreground/40 underline-offset-[3px] hover:decoration-foreground">{compact(r.requests24h)}</Link>
-                      ) : (
-                        <span className="text-right font-mono text-[12px] text-muted-foreground">0</span>
-                      )}
-                      <span className="text-right font-mono text-[12px] text-secondary-foreground">{r.perReplica ?? (r.kind === "slurm" && r.wanted ? Math.round(cap / Math.max(1, r.wanted)) || "—" : "—")}</span>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-            <div className="flex flex-wrap justify-between gap-2 border-t border-border px-[18px] py-3 text-[12.5px] text-muted-foreground">
-              <span>{shown.length === rows.length ? `${rows.length} deployments` : `${shown.length} of ${rows.length} deployments`} · click one for its page</span>
-              <span>Filled dot serving · half dot starting · ring not seen lately · dashed ring off or not running · white pill needs you</span>
-            </div>
-          </section>
+          <DataTable
+            label="Deployments"
+            minWidth="min-w-[1000px]"
+            columns={[{ label: "Model" }, { label: "Status" }, { label: "Replicas" }, { label: "Runs on" }, { label: "Pool now" }, { label: "Req · 24h", align: "right" }, { label: "Per replica", align: "right" }]}
+            empty={rows.length ? "Nothing matches these filters." : <>Nothing deployed yet. <Link href="/deployments/new" className="text-foreground underline underline-offset-2">Launch a recipe</Link>{" "}or point a model&apos;s capacity at a Kubernetes Service.</>}
+            footer={
+              <>
+                <span>{shown.length === rows.length ? `${rows.length} deployments` : `${shown.length} of ${rows.length} deployments`} · click one for its page</span>
+                <span>Filled dot serving · half dot starting · ring not seen lately · dashed ring off or not running · white pill needs you</span>
+              </>
+            }
+          >
+            {shown.map((r) => {
+              const c = countReplicas(r.replicas);
+              const { inFlight, cap } = pool(r);
+              const href = deploymentHref(r.model.model_name);
+              return (
+                <DataRow key={r.model.id} href={href} label={`Open ${r.model.model_name}`}>
+                  <Cell className="max-w-[20rem]"><RowTitle href={href} sub={[r.engine, MODEL_TYPE_NAMES[r.model.model_type]?.toLowerCase() ?? r.model.model_type].filter(Boolean).join(" · ")}>{r.model.model_name}</RowTitle></Cell>
+                  <Cell className="max-w-[14rem]">
+                    <span className="flex min-w-0 flex-col items-start gap-0.5">
+                      <StateMark state={r.view.state} />
+                      {r.view.why && <span className="max-w-full truncate text-[11.5px] text-muted-foreground" title={r.view.why}>{r.view.why}</span>}
+                    </span>
+                  </Cell>
+                  <Cell>
+                    <span className="flex items-center gap-2">
+                      <ReplicaDots ready={r.ready} starting={c.queued + c.running} wanted={r.wanted} />
+                      <span className="font-mono text-[12px] text-secondary-foreground">{r.kind === "slurm" ? `${r.ready} / ${r.wanted}` : r.ready}</span>
+                    </span>
+                  </Cell>
+                  <Cell className="max-w-[16rem]"><RowTitle sub={<span title={r.where}>{r.where}</span>}>{r.kind === "slurm" ? "Slurm" : "Kubernetes"}</RowTitle></Cell>
+                  <Cell className="w-[130px]">
+                    <span className="flex flex-col gap-1">
+                      <span className="font-mono text-[12px]">{cap ? `${inFlight} of ${cap}` : "—"}</span>
+                      <Meter value={inFlight} max={cap} strong={cap > 0 && inFlight >= cap} />
+                    </span>
+                  </Cell>
+                  <Cell align="right" mono>{!requests.data ? (
+                    <span className="text-muted-foreground">—</span>
+                  ) : r.requests24h ? (
+                    <Link href={logsHref({ model: r.model.model_name, window: "24h" })} title="See these requests" className="underline decoration-muted-foreground/40 underline-offset-[3px] hover:decoration-foreground">{compact(r.requests24h)}</Link>
+                  ) : (
+                    <span className="text-muted-foreground">0</span>
+                  )}</Cell>
+                  <Cell align="right" mono className="text-secondary-foreground">{r.perReplica ?? (r.kind === "slurm" && r.wanted ? Math.round(cap / Math.max(1, r.wanted)) || "—" : "—")}</Cell>
+                </DataRow>
+              );
+            })}
+          </DataTable>
         </>
       )}
     </div>

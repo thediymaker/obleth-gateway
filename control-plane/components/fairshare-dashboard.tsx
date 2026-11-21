@@ -47,22 +47,12 @@ export {
 import { modelHref } from "@/lib/model-links";
 import { formatNumber } from "@/lib/format";
 import { Pill } from "@/components/ui/pill";
-import { SectionLabel } from "@/components/ui/section-label";
+import { Tile } from "@/components/ui/tile";
+import { Cell, DataRow, DataTable } from "@/components/ui/data-table";
 export type { FairshareLiveView, GroupFairshareView, KeyFairshareView, ModelPoolView, TenantFairshareView } from "@/lib/obleth";
 
 const FIRST_POOLS = 8;
 const STATE_LABEL: Record<PoolRow["state"], string> = { full: "Full", busy: "Busy", normal: "Normal", idle: "Idle", no_servers: "No servers" };
-
-function Tile({ label, value, detail, meter, emphasis }: { label: string; value: React.ReactNode; detail: React.ReactNode; meter?: [number, number]; emphasis?: boolean }) {
-  return (
-    <div className={cn("flex min-w-0 flex-col gap-1.5 rounded-xl border bg-card px-4 py-3.5", emphasis ? "border-muted-foreground" : "border-border")}>
-      <SectionLabel className={cn(emphasis && "text-secondary-foreground")}>{label}</SectionLabel>
-      <span className="text-[26px] font-semibold leading-tight tracking-tight tabular-nums">{value}</span>
-      {meter && <Meter value={meter[0]} max={meter[1]} className="mt-1" strong={meter[1] > 0 && meter[0] >= meter[1]} />}
-      <span className={cn("truncate text-xs", emphasis ? "text-foreground" : "text-muted-foreground")}>{detail}</span>
-    </div>
-  );
-}
 
 /** The four sentences behind the page, one hover away instead of on it. */
 function HowItDecides() {
@@ -254,20 +244,24 @@ function AllPools({ raw, pools, expanded, onExpand, onScope, onOpen, tenantTotal
 
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_400px]">
         <Panel title="Model pools" subtitle="Every model has its own pool of slots, and fair share is decided inside each pool. Open one to see who holds its slots.">
-          <div className="mt-3 overflow-x-auto">
-            <div className="min-w-[36rem]">
-              <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,11rem)_4rem_4rem_4rem_4.5rem] gap-3 border-t border-border px-[18px] py-2 text-[11.5px] text-muted-foreground"><span>Pool</span><span>Slots in use</span><span className="text-right">Running</span><span className="text-right">Waiting</span><span className="text-right">Tenants</span><span className="text-right">State</span></div>
+          <div className="mt-3 border-t border-border">
+            <DataTable
+              framed={false}
+              label="Model pools"
+              minWidth="min-w-[36rem]"
+              columns={[{ label: "Pool" }, { label: "Slots in use", className: "w-44" }, { label: "Running", align: "right" }, { label: "Waiting", align: "right" }, { label: "Tenants", align: "right" }, { label: "State", align: "right" }]}
+            >
               {visible.map((p) => (
-                <button key={p.model} type="button" onClick={() => onScope(p.model)} className="grid w-full grid-cols-[minmax(0,1fr)_minmax(0,11rem)_4rem_4rem_4rem_4.5rem] items-center gap-3 border-t border-border px-[18px] py-[9px] text-left text-[13px] hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring">
-                  <span className="truncate" title={p.model}>{p.model}</span>
-                  <Meter value={p.inFlight} max={p.state === "no_servers" ? 0 : p.cap} strong={p.state === "full"} />
-                  <span className="text-right font-mono text-xs tabular-nums">{p.state === "no_servers" ? "—" : `${p.inFlight}/${p.cap || "—"}`}</span>
-                  <span className={cn("text-right font-mono text-xs tabular-nums", p.queued > 0 && "font-semibold text-foreground")}>{p.queued}</span>
-                  <span className="text-right font-mono text-xs tabular-nums">{p.tenants}</span>
-                  <span className="text-right">{p.state === "full" ? <Pill inverted>Full</Pill> : <span className={cn("text-xs", p.state === "busy" ? "text-foreground" : "text-muted-foreground")}>{STATE_LABEL[p.state]}</span>}</span>
-                </button>
+                <DataRow key={p.model} onOpen={() => onScope(p.model)} label={`Open ${p.model}`}>
+                  <Cell className="max-w-0 truncate" title={p.model}>{p.model}</Cell>
+                  <Cell><Meter value={p.inFlight} max={p.state === "no_servers" ? 0 : p.cap} strong={p.state === "full"} /></Cell>
+                  <Cell align="right" mono>{p.state === "no_servers" ? "—" : `${p.inFlight}/${p.cap || "—"}`}</Cell>
+                  <Cell align="right" mono className={cn(p.queued > 0 && "font-semibold text-foreground")}>{p.queued}</Cell>
+                  <Cell align="right" mono>{p.tenants}</Cell>
+                  <Cell align="right">{p.state === "full" ? <Pill inverted>Full</Pill> : <span className={cn("text-xs", p.state === "busy" ? "text-foreground" : "text-muted-foreground")}>{STATE_LABEL[p.state]}</span>}</Cell>
+                </DataRow>
               ))}
-            </div>
+            </DataTable>
           </div>
           <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border px-[18px] pb-4 pt-3">
             {pools.length > FIRST_POOLS
@@ -320,28 +314,31 @@ function TenantsNow({ raw, onOpen }: { raw: FairshareLiveView; onOpen: (id: stri
   const active = raw.tenants.filter((t) => t.in_flight > 0 || t.queued > 0).sort((a, b) => Number(isShort(b)) - Number(isShort(a)) || b.in_flight - a.in_flight || b.queued - a.queued);
   const top = active[0]?.in_flight ?? 0;
   const rows = all ? active : active.slice(0, 8);
-  const cols = "grid-cols-[minmax(0,1.2fr)_minmax(0,6rem)_4rem_minmax(0,1.4fr)_4rem_3.5rem_minmax(0,1fr)]";
   return (
     <Panel title="Tenants right now" subtitle="Across every pool. Open a tenant to change its weight, see its keys, or set a cap." action={active.length > 8 ? <button type="button" onClick={() => setAll(!all)} className="text-[12.5px] text-secondary-foreground hover:text-foreground">{all ? "Show fewer" : `Show all ${active.length}`}</button> : undefined}>
-      <div className="mt-3 overflow-x-auto pb-2">
-        <div className="min-w-[44rem]">
-          <div className={cn("grid gap-3 border-t border-border px-[18px] py-2 text-[11.5px] text-muted-foreground", cols)}><span>Tenant</span><span>Group</span><span className="text-right">Weight</span><span>Running</span><span className="text-right">Waiting</span><span className="text-right">Pools</span><span>Most used pool</span></div>
-          {rows.length === 0 && <p className="border-t border-border px-[18px] py-6 text-center text-sm text-muted-foreground">No tenant has work running or waiting.</p>}
+      <div className="mt-3 border-t border-border pb-2">
+        <DataTable
+          framed={false}
+          label="Tenants right now"
+          minWidth="min-w-[44rem]"
+          empty="No tenant has work running or waiting."
+          columns={[{ label: "Tenant" }, { label: "Group" }, { label: "Weight", align: "right" }, { label: "Running", className: "w-48" }, { label: "Waiting", align: "right" }, { label: "Pools", align: "right" }, { label: "Most used pool" }]}
+        >
           {rows.map((t) => {
             const p = tenantPools(raw, t.tenant_id);
             return (
-              <button key={t.tenant_id} type="button" onClick={() => onOpen(t.tenant_id)} className={cn("grid w-full items-center gap-3 border-t border-border px-[18px] py-[9px] text-left text-[13px] hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring", cols)}>
-                <span className="flex min-w-0 items-center gap-2"><span className="truncate">{t.name || "Unnamed tenant"}</span>{isShort(t) && <Pill inverted>Below share</Pill>}</span>
-                <span className="truncate text-muted-foreground">{t.fairshare_group || "default"}</span>
-                <span className="text-right font-mono text-xs">{t.weight}</span>
-                <span className="flex items-center gap-2.5"><Meter value={t.in_flight} max={top} className="flex-1" /><span className="w-9 text-right font-mono text-xs tabular-nums">{t.in_flight}</span></span>
-                <span className={cn("text-right font-mono text-xs tabular-nums", t.queued > 0 && "font-semibold text-foreground")}>{t.queued}</span>
-                <span className="text-right font-mono text-xs tabular-nums">{p.count || "—"}</span>
-                <span className="truncate text-muted-foreground">{p.top ?? "—"}</span>
-              </button>
+              <DataRow key={t.tenant_id} onOpen={() => onOpen(t.tenant_id)} label={`Open ${t.name || "Unnamed tenant"}`}>
+                <Cell><span className="flex min-w-0 items-center gap-2"><span className="truncate">{t.name || "Unnamed tenant"}</span>{isShort(t) && <Pill inverted>Below share</Pill>}</span></Cell>
+                <Cell className="max-w-[8rem] truncate text-muted-foreground">{t.fairshare_group || "default"}</Cell>
+                <Cell align="right" mono>{t.weight}</Cell>
+                <Cell><span className="flex items-center gap-2.5"><Meter value={t.in_flight} max={top} className="flex-1" /><span className="w-9 text-right font-mono text-xs tabular-nums">{t.in_flight}</span></span></Cell>
+                <Cell align="right" mono className={cn(t.queued > 0 && "font-semibold text-foreground")}>{t.queued}</Cell>
+                <Cell align="right" mono>{p.count || "—"}</Cell>
+                <Cell className="max-w-[12rem] truncate text-muted-foreground">{p.top ?? "—"}</Cell>
+              </DataRow>
             );
           })}
-        </div>
+        </DataTable>
       </div>
     </Panel>
   );
@@ -421,20 +418,24 @@ function PoolView({ view, raw, poolRow, shared, onOpen }: { view: FairshareLiveV
 
       {keys.length > 0 && (
         <Panel title="Keys in this pool" subtitle="Inside a tenant, slots are split between its keys by key weight">
-          <div className="mt-3 overflow-x-auto pb-2">
-            <div className="min-w-[40rem]">
-              <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,10rem)_4.5rem_4.5rem_4.5rem_4.5rem] gap-3 border-t border-border px-[18px] py-2 text-[11.5px] text-muted-foreground"><span>Key</span><span>Tenant</span><span className="text-right">Weight</span><span className="text-right">Cap</span><span className="text-right">Running</span><span className="text-right">Waiting</span></div>
+          <div className="mt-3 border-t border-border pb-2">
+            <DataTable
+              framed={false}
+              label="Keys in this pool"
+              minWidth="min-w-[40rem]"
+              columns={[{ label: "Key" }, { label: "Tenant" }, { label: "Weight", align: "right" }, { label: "Cap", align: "right" }, { label: "Running", align: "right" }, { label: "Waiting", align: "right" }]}
+            >
               {keys.slice(0, 12).map((k) => (
-                <button key={k.key_id} type="button" onClick={() => onOpen(k.tenant_id)} className="grid w-full grid-cols-[minmax(0,1fr)_minmax(0,10rem)_4.5rem_4.5rem_4.5rem_4.5rem] items-center gap-3 border-t border-border px-[18px] py-[9px] text-left text-[13px] hover:bg-accent/40">
-                  <span className="truncate" title={keyRowLabel(k)}>{keyRowLabel(k)}</span>
-                  <span className="truncate text-muted-foreground">{names.get(k.tenant_id) ?? "—"}</span>
-                  <span className="text-right font-mono text-xs">{k.weight}</span>
-                  <span className="text-right font-mono text-xs text-muted-foreground">{k.max_in_flight ?? "—"}</span>
-                  <span className="text-right font-mono text-xs">{k.in_flight}</span>
-                  <span className={cn("text-right font-mono text-xs", k.queued > 0 && "font-semibold text-foreground")}>{k.queued}</span>
-                </button>
+                <DataRow key={k.key_id} onOpen={() => onOpen(k.tenant_id)} label={`Open ${names.get(k.tenant_id) ?? "its tenant"}`}>
+                  <Cell className="max-w-[16rem] truncate" title={keyRowLabel(k)}>{keyRowLabel(k)}</Cell>
+                  <Cell className="max-w-[10rem] truncate text-muted-foreground">{names.get(k.tenant_id) ?? "—"}</Cell>
+                  <Cell align="right" mono>{k.weight}</Cell>
+                  <Cell align="right" mono className="text-muted-foreground">{k.max_in_flight ?? "—"}</Cell>
+                  <Cell align="right" mono>{k.in_flight}</Cell>
+                  <Cell align="right" mono className={cn(k.queued > 0 && "font-semibold text-foreground")}>{k.queued}</Cell>
+                </DataRow>
               ))}
-            </div>
+            </DataTable>
           </div>
         </Panel>
       )}

@@ -13,6 +13,7 @@ import { dateTime, secsAgo } from "@/lib/format";
 import { Notice } from "@/components/ui/notice";
 import { Sheet } from "@/components/ui/sheet";
 import { type SaveResult, SettingsForm } from "@/components/ui/settings-form";
+import { Tabs } from "@/components/ui/tabs";
 import { Switch } from "@/components/ui/switch";
 
 const FIELDS = ["enabled", "url", "api_version", "user", "jwt", "aliases", "cache_dir", "images_dir", "images", "log_dir", "setup", "hf_token", "hf_clear"];
@@ -153,11 +154,7 @@ export function SlurmConnection({ settings, replicas, onClose, onSaved }: { sett
         </div>
 
         <SettingsForm id="slurm" sectionOf={sectionOf} labelOf={labelOf} save={save} confirmSave={confirmSave} bar="panel" ariaLabel="Slurm connection">
-          <div className="flex gap-5 border-b border-border px-6" role="tablist" aria-label="Slurm settings">
-            {([["connection", "Connection"], ["defaults", "Cluster defaults"]] as const).map(([t, label]) => (
-              <button key={t} type="button" role="tab" aria-selected={tab === t} onClick={() => setTab(t)} className={cn("-mb-px h-10 border-b-2 text-[13.5px]", tab === t ? "border-foreground font-medium text-foreground" : "border-transparent text-muted-foreground hover:text-foreground")}>{label}</button>
-            ))}
-          </div>
+          <Tabs label="Slurm settings" value={tab} onChange={setTab} className="px-6" tabs={[{ value: "connection", label: "Connection" }, { value: "defaults", label: "Cluster defaults" }]} />
           {/* Both tabs stay in the form (hidden, not unmounted) so one save covers them. */}
           <div hidden={tab !== "connection"}>
           <Setting label="Slurm" hint="On, models with a Slurm deployment are launched and kept running." fields={["enabled"]} was={{ field: "enabled", checkbox: true }} className="px-6">

@@ -94,7 +94,8 @@ afterEach(() => { act(() => root.unmount()); host.remove(); document.body.innerH
 
 async function render(initialPool = "all") { await act(async () => root.render(<FairshareDashboard tenantNames={{ a: "a", b: "b", c: "c" }} initialPool={initialPool} />)); }
 function button(text: string, scope: ParentNode = document) {
-  const result = [...scope.querySelectorAll<HTMLButtonElement>("button")].find((b) => b.textContent?.includes(text) || b.getAttribute("aria-label") === text);
+  // Rows that open something are table rows with focus, not buttons.
+  const result = [...scope.querySelectorAll<HTMLElement>("button, tr[tabindex]")].find((b) => b.textContent?.includes(text) || b.getAttribute("aria-label") === text);
   if (!result) throw new Error(`Missing button: ${text}`);
   return result;
 }
@@ -115,7 +116,7 @@ describe("all pools", () => {
     await render();
     expect(host.textContent).toContain("3 waiting");
     expect(host.textContent).toContain("1 tenant is waiting below their fair share");
-    const pools = [...host.querySelectorAll('[aria-label="Model pools"] button')].map((b) => b.textContent ?? "");
+    const pools = [...host.querySelectorAll('table[aria-label="Model pools"] tbody tr')].map((b) => b.textContent ?? "");
     expect(pools[0]).toContain("llama");
     expect(pools[0]).toContain("Busy");
     expect(pools[1]).toContain("quiet");

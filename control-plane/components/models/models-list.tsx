@@ -4,7 +4,7 @@ import { memo, useCallback, useEffect, useMemo, useState, useTransition } from "
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
-import { Check, ChevronDown, Download, Plus, Upload, X } from "lucide-react";
+import { ChevronDown, Download, Plus, Upload, X } from "lucide-react";
 import { checkModelsHealthAction, deleteModelsAction, setModelsEnabledAction, type BulkModelResult } from "@/app/actions";
 import { useCapacityDiscovery, useFairshareLive, usePoolLoad } from "@/components/fairshare/hooks";
 import { AddModelSheet, type AddMode } from "@/components/models/add-model";
@@ -13,7 +13,7 @@ import { ProviderMark, StatusMark } from "@/components/models/ui";
 import { Meter } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm-dialog";
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { buildModelRows, contextLabel, EMPTY_FILTERS, filterRows, groupCounts, LIFECYCLE_BADGES, lifecycleLabel, lifecycleStatus, MODEL_TYPE_NAMES, type ModelFilters, modelHref, type ModelRow, type ModelSort, RUNS_LABELS, type RunsOn, SORT_LABELS, sortRows, STATUS_LABELS, type StatusFilter, statusLine, tagLabels, TYPE_GROUPS, type TypeGroup } from "@/lib/models-model";
 import type { CacheStats, ModelFamily, ModelHealthSummary, ModelRoute, UsageModelAgg } from "@/lib/obleth";
 import { isBenchmarkRoute } from "@/lib/overview-model";
@@ -24,7 +24,8 @@ import { ReadNotice, readFailed } from "@/components/ui/read-state";
 import { Segmented } from "@/components/ui/segmented";
 import { Notice } from "@/components/ui/notice";
 import { Tile } from "@/components/ui/tile";
-import { SearchBox } from "@/components/ui/search-box";
+import { FilterBar, FilterSelect } from "@/components/ui/filter-bar";
+import { Cell, DataRow, DataTable } from "@/components/ui/data-table";
 
 const DAY_MS = 86_400_000;
 
@@ -105,7 +106,6 @@ export function ModelsList({
   const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selected.has(id));
 
   const toggle = useCallback((id: string) => setSelected((prev) => { const next = new Set(prev); if (next.has(id)) next.delete(id); else next.add(id); return next; }), []);
-  const open = useCallback((name: string) => router.push(modelHref(name)), [router]);
   const requestsUnread = readFailed(usageQuery);
   const toggleAll = () => setSelected((prev) => (allVisibleSelected ? new Set([...prev].filter((id) => !visibleIds.includes(id))) : new Set([...prev, ...visibleIds])));
 
@@ -206,8 +206,7 @@ export function ModelsList({
       </div>
 
       <div className="flex flex-col gap-3">
-        <div className="flex flex-wrap items-center gap-2">
-          <SearchBox slash value={filters.query} onChange={(query) => set("query", query)} label="Search models" placeholder="Search name, alias, upstream or tag" className="min-w-[16rem] lg:max-w-md" />
+        <FilterBar search={{ value: filters.query, onChange: (query) => set("query", query), label: "Search models", placeholder: "Search name, alias, upstream or tag" }}>
           <Segmented<TypeGroup | "all">
             label="Model type"
             value={filters.group}
@@ -217,20 +216,21 @@ export function ModelsList({
               ...TYPE_GROUPS.filter((g) => counts[g.value] > 0).map((g) => ({ value: g.value, label: <>{g.label} <span className="ml-1 tabular-nums text-muted-foreground">{counts[g.value]}</span></> })),
             ]}
           />
-          <Choice label="Status" value={filters.status} options={STATUS_FILTERS} onChange={(v) => set("status", v)} />
-          <Choice
+          <FilterSelect label="Status" value={filters.status} unset={STATUS_FILTERS[0].value} options={STATUS_FILTERS} onChange={(v) => set("status", v)} />
+          <FilterSelect
             label="Runs on"
             value={filters.runs}
+            unset="all"
             options={[{ value: "all", label: "Runs anywhere" }, ...(Object.keys(RUNS_LABELS) as RunsOn[]).map((r) => ({ value: r, label: RUNS_LABELS[r] }))]}
-            onChange={(v) => set("runs", v as RunsOn | "all")}
+            onChange={(v) => set("runs", v)}
           />
-          <Choice label="Sort" value={sort} prefix="Sort: " options={(Object.keys(SORT_LABELS) as ModelSort[]).map((s) => ({ value: s, label: SORT_LABELS[s] }))} onChange={(v) => setSort(v as ModelSort)} />
+          <FilterSelect label="Sort" value={sort} options={(Object.keys(SORT_LABELS) as ModelSort[]).map((s) => ({ value: s, label: `Sort: ${SORT_LABELS[s]}` }))} onChange={setSort} />
           {benchmarkCount > 0 && (
             <button type="button" onClick={() => set("benchmarks", !filters.benchmarks)} className="text-[12.5px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline">
               {filters.benchmarks ? "Hide" : "Show"} {benchmarkCount} benchmark route{benchmarkCount === 1 ? "" : "s"}
             </button>
           )}
-        </div>
+        </FilterBar>
         {notice && (
           <Notice onDismiss={() => setNotice(null)} strong={notice.failed.length > 0}>
             <p>{notice.text}</p>
@@ -243,34 +243,23 @@ export function ModelsList({
         )}
       </div>
 
-      <section aria-label="Models" className="overflow-hidden rounded-xl border border-border bg-card">
-        <div className="overflow-x-auto">
-          <table className="w-full min-w-[980px] text-[13px]">
-            <thead>
-              <tr className="border-b border-border text-left text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">
-                <th className="w-10 py-2.5 pl-4">
-                  <input type="checkbox" aria-label="Select every model shown" checked={allVisibleSelected} onChange={toggleAll} className="h-3.5 w-3.5 accent-foreground" />
-                </th>
-                <th className="py-2.5 pr-3 font-semibold">Model</th>
-                <th className="py-2.5 pr-3 font-semibold">Type</th>
-                <th className="py-2.5 pr-3 font-semibold">Health</th>
-                <th className="w-40 py-2.5 pr-3 font-semibold">Load now</th>
-                <th className="py-2.5 pr-3 text-right font-semibold">Req · 24h</th>
-                <th className="py-2.5 pr-3 text-right font-semibold">First token</th>
-                <th className="py-2.5 pr-3 font-semibold">Price</th>
-                <th className="py-2.5 pr-3 text-right font-semibold">Context</th>
-                <th className="py-2.5 pr-4 font-semibold">Router tags</th>
-              </tr>
-            </thead>
-            <tbody>
-              {shown.map((row) => (
-                <Row key={row.id} model={row.model} status={row.status} requests={row.requests} p50TtftMs={row.p50TtftMs} price={row.price} requestsUnread={requestsUnread} selected={selected.has(row.id)} onToggle={toggle} onOpen={open} />
-              ))}
-            </tbody>
-          </table>
-        </div>
-        {shown.length === 0 && (
-          <div className="flex flex-col items-center gap-3 px-6 py-14 text-center text-[13px] text-muted-foreground">
+      <DataTable
+        label="Models"
+        minWidth="min-w-[980px]"
+        columns={[
+          { label: <input type="checkbox" aria-label="Select every model shown" checked={allVisibleSelected} onChange={toggleAll} className="h-3.5 w-3.5 accent-foreground" />, className: "w-10" },
+          { label: "Model" },
+          { label: "Type" },
+          { label: "Health" },
+          { label: "Load now", className: "w-40" },
+          { label: "Req · 24h", align: "right" },
+          { label: "First token", align: "right" },
+          { label: "Price" },
+          { label: "Context", align: "right" },
+          { label: "Router tags" },
+        ]}
+        empty={
+          <div className="flex flex-col items-center gap-3 py-4">
             {models.length === 0 ? (
               <>
                 <p>No models yet. Point obleth at an endpoint that already serves one.</p>
@@ -283,13 +272,13 @@ export function ModelsList({
               </>
             )}
           </div>
-        )}
-        {shown.length > 0 && (
-          <div className="border-t border-border px-4 py-2.5 text-xs text-muted-foreground">
-            {shown.length === rows.length ? `${shown.length} models` : `${shown.length} of ${filters.benchmarks ? rows.length : real.length} models`}
-          </div>
-        )}
-      </section>
+        }
+        footer={shown.length > 0 && <span>{shown.length === rows.length ? `${shown.length} models` : `${shown.length} of ${filters.benchmarks ? rows.length : real.length} models`}</span>}
+      >
+        {shown.map((row) => (
+          <Row key={row.id} model={row.model} status={row.status} requests={row.requests} p50TtftMs={row.p50TtftMs} price={row.price} requestsUnread={requestsUnread} selected={selected.has(row.id)} onToggle={toggle} />
+        ))}
+      </DataTable>
 
       <FamiliesSection families={families} models={models} />
 
@@ -320,7 +309,7 @@ export function ModelsList({
  * changes on every fair-share poll, so a poll re-renders only its LoadCell.
  * `requestsUnread` marks a usage read that never answered: a dash, not zero.
  */
-const Row = memo(function Row({ model: m, status, requests, p50TtftMs, price, requestsUnread, selected, onToggle, onOpen }: {
+const Row = memo(function Row({ model: m, status, requests, p50TtftMs, price, requestsUnread, selected, onToggle }: {
   model: ModelRoute;
   status: ModelRow["status"];
   requests: number;
@@ -329,26 +318,22 @@ const Row = memo(function Row({ model: m, status, requests, p50TtftMs, price, re
   requestsUnread: boolean;
   selected: boolean;
   onToggle: (id: string) => void;
-  onOpen: (name: string) => void;
 }) {
   const name = m.model_name;
   const off = status === "off";
   const tags = tagLabels(m.tags);
   const textual = m.model_type === "chat" || m.model_type === "embedding";
   return (
-    <tr
-      onClick={() => onOpen(name)}
-      className={cn("cursor-pointer border-b border-border/70 transition-colors last:border-b-0 hover:bg-muted/30", selected && "bg-muted/40", off && "text-muted-foreground")}
-    >
-      <td className="py-2.5 pl-4" onClick={(e) => e.stopPropagation()}>
+    <DataRow href={modelHref(name)} label={`Open ${name}`} selected={selected} muted={off}>
+      <Cell>
         <input type="checkbox" aria-label={`Select ${name}`} checked={selected} onChange={() => onToggle(m.id)} className="h-3.5 w-3.5 accent-foreground" />
-      </td>
-      <td className="max-w-[24rem] py-2.5 pr-3">
+      </Cell>
+      <Cell className="max-w-[24rem]">
         <div className="flex min-w-0 items-center gap-2.5">
           <ProviderMark name={name} upstream={m.upstream_model} className={cn(off && "opacity-50")} />
           <div className="min-w-0">
             <span className="flex min-w-0 items-center gap-1.5">
-              <Link href={modelHref(name)} onClick={(e) => e.stopPropagation()} className={cn("truncate font-medium hover:underline", off ? "text-secondary-foreground" : "text-foreground")}>
+              <Link href={modelHref(name)} className={cn("truncate font-medium hover:underline", off ? "text-secondary-foreground" : "text-foreground")}>
                 {name}
               </Link>
               {lifecycleStatus(m) !== "active" && (
@@ -362,24 +347,24 @@ const Row = memo(function Row({ model: m, status, requests, p50TtftMs, price, re
             </span>
           </div>
         </div>
-      </td>
-      <td className="whitespace-nowrap py-2.5 pr-3 text-secondary-foreground">{MODEL_TYPE_NAMES[m.model_type] ?? m.model_type}</td>
-      <td className="whitespace-nowrap py-2.5 pr-3"><StatusMark status={status} /></td>
-      <td className="py-2.5 pr-3">
+      </Cell>
+      <Cell className="whitespace-nowrap text-secondary-foreground">{MODEL_TYPE_NAMES[m.model_type] ?? m.model_type}</Cell>
+      <Cell className="whitespace-nowrap"><StatusMark status={status} /></Cell>
+      <Cell>
         <LoadCell model={m} off={off} />
-      </td>
-      <td className="py-2.5 pr-3 text-right font-mono text-[12px] tabular-nums">
+      </Cell>
+      <Cell align="right" mono>
         {requestsUnread ? (
           <span className="text-muted-foreground" title="Can't read the last day's requests">—</span>
         ) : requests ? (
-          <Link href={logsHref({ model: name, window: "24h" })} onClick={(e) => e.stopPropagation()} title="See these requests" className="underline-offset-2 hover:underline">{compact(requests)}</Link>
+          <Link href={logsHref({ model: name, window: "24h" })} title="See these requests" className="underline-offset-2 hover:underline">{compact(requests)}</Link>
         ) : "—"}
-      </td>
-      <td className="py-2.5 pr-3 text-right font-mono text-[12px] tabular-nums">{p50TtftMs ? formatMs(p50TtftMs) : "—"}</td>
-      <td className="whitespace-nowrap py-2.5 pr-3 font-mono text-[12px]">{price ?? <span className="text-muted-foreground">not set</span>}</td>
-      <td className="py-2.5 pr-3 text-right font-mono text-[12px] tabular-nums">{textual ? contextLabel(m.context_window) : "—"}</td>
-      <td className="max-w-[16rem] truncate py-2.5 pr-4 text-[12.5px] text-secondary-foreground" title={tags.join(" · ")}>{tags.length ? tags.join(" · ") : <span className="text-muted-foreground">—</span>}</td>
-    </tr>
+      </Cell>
+      <Cell align="right" mono>{p50TtftMs ? formatMs(p50TtftMs) : "—"}</Cell>
+      <Cell className="whitespace-nowrap font-mono text-[12px]">{price ?? <span className="text-muted-foreground">not set</span>}</Cell>
+      <Cell align="right" mono>{textual ? contextLabel(m.context_window) : "—"}</Cell>
+      <Cell className="max-w-[16rem] truncate text-[12.5px] text-secondary-foreground" title={tags.join(" · ")}>{tags.length ? tags.join(" · ") : <span className="text-muted-foreground">—</span>}</Cell>
+    </DataRow>
   );
 });
 
@@ -399,37 +384,4 @@ export function LoadCell({ model, off }: { model: ModelRoute; off: boolean }) {
     );
   }
   return <span className="font-mono text-[12px] tabular-nums text-muted-foreground">{load.inFlight > 0 ? `${load.inFlight} in flight` : "no cap"}</span>;
-}
-
-function Choice<T extends string>({ label, value, options, onChange, prefix = "" }: {
-  label: string; value: T; options: { value: T; label: string }[]; onChange: (value: T) => void; prefix?: string;
-}) {
-  const current = options.find((o) => o.value === value) ?? options[0];
-  const active = value !== options[0].value && !prefix;
-  return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <button
-          type="button"
-          aria-label={`${label}: ${current.label}`}
-          className={cn(
-            "inline-flex h-9 items-center gap-1.5 rounded-lg border px-3 text-[12.5px] transition-colors hover:text-foreground",
-            active ? "border-foreground text-foreground" : "border-border text-secondary-foreground",
-          )}
-        >
-          {prefix}{current.label}
-          <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
-        </button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="start">
-        <DropdownMenuLabel className="text-[11px] uppercase tracking-[0.07em] text-muted-foreground">{label}</DropdownMenuLabel>
-        {options.map((o) => (
-          <DropdownMenuItem key={o.value} onSelect={() => onChange(o.value)}>
-            <Check className={cn("mr-2 h-3.5 w-3.5", o.value !== value && "invisible")} />
-            {o.label}
-          </DropdownMenuItem>
-        ))}
-      </DropdownMenuContent>
-    </DropdownMenu>
-  );
 }

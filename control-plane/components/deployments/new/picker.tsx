@@ -12,7 +12,8 @@ import { cn } from "@/lib/utils";
 import { Pill } from "@/components/ui/pill";
 import { Segmented } from "@/components/ui/segmented";
 import { Notice } from "@/components/ui/notice";
-import { SearchBox } from "@/components/ui/search-box";
+import { FilterBar } from "@/components/ui/filter-bar";
+import { Tabs } from "@/components/ui/tabs";
 
 export type PickerTab = "saved" | "library" | "hf";
 
@@ -78,24 +79,24 @@ export function Picker({ recipes, launches, resources, tab, onTab, picked, onPic
 
   return (
     <div className="flex flex-col gap-4">
-      <div role="tablist" aria-label="Start from" className="flex gap-6 border-b border-border">
-        {([["saved", `Saved · ${saved.length}`], ["library", `Library · ${library.length}`], ["hf", "From Hugging Face"]] as const).map(([t, label]) => (
-          <button key={t} type="button" role="tab" aria-selected={tab === t} onClick={() => { onTab(t); setEngine("all"); }} className={cn("-mb-px h-10 border-b-2 px-0.5 text-sm", tab === t ? "border-foreground font-medium text-foreground" : "border-transparent text-muted-foreground hover:text-foreground")}>{label}</button>
-        ))}
-      </div>
+      <Tabs
+        label="Start from"
+        value={tab}
+        onChange={(t) => { onTab(t); setEngine("all"); }}
+        tabs={[{ value: "saved", label: "Saved", count: saved.length }, { value: "library", label: "Library", count: library.length }, { value: "hf", label: "From Hugging Face" }]}
+      />
 
       {tab === "hf" ? (
         <FromHuggingFace engines={engines} picked={picked} onPick={onPick} onNext={onNext} />
       ) : (
         <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
           <div className="flex min-w-0 flex-col gap-3">
-            <div className="flex flex-wrap items-center gap-2">
-              <SearchBox value={query} onChange={setQuery} label={tab === "saved" ? "Search saved recipes" : "Search the library"} placeholder="Model, engine or recipe" className="min-w-[220px]" />
+            <FilterBar search={{ value: query, onChange: setQuery, label: tab === "saved" ? "Search saved recipes" : "Search the library", placeholder: "Model, engine or recipe" }}>
               {engineOptions.length > 1 && <Segmented label="Engine" value={engine} onChange={setEngine} options={[{ value: "all", label: "Any engine" }, ...engineOptions.map((e) => ({ value: e, label: engineName(e) }))]} />}
               {resources.partitions.length > 0 && (
                 <button type="button" aria-pressed={fitsOnly} onClick={() => setFitsOnly((x) => !x)} className={cn("inline-flex h-8 items-center rounded-full border px-3 text-[12.5px]", fitsOnly ? "border-foreground bg-secondary text-foreground" : "border-border text-muted-foreground hover:text-foreground")}>Fits a partition</button>
               )}
-            </div>
+            </FilterBar>
 
             <section aria-label={tab === "saved" ? "Saved recipes" : "Library"} className="overflow-hidden rounded-xl border border-border bg-card">
               <div className="overflow-x-auto">

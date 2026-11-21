@@ -1,6 +1,7 @@
 "use client";
 
 import { SettingsCard } from "@/components/ui/settings-card";
+import { Cell, DataRow, DataTable } from "@/components/ui/data-table";
 import { memo, useRef, useState, useTransition } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Plus, Trash2 } from "lucide-react";
@@ -65,69 +66,59 @@ export const EndpointsSection = memo(function EndpointsSection({ model, endpoint
       {confirmElement}
       {error && <p role="alert" className="mx-[18px] my-3 rounded-lg border border-foreground/60 px-3 py-2 text-[12.5px]">{error}</p>}
       {endpoints.length > 0 && (
-        <div className="overflow-x-auto">
-          <table className="w-full min-w-[720px] text-left text-[13px]">
-            <thead>
-              <tr className="border-b border-border text-[10.5px] uppercase tracking-[0.07em] text-muted-foreground">
-                <th className="py-2 pl-[18px] pr-3 font-semibold">Name</th>
-                <th className="py-2 pr-3 font-semibold">API base</th>
-                <th className="py-2 pr-3 text-right font-semibold">Priority</th>
-                <th className="py-2 pr-3 text-right font-semibold">Weight</th>
-                <th className="py-2 pr-3 text-right font-semibold" title="Requests this endpoint takes at once (discovered capacity)">Max in flight</th>
-                <th className="py-2 pr-3 font-semibold">Health</th>
-                <th className="py-2 pr-[18px]" />
-              </tr>
-            </thead>
-            <tbody>
-              {endpoints.map((ep) => (
-                <tr key={ep.id} className={cn("border-b border-border/60 last:border-b-0", !ep.enabled && "text-muted-foreground")}>
-                  <td className="py-2 pl-[18px] pr-3 font-medium">
-                    {ep.name}
-                    {ep.last_message && ep.health_status !== "healthy" && <span className="block max-w-[32ch] truncate text-[11px] font-normal text-muted-foreground" title={ep.last_message}>{ep.last_message}</span>}
-                  </td>
-                  <td className="max-w-[20rem] truncate py-2 pr-3 font-mono text-[11.5px] text-muted-foreground" title={ep.api_base}>{ep.api_base}</td>
-                  <td className="py-2 pr-3 text-right tabular-nums">{ep.priority}</td>
-                  <td className="py-2 pr-3 text-right tabular-nums">{ep.weight}</td>
-                  <td className="py-2 pr-3 text-right tabular-nums">{ep.max_in_flight ?? "—"}</td>
-                  <td className="py-2 pr-3">
-                    {!ep.enabled ? <StatusText glyph="off">{STATUS_LABELS.off}</StatusText> : <StatusText glyph={ep.health_status === "healthy" || ep.health_status === "degraded" ? "on" : "none"} attention={ep.health_status === "unhealthy"}>{checkStatusLabel(ep.health_status)}</StatusText>}
-                  </td>
-                  <td className="py-2 pr-[18px]">
-                    <div className="flex items-center justify-end gap-1">
-                      {replicaByEndpoint.has(ep.id) && (
-                        <Button type="button" size="sm" variant="ghost" disabled={busy} title="Cancel this replica's Slurm job; the provisioner launches a fresh one" onClick={() => run(() => restartReplicaAction(replicaByEndpoint.get(ep.id)!.id))}>
-                          Restart
-                        </Button>
-                      )}
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant="ghost"
-                        disabled={busy}
-                        onClick={() => run(() => updateModelEndpointAction(model.id, ep.id, { name: ep.name, api_base: ep.api_base, priority: ep.priority, weight: ep.weight, enabled: !ep.enabled }))}
-                      >
-                        {ep.enabled ? "Turn off" : "Turn on"}
-                      </Button>
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant="ghost"
-                        disabled={busy}
-                        aria-label={`Remove ${ep.name}`}
-                        onClick={async () => {
-                          const ok = await confirm({ tone: "destructive", title: "Remove endpoint", description: `Remove endpoint "${ep.name}"? Traffic shifts to the model's other endpoints.`, confirmLabel: "Remove" });
-                          if (ok) run(() => deleteModelEndpointAction(model.id, ep.id));
-                        }}
-                      >
-                        <Trash2 className="h-3.5 w-3.5" />
-                      </Button>
-                    </div>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <DataTable
+          framed={false}
+          label="Endpoints"
+          minWidth="min-w-[720px]"
+          columns={[{ label: "Name" }, { label: "API base" }, { label: "Priority", align: "right" }, { label: "Weight", align: "right" }, { label: <span title="Requests this endpoint takes at once (discovered capacity)">Max in flight</span>, align: "right" }, { label: "Health" }, { label: <span className="sr-only">Actions</span> }]}
+        >
+          {endpoints.map((ep) => (
+            <DataRow key={ep.id} muted={!ep.enabled}>
+              <Cell className="font-medium">
+                {ep.name}
+                {ep.last_message && ep.health_status !== "healthy" && <span className="block max-w-[32ch] truncate text-[11px] font-normal text-muted-foreground" title={ep.last_message}>{ep.last_message}</span>}
+              </Cell>
+              <Cell className="max-w-[20rem] truncate font-mono text-[11.5px] text-muted-foreground" title={ep.api_base}>{ep.api_base}</Cell>
+              <Cell align="right" className="tabular-nums">{ep.priority}</Cell>
+              <Cell align="right" className="tabular-nums">{ep.weight}</Cell>
+              <Cell align="right" className="tabular-nums">{ep.max_in_flight ?? "—"}</Cell>
+              <Cell>
+                {!ep.enabled ? <StatusText glyph="off">{STATUS_LABELS.off}</StatusText> : <StatusText glyph={ep.health_status === "healthy" || ep.health_status === "degraded" ? "on" : "none"} attention={ep.health_status === "unhealthy"}>{checkStatusLabel(ep.health_status)}</StatusText>}
+              </Cell>
+              <Cell>
+                <div className="flex items-center justify-end gap-1">
+                  {replicaByEndpoint.has(ep.id) && (
+                    <Button type="button" size="sm" variant="ghost" disabled={busy} title="Cancel this replica's Slurm job; the provisioner launches a fresh one" onClick={() => run(() => restartReplicaAction(replicaByEndpoint.get(ep.id)!.id))}>
+                      Restart
+                    </Button>
+                  )}
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    disabled={busy}
+                    onClick={() => run(() => updateModelEndpointAction(model.id, ep.id, { name: ep.name, api_base: ep.api_base, priority: ep.priority, weight: ep.weight, enabled: !ep.enabled }))}
+                  >
+                    {ep.enabled ? "Turn off" : "Turn on"}
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    disabled={busy}
+                    aria-label={`Remove ${ep.name}`}
+                    onClick={async () => {
+                      const ok = await confirm({ tone: "destructive", title: "Remove endpoint", description: `Remove endpoint "${ep.name}"? Traffic shifts to the model's other endpoints.`, confirmLabel: "Remove" });
+                      if (ok) run(() => deleteModelEndpointAction(model.id, ep.id));
+                    }}
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </Button>
+                </div>
+              </Cell>
+            </DataRow>
+          ))}
+        </DataTable>
       )}
       {adding && (
         <form ref={addForm} action={add} className={cn("px-[18px] py-4", endpoints.length > 0 && "border-t border-border")}>

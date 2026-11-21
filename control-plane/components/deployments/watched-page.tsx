@@ -6,7 +6,7 @@ import { useQuery } from "@tanstack/react-query";
 import { ChangesList, InFlightChart, useModelDay } from "@/components/deployments/detail-ui";
 import { StateMark } from "@/components/deployments/ui";
 import { useFairshareLive } from "@/components/fairshare/hooks";
-import { Meter, Panel } from "@/components/overview/ui";
+import { Panel } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
 import type { DeploymentData } from "@/lib/deployments-data";
 import { deploymentKey, deploymentRow } from "@/lib/deployments-model";
@@ -18,7 +18,6 @@ import { poolOccupancy } from "@/lib/occupancy";
 import { getJson } from "@/lib/utils";
 import { Pill } from "@/components/ui/pill";
 import { Tile } from "@/components/ui/tile";
-import { SectionLabel } from "@/components/ui/section-label";
 
 function secsAgo(iso: string | null | undefined): string {
   if (!iso) return "never";
@@ -79,12 +78,7 @@ export function WatchedPage({ modelId, initial, changes }: { modelId: string; in
 
       <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
         <Tile label="Ready replicas" value={row?.ready ?? "—"} detail={status ? `read ${secsAgo(status.last_success)}` : "not seen by discovery"} />
-        <div className="flex min-w-0 flex-col gap-1 rounded-xl border border-border bg-card px-4 py-3">
-          <SectionLabel>Pool now</SectionLabel>
-          <span className="text-[24px] font-semibold leading-tight tabular-nums">{inFlight} <span className="text-[13px] font-normal text-muted-foreground">of {cap}</span></span>
-          <Meter value={inFlight} max={cap} strong={cap > 0 && inFlight >= cap} />
-          <span className="text-xs text-muted-foreground">{queued ? `${queued} waiting` : "none waiting"}</span>
-        </div>
+        <Tile label="Pool now" value={<>{inFlight} <span className="text-[13px] font-normal text-muted-foreground">of {cap}</span></>} meter={[inFlight, cap]} detail={queued ? `${queued} waiting` : "none waiting"} />
         <Tile label="Requests · 24h" value={day.data ? compact(day.data.requests) : "—"} href={day.data?.requests ? logsHref({ model: model.model_name, window: "24h" }) : undefined} detail={day.data?.requests ? "see them" : null} />
         <Tile
           label="Failed · 24h"

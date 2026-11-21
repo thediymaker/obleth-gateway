@@ -3,11 +3,11 @@
 import { memo, useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useFairshareHistory, usePoolLoad } from "@/components/fairshare/hooks";
-import { Meter, Panel } from "@/components/overview/ui";
+import { Panel } from "@/components/overview/ui";
 import type { AuditEntry, ModelRoute, UsageLogHistogram } from "@/lib/obleth";
 import { getJson } from "@/lib/utils";
 import { clock, dateTime } from "@/lib/format";
-import { SectionLabel } from "@/components/ui/section-label";
+import { Tile } from "@/components/ui/tile";
 
 const DAY_MS = 86_400_000;
 
@@ -27,17 +27,16 @@ export function useModelDay(model: string) {
   });
 }
 
-/** In flight and waiting over the last hour, from the scheduler's own samples of this model's pool. */
 /** The "Pool now" tile, reading the live load itself so a poll re-renders only it. */
 export function PoolNowTile({ model }: { model: ModelRoute }) {
   const { load: { inFlight, cap, queued } } = usePoolLoad(model);
   return (
-    <div className="flex min-w-0 flex-col gap-1 rounded-xl border border-border bg-card px-4 py-3">
-      <SectionLabel>Pool now</SectionLabel>
-      <span className="text-[24px] font-semibold leading-tight tabular-nums">{inFlight} <span className="text-[13px] font-normal text-muted-foreground">{cap ? `of ${cap}` : "in flight"}</span></span>
-      <Meter value={inFlight} max={cap} strong={cap > 0 && inFlight >= cap} />
-      <span className="text-xs text-muted-foreground">{queued ? `${queued} waiting` : "none waiting"}</span>
-    </div>
+    <Tile
+      label="Pool now"
+      value={<>{inFlight} <span className="text-[13px] font-normal text-muted-foreground">{cap ? `of ${cap}` : "in flight"}</span></>}
+      meter={[inFlight, cap]}
+      detail={queued ? `${queued} waiting` : "none waiting"}
+    />
   );
 }
 
@@ -46,6 +45,7 @@ export function PoolChart({ model }: { model: ModelRoute }) {
   return <InFlightChart model={model.model_name} cap={usePoolLoad(model).load.cap} />;
 }
 
+/** In flight and waiting over the last hour, from the scheduler's own samples of this model's pool. */
 export const InFlightChart = memo(function InFlightChart({ model, cap }: { model: string; cap: number }) {
   const history = useFairshareHistory(model);
   const bars = useMemo(() => {

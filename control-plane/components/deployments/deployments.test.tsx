@@ -99,7 +99,7 @@ async function type(el: HTMLInputElement, value: string) {
 describe("the Deployments list", () => {
   it("lists launched and watched models, and filters to the ones that need you", async () => {
     await render(<DeploymentsList initial={data()} recipes={[]} tab="deployments" />);
-    const table = host.querySelector('[aria-label="Deployments"][class*="overflow-hidden"]')!;
+    const table = host.querySelector('table[aria-label="Deployments"]')!;
     expect(table.textContent).toContain("glm-5.2");
     expect(table.textContent).toContain("glm-5-3-flash");
     expect(table.textContent).not.toContain("static-proxy");
@@ -117,7 +117,7 @@ describe("the Deployments list", () => {
     expect((fleet.options as { refetchInterval?: number }).refetchInterval).toBe(15_000);
     expect((requests.options as { refetchInterval?: number }).refetchInterval).toBe(60_000);
     // Until the counts arrive the column says so rather than showing 0.
-    const table = host.querySelector('[aria-label="Deployments"][class*="overflow-hidden"]')!;
+    const table = host.querySelector('table[aria-label="Deployments"]')!;
     expect(table.textContent).toContain("—");
     await act(async () => {
       client.setQueryData(["deployment-requests"], { "glm-5-3-flash": 16039 });
