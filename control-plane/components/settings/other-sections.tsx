@@ -4,7 +4,6 @@ import { useState, useTransition } from "react";
 import { compactUsageAction, resyncCacheAction, testEnergyQueryAction } from "@/app/actions";
 import { SettingsCard } from "@/components/access/ui";
 import { BackupRestore } from "@/components/backup-restore";
-import { Glyph } from "@/components/deployments/ui";
 import { SelectField, Setting, Switch, TextField } from "@/components/models/fields";
 import { Notice } from "@/components/models/ui";
 import { Pill } from "@/components/overview/ui";
@@ -14,6 +13,7 @@ import type { CharoSettingsView, CompressorStatusView, EnergySettingsView, KeyPr
 import { KEY_PREFIX_MAX, keyPrefixExample, keyPrefixProblem } from "@/lib/key-prefix";
 import { describeEnergyTest, describeResync } from "@/lib/settings-model";
 import { cn } from "@/lib/utils";
+import { StatusPill } from "@/components/ui/status";
 
 /** Reads power from Prometheus to put watts, cost and CO₂ on Reports and the Overview. */
 export function EnergySection({ settings }: { settings: EnergySettingsView }) {
@@ -36,7 +36,7 @@ export function EnergySection({ settings }: { settings: EnergySettingsView }) {
   }
   const queryClass = "w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-[12.5px] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring";
   return (
-    <SettingsCard id="energy" title="Energy" description="Reads power from Prometheus to put watts, cost and CO₂ on Reports and the Overview." action={<Pill><Glyph glyph={settings.enabled ? "on" : "off"} className="h-[7px] w-[7px]" />{settings.enabled ? "On" : "Off"}</Pill>}>
+    <SettingsCard id="energy" title="Energy" description="Reads power from Prometheus to put watts, cost and CO₂ on Reports and the Overview." action={<StatusPill glyph={settings.enabled ? "on" : "off"}>{settings.enabled ? "On" : "Off"}</StatusPill>}>
       <Setting id="set-energy" label="Energy" hint="Off, no energy numbers are shown anywhere." fields={["energy.enabled"]} was={{ field: "energy.enabled", checkbox: true }}>
         <Switch name="energy.enabled" label="Energy on" checked={on} onChange={setOn} />
       </Setting>
@@ -120,7 +120,7 @@ export function AssistantSection({ settings, models }: { settings: CharoSettings
   const [brain, setBrain] = useState(settings.brain_model ?? "");
   const brains = [...new Set([...(settings.brain_model ? [settings.brain_model] : []), ...models.filter((m) => m.enabled && m.supports_function_calling).map((m) => m.model_name)])].sort();
   return (
-    <SettingsCard id="assistant" title="Assistant" description="The helper in the Playground that can test models, explain settings, and run benchmarks." action={<Pill><Glyph glyph={settings.enabled ? "on" : "off"} className="h-[7px] w-[7px]" />{settings.enabled ? "On" : "Off"}</Pill>}>
+    <SettingsCard id="assistant" title="Assistant" description="The helper in the Playground that can test models, explain settings, and run benchmarks." action={<StatusPill glyph={settings.enabled ? "on" : "off"}>{settings.enabled ? "On" : "Off"}</StatusPill>}>
       <Setting id="set-assistant" label="Playground" hint="Off hides the Playground and its assistant from the dashboard." fields={["assistant.enabled"]} was={{ field: "assistant.enabled", checkbox: true }}>
         <Switch name="assistant.enabled" label="Playground on" defaultChecked={settings.enabled} />
       </Setting>
@@ -245,20 +245,20 @@ export function AboutSection({ version, slurm, compressor }: { version: VersionI
   const sha = (s: string | null | undefined) => (s ? ` · ${s.slice(0, 7)}` : "");
   return (
     <SettingsCard id="about" title="About">
-      <Row label="Gateway" mark={version.updateAvailable ? <Pill inverted>{version.latest} is out</Pill> : <Pill><Glyph glyph="on" className="h-[7px] w-[7px]" />{version.latest ? "Latest" : "Running"}</Pill>}>
+      <Row label="Gateway" mark={version.updateAvailable ? <Pill inverted>{version.latest} is out</Pill> : <StatusPill glyph="on">{version.latest ? "Latest" : "Running"}</StatusPill>}>
         {g ? <><span className="font-mono text-[12px]">{g.version}{sha(g.git_sha)}</span>{g.built_at && <span className="text-muted-foreground"> · built {new Date(g.built_at).toLocaleDateString([], { month: "short", day: "numeric" })}</span>}</> : <span className="text-muted-foreground">Couldn&apos;t be reached</span>}
       </Row>
-      <Row label="Control plane" mark={mismatch ? <Pill inverted>Differs from the gateway</Pill> : <Pill><Glyph glyph="on" className="h-[7px] w-[7px]" />Matches</Pill>}>
+      <Row label="Control plane" mark={mismatch ? <Pill inverted>Differs from the gateway</Pill> : <StatusPill glyph="on">Matches</StatusPill>}>
         <span className="font-mono text-[12px]">{version.controlPlane.version}{sha(version.controlPlane.sha)}</span>
       </Row>
-      <Row label="Provisioner" mark={slurm?.provisioner_running ? <Pill><Glyph glyph={slurm.provisioner_tick_status === "error" ? "half" : "on"} className="h-[7px] w-[7px]" />Running</Pill> : <Pill><Glyph glyph="off" className="h-[7px] w-[7px]" />Not seen</Pill>}>
+      <Row label="Provisioner" mark={slurm?.provisioner_running ? <StatusPill glyph={slurm.provisioner_tick_status === "error" ? "half" : "on"}>Running</StatusPill> : <StatusPill glyph="off">Not seen</StatusPill>}>
         {slurm?.provisioner_running ? (
           <><span className="font-mono text-[12px]">{slurm.provisioner_version ?? "?"}{sha(slurm.provisioner_git_sha)}</span><span className="text-muted-foreground"> · checked in {slurm.provisioner_last_seen_secs ?? "?"} s ago{slurm.provisioner_tick_detail ? ` · ${slurm.provisioner_tick_detail}` : ""}</span></>
         ) : (
           <span className="text-muted-foreground">Only needed to launch models on Slurm.</span>
         )}
       </Row>
-      <Row label="Compressor" mark={compressor?.configured ? (compressor.reachable ? <Pill><Glyph glyph="on" className="h-[7px] w-[7px]" />Answering</Pill> : <Pill inverted>Not answering</Pill>) : <Pill><Glyph glyph="off" className="h-[7px] w-[7px]" />None</Pill>}>
+      <Row label="Compressor" mark={compressor?.configured ? (compressor.reachable ? <StatusPill glyph="on">Answering</StatusPill> : <Pill inverted>Not answering</Pill>) : <StatusPill glyph="off">None</StatusPill>}>
         {compressor?.configured ? (
           <span className={cn(!compressor.reachable && "font-medium")}>{compressor.reachable ? <><span className="font-mono text-[12px]">{compressor.model ?? "model"}{compressor.revision ? ` · ${compressor.revision.slice(0, 7)}` : ""}</span><span className="text-muted-foreground"> · {compressor.url}</span></> : compressor.error ?? `${compressor.url} doesn't answer`}</span>
         ) : (

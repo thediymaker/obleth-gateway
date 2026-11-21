@@ -20,22 +20,7 @@ import { useConfirm } from "@/components/ui/confirm-dialog";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import type { BoonBlockers } from "@/lib/boon-availability";
 import { deploymentHref } from "@/lib/deployments-model";
-import {
-  awaitingFirstPass,
-  contextLabel,
-  lifecycleLabel,
-  lifecycleStatus,
-  MODEL_TYPE_NAMES,
-  modelStatus,
-  reasoningNavCount,
-  RUNS_LABELS,
-  runsOn,
-  searchSettings,
-  SECTION_LABEL,
-  type ModelOverviewData,
-  type SettingEntry,
-  type SettingsSectionId,
-} from "@/lib/models-model";
+import { awaitingFirstPass, contextLabel, lifecycleLabel, lifecycleStatus, MODEL_TYPE_NAMES, type ModelOverviewData, modelStatus, reasoningNavCount, RUNS_LABELS, runsOn, searchSettings, SECTION_LABEL, type SettingEntry, type SettingsSectionId, STATUS_LABELS } from "@/lib/models-model";
 import type { CapacityDiscoveryView, McpServer, ModelEndpoint, ModelHealthCheck, ModelHealthDetail, ModelHealthSummary, ModelRoute, UsageLogFacet } from "@/lib/obleth";
 import { cn, getJson } from "@/lib/utils";
 import { ReadNotice } from "@/components/ui/read-state";
@@ -320,7 +305,7 @@ export function ModelPage({
           </h1>
           <div className="flex flex-wrap items-center gap-2">
             {lifecycleLabel(model) && <Pill inverted={lifecycleStatus(model) === "retired"}>{lifecycleLabel(model)}</Pill>}
-            {status === "down" ? <Pill inverted>Failing health checks</Pill> : <Pill><StatusMark status={status} /></Pill>}
+            {status === "down" ? <Pill inverted>{STATUS_LABELS.down}</Pill> : <Pill><StatusMark status={status} /></Pill>}
             <Pill>{MODEL_TYPE_NAMES[model.model_type] ?? model.model_type}{textual ? ` · ${contextLabel(model.context_window)} context` : ""}</Pill>
             <Pill>{model.capacity_mode === "discovered" ? "Discovered capacity" : model.capacity_mode === "tuned" ? "Tuned capacity" : model.max_in_flight ? `${model.max_in_flight} slots` : "No slot cap"}</Pill>
             {chat && <Pill>{model.auto_eligible ? "Eligible for auto" : "Not picked by auto"}</Pill>}

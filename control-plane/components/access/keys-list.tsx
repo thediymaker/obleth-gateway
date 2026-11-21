@@ -7,7 +7,7 @@ import { Plus, Search } from "lucide-react";
 import { deleteKeysAction, setKeysDisabledAction, type KeyTarget } from "@/app/actions";
 import { BudgetDialog, bulkFailures, MoveDialog, NewKeySheet, type KeysByFilter } from "@/components/access/key-dialogs";
 import { KeyPanel } from "@/components/access/key-panel";
-import { BudgetBar, SecretBanner, StateDot } from "@/components/access/ui";
+import { BudgetBar, SecretBanner } from "@/components/access/ui";
 import { Notice, Tile } from "@/components/models/ui";
 import { Pill } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
@@ -30,6 +30,7 @@ import { logsHref } from "@/lib/log-links";
 import type { ApiKey, KeyStats, NamedNetwork, Tenant } from "@/lib/obleth";
 import { compact, formatNumber, money } from "@/lib/format";
 import { cn, getJson } from "@/lib/utils";
+import { StatusDot } from "@/components/ui/status";
 
 const SORTS: { value: KeySort; label: string }[] = [
   { value: "last-used", label: "Sort: last used" },
@@ -81,7 +82,7 @@ const KeyListRow = memo(function KeyListRow({ row: r, now, picked, isOpen, onOpe
         <span className="truncate font-mono text-[11.5px] text-muted-foreground">{k.kind === "identity" ? `identity · ${k.identity_subject ?? ""}` : `${k.key_prefix}…`}</span>
       </button>
       <span className="truncate">{r.tenantName}</span>
-      <span className="inline-flex items-center gap-2"><StateDot state={k.disabled ? "off" : "on"} />{k.disabled ? "Off" : "On"}</span>
+      <span className="inline-flex items-center gap-2"><StatusDot glyph={k.disabled ? "off" : "on"} />{k.disabled ? "Off" : "On"}</span>
       <span className="flex min-w-0 flex-col">
         <span className="font-mono text-[12px]">{lastUsed(r.lastUsedMs, now)}</span>
         {r.usage?.last_model && <span className="truncate text-[11.5px] text-muted-foreground">{r.usage.last_model}</span>}

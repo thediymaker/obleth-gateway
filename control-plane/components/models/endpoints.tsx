@@ -9,6 +9,8 @@ import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import type { ModelEndpoint, ModelReplica, ModelRoute } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
+import { checkStatusLabel, STATUS_LABELS } from "@/lib/models-model";
+import { StatusText } from "@/components/ui/status";
 
 /**
  * The model's extra upstreams. Unlike the settings above it, every change
@@ -94,7 +96,7 @@ export const EndpointsSection = memo(function EndpointsSection({ model, endpoint
                   <td className="py-2 pr-3 text-right tabular-nums">{ep.weight}</td>
                   <td className="py-2 pr-3 text-right tabular-nums">{ep.max_in_flight ?? "—"}</td>
                   <td className="py-2 pr-3">
-                    {!ep.enabled ? "off" : ep.health_status === "unhealthy" ? <span className="rounded-full bg-foreground px-1.5 text-[10.5px] font-bold text-background">DOWN</span> : ep.health_status}
+                    {!ep.enabled ? <StatusText glyph="off">{STATUS_LABELS.off}</StatusText> : <StatusText glyph={ep.health_status === "healthy" || ep.health_status === "degraded" ? "on" : "none"} attention={ep.health_status === "unhealthy"}>{checkStatusLabel(ep.health_status)}</StatusText>}
                   </td>
                   <td className="py-2 pr-[18px]">
                     <div className="flex items-center justify-end gap-1">

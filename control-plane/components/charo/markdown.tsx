@@ -29,17 +29,17 @@ const COMPONENTS: Components = {
   p: ({ children }) => <p className="my-2 first:mt-0 last:mb-0">{children}</p>,
   strong: ({ children }) => <strong className="font-semibold text-foreground">{children}</strong>,
   a: ({ href, children }) => (
-    <a href={href} target="_blank" rel="noreferrer" className="text-violet-600 underline-offset-2 hover:underline dark:text-violet-300">
+    <a href={href} target="_blank" rel="noreferrer" className="text-foreground underline underline-offset-2 hover:no-underline">
       {children}
     </a>
   ),
   code: ({ children }) => (
-    <code className="rounded border border-violet-500/20 bg-violet-500/10 px-1 py-px font-mono text-[12px] text-violet-700 dark:text-violet-200">
+    <code className="rounded border border-border bg-muted px-1 py-px font-mono text-[12px] text-foreground">
       {children}
     </code>
   ),
   pre: ({ children }) => (
-    <pre className="my-2 overflow-x-auto rounded-md bg-black/5 px-2.5 py-2 text-[12px] leading-normal [&_code]:border-0 [&_code]:bg-transparent [&_code]:p-0 [&_code]:text-foreground/85 dark:bg-black/40">
+    <pre className="my-2 overflow-x-auto rounded-md bg-black/40 px-2.5 py-2 text-[12px] leading-normal [&_code]:border-0 [&_code]:bg-transparent [&_code]:p-0 [&_code]:text-foreground/85">
       {children}
     </pre>
   ),

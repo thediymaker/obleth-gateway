@@ -3,24 +3,22 @@
 import { useState, useTransition } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { AlertCircle, Plus } from "lucide-react";
+import { Plus } from "lucide-react";
 import { setKnowledgeEnabledAction } from "@/app/actions";
-import { Glyph } from "@/components/deployments/ui";
 import { RetrievalSettings } from "@/components/knowledge/retrieval-settings";
 import { Field, SelectField } from "@/components/models/fields";
 import { Notice, Sheet, Tile } from "@/components/models/ui";
-import { Pill } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
 import { compact, formatBytes } from "@/lib/format";
 import type { KnowledgeData } from "@/lib/knowledge-data";
 import { COLLECTION_STATUS_LABEL, collectionGlyph, collectionHref, collectionStatus, retrievalUse } from "@/lib/knowledge-format";
 import { cn } from "@/lib/utils";
+import { StatusPill, type StatusGlyph } from "@/components/ui/status";
 
 const COLS = "grid-cols-[minmax(0,1.5fr)_130px_70px_70px_minmax(0,1fr)_minmax(0,1fr)_120px_90px]";
 
-export function StatusMark({ label, glyph }: { label: string; glyph: "on" | "half" | "off" | "attention" }) {
-  if (glyph === "attention") return <span className="inline-flex h-[22px] items-center gap-1 whitespace-nowrap rounded-full bg-foreground px-2 text-[11.5px] font-semibold text-background"><AlertCircle className="h-3 w-3" aria-hidden />{label}</span>;
-  return <Pill><Glyph glyph={glyph} className="h-[7px] w-[7px]" />{label}</Pill>;
+export function StatusMark({ label, glyph }: { label: string; glyph: StatusGlyph | "attention" }) {
+  return <StatusPill glyph={glyph === "attention" ? "off" : glyph} attention={glyph === "attention"}>{label}</StatusPill>;
 }
 
 function NewCollectionSheet({ open, onClose, embedders }: { open: boolean; onClose: () => void; embedders: string[] }) {

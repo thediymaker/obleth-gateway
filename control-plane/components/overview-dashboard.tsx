@@ -3,7 +3,7 @@
 import { useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { RefreshCw } from "lucide-react";
-import type { CapacityDiscoveryView, FairshareLiveView, LiveStats, ModelHealthSummary, ModelRoute } from "@/lib/obleth";
+import type { FairshareLiveView, LiveStats, ModelHealthSummary, ModelRoute } from "@/lib/obleth";
 import type { OverviewContext, OverviewWindow } from "@/lib/overview-data";
 import { PREVIOUS_LABEL, buildAttention, buildFleet, buildSeries, changeLabel, type OverviewRange } from "@/lib/overview-model";
 import { compact, formatMs, formatNumber, money } from "@/lib/format";

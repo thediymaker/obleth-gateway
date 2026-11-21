@@ -298,7 +298,7 @@ export function Playground({ scope, gatewayBase = "http://localhost:8080", openM
                 onClick={() => update({ mode, launcher: false })}
                 className={cn(
                   "-mb-px flex items-center gap-1.5 border-b-2 px-2.5 text-[13px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring sm:px-3.5",
-                  tabActive(mode) ? "border-violet-400 text-foreground" : "border-transparent text-muted-foreground hover:text-foreground",
+                  tabActive(mode) ? "border-foreground text-foreground" : "border-transparent text-muted-foreground hover:text-foreground",
                 )}
               >
                 <Icon className="h-3.5 w-3.5" aria-hidden="true" /><span className="hidden sm:inline">{label}</span>

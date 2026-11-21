@@ -261,7 +261,7 @@ export function MeshWorkspace({
                     <div className="flex aspect-[16/9] max-w-3xl flex-col items-center justify-center gap-3 rounded-xl border border-dashed border-border bg-card px-6">
                       <span className="inline-flex items-center gap-2 text-sm"><Loader2 className="h-4 w-4 animate-spin" />{done ? "Downloading" : stageLabel(l)}</span>
                       <div className="h-1.5 w-full max-w-sm overflow-hidden rounded-full bg-secondary" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={l?.progress ?? 0}>
-                        <div className="h-full rounded-full bg-violet-400 transition-[width] duration-700" style={{ width: `${done ? 100 : Math.max(2, l?.progress ?? 0)}%` }} />
+                        <div className="h-full rounded-full bg-foreground transition-[width] duration-700" style={{ width: `${done ? 100 : Math.max(2, l?.progress ?? 0)}%` }} />
                       </div>
                       <span className="font-mono text-[11.5px] text-muted-foreground">{done ? "100%" : `${l?.progress ?? 0}%`} · {fmtElapsed(elapsed)}</span>
                     </div>
@@ -275,7 +275,7 @@ export function MeshWorkspace({
 
         <div className="px-4 pb-4 md:px-8">
           <div
-            className={cn("mx-auto max-w-3xl rounded-2xl border bg-card", dragging ? "border-violet-400" : "border-border")}
+            className={cn("mx-auto max-w-3xl rounded-2xl border bg-card", dragging ? "border-foreground" : "border-border")}
             onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
             onDragLeave={() => setDragging(false)}
             onDrop={(e) => { e.preventDefault(); setDragging(false); choose(e.dataTransfer.files[0]); }}

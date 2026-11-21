@@ -90,6 +90,19 @@ export const STATUS_LABELS: Record<ModelStatus, string> = {
   off: "Off",
 };
 
+/** The words for an endpoint's or a check's raw status from the gateway. */
+export const CHECK_STATUS_LABELS: Record<string, string> = {
+  healthy: "Healthy",
+  unhealthy: "Failing",
+  degraded: "Degraded",
+  unknown: "Not checked yet",
+  disabled: STATUS_LABELS.off,
+};
+
+export function checkStatusLabel(status: string): string {
+  return CHECK_STATUS_LABELS[status] ?? status;
+}
+
 export function modelStatus(model: Pick<ModelRoute, "enabled">, row: ModelHealthSummary | undefined, now = Date.now()): ModelStatus {
   if (!model.enabled) return "off";
   const state = healthState(row, now);

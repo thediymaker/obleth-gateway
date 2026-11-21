@@ -27,7 +27,7 @@ import {
 } from "@/components/models/fields";
 import { Button } from "@/components/ui/button";
 import type { BoonBlockers } from "@/lib/boon-availability";
-import { changedFields, changedSections, changeSummary, fieldSection, snapshotForm, type FormSnapshot, type SettingsSectionId } from "@/lib/models-model";
+import { changedFields, changedSections, changeSummary, checkStatusLabel, fieldSection, type FormSnapshot, type SettingsSectionId, snapshotForm } from "@/lib/models-model";
 import type { McpServer, ModelHealthCheck, ModelHealthSummary, ModelRoute } from "@/lib/obleth";
 import { upstreamHeadersText } from "@/lib/upstream-headers";
 import { cn } from "@/lib/utils";
@@ -575,7 +575,7 @@ function RecentChecks({ checks }: { checks: ModelHealthCheck[] }) {
           {checks.slice(0, 20).map((c) => (
             <tr key={c.id} className="border-b border-border/60 last:border-b-0">
               <td className="whitespace-nowrap py-1.5 pl-3 pr-3 tabular-nums text-muted-foreground">{new Date(c.checked_at).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</td>
-              <td className={cn("py-1.5 pr-3", c.status === "unhealthy" && "font-semibold")}>{c.status}{c.trigger !== "scheduled" ? <span className="text-muted-foreground"> · {c.trigger}</span> : null}</td>
+              <td className={cn("py-1.5 pr-3", c.status === "unhealthy" && "font-semibold")}>{checkStatusLabel(c.status)}{c.trigger !== "scheduled" ? <span className="text-muted-foreground"> · {c.trigger}</span> : null}</td>
               <td className="py-1.5 pr-3 tabular-nums text-muted-foreground">{c.http_status ?? "—"}</td>
               <td className="py-1.5 pr-3 tabular-nums text-muted-foreground">{c.latency_ms == null ? "—" : `${c.latency_ms} ms`}</td>
               <td className="max-w-[20rem] truncate py-1.5 pr-3 text-muted-foreground" title={c.message ?? ""}>{c.message ?? ""}</td>

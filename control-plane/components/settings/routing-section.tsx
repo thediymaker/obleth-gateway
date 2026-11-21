@@ -3,12 +3,12 @@
 import { useState } from "react";
 import Link from "next/link";
 import { SettingsCard } from "@/components/access/ui";
-import { Glyph } from "@/components/deployments/ui";
 import { SelectField, Setting, Switch, TextField } from "@/components/models/fields";
 import { Pill } from "@/components/overview/ui";
 import type { AutoRouterSettingsView, ModelRoute, RouterReadinessView } from "@/lib/obleth";
 import { ROUTER_PROFILES, routerProfileOf, routerValues, type RouterValues } from "@/lib/settings-model";
 import { cn } from "@/lib/utils";
+import { StatusPill } from "@/components/ui/status";
 
 const WEIGHTS: { key: "capacity_weight" | "cost_weight" | "tag_weight"; label: string; means: string }[] = [
   { key: "capacity_weight", label: "Free capacity", means: "prefers a model with open slots" },
@@ -44,7 +44,7 @@ export function RoutingSection({ settings, models, readiness }: { settings: Auto
       description={<>How the <span className="font-mono">auto</span> model picks a real one for each request.</>}
       action={
         <div className="flex flex-wrap items-center gap-2">
-          {readiness && (warns.length ? <Pill inverted>{warns.length} to fix</Pill> : <Pill><Glyph glyph="on" className="h-[7px] w-[7px]" />Ready · {readiness.pool_size} models in the pool</Pill>)}
+          {readiness && (warns.length ? <Pill inverted>{warns.length} to fix</Pill> : <StatusPill glyph="on">Ready · {readiness.pool_size} models in the pool</StatusPill>)}
           <Link href="/playground" className="inline-flex h-[22px] items-center rounded-full border border-border px-2 text-[11.5px] text-secondary-foreground hover:text-foreground">Try it in the Playground ›</Link>
         </div>
       }

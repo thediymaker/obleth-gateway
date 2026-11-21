@@ -3,11 +3,11 @@
 import { useState, useTransition } from "react";
 import { testAlertAction } from "@/app/actions";
 import { SettingsCard } from "@/components/access/ui";
-import { Glyph } from "@/components/deployments/ui";
 import { Setting, Switch, TextArea, TextField } from "@/components/models/fields";
 import { Pill } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
 import type { AlertSettingsView, ChannelResult } from "@/lib/obleth";
+import { StatusDot, StatusPill } from "@/components/ui/status";
 
 /** Where the gateway says a model is down, a pool is full, or Slurm has stalled. */
 export function AlertsSection({ settings }: { settings: AlertSettingsView }) {
@@ -33,7 +33,7 @@ export function AlertsSection({ settings }: { settings: AlertSettingsView }) {
       id="alerts"
       title="Alerts"
       description="Where the gateway says a model is down, a pool is full, or Slurm has stalled."
-      action={channels.length ? <Pill><Glyph glyph="on" className="h-[7px] w-[7px]" />{channels.join(" and ")}</Pill> : <Pill inverted>No channel</Pill>}
+      action={channels.length ? <StatusPill glyph="on">{channels.join(" and ")}</StatusPill> : <Pill inverted>No channel</Pill>}
     >
       <Setting id="set-slack" label="Slack" hint={settings.slack_webhook_set ? "Set. Type a new webhook to replace it; it's never shown." : "An incoming-webhook URL. It's never shown again."} fields={["alerts.slack_webhook_url", "alerts.clear_slack"]}>
         <TextField name="alerts.slack_webhook_url" label="Slack webhook" type="password" autoComplete="off" defaultValue="" placeholder={settings.slack_webhook_set ? "•••••••• (set)" : "https://hooks.slack.com/services/…"} mono />
@@ -79,7 +79,7 @@ export function AlertsSection({ settings }: { settings: AlertSettingsView }) {
         {error && <p role="alert" className="text-xs font-medium">{error}</p>}
         {results?.map((r) => (
           <p key={r.channel} className="flex items-center gap-2 text-[12.5px]">
-            {r.ok ? <Glyph glyph="on" className="h-[7px] w-[7px]" /> : <span className="rounded-full bg-foreground px-1.5 text-[10.5px] font-semibold text-background">failed</span>}
+            {r.ok ? <StatusDot glyph="on" className="h-[7px] w-[7px]" /> : <span className="rounded-full bg-foreground px-1.5 text-[10.5px] font-semibold text-background">failed</span>}
             <span className="font-medium">{r.channel}</span>
             <span className="text-muted-foreground">{r.detail}</span>
           </p>

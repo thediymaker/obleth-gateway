@@ -1,7 +1,6 @@
 "use client";
 
 import type { ReactNode } from "react";
-import { Badge } from "@/components/ui/badge";
 import {
   ResponsiveContainer, LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid, ReferenceLine,
 } from "recharts";
@@ -9,14 +8,9 @@ import type { BenchResult } from "@/lib/charo/bench/types";
 import { Rail, MicroLabel } from "@/components/charo/rail";
 import { tip } from "@/components/chart-tooltip";
 import { axisTick, chartGrid, timeCursor } from "@/lib/chart-style";
+import { Pill } from "@/components/overview/ui";
+import { cn } from "@/lib/utils";
 
-const GRADE_TONE: Record<string, string> = {
-  A: "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400",
-  B: "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400",
-  C: "bg-amber-500/15 text-amber-600 dark:text-amber-400",
-  D: "bg-orange-500/15 text-orange-600 dark:text-orange-400",
-  F: "bg-destructive/15 text-destructive",
-};
 
 // Validated against the dark card surface (#111113): the three panel leads clear
 // every all-pairs gate, and p99/p50 are one hue at two steps because they are the
@@ -137,7 +131,7 @@ export function BenchResultCard({ data }: { data: unknown }) {
         </div>
         {r.grade && (
           <div className="flex shrink-0 flex-col items-end gap-0.5">
-            <Badge className={GRADE_TONE[r.grade] ?? ""}>{r.grade} · {r.score ?? 0}/100</Badge>
+            <Pill inverted={r.grade === "F"} className={cn(r.grade === "A" && "font-semibold text-foreground")}>{r.grade} · {r.score ?? 0}/100</Pill>
             {kneeFloor && (
               <span className="text-[10px] text-muted-foreground">
                 {r.capped ? "provisional — ramp capped" : "no degradation seen"}

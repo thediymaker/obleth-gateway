@@ -1,10 +1,8 @@
 "use client";
 
 import { useCallback, useState, useTransition } from "react";
-import { AlertCircle } from "lucide-react";
 import { deleteMcpServerAction, saveMcpServerAction, setMcpServerEnabledAction, setMcpServerTenantAction, setModelToolServerAction } from "@/app/actions";
 import { SettingsForm, type SaveResult } from "@/components/access/settings-form";
-import { Glyph } from "@/components/deployments/ui";
 import { Setting, Switch, TextField } from "@/components/models/fields";
 import { Notice, Sheet } from "@/components/models/ui";
 import { Pill } from "@/components/overview/ui";
@@ -13,15 +11,11 @@ import { useConfirm } from "@/components/ui/confirm-dialog";
 import { MCP_STATE_LABEL, probeLatency, type McpRow, type McpState } from "@/lib/mcp-model";
 import type { ModelRoute } from "@/lib/obleth";
 import { compact } from "@/lib/format";
-import { cn } from "@/lib/utils";
+import { StatusPill } from "@/components/ui/status";
 
-/** Monochrome: filled dot answering, half dot old-style or checking, dashed off, white pill not answering. */
+/** Filled dot answering, half dot old-style or checking, dashed off, the attention pill not answering. */
 export function McpStateMark({ state }: { state: McpState }) {
-  if (state === "not-answering") {
-    return <span className="inline-flex h-[22px] items-center gap-1 whitespace-nowrap rounded-full bg-foreground px-2 text-[11.5px] font-semibold text-background"><AlertCircle className="h-3 w-3" aria-hidden />{MCP_STATE_LABEL[state]}</span>;
-  }
-  const glyph = state === "answering" ? "on" : state === "off" ? "off" : "half";
-  return <Pill><Glyph glyph={glyph} className="h-[7px] w-[7px]" />{MCP_STATE_LABEL[state]}</Pill>;
+  return <StatusPill glyph={state === "answering" ? "on" : state === "off" ? "off" : "half"} attention={state === "not-answering"}>{MCP_STATE_LABEL[state]}</StatusPill>;
 }
 
 const SHOWN = 6;

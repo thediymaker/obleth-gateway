@@ -7,23 +7,15 @@ import { HealthGlyph, SectionLabel } from "@/components/overview/ui";
 import { STATUS_LABELS, type ModelStatus } from "@/lib/models-model";
 import { providerForModel } from "@/lib/model-providers";
 import { cn } from "@/lib/utils";
+import { StatusDot, StatusText, type StatusGlyph } from "@/components/ui/status";
 
-/**
- * A model's standing in the monochrome vocabulary: a filled dot while it
- * serves, a ring before it is checked, a dashed ring in maintenance, the
- * inverted DOWN badge when checks fail, and a plain "Off" when switched off.
- */
+const MODEL_GLYPH: Record<Exclude<ModelStatus, "down">, StatusGlyph> = { serving: "on", unchecked: "none", maintenance: "off", off: "off" };
+
+/** A model's standing in the shared status marks; failing checks is the DOWN pill. */
 export function StatusMark({ status, className, label = true }: { status: ModelStatus; className?: string; label?: boolean }) {
-  if (status === "off") {
-    return <span className={cn("inline-flex items-center gap-2 text-[12.5px] text-muted-foreground", className)}><span aria-hidden className="inline-block h-2 w-2 rounded-[2px] border-[1.5px] border-muted-foreground/70" />{label && "Off"}</span>;
-  }
-  const glyph = status === "serving" ? "healthy" : status === "down" ? "unhealthy" : status === "maintenance" ? "maintenance" : "unknown";
-  return (
-    <span className={cn("inline-flex items-center gap-2 text-[12.5px]", status === "serving" ? "text-secondary-foreground" : "text-foreground", className)}>
-      <HealthGlyph state={glyph} />
-      {label && glyph !== "unhealthy" && STATUS_LABELS[status]}
-    </span>
-  );
+  if (status === "down") return <HealthGlyph state="unhealthy" className={className} />;
+  const glyph = MODEL_GLYPH[status];
+  return label ? <StatusText glyph={glyph} className={className}>{STATUS_LABELS[status]}</StatusText> : <StatusDot glyph={glyph} label={STATUS_LABELS[status]} className={className} />;
 }
 
 /**

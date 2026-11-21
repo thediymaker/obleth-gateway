@@ -7,7 +7,7 @@ import { useInfiniteQuery } from "@tanstack/react-query";
 import { Search } from "lucide-react";
 import { cancelBatchAction } from "@/app/(dashboard)/batches/batches-actions";
 import { Tile } from "@/components/models/ui";
-import { Pill, Segmented } from "@/components/overview/ui";
+import { Segmented } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
 import {
   BATCH_FILTERS,
@@ -30,6 +30,7 @@ import { compact, formatNumber } from "@/lib/format";
 import { cn, getJson } from "@/lib/utils";
 import { ListFooter } from "@/components/ui/list-footer";
 import { ReadNotice } from "@/components/ui/read-state";
+import { StatusText, type StatusGlyph } from "@/components/ui/status";
 
 const COLS = "grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)_minmax(0,0.9fr)_minmax(220px,1.6fr)_minmax(0,1.3fr)_88px]";
 
@@ -61,23 +62,11 @@ function Progress({ b, tone }: { b: AdminBatch; tone: BatchTone }) {
   );
 }
 
+const TONE_GLYPH: Record<Exclude<BatchTone, "problem">, StatusGlyph> = { running: "half", waiting: "half", done: "on", stopped: "off" };
+
 function StateLabel({ tone, label }: { tone: BatchTone; label: string }) {
-  if (tone === "problem") return <Pill inverted className="h-5 px-2 text-[11px]">{label}</Pill>;
-  return (
-    <span className="inline-flex items-center gap-1.5 text-[12.5px]">
-      <span
-        aria-hidden
-        className={cn(
-          "h-[7px] w-[7px] rounded-full",
-          tone === "running" && "animate-pulse bg-foreground",
-          tone === "waiting" && "border border-foreground",
-          tone === "done" && "bg-foreground",
-          tone === "stopped" && "border border-dashed border-muted-foreground",
-        )}
-      />
-      {label}
-    </span>
-  );
+  if (tone === "problem") return <StatusText glyph="off" attention>{label}</StatusText>;
+  return <StatusText glyph={TONE_GLYPH[tone]} className="text-foreground">{label}</StatusText>;
 }
 
 export function BatchesView({ initial, initialFilter }: { initial: AdminBatchList | null; initialFilter: BatchFilter }) {

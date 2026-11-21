@@ -5,6 +5,7 @@ import Link from "next/link";
 import { ArrowRight } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { HealthState } from "@/lib/overview-model";
+import { AttentionPill, StatusDot } from "@/components/ui/status";
 
 /** The Overview's card: one border, one radius, one header shape. */
 export function Panel({ title, subtitle, action, children, className, label }: {
@@ -42,26 +43,13 @@ export function Pill({ children, inverted, className }: { children: ReactNode; i
   );
 }
 
-/**
- * Monochrome health: a filled dot for healthy, a ring for no data, a dashed
- * ring for maintenance. Failing models get an inverted "Down" badge instead,
- * which is the one attention mark on the page.
- */
+const HEALTH_GLYPH = { healthy: "on", unknown: "none", maintenance: "off" } as const;
+const HEALTH_WORD = { healthy: "Healthy", unknown: "No health data", maintenance: "In maintenance" } as const;
+
+/** A model's health in the shared status marks; failing is the small attention pill. */
 export function HealthGlyph({ state, className }: { state: HealthState; className?: string }) {
-  if (state === "unhealthy") return <Pill inverted className={cn("h-4 px-1.5 text-[10px] font-bold tracking-wide", className)}>DOWN</Pill>;
-  return (
-    <span
-      role="img"
-      aria-label={state === "healthy" ? "Healthy" : state === "maintenance" ? "In maintenance" : "No health data"}
-      className={cn(
-        "inline-block h-2 w-2 shrink-0 rounded-full",
-        state === "healthy" && "bg-secondary-foreground",
-        state === "unknown" && "border-[1.5px] border-muted-foreground",
-        state === "maintenance" && "border-[1.5px] border-dashed border-secondary-foreground",
-        className,
-      )}
-    />
-  );
+  if (state === "unhealthy") return <AttentionPill icon={false} className={cn("h-4 px-1.5 text-[10px] font-bold tracking-wide", className)}>DOWN</AttentionPill>;
+  return <StatusDot glyph={HEALTH_GLYPH[state]} label={HEALTH_WORD[state]} className={className} />;
 }
 
 /** A horizontal fill bar for "x of y": pool load, share of traffic. */

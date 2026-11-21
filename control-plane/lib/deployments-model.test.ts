@@ -86,7 +86,7 @@ describe("a Slurm deployment's state", () => {
   });
 
   it("is paused when turned off", () => {
-    expect(managedState(spec({ enabled: false }), [replica({ state: "draining" })])).toMatchObject({ state: "paused", why: "stopping its jobs" });
+    expect(managedState(spec({ enabled: false }), [replica({ state: "draining" })])).toMatchObject({ state: "off", why: "stopping its jobs" });
   });
 });
 

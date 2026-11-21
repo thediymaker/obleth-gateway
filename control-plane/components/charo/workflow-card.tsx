@@ -57,7 +57,7 @@ function ImageField({ value, onChange }: { value: string; onChange: (v: string) 
           onClick={() => inputRef.current?.click()}
           onDragOver={(e) => e.preventDefault()}
           onDrop={(e) => { e.preventDefault(); readFile(e.dataTransfer.files); }}
-          className="flex h-24 w-full flex-col items-center justify-center gap-1 rounded-md border border-dashed border-violet-400/40 text-muted-foreground hover:bg-violet-500/[0.05]"
+          className="flex h-24 w-full flex-col items-center justify-center gap-1 rounded-md border border-dashed border-border text-muted-foreground hover:bg-accent/40"
         >
           <ImagePlus className="h-4 w-4" />
           <span className="text-[11.5px]">Click or drop an image — the vision test asks the model to describe it</span>
@@ -126,7 +126,7 @@ export function WorkflowCard({
               <DropdownMenuTrigger asChild>
                 <button
                   type="button"
-                  className="flex h-9 w-full items-center justify-between rounded-md border border-violet-400/40 bg-background px-3 text-sm shadow-sm hover:bg-accent/40"
+                  className="flex h-9 w-full items-center justify-between rounded-md border border-border bg-background px-3 text-sm shadow-sm hover:bg-accent/40"
                 >
                   <span className="truncate">{model ? model.model_name : "Select a model…"}</span>
                   <ChevronDown className="ml-2 h-4 w-4 shrink-0 opacity-60" />
@@ -180,7 +180,7 @@ export function WorkflowCard({
               });
               return (
                 <button key={o.value} type="button" onClick={toggle} className="flex w-full items-center gap-2 rounded-md px-1 py-1.5 text-left hover:bg-accent/40">
-                  <span className={cn("flex h-4 w-4 items-center justify-center rounded border-2", selected ? "border-cyan-400 bg-cyan-400 text-background" : "border-muted-foreground/50")}>
+                  <span className={cn("flex h-4 w-4 items-center justify-center rounded border-2", selected ? "border-foreground bg-foreground text-background" : "border-muted-foreground/50")}>
                     {selected && <Check className="h-3 w-3" />}
                   </span>
                   <span className="text-sm">{o.label}</span>

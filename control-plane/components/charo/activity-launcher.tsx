@@ -1,6 +1,5 @@
 "use client";
 
-import { cn } from "@/lib/utils";
 import type { Activity } from "@/lib/charo/activities/types";
 import { ensureActivitiesRegistered, listActivities } from "@/lib/charo/activities";
 
@@ -8,13 +7,6 @@ function useActivities(): Activity[] {
   ensureActivitiesRegistered();
   return listActivities();
 }
-
-const TINT: Record<string, string> = {
-  test_capabilities: "bg-violet-500/15 text-violet-300",
-  chat_with_model: "bg-sky-400/15 text-sky-300",
-  benchmark: "bg-emerald-400/15 text-emerald-300",
-};
-const DEFAULT_TINT = "bg-violet-500/15 text-violet-300";
 
 export function ActivityCards({ onPick }: { onPick: (a: Activity) => void }) {
   const activities = useActivities();
@@ -27,9 +19,9 @@ export function ActivityCards({ onPick }: { onPick: (a: Activity) => void }) {
             key={a.id}
             type="button"
             onClick={() => onPick(a)}
-            className="flex w-full items-center gap-3 rounded-[10px] px-2.5 py-[9px] text-left transition-colors hover:bg-violet-500/[0.07]"
+            className="flex w-full items-center gap-3 rounded-[10px] px-2.5 py-[9px] text-left transition-colors hover:bg-accent/40"
           >
-            <span className={cn("flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-lg", TINT[a.id] ?? DEFAULT_TINT)}>
+            <span className="flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-lg border border-border text-secondary-foreground">
               {Icon && <Icon className="h-[15px] w-[15px]" />}
             </span>
             <span className="min-w-0">

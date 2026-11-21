@@ -5,7 +5,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { ChevronDown, ChevronRight, RefreshCw, Search } from "lucide-react";
-import { Kpi, Panel, PanelLink, Segmented } from "@/components/overview/ui";
+import { Kpi, Panel, PanelLink, Pill, Segmented } from "@/components/overview/ui";
 import { Input } from "@/components/ui/input";
 import { ListFooter } from "@/components/ui/list-footer";
 import { Select } from "@/components/ui/select";
@@ -60,9 +60,7 @@ const stamp = (ms: number) => (ms ? new Date(ms).toLocaleString() : "");
 
 function NewTag({ children = "New" }: { children?: string }) {
   return (
-    <span className="rounded-full border border-[hsl(38_65%_62%/0.5)] px-1.5 py-px text-[10.5px] font-medium text-[hsl(38_65%_62%)]">
-      {children}
-    </span>
+    <Pill className="h-[18px] px-1.5 text-[10.5px]">{children}</Pill>
   );
 }
 
@@ -113,9 +111,7 @@ function KeyRow({ row, range, now, open, onToggle }: { row: KeyAccessRow; range:
             <span className="truncate font-medium" title={row.keyName}>{row.keyName || `${row.keyId.slice(0, 8)}…`}</span>
             {(row.newCountries.length > 0 || row.newNetworks > 0) && <NewTag>{row.newCountries.length > 0 ? "New country" : "New network"}</NewTag>}
             {row.refused > 0 && (
-              <span className="rounded-full border border-[hsl(350_55%_64%/0.5)] px-1.5 py-px text-[10.5px] font-medium text-[hsl(350_55%_64%)]">
-                {compact(row.refused)} refused
-              </span>
+              <Pill inverted className="h-[18px] px-1.5 text-[10.5px]">{compact(row.refused)} refused</Pill>
             )}
           </span>
           <span className="truncate text-xs text-muted-foreground">{row.tenantName}</span>

@@ -4,7 +4,7 @@ import { memo, useCallback, useDeferredValue, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Plus, Search } from "lucide-react";
-import { BudgetBar, StateDot, TENANT_STATUS_LABEL, tenantState } from "@/components/access/ui";
+import { BudgetBar, TENANT_STATUS_LABEL, tenantGlyph } from "@/components/access/ui";
 import { AddTenantSheet } from "@/components/access/add-tenant";
 import { useFairshareLive } from "@/components/fairshare/hooks";
 import { Tile } from "@/components/models/ui";
@@ -31,6 +31,7 @@ import { logsHref } from "@/lib/log-links";
 import type { BudgetUsage, Tenant, UsageAgg } from "@/lib/obleth";
 import { compact, money } from "@/lib/format";
 import { cn } from "@/lib/utils";
+import { StatusDot } from "@/components/ui/status";
 
 const HAS_OPTIONS: { value: TenantHas; label: string }[] = [
   { value: "any", label: "Has anything" },
@@ -77,7 +78,7 @@ const TenantListRow = memo(function TenantListRow({ row: r, monthSpend, onOpen }
         <Link href={href} className="truncate font-medium text-foreground hover:underline">{t.name}</Link>
         <span className="truncate text-[11.5px] text-muted-foreground">{t.organization || t.description || t.contact_email || " "}</span>
       </span>
-      <span className="inline-flex items-center gap-2"><StateDot state={tenantState(t.status)} />{TENANT_STATUS_LABEL[t.status] ?? t.status}</span>
+      <span className="inline-flex items-center gap-2"><StatusDot glyph={tenantGlyph(t.status)} />{TENANT_STATUS_LABEL[t.status] ?? t.status}</span>
       <span className="truncate font-mono text-[12px]">{t.fairshare_group} · {t.weight}</span>
       <Link href={`/keys?tenant=${t.id}`} className="text-right font-mono text-[12px] hover:underline" title={r.keysOff ? `${r.keysOff} off` : undefined}>{r.keys}</Link>
       <span className="text-right font-mono text-[12px]">{r.users}</span>

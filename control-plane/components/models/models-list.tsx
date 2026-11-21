@@ -14,30 +14,7 @@ import { Meter, Segmented } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
-import {
-  buildModelRows,
-  contextLabel,
-  EMPTY_FILTERS,
-  filterRows,
-  groupCounts,
-  LIFECYCLE_BADGES,
-  lifecycleLabel,
-  lifecycleStatus,
-  MODEL_TYPE_NAMES,
-  modelHref,
-  RUNS_LABELS,
-  SORT_LABELS,
-  sortRows,
-  statusLine,
-  tagLabels,
-  TYPE_GROUPS,
-  type ModelFilters,
-  type ModelRow,
-  type ModelSort,
-  type RunsOn,
-  type StatusFilter,
-  type TypeGroup,
-} from "@/lib/models-model";
+import { buildModelRows, contextLabel, EMPTY_FILTERS, filterRows, groupCounts, LIFECYCLE_BADGES, lifecycleLabel, lifecycleStatus, MODEL_TYPE_NAMES, type ModelFilters, modelHref, type ModelRow, type ModelSort, RUNS_LABELS, type RunsOn, SORT_LABELS, sortRows, STATUS_LABELS, type StatusFilter, statusLine, tagLabels, TYPE_GROUPS, type TypeGroup } from "@/lib/models-model";
 import type { CacheStats, ModelFamily, ModelHealthSummary, ModelRoute, UsageModelAgg } from "@/lib/obleth";
 import { isBenchmarkRoute } from "@/lib/overview-model";
 import { compact, formatMs } from "@/lib/format";
@@ -219,7 +196,7 @@ export function ModelsList({
       <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
         <Tile label="Models" value={real.length} detail={`${real.filter((r) => r.model.enabled).length} on · ${real.filter((r) => !r.model.enabled).length} off`} />
         <Tile
-          label="Failing health checks"
+          label={STATUS_LABELS.down}
           value={down.length}
           detail={down.length ? down.map((r) => r.name).slice(0, 2).join(", ") + (down.length > 2 ? ` +${down.length - 2}` : "") : "Every check passing"}
           emphasis={down.length > 0}

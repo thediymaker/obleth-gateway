@@ -6,7 +6,7 @@ import { useQuery } from "@tanstack/react-query";
 import { deleteKeyAction, replaceKeyAction, saveKeySettingsAction, setKeysDisabledAction } from "@/app/actions";
 import { PERIOD_OPTIONS } from "@/lib/access-model";
 import { SettingsForm } from "@/components/access/settings-form";
-import { BudgetBar, StateDot } from "@/components/access/ui";
+import { BudgetBar } from "@/components/access/ui";
 import { SelectField, Setting, Switch, TextField } from "@/components/models/fields";
 import { AllowedCountriesField } from "@/components/access/allowed-countries-field";
 import { AllowedNetworksField } from "@/components/access/allowed-networks-field";
@@ -21,6 +21,7 @@ import { logsHref } from "@/lib/log-links";
 import type { ApiKey, NamedNetwork, Tenant, UsageDailyRow } from "@/lib/obleth";
 import { compact, money } from "@/lib/format";
 import { cn, getJson } from "@/lib/utils";
+import { StatusDot } from "@/components/ui/status";
 
 const DAY_MS = 86_400_000;
 
@@ -191,7 +192,7 @@ export function KeyPanel({
         width="w-[min(620px,100vw)]"
         description={
           <span className="flex flex-wrap items-center gap-2">
-            <Pill><StateDot state={k.disabled ? "off" : "on"} />{k.disabled ? "Off" : "On"}</Pill>
+            <Pill><StatusDot glyph={k.disabled ? "off" : "on"} />{k.disabled ? "Off" : "On"}</Pill>
             <Pill>{identity ? "identity key" : "secret key"}</Pill>
             {!identity && <span className="font-mono text-[12px]">{k.key_prefix}…</span>}
             <span>in {tenant ? <Link href={tenantHref(tenant)} className="text-secondary-foreground underline underline-offset-2 hover:text-foreground">{tenant.name}</Link> : "a deleted tenant"}{made ? ` · made ${made}` : ""}</span>

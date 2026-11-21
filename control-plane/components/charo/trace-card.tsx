@@ -62,7 +62,7 @@ export function TraceCard({
       <div className="flex flex-wrap gap-x-1.5">
         {trace.boonsFired.length === 0 && notFired.length === 0 && <span>boons none</span>}
         {trace.boonsFired.map((b) => (
-          <span key={b} className="text-emerald-600 dark:text-emerald-400/90">✓ {label(b)}</span>
+          <span key={b} className="text-secondary-foreground">✓ {label(b)}</span>
         ))}
         {notFired.map((b) => (
           <span key={b} className="text-muted-foreground/50">{label(b)}</span>

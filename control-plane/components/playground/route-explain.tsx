@@ -2,9 +2,9 @@
 
 import { useState } from "react";
 import { AlertTriangle, ChevronDown, ChevronRight } from "lucide-react";
-import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 import type { RouteExplainView } from "@/lib/obleth";
+import { Pill } from "./ui";
 
 const fmt = (n: number) => n.toFixed(3);
 
@@ -45,7 +45,7 @@ export function RouteExplainPanel({
       {explain.tier_floor_clamped && (
         <p
           role="status"
-          className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-700 dark:text-amber-400"
+          className="flex items-start gap-2 rounded-md border border-foreground px-3 py-2 text-sm font-medium text-foreground"
         >
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
           <span>
@@ -132,9 +132,9 @@ export function RouteExplainPanel({
                       <ChevronRight className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
                     )}
                     <span className="truncate">{row.model}</span>
-                    {row.chosen && <Badge className="shrink-0 border-violet-500/30 text-violet-600 dark:text-violet-400">chosen</Badge>}
+                    {row.chosen && <Pill inverted className="h-5 px-2 text-[11px]">chosen</Pill>}
                     {wasLiveChoice && (
-                      <Badge className="shrink-0 border-amber-500/30 text-amber-600 dark:text-amber-400">live pick</Badge>
+                      <Pill className="h-5 px-2 text-[11px]">live pick</Pill>
                     )}
                     {tiering && row.level > 0 && (
                       <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
@@ -195,7 +195,7 @@ export function RouteExplainPanel({
                         score = {fmt(blend)} (blend) × {fmt(row.bias)} (bias) = <strong>{fmt(row.score)}</strong>
                       </p>
                       {wasLiveChoice && (
-                        <p className="text-amber-600 dark:text-amber-400">
+                        <p className="font-medium text-foreground">
                           This model was chosen by the live weights.
                         </p>
                       )}

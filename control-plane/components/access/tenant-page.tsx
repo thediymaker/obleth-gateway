@@ -7,7 +7,7 @@ import { useQuery } from "@tanstack/react-query";
 import { ChevronDown, MoreHorizontal, Search } from "lucide-react";
 import { deleteTenantAction, setTenantStatusAction } from "@/app/actions";
 import { TenantSettings } from "@/components/access/tenant-settings";
-import { BudgetBar, StateDot, TENANT_STATUS_LABEL, tenantState } from "@/components/access/ui";
+import { BudgetBar, TENANT_STATUS_LABEL, tenantGlyph } from "@/components/access/ui";
 import { useFairshareLive } from "@/components/fairshare/hooks";
 import { Notice, Tile } from "@/components/models/ui";
 import { Meter, Panel, Pill, Segmented } from "@/components/overview/ui";
@@ -30,6 +30,7 @@ import { logsHref } from "@/lib/log-links";
 import type { ApiKey, BudgetUsage, Tenant } from "@/lib/obleth";
 import { compact, money } from "@/lib/format";
 import { cn, getJson } from "@/lib/utils";
+import { StatusDot } from "@/components/ui/status";
 
 type NavId = "overview" | "profile" | "limits" | "hours" | "budget" | "models" | "guardrails" | "compression" | "advanced" | "keys" | "people" | "activity";
 
@@ -357,7 +358,7 @@ export function TenantPage({
           </p>
           <h1 className="truncate text-[26px] font-semibold tracking-tight">{tenant.name}</h1>
           <div className="flex flex-wrap items-center gap-2">
-            <Pill><StateDot state={tenantState(tenant.status)} className="h-[7px] w-[7px]" />{TENANT_STATUS_LABEL[tenant.status] ?? tenant.status}</Pill>
+            <Pill><StatusDot glyph={tenantGlyph(tenant.status)} className="h-[7px] w-[7px]" />{TENANT_STATUS_LABEL[tenant.status] ?? tenant.status}</Pill>
             <Pill>{tenant.fairshare_group} group · weight {tenant.weight}</Pill>
             <Pill>{tenant.weekly_windows?.length || tenant.active_from || tenant.active_until ? accessLabel(tenant) : "Open all hours"}</Pill>
             {live && live.queued > 0 && <Pill inverted>{live.queued} waiting for slots</Pill>}
@@ -370,7 +371,7 @@ export function TenantPage({
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button type="button" variant="outline" size="sm" className="h-9" disabled={pending} aria-label="Status">
-                <StateDot state={tenantState(tenant.status)} />{TENANT_STATUS_LABEL[tenant.status] ?? tenant.status}<ChevronDown className="h-3.5 w-3.5" />
+                <StatusDot glyph={tenantGlyph(tenant.status)} />{TENANT_STATUS_LABEL[tenant.status] ?? tenant.status}<ChevronDown className="h-3.5 w-3.5" />
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
@@ -511,7 +512,7 @@ export function TenantPage({
                   return (
                     <Link key={k.id} href={`/keys?key=${k.id}`} className={cn("grid grid-cols-[minmax(0,1fr)_96px_64px_64px] items-center gap-3 border-t border-border py-2 text-[13px] hover:bg-muted/30", k.disabled && "text-muted-foreground")}>
                       <span className="flex min-w-0 items-center gap-2">
-                        <StateDot state={k.disabled ? "off" : "on"} />
+                        <StatusDot glyph={k.disabled ? "off" : "on"} />
                         <span className="truncate">{k.name || k.key_prefix}</span>
                         <span className="shrink-0 font-mono text-[11.5px] text-muted-foreground">{k.kind === "identity" ? "identity" : `${k.key_prefix}…`}</span>
                         {k.disabled && <span className="text-[11.5px]">· off</span>}

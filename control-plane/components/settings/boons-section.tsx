@@ -4,12 +4,12 @@ import { useState, type ReactNode } from "react";
 import Link from "next/link";
 import { Plus, X } from "lucide-react";
 import { SettingsCard } from "@/components/access/ui";
-import { Glyph } from "@/components/deployments/ui";
 import { SelectField, Setting, Switch, TextArea, TextField } from "@/components/models/fields";
 import { Pill } from "@/components/overview/ui";
 import type { BoonSettingsView, CompressorStatusView, KnowledgeSettingsView, ModelRoute, SpeculationCategoryGate } from "@/lib/obleth";
 import { BOONS, boonSummary, modelsAsking, SPEC_PROFILES, specProfileOf, specValues, type BoonKey, type SpecValues } from "@/lib/settings-model";
 import { cn } from "@/lib/utils";
+import { StatusDot } from "@/components/ui/status";
 
 function NumberField({ name, label, value, unit, className = "w-24" }: { name: string; label: string; value: number; unit?: string; className?: string }) {
   return (
@@ -282,7 +282,7 @@ export function BoonsSection({ settings: b, models, knowledge, compressor }: { s
       </>)}
 
       <div id="boon-knowledge" className="grid min-h-[60px] grid-cols-[44px_minmax(0,1.1fr)_minmax(0,1.5fr)_minmax(0,1fr)_84px] items-center gap-3.5 border-t border-border px-[18px] py-2.5 text-[13px]">
-        <span className="flex justify-center"><Glyph glyph={knowledge?.enabled ? "on" : "off"} /></span>
+        <span className="flex justify-center"><StatusDot glyph={knowledge?.enabled ? "on" : "off"} /></span>
         <span className="flex flex-col"><span className="font-medium">Knowledge</span><span className="text-[11.5px] text-muted-foreground">Quotes your documents to the model</span></span>
         <span className="text-muted-foreground">Retrieval is {knowledge?.enabled ? "on" : "off"} · set on the Knowledge page</span>
         <span className="text-muted-foreground">{models.filter((m) => (m.boons ?? []).includes("knowledge")).length || "none"}</span>

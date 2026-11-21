@@ -7,7 +7,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Plus, Search } from "lucide-react";
 import { RecipesTab } from "@/components/deployments/recipes-tab";
 import { SlurmConnection } from "@/components/deployments/slurm-connection";
-import { Glyph, ReplicaDots, StateMark } from "@/components/deployments/ui";
+import { ReplicaDots, StateMark } from "@/components/deployments/ui";
 import { useFairshareLive } from "@/components/fairshare/hooks";
 import { Tile } from "@/components/models/ui";
 import { Meter, Pill, Segmented } from "@/components/overview/ui";
@@ -38,6 +38,7 @@ import { poolOccupancy } from "@/lib/occupancy";
 import { useClusterResources } from "@/lib/use-cluster-resources";
 import { cn, getJson } from "@/lib/utils";
 import { ReadNotice } from "@/components/ui/read-state";
+import { StatusDot } from "@/components/ui/status";
 
 const COLS = "grid-cols-[minmax(0,1.4fr)_minmax(130px,0.9fr)_150px_minmax(0,1.4fr)_130px_84px_84px]";
 
@@ -170,7 +171,7 @@ export function DeploymentsList({ initial, recipes: initialRecipes, tab: initial
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <span className="flex items-center gap-2.5"><span className="text-sm font-semibold">Kubernetes</span><Pill>watched</Pill></span>
                 <span className="inline-flex items-center gap-2 text-xs text-secondary-foreground">
-                  <Glyph glyph={data.discovery?.enabled ? "on" : "off"} className="h-[7px] w-[7px]" />
+                  <StatusDot glyph={data.discovery?.enabled ? "on" : "off"} className="h-[7px] w-[7px]" />
                   {data.discovery?.enabled ? `Discovery every ${data.discovery.interval_secs} s` : "Discovery is off"}
                 </span>
               </div>
@@ -185,7 +186,7 @@ export function DeploymentsList({ initial, recipes: initialRecipes, tab: initial
                 <span className="flex items-center gap-2.5"><span className="text-sm font-semibold">Slurm</span><Pill>launched by obleth</Pill></span>
                 {slurmOn && (
                   <span className="inline-flex items-center gap-2 text-xs text-secondary-foreground">
-                    <Glyph glyph={data.slurm?.provisioner_running ? (data.slurm.provisioner_tick_status === "error" ? "half" : "on") : "off"} className="h-[7px] w-[7px]" />
+                    <StatusDot glyph={data.slurm?.provisioner_running ? (data.slurm.provisioner_tick_status === "error" ? "half" : "on") : "off"} className="h-[7px] w-[7px]" />
                     {data.slurm?.provisioner_running ? `Provisioner checked in ${ago(data.slurm.provisioner_last_seen_secs)}${data.slurm.provisioner_tick_status === "error" ? ", and its last pass failed" : ""}` : prov.kind === "never" ? "No provisioner has run yet" : `Provisioner stopped, last seen ${ago(data.slurm?.provisioner_last_seen_secs)}`}
                   </span>
                 )}
@@ -316,7 +317,7 @@ export function DeploymentsList({ initial, recipes: initialRecipes, tab: initial
             </div>
             <div className="flex flex-wrap justify-between gap-2 border-t border-border px-[18px] py-3 text-[12.5px] text-muted-foreground">
               <span>{shown.length === rows.length ? `${rows.length} deployments` : `${shown.length} of ${rows.length} deployments`} · click one for its page</span>
-              <span>A filled dot means serving, a half dot starting, a dashed one not running. A filled pill marks a deployment that needs you.</span>
+              <span>Filled dot serving · half dot starting · ring not seen lately · dashed ring off or not running · white pill needs you</span>
             </div>
           </section>
         </>

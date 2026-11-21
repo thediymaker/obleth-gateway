@@ -6,12 +6,13 @@ import { cn } from "@/lib/utils";
 import { Rail, MicroLabel } from "@/components/charo/rail";
 import { TraceCard } from "@/components/charo/trace-card";
 import type { CapabilityResult, TestOutcome, TestStatus } from "@/lib/charo/capabilities/types";
+import { AttentionPill, StatusDot } from "@/components/ui/status";
 
-const DOT: Record<TestStatus, string> = {
-  pass: "bg-emerald-400",
-  warn: "bg-amber-400",
-  fail: "bg-destructive",
-};
+/** A test result in the shared status marks: passed filled, warned half, failed the attention pill. */
+function TestMark({ status }: { status: TestStatus }) {
+  if (status === "fail") return <AttentionPill icon={false} className="h-4 shrink-0 px-1.5 text-[10px]">failed</AttentionPill>;
+  return <StatusDot glyph={status === "pass" ? "on" : "half"} label={status === "pass" ? "passed" : "warning"} className="h-[7px] w-[7px]" />;
+}
 
 function Output({ text }: { text: string }) {
   const [full, setFull] = useState(false);
@@ -22,7 +23,7 @@ function Output({ text }: { text: string }) {
         {text}
       </pre>
       {long && (
-        <button type="button" onClick={() => setFull((f) => !f)} className="mt-1 text-[11px] text-violet-600 hover:underline dark:text-violet-300">
+        <button type="button" onClick={() => setFull((f) => !f)} className="mt-1 text-[11px] text-secondary-foreground underline underline-offset-2 hover:text-foreground">
           {full ? "collapse" : "show full output"}
         </button>
       )}
@@ -35,7 +36,7 @@ function Row({ t }: { t: TestOutcome }) {
   return (
     <div>
       <button type="button" onClick={() => setOpen((o) => !o)} className="flex w-full items-center gap-2 py-[5px] text-left">
-        <span className={cn("h-[7px] w-[7px] shrink-0 rounded-full", DOT[t.status])} aria-label={t.status} />
+        <TestMark status={t.status} />
         <span className="text-[13px] text-foreground/90">{t.label}</span>
         <span className="ml-auto truncate text-[11.5px] text-muted-foreground">{t.detail}</span>
         <ChevronRight className={cn("h-3.5 w-3.5 shrink-0 text-muted-foreground/70 transition-transform", open && "rotate-90")} />

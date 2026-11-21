@@ -9,7 +9,7 @@ const DOCS_BASE = "https://obleth.com/docs";
 function SourceRow({ source }: { source: DocsSource }) {
   return (
     <a href={`${DOCS_BASE}/${source.route}`} target="_blank" rel="noreferrer" className="group block">
-      <span className="text-[13px] font-semibold text-violet-600 group-hover:underline dark:text-violet-300">{source.title}</span>
+      <span className="text-[13px] font-semibold text-foreground group-hover:underline">{source.title}</span>
       <span className="text-[12px] text-muted-foreground"> › {source.heading}</span>
       <p className="mt-0.5 line-clamp-2 text-[12px] leading-[1.45] text-muted-foreground/90">
         {cleanSnippet(source.snippet)}

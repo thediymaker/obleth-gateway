@@ -1,5 +1,7 @@
 import type { DeploymentData } from "@/lib/deployments-data";
 import type { CapacityDiscoveryModelView, ClusterResources, ManagedModelSpec, ModelReplica, ModelRoute, SlurmSettingsView } from "@/lib/obleth";
+import { STATUS_LABELS } from "@/lib/models-model";
+import { type StatusGlyph } from "@/components/ui/status";
 
 /**
  * The Deployments pages' pure logic: which models are deployments, what state
@@ -12,12 +14,12 @@ import type { CapacityDiscoveryModelView, ClusterResources, ManagedModelSpec, Mo
 
 export type DeployKind = "slurm" | "kubernetes";
 
-export type DeployState = "serving" | "starting" | "paused" | "stopped" | "blocked" | "not-running" | "no-replicas" | "stale";
+export type DeployState = "serving" | "starting" | "off" | "stopped" | "blocked" | "not-running" | "no-replicas" | "stale";
 
 export const STATE_LABEL: Record<DeployState, string> = {
   serving: "Serving",
   starting: "Starting",
-  paused: "Paused",
+  off: STATUS_LABELS.off,
   stopped: "Stopped",
   blocked: "Can't start",
   "not-running": "Not running",
@@ -25,14 +27,20 @@ export const STATE_LABEL: Record<DeployState, string> = {
   stale: "Not seen lately",
 };
 
-/** Filled dot, half dot, dashed ring, or the inverted "needs you" pill. */
-export type Glyph = "on" | "half" | "off" | "attention";
+/** A state's mark: one of the shared status dots, or the inverted "needs you" pill. */
+export type Glyph = StatusGlyph | "attention";
 
 export function glyphOf(state: DeployState): Glyph {
   if (state === "serving") return "on";
   if (state === "starting") return "half";
   if (state === "stopped" || state === "blocked" || state === "no-replicas") return "attention";
+  if (state === "stale") return "none";
   return "off";
+}
+
+/** A replica's dot: serving filled, queued or loading half, stopping or lost dashed. */
+export function replicaGlyph(phase: ReplicaPhase): StatusGlyph {
+  return phase === "serving" ? "on" : phase === "queued" || phase === "running" ? "half" : "off";
 }
 
 export interface ReplicaCounts {
@@ -171,7 +179,7 @@ export function healthyFloor(spec: Partial<Pick<ManagedModelSpec, "min_replicas"
  */
 export function managedState(spec: SpecForState, replicas: Pick<ModelReplica, "state" | "last_message">[], now = Date.now()): StateView {
   const c = countReplicas(replicas);
-  if (!spec.enabled) return { state: "paused", why: c.healthy + c.queued + c.running + c.draining > 0 ? "stopping its jobs" : null, attention: false };
+  if (!spec.enabled) return { state: "off", why: c.healthy + c.queued + c.running + c.draining > 0 ? "stopping its jobs" : null, attention: false };
   const pause = pauseOf(spec, now);
   if (pause) {
     const when = pause.until ? `tries again at ${clockLabel(pause.until, now)}` : "waits for you";
@@ -250,7 +258,7 @@ export function jobEndLine(endsAt: string | null | undefined, handoffMins: numbe
 
 /** A watched Kubernetes deployment's state, from what discovery last saw. */
 export function watchedState(d: CapacityDiscoveryModelView | undefined, model: Pick<ModelRoute, "enabled">): StateView {
-  if (!model.enabled) return { state: "paused", why: "turned off in Models", attention: false };
+  if (!model.enabled) return { state: "off", why: "turned off in Models", attention: false };
   if (!d?.status) return { state: "stale", why: "discovery hasn't reported it", attention: false };
   if (d.status.state === "stale" || d.status.state === "fallback") return { state: "stale", why: d.status.reason ?? "the Service couldn't be read", attention: false };
   if (!d.status.ready_replicas) return { state: "no-replicas", why: "requests wait, then fail", attention: true };

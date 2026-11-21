@@ -19,7 +19,7 @@ import {
 import { SettingsForm } from "@/components/access/settings-form";
 import { SettingsCard } from "@/components/access/ui";
 import { ChangesList, PoolChart, PoolNowTile, useModelDay } from "@/components/deployments/detail-ui";
-import { Glyph, StateMark } from "@/components/deployments/ui";
+import { StateMark } from "@/components/deployments/ui";
 import { Setting, TextArea, TextField } from "@/components/models/fields";
 import { Notice, Tile } from "@/components/models/ui";
 import { Pill } from "@/components/overview/ui";
@@ -56,6 +56,7 @@ import {
   formatTimeLimit,
   replicaAsk,
   type ReplicaPhase,
+  replicaGlyph,
 } from "@/lib/deployments-model";
 import { logsHref } from "@/lib/log-links";
 import { modelHref } from "@/lib/models-model";
@@ -66,6 +67,7 @@ import { sbatchLines, stripSbatchDirectives, type PlacementKey, type SbatchLine 
 import { useClusterResources } from "@/lib/use-cluster-resources";
 import { useLatestCallback } from "@/lib/use-latest-callback";
 import { cn, getJson } from "@/lib/utils";
+import { AttentionPill, StatusPill } from "@/components/ui/status";
 
 type Card = "script" | "placement" | "service";
 
@@ -140,9 +142,9 @@ function ReplicaCard({ r, letter, spec, onRestart, pending, stale }: { r: ModelR
           </p>
         </div>
         {blocked ? (
-          <span className="inline-flex shrink-0 items-center rounded-full bg-foreground px-2.5 py-0.5 text-[11.5px] font-semibold text-background">{label}</span>
+          <AttentionPill>{label}</AttentionPill>
         ) : (
-          <Pill><Glyph glyph={phase} className="h-[7px] w-[7px]" />{label}</Pill>
+          <StatusPill glyph={replicaGlyph(phase)}>{label}</StatusPill>
         )}
       </div>
       {phase !== "draining" && (

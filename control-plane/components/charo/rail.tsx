@@ -10,7 +10,11 @@ export function MicroLabel({ children, className }: { children: ReactNode; class
   );
 }
 
-/** Thin left rail that structured results hang off — replaces boxed cards. */
+/**
+ * Thin left rail that the assistant's own messages hang off. Its violet is the
+ * dashboard's one colour, kept to the assistant's messages; every status mark
+ * inside stays monochrome (components/ui/status.tsx).
+ */
 export function Rail({
   children,
   tone = "violet",

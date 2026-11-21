@@ -2,30 +2,13 @@
 
 import { useEffect, useState, type ReactNode } from "react";
 import { cn } from "@/lib/utils";
-
-/**
- * Monochrome status: a filled dot for on, a ring for suspended or off, a
- * dashed ring for archived.
- */
-export function StateDot({ state, className }: { state: "on" | "off" | "archived"; className?: string }) {
-  return (
-    <span
-      aria-hidden="true"
-      className={cn(
-        "inline-block h-2 w-2 shrink-0 rounded-full",
-        state === "on" && "bg-secondary-foreground",
-        state === "off" && "border-[1.5px] border-muted-foreground",
-        state === "archived" && "border-[1.5px] border-dashed border-muted-foreground",
-        className,
-      )}
-    />
-  );
-}
+import { type StatusGlyph } from "@/components/ui/status";
 
 export const TENANT_STATUS_LABEL: Record<string, string> = { active: "Active", suspended: "Suspended", archived: "Archived" };
 
-export function tenantState(status: string): "on" | "off" | "archived" {
-  return status === "active" ? "on" : status === "archived" ? "archived" : "off";
+/** Active is on; suspended and archived are both deliberately off. */
+export function tenantGlyph(status: string): StatusGlyph {
+  return status === "active" ? "on" : "off";
 }
 
 /** A settings card: title, a line on what it's for, then its settings. */

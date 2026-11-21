@@ -3,7 +3,6 @@
 import { useCallback, useState, useTransition } from "react";
 import { setSlurmSettingsAction, testSlurmConnectionAction } from "@/app/actions";
 import { SettingsForm, type SaveResult } from "@/components/access/settings-form";
-import { Glyph } from "@/components/deployments/ui";
 import { Setting, Switch, TextField } from "@/components/models/fields";
 import { Notice, Sheet } from "@/components/models/ui";
 import { Button } from "@/components/ui/button";
@@ -11,6 +10,7 @@ import { useConfirm } from "@/components/ui/confirm-dialog";
 import { duration, MINT_TOKEN, START_PROVISIONER, tokenExpiry } from "@/lib/deployments-model";
 import { cn } from "@/lib/utils";
 import type { NodeAlias, SlurmHealthView, SlurmSettingsView, UpdateSlurmSettings } from "@/lib/obleth";
+import { StatusDot } from "@/components/ui/status";
 
 const FIELDS = ["enabled", "url", "api_version", "user", "jwt", "aliases", "cache_dir", "images_dir", "images", "log_dir", "setup", "hf_token", "hf_clear"];
 const LABELS: Record<string, string> = { enabled: "Slurm", url: "slurmrestd URL", api_version: "API version", user: "Slurm user", jwt: "JWT", aliases: "Node addresses", cache_dir: "Weight cache", images_dir: "Images folder", images: "Image per engine", log_dir: "Job logs", setup: "Load before launch", hf_token: "Hugging Face token", hf_clear: "Hugging Face token" };
@@ -138,7 +138,7 @@ export function SlurmConnection({ settings, replicas, onClose, onSaved }: { sett
         <div className="flex flex-col gap-3 px-6 pb-4">
           {settings.enabled && (
             <div className="flex flex-col gap-1 rounded-lg border border-border px-3 py-2.5 text-[12.5px]">
-              <span className="flex items-center gap-2 font-medium"><Glyph glyph={line.glyph} className="h-[7px] w-[7px]" />{line.text}</span>
+              <span className="flex items-center gap-2 font-medium"><StatusDot glyph={line.glyph} className="h-[7px] w-[7px]" />{line.text}</span>
               {line.detail && <span className="text-secondary-foreground">{line.detail}</span>}
             </div>
           )}
@@ -231,7 +231,7 @@ export function SlurmConnection({ settings, replicas, onClose, onSaved }: { sett
 function HealthResult({ health }: { health: SlurmHealthView }) {
   const jwt = health.jwt;
   const Bad = ({ children }: { children: string }) => <span className="rounded-full bg-foreground px-1.5 text-[10.5px] font-semibold text-background">{children}</span>;
-  const Ok = () => <Glyph glyph="on" className="h-[7px] w-[7px]" />;
+  const Ok = () => <StatusDot glyph="on" className="h-[7px] w-[7px]" />;
   const ping = health.ping;
   const pingText = ping.ok
     ? `answered in ${ping.latency_ms} ms${health.slurmctld ? `; slurmctld is ${health.slurmctld === "UP" ? "up" : "down"}` : ""}${health.slurm_release ? `; Slurm ${health.slurm_release}` : ""}`
