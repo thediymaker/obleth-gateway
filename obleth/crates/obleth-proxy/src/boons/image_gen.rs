@@ -12,12 +12,11 @@
 //! The image travels out of band in a `Vec<GeneratedImage>` accumulator and is
 //! appended to the final assistant message as markdown.
 
-use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::time::Duration;
 
 use obleth_config::{
-    ImageGenerationBoonSettings, ResolvedKey, ResolvedModel, IMAGE_GENERATION_MAX_PER_REQUEST,
+    Boon, ImageGenerationBoonSettings, ResolvedKey, ResolvedModel, IMAGE_GENERATION_MAX_PER_REQUEST,
 };
 use regex::Regex;
 use serde_json::{json, Value};
@@ -123,56 +122,35 @@ fn nudge_text() -> &'static str {
      user brings it up."
 }
 
-/// Whether `generate_image` is already owned by something else: a tool the
-/// client itself defined, or a tool the MCP tool loop already mapped from a
-/// granted server (`tool_loop_servers`, built by `tool_loop::inject` just
-/// before this boon's gate runs). Mirrors `tool_loop::inject`'s own
-/// client-collision check.
-///
-/// The caller must decide the injection and the `tool_loop_servers` map
-/// insert together from this single answer: checking client tools and MCP
-/// tools separately (one gate in `inject`, another in the map insert) would
-/// let the two records of "who owns this name" disagree — which is exactly
-/// how a client's own tool call ends up hijacked by the gateway's image
-/// executor and billed to the tenant.
-pub(super) fn collides(
-    json_body: &Value,
-    tool_loop_servers: Option<&HashMap<String, String>>,
-) -> bool {
-    let client_has_it = json_body
-        .get("tools")
-        .and_then(|v| v.as_array())
-        .is_some_and(|arr| {
-            arr.iter().any(|t| {
-                t.pointer("/function/name").and_then(|n| n.as_str()) == Some(GENERATE_IMAGE_TOOL)
-            })
-        });
-    client_has_it || tool_loop_servers.is_some_and(|m| m.contains_key(GENERATE_IMAGE_TOOL))
+/// Whether the boon applies to a request for `route`: the model was granted
+/// it, the boon is globally active (enabled with an image model configured),
+/// and the model can call functions. There is no tenant opt-out: an
+/// operator granting the boon is the opt-in.
+pub(super) fn eligible(route: &ResolvedModel, settings: &obleth_config::BoonSettings) -> bool {
+    route.has_boon(Boon::ImageGeneration)
+        && settings.image_generation.active()
+        && route.supports_function_calling
 }
 
-/// Merge the tool definition into the request, and optionally add the system
-/// nudge. Client-supplied tools are preserved: a client that brought its own
-/// tools keeps them and gains this one.
-///
-/// Callers must check [`collides`] first: this function does not itself guard
-/// against a name collision.
-pub(super) fn inject(
-    cfg: &ImageGenerationBoonSettings,
-    nudge: bool,
-    supports_system_messages: bool,
-    json_body: &mut Value,
-) {
-    let def = tool_def(cfg);
-    if let Some(obj) = json_body.as_object_mut() {
-        match obj.get_mut("tools").and_then(|v| v.as_array_mut()) {
-            Some(existing) => existing.push(def),
-            None => {
-                obj.insert("tools".into(), Value::Array(vec![def]));
-            }
-        }
-    }
-    if nudge {
-        super::structured::inject_prompt_section(json_body, nudge_text(), supports_system_messages);
+/// Granted and configured, but the model cannot call functions: it would
+/// silently get no tool and tell the user it cannot draw.
+pub(super) fn misconfigured(route: &ResolvedModel, settings: &obleth_config::BoonSettings) -> bool {
+    super::gateway_tool::lacks_function_calling(
+        route,
+        Boon::ImageGeneration,
+        settings.image_generation.active(),
+    )
+}
+
+/// The `generate_image` tool, armed by [`super::gateway_tool::GatewayTool::arm`].
+pub(super) fn gateway_tool(cfg: &ImageGenerationBoonSettings) -> super::gateway_tool::GatewayTool {
+    super::gateway_tool::GatewayTool {
+        boon: Boon::ImageGeneration,
+        name: GENERATE_IMAGE_TOOL,
+        server: IMAGE_SYNTHETIC_SERVER,
+        def: tool_def(cfg),
+        nudge: nudge_text(),
+        warn_on_collision: true,
     }
 }
 
@@ -499,14 +477,20 @@ pub(super) fn attach_to_completion(images: &[GeneratedImage], body: &mut Value) 
     true
 }
 
-/// One generation attempt, for the trace span. Recorded by the caller, which
-/// owns the tracer (`execute` does not).
-pub(super) struct ImageGenEvent {
-    pub images: u32,
-    pub size: String,
-    pub model: String,
-    pub upstream_ms: u32,
-    pub ok: bool,
+/// One generation attempt, for the trace span.
+fn event(
+    images: u32,
+    size: String,
+    model: String,
+    upstream_ms: u32,
+    ok: bool,
+) -> super::gateway_tool::GatewayToolEvent {
+    super::gateway_tool::GatewayToolEvent {
+        span: "boon:image_generation",
+        upstream_ms,
+        ok,
+        attributes: json!({ "images": images, "size": size, "model": model }),
+    }
 }
 
 /// Everything the gateway-executed `generate_image` tool needs, threaded
@@ -523,7 +507,7 @@ pub(super) struct ImageCtx<'a> {
     /// Images produced so far — the out-of-band channel that keeps image bytes
     /// out of the model's context.
     pub images: Vec<GeneratedImage>,
-    pub events: Vec<ImageGenEvent>,
+    pub events: Vec<super::gateway_tool::GatewayToolEvent>,
 }
 
 /// What one `generate_image` call produced. The tool loop runs a turn's
@@ -532,7 +516,7 @@ pub(super) struct ImageCtx<'a> {
 pub(super) struct ImageCall {
     receipt: String,
     images: Vec<GeneratedImage>,
-    event: Option<ImageGenEvent>,
+    event: Option<super::gateway_tool::GatewayToolEvent>,
 }
 
 impl ImageCall {
@@ -618,13 +602,13 @@ pub(super) async fn execute(
                     "image-generation boon response carried no image data"
                 );
                 return ImageCall {
-                    event: Some(ImageGenEvent {
-                        images: 0,
+                    event: Some(event(
+                        0,
                         size,
-                        model: image_model.model_name.clone(),
+                        image_model.model_name.clone(),
                         upstream_ms,
-                        ok: false,
-                    }),
+                        false,
+                    )),
                     ..ImageCall::failed("the image model returned no image")
                 };
             }
@@ -650,13 +634,13 @@ pub(super) async fn execute(
             ImageCall {
                 receipt: receipt(count, &size, &prompt),
                 images,
-                event: Some(ImageGenEvent {
-                    images: count as u32,
+                event: Some(event(
+                    count as u32,
                     size,
-                    model: image_model.model_name.clone(),
+                    image_model.model_name.clone(),
                     upstream_ms,
-                    ok: true,
-                }),
+                    true,
+                )),
             }
         }
         Err(e) => {
@@ -666,13 +650,13 @@ pub(super) async fn execute(
                 "image-generation boon call failed; answering without an image"
             );
             ImageCall {
-                event: Some(ImageGenEvent {
-                    images: 0,
+                event: Some(event(
+                    0,
                     size,
-                    model: image_model.model_name.clone(),
+                    image_model.model_name.clone(),
                     upstream_ms,
-                    ok: false,
-                }),
+                    false,
+                )),
                 ..ImageCall::failed(&sanitize_generation_error(&e))
             }
         }
@@ -740,6 +724,7 @@ async fn generate(
 mod tests {
     use super::*;
     use obleth_config::ImageGenerationBoonSettings;
+    use std::collections::HashMap;
 
     fn cfg() -> ImageGenerationBoonSettings {
         ImageGenerationBoonSettings {
@@ -916,11 +901,17 @@ mod tests {
             "messages": [{ "role": "user", "content": "draw a cat" }],
             "tools": [{ "type": "function", "function": { "name": "client_tool" } }],
         });
-        inject(&cfg(), false, true, &mut json);
+        assert!(gateway_tool(&cfg()).arm(&chat_route(), false, &mut json, &mut None));
         let tools = json["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0]["function"]["name"], "client_tool");
         assert_eq!(tools[1]["function"]["name"], GENERATE_IMAGE_TOOL);
+    }
+
+    fn chat_route() -> ResolvedModel {
+        let mut route = super::super::tests::endpoint_only_route("http://unused/v1");
+        route.supports_system_messages = true;
+        route
     }
 
     #[test]
@@ -929,7 +920,12 @@ mod tests {
             "model": "m",
             "messages": [{ "role": "user", "content": "draw a cat" }],
         });
-        inject(&cfg(), true, true, &mut json);
+        let mut servers = None;
+        assert!(gateway_tool(&cfg()).arm(&chat_route(), true, &mut json, &mut servers));
+        assert_eq!(
+            servers.unwrap()[GENERATE_IMAGE_TOOL],
+            IMAGE_SYNTHETIC_SERVER
+        );
         assert_eq!(json["tools"].as_array().unwrap().len(), 1);
         let system = json["messages"][0]["content"].as_str().unwrap_or_default();
         assert!(
@@ -1136,7 +1132,11 @@ mod tests {
         let json = serde_json::json!({
             "tools": [{ "type": "function", "function": { "name": GENERATE_IMAGE_TOOL } }],
         });
-        assert!(collides(&json, None));
+        assert!(super::super::gateway_tool::collides(
+            &json,
+            None,
+            GENERATE_IMAGE_TOOL
+        ));
     }
 
     #[test]
@@ -1147,7 +1147,11 @@ mod tests {
             GENERATE_IMAGE_TOOL.to_string(),
             "some_mcp_server".to_string(),
         );
-        assert!(collides(&json, Some(&servers)));
+        assert!(super::super::gateway_tool::collides(
+            &json,
+            Some(&servers),
+            GENERATE_IMAGE_TOOL
+        ));
     }
 
     #[test]
@@ -1156,12 +1160,20 @@ mod tests {
             "tools": [{ "type": "function", "function": { "name": "client_tool" } }],
         });
         let servers: HashMap<String, String> = HashMap::new();
-        assert!(!collides(&json, Some(&servers)));
-        assert!(!collides(&json, None));
+        assert!(!super::super::gateway_tool::collides(
+            &json,
+            Some(&servers),
+            GENERATE_IMAGE_TOOL
+        ));
+        assert!(!super::super::gateway_tool::collides(
+            &json,
+            None,
+            GENERATE_IMAGE_TOOL
+        ));
     }
 
-    /// Mirrors the calling contract in `boons::mod`: check `collides` first,
-    /// and only call `inject` when it says the name is free.
+    /// A client's own `generate_image` keeps the name: nothing is merged in
+    /// and nothing is mapped for the loop.
     #[test]
     fn a_client_tool_named_generate_image_suppresses_injection() {
         let mut json = serde_json::json!({
@@ -1172,10 +1184,9 @@ mod tests {
                 "function": { "name": GENERATE_IMAGE_TOOL, "parameters": { "type": "object" } },
             }],
         });
-        let tool_loop_servers: Option<HashMap<String, String>> = None;
-        if !collides(&json, tool_loop_servers.as_ref()) {
-            inject(&cfg(), false, true, &mut json);
-        }
+        let mut tool_loop_servers: Option<HashMap<String, String>> = None;
+        assert!(!gateway_tool(&cfg()).arm(&chat_route(), false, &mut json, &mut tool_loop_servers));
+        assert!(tool_loop_servers.is_none());
         let tools = json["tools"].as_array().unwrap();
         assert_eq!(
             tools.len(),
@@ -1196,9 +1207,8 @@ mod tests {
             "messages": [{ "role": "user", "content": "draw a cat" }],
             "tools": [{ "type": "function", "function": { "name": "client_tool" } }],
         });
-        let tool_loop_servers: Option<HashMap<String, String>> = None;
-        assert!(!collides(&json, tool_loop_servers.as_ref()));
-        inject(&cfg(), false, true, &mut json);
+        let mut tool_loop_servers: Option<HashMap<String, String>> = None;
+        assert!(gateway_tool(&cfg()).arm(&chat_route(), false, &mut json, &mut tool_loop_servers));
         let tools = json["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0]["function"]["name"], "client_tool");

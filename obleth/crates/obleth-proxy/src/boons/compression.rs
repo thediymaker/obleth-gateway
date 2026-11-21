@@ -968,6 +968,100 @@ pub(super) fn compact_log(text: &str) -> Option<String> {
     Some(out)
 }
 
+/// Phase A/B1 gating: the model was granted the boon AND it is globally active
+/// AND this is a chat completion AND the key's tenant has not opted out. Internal
+/// probe keys are exempt (mirrors guardrails). A `None` tenant policy follows the
+/// global default (eligible).
+pub(super) fn eligible(
+    route: &obleth_config::ResolvedModel,
+    settings: &obleth_config::BoonSettings,
+    key: &obleth_config::ResolvedKey,
+    is_chat: bool,
+) -> bool {
+    let tenant_opted_in = key.compression_policy.as_ref().is_none_or(|p| p.enabled);
+    is_chat
+        && !key.internal
+        && settings.compression.active()
+        && tenant_opted_in
+        && route.has_boon(obleth_config::Boon::Compression)
+}
+
+/// Base gate for the opt-in compression passes: chat + global active + boon
+/// granted + not an internal key. No reversibility requirement (lossy/dedup are
+/// deterministic and run on any model; retrieve_original is a bonus).
+fn opt_in_base(
+    route: &obleth_config::ResolvedModel,
+    settings: &obleth_config::BoonSettings,
+    key: &obleth_config::ResolvedKey,
+) -> bool {
+    settings.compression.active()
+        && route.has_boon(obleth_config::Boon::Compression)
+        && !key.internal
+}
+
+/// Cross-turn dedup is eligible when the base holds and the `dedup` piece is on.
+/// A per-tenant policy overrides the global `dedup` default; a tenant with no
+/// policy inherits it.
+pub(super) fn dedup_eligible(
+    route: &obleth_config::ResolvedModel,
+    settings: &obleth_config::BoonSettings,
+    key: &obleth_config::ResolvedKey,
+) -> bool {
+    opt_in_base(route, settings, key)
+        && match &key.compression_policy {
+            Some(p) => p.dedup,
+            None => settings.compression.dedup,
+        }
+}
+
+/// Near-lossless log template-collapse is eligible when the base holds and the
+/// `compact_logs` piece is on. A per-tenant policy overrides the global
+/// `compact_logs` default; a tenant with no policy inherits it. Independent of
+/// `allow_lossy`.
+pub(super) fn log_compaction_eligible(
+    route: &obleth_config::ResolvedModel,
+    settings: &obleth_config::BoonSettings,
+    key: &obleth_config::ResolvedKey,
+) -> bool {
+    opt_in_base(route, settings, key)
+        && match &key.compression_policy {
+            Some(p) => p.compact_logs,
+            None => settings.compression.compact_logs,
+        }
+}
+
+/// Lossy semantic compression is eligible when the base holds and the
+/// `allow_lossy` piece is on. A per-tenant policy overrides the global
+/// `allow_lossy` default; a tenant with no policy inherits it. `force` is the
+/// per-request `x-obleth-boons: lossy` override — it turns the lossy pass on for
+/// this request regardless of the toggle, but the base gate (boon granted, not
+/// internal, globally active) still applies.
+pub(super) fn lossy_eligible(
+    route: &obleth_config::ResolvedModel,
+    settings: &obleth_config::BoonSettings,
+    key: &obleth_config::ResolvedKey,
+    force: bool,
+) -> bool {
+    opt_in_base(route, settings, key)
+        && (force
+            || match &key.compression_policy {
+                Some(p) => p.allow_lossy,
+                None => settings.compression.allow_lossy,
+            })
+}
+
+/// Per-tenant code-compaction toggle with the global setting as the no-policy
+/// default: a tenant policy overrides the global `code_compaction` flag.
+pub(super) fn effective_code_compaction(
+    settings: &obleth_config::BoonSettings,
+    key: &obleth_config::ResolvedKey,
+) -> bool {
+    match &key.compression_policy {
+        Some(policy) => policy.code_compaction,
+        None => settings.compression.code_compaction,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

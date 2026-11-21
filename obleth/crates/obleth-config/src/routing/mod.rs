@@ -477,13 +477,12 @@ fn evaluate<'a>(
     // Capability via boon: the gateway emulates structured output for opted-in
     // models, so the hard filters must not exclude them. Function calling and
     // tool choice are native capabilities only — no boon emulates them.
-    let schema_via_boon = |c: &Candidate| {
-        grants.structured_active && c.model.boons.iter().any(|b| b == "structured_output")
-    };
+    let schema_via_boon =
+        |c: &Candidate| grants.structured_active && c.model.has_boon(crate::Boon::StructuredOutput);
     // Likewise vision: the vision boon relays images to a describer, so a
     // text-only model that carries it can serve an image request.
     let vision_via_boon =
-        |c: &Candidate| grants.vision_active && c.model.boons.iter().any(|b| b == "vision");
+        |c: &Candidate| grants.vision_active && c.model.has_boon(crate::Boon::Vision);
 
     // Which domains the tier filter reasons over. Needed for the verdict when
     // tiering is on, and reported when narrating; skipped entirely otherwise so

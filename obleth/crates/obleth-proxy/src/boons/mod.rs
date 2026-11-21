@@ -43,6 +43,7 @@ mod compression_verify;
 pub(crate) mod compressor;
 pub(crate) mod drain;
 pub(crate) mod embedded_json;
+mod gateway_tool;
 pub(crate) mod guardrails;
 pub(crate) mod image_gen;
 pub(crate) mod knowledge;
@@ -61,7 +62,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use obleth_config::{
-    BoonSettings, ResolvedKey, ResolvedModel, StructuredOutputBoonSettings, UsageRecord,
+    Boon, BoonSettings, ResolvedKey, ResolvedModel, StructuredOutputBoonSettings, UsageRecord,
 };
 use obleth_tokenizer::Tokenizer;
 use serde_json::Value;
@@ -69,151 +70,6 @@ use uuid::Uuid;
 
 use crate::proxy::UpstreamUsage;
 use crate::state::AppState;
-
-/// Phase A/B1 gating: the model was granted the boon AND it is globally active
-/// AND this is a chat completion AND the key's tenant has not opted out. Internal
-/// probe keys are exempt (mirrors guardrails). A `None` tenant policy follows the
-/// global default (eligible).
-fn compression_eligible(
-    route: &obleth_config::ResolvedModel,
-    settings: &obleth_config::BoonSettings,
-    key: &obleth_config::ResolvedKey,
-    is_chat: bool,
-) -> bool {
-    let tenant_opted_in = key.compression_policy.as_ref().is_none_or(|p| p.enabled);
-    is_chat
-        && !key.internal
-        && settings.compression.active()
-        && tenant_opted_in
-        && route.boons.iter().any(|b| b == "compression")
-}
-
-/// Base gate for the opt-in compression passes: chat + global active + boon
-/// granted + not an internal key. No reversibility requirement (lossy/dedup are
-/// deterministic and run on any model; retrieve_original is a bonus).
-fn opt_in_compression_base(
-    route: &obleth_config::ResolvedModel,
-    settings: &obleth_config::BoonSettings,
-    key: &obleth_config::ResolvedKey,
-) -> bool {
-    settings.compression.active() && route.boons.iter().any(|b| b == "compression") && !key.internal
-}
-
-/// Cross-turn dedup is eligible when the base holds and the `dedup` piece is on.
-/// A per-tenant policy overrides the global `dedup` default; a tenant with no
-/// policy inherits it.
-fn dedup_eligible(
-    route: &obleth_config::ResolvedModel,
-    settings: &obleth_config::BoonSettings,
-    key: &obleth_config::ResolvedKey,
-) -> bool {
-    opt_in_compression_base(route, settings, key)
-        && match &key.compression_policy {
-            Some(p) => p.dedup,
-            None => settings.compression.dedup,
-        }
-}
-
-/// Near-lossless log template-collapse is eligible when the base holds and the
-/// `compact_logs` piece is on. A per-tenant policy overrides the global
-/// `compact_logs` default; a tenant with no policy inherits it. Independent of
-/// `allow_lossy`.
-fn log_compaction_eligible(
-    route: &obleth_config::ResolvedModel,
-    settings: &obleth_config::BoonSettings,
-    key: &obleth_config::ResolvedKey,
-) -> bool {
-    opt_in_compression_base(route, settings, key)
-        && match &key.compression_policy {
-            Some(p) => p.compact_logs,
-            None => settings.compression.compact_logs,
-        }
-}
-
-/// Lossy semantic compression is eligible when the base holds and the
-/// `allow_lossy` piece is on. A per-tenant policy overrides the global
-/// `allow_lossy` default; a tenant with no policy inherits it. `force` is the
-/// per-request `x-obleth-boons: lossy` override — it turns the lossy pass on for
-/// this request regardless of the toggle, but the base gate (boon granted, not
-/// internal, globally active) still applies.
-fn lossy_eligible(
-    route: &obleth_config::ResolvedModel,
-    settings: &obleth_config::BoonSettings,
-    key: &obleth_config::ResolvedKey,
-    force: bool,
-) -> bool {
-    opt_in_compression_base(route, settings, key)
-        && (force
-            || match &key.compression_policy {
-                Some(p) => p.allow_lossy,
-                None => settings.compression.allow_lossy,
-            })
-}
-
-/// Per-tenant code-compaction toggle with the global setting as the no-policy
-/// default: a tenant policy overrides the global `code_compaction` flag.
-fn effective_code_compaction(
-    settings: &obleth_config::BoonSettings,
-    key: &obleth_config::ResolvedKey,
-) -> bool {
-    match &key.compression_policy {
-        Some(policy) => policy.code_compaction,
-        None => settings.compression.code_compaction,
-    }
-}
-
-/// The image-generation boon is eligible when the model was granted it, the
-/// boon is globally active (enabled with an image model configured), and the
-/// model can actually call functions. Unlike the compression boon there is no
-/// tenant opt-out: an operator granting the boon is the opt-in.
-fn image_gen_eligible(
-    route: &obleth_config::ResolvedModel,
-    settings: &obleth_config::BoonSettings,
-) -> bool {
-    route.boons.iter().any(|b| b == "image_generation")
-        && settings.image_generation.active()
-        && route.supports_function_calling
-}
-
-/// The web-search boon is eligible when the model was granted it, the boon is
-/// globally active (enabled with a search route configured), and the model can
-/// actually call functions. As with image generation, the operator's grant is
-/// the opt-in.
-fn web_search_eligible(
-    route: &obleth_config::ResolvedModel,
-    settings: &obleth_config::BoonSettings,
-) -> bool {
-    route.boons.iter().any(|b| b == "web_search")
-        && settings.web_search.active()
-        && route.supports_function_calling
-}
-
-/// The speculation boon is eligible when the model was granted it, the boon is
-/// globally active (enabled with a drafter and a verifier configured), the key
-/// is not an internal probe (probes must measure the target model itself), and
-/// the drafter is not the target. Request-body eligibility (bypass params,
-/// multimodal content) is decided separately by
-/// [`speculation::eligible_messages`].
-fn speculation_eligible(
-    route: &obleth_config::ResolvedModel,
-    settings: &obleth_config::BoonSettings,
-    key: &obleth_config::ResolvedKey,
-) -> bool {
-    if key.internal
-        || !settings.speculation.active()
-        || !route.boons.iter().any(|b| b == "speculation")
-    {
-        return false;
-    }
-    // Both helpers resolve per target: its own drafter (fleet default as
-    // fallback) and its own scoring endpoint. Missing either means the model
-    // cannot speculate, decided here before anything is armed.
-    if speculation::scoring_base(route, &settings.speculation.verify_url_template).is_empty() {
-        return false;
-    }
-    let drafter = speculation::effective_draft_model(route, &settings.speculation);
-    !drafter.is_empty() && drafter != route.model_name
-}
 
 /// Whether a response plan leaves room for the speculation boon.
 ///
@@ -266,6 +122,9 @@ pub const COMPRESSION_HEADER: &str = "x-obleth-compression";
 #[derive(Clone)]
 pub struct BoonEngine {
     settings: Arc<ArcSwap<BoonSettings>>,
+    /// (model, boon) misconfigurations already logged since the last
+    /// settings refresh.
+    warned: Arc<std::sync::Mutex<std::collections::HashSet<(String, &'static str)>>>,
 }
 
 /// What `enrich_request` did to the request, and whether the response must be
@@ -405,6 +264,7 @@ impl BoonEngine {
     pub fn new(initial: BoonSettings) -> Self {
         Self {
             settings: Arc::new(ArcSwap::from_pointee(initial)),
+            warned: Default::default(),
         }
     }
 
@@ -413,9 +273,24 @@ impl BoonEngine {
         self.settings.load_full()
     }
 
-    /// Replace the settings (called by the periodic refresh task).
+    /// Replace the settings (called by the periodic refresh task). A
+    /// misconfiguration still present is reported again after it.
     pub fn update(&self, settings: BoonSettings) {
         self.settings.store(Arc::new(settings));
+        self.warned
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    /// True the first time `model`'s misconfiguration of `boon` is seen
+    /// since the last settings refresh, so it is logged once per refresh
+    /// rather than on every request.
+    fn first_warning(&self, model: &str, boon: &'static str) -> bool {
+        self.warned
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((model.to_string(), boon))
     }
 
     /// Scan a chat-shaped body with the tenant's input guardrails outside the
@@ -530,10 +405,7 @@ impl BoonEngine {
         // Only when the model opted into the vision boon, lacks native vision,
         // and a describer is configured. Models that natively accept images,
         // or that haven't enabled the boon, are left untouched.
-        if route.boons.iter().any(|b| b == "vision")
-            && !route.supports_vision
-            && settings.vision.active()
-        {
+        if vision::eligible(route, &settings) {
             let vision_start = crate::tracer::now_ms();
             let images =
                 vision::apply(state, &settings.vision, key, session_id, request_id, json).await;
@@ -557,7 +429,7 @@ impl BoonEngine {
                 outcome.rewritten = true;
             }
             if images.described > 0 {
-                outcome.applied.push("vision");
+                outcome.applied.push(Boon::Vision.name());
             }
         }
 
@@ -604,12 +476,12 @@ impl BoonEngine {
 
         // Lossless structural/code compaction: `is_chat` is always true here; the
         // parameter exists so unit tests can exercise the ineligible path.
-        if compression_eligible(route, &settings, key, is_chat) {
-            let code_compaction = effective_code_compaction(&settings, key);
+        if compression::eligible(route, &settings, key, is_chat) {
+            let code_compaction = compression::effective_code_compaction(&settings, key);
             lossless = compression::apply(&settings.compression, code_compaction, json);
             if lossless.replaced > 0 {
                 outcome.rewritten = true;
-                outcome.applied.push("compression");
+                outcome.applied.push(Boon::Compression.name());
                 state.metrics.record_compression_saved(lossless.saved());
             }
         }
@@ -650,10 +522,11 @@ impl BoonEngine {
                     outcome.rewritten = true;
                     outcome.applied.push("tool_loop");
                 }
-            } else {
+            } else if self.first_warning(&route.model_name, "tool_loop") {
                 // Granted tools but no native function calling: the loop is
                 // skipped and the model silently gets no tools (it will often
-                // claim it cannot search). Surface the misconfiguration loudly.
+                // claim it cannot search). Surface the misconfiguration, once
+                // per model per settings refresh.
                 tracing::warn!(
                     model = %route.model_name,
                     servers = ?route.tool_servers,
@@ -676,49 +549,30 @@ impl BoonEngine {
         // loop's global switch. `run()` executes whenever `plan.tool_loop` is
         // `Some`, so the entry alone is enough.
         let mut image_gen_cfg: Option<obleth_config::ImageGenerationBoonSettings> = None;
-        if image_gen_eligible(route, &settings) {
+        if image_gen::eligible(route, &settings) {
             // `generate_image` may already be owned by the client's own tools
             // or by a granted MCP server (`tool_loop_servers`, just injected
-            // above). Both the tool injection and the map insert below must be
-            // skipped together in that case — deciding them from one shared
-            // check keeps "who owns this name" consistent between the request
-            // body and the tool loop's dispatch map. See `image_gen::collides`.
-            if image_gen::collides(json, tool_loop_servers.as_ref()) {
-                tracing::warn!(
-                    tool = %image_gen::GENERATE_IMAGE_TOOL,
-                    model = %route.model_name,
-                    "generate_image collides with a client-supplied tool or a granted MCP \
-                     tool; existing tool wins, image-generation boon inactive for this request"
-                );
-            } else {
-                // Nudge only a plain chat client that got no other nudge: an
-                // agentic client steers its own tool use, and the tool-loop nudge
-                // already told the model it has tools. Read before the insert
-                // below, which would otherwise make the map non-empty.
-                let nudge = !client_sent_tools && tool_loop_servers.is_none();
-                image_gen::inject(
-                    &settings.image_generation,
-                    nudge,
-                    route.supports_system_messages,
-                    json,
-                );
-                tool_loop_servers
-                    .get_or_insert_with(std::collections::HashMap::new)
-                    .insert(
-                        image_gen::GENERATE_IMAGE_TOOL.to_string(),
-                        image_gen::IMAGE_SYNTHETIC_SERVER.to_string(),
-                    );
+            // above); then the existing tool wins (see `GatewayTool::arm`).
+            // Nudge only a plain chat client that got no other nudge: an
+            // agentic client steers its own tool use, and the tool-loop nudge
+            // already told the model it has tools. Read before arming, which
+            // makes the map non-empty.
+            let nudge = !client_sent_tools && tool_loop_servers.is_none();
+            if image_gen::gateway_tool(&settings.image_generation).arm(
+                route,
+                nudge,
+                json,
+                &mut tool_loop_servers,
+            ) {
                 image_gen_cfg = Some(settings.image_generation.clone());
                 outcome.rewritten = true;
-                outcome.applied.push("image_generation");
+                outcome.applied.push(Boon::ImageGeneration.name());
             }
-        } else if route.boons.iter().any(|b| b == "image_generation")
-            && settings.image_generation.active()
+        } else if image_gen::misconfigured(route, &settings)
+            && self.first_warning(&route.model_name, Boon::ImageGeneration.name())
         {
-            // Granted and configured, but the model cannot call functions.
-            // Same failure shape as the tool loop's: the model silently gets no
-            // tool and tells the user it cannot draw, with nothing in the logs
-            // to explain why.
+            // Same failure shape as the tool loop's: the model silently gets
+            // no tool and tells the user it cannot draw.
             tracing::warn!(
                 model = %route.model_name,
                 "model is granted the image_generation boon but is not flagged \
@@ -731,39 +585,26 @@ impl BoonEngine {
         // Same shape as the image-generation boon above: a gateway-executed
         // `web_search` tool, armed through its own synthetic-server entry and
         // independent of the MCP tool loop's global switch. A client's own
-        // `web_search` or a granted MCP server's wins (see
-        // `web_search::collides`).
+        // `web_search` or a granted MCP server's wins.
         let mut web_search_cfg: Option<obleth_config::WebSearchBoonSettings> = None;
-        if web_search_eligible(route, &settings) {
-            if web_search::collides(json, tool_loop_servers.as_ref()) {
-                tracing::debug!(
-                    tool = %web_search::WEB_SEARCH_TOOL,
-                    model = %route.model_name,
-                    "web_search is owned by a client-supplied tool or a granted MCP tool; \
-                     existing tool wins, web-search boon inactive for this request"
-                );
-            } else {
-                // The image boon's nudge is about drawing, so it does not stand
-                // in for this one; only the MCP loop's generic tools nudge or a
-                // client steering its own tools does.
-                let nudge = !client_sent_tools && !mcp_tools_injected;
-                web_search::inject(
-                    &settings.web_search,
-                    nudge,
-                    route.supports_system_messages,
-                    json,
-                );
-                tool_loop_servers
-                    .get_or_insert_with(std::collections::HashMap::new)
-                    .insert(
-                        web_search::WEB_SEARCH_TOOL.to_string(),
-                        web_search::SEARCH_SYNTHETIC_SERVER.to_string(),
-                    );
+        if web_search::eligible(route, &settings) {
+            // The image boon's nudge is about drawing, so it does not stand
+            // in for this one; only the MCP loop's generic tools nudge or a
+            // client steering its own tools does.
+            let nudge = !client_sent_tools && !mcp_tools_injected;
+            if web_search::gateway_tool(&settings.web_search).arm(
+                route,
+                nudge,
+                json,
+                &mut tool_loop_servers,
+            ) {
                 web_search_cfg = Some(settings.web_search.clone());
                 outcome.rewritten = true;
-                outcome.applied.push("web_search");
+                outcome.applied.push(Boon::WebSearch.name());
             }
-        } else if route.boons.iter().any(|b| b == "web_search") && settings.web_search.active() {
+        } else if web_search::misconfigured(route, &settings)
+            && self.first_warning(&route.model_name, Boon::WebSearch.name())
+        {
             tracing::warn!(
                 model = %route.model_name,
                 "model is granted the web_search boon but is not flagged \
@@ -777,9 +618,9 @@ impl BoonEngine {
         // are reversible only when the model can call that tool: then the
         // originals are stashed and the markers say so.
         let reversible = route.supports_function_calling && settings.tool_loop.active();
-        let dedup_on = dedup_eligible(route, &settings, key);
-        let logs_on = log_compaction_eligible(route, &settings, key);
-        let lossy_on = lossy_eligible(route, &settings, key, force_lossy);
+        let dedup_on = compression::dedup_eligible(route, &settings, key);
+        let logs_on = compression::log_compaction_eligible(route, &settings, key);
+        let lossy_on = compression::lossy_eligible(route, &settings, key, force_lossy);
         if dedup_on || logs_on || lossy_on {
             // One segment index for the three passes; each records its
             // rewrites, and `finish` writes them and stashes the originals.
@@ -804,8 +645,8 @@ impl BoonEngine {
                 .saturating_add(lossy.pass.replaced);
             if refs > 0 {
                 outcome.rewritten = true;
-                if !outcome.applied.contains(&"compression") {
-                    outcome.applied.push("compression");
+                if !outcome.applied.contains(&Boon::Compression.name()) {
+                    outcome.applied.push(Boon::Compression.name());
                 }
                 // Bonus: when the model can call tools, let it recover originals.
                 if reversible {
@@ -874,10 +715,7 @@ impl BoonEngine {
         }
 
         // ---- structured-output boon ----
-        if route.boons.iter().any(|b| b == "structured_output")
-            && !route.supports_response_schema
-            && settings.structured_output.active()
-        {
+        if structured::eligible(route, &settings) {
             let structured_start = crate::tracer::now_ms();
             if let Some(plan) = structured::apply(json, route.supports_system_messages) {
                 if let Some(t) = tracer.as_deref_mut() {
@@ -893,7 +731,7 @@ impl BoonEngine {
                     );
                 }
                 outcome.rewritten = true;
-                outcome.applied.push("structured_output");
+                outcome.applied.push(Boon::StructuredOutput.name());
                 structured_plan = Some(StructuredPlan {
                     schema: plan,
                     settings: settings.structured_output.clone(),
@@ -948,7 +786,7 @@ impl BoonEngine {
                             .await;
                     if retrieval.outcome == "hit" {
                         outcome.rewritten = true;
-                        outcome.applied.push("knowledge");
+                        outcome.applied.push(Boon::Knowledge.name());
                     }
                     // Last use of `tracer` in this function (nothing after phase
                     // 2 needs it), so it is moved rather than reborrowed.
@@ -1037,10 +875,10 @@ impl BoonEngine {
         // cannot make. See `SpeculationPlan::gateway_tool_pending`.
         let gateway_tool_pending = image_gen_cfg.is_some() || web_search_cfg.is_some();
         if plan_yields_to_speculation(outcome.response_plan.as_ref(), gateway_tool_pending)
-            && speculation_eligible(route, &settings, key)
+            && speculation::eligible(route, &settings, key)
         {
             if let Some(messages) = speculation::eligible_messages(json) {
-                outcome.applied.push("speculation");
+                outcome.applied.push(Boon::Speculation.name());
                 outcome.speculation = Some(speculation::SpeculationPlan {
                     // Without its messages, which `messages` holds flattened:
                     // the speculation calls supply their own.
@@ -1810,24 +1648,24 @@ mod tests {
         let mut route = crate::boons::tests::endpoint_only_route("http://unused/v1");
         route.supports_function_calling = true;
         route.boons = vec!["web_search".to_string()];
-        assert!(web_search_eligible(&route, &settings));
+        assert!(web_search::eligible(&route, &settings));
 
         route.boons = vec!["image_generation".to_string()];
-        assert!(!web_search_eligible(&route, &settings), "not granted");
+        assert!(!web_search::eligible(&route, &settings), "not granted");
         route.boons = vec!["web_search".to_string()];
 
         route.supports_function_calling = false;
         assert!(
-            !web_search_eligible(&route, &settings),
+            !web_search::eligible(&route, &settings),
             "no function calling"
         );
         route.supports_function_calling = true;
 
         settings.web_search.enabled = false;
-        assert!(!web_search_eligible(&route, &settings), "globally off");
+        assert!(!web_search::eligible(&route, &settings), "globally off");
         settings.web_search.enabled = true;
         settings.web_search.search_tool = None;
-        assert!(!web_search_eligible(&route, &settings), "no search route");
+        assert!(!web_search::eligible(&route, &settings), "no search route");
     }
 
     #[test]
@@ -1837,43 +1675,43 @@ mod tests {
         let mut settings = obleth_config::BoonSettings::default();
 
         assert!(
-            !speculation_eligible(&route, &settings, &key),
+            !speculation::eligible(&route, &settings, &key),
             "nothing configured"
         );
         settings.speculation.enabled = true;
         settings.speculation.draft_model = Some("drafter".into());
         assert!(
-            !speculation_eligible(&route, &settings, &key),
+            !speculation::eligible(&route, &settings, &key),
             "boon not granted on the model"
         );
         route.boons = vec!["speculation".into()];
         assert!(
-            !speculation_eligible(&route, &settings, &key),
+            !speculation::eligible(&route, &settings, &key),
             "the target has no scoring endpoint, so it cannot speculate"
         );
         route.verify_api_base = "http://scorer.test:8000/v1".into();
-        assert!(speculation_eligible(&route, &settings, &key));
+        assert!(speculation::eligible(&route, &settings, &key));
 
         key.internal = true;
         assert!(
-            !speculation_eligible(&route, &settings, &key),
+            !speculation::eligible(&route, &settings, &key),
             "internal probes must measure the target model itself"
         );
         key.internal = false;
 
         // The model's own drafter beats the fleet default...
         route.draft_model = "special-drafter".into();
-        assert!(speculation_eligible(&route, &settings, &key));
+        assert!(speculation::eligible(&route, &settings, &key));
         // ...including when that choice is the (invalid) self-draft.
         route.draft_model = route.model_name.clone();
         assert!(
-            !speculation_eligible(&route, &settings, &key),
+            !speculation::eligible(&route, &settings, &key),
             "a model must not draft for itself"
         );
         route.draft_model = String::new();
         settings.speculation.draft_model = Some(route.model_name.clone());
         assert!(
-            !speculation_eligible(&route, &settings, &key),
+            !speculation::eligible(&route, &settings, &key),
             "the fleet-default drafter must not be the target either"
         );
     }
@@ -1999,24 +1837,24 @@ mod tests {
         let mut key = test_key();
 
         // Granted + active + chat + no tenant policy -> eligible.
-        assert!(compression_eligible(&route, &settings, &key, true));
+        assert!(compression::eligible(&route, &settings, &key, true));
 
         // Not chat -> ineligible.
-        assert!(!compression_eligible(&route, &settings, &key, false));
+        assert!(!compression::eligible(&route, &settings, &key, false));
 
         // No grant -> ineligible.
         route.boons.clear();
-        assert!(!compression_eligible(&route, &settings, &key, true));
+        assert!(!compression::eligible(&route, &settings, &key, true));
         route.boons = vec!["compression".to_string()];
 
         // Global master switch off -> ineligible.
         settings.compression.enabled = false;
-        assert!(!compression_eligible(&route, &settings, &key, true));
+        assert!(!compression::eligible(&route, &settings, &key, true));
         settings.compression.enabled = true;
 
         // Internal probe keys are exempt.
         key.internal = true;
-        assert!(!compression_eligible(&route, &settings, &key, true));
+        assert!(!compression::eligible(&route, &settings, &key, true));
         key.internal = false;
 
         // Tenant opt-out policy (enabled = false) -> ineligible.
@@ -2027,7 +1865,7 @@ mod tests {
             compact_logs: false,
             allow_lossy: false,
         });
-        assert!(!compression_eligible(&route, &settings, &key, true));
+        assert!(!compression::eligible(&route, &settings, &key, true));
 
         // Tenant policy enabled -> eligible again.
         key.compression_policy = Some(CompressionPolicy {
@@ -2037,7 +1875,7 @@ mod tests {
             compact_logs: false,
             allow_lossy: false,
         });
-        assert!(compression_eligible(&route, &settings, &key, true));
+        assert!(compression::eligible(&route, &settings, &key, true));
     }
 
     #[test]
@@ -2062,8 +1900,8 @@ mod tests {
             compact_logs: false,
             allow_lossy: true,
         }));
-        assert!(dedup_eligible(&route, &settings, &key));
-        assert!(lossy_eligible(&route, &settings, &key, false));
+        assert!(compression::dedup_eligible(&route, &settings, &key));
+        assert!(compression::lossy_eligible(&route, &settings, &key, false));
 
         // Toggles off → ineligible.
         key.compression_policy = Some(CompressionPolicy {
@@ -2073,18 +1911,18 @@ mod tests {
             compact_logs: false,
             allow_lossy: false,
         });
-        assert!(!dedup_eligible(&route, &settings, &key));
-        assert!(!lossy_eligible(&route, &settings, &key, false));
+        assert!(!compression::dedup_eligible(&route, &settings, &key));
+        assert!(!compression::lossy_eligible(&route, &settings, &key, false));
         // ...but the per-request force override turns it on despite the toggle.
-        assert!(lossy_eligible(&route, &settings, &key, true));
+        assert!(compression::lossy_eligible(&route, &settings, &key, true));
 
         // No policy → ineligible (conservative).
         key.compression_policy = None;
-        assert!(!dedup_eligible(&route, &settings, &key));
-        assert!(!lossy_eligible(&route, &settings, &key, false));
+        assert!(!compression::dedup_eligible(&route, &settings, &key));
+        assert!(!compression::lossy_eligible(&route, &settings, &key, false));
         // Force still respects the base gate: it flips only the allow_lossy
         // toggle, so with the boon granted + globally active it now applies.
-        assert!(lossy_eligible(&route, &settings, &key, true));
+        assert!(compression::lossy_eligible(&route, &settings, &key, true));
     }
 
     #[test]
@@ -2102,7 +1940,7 @@ mod tests {
         route.boons = vec![];
         let key = test_key_with_policy(None);
         // The force override cannot bypass the base gate (boon must be granted).
-        assert!(!lossy_eligible(&route, &settings, &key, true));
+        assert!(!compression::lossy_eligible(&route, &settings, &key, true));
     }
 
     #[test]
@@ -2515,26 +2353,59 @@ mod tests {
         route.boons = vec!["image_generation".to_string()];
         route.supports_function_calling = true;
 
-        assert!(image_gen_eligible(&route, &settings));
+        assert!(image_gen::eligible(&route, &settings));
 
         // Not granted -> ineligible.
         route.boons.clear();
-        assert!(!image_gen_eligible(&route, &settings));
+        assert!(!image_gen::eligible(&route, &settings));
         route.boons = vec!["image_generation".to_string()];
 
         // No native function calling -> ineligible (the tool can never be called).
         route.supports_function_calling = false;
-        assert!(!image_gen_eligible(&route, &settings));
+        assert!(!image_gen::eligible(&route, &settings));
         route.supports_function_calling = true;
 
         // Global switch off -> ineligible.
         settings.image_generation.enabled = false;
-        assert!(!image_gen_eligible(&route, &settings));
+        assert!(!image_gen::eligible(&route, &settings));
         settings.image_generation.enabled = true;
 
         // No image model configured -> ineligible.
         settings.image_generation.image_model = None;
-        assert!(!image_gen_eligible(&route, &settings));
+        assert!(!image_gen::eligible(&route, &settings));
+    }
+
+    /// Granted and configured but unable to call functions is the
+    /// misconfiguration that is reported; not granted, or switched off, is not.
+    #[test]
+    fn a_gateway_tool_without_function_calling_is_a_misconfiguration() {
+        let mut settings = BoonSettings::default();
+        settings.image_generation.enabled = true;
+        settings.image_generation.image_model = Some("sdxl".to_string());
+        let mut route = test_route();
+        route.boons = vec!["image_generation".to_string()];
+        route.supports_function_calling = false;
+        assert!(image_gen::misconfigured(&route, &settings));
+        assert!(!web_search::misconfigured(&route, &settings), "not granted");
+        settings.image_generation.enabled = false;
+        assert!(!image_gen::misconfigured(&route, &settings), "switched off");
+        settings.image_generation.enabled = true;
+        route.supports_function_calling = true;
+        assert!(!image_gen::misconfigured(&route, &settings));
+        assert!(image_gen::eligible(&route, &settings));
+    }
+
+    /// A misconfigured model is logged once per settings refresh, not once
+    /// per request.
+    #[test]
+    fn a_misconfiguration_is_reported_once_per_settings_refresh() {
+        let engine = BoonEngine::new(BoonSettings::default());
+        assert!(engine.first_warning("m", "web_search"));
+        assert!(!engine.first_warning("m", "web_search"));
+        assert!(engine.first_warning("m", "image_generation"));
+        assert!(engine.first_warning("other", "web_search"));
+        engine.update(BoonSettings::default());
+        assert!(engine.first_warning("m", "web_search"));
     }
 
     /// The gate must sit inside the `is_chat` region and after the tool-loop

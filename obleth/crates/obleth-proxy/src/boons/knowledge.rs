@@ -25,7 +25,7 @@
 //! "prompt injection" in an AI-use policy) trip a tenant's own scanner and
 //! block a request the boon must never fail.
 
-use obleth_config::{KnowledgeBoonSettings, ResolvedKey, ResolvedModel};
+use obleth_config::{Boon, KnowledgeBoonSettings, ResolvedKey, ResolvedModel};
 use serde_json::{json, Value};
 
 use crate::knowledge::Hit;
@@ -45,7 +45,7 @@ pub fn eligible(
         && !key.internal
         && settings.active()
         && !route.knowledge_collections.is_empty()
-        && route.boons.iter().any(|b| b == "knowledge")
+        && route.has_boon(Boon::Knowledge)
 }
 
 /// Concatenate the last `turns` user messages, newest first. A short follow-up

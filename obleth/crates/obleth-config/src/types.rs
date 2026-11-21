@@ -638,6 +638,11 @@ pub struct ModelRoute {
 }
 
 impl ModelRoute {
+    /// The model was granted `boon`.
+    pub fn has_boon(&self, boon: Boon) -> bool {
+        boon.granted(&self.boons)
+    }
+
     /// Every client-facing name this route answers to: `model_name`, its
     /// aliases, then its variants. The same set
     /// [`ResolvedModel::addressable_names`] publishes as resolver keys.
@@ -888,6 +893,11 @@ pub struct ResolvedModel {
 }
 
 impl ResolvedModel {
+    /// The model was granted `boon`.
+    pub fn has_boon(&self, boon: Boon) -> bool {
+        boon.granted(&self.boons)
+    }
+
     /// Every client-facing name that must resolve to this route: the canonical
     /// `model_name` first, then each alias, then each variant. This is the set
     /// of resolver keys a warm-up or a cache invalidation has to cover, so
@@ -1863,14 +1873,46 @@ pub fn parse_tag_level(raw: &str) -> Option<(String, u8)> {
 /// look things up through a registered `search` route.
 /// Operators opt each model into a subset of these; nothing is granted by default.
 pub const MODEL_BOONS: &[&str] = &[
-    "vision",
-    "structured_output",
-    "compression",
-    "knowledge",
-    "image_generation",
-    "speculation",
-    "web_search",
+    Boon::Vision.name(),
+    Boon::StructuredOutput.name(),
+    Boon::Compression.name(),
+    Boon::Knowledge.name(),
+    Boon::ImageGeneration.name(),
+    Boon::Speculation.name(),
+    Boon::WebSearch.name(),
 ];
+
+/// One of the [`MODEL_BOONS`], for code that checks a grant: a typo in a
+/// variant does not compile, where a typo in a string literal never matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Boon {
+    Vision,
+    StructuredOutput,
+    Compression,
+    Knowledge,
+    ImageGeneration,
+    Speculation,
+    WebSearch,
+}
+
+impl Boon {
+    /// The name the boon is granted and reported by.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Boon::Vision => "vision",
+            Boon::StructuredOutput => "structured_output",
+            Boon::Compression => "compression",
+            Boon::Knowledge => "knowledge",
+            Boon::ImageGeneration => "image_generation",
+            Boon::Speculation => "speculation",
+            Boon::WebSearch => "web_search",
+        }
+    }
+
+    fn granted(self, boons: &[String]) -> bool {
+        boons.iter().any(|b| b == self.name())
+    }
+}
 
 /// True when `boon` is part of the fixed [`MODEL_BOONS`] vocabulary.
 pub fn is_valid_boon(boon: &str) -> bool {
@@ -4959,6 +5001,25 @@ mod tests {
     #[test]
     fn web_search_boon_is_in_the_vocabulary() {
         assert!(is_valid_boon("web_search"));
+        // Each typed boon is exactly one name of the vocabulary.
+        let all = [
+            Boon::Vision,
+            Boon::StructuredOutput,
+            Boon::Compression,
+            Boon::Knowledge,
+            Boon::ImageGeneration,
+            Boon::Speculation,
+            Boon::WebSearch,
+        ];
+        assert_eq!(all.map(Boon::name).as_slice(), MODEL_BOONS);
+        for name in MODEL_BOONS {
+            let granted: Vec<&str> = all
+                .into_iter()
+                .filter(|b| b.granted(&[name.to_string()]))
+                .map(Boon::name)
+                .collect();
+            assert_eq!(granted, vec![*name]);
+        }
         assert_eq!(
             normalize_boons(["Web_Search", "web_search", "vision"]),
             vec!["web_search".to_string(), "vision".to_string()]

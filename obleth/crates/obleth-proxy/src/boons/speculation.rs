@@ -261,6 +261,33 @@ pub(crate) fn last_user_text(messages: &Value) -> String {
         .to_string()
 }
 
+/// The speculation boon is eligible when the model was granted it, the boon is
+/// globally active (enabled with a drafter and a verifier configured), the key
+/// is not an internal probe (probes must measure the target model itself), and
+/// the drafter is not the target. Request-body eligibility (bypass params,
+/// multimodal content) is decided separately by
+/// [`eligible_messages`].
+pub(super) fn eligible(
+    route: &obleth_config::ResolvedModel,
+    settings: &obleth_config::BoonSettings,
+    key: &obleth_config::ResolvedKey,
+) -> bool {
+    if key.internal
+        || !settings.speculation.active()
+        || !route.has_boon(obleth_config::Boon::Speculation)
+    {
+        return false;
+    }
+    // Both helpers resolve per target: its own drafter (fleet default as
+    // fallback) and its own scoring endpoint. Missing either means the model
+    // cannot speculate, decided here before anything is armed.
+    if scoring_base(route, &settings.speculation.verify_url_template).is_empty() {
+        return false;
+    }
+    let drafter = effective_draft_model(route, &settings.speculation);
+    !drafter.is_empty() && drafter != route.model_name
+}
+
 /// Decide eligibility from the request body and return the flattened messages
 /// when eligible. `None` = ineligible (multimodal parts, bypass params, n>1,
 /// no messages).

@@ -876,7 +876,7 @@ fn images_refused(inp: &Inputs<'_>, out: &mut Vec<AdviceFinding>, covered: &mut 
         // A native vision model refusing (too many images) is the caller's to
         // fix; a model granted the boon since has its images described from
         // now on, though the window still holds its earlier refusals.
-        if m.supports_vision || m.boons.iter().any(|b| b == "vision") {
+        if m.supports_vision || m.has_boon(obleth_config::Boon::Vision) {
             continue;
         }
         let e = by_model.entry(g.model.clone()).or_default();

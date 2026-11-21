@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use obleth_config::{ResolvedKey, VisionBoonSettings};
+use obleth_config::{Boon, ResolvedKey, ResolvedModel, VisionBoonSettings};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -330,6 +330,12 @@ fn description_hashes(
     } else {
         hash_all()
     }
+}
+
+/// Whether the boon applies to a request for `route`: the model was granted
+/// it, cannot read images itself, and a describer is configured.
+pub(super) fn eligible(route: &ResolvedModel, settings: &obleth_config::BoonSettings) -> bool {
+    route.has_boon(Boon::Vision) && !route.supports_vision && settings.vision.active()
 }
 
 #[cfg(test)]

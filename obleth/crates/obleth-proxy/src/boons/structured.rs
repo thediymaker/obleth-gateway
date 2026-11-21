@@ -11,6 +11,7 @@
 //! model); on final failure the original completion passes through unchanged
 //! (fail-open) with a warning header.
 
+use obleth_config::{Boon, ResolvedModel};
 use serde_json::{json, Value};
 
 /// Schemas larger than this are not validated (fail-open, prompt-only) so a
@@ -38,6 +39,14 @@ impl Schema {
         };
         Schema { text, validator }
     }
+}
+
+/// Whether the boon applies to a request for `route`: the model was granted
+/// it, has no native `response_format` support, and the boon is active.
+pub(super) fn eligible(route: &ResolvedModel, settings: &obleth_config::BoonSettings) -> bool {
+    route.has_boon(Boon::StructuredOutput)
+        && !route.supports_response_schema
+        && settings.structured_output.active()
 }
 
 /// Apply the structured-output boon to a chat request in place.

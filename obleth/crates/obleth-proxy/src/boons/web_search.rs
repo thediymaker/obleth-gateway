@@ -17,12 +17,11 @@
 //! a timeout, a guardrails block, or the per-request limit all become a short
 //! tool result the model can answer around. A search never fails the request.
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 use obleth_config::{
-    ResolvedKey, WebSearchBoonSettings, SEARCH_MODEL_TYPE, WEB_SEARCH_MAX_PER_REQUEST,
-    WEB_SEARCH_MAX_RESULTS,
+    Boon, ResolvedKey, ResolvedModel, WebSearchBoonSettings, SEARCH_MODEL_TYPE,
+    WEB_SEARCH_MAX_PER_REQUEST, WEB_SEARCH_MAX_RESULTS,
 };
 use serde_json::{json, Value};
 
@@ -104,52 +103,36 @@ fn nudge_text() -> &'static str {
      unless it helps answer the user."
 }
 
-/// Whether `web_search` is already owned by something else: a tool the client
-/// itself defined (agentic clients often bring their own `web_search`), or a
-/// tool the MCP tool loop already mapped from a granted server. The existing
-/// owner always wins.
-///
-/// As with `image_gen::collides`, the caller must decide the injection and the
-/// `tool_loop_servers` map insert together from this single answer, so the
-/// request body and the loop's dispatch map never disagree about who owns the
-/// name.
-pub(super) fn collides(
-    json_body: &Value,
-    tool_loop_servers: Option<&HashMap<String, String>>,
-) -> bool {
-    let client_has_it = json_body
-        .get("tools")
-        .and_then(|v| v.as_array())
-        .is_some_and(|arr| {
-            arr.iter().any(|t| {
-                t.pointer("/function/name").and_then(|n| n.as_str()) == Some(WEB_SEARCH_TOOL)
-            })
-        });
-    client_has_it || tool_loop_servers.is_some_and(|m| m.contains_key(WEB_SEARCH_TOOL))
+/// Whether the boon applies to a request for `route`: the model was granted
+/// it, the boon is globally active (enabled with a search route configured),
+/// and the model can call functions. As with image generation, the
+/// operator's grant is the opt-in.
+pub(super) fn eligible(route: &ResolvedModel, settings: &obleth_config::BoonSettings) -> bool {
+    route.has_boon(Boon::WebSearch)
+        && settings.web_search.active()
+        && route.supports_function_calling
 }
 
-/// Merge the tool definition into the request, and optionally add the system
-/// nudge. Client-supplied tools are preserved.
-///
-/// Callers must check [`collides`] first: this function does not itself guard
-/// against a name collision.
-pub(super) fn inject(
-    cfg: &WebSearchBoonSettings,
-    nudge: bool,
-    supports_system_messages: bool,
-    json_body: &mut Value,
-) {
-    let def = tool_def(cfg, chrono::Utc::now().date_naive());
-    if let Some(obj) = json_body.as_object_mut() {
-        match obj.get_mut("tools").and_then(|v| v.as_array_mut()) {
-            Some(existing) => existing.push(def),
-            None => {
-                obj.insert("tools".into(), Value::Array(vec![def]));
-            }
-        }
-    }
-    if nudge {
-        super::structured::inject_prompt_section(json_body, nudge_text(), supports_system_messages);
+/// Granted and configured, but the model cannot call functions.
+pub(super) fn misconfigured(route: &ResolvedModel, settings: &obleth_config::BoonSettings) -> bool {
+    super::gateway_tool::lacks_function_calling(
+        route,
+        Boon::WebSearch,
+        settings.web_search.active(),
+    )
+}
+
+/// The `web_search` tool, armed by [`super::gateway_tool::GatewayTool::arm`].
+/// A client's own `web_search` is common, so losing the name is logged at
+/// debug.
+pub(super) fn gateway_tool(cfg: &WebSearchBoonSettings) -> super::gateway_tool::GatewayTool {
+    super::gateway_tool::GatewayTool {
+        boon: Boon::WebSearch,
+        name: WEB_SEARCH_TOOL,
+        server: SEARCH_SYNTHETIC_SERVER,
+        def: tool_def(cfg, chrono::Utc::now().date_naive()),
+        nudge: nudge_text(),
+        warn_on_collision: false,
     }
 }
 
@@ -274,15 +257,6 @@ pub(super) fn limit_result(limit: u32) -> String {
     )
 }
 
-/// One search attempt, for the trace span. Recorded by the caller, which owns
-/// the tracer (`execute` does not).
-pub(super) struct SearchEvent {
-    pub results: u32,
-    pub tool: String,
-    pub upstream_ms: u32,
-    pub ok: bool,
-}
-
 /// Everything the gateway-executed `web_search` tool needs, threaded through
 /// the tool loop for the life of one request.
 pub(super) struct SearchCtx<'a> {
@@ -297,7 +271,7 @@ pub(super) struct SearchCtx<'a> {
     /// Searches attempted so far. Counts attempts, not successes, so a
     /// failing upstream cannot be retried past the limit.
     pub searches: u32,
-    pub events: Vec<SearchEvent>,
+    pub events: Vec<super::gateway_tool::GatewayToolEvent>,
 }
 
 /// Timeout for one search: the boon's own timeout, capped by the loop's
@@ -314,7 +288,7 @@ pub(super) fn call_timeout(
 /// [`SearchCtx::absorb`].
 pub(super) struct SearchCall {
     result: String,
-    event: Option<SearchEvent>,
+    event: Option<super::gateway_tool::GatewayToolEvent>,
 }
 
 impl SearchCall {
@@ -474,11 +448,11 @@ pub(super) async fn execute(
     );
     SearchCall {
         result,
-        event: Some(SearchEvent {
-            results,
-            tool: route.model_name.clone(),
+        event: Some(super::gateway_tool::GatewayToolEvent {
+            span: "boon:web_search",
             upstream_ms,
             ok: status == 200,
+            attributes: json!({ "results": results, "tool": route.model_name }),
         }),
     }
 }
@@ -523,46 +497,13 @@ mod tests {
     }
 
     #[test]
-    fn a_client_or_mcp_web_search_wins_over_the_boon() {
-        let plain = json!({ "messages": [] });
-        assert!(!collides(&plain, None));
-
-        let client = json!({
-            "tools": [{ "type": "function", "function": { "name": "web_search" } }]
-        });
-        assert!(collides(&client, None));
-
-        let mut mcp = HashMap::new();
-        mcp.insert("web_search".to_string(), "searxng-mcp".to_string());
-        assert!(collides(&plain, Some(&mcp)));
-
-        let mut other = HashMap::new();
-        other.insert("generate_image".to_string(), "__image__".to_string());
-        assert!(!collides(&plain, Some(&other)));
-    }
-
-    #[test]
-    fn inject_keeps_client_tools_and_nudges_only_when_asked() {
-        let mut body = json!({
-            "messages": [{ "role": "user", "content": "hi" }],
-            "tools": [{ "type": "function", "function": { "name": "client_tool" } }]
-        });
-        inject(&cfg(), false, true, &mut body);
-        let names: Vec<&str> = body["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|t| t["function"]["name"].as_str())
-            .collect();
-        assert_eq!(names, vec!["client_tool", WEB_SEARCH_TOOL]);
-        assert_eq!(body["messages"].as_array().unwrap().len(), 1, "no nudge");
-
-        let mut plain = json!({ "messages": [{ "role": "user", "content": "hi" }] });
-        inject(&cfg(), true, true, &mut plain);
-        assert_eq!(plain["tools"].as_array().unwrap().len(), 1);
-        assert!(plain
-            .to_string()
-            .contains("A `web_search` tool is available"));
+    fn the_tool_carries_the_search_definition_and_nudge() {
+        let tool = gateway_tool(&cfg());
+        assert_eq!(tool.name, WEB_SEARCH_TOOL);
+        assert_eq!(tool.server, SEARCH_SYNTHETIC_SERVER);
+        assert_eq!(tool.def["function"]["name"], WEB_SEARCH_TOOL);
+        assert!(tool.nudge.contains("A `web_search` tool is available"));
+        assert!(!tool.warn_on_collision);
     }
 
     #[test]

@@ -814,36 +814,28 @@ impl LoopTrace {
         image_ctx: Option<&mut super::image_gen::ImageCtx<'_>>,
         search_ctx: Option<&mut super::web_search::SearchCtx<'_>>,
     ) {
-        let image_events = image_ctx.into_iter().flat_map(|ctx| ctx.events.drain(..));
-        let search_events = search_ctx.into_iter().flat_map(|ctx| ctx.events.drain(..));
-        let mut spans = Vec::new();
-        for event in image_events {
-            spans.push(crate::tracer::PendingSpan {
-                name: "boon:image_generation".into(),
+        let mut events = Vec::new();
+        for ctx_events in [
+            image_ctx.map(|ctx| &mut ctx.events),
+            search_ctx.map(|ctx| &mut ctx.events),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            events.append(ctx_events);
+        }
+        if !self.on {
+            return;
+        }
+        self.spans
+            .extend(events.into_iter().map(|event| crate::tracer::PendingSpan {
+                name: event.span.into(),
                 parent: "boon:tool_loop".into(),
                 start_ms: tool_exec_start,
                 duration_ms: event.upstream_ms,
                 status: if event.ok { "ok" } else { "error" },
-                attributes: json!({
-                    "images": event.images,
-                    "size": event.size,
-                    "model": event.model,
-                }),
-            });
-        }
-        for event in search_events {
-            spans.push(crate::tracer::PendingSpan {
-                name: "boon:web_search".into(),
-                parent: "boon:tool_loop".into(),
-                start_ms: tool_exec_start,
-                duration_ms: event.upstream_ms,
-                status: if event.ok { "ok" } else { "error" },
-                attributes: json!({ "results": event.results, "tool": event.tool }),
-            });
-        }
-        if self.on {
-            self.spans.extend(spans);
-        }
+                attributes: event.attributes,
+            }));
     }
 
     /// One gateway turn: running its tool calls and the model call after
