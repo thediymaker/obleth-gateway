@@ -17,13 +17,36 @@ use serde_json::{json, Value};
 /// hostile client cannot feed the validator a pathological document.
 const SCHEMA_MAX_BYTES: usize = 64 * 1024;
 
+/// A request's JSON schema, serialized and compiled once when the boon arms:
+/// the prompt section, every repair request and every validation reuse it.
+pub struct Schema {
+    /// The schema as compact JSON.
+    pub text: String,
+    /// `None` when the schema does not compile: validation is skipped
+    /// (fail-open), as for a request with no schema.
+    validator: Option<jsonschema::Validator>,
+}
+
+impl Schema {
+    pub(super) fn new(schema: &Value, text: String) -> Self {
+        let validator = match jsonschema::validator_for(schema) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!(error = %e, "structured-output schema failed to compile; skipping validation");
+                None
+            }
+        };
+        Schema { text, validator }
+    }
+}
+
 /// Apply the structured-output boon to a chat request in place.
 ///
 /// Returns `None` when the request carries no `json_schema`/`json_object`
 /// response format (nothing was changed). Returns `Some(schema)` when armed:
 /// the schema to validate against, or `Some(None)` for a syntactic-only check
 /// (`json_object`, missing schema, or an oversized schema).
-pub(super) fn apply(json: &mut Value, supports_system: bool) -> Option<Option<Value>> {
+pub(super) fn apply(json: &mut Value, supports_system: bool) -> Option<Option<Schema>> {
     let format_type = json
         .pointer("/response_format/type")
         .and_then(|v| v.as_str())
@@ -34,20 +57,19 @@ pub(super) fn apply(json: &mut Value, supports_system: bool) -> Option<Option<Va
 
     let schema = json
         .pointer("/response_format/json_schema/schema")
-        .cloned()
-        .filter(|s| {
-            let size = serde_json::to_string(s).map(|t| t.len()).unwrap_or(0);
-            if size > SCHEMA_MAX_BYTES {
+        .and_then(|schema| {
+            let text = serde_json::to_string(schema).unwrap_or_default();
+            if text.len() > SCHEMA_MAX_BYTES {
                 tracing::warn!(
-                    size,
+                    size = text.len(),
                     "structured-output boon schema exceeds size cap; skipping validation"
                 );
-                return false;
+                return None;
             }
-            true
+            Some(Schema::new(schema, text))
         });
 
-    let section = render_schema_prompt(schema.as_ref());
+    let section = render_schema_prompt(schema.as_ref().map(|s| s.text.as_str()));
     inject_prompt_section(json, &section, supports_system);
     if let Some(obj) = json.as_object_mut() {
         obj.remove("response_format");
@@ -56,15 +78,14 @@ pub(super) fn apply(json: &mut Value, supports_system: bool) -> Option<Option<Va
 }
 
 /// Render the injected system section instructing the model to emit JSON.
-pub(super) fn render_schema_prompt(schema: Option<&Value>) -> String {
+fn render_schema_prompt(schema: Option<&str>) -> String {
     match schema {
         Some(schema) => format!(
             "# Response format\n\n\
              Respond with a single JSON document that conforms to the JSON Schema below. \
              Output only the JSON document — no prose, no markdown fences, nothing before \
              or after it.\n\n\
-             JSON Schema: {}\n",
-            serde_json::to_string(schema).unwrap_or_else(|_| "{}".into())
+             JSON Schema: {schema}\n"
         ),
         None => "# Response format\n\n\
              Respond with a single valid JSON object. Output only the JSON — no prose, \
@@ -130,14 +151,10 @@ pub(super) fn extract_json(content: &str) -> Option<Value> {
 }
 
 /// Validate `value` against `schema`. Returns the validator's error messages
-/// on mismatch. A schema that fails to compile validates nothing (fail-open).
-pub(super) fn validate(schema: &Value, value: &Value) -> Result<(), Vec<String>> {
-    let validator = match jsonschema::validator_for(schema) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(error = %e, "structured-output schema failed to compile; skipping validation");
-            return Ok(());
-        }
+/// on mismatch. A schema that failed to compile validates nothing (fail-open).
+pub(super) fn validate(schema: &Schema, value: &Value) -> Result<(), Vec<String>> {
+    let Some(validator) = &schema.validator else {
+        return Ok(());
     };
     let errors: Vec<String> = validator
         .iter_errors(value)
@@ -154,13 +171,11 @@ pub(super) fn validate(schema: &Value, value: &Value) -> Result<(), Vec<String>>
 /// Build the chat-completions body for one repair attempt.
 pub(super) fn repair_request_body(
     upstream_model: &str,
-    schema: Option<&Value>,
+    schema: Option<&Schema>,
     invalid_output: &str,
     errors: &[String],
 ) -> Value {
-    let schema_text = schema
-        .map(|s| serde_json::to_string(s).unwrap_or_else(|_| "{}".into()))
-        .unwrap_or_else(|| "(none — any valid JSON object)".into());
+    let schema_text = schema.map_or("(none — any valid JSON object)", |s| s.text.as_str());
     json!({
         "model": upstream_model,
         "messages": [
@@ -210,8 +225,9 @@ mod tests {
                 "json_schema": { "name": "person", "schema": schema() }
             }
         });
-        let plan = apply(&mut req, true).expect("armed");
-        assert_eq!(plan, Some(schema()));
+        let plan = apply(&mut req, true).expect("armed").expect("a schema");
+        assert_eq!(plan.text, schema().to_string());
+        assert!(plan.validator.is_some());
         assert!(req.get("response_format").is_none());
         assert_eq!(req["messages"][0]["role"], "system");
         assert!(req["messages"][0]["content"]
@@ -327,22 +343,27 @@ mod tests {
 
     // ---- validation ----
 
+    fn compiled(schema: &Value) -> Schema {
+        Schema::new(schema, schema.to_string())
+    }
+
     #[test]
     fn validate_passes_conforming_value() {
         let value = json!({ "name": "Bob", "age": 42 });
-        assert!(validate(&schema(), &value).is_ok());
+        assert!(validate(&compiled(&schema()), &value).is_ok());
     }
 
     #[test]
     fn validate_reports_errors() {
         let value = json!({ "name": "Bob", "age": "forty-two", "extra": true });
-        let errors = validate(&schema(), &value).unwrap_err();
+        let errors = validate(&compiled(&schema()), &value).unwrap_err();
         assert!(!errors.is_empty());
     }
 
     #[test]
     fn uncompilable_schema_fails_open() {
-        let bad = json!({ "type": "not-a-real-type" });
+        let bad = compiled(&json!({ "type": "not-a-real-type" }));
+        assert!(bad.validator.is_none());
         assert!(validate(&bad, &json!({})).is_ok());
     }
 
@@ -352,7 +373,7 @@ mod tests {
     fn repair_body_carries_schema_output_and_errors() {
         let body = repair_request_body(
             "fixer-1b",
-            Some(&schema()),
+            Some(&compiled(&schema())),
             "{\"name\": \"Bob\"}",
             &["missing required property 'age'".to_string()],
         );

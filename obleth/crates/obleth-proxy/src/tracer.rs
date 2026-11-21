@@ -57,6 +57,33 @@ impl SpanRecorder {
         });
     }
 
+    /// Record spans a boon measured without a recorder at hand.
+    pub fn record_pending(&mut self, spans: impl IntoIterator<Item = PendingSpan>) {
+        for span in spans {
+            self.record(
+                &span.name,
+                &span.parent,
+                span.start_ms,
+                span.duration_ms,
+                span.status,
+                span.attributes,
+            );
+        }
+    }
+
+    /// A handle that records spans for this request after the recorder has
+    /// finished: a streamed response's boons (the streaming tool loop, a
+    /// committed speculation) finish inside the response body, after the
+    /// recorder has sent the trace at header time.
+    pub fn late(&self) -> LateSpans {
+        LateSpans {
+            request_id: self.request_id,
+            session_id: self.session_id.clone(),
+            session_id_source: self.session_id_source.clone(),
+            sink: self.sink.clone(),
+        }
+    }
+
     pub fn record_elapsed(
         &mut self,
         span_name: &str,
@@ -108,6 +135,66 @@ impl SpanRecorder {
 impl Drop for SpanRecorder {
     fn drop(&mut self) {
         self.close("error");
+    }
+}
+
+/// A span measured where no recorder is at hand, recorded afterwards with
+/// [`SpanRecorder::record_pending`] or [`LateSpans::record`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingSpan {
+    pub name: String,
+    pub parent: String,
+    pub start_ms: i64,
+    pub duration_ms: u32,
+    pub status: &'static str,
+    pub attributes: serde_json::Value,
+}
+
+impl PendingSpan {
+    /// A span from `start_ms` to `end_ms`.
+    pub fn between(
+        name: impl Into<String>,
+        parent: impl Into<String>,
+        start_ms: i64,
+        end_ms: i64,
+        status: &'static str,
+        attributes: serde_json::Value,
+    ) -> Self {
+        PendingSpan {
+            name: name.into(),
+            parent: parent.into(),
+            start_ms,
+            duration_ms: u32::try_from((end_ms - start_ms).max(0)).unwrap_or(u32::MAX),
+            status,
+            attributes,
+        }
+    }
+}
+
+/// Records spans for a request whose recorder already finished (see
+/// [`SpanRecorder::late`]). Each span goes to the sink as it is recorded.
+pub struct LateSpans {
+    request_id: Uuid,
+    session_id: String,
+    session_id_source: String,
+    sink: TelemetrySink,
+}
+
+impl LateSpans {
+    pub fn record(&self, spans: impl IntoIterator<Item = PendingSpan>) {
+        for span in spans {
+            self.sink.record_span(SpanRecord {
+                request_id: self.request_id,
+                span_name: span.name,
+                parent_span: span.parent,
+                start_ms: span.start_ms,
+                duration_ms: span.duration_ms,
+                status: span.status.to_string(),
+                attributes: span.attributes.to_string(),
+                session_id: self.session_id.clone(),
+                session_id_source: self.session_id_source.clone(),
+            });
+        }
     }
 }
 
@@ -176,6 +263,39 @@ mod tests {
         // Two spans per recorder: the one recorded and the root, for each of
         // the two recorders, and nothing more from the one that finished twice.
         assert_eq!(handed, 4);
+
+        // Spans a stream measures after the recorder finished still reach
+        // the sink, once each.
+        let recorder = SpanRecorder::new(Uuid::new_v4(), now_ms(), sink.clone());
+        let late = recorder.late();
+        recorder.finish("ok");
+        let start = now_ms();
+        late.record([
+            PendingSpan::between(
+                "boon:tool_loop",
+                "proxy_request",
+                start,
+                start + 5,
+                "ok",
+                serde_json::json!({}),
+            ),
+            PendingSpan::between(
+                "boon:tool_loop:iter:0",
+                "boon:tool_loop",
+                start,
+                start + 3,
+                "ok",
+                serde_json::json!({}),
+            ),
+        ]);
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            handed = stats.lost(Stream::Spans, Outcome::Dropped) - before;
+            if handed >= 7 {
+                break;
+            }
+        }
+        assert_eq!(handed, 7);
         let _ = std::fs::remove_dir_all(&wal);
     }
 }

@@ -277,7 +277,7 @@ pub struct EnrichOutcome {
     /// Names of the boons that acted on this request (for the response header).
     pub applied: Vec<&'static str>,
     /// When set, the proxy must buffer the upstream response and run it through
-    /// [`respond::transform_completion`] before replying to the client.
+    /// [`tool_loop::run`] before replying to the client.
     pub response_plan: Option<ResponsePlan>,
     /// Set by the guardrails boon when a scanner rejects the request. The proxy
     /// must return `block.status` immediately when this is Some.
@@ -323,9 +323,10 @@ pub struct GuardrailsOutputPlan {
 /// Structured-output-boon response work: validate (and repair) the completion
 /// against the requested schema.
 pub struct StructuredPlan {
-    /// The JSON schema from `response_format.json_schema.schema`, or `None`
-    /// for `json_object` (syntactic JSON check only).
-    pub schema: Option<Value>,
+    /// The JSON schema from `response_format.json_schema.schema`, serialized
+    /// and compiled once, or `None` for `json_object` (syntactic JSON check
+    /// only).
+    pub schema: Option<structured::Schema>,
     /// Settings snapshot taken at request time so a hot-reload mid-request
     /// cannot change repair behavior.
     pub settings: StructuredOutputBoonSettings,
@@ -881,11 +882,14 @@ impl BoonEngine {
             if let Some(plan) = structured::apply(json, route.supports_system_messages) {
                 if let Some(t) = tracer.as_deref_mut() {
                     t.record_elapsed(
-                        "boon:structured_repair",
+                        "boon:structured_output",
                         "proxy_request",
                         structured_start,
                         "ok",
-                        serde_json::json!({}),
+                        serde_json::json!({
+                            "schema": plan.is_some(),
+                            "schema_bytes": plan.as_ref().map_or(0, |s| s.text.len()),
+                        }),
                     );
                 }
                 outcome.rewritten = true;

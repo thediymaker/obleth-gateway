@@ -120,6 +120,109 @@ pub struct SpecStats {
     /// could not be dispatched, or reported an error of its own. The tokens
     /// above are then what reached the client.
     pub failure: Option<u16>,
+    /// The cascade's trace spans (`boon:speculation` and its draft, verify
+    /// and escalate children), set when it ends: by [`run`] for an abstain
+    /// or a non-streaming ship, by the stream once a committed stream ends.
+    pub spans: Vec<crate::tracer::PendingSpan>,
+}
+
+/// Times of the cascade's phases, for its trace spans.
+#[derive(Clone, Default)]
+struct SpecTrace {
+    start_ms: i64,
+    drafter: String,
+    /// The draft call: dispatched, and ended (complete, or abandoned).
+    draft: Option<(i64, Option<i64>)>,
+    /// The continuation the target wrote after an escalation.
+    escalate: Option<(i64, i64, &'static str)>,
+}
+
+impl SpecTrace {
+    fn new() -> Self {
+        SpecTrace {
+            start_ms: crate::tracer::now_ms(),
+            ..SpecTrace::default()
+        }
+    }
+
+    fn draft_started(&mut self) {
+        self.draft = Some((crate::tracer::now_ms(), None));
+    }
+
+    fn draft_ended(&mut self, at_ms: i64) {
+        if let Some((_, end)) = self.draft.as_mut() {
+            end.get_or_insert(at_ms);
+        }
+    }
+
+    /// The spans for a cascade that ended `outcome` (`abstain`, `shipped`,
+    /// `escalated`, `error`), with the verifier's scorings when it had one.
+    fn spans(
+        mut self,
+        outcome: &'static str,
+        reason: Option<&'static str>,
+        verify: Option<&VerifyTimes>,
+    ) -> Vec<crate::tracer::PendingSpan> {
+        use crate::tracer::PendingSpan;
+        let now = crate::tracer::now_ms();
+        self.draft_ended(now);
+        let parent = "boon:speculation";
+        let mut spans = Vec::new();
+        if let Some((start, end)) = self.draft {
+            spans.push(PendingSpan::between(
+                "boon:speculation:draft",
+                parent,
+                start,
+                end.unwrap_or(now),
+                "ok",
+                json!({ "model": self.drafter }),
+            ));
+        }
+        if let Some(v) = verify.filter(|v| v.scorings > 0) {
+            spans.push(PendingSpan::between(
+                "boon:speculation:verify",
+                parent,
+                v.first_ms,
+                v.last_ms,
+                "ok",
+                json!({ "scorings": v.scorings, "scoring_ms": v.busy_ms }),
+            ));
+        }
+        if let Some((start, end, status)) = self.escalate {
+            spans.push(PendingSpan::between(
+                "boon:speculation:escalate",
+                parent,
+                start,
+                end,
+                status,
+                json!({}),
+            ));
+        }
+        spans.push(PendingSpan::between(
+            parent,
+            "proxy_request",
+            self.start_ms,
+            now,
+            if outcome == "error" { "error" } else { "ok" },
+            json!({ "outcome": outcome, "reason": reason, "drafter": self.drafter }),
+        ));
+        spans
+    }
+}
+
+/// When the verifier scored, and for how long in all.
+#[derive(Clone, Copy, Default)]
+struct VerifyTimes {
+    scorings: u32,
+    first_ms: i64,
+    last_ms: i64,
+    busy_ms: i64,
+}
+
+fn set_spans(stats: &Mutex<SpecStats>, spans: Vec<crate::tracer::PendingSpan>) {
+    if let Ok(mut st) = stats.lock() {
+        st.spans = spans;
+    }
 }
 
 /// What [`run`] decided. Both committed outcomes carry `drafted_by`, the
@@ -742,6 +845,8 @@ struct Verifier {
     timeout: Duration,
     /// Largest reply read; a `prompt_logprobs` answer is megabytes for a long prompt.
     reply_max: usize,
+    /// When the scorings ran, for the trace.
+    times: VerifyTimes,
 }
 
 impl Verifier {
@@ -756,6 +861,7 @@ impl Verifier {
             scorings: 0,
             timeout: Duration::from_millis(s.verify_timeout_ms.max(1)),
             reply_max: s.verify_reply_max_bytes.max(1),
+            times: VerifyTimes::default(),
         }
     }
 
@@ -863,9 +969,29 @@ impl Verifier {
         Ok(())
     }
 
+    /// Score `draft_text`, timing the call for the trace.
+    async fn score(
+        &mut self,
+        state: &AppState,
+        messages: &Value,
+        draft_text: &str,
+    ) -> anyhow::Result<Score> {
+        let start = crate::tracer::now_ms();
+        let score = self.score_once(state, messages, draft_text).await;
+        let end = crate::tracer::now_ms();
+        let t = &mut self.times;
+        if t.scorings == 0 {
+            t.first_ms = start;
+        }
+        t.scorings += 1;
+        t.last_ms = end;
+        t.busy_ms += end - start;
+        score
+    }
+
     /// Score `draft_text` with one prefill over prefix+draft. Retries once on
     /// the cold-bucket corrupt-keys signature.
-    async fn score(
+    async fn score_once(
         &mut self,
         state: &AppState,
         messages: &Value,
@@ -1081,11 +1207,39 @@ pub struct SpecRequest<'a> {
 
 /// Run the cascade up to its commit point. See the module docs for the
 /// contract; every failure before a verified span is released returns
-/// [`Outcome::Abstain`].
+/// [`Outcome::Abstain`]. An abstain or a non-streaming ship leaves its trace
+/// spans in `stats` now; a committed stream leaves them when it ends.
 pub async fn run(
     req: SpecRequest<'_>,
     plan: SpeculationPlan,
     stats: Arc<Mutex<SpecStats>>,
+) -> Outcome {
+    let mut trace = SpecTrace::new();
+    let mut verify = None;
+    let outcome = cascade(req, plan, stats.clone(), &mut trace, &mut verify).await;
+    match &outcome {
+        Outcome::Abstain(reason) => {
+            set_spans(
+                &stats,
+                trace.spans("abstain", Some(reason), verify.as_ref()),
+            );
+        }
+        Outcome::ShippedJson { .. } => {
+            set_spans(&stats, trace.spans("shipped", None, verify.as_ref()));
+        }
+        Outcome::Stream { .. } => {}
+    }
+    outcome
+}
+
+/// The cascade behind [`run`]. Fills `trace` as it goes, and `verify` with the
+/// verifier's scorings when it does not hand the verifier to a stream.
+async fn cascade(
+    req: SpecRequest<'_>,
+    plan: SpeculationPlan,
+    stats: Arc<Mutex<SpecStats>>,
+    trace: &mut SpecTrace,
+    verify: &mut Option<VerifyTimes>,
 ) -> Outcome {
     let s = &plan.settings;
     // The drafter is the target's own choice; the fleet default is the fallback.
@@ -1104,6 +1258,7 @@ pub async fn run(
     if !drafter.enabled {
         return Outcome::Abstain("helper disabled");
     }
+    trace.drafter = drafter.model_name.clone();
     // Verification is the target's own scoring endpoint: a direct-URL
     // deployment of this model whose backend supports prompt_logprobs (its
     // own pods once patched, a canary until then). Not a registered route.
@@ -1168,9 +1323,10 @@ pub async fn run(
         .and_then(|v| v.as_u64())
         .filter(|v| *v > 0);
     let mut verifier = Verifier::new(verifier_model, s);
+    trace.draft_started();
 
     if plan.client_stream {
-        return match tokio::time::timeout(
+        let precommitted = tokio::time::timeout(
             budget,
             precommit_stream(
                 &req,
@@ -1181,17 +1337,32 @@ pub async fn run(
                 client_max_tokens,
             ),
         )
-        .await
-        {
+        .await;
+        return match precommitted {
             Ok(Ok(committed)) => Outcome::Stream {
                 drafted_by: drafter.model_name.clone(),
-                driver: drive_stream(req, plan, gate, drafter, verifier, committed, stats),
+                driver: drive_stream(
+                    req,
+                    plan,
+                    gate,
+                    drafter,
+                    verifier,
+                    committed,
+                    stats,
+                    std::mem::take(trace),
+                ),
             },
-            Ok(Err(reason)) => abstain(&req, &verifier, reason),
-            Err(_) => abstain(&req, &verifier, "pre-release budget exhausted"),
+            Ok(Err(reason)) => {
+                *verify = Some(verifier.times);
+                abstain(&req, &verifier, reason)
+            }
+            Err(_) => {
+                *verify = Some(verifier.times);
+                abstain(&req, &verifier, "pre-release budget exhausted")
+            }
         };
     }
-    match tokio::time::timeout(
+    let outcome = tokio::time::timeout(
         budget,
         run_nonstream(
             &req,
@@ -1200,10 +1371,12 @@ pub async fn run(
             &drafter,
             &mut verifier,
             client_max_tokens,
+            trace,
         ),
     )
-    .await
-    {
+    .await;
+    *verify = Some(verifier.times);
+    match outcome {
         Ok(Outcome::Abstain(reason)) => abstain(&req, &verifier, reason),
         Ok(outcome) => outcome,
         Err(_) => abstain(&req, &verifier, "pre-release budget exhausted"),
@@ -1263,6 +1436,7 @@ async fn run_nonstream(
     drafter: &Arc<ResolvedModel>,
     verifier: &mut Verifier,
     client_max_tokens: Option<u64>,
+    trace: &mut SpecTrace,
 ) -> Outcome {
     let s = &plan.settings;
     let body = draft_body(
@@ -1274,10 +1448,16 @@ async fn run_nonstream(
     );
     // The scoring prefix is tokenized while the drafter writes; a failure
     // here is retried by the first score.
-    let (completion, _) = tokio::join!(
-        super::chat_call_completion(req.state, drafter, &body, req.dispatch_timeout),
+    let draft_call = async {
+        let completion =
+            super::chat_call_completion(req.state, drafter, &body, req.dispatch_timeout).await;
+        (completion, crate::tracer::now_ms())
+    };
+    let ((completion, drafted_at), _) = tokio::join!(
+        draft_call,
         verifier.prefix_ids(&req.state.http, &plan.messages),
     );
+    trace.draft_ended(drafted_at);
     let completion = match completion {
         Ok(c) => c,
         Err(e) => {
@@ -1498,6 +1678,8 @@ struct Ended<S> {
     usage: Option<UpstreamUsage>,
     /// Deltas the drafter wrote, for billing a draft that reported no usage.
     drafted: usize,
+    /// When the draft ended (complete, or abandoned at a failed span).
+    draft_end_ms: i64,
     scorer: S,
 }
 
@@ -1644,6 +1826,7 @@ async fn verify_spans<D: DraftSource, S: SpanScorer>(
         }
     }
 
+    let draft_end_ms = crate::tracer::now_ms();
     // Final verify over the complete draft. A COMPLETE draft above the abort
     // floors with content already released is SHIPPED ("soft ship"): handing
     // the target a finished document to continue because it missed the gate
@@ -1692,6 +1875,7 @@ async fn verify_spans<D: DraftSource, S: SpanScorer>(
         ship,
         usage: draft.usage(),
         drafted: draft.deltas().len(),
+        draft_end_ms,
         scorer,
     };
     drop(draft); // disconnect aborts any still-running draft generation
@@ -1700,6 +1884,8 @@ async fn verify_spans<D: DraftSource, S: SpanScorer>(
 
 /// The committed streaming driver: release verified spans paced, keep
 /// verifying the growing draft, soft-ship or escalate mid-stream at the end.
+/// Leaves the cascade's trace spans in `stats` when it ends.
+#[allow(clippy::too_many_arguments)]
 fn drive_stream(
     req: SpecRequest<'_>,
     plan: SpeculationPlan,
@@ -1708,6 +1894,7 @@ fn drive_stream(
     verifier: Verifier,
     committed: Committed,
     stats: Arc<Mutex<SpecStats>>,
+    mut trace: SpecTrace,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
     let state = req.state.clone();
     let route = req.route.clone();
@@ -1753,6 +1940,9 @@ fn drive_stream(
         // so verifying the next span overlaps releasing this one. Dropping
         // the stream (the client went away) aborts the task.
         let draft_done = Arc::new(AtomicBool::new(reader.done));
+        // Scorings so far, for the trace should the verification task not
+        // come back with the verifier.
+        let committed_times = verifier.times;
         let mut pending: std::collections::VecDeque<String> =
             reader.deltas[..release_upto].iter().cloned().collect();
         let (tx, mut rx) = tokio::sync::mpsc::channel(VERIFIED_SPANS_BUFFERED);
@@ -1798,19 +1988,22 @@ fn drive_stream(
                 None => break None,
             }
         };
-        let Some(Ended { ship, tail, usage: draft_usage, drafted, scorer }) = ended else {
+        let Some(Ended { ship, tail, usage: draft_usage, drafted, draft_end_ms, scorer }) = ended else {
             // The task ended without an outcome (it panicked): the answer
             // stops short, as a broken-off continuation does.
             tracing::warn!(model = %model_name, "speculation verification ended without an outcome");
+            let spans = trace.spans("error", Some("verification ended without an outcome"), Some(&committed_times));
             if let Ok(mut st) = stats.lock() {
                 st.usage = UpstreamUsage::uncached(0, released as u32);
                 st.final_set = true;
                 st.failure = Some(DEFAULT_FAILURE_STATUS);
+                st.spans = spans;
             }
             yield Err(stream_cut_error());
             return;
         };
         let verifier = scorer.verifier;
+        trace.draft_ended(draft_end_ms);
 
         // The complete draft passed its final verify (or, with content
         // already released, cleared the abort floors: a "soft ship"): send
@@ -1838,9 +2031,11 @@ fn drive_stream(
                 yield Ok(Bytes::from(usage_chunk(&id, &model_name, created, usage)));
             }
             yield Ok(Bytes::from(done()));
+            let spans = trace.spans("shipped", None, Some(&verifier.times));
             if let Ok(mut st) = stats.lock() {
                 st.usage = usage;
                 st.final_set = true;
+                st.spans = spans;
             }
             return;
         }
@@ -1879,6 +2074,7 @@ fn drive_stream(
         let mut failure: Option<u16> = None;
         let mut error_forwarded = false;
         let mut cont_chars = 0usize;
+        let escalate_start = crate::tracer::now_ms();
         match dispatch_stream(&state, &route, &body, dispatch_timeout).await {
             Ok(resp) => {
                 use super::tool_stream::TurnEvent;
@@ -1935,6 +2131,13 @@ fn drive_stream(
                 broke_off = true;
             }
         }
+        let escalated_ok = !broke_off && failure.is_none() && (done_seen || finish.is_some());
+        trace.escalate = Some((
+            escalate_start,
+            crate::tracer::now_ms(),
+            if escalated_ok { "ok" } else { "error" },
+        ));
+        let spans = trace.spans("escalated", None, Some(&verifier.times));
         // Settle with what the target actually processed: its prompt covers
         // the original request plus the released prefix; the client received
         // released draft deltas plus the continuation's completion tokens.
@@ -1964,6 +2167,7 @@ fn drive_stream(
                     UpstreamUsage::new(input, (released as u32).saturating_add(cont_out), cached);
                 st.final_set = true;
                 st.failure = Some(failure.unwrap_or(DEFAULT_FAILURE_STATUS));
+                st.spans = spans;
             }
             yield Err(stream_cut_error());
             return;
@@ -1982,6 +2186,7 @@ fn drive_stream(
             st.usage = usage;
             st.final_set = true;
             st.failure = failure;
+            st.spans = spans;
         }
     })
 }
@@ -1989,6 +2194,48 @@ fn drive_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cascade's trace: the `boon:speculation` span with its draft, verify
+    /// and escalate phases under it, and the outcome on the parent.
+    #[test]
+    fn a_speculation_traces_its_draft_verify_and_escalation() {
+        let mut trace = SpecTrace::new();
+        trace.drafter = "drafter".into();
+        trace.draft_started();
+        let start = trace.start_ms;
+        trace.draft_ended(start + 40);
+        trace.escalate = Some((start + 60, start + 90, "ok"));
+        let verify = VerifyTimes {
+            scorings: 3,
+            first_ms: start + 10,
+            last_ms: start + 50,
+            busy_ms: 30,
+        };
+        let spans = trace.clone().spans("escalated", None, Some(&verify));
+        let names: Vec<(&str, &str)> = spans
+            .iter()
+            .map(|s| (s.name.as_str(), s.parent.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("boon:speculation:draft", "boon:speculation"),
+                ("boon:speculation:verify", "boon:speculation"),
+                ("boon:speculation:escalate", "boon:speculation"),
+                ("boon:speculation", "proxy_request"),
+            ]
+        );
+        assert_eq!(spans[1].attributes["scorings"], 3);
+        assert_eq!(spans[1].duration_ms, 40);
+        assert_eq!(spans[3].attributes["outcome"], "escalated");
+        assert_eq!(spans[3].attributes["drafter"], "drafter");
+
+        // An abstain before any draft is the parent alone, with its reason.
+        let spans = SpecTrace::new().spans("abstain", Some("no scoring endpoint"), None);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].name, "boon:speculation");
+        assert_eq!(spans[0].attributes["reason"], "no scoring endpoint");
+    }
 
     fn target(name: &str) -> ResolvedModel {
         serde_json::from_value(serde_json::json!({

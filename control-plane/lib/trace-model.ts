@@ -22,7 +22,14 @@ export function spanLabel(name: string, attributes?: string): string {
     cache_lookup: "Cache",
     "boon:vision": "Vision",
     "boon:tool_loop": "Tool Loop",
+    "boon:image_generation": "Image",
+    "boon:web_search": "Web Search",
+    "boon:structured_output": "Structured Output",
     "boon:structured_repair": "Repair",
+    "boon:speculation": "Speculation",
+    "boon:speculation:draft": "Draft",
+    "boon:speculation:verify": "Verify",
+    "boon:speculation:escalate": "Escalate",
     upstream: "Upstream",
     dispatch: "Upstream",
   };
@@ -44,7 +51,14 @@ export function spanHint(name: string): string {
     dispatch: "Provider model call",
     "boon:vision": "Image-to-text relay",
     "boon:tool_loop": "MCP tool execution loop",
-    "boon:structured_repair": "Schema validation",
+    "boon:image_generation": "Gateway image tool call",
+    "boon:web_search": "Gateway search tool call",
+    "boon:structured_output": "JSON schema added to the prompt",
+    "boon:structured_repair": "Answer repaired to match the schema",
+    "boon:speculation": "Draft model answer, checked by the target",
+    "boon:speculation:draft": "Draft model call",
+    "boon:speculation:verify": "Target model scoring the draft",
+    "boon:speculation:escalate": "Target model continuing the answer",
   };
   if (name in hints) return hints[name];
   if (name.startsWith("boon:tool_loop:iter:")) return "Tool call + model turn";

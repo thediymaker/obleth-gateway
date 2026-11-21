@@ -2492,7 +2492,17 @@ async fn run_pipeline(
                 dispatch_timeout: req_timeout,
                 started: request_start,
             };
-            match crate::boons::speculation::run(spec_req, spec_plan, spec_stats.clone()).await {
+            let outcome =
+                crate::boons::speculation::run(spec_req, spec_plan, spec_stats.clone()).await;
+            // An abstain or a shipped answer has its spans now; a committed
+            // stream's follow the trace once the stream ends.
+            let late_spans = tracer.as_ref().map(crate::tracer::SpanRecorder::late);
+            if let Some(t) = tracer.as_mut() {
+                let spans =
+                    std::mem::take(&mut spec_stats.lock().unwrap_or_else(|e| e.into_inner()).spans);
+                t.record_pending(spans);
+            }
+            match outcome {
                 crate::boons::speculation::Outcome::Abstain(_) => {}
                 crate::boons::speculation::Outcome::ShippedJson {
                     body,
@@ -2563,11 +2573,18 @@ async fn run_pipeline(
                             }
                         }
                         drop(permit);
-                        let (ttft_ms, settled) = {
-                            let s = spec_stats.lock().unwrap_or_else(|e| e.into_inner());
+                        let (ttft_ms, settled, spans) = {
+                            let mut s = spec_stats.lock().unwrap_or_else(|e| e.into_inner());
                             let usage = s.final_set.then_some(s.usage);
-                            (s.ttft_ms, drained_settlement(200, s.failure, usage, 0, est))
+                            (
+                                s.ttft_ms,
+                                drained_settlement(200, s.failure, usage, 0, est),
+                                std::mem::take(&mut s.spans),
+                            )
                         };
+                        if let Some(late) = &late_spans {
+                            late.record(spans);
+                        }
                         let total_ms = request_start.elapsed().as_millis() as u32;
                         let mut accounting = accounting;
                         accounting.fail_stream(settled.status, cut, None);
@@ -3162,10 +3179,14 @@ async fn run_pipeline(
                         dispatch_timeout: req_timeout,
                         client_include_usage: plan.include_usage,
                         upstream_start,
+                        traced: tracer.is_some(),
                     },
                     upstream,
                     stats.clone(),
                 );
+                // The loop's spans are known only once the stream ends, after
+                // the trace was sent; they follow it.
+                let late_spans = tracer.as_ref().map(crate::tracer::SpanRecorder::late);
 
                 let body_stream = async_stream::stream! {
                     futures_util::pin_mut!(driver);
@@ -3208,16 +3229,20 @@ async fn run_pipeline(
                     // A failed client-facing turn settles like a failed
                     // pass-through stream; a clean one with its usage, or the
                     // estimate when the upstream reported none.
-                    let (ttft_ms, settled) = {
-                        let s = stats.lock().unwrap_or_else(|e| e.into_inner());
+                    let (ttft_ms, settled, spans) = {
+                        let mut s = stats.lock().unwrap_or_else(|e| e.into_inner());
                         let usage = s.final_set.then(|| {
                             UpstreamUsage::new(s.input_tokens, s.output_tokens, s.cached_input_tokens)
                         });
                         (
                             s.ttft_ms,
                             drained_settlement(status_code, s.failure, usage, s.failed_turn_chars, est),
+                            std::mem::take(&mut s.spans),
                         )
                     };
+                    if let Some(late) = &late_spans {
+                        late.record(spans);
+                    }
                     let total_ms = request_start.elapsed().as_millis() as u32;
                     let finished = output_monitor.map(crate::output_monitor::OutputMonitor::finish);
                     accounting.monitor(scan_policy.as_ref(), finished.as_ref());

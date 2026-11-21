@@ -2,7 +2,8 @@
 //!
 //! When request enrichment arms a [`super::ResponsePlan`], the proxy forces a
 //! non-streaming upstream call, buffers the complete `chat.completion` JSON,
-//! and hands it to [`transform_completion`]. For clients that asked for
+//! and hands it to [`apply_structured`] (through the tool loop's
+//! [`super::tool_loop::run`]). For clients that asked for
 //! `stream: true`, the transformed completion is re-emitted as a short
 //! synthesized SSE sequence by [`synthesize_sse`].
 
@@ -12,7 +13,7 @@ use obleth_config::{ResolvedKey, ResolvedModel, STRUCTURED_OUTPUT_MAX_REPAIR_ATT
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use super::{structured, ResponsePlan, StructuredPlan};
+use super::{structured, StructuredPlan};
 use crate::state::AppState;
 
 /// Non-fatal outcome notes from a response transform, surfaced to the client
@@ -29,43 +30,12 @@ pub struct TransformResult {
     pub turn0_usage: Option<crate::proxy::UpstreamUsage>,
 }
 
-/// Apply the structured-output boon to a buffered chat completion.
-///
-/// Fail-open throughout: anything unexpected leaves the body unchanged.
-pub async fn transform_completion(
-    state: &AppState,
-    plan: &ResponsePlan,
-    route: Option<&ResolvedModel>,
-    key: &ResolvedKey,
-    session_id: &str,
-    request_id: Uuid,
-    body: &mut Value,
-) -> TransformResult {
-    // ---- structured-output boon ----
-    let warning = match &plan.structured {
-        Some(structured_plan) => {
-            apply_structured(
-                state,
-                structured_plan,
-                route,
-                key,
-                session_id,
-                request_id,
-                body,
-            )
-            .await
-        }
-        None => None,
-    };
-    TransformResult {
-        warning,
-        turn0_usage: None,
-    }
-}
-
 /// Validate (and repair) the completion's JSON against the armed schema,
 /// replacing the content with the canonical document on success. Returns the
 /// warning label on final failure (the original content passes through).
+/// Fail-open throughout: anything unexpected leaves the body unchanged. A
+/// repair that ran is traced as `boon:structured_repair`.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn apply_structured(
     state: &AppState,
     plan: &StructuredPlan,
@@ -74,12 +44,19 @@ pub(super) async fn apply_structured(
     session_id: &str,
     request_id: Uuid,
     body: &mut Value,
+    tracer: Option<&mut crate::tracer::SpanRecorder>,
 ) -> Option<&'static str> {
     let content = body
         .pointer("/choices/0/message/content")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())?;
-    match enforce_schema(state, plan, route, key, session_id, request_id, &content).await {
+    let start = crate::tracer::now_ms();
+    let (canonical, repair) =
+        enforce_schema(state, plan, route, key, session_id, request_id, &content).await;
+    if let (Some(t), Some(repair)) = (tracer, repair) {
+        t.record_pending([repair.span(start, crate::tracer::now_ms(), canonical.is_some())]);
+    }
+    match canonical {
         Some(canonical) => {
             if let Some(message) = body
                 .pointer_mut("/choices/0/message")
@@ -93,9 +70,33 @@ pub(super) async fn apply_structured(
     }
 }
 
+/// A repair the completion needed: the calls made, and the model that made
+/// them (empty when no model could).
+#[derive(Debug, PartialEq)]
+struct Repair {
+    attempts: u32,
+    fixer: String,
+}
+
+impl Repair {
+    /// The `boon:structured_repair` span: the repair calls made, whether the
+    /// answer ended valid, and the model that repaired it.
+    fn span(self, start_ms: i64, end_ms: i64, valid: bool) -> crate::tracer::PendingSpan {
+        crate::tracer::PendingSpan::between(
+            "boon:structured_repair",
+            "proxy_request",
+            start_ms,
+            end_ms,
+            if valid { "ok" } else { "error" },
+            json!({ "attempts": self.attempts, "valid": valid, "fixer": self.fixer }),
+        )
+    }
+}
+
 /// Extract, validate, and (when necessary) repair the completion's JSON
 /// document. Returns the canonical compact JSON string on success, `None`
-/// when every attempt failed (the caller passes the original through).
+/// when every attempt failed (the caller passes the original through), and
+/// the repair when the completion did not pass as it was.
 async fn enforce_schema(
     state: &AppState,
     plan: &super::StructuredPlan,
@@ -104,9 +105,9 @@ async fn enforce_schema(
     session_id: &str,
     request_id: Uuid,
     content: &str,
-) -> Option<String> {
+) -> (Option<String>, Option<Repair>) {
     let mut errors = match check(plan.schema.as_ref(), content) {
-        Ok(canonical) => return Some(canonical),
+        Ok(canonical) => return (Some(canonical), None),
         Err(errors) => errors,
     };
 
@@ -132,7 +133,13 @@ async fn enforce_schema(
     let helper = match (&fixer, route) {
         (Some(f), _) => f.as_ref().clone(),
         (None, Some(r)) => r.clone(),
-        (None, None) => return None,
+        (None, None) => {
+            let repair = Repair {
+                attempts: 0,
+                fixer: String::new(),
+            };
+            return (None, Some(repair));
+        }
     };
 
     let attempts = plan
@@ -140,8 +147,13 @@ async fn enforce_schema(
         .max_repair_attempts
         .min(STRUCTURED_OUTPUT_MAX_REPAIR_ATTEMPTS);
     let timeout = Duration::from_millis(plan.settings.timeout_ms.max(1));
+    let mut repair = Repair {
+        attempts: 0,
+        fixer: helper.model_name.clone(),
+    };
     let mut current = content.to_string();
     for attempt in 0..attempts {
+        repair.attempts += 1;
         let request = structured::repair_request_body(
             &helper.upstream_model,
             plan.schema.as_ref(),
@@ -160,7 +172,7 @@ async fn enforce_schema(
                     reply.usage,
                 );
                 match check(plan.schema.as_ref(), &reply.text) {
-                    Ok(canonical) => return Some(canonical),
+                    Ok(canonical) => return (Some(canonical), Some(repair)),
                     Err(next_errors) => {
                         current = reply.text;
                         errors = next_errors;
@@ -177,12 +189,12 @@ async fn enforce_schema(
             }
         }
     }
-    None
+    (None, Some(repair))
 }
 
 /// Extract the JSON document from `content` and validate it. Returns the
 /// canonical compact serialization on success, the error list on failure.
-fn check(schema: Option<&Value>, content: &str) -> Result<String, Vec<String>> {
+fn check(schema: Option<&structured::Schema>, content: &str) -> Result<String, Vec<String>> {
     let Some(value) = structured::extract_json(content) else {
         return Err(vec!["no JSON document found in the output".to_string()]);
     };
@@ -302,6 +314,25 @@ pub fn synthesize_sse(completion: &Value, include_usage: bool) -> String {
 mod tests {
     use super::*;
 
+    /// A completion repaired on the first call is traced as one attempt.
+    #[test]
+    fn a_first_time_repair_is_traced_as_one_attempt() {
+        let repair = Repair {
+            attempts: 1,
+            fixer: "fixer-1b".into(),
+        };
+        let span = repair.span(100, 160, true);
+        assert_eq!(span.name, "boon:structured_repair");
+        assert_eq!(
+            (span.start_ms, span.duration_ms, span.status),
+            (100, 60, "ok")
+        );
+        assert_eq!(
+            span.attributes,
+            json!({ "attempts": 1, "valid": true, "fixer": "fixer-1b" })
+        );
+    }
+
     fn completion(message: Value, finish: &str) -> Value {
         json!({
             "id": "chatcmpl-42",
@@ -392,6 +423,7 @@ mod tests {
     #[test]
     fn check_returns_canonical_json() {
         let schema = json!({ "type": "object", "required": ["a"] });
+        let schema = structured::Schema::new(&schema, schema.to_string());
         let out = check(Some(&schema), "here: {\"a\": 1} done").unwrap();
         assert_eq!(out, "{\"a\":1}");
     }
@@ -399,6 +431,7 @@ mod tests {
     #[test]
     fn check_collects_validation_errors() {
         let schema = json!({ "type": "object", "required": ["a"] });
+        let schema = structured::Schema::new(&schema, schema.to_string());
         let errors = check(Some(&schema), "{\"b\": 2}").unwrap_err();
         assert!(!errors.is_empty());
     }

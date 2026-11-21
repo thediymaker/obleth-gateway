@@ -63,6 +63,9 @@ pub struct StreamStats {
     /// Characters of generated text the failed turn delivered, for billing
     /// it when the upstream reported no usage.
     pub failed_turn_chars: usize,
+    /// The loop's trace spans, the buffered loop's names, set when the loop
+    /// ends; the proxy records them once the request has settled.
+    pub spans: Vec<crate::tracer::PendingSpan>,
 }
 
 /// Everything the streaming tool loop owns for the duration of a request.
@@ -92,6 +95,44 @@ pub struct StreamLoop {
     /// Whether the client asked for `stream_options.include_usage`.
     pub client_include_usage: bool,
     pub upstream_start: Instant,
+    /// The request is traced: collect the loop's spans into the stats.
+    pub traced: bool,
+}
+
+/// A gateway turn whose tools ran and whose follow-up model call is pending.
+struct OpenTurn {
+    turn: u32,
+    start_ms: i64,
+    tools: Vec<String>,
+    tool_ms: u32,
+}
+
+impl OpenTurn {
+    /// Close the turn when its follow-up call answered (or failed).
+    fn close(
+        self,
+        trace: &mut super::tool_loop::LoopTrace,
+        model_start_ms: i64,
+        failed: Option<&anyhow::Error>,
+    ) {
+        let now = crate::tracer::now_ms();
+        let duration_ms = u32::try_from((now - self.start_ms).max(0)).unwrap_or(u32::MAX);
+        let (status, extra) = match failed {
+            None => (
+                "ok",
+                json!({ "tool_ms": self.tool_ms, "model_ms": (now - model_start_ms).max(0) }),
+            ),
+            Some(e) => ("error", json!({ "error": e.to_string() })),
+        };
+        trace.turn(
+            self.turn,
+            self.start_ms,
+            duration_ms,
+            status,
+            self.tools,
+            extra,
+        );
+    }
 }
 
 /// One tool call assembled from streamed `tool_calls` deltas.
@@ -126,7 +167,12 @@ pub fn run(
             dispatch_timeout,
             client_include_usage,
             upstream_start,
+            traced,
         } = args;
+        let mut trace = super::tool_loop::LoopTrace::new(traced);
+        // Gateway turns whose follow-up answered, as the buffered loop counts.
+        let mut turns_done: u32 = 0;
+        let mut open_turn: Option<OpenTurn> = None;
 
         let tool_timeout = Duration::from_millis(settings.tool_timeout_ms.max(1));
         let max_turns = settings.max_turns.clamp(1, obleth_config::TOOL_LOOP_MAX_TURNS);
@@ -163,7 +209,7 @@ pub fn run(
             events: Vec::new(),
         });
 
-        'turns: for _turn in 0..max_turns {
+        'turns: for turn_no in 0..max_turns {
             // Obtain this turn's streaming response: reuse the proxy's first
             // dispatch, otherwise dispatch a follow-up here.
             let resp = match current.take() {
@@ -177,13 +223,22 @@ pub fn run(
                         );
                         obj.insert("model".into(), Value::String(upstream_model.clone()));
                     }
-                    match dispatch(&state, &target, &request, deadline.bound(dispatch_timeout)).await {
-                        Ok(r) => r,
+                    let model_start = crate::tracer::now_ms();
+                    let dispatched =
+                        dispatch(&state, &target, &request, deadline.bound(dispatch_timeout)).await;
+                    if let Some(open) = open_turn.take() {
+                        open.close(&mut trace, model_start, dispatched.as_ref().err());
+                    }
+                    match dispatched {
+                        Ok(r) => {
+                            turns_done += 1;
+                            r
+                        }
                         Err(e) => {
                             // The answer cannot go on past the tool call: it
                             // ends the way a broken-off stream does.
                             tracing::warn!(error = %e, "tool stream follow-up dispatch failed");
-                            fail_stats(&stats, DEFAULT_FAILURE_STATUS, None, 0);
+                            fail_stats(&stats, DEFAULT_FAILURE_STATUS, None, 0, trace.finish("error", turns_done));
                             yield Err(stream_cut_error());
                             return;
                         }
@@ -252,7 +307,7 @@ pub fn run(
                 if !broke_off {
                     tracing::warn!("tool stream upstream ended before its last event");
                 }
-                fail_stats(&stats, failure.unwrap_or(DEFAULT_FAILURE_STATUS), usage, turn_chars);
+                fail_stats(&stats, failure.unwrap_or(DEFAULT_FAILURE_STATUS), usage, turn_chars, trace.finish("error", turns_done));
                 yield Err(stream_cut_error());
                 return;
             }
@@ -273,7 +328,7 @@ pub fn run(
                     }
                 }
                 yield Ok(Bytes::from(done()));
-                fail_stats(&stats, status, usage, turn_chars);
+                fail_stats(&stats, status, usage, turn_chars, trace.finish("error", turns_done));
                 return;
             }
 
@@ -298,7 +353,7 @@ pub fn run(
                     yield Ok(Bytes::from(frame));
                 }
                 yield Ok(Bytes::from(done()));
-                finalize_stats(&stats, usage);
+                finalize_stats(&stats, usage, trace.finish("ok", turns_done));
                 return;
             }
 
@@ -328,7 +383,7 @@ pub fn run(
                     yield Ok(Bytes::from(frame));
                 }
                 yield Ok(Bytes::from(done()));
-                finalize_stats(&stats, usage);
+                finalize_stats(&stats, usage, trace.finish("ok", turns_done));
                 return;
             }
 
@@ -362,6 +417,7 @@ pub fn run(
                     arguments: serde_json::from_str(&c.arguments).unwrap_or_else(|_| json!({})),
                 })
                 .collect();
+            let tool_exec_start = crate::tracer::now_ms();
             let results = super::tool_loop::run_turn(
                 &state,
                 &key.tenant_id,
@@ -374,6 +430,13 @@ pub fn run(
                 tool_timeout,
             )
             .await;
+            trace.tool_events(tool_exec_start, image_ctx.as_mut(), search_ctx.as_mut());
+            open_turn = Some(OpenTurn {
+                turn: turn_no,
+                start_ms: tool_exec_start,
+                tools: calls.iter().map(|c| c.name.clone()).collect(),
+                tool_ms: u32::try_from((crate::tracer::now_ms() - tool_exec_start).max(0)).unwrap_or(u32::MAX),
+            });
             for (c, result) in calls.iter().zip(results) {
                 super::tool_loop::push_message(
                     Arc::make_mut(&mut request),
@@ -408,11 +471,16 @@ pub fn run(
             }),
         );
 
-        let final_resp = match dispatch(&state, &target, &request, deadline.bound(dispatch_timeout)).await {
+        let model_start = crate::tracer::now_ms();
+        let dispatched = dispatch(&state, &target, &request, deadline.bound(dispatch_timeout)).await;
+        if let Some(open) = open_turn.take() {
+            open.close(&mut trace, model_start, dispatched.as_ref().err());
+        }
+        let final_resp = match dispatched {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(error = %e, "tool stream finalization dispatch failed");
-                fail_stats(&stats, DEFAULT_FAILURE_STATUS, None, 0);
+                fail_stats(&stats, DEFAULT_FAILURE_STATUS, None, 0, trace.finish("error", max_turns));
                 yield Err(stream_cut_error());
                 return;
             }
@@ -472,7 +540,7 @@ pub fn run(
             if !broke_off {
                 tracing::warn!("tool stream final turn ended before its last event");
             }
-            fail_stats(&stats, failure.unwrap_or(DEFAULT_FAILURE_STATUS), usage, turn_chars);
+            fail_stats(&stats, failure.unwrap_or(DEFAULT_FAILURE_STATUS), usage, turn_chars, trace.finish("error", max_turns));
             yield Err(stream_cut_error());
             return;
         }
@@ -494,10 +562,10 @@ pub fn run(
         }
         yield Ok(Bytes::from(done()));
         if let Some(status) = failure {
-            fail_stats(&stats, status, usage, turn_chars);
+            fail_stats(&stats, status, usage, turn_chars, trace.finish("error", max_turns));
             return;
         }
-        finalize_stats(&stats, usage);
+        finalize_stats(&stats, usage, trace.finish("ok", max_turns));
     }
 }
 
@@ -803,14 +871,21 @@ pub(crate) fn chunk_usage(u: &Value) -> UpstreamUsage {
     )
 }
 
-fn finalize_stats(stats: &Arc<Mutex<StreamStats>>, usage: Option<UpstreamUsage>) {
-    if let Some(u) = usage {
-        if let Ok(mut s) = stats.lock() {
+/// Record how the loop ended: the usage the client-facing turn reported, and
+/// the loop's trace spans.
+fn finalize_stats(
+    stats: &Arc<Mutex<StreamStats>>,
+    usage: Option<UpstreamUsage>,
+    spans: Vec<crate::tracer::PendingSpan>,
+) {
+    if let Ok(mut s) = stats.lock() {
+        if let Some(u) = usage {
             s.input_tokens = u.input;
             s.output_tokens = u.output;
             s.cached_input_tokens = u.cached;
             s.final_set = true;
         }
+        s.spans = spans;
     }
 }
 
@@ -821,8 +896,9 @@ fn fail_stats(
     status: u16,
     usage: Option<UpstreamUsage>,
     delivered_chars: usize,
+    spans: Vec<crate::tracer::PendingSpan>,
 ) {
-    finalize_stats(stats, usage);
+    finalize_stats(stats, usage, spans);
     if let Ok(mut s) = stats.lock() {
         s.failure = Some(status);
         s.failed_turn_chars = delivered_chars;
@@ -1031,6 +1107,91 @@ pub(crate) fn done() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A streamed request whose loop runs one gateway tool call leaves the
+    /// same spans, by name, parent, status and attribute keys, as the
+    /// buffered loop does for the same turn.
+    #[test]
+    fn a_streamed_tool_turn_traces_like_a_buffered_one() {
+        use crate::tracer::PendingSpan;
+        fn shape(spans: Vec<PendingSpan>) -> Vec<(String, String, &'static str, Vec<String>)> {
+            spans
+                .into_iter()
+                .map(|s| {
+                    let keys = s
+                        .attributes
+                        .as_object()
+                        .map(|o| o.keys().cloned().collect())
+                        .unwrap_or_default();
+                    (s.name, s.parent, s.status, keys)
+                })
+                .collect()
+        }
+        let start = crate::tracer::now_ms();
+        let mut buffered = super::super::tool_loop::LoopTrace::new(true);
+        buffered.turn(
+            0,
+            start,
+            5,
+            "ok",
+            vec!["search".into()],
+            json!({ "tool_ms": 1, "model_ms": 4 }),
+        );
+        let buffered = buffered.finish("ok", 1);
+
+        let mut streamed = super::super::tool_loop::LoopTrace::new(true);
+        OpenTurn {
+            turn: 0,
+            start_ms: start,
+            tools: vec!["search".into()],
+            tool_ms: 1,
+        }
+        .close(&mut streamed, start + 1, None);
+        let streamed = streamed.finish("ok", 1);
+
+        assert_eq!(
+            shape(streamed.clone()),
+            vec![
+                (
+                    "boon:tool_loop:iter:0".into(),
+                    "boon:tool_loop".into(),
+                    "ok",
+                    vec!["model_ms".into(), "tool_ms".into(), "tools".into()]
+                ),
+                (
+                    "boon:tool_loop".into(),
+                    "proxy_request".into(),
+                    "ok",
+                    vec!["tools".into(), "turns".into()]
+                ),
+            ]
+        );
+        assert_eq!(shape(buffered), shape(streamed.clone()));
+        assert_eq!(streamed[1].attributes["tools"], json!(["search"]));
+
+        // A follow-up that failed closes its turn as an error.
+        let mut failed = super::super::tool_loop::LoopTrace::new(true);
+        OpenTurn {
+            turn: 0,
+            start_ms: start,
+            tools: vec!["search".into()],
+            tool_ms: 1,
+        }
+        .close(&mut failed, start, Some(&anyhow::anyhow!("refused")));
+        let failed = failed.finish("error", 0);
+        assert_eq!((failed[0].status, failed[1].status), ("error", "error"));
+
+        // Untraced, nothing is kept.
+        let mut off = super::super::tool_loop::LoopTrace::new(false);
+        OpenTurn {
+            turn: 0,
+            start_ms: start,
+            tools: vec![],
+            tool_ms: 0,
+        }
+        .close(&mut off, start, None);
+        assert!(off.finish("ok", 1).is_empty());
+    }
 
     #[tokio::test]
     async fn next_within_gives_up_on_a_silent_stream() {
@@ -1334,7 +1495,7 @@ mod tests {
     #[test]
     fn finalize_stats_carries_the_cached_prompt_tokens() {
         let stats = Arc::new(Mutex::new(StreamStats::default()));
-        finalize_stats(&stats, Some(UpstreamUsage::new(500, 20, 448)));
+        finalize_stats(&stats, Some(UpstreamUsage::new(500, 20, 448)), Vec::new());
         let s = stats.lock().unwrap();
         assert!(s.final_set);
         assert_eq!(

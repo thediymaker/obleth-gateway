@@ -474,10 +474,26 @@ pub async fn run(
     mut tracer: Option<&mut crate::tracer::SpanRecorder>,
 ) -> TransformResult {
     let Some(loop_plan) = &plan.tool_loop else {
-        return super::respond::transform_completion(
-            state, plan, route, key, session_id, request_id, body,
-        )
-        .await;
+        let warning = match &plan.structured {
+            Some(structured_plan) => {
+                super::respond::apply_structured(
+                    state,
+                    structured_plan,
+                    route,
+                    key,
+                    session_id,
+                    request_id,
+                    body,
+                    tracer,
+                )
+                .await
+            }
+            None => None,
+        };
+        return TransformResult {
+            warning,
+            turn0_usage: None,
+        };
     };
     let Some(route) = route else {
         return TransformResult {
@@ -503,7 +519,7 @@ pub async fn run(
     // One MCP session per server for the whole request: rate-limited servers
     // see a single initialization instead of one per tool call.
     let mut sessions = Sessions::default();
-    let tool_loop_start = crate::tracer::now_ms();
+    let mut trace = LoopTrace::new(tracer.is_some());
     let mut image_ctx = loop_plan
         .image_gen
         .as_ref()
@@ -528,9 +544,6 @@ pub async fn run(
         });
 
     let mut completed_turns: u32 = 0;
-    // Deduplicated list of every tool name called across all turns, for the
-    // parent span summary.
-    let mut all_tools_seen: Vec<String> = Vec::new();
 
     for turn in 0..max_turns {
         let calls = extract_tool_calls(body);
@@ -544,13 +557,7 @@ pub async fn run(
         {
             tracing::debug!("tool loop yielding client-owned tool call back to the client");
             if let Some(t) = tracer {
-                t.record_elapsed(
-                    "boon:tool_loop",
-                    "proxy_request",
-                    tool_loop_start,
-                    "ok",
-                    serde_json::json!({ "turns": completed_turns, "tools": all_tools_seen }),
-                );
+                t.record_pending(trace.finish("ok", completed_turns));
             }
             let warning = finish_images(
                 image_ctx
@@ -578,6 +585,7 @@ pub async fn run(
                         session_id,
                         request_id,
                         body,
+                        tracer.as_deref_mut(),
                     )
                     .await
                 }
@@ -593,13 +601,7 @@ pub async fn run(
                 warning,
             );
             if let Some(t) = tracer {
-                t.record_elapsed(
-                    "boon:tool_loop",
-                    "proxy_request",
-                    tool_loop_start,
-                    "ok",
-                    serde_json::json!({ "turns": completed_turns, "tools": all_tools_seen }),
-                );
+                t.record_pending(trace.finish("ok", completed_turns));
             }
             return TransformResult {
                 warning,
@@ -607,13 +609,7 @@ pub async fn run(
             };
         }
 
-        // Collect the tool names for this iteration and update the all-turns list.
         let iter_tool_names: Vec<String> = calls.iter().map(|c| c.name.clone()).collect();
-        for name in &iter_tool_names {
-            if !all_tools_seen.contains(name) {
-                all_tools_seen.push(name.clone());
-            }
-        }
         let iter_start = crate::tracer::now_ms();
 
         // Record the assistant turn, execute each call, and append results.
@@ -649,41 +645,7 @@ pub async fn run(
                 }),
             );
         }
-        if let Some(ctx) = image_ctx.as_mut() {
-            for event in ctx.events.drain(..) {
-                if let Some(t) = tracer.as_deref_mut() {
-                    t.record(
-                        "boon:image_generation",
-                        "boon:tool_loop",
-                        tool_exec_start,
-                        event.upstream_ms,
-                        if event.ok { "ok" } else { "error" },
-                        serde_json::json!({
-                            "images": event.images,
-                            "size": event.size,
-                            "model": event.model,
-                        }),
-                    );
-                }
-            }
-        }
-        if let Some(ctx) = search_ctx.as_mut() {
-            for event in ctx.events.drain(..) {
-                if let Some(t) = tracer.as_deref_mut() {
-                    t.record(
-                        "boon:web_search",
-                        "boon:tool_loop",
-                        tool_exec_start,
-                        event.upstream_ms,
-                        if event.ok { "ok" } else { "error" },
-                        serde_json::json!({
-                            "results": event.results,
-                            "tool": event.tool,
-                        }),
-                    );
-                }
-            }
-        }
+        trace.tool_events(tool_exec_start, image_ctx.as_mut(), search_ctx.as_mut());
         let tool_exec_ms = (crate::tracer::now_ms() - tool_exec_start) as u32;
 
         let model_call_start = crate::tracer::now_ms();
@@ -713,20 +675,14 @@ pub async fn run(
                 *body = completion;
                 replaced = true;
                 completed_turns += 1;
-                if let Some(t) = tracer.as_deref_mut() {
-                    t.record(
-                        &format!("boon:tool_loop:iter:{turn}"),
-                        "boon:tool_loop",
-                        iter_start,
-                        iter_ms,
-                        "ok",
-                        serde_json::json!({
-                            "tools": iter_tool_names,
-                            "tool_ms": tool_exec_ms,
-                            "model_ms": model_ms,
-                        }),
-                    );
-                }
+                trace.turn(
+                    turn,
+                    iter_start,
+                    iter_ms,
+                    "ok",
+                    iter_tool_names,
+                    serde_json::json!({ "tool_ms": tool_exec_ms, "model_ms": model_ms }),
+                );
             }
             Err(e) => {
                 tracing::warn!(
@@ -735,27 +691,16 @@ pub async fn run(
                     turn,
                     "gateway tool loop dispatch failed; returning last completion"
                 );
-                if let Some(t) = tracer.as_deref_mut() {
-                    t.record(
-                        &format!("boon:tool_loop:iter:{turn}"),
-                        "boon:tool_loop",
-                        iter_start,
-                        (crate::tracer::now_ms() - iter_start) as u32,
-                        "error",
-                        serde_json::json!({
-                            "tools": iter_tool_names,
-                            "error": e.to_string(),
-                        }),
-                    );
-                }
+                trace.turn(
+                    turn,
+                    iter_start,
+                    (crate::tracer::now_ms() - iter_start) as u32,
+                    "error",
+                    iter_tool_names,
+                    serde_json::json!({ "error": e.to_string() }),
+                );
                 if let Some(t) = tracer {
-                    t.record_elapsed(
-                        "boon:tool_loop",
-                        "proxy_request",
-                        tool_loop_start,
-                        "error",
-                        serde_json::json!({ "turns": completed_turns, "tools": all_tools_seen }),
-                    );
+                    t.record_pending(trace.finish("error", completed_turns));
                 }
                 let warning = finish_images(
                     image_ctx
@@ -821,13 +766,7 @@ pub async fn run(
         }
     }
     if let Some(t) = tracer {
-        t.record_elapsed(
-            "boon:tool_loop",
-            "proxy_request",
-            tool_loop_start,
-            "ok",
-            serde_json::json!({ "turns": max_turns, "tools": all_tools_seen }),
-        );
+        t.record_pending(trace.finish("ok", max_turns));
     }
     let warning = finish_images(
         image_ctx
@@ -841,6 +780,123 @@ pub async fn run(
     TransformResult {
         warning,
         turn0_usage: replaced.then(|| turn0_or_estimate(state, loop_plan, turn0)),
+    }
+}
+
+/// The tool loop's trace spans, shared by the buffered and the streaming loop
+/// so a request's trace reads the same either way: a `boon:tool_loop` span
+/// with each gateway turn under it (`boon:tool_loop:iter:N`) and each
+/// gateway-executed tool's call (`boon:image_generation`, `boon:web_search`).
+/// Collects nothing when the request is not traced.
+pub(super) struct LoopTrace {
+    on: bool,
+    start_ms: i64,
+    /// Every tool name called, once each, for the parent span.
+    tools: Vec<String>,
+    spans: Vec<crate::tracer::PendingSpan>,
+}
+
+impl LoopTrace {
+    pub(super) fn new(on: bool) -> Self {
+        LoopTrace {
+            on,
+            start_ms: crate::tracer::now_ms(),
+            tools: Vec::new(),
+            spans: Vec::new(),
+        }
+    }
+
+    /// The gateway tools a turn ran, from when they started. Drains the
+    /// tools' events whether traced or not.
+    pub(super) fn tool_events(
+        &mut self,
+        tool_exec_start: i64,
+        image_ctx: Option<&mut super::image_gen::ImageCtx<'_>>,
+        search_ctx: Option<&mut super::web_search::SearchCtx<'_>>,
+    ) {
+        let image_events = image_ctx.into_iter().flat_map(|ctx| ctx.events.drain(..));
+        let search_events = search_ctx.into_iter().flat_map(|ctx| ctx.events.drain(..));
+        let mut spans = Vec::new();
+        for event in image_events {
+            spans.push(crate::tracer::PendingSpan {
+                name: "boon:image_generation".into(),
+                parent: "boon:tool_loop".into(),
+                start_ms: tool_exec_start,
+                duration_ms: event.upstream_ms,
+                status: if event.ok { "ok" } else { "error" },
+                attributes: json!({
+                    "images": event.images,
+                    "size": event.size,
+                    "model": event.model,
+                }),
+            });
+        }
+        for event in search_events {
+            spans.push(crate::tracer::PendingSpan {
+                name: "boon:web_search".into(),
+                parent: "boon:tool_loop".into(),
+                start_ms: tool_exec_start,
+                duration_ms: event.upstream_ms,
+                status: if event.ok { "ok" } else { "error" },
+                attributes: json!({ "results": event.results, "tool": event.tool }),
+            });
+        }
+        if self.on {
+            self.spans.extend(spans);
+        }
+    }
+
+    /// One gateway turn: running its tool calls and the model call after
+    /// them. `extra` adds to the span's `tools` attribute.
+    pub(super) fn turn(
+        &mut self,
+        turn: u32,
+        start_ms: i64,
+        duration_ms: u32,
+        status: &'static str,
+        tools: Vec<String>,
+        extra: Value,
+    ) {
+        for name in &tools {
+            if !self.tools.contains(name) {
+                self.tools.push(name.clone());
+            }
+        }
+        if !self.on {
+            return;
+        }
+        let mut attributes = json!({ "tools": tools });
+        if let (Some(attrs), Value::Object(extra)) = (attributes.as_object_mut(), extra) {
+            attrs.extend(extra);
+        }
+        self.spans.push(crate::tracer::PendingSpan {
+            name: format!("boon:tool_loop:iter:{turn}"),
+            parent: "boon:tool_loop".into(),
+            start_ms,
+            duration_ms,
+            status,
+            attributes,
+        });
+    }
+
+    /// The spans, closed by the `boon:tool_loop` span; none when untraced.
+    pub(super) fn finish(
+        mut self,
+        status: &'static str,
+        turns: u32,
+    ) -> Vec<crate::tracer::PendingSpan> {
+        if !self.on {
+            return Vec::new();
+        }
+        self.spans.push(crate::tracer::PendingSpan::between(
+            "boon:tool_loop",
+            "proxy_request",
+            self.start_ms,
+            crate::tracer::now_ms(),
+            status,
+            json!({ "turns": turns, "tools": self.tools }),
+        ));
+        self.spans
     }
 }
 
