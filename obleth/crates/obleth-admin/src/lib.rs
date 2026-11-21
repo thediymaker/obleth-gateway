@@ -14,6 +14,7 @@ mod batches;
 pub mod capacity_discovery;
 pub mod energy_probe;
 mod error;
+mod keys_page;
 pub mod knowledge;
 pub mod live_catalog;
 pub mod live_load;
@@ -215,6 +216,8 @@ pub fn router(state: AdminState) -> Router {
             put(set_tenant_synthetic_handler),
         )
         .route("/api/v1/keys", get(list_keys))
+        .route("/api/v1/keys/count", get(keys_page::count_keys))
+        .route("/api/v1/keys/stats", get(keys_page::key_stats))
         .route("/api/v1/budgets/usage", get(get_budget_usage))
         .route("/api/v1/resync", post(resync_resolver_cache))
         .route(
@@ -1884,15 +1887,45 @@ pub struct ListKeysQuery {
     pub ids: Vec<Uuid>,
     /// Page size, 1 to 1,000. Without it every matching key comes back.
     pub limit: Option<i64>,
-    /// Continue after this key (the last id of the previous page).
+    /// Continue after this key (the last id of the previous page), in the
+    /// default oldest-first order. Other orders page with `cursor`.
     #[schema(value_type = Option<String>)]
     pub after: Option<Uuid>,
-    /// Only keys whose name, prefix, description or identity subject contains
-    /// this text, ignoring case.
+    /// Continue where the previous page ended: its `x-obleth-next-cursor`
+    /// header, sent back as is with the same `sort`, `dir`, filters and
+    /// window.
+    pub cursor: Option<String>,
+    /// Only keys whose name, prefix, description, identity subject or
+    /// issuer, or tenant's name, contains this text, ignoring case.
     pub q: Option<String>,
     /// Only these fields of each key, comma-separated (`id,name,key_prefix,tenant_id`
     /// for a picker). Without it, every field.
     pub fields: Option<String>,
+    /// Only keys turned off (`true`) or on (`false`).
+    pub disabled: Option<bool>,
+    /// Only `secret` or `identity` keys.
+    pub kind: Option<String>,
+    /// `capped`: only keys with a token or cost cap; `none`: only keys
+    /// without; `near`: only keys that have used 80% or more of a cap this
+    /// period.
+    pub budget: Option<String>,
+    /// Only keys with no use in the window (`since_ms` to `until_ms`).
+    pub unused: Option<bool>,
+    /// The order: `created` (default), `name` (ignoring case), or, highest
+    /// first, `last_used`, `requests`, `tokens` or `cost` in the window, or
+    /// `budget` (the share of its cap used this period). The use and budget
+    /// orders list the keys without use (or without a cap) after the rest,
+    /// by name. Ties go by id.
+    pub sort: Option<String>,
+    /// `asc` or `desc`, for `created` and `name` (default `asc`). The other
+    /// orders are highest first only.
+    pub dir: Option<String>,
+    /// Start of the window the use orders and `unused` read, unix epoch
+    /// millis. Defaults to 30 days before `until_ms`. Send the same window
+    /// with every page so the order holds still.
+    pub since_ms: Option<i64>,
+    /// End of that window (exclusive), unix epoch millis. Defaults to now.
+    pub until_ms: Option<i64>,
 }
 
 /// Most keys one page of `GET /keys` returns.
@@ -5156,6 +5189,12 @@ pub struct BudgetUsageQuery {
     /// One tenant: its own budget and its keys'.
     #[schema(value_type = Option<String>)]
     pub tenant_id: Option<Uuid>,
+    /// Only these keys' budgets (no tenant's): one id or up to 200 joined by
+    /// commas, for a page of the Keys list.
+    #[serde(default, deserialize_with = "usage::key_id_list")]
+    #[param(value_type = Option<String>)]
+    #[schema(value_type = Option<String>)]
+    pub ids: Vec<Uuid>,
 }
 
 /// Every tenant and key budget with a cap, or one tenant's, and how much of
@@ -5179,7 +5218,7 @@ async fn get_budget_usage(
     let zones: std::collections::HashMap<Uuid, String> =
         tenants.iter().map(|t| (t.id, t.timezone.clone())).collect();
     let mut wanted = Vec::new();
-    for t in &tenants {
+    for t in tenants.iter().filter(|_| q.ids.is_empty()) {
         if t.id == Store::CONTROL_PLANE_TENANT_ID {
             continue;
         }
@@ -5191,65 +5230,106 @@ async fn get_budget_usage(
             &t.timezone,
             now,
         ) {
-            wanted.push((
-                "tenant",
-                t.id,
-                t.id,
-                period,
-                t.budget_period.clone(),
-                t.budget_tokens,
-                t.budget_cost_usd,
-                t.budget_started_at,
-                t.timezone.clone(),
-            ));
+            wanted.push(BudgetRead {
+                scope: "tenant",
+                id: t.id,
+                tenant_id: t.id,
+                period_key: period,
+                period: t.budget_period.clone(),
+                budget_tokens: t.budget_tokens,
+                budget_cost_usd: t.budget_cost_usd,
+                started_at: t.budget_started_at,
+                tz: t.timezone.clone(),
+            });
         }
     }
-    for k in state.store.keys_with_budget(q.tenant_id).await? {
-        if k.tenant_id == Store::CONTROL_PLANE_TENANT_ID {
-            continue;
-        }
-        let tz = zones
-            .get(&k.tenant_id)
-            .cloned()
-            .unwrap_or_else(|| "UTC".into());
-        if let Some(period) = obleth_config::budget::period_key(
-            k.budget_tokens,
-            k.budget_cost_usd,
-            k.budget_period.as_deref(),
-            k.budget_started_at,
-            &tz,
-            now,
-        ) {
-            wanted.push((
-                "key",
-                k.id,
-                k.tenant_id,
-                period,
-                k.budget_period.clone(),
+    let keys = state
+        .store
+        .list_keys_where(&obleth_store::KeyListFilter {
+            tenant_id: q.tenant_id,
+            ids: (!q.ids.is_empty()).then_some(q.ids),
+            capped: Some(true),
+            ..Default::default()
+        })
+        .await?;
+    wanted.extend(key_budget_reads(&keys, &zones, now));
+    Ok(Json(read_budgets(&state, &wanted, now).await?))
+}
+
+/// One budget whose current period `read_budgets` reads.
+pub(crate) struct BudgetRead {
+    scope: &'static str,
+    id: Uuid,
+    tenant_id: Uuid,
+    period_key: String,
+    period: Option<String>,
+    budget_tokens: Option<i64>,
+    budget_cost_usd: Option<f64>,
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+    tz: String,
+}
+
+/// The capped keys' budgets to read, in their tenants' time zones (`zones`,
+/// by tenant id; UTC for one not there). The control plane's are left out.
+pub(crate) fn key_budget_reads(
+    keys: &[ApiKey],
+    zones: &std::collections::HashMap<Uuid, String>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<BudgetRead> {
+    keys.iter()
+        .filter(|k| k.tenant_id != Store::CONTROL_PLANE_TENANT_ID)
+        .filter_map(|k| {
+            let tz = zones
+                .get(&k.tenant_id)
+                .cloned()
+                .unwrap_or_else(|| "UTC".into());
+            let period_key = obleth_config::budget::period_key(
                 k.budget_tokens,
                 k.budget_cost_usd,
+                k.budget_period.as_deref(),
                 k.budget_started_at,
+                &tz,
+                now,
+            )?;
+            Some(BudgetRead {
+                scope: "key",
+                id: k.id,
+                tenant_id: k.tenant_id,
+                period_key,
+                period: k.budget_period.clone(),
+                budget_tokens: k.budget_tokens,
+                budget_cost_usd: k.budget_cost_usd,
+                started_at: k.budget_started_at,
                 tz,
-            ));
-        }
-    }
+            })
+        })
+        .collect()
+}
+
+/// How much of each budget's current period is used, from the enforcement
+/// counters, 32 reads at a time.
+pub(crate) async fn read_budgets(
+    state: &AdminState,
+    wanted: &[BudgetRead],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<BudgetUsage>> {
     let mut out = Vec::with_capacity(wanted.len());
     for chunk in wanted.chunks(32) {
         let reads = chunk
             .iter()
-            .map(|w| state.redis.term_usage_peek(&w.1, &w.3));
+            .map(|w| state.redis.term_usage_peek(&w.id, &w.period_key));
         let used = futures::future::join_all(reads).await;
         for (w, u) in chunk.iter().zip(used) {
             let (used_tokens, used_cost_usd) = u?;
             let (period_start, resets_at) =
-                obleth_config::budget::period_bounds(w.4.as_deref(), w.7, &w.8, now);
+                obleth_config::budget::period_bounds(w.period.as_deref(), w.started_at, &w.tz, now);
             out.push(BudgetUsage {
-                scope: w.0.to_string(),
-                id: w.1,
-                tenant_id: w.2,
-                period: w.4.clone().unwrap_or_else(|| "lifetime".into()),
-                budget_tokens: w.5,
-                budget_cost_usd: w.6,
+                scope: w.scope.to_string(),
+                id: w.id,
+                tenant_id: w.tenant_id,
+                period: w.period.clone().unwrap_or_else(|| "lifetime".into()),
+                budget_tokens: w.budget_tokens,
+                budget_cost_usd: w.budget_cost_usd,
                 used_tokens,
                 used_cost_usd,
                 period_start,
@@ -5257,20 +5337,40 @@ async fn get_budget_usage(
             });
         }
     }
-    Ok(Json(out))
+    Ok(out)
 }
 
-/// API keys, oldest first. `tenant_id`, `ids` and `q` narrow the list. With
-/// `limit` it comes in pages: pass the last key's id as `after` for the next,
-/// and while more follow the response carries `x-obleth-truncated: true`.
-/// Without `limit`, every matching key in one array. `fields` sends only the
-/// named fields of each key, for pickers that need names and prefixes.
+impl BudgetUsage {
+    /// The larger of its cost and token shares (a cap of 0 counts as no
+    /// share), as the Keys page shows it.
+    pub fn share(&self) -> f64 {
+        let cost = match self.budget_cost_usd {
+            Some(cap) if cap != 0.0 => self.used_cost_usd / cap,
+            _ => 0.0,
+        };
+        let tokens = match self.budget_tokens {
+            Some(cap) if cap != 0 => self.used_tokens as f64 / cap as f64,
+            _ => 0.0,
+        };
+        cost.max(tokens)
+    }
+}
+
+/// API keys, oldest first unless `sort` says otherwise. `tenant_id`, `ids`,
+/// `q`, `disabled`, `kind`, `budget` and `unused` narrow the list. With
+/// `limit` it comes in pages: while more follow, the response carries
+/// `x-obleth-truncated: true` and `x-obleth-next-cursor`, which the next
+/// request sends back as `cursor` (the oldest-first order also takes the
+/// last key's id as `after`). Without `limit`, every matching key in one
+/// array. `fields` sends only the named fields of each key, for pickers that
+/// need names and prefixes.
 #[utoipa::path(
     get, path = "/api/v1/keys", tag = "keys",
     params(ListKeysQuery),
     responses(
         (status = 200, body = [ApiKey], headers(
-            ("x-obleth-truncated" = String, description = "`true` when keys past this page match")
+            ("x-obleth-truncated" = String, description = "`true` when keys past this page match"),
+            ("x-obleth-next-cursor" = String, description = "Where the next page starts, sent back as `cursor`; only while more follow")
         )),
         (status = 400)
     )
@@ -5281,25 +5381,11 @@ async fn list_keys(
 ) -> Result<Response> {
     let projection = q.fields.as_deref().map(key_projection).transpose()?;
     let limit = q.limit.map(|n| n.clamp(1, KEYS_PAGE_MAX));
-    let mut keys = state
-        .store
-        .list_keys_where(&obleth_store::KeyListFilter {
-            tenant_id: q.tenant_id,
-            ids: (!q.ids.is_empty()).then_some(q.ids),
-            // The reserved control-plane key (Charo's) stays off the
-            // management surface.
-            exclude_tenant: Some(Store::CONTROL_PLANE_TENANT_ID),
-            after: q.after,
-            // One past the page, to tell whether more follow.
-            limit: limit.map(|n| n + 1),
-            q: q.q,
-        })
-        .await?;
-    let more = limit.is_some_and(|n| keys.len() > n as usize);
-    if let Some(n) = limit {
-        keys.truncate(n as usize);
+    let keys_page::KeyPage { keys, more, next } = keys_page::list_page(&state, &q, limit).await?;
+    let mut headers = truncated_header(more);
+    if let Some(cursor) = next.and_then(|c| axum::http::HeaderValue::from_str(&c).ok()) {
+        headers.insert("x-obleth-next-cursor", cursor);
     }
-    let headers = truncated_header(more);
     let Some(fields) = projection else {
         return Ok(axum::response::IntoResponse::into_response((
             headers,
@@ -11024,6 +11110,28 @@ mod tests {
             redis_url: &str,
             capacity_discovery: capacity_discovery::CapacityDiscovery,
         ) -> Option<TestApp> {
+            // Never dialled: no route under test reads ClickHouse.
+            test_admin_app_full(redis_url, capacity_discovery, clickhouse::Client::default()).await
+        }
+
+        /// [`test_admin_app`] reading usage from this ClickHouse.
+        pub(super) async fn test_admin_app_on_clickhouse(
+            clickhouse: clickhouse::Client,
+        ) -> Option<TestApp> {
+            let redis_url = std::env::var("OBLETH_TEST_REDIS_URL").ok()?;
+            test_admin_app_full(
+                &redis_url,
+                capacity_discovery::CapacityDiscovery::disabled(),
+                clickhouse,
+            )
+            .await
+        }
+
+        async fn test_admin_app_full(
+            redis_url: &str,
+            capacity_discovery: capacity_discovery::CapacityDiscovery,
+            clickhouse: clickhouse::Client,
+        ) -> Option<TestApp> {
             let db_url = test_db_url()?;
 
             // Taken before the first database touch (`migrate()` runs DDL) and
@@ -11053,8 +11161,7 @@ mod tests {
                 fairshare_history_secs: 3600,
                 fairshare_replica_aware: true,
                 fairshare_shared_slots: false,
-                // Never dialled: no route under test reads ClickHouse.
-                clickhouse: clickhouse::Client::default(),
+                clickhouse,
                 admin_token: TEST_ADMIN_TOKEN.to_string(),
                 output_stats: Default::default(),
                 classify: None,
@@ -11115,7 +11222,8 @@ mod tests {
 
     use harness::{
         fixture_model, send, simulate_request, test_admin_app, test_admin_app_discovering,
-        test_admin_app_on, test_admin_app_with_discovery, TEST_ADMIN_TOKEN,
+        test_admin_app_on, test_admin_app_on_clickhouse, test_admin_app_with_discovery,
+        TEST_ADMIN_TOKEN,
     };
 
     fn json_request(
@@ -14148,6 +14256,436 @@ mod tests {
         all.sort_unstable();
         known.sort_unstable();
         assert_eq!(all, known);
+    }
+
+    /// One `GET` of the keys API: status, whether more follow, the next
+    /// cursor, and the body.
+    async fn keys_get(
+        app: &Router,
+        path: &str,
+    ) -> (StatusCode, bool, Option<String>, serde_json::Value) {
+        let req = axum::http::Request::get(path)
+            .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let res = tower::ServiceExt::oneshot(app.clone(), req)
+            .await
+            .expect("handler ran");
+        let status = res.status();
+        let more = res.headers().get("x-obleth-truncated").is_some();
+        let next = res
+            .headers()
+            .get("x-obleth-next-cursor")
+            .map(|v| v.to_str().unwrap().to_string());
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, more, next, body)
+    }
+
+    fn key_ids_of(body: &serde_json::Value) -> Vec<Uuid> {
+        body.as_array()
+            .unwrap_or_else(|| panic!("not a list: {body}"))
+            .iter()
+            .map(|k| k["id"].as_str().unwrap().parse().unwrap())
+            .collect()
+    }
+
+    /// Every key `query` lists, `limit` at a time, following the cursor;
+    /// each page but the last says more follow.
+    async fn keys_all_pages(app: &Router, query: &str, limit: usize) -> Vec<Uuid> {
+        let mut out = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..1000 {
+            let path = match &cursor {
+                Some(c) => format!("/api/v1/keys?{query}&limit={limit}&cursor={c}"),
+                None => format!("/api/v1/keys?{query}&limit={limit}"),
+            };
+            let (status, more, next, body) = keys_get(app, &path).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+            let ids = key_ids_of(&body);
+            assert!(ids.len() <= limit);
+            out.extend(ids);
+            assert_eq!(more, next.is_some(), "{path}");
+            match next {
+                Some(c) => cursor = Some(c),
+                None => return out,
+            }
+        }
+        panic!("{query} never ended");
+    }
+
+    /// The created and name orders page by keyset in both directions with
+    /// no key twice or missed, ties going by id; a page continues after its
+    /// last key even when that key is gone. Every filter the Keys page
+    /// offers is applied by the gateway, the count matches, and the budget
+    /// order ranks capped keys by the share used before the rest by name.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn keys_pages_sort_and_filter_on_the_server() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let tenant_name = format!("pager-{}", Uuid::new_v4().simple());
+        let tenant = t
+            .store
+            .create_tenant(&tenant_name, 100, 1000, None, None)
+            .await
+            .expect("tenant");
+        let mut keys = Vec::new();
+        for (name, cap) in [
+            ("beta", Some(100)),
+            ("Alpha", None),
+            ("alpha", None),
+            ("gamma", Some(100)),
+            ("Delta", Some(1000)),
+            ("alpha", None),
+        ] {
+            let (key, _) = t
+                .store
+                .create_api_key(
+                    tenant.id,
+                    name,
+                    "",
+                    cap,
+                    None,
+                    None,
+                    None,
+                    100,
+                    None,
+                    &[],
+                    &[],
+                )
+                .await
+                .expect("key");
+            keys.push(key);
+        }
+        t.store.set_key_disabled(keys[1].id, true).await.unwrap();
+        t.store.set_key_disabled(keys[4].id, true).await.unwrap();
+        let scope = format!("tenant_id={}", tenant.id);
+        let created: Vec<Uuid> = keys.iter().map(|k| k.id).collect();
+        let mut by_name = keys.clone();
+        by_name.sort_by(|a, b| {
+            a.name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then(a.id.cmp(&b.id))
+        });
+        let by_name: Vec<Uuid> = by_name.iter().map(|k| k.id).collect();
+        let reversed = |v: &[Uuid]| v.iter().rev().copied().collect::<Vec<_>>();
+
+        for limit in [1, 2, 4] {
+            assert_eq!(keys_all_pages(&t.app, &scope, limit).await, created);
+            assert_eq!(
+                keys_all_pages(&t.app, &format!("{scope}&sort=created&dir=desc"), limit).await,
+                reversed(&created)
+            );
+            assert_eq!(
+                keys_all_pages(&t.app, &format!("{scope}&sort=name"), limit).await,
+                by_name
+            );
+            assert_eq!(
+                keys_all_pages(&t.app, &format!("{scope}&sort=name&dir=desc"), limit).await,
+                reversed(&by_name)
+            );
+        }
+        // `after` still pages the default order.
+        let (_, more, _, body) = keys_get(
+            &t.app,
+            &format!("/api/v1/keys?{scope}&limit=2&after={}", created[1]),
+        )
+        .await;
+        assert_eq!((key_ids_of(&body), more), (created[2..4].to_vec(), true));
+
+        // Filters, and their counts.
+        let filtered = |f: &str| {
+            let app = t.app.clone();
+            let path = format!("/api/v1/keys?{scope}&{f}");
+            async move { key_ids_of(&keys_get(&app, &path).await.3) }
+        };
+        let count = |f: &str| {
+            let app = t.app.clone();
+            let path = format!("/api/v1/keys/count?{scope}&{f}");
+            async move { keys_get(&app, &path).await.3 }
+        };
+        assert_eq!(filtered("disabled=true").await, [created[1], created[4]]);
+        assert_eq!(filtered("disabled=false").await.len(), 4);
+        assert_eq!(filtered("kind=secret").await, created);
+        assert!(filtered("kind=identity").await.is_empty());
+        assert_eq!(
+            filtered("budget=capped").await,
+            [created[0], created[3], created[4]]
+        );
+        assert_eq!(
+            filtered("budget=none").await,
+            [created[1], created[2], created[5]]
+        );
+        // The tenant's name matches too.
+        let q = &tenant_name[6..14];
+        assert_eq!(filtered(&format!("q={q}")).await, created);
+        assert_eq!(
+            filtered("q=ALPHA&disabled=false").await,
+            [created[2], created[5]]
+        );
+        assert_eq!(
+            count("disabled=false").await,
+            serde_json::json!({ "keys": 4, "tenants": 1 })
+        );
+        assert_eq!(count("q=zzz-none").await["keys"], 0);
+        // An unknown order or a cursor from another order is refused.
+        assert_eq!(
+            keys_get(&t.app, "/api/v1/keys?sort=weight").await.0,
+            StatusCode::BAD_REQUEST
+        );
+        let (_, _, name_cursor, _) =
+            keys_get(&t.app, &format!("/api/v1/keys?{scope}&sort=name&limit=1")).await;
+        let (status, ..) = keys_get(
+            &t.app,
+            &format!(
+                "/api/v1/keys?{scope}&sort=created&limit=1&cursor={}",
+                name_cursor.unwrap()
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Budget order: gamma has used 90% of its cap, beta 50%, Delta none;
+        // the uncapped keys follow by name.
+        let now = chrono::Utc::now();
+        let redis =
+            obleth_redis::RedisStore::connect(&std::env::var("OBLETH_TEST_REDIS_URL").unwrap())
+                .await
+                .unwrap();
+        for (key, used) in [(&keys[3], 90), (&keys[0], 50)] {
+            let period = obleth_config::budget::period_key(
+                key.budget_tokens,
+                key.budget_cost_usd,
+                key.budget_period.as_deref(),
+                key.budget_started_at,
+                "UTC",
+                now,
+            )
+            .unwrap();
+            redis
+                .term_usage_add(&key.id, &period, used, 0.0)
+                .await
+                .unwrap();
+        }
+        let uncapped = by_name
+            .iter()
+            .filter(|id| ![created[0], created[3], created[4]].contains(id));
+        let mut budget_order = vec![created[3], created[0], created[4]];
+        budget_order.extend(uncapped);
+        for limit in [1, 2, 5] {
+            assert_eq!(
+                keys_all_pages(&t.app, &format!("{scope}&sort=budget"), limit).await,
+                budget_order
+            );
+        }
+        assert_eq!(filtered("budget=near").await, [created[3]]);
+        assert_eq!(count("budget=near").await["keys"], 1);
+        assert_eq!(
+            filtered("budget=near&disabled=true").await,
+            Vec::<Uuid>::new()
+        );
+
+        // A page continues after its last key even when that key is deleted.
+        let (_, _, next, body) =
+            keys_get(&t.app, &format!("/api/v1/keys?{scope}&sort=name&limit=2")).await;
+        let first = key_ids_of(&body);
+        t.store.delete_key(first[1]).await.unwrap();
+        let (_, _, _, body) = keys_get(
+            &t.app,
+            &format!(
+                "/api/v1/keys?{scope}&sort=name&limit=2&cursor={}",
+                next.unwrap()
+            ),
+        )
+        .await;
+        let rest = key_ids_of(
+            &keys_get(&t.app, &format!("/api/v1/keys?{scope}&sort=name"))
+                .await
+                .3,
+        );
+        let at = rest.iter().position(|id| *id == first[0]).unwrap();
+        assert_eq!(key_ids_of(&body), rest[at + 1..at + 3].to_vec());
+    }
+
+    /// The use orders rank keys in ClickHouse over the window and page there:
+    /// highest first, ties by id, keys used outside the window or not at all
+    /// after them by name, a deleted key's usage left out. `unused` and the
+    /// tiles read the same window. Runs with a real ClickHouse only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn keys_use_orders_rank_in_clickhouse() {
+        let Ok(url) = std::env::var("OBLETH_TEST_CLICKHOUSE_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_CLICKHOUSE_URL to run");
+            return;
+        };
+        let database = format!("obleth_test_{}", Uuid::new_v4().simple());
+        let client = clickhouse::Client::default()
+            .with_url(&url)
+            .with_database(&database);
+        let Some(t) = test_admin_app_on_clickhouse(client).await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let tenant = t
+            .store
+            .create_tenant(&format!("ranks-{}", Uuid::new_v4()), 100, 1000, None, None)
+            .await
+            .expect("tenant");
+        let mut keys = Vec::new();
+        for name in ["k0", "k1", "k2", "k3", "k4", "k5"] {
+            let (key, _) = t
+                .store
+                .create_api_key(
+                    tenant.id,
+                    name,
+                    "",
+                    None,
+                    None,
+                    None,
+                    None,
+                    100,
+                    None,
+                    &[],
+                    &[],
+                )
+                .await
+                .expect("key");
+            keys.push(key.id);
+        }
+        let dir = std::env::temp_dir().join(format!("obleth-ranks-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sink = obleth_telemetry::TelemetrySink::start(
+            &url,
+            &database,
+            "default",
+            "",
+            dir.join("usage.wal").to_str().unwrap(),
+            std::time::Duration::from_millis(50),
+        )
+        .await
+        .expect("sink");
+        let hour = 3_600_000;
+        let now = usage::now_ms();
+        let record = |key: Uuid, ts_ms: i64, cost: f64| {
+            let mut rec: obleth_config::UsageRecord = serde_json::from_value(serde_json::json!({
+                "request_id": Uuid::new_v4(), "tenant_id": tenant.id, "key_id": key,
+                "model": "m", "admission": "fast", "weight": 1, "input_tokens": 10,
+                "output_tokens": 5, "estimated_tokens": 15, "queue_wait_ms": 0, "ttft_ms": 0,
+                "total_ms": 1, "status_code": 200, "cache_status": "off",
+                "ts_ms": ts_ms, "request_type": "chat", "key_name": "k"
+            }))
+            .unwrap();
+            rec.cost_usd = cost;
+            rec
+        };
+        // k1: 3 requests; k0: 2, the most spend; k3: 1, the latest; k5 two
+        // requests like k0 (a tie, broken by id); k4 only before the
+        // window; k2 never. A deleted key has the most of all.
+        for at in [5, 4, 3] {
+            sink.record(record(keys[1], now - at * hour, 0.1));
+        }
+        for at in [6, 5] {
+            sink.record(record(keys[0], now - at * hour, 1.5));
+            sink.record(record(keys[5], now - at * hour, 0.01));
+        }
+        sink.record(record(keys[3], now - hour, 0.2));
+        sink.record(record(keys[4], now - 40 * 24 * hour, 9.0));
+        let gone = Uuid::new_v4();
+        for at in 1..=10 {
+            sink.record(record(gone, now - at * 60_000, 5.0));
+        }
+        // Health probes are not use.
+        let mut probe = record(keys[2], now - hour, 0.0);
+        probe.request_type = crate::model_health::HEALTH_PROBE_REQUEST_TYPE.into();
+        sink.record(probe);
+        sink.shutdown().await;
+
+        let window = format!("since_ms={}&until_ms={}", now - 30 * 24 * hour, now);
+        let scope = format!("tenant_id={}&{window}", tenant.id);
+        let (tie_first, tie_second) = if keys[0] > keys[5] {
+            (keys[0], keys[5])
+        } else {
+            (keys[5], keys[0])
+        };
+        // Unused keys (k2, k4) by name after the ranked ones.
+        let expected = [
+            (
+                "requests",
+                vec![keys[1], tie_first, tie_second, keys[3], keys[2], keys[4]],
+            ),
+            (
+                "tokens",
+                vec![keys[1], tie_first, tie_second, keys[3], keys[2], keys[4]],
+            ),
+            (
+                "cost",
+                vec![keys[0], keys[1], keys[3], keys[5], keys[2], keys[4]],
+            ),
+            (
+                "last_used",
+                vec![keys[3], keys[1], tie_first, tie_second, keys[2], keys[4]],
+            ),
+        ];
+        // Once naming the tenant's keys to ClickHouse, once ranking every
+        // key and keeping the tenant's over growing rounds.
+        for pushdown in [2_000, 0] {
+            keys_page::TEST_RANK_PUSHDOWN_MAX.store(pushdown, std::sync::atomic::Ordering::Relaxed);
+            for (sort, order) in &expected {
+                for limit in [1, 2, 3, 6, 10] {
+                    assert_eq!(
+                        &keys_all_pages(&t.app, &format!("{scope}&sort={sort}"), limit).await,
+                        order,
+                        "sort={sort} limit={limit} pushdown={pushdown}"
+                    );
+                }
+            }
+        }
+        // Filters apply to both parts; a broad filter (every key in the
+        // database) drops the deleted key's rows.
+        assert_eq!(
+            keys_all_pages(&t.app, &format!("{scope}&sort=requests&q=k1"), 1).await,
+            [keys[1]]
+        );
+        let (_, more, _, body) = keys_get(
+            &t.app,
+            &format!("/api/v1/keys?{window}&sort=requests&limit=4"),
+        )
+        .await;
+        assert!(more);
+        assert_eq!(key_ids_of(&body), [keys[1], tie_first, tie_second, keys[3]]);
+        keys_page::TEST_RANK_PUSHDOWN_MAX.store(2_000, std::sync::atomic::Ordering::Relaxed);
+        // Unused in the window, by any order.
+        assert_eq!(
+            keys_all_pages(&t.app, &format!("{scope}&unused=true"), 1).await,
+            [keys[2], keys[4]]
+        );
+        assert_eq!(
+            keys_all_pages(&t.app, &format!("{scope}&unused=true&sort=requests"), 1).await,
+            [keys[2], keys[4]]
+        );
+        let (_, _, _, body) =
+            keys_get(&t.app, &format!("/api/v1/keys/count?{scope}&unused=true")).await;
+        assert_eq!(body["keys"], 2);
+
+        // Tiles: the busiest key that still exists, and the use spans.
+        let (status, _, _, stats) = keys_get(
+            &t.app,
+            &format!("/api/v1/keys/stats?{window}&recent_ms={}", now - 2 * hour),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{stats}");
+        assert_eq!(stats["busiest"]["id"], keys[1].to_string());
+        assert_eq!(stats["busiest"]["requests"], 3);
+        assert!(stats["used"].as_i64().unwrap() >= 4);
+        assert!(stats["used_recent"].as_i64().unwrap() >= 1);
+        assert_eq!(
+            stats["keys"].as_i64().unwrap() - stats["used"].as_i64().unwrap(),
+            stats["unused"].as_i64().unwrap()
+        );
     }
 
     /// `GET /keys` narrows by tenant and ids and pages with `limit` and

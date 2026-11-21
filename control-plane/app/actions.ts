@@ -3,7 +3,7 @@
 import { revalidatePath } from "next/cache";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
-import { obleth, OblethApiError } from "@/lib/obleth";
+import { obleth, OblethApiError, type KeyListQuery } from "@/lib/obleth";
 import type {
   ApiKey,
   ManagedModelSpec,
@@ -673,13 +673,42 @@ export interface BulkKeyResult {
 const KEY_IDS_PER_READ = 200;
 
 /**
+ * The keys a bulk action acts on: the rows picked on the page (ids), or every
+ * key the Keys list's search and filters match, with the count the person
+ * confirmed.
+ */
+export type KeyTarget = string[] | { filter: KeyListQuery; expected: number };
+
+/**
+ * The ids of a target's keys. A filter is matched by the gateway now; if it
+ * matches a different number of keys than the person was shown, nothing is
+ * done, so no key they were not told about is touched.
+ */
+async function targetIds(target: KeyTarget): Promise<string[]> {
+  if (Array.isArray(target)) return target;
+  const { sort: _sort, dir: _dir, ...filter } = target.filter;
+  const ids: string[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await obleth.listKeysPage(filter, { limit: 1000, cursor, fields: ["id"] as const });
+    ids.push(...page.data.map((k) => k.id));
+    cursor = page.next ?? undefined;
+  } while (cursor);
+  if (ids.length !== target.expected) {
+    throw new Error(`${ids.length.toLocaleString()} keys match now, not the ${target.expected.toLocaleString()} you were shown. Nothing was changed; look again and retry.`);
+  }
+  return ids;
+}
+
+/**
  * Run `task` over the chosen keys, a few at a time, collecting failures by
  * name. The pages refresh whatever happened, even when a run fails partway.
  */
-async function eachKey(ids: string[], task: (key: ApiKey) => Promise<void>): Promise<BulkKeyResult> {
+async function eachKey(target: KeyTarget, task: (key: ApiKey) => Promise<void>): Promise<BulkKeyResult> {
   const failed: BulkKeyResult["failed"] = [];
   let done = 0;
   try {
+    const ids = await targetIds(target);
     const keys: ApiKey[] = [];
     for (let i = 0; i < ids.length; i += KEY_IDS_PER_READ) {
       keys.push(...(await obleth.keysByIds(ids.slice(i, i + KEY_IDS_PER_READ))));
@@ -706,9 +735,9 @@ async function eachKey(ids: string[], task: (key: ApiKey) => Promise<void>): Pro
   return { done, failed };
 }
 
-export async function setKeysDisabledAction(ids: string[], disabled: boolean): Promise<BulkKeyResult> {
+export async function setKeysDisabledAction(target: KeyTarget, disabled: boolean): Promise<BulkKeyResult> {
   const session = await requireAdmin();
-  return eachKey(ids, async (key) => {
+  return eachKey(target, async (key) => {
     if (key.disabled === disabled) return;
     await obleth.setKeyDisabled(key.id, disabled, { auditActor: session.email });
   });
@@ -716,13 +745,13 @@ export async function setKeysDisabledAction(ids: string[], disabled: boolean): P
 
 /** Give every chosen key the same budget (blank caps clear it). Their other settings stay. */
 export async function setKeysBudgetAction(
-  ids: string[],
+  target: KeyTarget,
   budget: { budget_tokens: number | null; budget_cost_usd: number | null; budget_period: string },
 ): Promise<BulkKeyResult> {
   const session = await requireAdmin();
   const capped = budget.budget_tokens != null || budget.budget_cost_usd != null;
   if ((budget.budget_tokens ?? 0) < 0 || (budget.budget_cost_usd ?? 0) < 0) return { done: 0, failed: [{ name: "all", error: "Caps can't be negative." }] };
-  return eachKey(ids, async (key) => {
+  return eachKey(target, async (key) => {
     await obleth.updateKey(key.id, {
       name: key.name,
       description: key.description,
@@ -746,9 +775,16 @@ export type MoveTarget =
  * placed in its fairshare group). Their secrets keep working; past usage
  * stays under the tenant it was recorded in.
  */
-export async function moveKeysAction(ids: string[], target: MoveTarget): Promise<BulkKeyResult & { tenantId?: string; error?: string }> {
+export async function moveKeysAction(keys: KeyTarget, target: MoveTarget): Promise<BulkKeyResult & { tenantId?: string; error?: string }> {
   const session = await requireAdmin();
   const audit = { auditActor: session.email };
+  // Matched before a new tenant is made, so a changed match makes nothing.
+  let ids: string[];
+  try {
+    ids = await targetIds(keys);
+  } catch (e) {
+    return { done: 0, failed: [], error: actionError(e).error };
+  }
   let tenantId: string;
   if ("tenantId" in target) {
     tenantId = target.tenantId;
@@ -837,9 +873,9 @@ export async function deleteKeyAction(id: string): Promise<ActionResult> {
   );
 }
 
-export async function deleteKeysAction(ids: string[]): Promise<BulkKeyResult> {
+export async function deleteKeysAction(target: KeyTarget): Promise<BulkKeyResult> {
   const session = await requireAdmin();
-  return eachKey(ids, (key) => obleth.deleteKey(key.id, { auditActor: session.email }));
+  return eachKey(target, (key) => obleth.deleteKey(key.id, { auditActor: session.email }));
 }
 
 export type CreateModelResult =

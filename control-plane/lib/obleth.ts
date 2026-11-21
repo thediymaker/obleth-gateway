@@ -4,6 +4,7 @@
 // `reactCache` so a layout and page reading the same setting in one render
 // tree cost one admin round-trip. Freshness is unchanged — the memo does not
 // outlive the request.
+import { keyQueryParams, type KeyListQuery } from "@/lib/key-query";
 import { cache as reactCache } from "react";
 
 const BASE = process.env.OBLETH_ADMIN_BASE_URL ?? "http://localhost:9180";
@@ -785,6 +786,27 @@ export interface UsageAgg {
 }
 
 /** `GET /budgets/usage`: one capped budget and how much of its current period is used. */
+export type { KeyListQuery } from "@/lib/key-query";
+
+/** Every key's counts for the Keys page's tiles (`GET /keys/stats`). */
+export interface KeyStats {
+  keys: number;
+  disabled: number;
+  identity: number;
+  tenants: number;
+  /** Keys with use in the window. */
+  used: number;
+  /** Keys with use in the recent span (the last day). */
+  used_recent: number;
+  unused: number;
+  unused_on: number;
+  /** Requests in the window by keys that still exist. */
+  requests: number;
+  busiest: { id: string; name: string; requests: number } | null;
+  near_budget: number;
+  near_budget_keys: { id: string; name: string; share: number }[];
+}
+
 export interface BudgetUsage {
   scope: "tenant" | "key";
   id: string;
@@ -2332,6 +2354,8 @@ type ApiInit = RequestInit & {
   next?: NextFetchOptions;
   /** Overrides the default time limit (see `API_TIMEOUT_MS`). */
   timeoutMs?: number;
+  /** Sees the response's headers (a page's next cursor). */
+  onHeaders?: (headers: Headers) => void;
 };
 
 /**
@@ -2354,7 +2378,7 @@ function auditActorHeaders(options?: AuditOptions): Record<string, string> {
 }
 
 async function api<T>(path: string, init?: ApiInit): Promise<T> {
-  const { next, cache, headers, timeoutMs, ...rest } = init ?? {};
+  const { next, cache, headers, timeoutMs, onHeaders, ...rest } = init ?? {};
   const limit =
     timeoutMs ??
     ((rest.method ?? "GET").toUpperCase() === "GET" ? API_TIMEOUT_MS.read : API_TIMEOUT_MS.write);
@@ -2375,7 +2399,7 @@ async function api<T>(path: string, init?: ApiInit): Promise<T> {
   else fetchInit.cache = cache ?? "no-store";
 
   try {
-    return await send<T>(path, fetchInit);
+    return await send<T>(path, fetchInit, onHeaders);
   } catch (e) {
     // The time limit reads as the gateway not answering, which `safe()`
     // turns into its fallback.
@@ -2391,9 +2415,10 @@ async function api<T>(path: string, init?: ApiInit): Promise<T> {
 }
 
 /** One Management API call: the response body, or an `OblethApiError`. */
-async function send<T>(path: string, fetchInit: ApiInit): Promise<T> {
+async function send<T>(path: string, fetchInit: ApiInit, onHeaders?: (headers: Headers) => void): Promise<T> {
   const res = await fetch(`${BASE}/api/v1${path}`, fetchInit);
   if (!res.ok) throw await apiError(res, path);
+  onHeaders?.(res.headers);
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
 }
@@ -2715,6 +2740,26 @@ export const obleth = {
    */
   listKeyFields: <F extends keyof ApiKey>(fields: readonly F[], tenantId?: string) =>
     api<Pick<ApiKey, F>[]>(`/keys${qs({ fields: fields.join(","), tenant_id: tenantId })}`),
+  /**
+   * One page of the keys `query` matches, in its order, and where the next
+   * page starts (`null` on the last). `fields` sends only those fields.
+   */
+  listKeysPage: async <F extends keyof ApiKey = keyof ApiKey>(
+    query: KeyListQuery,
+    page: { limit: number; cursor?: string; fields?: readonly F[] },
+  ) => {
+    let next: string | null = null;
+    const data = await api<Pick<ApiKey, F>[]>(
+      `/keys${qs({ ...keyQueryParams(query), limit: page.limit, cursor: page.cursor || undefined, fields: page.fields?.join(",") })}`,
+      { onHeaders: (h) => { next = h.get("x-obleth-next-cursor"); } },
+    );
+    return { data, next: next as string | null };
+  },
+  /** How many keys `query` matches (its order aside), and in how many tenants. */
+  countKeys: (query: KeyListQuery) => api<{ keys: number; tenants: number }>(`/keys/count${qs(keyQueryParams(query))}`),
+  /** Every key's counts for the Keys page's tiles. */
+  keyStats: (window: { sinceMs: number; untilMs: number; recentMs: number }) =>
+    api<KeyStats>(`/keys/stats${qs({ since_ms: window.sinceMs, until_ms: window.untilMs, recent_ms: window.recentMs })}`),
   /** One key, or a 404 `OblethApiError`. */
   getKey: (id: string) => api<ApiKey>(`/keys/${encodeURIComponent(id)}`),
   /** The keys with these ids that exist, oldest first; 200 ids per call at most. */
@@ -2775,6 +2820,8 @@ export const obleth = {
   /** Every capped tenant and key budget, with its current period's use from the enforcement counters. */
   /** Every capped budget, or one tenant's own and its keys'. */
   budgetUsage: (tenantId?: string) => api<BudgetUsage[]>(`/budgets/usage${qs({ tenant_id: tenantId })}`),
+  /** These keys' budgets only (up to 200 ids). */
+  keyBudgets: (ids: string[]) => api<BudgetUsage[]>(`/budgets/usage${qs({ ids: ids.join(",") })}`),
   setKeyDisabled: (id: string, disabled: boolean, options?: AuditOptions) =>
     api<void>(`/keys/${seg(id)}/disabled`, {
       method: "PUT",
@@ -3152,12 +3199,14 @@ export const obleth = {
   usage: (filter: UsageFilter = {}) =>
     api<UsageAgg[]>(`/usage${usageQs(filter)}`),
   usageKeysSummary: (
-    params: { tenantId?: string; sinceMs?: number; limit?: number } = {},
+    params: { tenantId?: string; keyIds?: string[]; sinceMs?: number; untilMs?: number; limit?: number } = {},
   ) =>
     api<KeyUsageSummary[]>(
       `/usage/keys/summary${qs({
         tenant_id: params.tenantId,
+        key_id: params.keyIds?.join(","),
         since_ms: params.sinceMs,
+        until_ms: params.untilMs,
         limit: params.limit,
       })}`,
     ),

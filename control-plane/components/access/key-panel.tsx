@@ -125,7 +125,7 @@ export function KeyPanel({
   /** Settings › Networks, offered by name. */
   named?: NamedNetwork[];
   /** The other keys in its tenant, for the weight's meaning. */
-  siblings: ApiKey[];
+  siblings: Pick<ApiKey, "id" | "weight" | "disabled">[];
   onClose: () => void;
   onMove: (key: ApiKey) => void;
   onReplaced: (created: { secret: string; name: string; detail: string }) => void;

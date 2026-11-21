@@ -74,4 +74,33 @@ describe("bulk key delete", () => {
     expect(await deleteKeysAction(["a"])).toEqual({ done: 0, failed: [{ name: "all", error: "gateway down" }] });
     expect(revalidatePath).toHaveBeenCalledWith("/keys");
   });
+
+  it("acts on every key a filter matches, read page by page with the sort left out", async () => {
+    const keys = ["a", "b", "c"].map((id) => ({ id, name: `key-${id}`, key_prefix: `obl_${id}`, disabled: false }));
+    const listKeysPage = vi
+      .fn()
+      .mockResolvedValueOnce({ data: [{ id: "a" }, { id: "b" }], next: "c1" })
+      .mockResolvedValueOnce({ data: [{ id: "c" }], next: null });
+    const keysByIds = vi.fn().mockResolvedValue(keys);
+    const setKeyDisabled = vi.fn(async () => undefined);
+    setup({ listKeysPage, keysByIds, setKeyDisabled });
+    const { setKeysDisabledAction } = await import("./actions");
+    const filter = { q: "lab", tenantId: "t1", sort: "requests" as const, sinceMs: 1, untilMs: 2 };
+    expect(await setKeysDisabledAction({ filter, expected: 3 }, true)).toEqual({ done: 3, failed: [] });
+    expect(listKeysPage).toHaveBeenNthCalledWith(1, { q: "lab", tenantId: "t1", sinceMs: 1, untilMs: 2 }, { limit: 1000, cursor: undefined, fields: ["id"] });
+    expect(listKeysPage).toHaveBeenNthCalledWith(2, { q: "lab", tenantId: "t1", sinceMs: 1, untilMs: 2 }, { limit: 1000, cursor: "c1", fields: ["id"] });
+    expect(keysByIds).toHaveBeenCalledWith(["a", "b", "c"]);
+    expect(setKeyDisabled).toHaveBeenCalledTimes(3);
+  });
+
+  it("changes nothing when the filter now matches another number of keys than was confirmed", async () => {
+    const listKeysPage = vi.fn().mockResolvedValue({ data: [{ id: "a" }, { id: "b" }], next: null });
+    const deleteKey = vi.fn();
+    setup({ listKeysPage, keysByIds: vi.fn(), deleteKey });
+    const { deleteKeysAction } = await import("./actions");
+    const result = await deleteKeysAction({ filter: { disabled: true }, expected: 3 });
+    expect(result.done).toBe(0);
+    expect(result.failed[0].error).toContain("2 keys match now, not the 3 you were shown");
+    expect(deleteKey).not.toHaveBeenCalled();
+  });
 });

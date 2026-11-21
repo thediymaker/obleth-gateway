@@ -1053,49 +1053,120 @@ impl Store {
         .await
     }
 
-    /// Keys matching `f`, oldest first (`created_at`, then `id`), so a page
-    /// continues after its last key with `after`.
+    /// Keys matching `f` in `f.order` (oldest first by default), at most
+    /// `f.limit`, starting after `f.seek`. Every order ends in `id`, so a page
+    /// continues exactly after its last key.
     pub async fn list_keys_where(&self, f: &KeyListFilter) -> Result<Vec<ApiKey>> {
-        let rows = sqlx::query(&format!(
-            "select {KEY_COLS} from api_keys k
-             where ($1::uuid is null or k.tenant_id = $1)
-               and ($2::uuid[] is null or k.id = any($2))
-               and ($3::uuid is null or k.tenant_id <> $3)
-               and ($4::uuid is null or (k.created_at, k.id) > (
-                   select a.created_at, a.id from api_keys a where a.id = $4))
-               and ($6::text is null or k.name ilike $6 or k.key_prefix ilike $6
-                    or k.description ilike $6 or k.identity_subject ilike $6)
-             order by k.created_at, k.id
-             limit $5"
-        ))
-        .bind(f.tenant_id)
-        .bind(f.ids.as_deref())
-        .bind(f.exclude_tenant)
-        .bind(f.after)
-        .bind(f.limit)
-        .bind(
-            f.q.as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(contains_pattern),
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        let mut qb =
+            sqlx::QueryBuilder::new(format!("select {KEY_COLS} from api_keys k where true"));
+        push_key_filter(&mut qb, f);
+        let desc = f.order.descending();
+        let cmp = if desc { "<" } else { ">" };
+        let (column, dir) = match f.order {
+            KeyOrder::Created => ("k.created_at", ""),
+            KeyOrder::CreatedDesc => ("k.created_at", " desc"),
+            KeyOrder::Name => ("lower(k.name)", ""),
+            KeyOrder::NameDesc => ("lower(k.name)", " desc"),
+        };
+        match &f.seek {
+            None => {}
+            Some(KeySeek::Created(at, id)) => {
+                qb.push(format!(" and (k.created_at, k.id) {cmp} ("))
+                    .push_bind(*at)
+                    .push(", ")
+                    .push_bind(*id)
+                    .push(")");
+            }
+            Some(KeySeek::Name(name, id)) => {
+                qb.push(format!(" and (lower(k.name), k.id) {cmp} (lower("))
+                    .push_bind(name.clone())
+                    .push("), ")
+                    .push_bind(*id)
+                    .push(")");
+            }
+            Some(KeySeek::After(id)) => {
+                qb.push(" and (k.created_at, k.id) > (select a.created_at, a.id from api_keys a where a.id = ")
+                    .push_bind(*id)
+                    .push(")");
+            }
+        }
+        qb.push(format!(" order by {column}{dir}, k.id{dir}"));
+        if let Some(n) = f.limit {
+            qb.push(" limit ").push_bind(n);
+        }
+        let rows = qb.build().fetch_all(&self.pool).await?;
         rows.iter().map(api_key_from_row).collect()
     }
 
-    /// Keys with a token or cost cap, every tenant's or one's.
-    pub async fn keys_with_budget(&self, tenant_id: Option<Uuid>) -> Result<Vec<ApiKey>> {
-        let rows = sqlx::query(&format!(
-            "select {KEY_COLS} from api_keys k
-             where (k.budget_tokens is not null or k.budget_cost_usd is not null)
-               and ($1::uuid is null or k.tenant_id = $1)
-             order by k.created_at, k.id"
-        ))
-        .bind(tenant_id)
-        .fetch_all(&self.pool)
+    /// How many keys match `f` (its order, seek and limit aside), and how
+    /// many tenants they are in.
+    pub async fn count_keys_where(&self, f: &KeyListFilter) -> Result<(i64, i64)> {
+        let mut qb = sqlx::QueryBuilder::new(
+            "select count(*) as keys, count(distinct k.tenant_id) as tenants from api_keys k where true",
+        );
+        push_key_filter(&mut qb, f);
+        let row = qb.build().fetch_one(&self.pool).await?;
+        Ok((row.try_get("keys")?, row.try_get("tenants")?))
+    }
+
+    /// The ids of the keys matching `f` (its order and seek aside), at most
+    /// `f.limit`.
+    pub async fn key_ids_where(&self, f: &KeyListFilter) -> Result<Vec<Uuid>> {
+        let mut qb = sqlx::QueryBuilder::new("select k.id from api_keys k where true");
+        push_key_filter(&mut qb, f);
+        qb.push(" order by k.id");
+        if let Some(n) = f.limit {
+            qb.push(" limit ").push_bind(n);
+        }
+        let rows = qb.build().fetch_all(&self.pool).await?;
+        rows.iter()
+            .map(|r| r.try_get("id").map_err(Into::into))
+            .collect()
+    }
+
+    /// Counts over every key but `exclude_tenant`'s for the Keys page's
+    /// tiles. `used` are keys with use in a window, each with its requests;
+    /// `recent` those used in a shorter span. Ids of deleted keys count for
+    /// nothing.
+    pub async fn key_stats(
+        &self,
+        exclude_tenant: Option<Uuid>,
+        used: &[(Uuid, i64)],
+        recent: &[Uuid],
+    ) -> Result<KeyStats> {
+        let (ids, requests): (Vec<Uuid>, Vec<i64>) = used.iter().copied().unzip();
+        let row = sqlx::query(
+            "with used as (select * from unnest($1::uuid[], $2::bigint[]) as u(id, requests)),
+                  recent as (select unnest($3::uuid[]) as id)
+             select count(*) as keys,
+                    count(*) filter (where k.disabled) as disabled,
+                    count(*) filter (where k.kind = 'identity') as identity,
+                    count(distinct k.tenant_id) as tenants,
+                    count(u.id) as used,
+                    count(r.id) as used_recent,
+                    count(*) filter (where u.id is null and not k.disabled) as unused_on,
+                    coalesce(sum(u.requests), 0)::bigint as requests
+             from api_keys k
+             left join used u on u.id = k.id
+             left join recent r on r.id = k.id
+             where ($4::uuid is null or k.tenant_id <> $4)",
+        )
+        .bind(&ids)
+        .bind(&requests)
+        .bind(recent)
+        .bind(exclude_tenant)
+        .fetch_one(&self.pool)
         .await?;
-        rows.iter().map(api_key_from_row).collect()
+        Ok(KeyStats {
+            keys: row.try_get("keys")?,
+            disabled: row.try_get("disabled")?,
+            identity: row.try_get("identity")?,
+            tenants: row.try_get("tenants")?,
+            used: row.try_get("used")?,
+            used_recent: row.try_get("used_recent")?,
+            unused_on: row.try_get("unused_on")?,
+            requests: row.try_get("requests")?,
+        })
     }
 
     /// Names and fair-share groups of the given tenants, without reading or
@@ -4038,15 +4109,130 @@ pub struct KeyListFilter {
     pub tenant_id: Option<Uuid>,
     /// Only these keys.
     pub ids: Option<Vec<Uuid>>,
+    /// Leave out these keys.
+    pub exclude_ids: Option<Vec<Uuid>>,
     /// Leave out this tenant's keys (the control plane's own).
     pub exclude_tenant: Option<Uuid>,
-    /// Start after this key, in list order.
-    pub after: Option<Uuid>,
+    /// Start after this position in `order`.
+    pub seek: Option<KeySeek>,
     /// At most this many; all when `None`.
     pub limit: Option<i64>,
-    /// Only keys whose name, prefix, description or identity subject
-    /// contains this text, ignoring case.
+    /// Only keys whose name, prefix, description, identity subject or
+    /// issuer, or tenant's name, contains this text, ignoring case.
     pub q: Option<String>,
+    /// Only keys turned off (`true`) or on (`false`).
+    pub disabled: Option<bool>,
+    /// Only `secret` or `identity` keys.
+    pub kind: Option<String>,
+    /// Only keys with a token or cost cap (`true`) or with neither (`false`).
+    pub capped: Option<bool>,
+    pub order: KeyOrder,
+}
+
+/// The order `list_keys_where` returns keys in; ties always go by id, in the
+/// same direction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum KeyOrder {
+    /// Oldest first.
+    #[default]
+    Created,
+    /// Newest first.
+    CreatedDesc,
+    /// By name, ignoring case.
+    Name,
+    /// By name, ignoring case, Z first.
+    NameDesc,
+}
+
+impl KeyOrder {
+    pub fn descending(self) -> bool {
+        matches!(self, KeyOrder::CreatedDesc | KeyOrder::NameDesc)
+    }
+}
+
+/// Where a page of `list_keys_where` starts: just after the key with this
+/// sort value and id, whether or not that key still exists.
+#[derive(Debug, Clone, PartialEq)]
+pub enum KeySeek {
+    /// For the created orders.
+    Created(chrono::DateTime<chrono::Utc>, Uuid),
+    /// For the name orders: the key's name as stored (compared lowercased).
+    Name(String, Uuid),
+    /// After this key, oldest first, looked up by id (the original `after`
+    /// of `GET /keys`; the key must still exist).
+    After(Uuid),
+}
+
+/// The Keys page's tiles, from [`Store::key_stats`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KeyStats {
+    pub keys: i64,
+    pub disabled: i64,
+    pub identity: i64,
+    pub tenants: i64,
+    /// Keys with use in the window.
+    pub used: i64,
+    /// Keys with use in the recent span.
+    pub used_recent: i64,
+    /// Keys turned on with no use in the window.
+    pub unused_on: i64,
+    /// Requests in the window by keys that still exist.
+    pub requests: i64,
+}
+
+/// The `and ...` predicates of `f`, onto a query over `api_keys k`.
+fn push_key_filter(qb: &mut sqlx::QueryBuilder<'_, sqlx::Postgres>, f: &KeyListFilter) {
+    if let Some(t) = f.tenant_id {
+        qb.push(" and k.tenant_id = ").push_bind(t);
+    }
+    if let Some(ids) = &f.ids {
+        qb.push(" and k.id = any(").push_bind(ids.clone()).push(")");
+    }
+    if let Some(ids) = &f.exclude_ids {
+        // An anti-join, so a long list (every key used in a window) costs
+        // one hash, not a scan of the list per key.
+        qb.push(" and not exists (select 1 from unnest(")
+            .push_bind(ids.clone())
+            .push("::uuid[]) as x(id) where x.id = k.id)");
+    }
+    if let Some(t) = f.exclude_tenant {
+        qb.push(" and k.tenant_id <> ").push_bind(t);
+    }
+    if let Some(pattern) =
+        f.q.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(contains_pattern)
+    {
+        qb.push(" and (k.name ilike ")
+            .push_bind(pattern.clone())
+            .push(" or k.key_prefix ilike ")
+            .push_bind(pattern.clone())
+            .push(" or k.description ilike ")
+            .push_bind(pattern.clone())
+            .push(" or k.identity_subject ilike ")
+            .push_bind(pattern.clone())
+            .push(" or k.identity_issuer ilike ")
+            .push_bind(pattern.clone())
+            .push(" or exists (select 1 from tenants t where t.id = k.tenant_id and t.name ilike ")
+            .push_bind(pattern)
+            .push("))");
+    }
+    if let Some(d) = f.disabled {
+        qb.push(" and k.disabled = ").push_bind(d);
+    }
+    if let Some(kind) = &f.kind {
+        qb.push(" and k.kind = ").push_bind(kind.clone());
+    }
+    match f.capped {
+        Some(true) => {
+            qb.push(" and (k.budget_tokens is not null or k.budget_cost_usd is not null)");
+        }
+        Some(false) => {
+            qb.push(" and k.budget_tokens is null and k.budget_cost_usd is null");
+        }
+        None => {}
+    }
 }
 
 /// An `ilike` pattern matching text that contains `q`, its own `%`, `_` and

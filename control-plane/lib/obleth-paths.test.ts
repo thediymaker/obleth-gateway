@@ -51,4 +51,21 @@ describe("Management API paths", () => {
     await obleth.listKeyFields(["tenant_id", "disabled"], "t1");
     expect(calls).toEqual(["/api/v1/keys?fields=id%2Cname%2Ckey_prefix%2Ctenant_id", "/api/v1/keys?fields=tenant_id%2Cdisabled&tenant_id=t1"]);
   });
+
+  it("pages the keys with their filters, sort and cursor", async () => {
+    const page = await obleth.listKeysPage(
+      { q: "lab", tenantId: "t1", disabled: false, budget: "near", unused: true, sort: "name", dir: "desc", sinceMs: 1, untilMs: 2 },
+      { limit: 100, cursor: "abc" },
+    );
+    expect(page.next).toBeNull();
+    await obleth.countKeys({ kind: "identity" });
+    await obleth.usageKeysSummary({ keyIds: ["a", "b"], sinceMs: 1, untilMs: 2, limit: 2 });
+    await obleth.keyBudgets(["a"]);
+    expect(calls).toEqual([
+      "/api/v1/keys?tenant_id=t1&q=lab&disabled=false&budget=near&unused=true&sort=name&dir=desc&since_ms=1&until_ms=2&limit=100&cursor=abc",
+      "/api/v1/keys/count?kind=identity",
+      "/api/v1/usage/keys/summary?key_id=a%2Cb&since_ms=1&until_ms=2&limit=2",
+      "/api/v1/budgets/usage?ids=a",
+    ]);
+  });
 });

@@ -2,7 +2,7 @@
 
 import { useState, useTransition } from "react";
 import Link from "next/link";
-import { createKeyAction, moveKeysAction, setKeysBudgetAction, type BulkKeyResult } from "@/app/actions";
+import { createKeyAction, moveKeysAction, setKeysBudgetAction, type BulkKeyResult, type KeyTarget } from "@/app/actions";
 import { Field, SelectField } from "@/components/models/fields";
 import { AllowedCountriesField } from "@/components/access/allowed-countries-field";
 import { AllowedNetworksField } from "@/components/access/allowed-networks-field";
@@ -13,11 +13,26 @@ import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Select } from "@/components/ui/select";
 import { PERIOD_OPTIONS, tenantHref } from "@/lib/access-model";
-import type { ApiKey, NamedNetwork, Tenant } from "@/lib/obleth";
+import type { ApiKey, KeyListQuery, NamedNetwork, Tenant } from "@/lib/obleth";
 
 /** " 2 failed: a (why); b (why)" after a bulk key action's count, or "" when none did. */
 export function bulkFailures(r: BulkKeyResult): string {
   return r.failed.length ? ` ${r.failed.length} failed: ${r.failed.map((f) => `${f.name} (${f.error})`).join("; ")}` : "";
+}
+
+/**
+ * Every key a Keys list's search and filters match, as "select all" picks
+ * them: acted on by the filter on the server, `count` being what the person
+ * was told.
+ */
+export interface KeysByFilter {
+  filter: KeyListQuery;
+  count: number;
+}
+
+/** What a bulk dialog acts on: the picked keys, or every match of a filter. */
+function bulkTarget(keys: ApiKey[], byFilter?: KeysByFilter): KeyTarget {
+  return byFilter ? { filter: byFilter.filter, expected: byFilter.count } : keys.map((k) => k.id);
 }
 
 /**
@@ -29,16 +44,21 @@ export function MoveDialog({
   open,
   onClose,
   keys,
+  byFilter,
   tenants,
   onDone,
 }: {
   open: boolean;
   onClose: () => void;
   keys: ApiKey[];
+  /** Every key matching a filter instead of `keys`. */
+  byFilter?: KeysByFilter;
   tenants: Tenant[];
   onDone: (text: string) => void;
 }) {
-  const from = [...new Set(keys.map((k) => k.tenant_id))];
+  const from = byFilter ? (byFilter.filter.tenantId ? [byFilter.filter.tenantId] : []) : [...new Set(keys.map((k) => k.tenant_id))];
+  const count = byFilter?.count ?? keys.length;
+  const one = !byFilter && keys.length === 1 ? keys[0] : null;
   const [mode, setMode] = useState<"existing" | "new">("existing");
   const [target, setTarget] = useState("");
   const [name, setName] = useState("");
@@ -47,7 +67,7 @@ export function MoveDialog({
   const [pending, start] = useTransition();
   const [made, setMade] = useState<Tenant | { id: string; name: string } | null>(null);
   const others = tenants.filter((t) => !(from.length === 1 && t.id === from[0]));
-  const label = keys.length === 1 ? (keys[0].name || keys[0].key_prefix) : `${keys.length} keys`;
+  const label = one ? (one.name || one.key_prefix) : `${count.toLocaleString()} key${count === 1 ? "" : "s"}`;
   const fromName = from.length === 1 ? tenants.find((t) => t.id === from[0])?.name : null;
 
   function submit() {
@@ -55,7 +75,7 @@ export function MoveDialog({
     if (mode === "existing" && !target) return setError("Pick the tenant to move to.");
     if (mode === "new" && !name.trim()) return setError("Name the new tenant.");
     start(async () => {
-      const res = await moveKeysAction(keys.map((k) => k.id), mode === "existing" ? { tenantId: target } : { newTenant: { name: name.trim(), copyFrom: copyFrom || undefined } });
+      const res = await moveKeysAction(bulkTarget(keys, byFilter), mode === "existing" ? { tenantId: target } : { newTenant: { name: name.trim(), copyFrom: copyFrom || undefined } });
       if (res.error) return setError(res.error);
       const dest = mode === "existing" ? tenants.find((t) => t.id === target)?.name ?? "the tenant" : name.trim();
       onDone(`Moved ${res.done} key${res.done === 1 ? "" : "s"} to ${dest}.${bulkFailures(res)}`);
@@ -70,7 +90,7 @@ export function MoveDialog({
         <DialogHeader>
           <DialogTitle>Move {label}</DialogTitle>
           <DialogDescription>
-            {fromName ? `Out of ${fromName}. ` : ""}Secrets keep working. From now on {keys.length === 1 ? "it uses" : "they use"} the new tenant&apos;s share, limits, hours and budget; past usage stays with the tenant it was recorded under.
+            {fromName ? `Out of ${fromName}. ` : ""}Secrets keep working. From now on {count === 1 ? "it uses" : "they use"} the new tenant&apos;s share, limits, hours and budget; past usage stays with the tenant it was recorded under.
           </DialogDescription>
         </DialogHeader>
         {made ? (
@@ -92,7 +112,7 @@ export function MoveDialog({
               </div>
             ) : (
               <>
-                <Field label="Name" name="new_tenant_name" value={name} onChange={(e) => setName(e.target.value)} placeholder={keys.length === 1 ? `${keys[0].name}-own` : "heavy-users"} hint="A tenant of their own: its own share of the gateway, limits and budget." />
+                <Field label="Name" name="new_tenant_name" value={name} onChange={(e) => setName(e.target.value)} placeholder={one ? `${one.name}-own` : "heavy-users"} hint="A tenant of their own: its own share of the gateway, limits and budget." />
                 <div className="space-y-1.5">
                   <span className="text-[12.5px] font-medium text-secondary-foreground">Start with the settings of</span>
                   <Select aria-label="Copy settings from" value={copyFrom} onValueChange={setCopyFrom} className="h-9 text-[13px]" options={[{ value: "", label: "Nothing: defaults, no limits" }, ...tenants.map((t) => ({ value: t.id, label: t.name }))]} />
@@ -113,7 +133,8 @@ export function MoveDialog({
 }
 
 /** One budget for every chosen key. Blank caps take the budget off. */
-export function BudgetDialog({ open, onClose, keys, onDone }: { open: boolean; onClose: () => void; keys: ApiKey[]; onDone: (text: string) => void }) {
+export function BudgetDialog({ open, onClose, keys, byFilter, onDone }: { open: boolean; onClose: () => void; keys: ApiKey[]; byFilter?: KeysByFilter; onDone: (text: string) => void }) {
+  const count = byFilter?.count ?? keys.length;
   const [cost, setCost] = useState("");
   const [tokens, setTokens] = useState("");
   const [period, setPeriod] = useState("monthly");
@@ -124,7 +145,7 @@ export function BudgetDialog({ open, onClose, keys, onDone }: { open: boolean; o
     const t = tokens.trim() === "" ? null : Number(tokens);
     if ((c !== null && !(c >= 0)) || (t !== null && !(Number.isInteger(t) && t >= 0))) return setError("Caps are numbers of 0 or more, or blank for none.");
     start(async () => {
-      const res = await setKeysBudgetAction(keys.map((k) => k.id), { budget_cost_usd: c, budget_tokens: t, budget_period: period });
+      const res = await setKeysBudgetAction(bulkTarget(keys, byFilter), { budget_cost_usd: c, budget_tokens: t, budget_period: period });
       onDone(`${c === null && t === null ? "Took the budget off" : "Set the budget on"} ${res.done} key${res.done === 1 ? "" : "s"}.${bulkFailures(res)}`);
       onClose();
     });
@@ -133,7 +154,7 @@ export function BudgetDialog({ open, onClose, keys, onDone }: { open: boolean; o
     <Dialog open={open} onOpenChange={(v) => { if (!v) onClose(); }}>
       <DialogContent className="max-w-md">
         <DialogHeader>
-          <DialogTitle>Set a budget on {keys.length} key{keys.length === 1 ? "" : "s"}</DialogTitle>
+          <DialogTitle>Set a budget on {count.toLocaleString()} key{count === 1 ? "" : "s"}</DialogTitle>
           <DialogDescription>Replaces each key&apos;s own budget. A key stops once it reaches a cap, until the period resets. Leave both blank to take budgets off.</DialogDescription>
         </DialogHeader>
         <div className="grid gap-3 sm:grid-cols-2">

@@ -1,4 +1,5 @@
 import type { AdminUser } from "@/lib/auth/users";
+import { keyQueryParams, type KeyListQuery } from "@/lib/key-query";
 import { networksSummary } from "@/lib/key-networks";
 import type { ApiKey, BudgetUsage, FairshareLiveView, KeyUsageSummary, NamedNetwork, Tenant, UsageAgg, WeeklyWindow } from "@/lib/obleth";
 
@@ -339,8 +340,8 @@ export interface KeyRow {
 /** Per-key use covers 30 days: long enough for "last used" to mean something for
  * keys that aren't hit daily, while bounding the ClickHouse scan. */
 export const KEY_USAGE_WINDOW_MS = 30 * 86_400_000;
-/** The Keys page reads use for this many keys, the busiest first. */
-export const KEY_USAGE_LIMIT = 5000;
+/** Keys the Keys page reads at a time. */
+export const KEY_PAGE_SIZE = 100;
 
 export function buildKeyRows(
   keys: ApiKey[],
@@ -377,35 +378,89 @@ export interface KeyFilters {
 
 export const EMPTY_KEY_FILTERS: KeyFilters = { query: "", tenantId: "", status: "all", kind: "all", budget: "all", unused: false };
 
-const THIRTY_DAYS = 30 * 86_400_000;
-
-export function filterKeys(rows: KeyRow[], f: KeyFilters, now = Date.now()): KeyRow[] {
-  const q = f.query.trim().toLowerCase();
-  return rows.filter((r) => {
-    const k = r.key;
-    if (f.tenantId && k.tenant_id !== f.tenantId) return false;
-    if (f.status === "on" && k.disabled) return false;
-    if (f.status === "off" && !k.disabled) return false;
-    if (f.kind !== "all" && k.kind !== f.kind) return false;
-    if (f.budget === "capped" && !r.budget) return false;
-    if (f.budget === "near" && !((r.budget?.share ?? 0) >= NEAR_BUDGET)) return false;
-    if (f.budget === "none" && r.budget) return false;
-    if (f.unused && r.lastUsedMs > now - THIRTY_DAYS) return false;
-    return !q || [k.name, k.key_prefix, k.description, r.tenantName, k.identity_subject ?? "", k.identity_issuer ?? ""].join(" ").toLowerCase().includes(q);
-  });
-}
-
 export type KeySort = "last-used" | "requests" | "spend" | "name" | "budget" | "newest";
 
-export function sortKeys(rows: KeyRow[], sort: KeySort): KeyRow[] {
-  const byName = (a: KeyRow, b: KeyRow) => a.key.name.localeCompare(b.key.name);
-  const out = [...rows];
-  if (sort === "name") return out.sort(byName);
-  if (sort === "newest") return out.sort((a, b) => b.key.created_at.localeCompare(a.key.created_at) || byName(a, b));
-  if (sort === "requests") return out.sort((a, b) => (b.usage?.requests ?? 0) - (a.usage?.requests ?? 0) || byName(a, b));
-  if (sort === "spend") return out.sort((a, b) => (b.usage?.cost_usd ?? 0) - (a.usage?.cost_usd ?? 0) || byName(a, b));
-  if (sort === "budget") return out.sort((a, b) => (b.budget?.share ?? -1) - (a.budget?.share ?? -1) || byName(a, b));
-  return out.sort((a, b) => b.lastUsedMs - a.lastUsedMs || Number(a.key.disabled) - Number(b.key.disabled) || byName(a, b));
+/** The use window every page of one Keys list reads: the 30 days to `untilMs`. */
+export interface KeyWindow {
+  sinceMs: number;
+  untilMs: number;
+}
+
+export function keyWindow(untilMs: number): KeyWindow {
+  return { sinceMs: untilMs - KEY_USAGE_WINDOW_MS, untilMs };
+}
+
+const SORT_PARAMS: Record<KeySort, Pick<KeyListQuery, "sort" | "dir">> = {
+  "last-used": { sort: "last_used" },
+  requests: { sort: "requests" },
+  spend: { sort: "cost" },
+  budget: { sort: "budget" },
+  name: { sort: "name" },
+  newest: { sort: "created", dir: "desc" },
+};
+
+/**
+ * The gateway query for the Keys page's filters and sort: the gateway filters
+ * and orders every key, so a page holds the first matches of all of them.
+ */
+export function keyListQuery(f: KeyFilters, sort: KeySort, window: KeyWindow): KeyListQuery {
+  return {
+    tenantId: f.tenantId || undefined,
+    q: f.query.trim() || undefined,
+    disabled: f.status === "all" ? undefined : f.status === "off",
+    kind: f.kind === "all" ? undefined : f.kind,
+    budget: f.budget === "all" ? undefined : f.budget,
+    unused: f.unused || undefined,
+    ...SORT_PARAMS[sort],
+    sinceMs: window.sinceMs,
+    untilMs: window.untilMs,
+  };
+}
+
+/** `/api/live/keys` parameters for a query, a page's cursor aside. */
+export function keyListParams(q: KeyListQuery): URLSearchParams {
+  const p = new URLSearchParams();
+  for (const [k, v] of Object.entries(keyQueryParams(q))) if (v !== undefined) p.set(k, String(v));
+  return p;
+}
+
+/** A {@link KeyListQuery} from `/api/live/keys` parameters. */
+export function parseKeyListParams(p: URLSearchParams): KeyListQuery {
+  const str = (k: string) => p.get(k)?.trim() || undefined;
+  const num = (k: string) => {
+    const v = Number(p.get(k));
+    return p.has(k) && Number.isFinite(v) ? v : undefined;
+  };
+  const one = <T extends string>(k: string, allowed: readonly T[]) => {
+    const v = p.get(k);
+    return allowed.includes(v as T) ? (v as T) : undefined;
+  };
+  return {
+    tenantId: str("tenant_id"),
+    ids: str("ids")?.split(","),
+    q: str("q"),
+    disabled: p.has("disabled") ? p.get("disabled") === "true" : undefined,
+    kind: one("kind", ["secret", "identity"] as const),
+    budget: one("budget", ["capped", "none", "near"] as const),
+    unused: p.get("unused") === "true" || undefined,
+    sort: one("sort", ["created", "name", "last_used", "requests", "tokens", "cost", "budget"] as const),
+    dir: one("dir", ["asc", "desc"] as const),
+    sinceMs: num("since_ms"),
+    untilMs: num("until_ms"),
+  };
+}
+
+/** The filters in words, for a confirm that acts on every match: "matching “lab” in Research, turned off". */
+export function keyFiltersWords(f: KeyFilters, tenantName?: string): string {
+  const parts = [
+    f.query.trim() ? `matching “${f.query.trim()}”` : null,
+    f.tenantId ? `in ${tenantName ?? "one tenant"}` : null,
+    f.status === "on" ? "turned on" : f.status === "off" ? "turned off" : null,
+    f.kind === "secret" ? "secret keys" : f.kind === "identity" ? "identity keys" : null,
+    f.budget === "capped" ? "with a budget" : f.budget === "none" ? "without a budget" : f.budget === "near" ? "near their budget" : null,
+    f.unused ? "unused for 30 days" : null,
+  ].filter(Boolean);
+  return parts.length ? parts.join(", ") : "every key";
 }
 
 /** A budget's period, as tenant and key budgets offer it. */

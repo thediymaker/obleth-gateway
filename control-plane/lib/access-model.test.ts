@@ -7,14 +7,16 @@ import {
   buildKeyRows,
   changeVs,
   fillDays,
-  filterKeys,
+  keyFiltersWords,
+  keyListParams,
+  keyListQuery,
+  parseKeyListParams,
   EMPTY_KEY_FILTERS,
   gridToWindows,
   groupShare,
   lastUsed,
   reachLabel,
   reachOf,
-  sortKeys,
   tenantHref,
   utcToZoned,
   windowsSummary,
@@ -103,15 +105,36 @@ describe("keys", () => {
     [],
   );
 
-  it("finds keys by tenant name and identity", () => {
-    expect(filterKeys(rows, { ...EMPTY_KEY_FILTERS, query: "rcusers" }, now)).toHaveLength(3);
-    expect(filterKeys(rows, { ...EMPTY_KEY_FILTERS, query: "mlee42@" }, now).map((r) => r.key.id)).toEqual(["k3"]);
-    expect(filterKeys(rows, { ...EMPTY_KEY_FILTERS, unused: true }, now).map((r) => r.key.id)).toEqual(["k2"]);
+  it("joins a page's use to its keys", () => {
+    expect(rows.map((r) => [r.key.id, r.usage?.requests ?? 0, r.lastUsedMs, r.tenantName])).toEqual([
+      ["k1", 10, now - 60_000, "rcusers"],
+      ["k2", 0, 0, "rcusers"],
+      ["k3", 50, now - 3_600_000, "rcusers"],
+    ]);
   });
 
-  it("sorts by last use, then by requests", () => {
-    expect(sortKeys(rows, "last-used").map((r) => r.key.id)).toEqual(["k1", "k3", "k2"]);
-    expect(sortKeys(rows, "requests").map((r) => r.key.id)).toEqual(["k3", "k1", "k2"]);
+  it("asks the gateway to filter and sort every key", () => {
+    const window = { sinceMs: 1, untilMs: 2 };
+    expect(keyListQuery({ ...EMPTY_KEY_FILTERS, query: " lab ", tenantId: "t1", status: "off", kind: "identity", budget: "near", unused: true }, "spend", window)).toEqual({
+      tenantId: "t1", q: "lab", disabled: true, kind: "identity", budget: "near", unused: true, sort: "cost", sinceMs: 1, untilMs: 2,
+    });
+    expect(keyListQuery(EMPTY_KEY_FILTERS, "newest", window)).toEqual({
+      tenantId: undefined, q: undefined, disabled: undefined, kind: undefined, budget: undefined, unused: undefined, sort: "created", dir: "desc", sinceMs: 1, untilMs: 2,
+    });
+    expect(keyListQuery({ ...EMPTY_KEY_FILTERS, status: "on" }, "last-used", window)).toMatchObject({ disabled: false, sort: "last_used" });
+  });
+
+  it("carries the query through the live route unchanged", () => {
+    const q = keyListQuery({ ...EMPTY_KEY_FILTERS, query: "a&b", status: "on", budget: "capped" }, "name", { sinceMs: 10, untilMs: 20 });
+    const params = keyListParams(q);
+    expect(params.toString()).toBe("q=a%26b&disabled=false&budget=capped&sort=name&since_ms=10&until_ms=20");
+    expect(parseKeyListParams(params)).toEqual({ ...q, tenantId: undefined, ids: undefined, kind: undefined, unused: undefined, dir: undefined });
+    expect(parseKeyListParams(new URLSearchParams("sort=weight&kind=x&since_ms=abc"))).toMatchObject({ sort: undefined, kind: undefined, sinceMs: undefined });
+  });
+
+  it("says what a select-all-by-filter covers", () => {
+    expect(keyFiltersWords(EMPTY_KEY_FILTERS)).toBe("every key");
+    expect(keyFiltersWords({ ...EMPTY_KEY_FILTERS, query: "lab", tenantId: "t1", status: "off" }, "Research")).toBe("matching “lab”, in Research, turned off");
   });
 
   it("words when a key was last used", () => {

@@ -4,11 +4,14 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { KeysList } from "./keys-list";
-import type { ApiKey, Tenant } from "@/lib/obleth";
+import type { ApiKey, KeyStats, Tenant } from "@/lib/obleth";
+import type { KeyPageData } from "@/lib/key-page-data";
+import { EMPTY_KEY_FILTERS } from "@/lib/access-model";
 
 const mocks = vi.hoisted(() => ({
   createKey: vi.fn(),
   moveKeys: vi.fn(),
+  setDisabled: vi.fn(),
 }));
 vi.mock("@/app/actions", () => ({
   createKeyAction: mocks.createKey,
@@ -18,7 +21,15 @@ vi.mock("@/app/actions", () => ({
   replaceKeyAction: vi.fn(),
   saveKeySettingsAction: vi.fn(async () => ({ ok: true })),
   setKeysBudgetAction: vi.fn(),
-  setKeysDisabledAction: vi.fn(),
+  setKeysDisabledAction: mocks.setDisabled,
+}));
+// A plain select, so a test can pick a sort.
+vi.mock("@/components/ui/select", () => ({
+  Select: ({ value, onValueChange, options, ...rest }: { value: string; onValueChange: (v: string) => void; options: { value: string; label: string }[]; "aria-label"?: string }) => (
+    <select aria-label={rest["aria-label"]} value={value} onChange={(e) => onValueChange(e.target.value)}>
+      {options.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+    </select>
+  ),
 }));
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ refresh: vi.fn(), push: vi.fn() }),
@@ -42,11 +53,29 @@ const key: ApiKey = {
 
 let host: HTMLDivElement;
 let root: Root;
+/** The dashboard routes the list asked for, in order, and what they answer. */
+let requests: string[];
+let answer: (url: URL) => unknown;
+
+const WINDOW = { sinceMs: 1_000, untilMs: 2_000 };
+const STATS: KeyStats = {
+  keys: 1234, disabled: 4, identity: 0, tenants: 2, used: 1000, used_recent: 50, unused: 234, unused_on: 230,
+  requests: 9000, busiest: null, near_budget: 0, near_budget_keys: [],
+};
+const page = (keys: ApiKey[], next: string | null = null): KeyPageData => ({ keys, usage: [], budgets: [], next });
 
 beforeEach(() => {
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
   mocks.createKey.mockReset();
   mocks.moveKeys.mockReset();
+  mocks.setDisabled.mockReset();
+  requests = [];
+  answer = (url) => (url.pathname === "/api/live/keys" ? page([key]) : []);
+  vi.stubGlobal("fetch", vi.fn(async (input: string) => {
+    const url = new URL(input, "http://dash.test");
+    requests.push(`${url.pathname}?${url.searchParams.toString()}`);
+    return new Response(JSON.stringify(answer(url)), { status: 200, headers: { "content-type": "application/json" } });
+  }));
   host = document.createElement("div");
   document.body.appendChild(host);
   root = createRoot(host);
@@ -54,18 +83,33 @@ beforeEach(() => {
 afterEach(async () => {
   await act(async () => root.unmount());
   host.remove();
+  vi.unstubAllGlobals();
+  vi.useRealTimers();
 });
 
-async function render(keys: ApiKey[] = [key]) {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false, enabled: false } } });
+async function render(keys: ApiKey[] = [key], next: string | null = null) {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   await act(async () =>
     root.render(
       <QueryClientProvider client={client}>
-        <KeysList tenants={[tenant("t1", "Research"), tenant("t2", "Teaching")]} keys={keys} usage={[]} budgets={[]} initial={{}} />
+        <KeysList
+          tenants={[tenant("t1", "Research"), tenant("t2", "Teaching")]}
+          first={{ filters: EMPTY_KEY_FILTERS, sort: "last-used", page: page(keys, next) }}
+          usageWindow={WINDOW}
+          stats={STATS}
+          initial={{}}
+        />
       </QueryClientProvider>,
     ),
   );
 }
+/** Let fetches and the renders they cause finish. */
+async function settle() {
+  for (let i = 0; i < 5; i++) await act(async () => { await new Promise((r) => setTimeout(r, 0)); });
+}
+const listRequests = () => requests.filter((r) => r.startsWith("/api/live/keys?"));
+const names = () => [...host.querySelectorAll('[aria-label="Keys"] button[aria-label^="Open "]')].map((b) => b.getAttribute("aria-label")!.slice(5));
+const keyNamed = (name: string, id = name): ApiKey => ({ ...key, id, name });
 // Sheets and dialogs render over the page, so look across the whole document.
 function button(text: string) {
   const result = [...document.querySelectorAll<HTMLButtonElement>("button")].find((b) => b.textContent?.trim() === text || b.getAttribute("aria-label") === text);
@@ -124,16 +168,69 @@ describe("keys", () => {
     expect(document.body.textContent).toContain("alice-own is made and the keys are in it.");
   });
 
-  it("renders the first 100 keys, and Select all still takes every match", async () => {
-    const many = Array.from({ length: 150 }, (_, i) => ({ ...key, id: `k${i}`, name: `key-${String(i).padStart(3, "0")}` }));
-    await render(many);
-    const rows = () => host.querySelectorAll('[aria-label="Keys"] input[aria-label^="Select key-"]').length;
-    expect(rows()).toBe(100);
-    expect(host.textContent).toContain("100 of 150 keys shown");
-    await act(async () => host.querySelector<HTMLInputElement>('input[aria-label="Select all 150 matching keys"]')!.click());
-    expect(host.querySelector('[aria-label="Selected keys"]')!.textContent).toContain("150 selected");
-    await click("Show more");
-    expect(rows()).toBe(150);
+  it("loads the next page from where the last one ended", async () => {
+    await render([keyNamed("a")], "c1");
+    expect(host.textContent).toContain("1 key so far");
+    answer = () => page([keyNamed("b")]);
+    await click("Load more");
+    await settle();
+    expect(listRequests()).toEqual(["/api/live/keys?sort=last_used&since_ms=1000&until_ms=2000&cursor=c1"]);
+    expect(names()).toEqual(["a", "b"]);
+    expect(host.textContent).not.toContain("Load more");
+  });
+
+  it("searches on the gateway once typing pauses, from the first page", async () => {
+    await render([keyNamed("a")], "c1");
+    answer = () => page([keyNamed("lab-bot")]);
+    const box = host.querySelector<HTMLInputElement>('input[aria-label="Search keys"]')!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(box, "lab");
+      box.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    expect(listRequests()).toEqual([]);
+    await act(async () => { await new Promise((r) => setTimeout(r, 300)); });
+    await settle();
+    expect(listRequests()).toEqual(["/api/live/keys?q=lab&sort=last_used&since_ms=1000&until_ms=2000"]);
+    expect(names()).toEqual(["lab-bot"]);
+  });
+
+  it("starts again from the first page when the sort changes", async () => {
+    await render([keyNamed("a")], "c1");
+    answer = () => page([keyNamed("b")], "c2");
+    await click("Load more");
+    await settle();
+    answer = () => page([keyNamed("z-first")], "n1");
+    const sort = host.querySelector<HTMLSelectElement>('select[aria-label="Sort"]')!;
+    await act(async () => {
+      sort.value = "name";
+      sort.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await settle();
+    expect(listRequests().at(-1)).toBe("/api/live/keys?sort=name&since_ms=1000&until_ms=2000");
+    expect(names()).toEqual(["z-first"]);
+  });
+
+  it("selects every matching key by filter, saying how many the gateway counts", async () => {
+    mocks.setDisabled.mockResolvedValue({ done: 1234, failed: [] });
+    await render([keyNamed("a")], "c1");
+    answer = (url) => (url.pathname === "/api/live/keys/count" ? { keys: 1234, tenants: 2 } : page([keyNamed("a")], "c1"));
+    await act(async () => host.querySelector<HTMLInputElement>('input[aria-label="Select the 1 keys shown"]')!.click());
+    expect(host.querySelector('[aria-label="Selected keys"]')!.textContent).toContain("1 selected");
+    await click("Select every matching key");
+    await settle();
+    expect(host.querySelector('[aria-label="Selected keys"]')!.textContent).toContain("All 1,234 keys selected");
+    await click("Turn off");
+    await settle();
+    expect(requests.filter((r) => r.startsWith("/api/live/keys/count"))).toEqual([
+      "/api/live/keys/count?sort=last_used&since_ms=1000&until_ms=2000",
+      "/api/live/keys/count?sort=last_used&since_ms=1000&until_ms=2000",
+    ]);
+    expect(document.body.textContent).toContain("Turn off 1,234 keys?");
+    expect(document.body.textContent).toContain("1,233 of them are not loaded on this page");
+    await act(async () => [...document.querySelectorAll<HTMLButtonElement>('[role="alertdialog"] button, [role="dialog"] button')].find((b) => b.textContent?.trim() === "Turn off")!.click());
+    await settle();
+    expect(mocks.setDisabled).toHaveBeenCalledWith({ filter: expect.objectContaining({ sort: "last_used", sinceMs: 1000, untilMs: 2000 }), expected: 1234 }, true);
+    expect(document.body.textContent).toContain("Turned off 1,234 keys.");
   });
 
   it("shows where a key may be used from", async () => {

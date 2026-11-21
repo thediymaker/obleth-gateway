@@ -1668,6 +1668,12 @@ pub struct KeyUsageSummaryQuery {
     /// Most rows of the bulk feed, busiest keys first: default 1,000, at
     /// most 10,000.
     pub limit: Option<u64>,
+    /// Only these keys in the bulk feed: one UUID or up to 200 joined by
+    /// commas (a page of the Keys list). Ignored by the single-key endpoint.
+    #[serde(default, deserialize_with = "key_id_list")]
+    #[schema(value_type = Option<String>)]
+    #[param(value_type = Option<String>)]
+    pub key_id: Vec<Uuid>,
     /// When true, include internal traffic (health probes, benchmark runs)
     /// that is excluded from this read by default.
     pub include_internal: Option<bool>,
@@ -1814,6 +1820,7 @@ pub async fn query_keys_usage_summary(
     // Qualified so the SELECT alias `tenant_id` cannot shadow the column.
     filter
         .uuid("usage.tenant_id", q.tenant_id)
+        .uuids("usage.key_id", &q.key_id)
         .internal(q.include_internal);
     let sql = format!(
         "select \
@@ -1838,6 +1845,112 @@ pub async fn query_keys_usage_summary(
         .fetch_all::<KeyUsageSummaryRow>()
         .await?;
     Ok(rows.into_iter().map(KeyUsageSummary::from).collect())
+}
+
+/// What `GET /keys` can rank keys by: their use in a window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyRankMetric {
+    /// The last request's time.
+    LastUsed,
+    Requests,
+    /// Input and output tokens.
+    Tokens,
+    /// Spend, in billionths of a dollar so sums are exact and the same on
+    /// every read (a float sum's last bits depend on the order ClickHouse
+    /// adds in, and a page cursor compares them exactly).
+    Cost,
+}
+
+impl KeyRankMetric {
+    fn sql(self) -> &'static str {
+        match self {
+            KeyRankMetric::LastUsed => "max(ts_ms)",
+            KeyRankMetric::Requests => "toInt64(count())",
+            KeyRankMetric::Tokens => {
+                "toInt64(sum(toUInt64(input_tokens) + toUInt64(output_tokens)))"
+            }
+            KeyRankMetric::Cost => "sum(toInt64(round(cost_usd * 1000000000)))",
+        }
+    }
+}
+
+/// One key's place in a ranking by [`KeyRankMetric`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Row, Deserialize)]
+pub struct KeyRank {
+    #[serde(with = "clickhouse::serde::uuid")]
+    pub key_id: Uuid,
+    pub score: i64,
+}
+
+/// Seconds ClickHouse may spend ranking keys for one page of `GET /keys`.
+const KEY_RANK_MAX_EXECUTION_SECS: u32 = 10;
+
+/// A page of keys ranked by their use in `[since, until)`: highest first,
+/// ties by key id (also descending, compared as text: ClickHouse's own UUID
+/// order differs from the byte order Postgres and the cursor use), starting after `after` (a previous
+/// page's last score and id), at most `limit` rows. With `key_ids`, only
+/// those keys. Internal traffic is left out, as in the other usage reads.
+/// Keys with no use in the window have no row.
+pub async fn query_key_ranks(
+    client: &clickhouse::Client,
+    metric: KeyRankMetric,
+    since: i64,
+    until: i64,
+    key_ids: &[Uuid],
+    after: Option<(i64, Uuid)>,
+    limit: Option<u64>,
+) -> Result<Vec<KeyRank>, clickhouse::error::Error> {
+    let mut filter = Filter::window(since, Some(until));
+    filter.uuids("usage.key_id", key_ids).internal(None);
+    let sql = key_ranks_sql(metric, filter.sql(), after.is_some(), limit);
+    let mut query = filter.bind(client.query(&sql));
+    if let Some((score, id)) = after {
+        query = query.bind(score).bind(id.to_string());
+    }
+    query.fetch_all::<KeyRank>().await
+}
+
+fn key_ranks_sql(metric: KeyRankMetric, filter: &str, after: bool, limit: Option<u64>) -> String {
+    let having = if after {
+        " having (score, toString(key_id)) < (?, ?)"
+    } else {
+        ""
+    };
+    let limit = limit.map(|n| format!(" limit {n}")).unwrap_or_default();
+    format!(
+        "select key_id, {} as score from usage{filter} group by key_id{having} \
+         order by score desc, toString(key_id) desc{limit} \
+         settings max_execution_time = {KEY_RANK_MAX_EXECUTION_SECS}",
+        metric.sql()
+    )
+}
+
+/// One key's use in a window, from [`query_used_keys`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Row, Deserialize)]
+pub struct KeyUse {
+    #[serde(with = "clickhouse::serde::uuid")]
+    pub key_id: Uuid,
+    pub last_used_ms: i64,
+    pub requests: u64,
+}
+
+/// Every key with use in `[since, until)` (internal traffic left out), with
+/// its last request and request count: one small row per key, for telling
+/// used keys from unused ones.
+pub async fn query_used_keys(
+    client: &clickhouse::Client,
+    since: i64,
+    until: i64,
+) -> Result<Vec<KeyUse>, clickhouse::error::Error> {
+    let mut filter = Filter::window(since, Some(until));
+    filter.internal(None);
+    let sql = format!(
+        "select key_id, max(ts_ms) as last_used_ms, count() as requests \
+         from usage{} group by key_id \
+         settings max_execution_time = {KEY_RANK_MAX_EXECUTION_SECS}",
+        filter.sql()
+    );
+    filter.bind(client.query(&sql)).fetch_all::<KeyUse>().await
 }
 
 /// Longest window `key-sources` and `key-rejections` read, in milliseconds.
@@ -2735,7 +2848,7 @@ fn series_bucket_ms(since: i64, requested: Option<i64>, floor_ms: i64, now: i64)
     requested.unwrap_or(300_000).max(floor_ms).max(min_for_cap)
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
