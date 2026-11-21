@@ -250,7 +250,7 @@ async fn ask(
     let target = crate::boons::helper_target(brain, "", None)?;
     let outcomes = fan_out(
         http,
-        &build_chat_url(&target.base),
+        &crate::boons::build_chat_url(&target.base),
         target.api_key.as_deref(),
         &target.headers,
         &brain.model_name,
@@ -358,11 +358,6 @@ fn drop_exclusive_losers(chosen: &mut Vec<(String, f64)>) {
             chosen.remove(pa.max(pb));
         }
     }
-}
-
-fn build_chat_url(api_base: &str) -> String {
-    let base = api_base.trim_end_matches('/');
-    format!("{base}/chat/completions")
 }
 
 #[cfg(test)]
