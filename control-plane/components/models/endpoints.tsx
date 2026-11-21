@@ -121,7 +121,7 @@ export const EndpointsSection = memo(function EndpointsSection({ model, endpoint
                         disabled={busy}
                         aria-label={`Remove ${ep.name}`}
                         onClick={async () => {
-                          const ok = await confirm({ title: "Remove endpoint", description: `Remove endpoint "${ep.name}"? Traffic shifts to the model's other endpoints.`, confirmLabel: "Remove" });
+                          const ok = await confirm({ tone: "destructive", title: "Remove endpoint", description: `Remove endpoint "${ep.name}"? Traffic shifts to the model's other endpoints.`, confirmLabel: "Remove" });
                           if (ok) run(() => deleteModelEndpointAction(model.id, ep.id));
                         }}
                       >

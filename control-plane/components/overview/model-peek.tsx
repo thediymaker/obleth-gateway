@@ -69,7 +69,7 @@ export function ModelPeek({ tile, model, usage, audit, range, onClose }: {
                 {[modelTypeLabel(tile.type), model?.context_window ? `${compact(model.context_window)} context` : null, model?.tags.length ? `tags ${model.tags.join(", ")}` : null].filter(Boolean).join(" · ")}
               </p>
             </div>
-            <SheetClose onClose={onClose} />
+            <SheetClose />
           </div>
           <div className="flex flex-wrap gap-2">
             <Pill inverted={tile.health === "unhealthy"}>{tile.health !== "unhealthy" && <HealthGlyph state={tile.health} className="h-[7px] w-[7px]" />}{HEALTH_LABEL[tile.health]}</Pill>

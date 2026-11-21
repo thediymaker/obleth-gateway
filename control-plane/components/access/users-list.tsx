@@ -198,6 +198,7 @@ export function UsersList({ users, tenants, me }: { users: AdminUser[]; tenants:
   function takeAway(u: AdminUser) {
     start(async () => {
       const ok = await confirm({
+        tone: "destructive",
         title: `Take ${u.email}'s access away?`,
         description: "They go back to waiting for approval: signed in, but able to use nothing. Their keys in the portal stay with the tenant.",
         confirmLabel: "Take access away",

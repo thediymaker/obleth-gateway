@@ -292,6 +292,7 @@ export function KeysList({
       const t = await bulkTarget();
       if (!t) return;
       const ok = await confirm({
+        tone: "destructive",
         title: `Delete ${plural(t.count)}?`,
         description: `${t.words} Requests with them fail at once. This cannot be undone.`,
         confirmLabel: "Delete",
@@ -441,7 +442,7 @@ export function KeysList({
       )}
       {moving && (
         <MoveDialog
-          key={moving.byFilter ? "filter" : moving.keys.map((k) => k.id).join(",")}
+          key={moving.byFilter ? "move:filter" : `move:${moving.keys.map((k) => k.id).join(",")}`}
           open
           onClose={() => setMoving(null)}
           keys={moving.keys}

@@ -500,6 +500,7 @@ export function ManagedPage({ modelId, initial, changes }: { modelId: string; in
         if (victim && (phase === "serving" || phase === "running")) {
           const letter = String.fromCharCode(65 + (current.indexOf(victim) % 26));
           const ok = await confirm({
+            tone: "destructive",
             title: `Cancel replica ${letter}?`,
             description: phase === "serving"
               ? `Going down to ${to} cancels replica ${letter}'s job, which is serving now. ${counts.healthy > 1 ? "Requests move to the others." : "Nothing else serves, so requests fail until another replica is healthy."}`

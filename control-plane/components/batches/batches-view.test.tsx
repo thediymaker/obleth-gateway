@@ -3,10 +3,11 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { BatchesView } from "./batches-view";
+import { cancelBatchAction } from "@/app/(dashboard)/batches/batches-actions";
 import type { AdminBatch, AdminBatchList } from "@/lib/obleth";
 
 vi.mock("next/navigation", () => ({ useRouter: () => ({ replace: vi.fn() }), usePathname: () => "/batches" }));
-vi.mock("@/app/(dashboard)/batches/batches-actions", () => ({ cancelBatchAction: vi.fn() }));
+vi.mock("@/app/(dashboard)/batches/batches-actions", () => ({ cancelBatchAction: vi.fn(async () => ({ ok: true })) }));
 
 const batch = (n: number): AdminBatch => ({
   id: `batch_${String(n).padStart(3, "0")}`, tenant_id: "t", tenant_name: "team", key_id: "k", key_name: "key", model: "m", endpoint: "/v1/chat/completions",
@@ -48,4 +49,23 @@ it("reaches the older batches a page at a time and counts what it shows", async 
   // Every batch is on the page now, so the footer has nothing left to offer.
   expect(host.textContent).toContain("batch_149");
   expect([...host.querySelectorAll("button")].some((b) => b.textContent === "Load older")).toBe(false);
+});
+
+it("asks before cancelling a batch, and does nothing when the answer is no", async () => {
+  vi.mocked(cancelBatchAction).mockClear();
+  const running: AdminBatch = { ...batch(1), status: "in_progress", total: 10, completed: 4, finished_at: null };
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false, enabled: false } } });
+  await act(async () => root.render(<QueryClientProvider client={client}><BatchesView initial={{ data: [running], has_more: false, counts: { in_progress: 1 } }} initialFilter="all" /></QueryClientProvider>));
+  const press = async (label: string) => {
+    const b = [...document.querySelectorAll("button")].find((x) => x.textContent === label)!;
+    await act(async () => { b.click(); await new Promise((r) => setTimeout(r, 0)); });
+  };
+  await press("Cancel…");
+  expect(document.querySelector("[role=dialog]")?.textContent).toContain("6 not yet finished");
+  await press("Cancel");
+  expect(document.querySelector("[role=dialog]")).toBeNull();
+  expect(cancelBatchAction).not.toHaveBeenCalled();
+  await press("Cancel…");
+  await press("Cancel the batch");
+  expect(cancelBatchAction).toHaveBeenCalledWith(running.id);
 });

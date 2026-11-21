@@ -99,7 +99,7 @@ function button(text: string, scope: ParentNode = document) {
   return result;
 }
 async function click(text: string) { await act(async () => button(text).click()); }
-const panel = () => document.querySelector('[aria-label="Tenant details"]');
+const panel = () => document.querySelector('[role="dialog"]');
 async function type(label: string, value: string) {
   const input = document.querySelector<HTMLInputElement>(`[aria-label="${label}"]`)!;
   await act(async () => {

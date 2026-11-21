@@ -82,10 +82,10 @@ describe("auto_route span rendering", () => {
     await render(node({ attributes: JSON.stringify(newShapeExplain) }));
     // Only RouteExplainPanel produces per-candidate score rows and the
     // rejection grouping by reason — assert on both.
-    expect(host.textContent).toContain("gpt-oss-120b");
-    expect(host.textContent).toContain("0.820");
-    expect(host.textContent).toMatch(/context window too small/i);
-    expect(host.textContent).toMatch(/not considered/i);
+    expect(document.body.textContent).toContain("gpt-oss-120b");
+    expect(document.body.textContent).toContain("0.820");
+    expect(document.body.textContent).toMatch(/context window too small/i);
+    expect(document.body.textContent).toMatch(/not considered/i);
   });
 
   it("falls back to raw attribute rendering for a pre-upgrade span (regression guard)", async () => {
@@ -94,42 +94,42 @@ describe("auto_route span rendering", () => {
     // Raw dl rendering shows each key/value pair, including the field name
     // that a truthiness check on `candidates` (a number, not an array)
     // would otherwise misclassify as the new shape.
-    expect(host.textContent).toContain("candidates");
-    expect(host.textContent).toContain("7");
-    expect(host.textContent).toContain("chosen");
+    expect(document.body.textContent).toContain("candidates");
+    expect(document.body.textContent).toContain("7");
+    expect(document.body.textContent).toContain("chosen");
     // The panel never rendered: no "Not considered" rejection grouping.
-    expect(host.textContent).not.toMatch(/not considered/i);
+    expect(document.body.textContent).not.toMatch(/not considered/i);
   });
 
   it("falls back to raw rendering for the gateway's serialization-failure payload", async () => {
     const failure = { chosen: "m", error: "serde_json::to_value failed" };
     await render(node({ attributes: JSON.stringify(failure) }));
-    expect(host.textContent).toContain("error");
-    expect(host.textContent).toMatch(/serialization-failure|serde_json/i);
+    expect(document.body.textContent).toContain("error");
+    expect(document.body.textContent).toMatch(/serialization-failure|serde_json/i);
   });
 
   it("does not crash on unparseable attributes", async () => {
     await render(node({ attributes: "not json {{{" }));
-    expect(host.querySelector("section")).not.toBeNull();
-    expect(host.textContent).toContain("No attributes recorded.");
+    expect(document.body.querySelector("section")).not.toBeNull();
+    expect(document.body.textContent).toContain("No attributes recorded.");
   });
 
   it("does not crash on empty attributes", async () => {
     await render(node({ attributes: "{}" }));
-    expect(host.querySelector("section")).not.toBeNull();
-    expect(host.textContent).toContain("No attributes recorded.");
+    expect(document.body.querySelector("section")).not.toBeNull();
+    expect(document.body.textContent).toContain("No attributes recorded.");
   });
 
   it("leaves non-auto_route spans on the raw renderer even with a scored-shaped payload", async () => {
     await render(node({ span_name: "upstream", attributes: JSON.stringify(newShapeExplain) }));
-    expect(host.textContent).not.toMatch(/not considered/i);
+    expect(document.body.textContent).not.toMatch(/not considered/i);
   });
 
   it("falls back to raw rendering when scored is present but weights is missing", async () => {
     const { weights: _weights, ...malformed } = newShapeExplain;
     await render(node({ attributes: JSON.stringify(malformed) }));
-    expect(host.textContent).not.toMatch(/not considered/i);
-    expect(host.textContent).toContain("scored");
+    expect(document.body.textContent).not.toMatch(/not considered/i);
+    expect(document.body.textContent).toContain("scored");
   });
 
   it("falls back to raw rendering when a scored entry is missing score", async () => {
@@ -138,31 +138,31 @@ describe("auto_route span rendering", () => {
       scored: [{ model: "gpt-oss-120b", level: 2, spare: 0.9, cost_score: 0.7, tag_score: 0, bias: 1.0, chosen: true }],
     };
     await render(node({ attributes: JSON.stringify(malformed) }));
-    expect(host.textContent).not.toMatch(/not considered/i);
+    expect(document.body.textContent).not.toMatch(/not considered/i);
   });
 
   it("falls back to raw rendering when tags is missing", async () => {
     const { tags: _tags, ...malformed } = newShapeExplain;
     await render(node({ attributes: JSON.stringify(malformed) }));
-    expect(host.textContent).not.toMatch(/not considered/i);
+    expect(document.body.textContent).not.toMatch(/not considered/i);
   });
 
   it("falls back to raw rendering when tier_domains is missing", async () => {
     const { tier_domains: _tierDomains, ...malformed } = newShapeExplain;
     await render(node({ attributes: JSON.stringify(malformed) }));
-    expect(host.textContent).not.toMatch(/not considered/i);
+    expect(document.body.textContent).not.toMatch(/not considered/i);
   });
 
   it("falls back to raw rendering when a rejected entry is missing models", async () => {
     const malformed = { ...newShapeExplain, rejected: [{ reason: "context window too small" }] };
     await render(node({ attributes: JSON.stringify(malformed) }));
-    expect(host.textContent).not.toMatch(/not considered/i);
+    expect(document.body.textContent).not.toMatch(/not considered/i);
   });
 
   it("falls back to raw rendering when temperature or uniform is missing", async () => {
     const { temperature: _temperature, ...malformed } = newShapeExplain;
     await render(node({ attributes: JSON.stringify(malformed) }));
-    expect(host.textContent).not.toMatch(/not considered/i);
+    expect(document.body.textContent).not.toMatch(/not considered/i);
   });
 });
 
@@ -203,30 +203,30 @@ describe("the request panel", () => {
     await act(async () => { await new Promise((r) => setTimeout(r, 0)); });
   }
 
-  const fact = (label: string) => [...host.querySelectorAll("dt")].find((d) => d.textContent === label)?.nextElementSibling ?? null;
-  const helperSection = () => host.querySelector('[aria-label="Helper calls"]');
+  const fact = (label: string) => [...document.body.querySelectorAll("dt")].find((d) => d.textContent === label)?.nextElementSibling ?? null;
+  const helperSection = () => document.body.querySelector('[aria-label="Helper calls"]');
 
   it("says why a request failed, whose side it was on, and the reason as recorded", async () => {
     const picked: Partial<LogFilters>[] = [];
     await show(entry({ status_code: 503, output_tokens: 0, cost_usd: 0, error_class: "capacity", error_reason: "No slot came free in 30 s on glm-5-3" }), (p) => picked.push(p));
-    expect(host.querySelector("h2")!.textContent).toBe("No capacity");
-    const why = host.querySelector('[aria-label="Why it failed"]')!;
+    expect(document.body.querySelector("h2")!.textContent).toBe("No capacity");
+    const why = document.body.querySelector('[aria-label="Why it failed"]')!;
     expect(why.textContent).toContain("No capacity, on the platform's side.");
     expect(why.textContent).toContain("No slot came free in 30 s on glm-5-3");
-    const like = [...host.querySelectorAll("button")].find((b) => b.textContent === "Failures like this")!;
+    const like = [...document.body.querySelectorAll("button")].find((b) => b.textContent === "Failures like this")!;
     await act(async () => like.click());
     expect(picked).toEqual([{ errorClass: "capacity", statusCode: "503", model: "glm-5-3", keyId: "k-1", tenantId: "t-cs", status: "" }]);
   });
 
   it("gives an older failure's status in place of a reason it never recorded", async () => {
     await show(entry({ status_code: 400, output_tokens: 0, cost_usd: 0, error_class: "client_input", error_reason: "" }));
-    const why = host.querySelector('[aria-label="Why it failed"]')!;
+    const why = document.body.querySelector('[aria-label="Why it failed"]')!;
     expect(why.textContent).toContain("Request refused, on the caller's side.");
     expect(why.textContent).toContain("HTTP 400");
     // A gateway that does not classify failures leaves the section out.
     await show(entry({ request_id: "b0000000-0000-0000-0000-000000000000", status_code: 502 }));
-    expect(host.querySelector('[aria-label="Why it failed"]')).toBeNull();
-    expect(host.querySelector("h2")!.textContent).toBe("Bad gateway");
+    expect(document.body.querySelector('[aria-label="Why it failed"]')).toBeNull();
+    expect(document.body.querySelector("h2")!.textContent).toBe("Bad gateway");
   });
 
   it("names the variant a client asked for", async () => {
@@ -276,7 +276,7 @@ describe("the request panel", () => {
     await show(entry());
     expect(calls.some((u) => u.includes("parent_request_id="))).toBe(true);
     expect(helperSection()).toBeNull();
-    expect(host.textContent).not.toContain("Helper call");
+    expect(document.body.textContent).not.toContain("Helper call");
   });
 
   it("links a helper call back to the request it served, and looks for no helpers of its own", async () => {

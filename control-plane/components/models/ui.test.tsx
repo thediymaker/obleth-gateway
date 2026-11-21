@@ -35,7 +35,7 @@ describe("Sheet", () => {
   it("keeps focus where someone is typing when the parent re-renders with a new onClose", async () => {
     render(() => {});
     await frame();
-    const second = host.querySelector<HTMLInputElement>('input[aria-label="second"]')!;
+    const second = document.body.querySelector<HTMLInputElement>('input[aria-label="second"]')!;
     second.focus();
     // A parent that refetches passes a fresh callback on every render.
     render(() => {});

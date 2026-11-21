@@ -2,7 +2,7 @@
 import { act, useState, useTransition } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { useConfirm } from "./confirm-dialog";
+import { ConfirmDialog, useConfirm } from "./confirm-dialog";
 
 // The shape every destructive action in the dashboard uses: ask inside a
 // transition, then do the work. The dialog's open state used to be set inside
@@ -21,7 +21,7 @@ function AskInsideTransition() {
         disabled={pending}
         onClick={() =>
           start(async () => {
-            const ok = await confirm({ title: "Delete 2 keys?", description: "Cannot be undone." });
+            const ok = await confirm({ tone: "destructive", title: "Delete 2 keys?", description: "Cannot be undone.", confirmLabel: "Delete" });
             setResult(ok ? "confirmed" : "cancelled");
           })
         }
@@ -80,5 +80,28 @@ describe("useConfirm", () => {
       button("Cancel")!.click();
     });
     expect(document.querySelector('[data-testid="result"]')?.textContent).toBe("cancelled");
+  });
+});
+
+describe("ConfirmDialog tone", () => {
+  function show(tone?: "default" | "destructive") {
+    act(() => root.render(<ConfirmDialog open onOpenChange={() => {}} onConfirm={() => {}} title="Replace alice?" description="Makes a new key." confirmLabel="Go" tone={tone} />));
+    const title = document.querySelector("h2")!;
+    return { title, go: button("Go")! };
+  }
+
+  it("is neutral unless asked to be destructive", () => {
+    const { title, go } = show();
+    expect(title.className).not.toContain("text-destructive");
+    expect(title.querySelector("svg")).toBeNull();
+    expect(go.className).toContain("bg-primary");
+    expect(go.className).not.toContain("bg-destructive");
+  });
+
+  it("marks a destructive question in red, title and button", () => {
+    const { title, go } = show("destructive");
+    expect(title.className).toContain("text-destructive");
+    expect(title.querySelector("svg")).not.toBeNull();
+    expect(go.className).toContain("bg-destructive");
   });
 });

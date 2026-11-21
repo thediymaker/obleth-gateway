@@ -101,8 +101,10 @@ export function PortalKeys({
 
   async function handleDelete(key: ApiKey) {
     const ok = await confirm({
+      tone: "destructive",
       title: "Delete API key",
       description: `Delete API key "${key.name}"? Clients using it stop authenticating immediately. This cannot be undone.`,
+      confirmLabel: "Delete",
     });
     if (!ok) return;
     setRowErrors((prev) => ({ ...prev, [key.id]: "" }));

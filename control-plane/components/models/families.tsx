@@ -130,6 +130,7 @@ function FamilySheet({ family, families, models, onClose }: {
     if (!family) return;
     start(async () => {
       const ok = await confirm({
+        tone: "destructive",
         title: `Delete ${family.name}?`,
         description: "Requests naming it start failing straight away. Its models are not touched and still answer to their own names.",
         confirmLabel: "Delete",

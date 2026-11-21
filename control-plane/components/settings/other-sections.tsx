@@ -175,7 +175,7 @@ export function DataSection({ retention }: { retention: UsageRetentionView | nul
 
   function dropOld() {
     start(async () => {
-      const ok = await confirm({ title: `Drop history older than ${retention?.days ?? days} days?`, description: "Request logs, reports and traces for those days are deleted now. This cannot be undone.", confirmLabel: "Drop it" });
+      const ok = await confirm({ tone: "destructive", title: `Drop history older than ${retention?.days ?? days} days?`, description: "Request logs, reports and traces for those days are deleted now. This cannot be undone.", confirmLabel: "Drop it" });
       if (!ok) return;
       const res = await compactUsageAction();
       setNotice(res.ok ? { text: `Dropped ${res.partitionsDropped ?? 0} day${res.partitionsDropped === 1 ? "" : "s"} of history.` } : { text: res.error, strong: true });

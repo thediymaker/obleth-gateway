@@ -1,12 +1,12 @@
 "use client";
 
-// Recipe editor dialog for creating, editing, and copying saved recipes.
+// Recipe editor panel for creating, editing, and copying saved recipes.
 //
 // Validation strategy: parseRecipe lives in sbatch-recipes.ts which imports
 // node:fs at the module level. Importing it into a "use client" component would
 // bundle node:fs and break the Next.js build. All validation is therefore
 // server-side: saveTemplateAction runs parseRecipe and returns { ok:false, error }
-// for invalid recipes, which we surface inline in the dialog. The Save button is
+// for invalid recipes, which we show in the panel. The Save button is
 // only disabled while a request is in-flight (not pre-emptively on the client).
 
 import { useState, useTransition, useEffect } from "react";
@@ -14,14 +14,8 @@ import { saveTemplateAction } from "@/app/actions";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
+import { Notice } from "@/components/ui/notice";
+import { Sheet } from "@/components/ui/sheet";
 
 // A minimal recipe in the shipped shape: the server listens on the port obleth
 // picks for each replica and serves under the deployment's name.
@@ -80,7 +74,7 @@ export function TemplateEditor({
   const [error, setError] = useState<string | null>(null);
   const [pending, startTransition] = useTransition();
 
-  // Sync local state whenever the dialog opens (open transitions false → true).
+  // Sync local state whenever the panel opens (open transitions false → true).
   // This handles the common pattern where the parent sets `initial` and `open`
   // in the same render cycle, so the textarea always shows the latest values.
   useEffect(() => {
@@ -91,10 +85,6 @@ export function TemplateEditor({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
-
-  function handleOpenChange(next: boolean) {
-    onOpenChange(next);
-  }
 
   function handleSave() {
     if (!name.trim()) {
@@ -120,72 +110,60 @@ export function TemplateEditor({
     : `Editing "${initial?.name ?? initial?.id}". Changes apply only to this saved recipe.`;
 
   return (
-    <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogContent className="grid max-h-[85vh] w-[min(720px,calc(100vw-2rem))] max-w-none grid-rows-[auto_minmax(0,1fr)_auto] gap-0 overflow-hidden p-0">
-        <DialogHeader className="border-b border-border/70 bg-background/35 px-6 py-4 pr-12">
-          <p className="mb-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-            Recipe
-          </p>
-          <DialogTitle className="text-lg">{title}</DialogTitle>
-          <DialogDescription className="mt-1">{description}</DialogDescription>
-        </DialogHeader>
-
-        <div className="min-h-0 overflow-y-auto px-6 py-4 space-y-4">
-          <div className="space-y-1.5">
-            <Label htmlFor="template-name" className="text-xs font-medium">
-              Name
-            </Label>
-            <Input
-              id="template-name"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder="e.g. Llama 3 8B (H100)"
-              disabled={pending}
-              className="h-8 text-sm"
-            />
-          </div>
-
-          <div className="space-y-1.5">
-            <Label htmlFor="template-body" className="text-xs font-medium">
-              Recipe body
-            </Label>
-            <p className="text-[11px] text-muted-foreground leading-relaxed">
-              YAML frontmatter between <code className="rounded bg-secondary px-1 py-0.5 font-mono">---</code> fences,
-              then the <code className="rounded bg-secondary px-1 py-0.5 font-mono">sbatch</code> script.
-            </p>
-            <textarea
-              id="template-body"
-              value={body}
-              onChange={(e) => setBody(e.target.value)}
-              disabled={pending}
-              rows={18}
-              spellCheck={false}
-              className="w-full resize-y rounded-md border border-input bg-background/70 px-3 py-2 font-mono text-xs leading-relaxed shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
-              placeholder={RECIPE_PLACEHOLDER}
-            />
-          </div>
-
-          {error && (
-            <div className="rounded-md border border-destructive/35 bg-destructive/10 px-3 py-2.5 text-sm text-destructive">
-              {error}
-            </div>
-          )}
-        </div>
-
-        <DialogFooter className="border-t border-border/70 bg-background/35 px-6 py-3">
-          <Button
-            type="button"
-            variant="ghost"
-            onClick={() => onOpenChange(false)}
-            disabled={pending}
-          >
+    <Sheet
+      open={open}
+      onClose={() => { if (!pending) onOpenChange(false); }}
+      title={title}
+      description={description}
+      width="w-[min(720px,100vw)]"
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button type="button" variant="ghost" onClick={() => onOpenChange(false)} disabled={pending}>
             Cancel
           </Button>
           <Button type="button" onClick={handleSave} disabled={pending}>
             {pending ? "Saving…" : "Save recipe"}
           </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+        </div>
+      }
+    >
+      <div className="space-y-4 px-6 pb-6">
+        <div className="space-y-1.5">
+          <Label htmlFor="template-name" className="text-xs font-medium">
+            Name
+          </Label>
+          <Input
+            id="template-name"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="e.g. Llama 3 8B (H100)"
+            disabled={pending}
+            className="h-8 text-sm"
+          />
+        </div>
+
+        <div className="space-y-1.5">
+          <Label htmlFor="template-body" className="text-xs font-medium">
+            Recipe body
+          </Label>
+          <p className="text-[11px] leading-relaxed text-muted-foreground">
+            YAML frontmatter between <code className="rounded bg-secondary px-1 py-0.5 font-mono">---</code> fences,
+            then the <code className="rounded bg-secondary px-1 py-0.5 font-mono">sbatch</code> script.
+          </p>
+          <textarea
+            id="template-body"
+            value={body}
+            onChange={(e) => setBody(e.target.value)}
+            disabled={pending}
+            rows={18}
+            spellCheck={false}
+            className="w-full resize-y rounded-md border border-input bg-background/70 px-3 py-2 font-mono text-xs leading-relaxed shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+            placeholder={RECIPE_PLACEHOLDER}
+          />
+        </div>
+
+        {error && <Notice strong>{error}</Notice>}
+      </div>
+    </Sheet>
   );
 }

@@ -173,7 +173,7 @@ export function KeyPanel({
 
   function remove() {
     start(async () => {
-      const ok = await confirm({ title: `Delete ${k.name}?`, description: "Requests with it fail at once. Its past usage stays in the logs. This cannot be undone.", confirmLabel: "Delete" });
+      const ok = await confirm({ tone: "destructive", title: `Delete ${k.name}?`, description: "Requests with it fail at once. Its past usage stays in the logs. This cannot be undone.", confirmLabel: "Delete" });
       if (!ok) return;
       const res = await deleteKeyAction(k.id);
       if (!res.ok) return onNotice(`Delete failed: ${res.error}`);

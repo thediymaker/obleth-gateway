@@ -15,31 +15,39 @@ import { Button } from "@/components/ui/button";
 export interface ConfirmOptions {
   title: string;
   description: React.ReactNode;
-  /** Label on the destructive confirm button. Defaults to "Delete". */
-  confirmLabel?: string;
+  /** Label on the confirm button: the action, in a word or two. */
+  confirmLabel: string;
+  /**
+   * "destructive" for what cannot be taken back (delete, remove, retire,
+   * cancel a running job, drop data): a red title and button. Everything
+   * else (turn off or on, replace, restart, reindex) stays neutral.
+   */
+  tone?: "default" | "destructive";
 }
 
-/// Styled replacement for `window.confirm` on routine destructive actions:
-/// one Cancel/Confirm dialog, no typing gate. Catastrophic operations
-/// (restore, secret rotation, bulk deletes) should keep `DestructiveConfirm`.
+/// Styled replacement for `window.confirm`: one Cancel/Confirm question with
+/// no typing gate. Typed confirmation (`DestructiveConfirm`) is kept for the
+/// few actions that take a whole tenant or the database with them.
 export function ConfirmDialog({
   open,
   onOpenChange,
   title,
   description,
-  confirmLabel = "Delete",
+  confirmLabel,
+  tone = "default",
   onConfirm,
 }: ConfirmOptions & {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onConfirm: () => void;
 }) {
+  const destructive = tone === "destructive";
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle className="flex items-center gap-2 text-destructive">
-            <AlertTriangle className="h-4 w-4" />
+          <DialogTitle className={destructive ? "flex items-center gap-2 text-destructive" : undefined}>
+            {destructive && <AlertTriangle className="h-4 w-4" aria-hidden />}
             {title}
           </DialogTitle>
           <DialogDescription asChild>
@@ -50,7 +58,7 @@ export function ConfirmDialog({
           <Button variant="outline" onClick={() => onOpenChange(false)} type="button">
             Cancel
           </Button>
-          <Button variant="destructive" onClick={onConfirm} type="button">
+          <Button variant={destructive ? "destructive" : "default"} onClick={onConfirm} type="button">
             {confirmLabel}
           </Button>
         </DialogFooter>
@@ -62,7 +70,7 @@ export function ConfirmDialog({
 /// Promise-based confirm for handler code:
 ///   const { confirm, confirmElement } = useConfirm();
 ///   ...render {confirmElement}...
-///   if (!(await confirm({ title, description }))) return;
+///   if (!(await confirm({ title, description, confirmLabel }))) return;
 export function useConfirm() {
   const [state, setState] = React.useState<{
     opts: ConfirmOptions;

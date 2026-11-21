@@ -6,6 +6,7 @@ import { usePathname, useRouter } from "next/navigation";
 import { useInfiniteQuery } from "@tanstack/react-query";
 import { cancelBatchAction } from "@/app/(dashboard)/batches/batches-actions";
 import { Button } from "@/components/ui/button";
+import { useConfirm } from "@/components/ui/confirm-dialog";
 import { BATCH_FILTERS, batchName, batchState, doneOf, filterCount, isActive, ownerOf, percentOf, type BatchFilter, type BatchTone } from "@/lib/batches-model";
 import { tenantHref } from "@/lib/access-model";
 import { logsHref } from "@/lib/log-links";
@@ -58,6 +59,7 @@ export function BatchesView({ initial, initialFilter }: { initial: AdminBatchLis
   const [query, setQuery] = useState("");
   const [pending, startTransition] = useTransition();
   const [cancelling, setCancelling] = useState<string | null>(null);
+  const { confirm, confirmElement } = useConfirm();
   const [error, setError] = useState<string | null>(null);
   const status = BATCH_FILTERS[filter].status;
   // Pages of 100, newest first; "Load older" asks for the page after the last row.
@@ -90,10 +92,16 @@ export function BatchesView({ initial, initialFilter }: { initial: AdminBatchLis
   };
 
   const cancel = (b: AdminBatch) => {
-    if (!window.confirm(`Cancel ${batchName(b) ?? b.id}? Queued requests stop; the ${b.total - doneOf(b)} not yet finished won't run.`)) return;
-    setError(null);
-    setCancelling(b.id);
     startTransition(async () => {
+      const ok = await confirm({
+        tone: "destructive",
+        title: `Cancel ${batchName(b) ?? b.id}?`,
+        description: `Queued requests stop; the ${formatNumber(b.total - doneOf(b))} not yet finished won't run. This cannot be undone.`,
+        confirmLabel: "Cancel the batch",
+      });
+      if (!ok) return;
+      setError(null);
+      setCancelling(b.id);
       const r = await cancelBatchAction(b.id);
       if (!r.ok) setError(r.error);
       await live.refetch();
@@ -103,6 +111,7 @@ export function BatchesView({ initial, initialFilter }: { initial: AdminBatchLis
 
   return (
     <div className="mx-auto flex max-w-[1600px] flex-col gap-[18px]">
+      {confirmElement}
       <div className="flex flex-wrap items-end justify-between gap-4">
         <div className="flex min-w-0 flex-col gap-1.5">
           <h1 className="text-[26px] font-semibold tracking-tight">Batches</h1>
@@ -184,7 +193,7 @@ export function BatchesView({ initial, initialFilter }: { initial: AdminBatchLis
                   <span className="flex justify-end gap-1">
                     {(b.status === "in_progress" || b.status === "validating") ? (
                       <Button type="button" variant="outline" size="sm" className="h-7 px-2.5 text-[12px]" disabled={pending && cancelling === b.id} onClick={() => cancel(b)}>
-                        {pending && cancelling === b.id ? "Cancelling" : "Cancel"}
+                        {pending && cancelling === b.id ? "Cancelling" : "Cancel…"}
                       </Button>
                     ) : doneOf(b) > 0 ? (
                       <Link href={logsHref({ model: b.model, team: b.tenant_name ?? undefined, window: "7d" })} className="text-[12px] text-secondary-foreground underline underline-offset-2 hover:text-foreground">Requests</Link>

@@ -103,13 +103,13 @@ export function SettingsPage({ data, anchor }: { data: SettingsData; anchor?: st
   const confirmSave = useCallback(async (form: FormData, sections: string[]) => {
     if (sections.includes("retention") && data.retention) {
       const days = Number(form.get("retention.days"));
-      if (days < data.retention.days && !(await confirm({ title: `Keep history for ${days} days?`, description: `Request logs, reports and traces older than ${days} days are dropped. This cannot be undone.`, confirmLabel: "Keep less" }))) return false;
+      if (days < data.retention.days && !(await confirm({ tone: "destructive", title: `Keep history for ${days} days?`, description: `Request logs, reports and traces older than ${days} days are dropped. This cannot be undone.`, confirmLabel: "Keep less" }))) return false;
     }
     if (sections.includes("alerts") && data.alerts?.email && form.get("alerts.email_enabled") !== "on") {
-      if (!(await confirm({ title: "Turn off email alerts?", description: "Its server, sign-in and recipients are deleted, so turning it on again means entering them again.", confirmLabel: "Turn off" }))) return false;
+      if (!(await confirm({ tone: "destructive", title: "Turn off email alerts?", description: "Its server, sign-in and recipients are deleted, so turning it on again means entering them again.", confirmLabel: "Turn off" }))) return false;
     }
     if (sections.includes("alerts") && form.get("alerts.clear_slack") === "on" && !String(form.get("alerts.slack_webhook_url") ?? "").trim()) {
-      if (!(await confirm({ title: "Remove the Slack webhook?", description: "Alerts stop going to Slack.", confirmLabel: "Remove" }))) return false;
+      if (!(await confirm({ tone: "destructive", title: "Remove the Slack webhook?", description: "Alerts stop going to Slack.", confirmLabel: "Remove" }))) return false;
     }
     return true;
   }, [confirm, data.alerts, data.retention]);

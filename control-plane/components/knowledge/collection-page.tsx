@@ -168,7 +168,7 @@ export function CollectionPage({
 
   function remove() {
     start(async () => {
-      const ok = await confirm({ title: `Delete ${collection.name}?`, description: `Its ${docs.length} documents and ${collection.chunk_count} chunks are deleted${usedBy.length ? `, and ${usedBy.join(", ")} stop${usedBy.length === 1 ? "s" : ""} retrieving from it` : ""}. This cannot be undone.`, confirmLabel: "Delete" });
+      const ok = await confirm({ tone: "destructive", title: `Delete ${collection.name}?`, description: `Its ${docs.length} documents and ${collection.chunk_count} chunks are deleted${usedBy.length ? `, and ${usedBy.join(", ")} stop${usedBy.length === 1 ? "s" : ""} retrieving from it` : ""}. This cannot be undone.`, confirmLabel: "Delete" });
       if (!ok) return;
       const err = await call(`/api/live/knowledge/collections/${collection.id}`, "DELETE");
       if (err) return setNotice({ text: err, strong: true });
@@ -178,7 +178,7 @@ export function CollectionPage({
 
   function deleteDoc(d: KnowledgeDocument) {
     start(async () => {
-      const ok = await confirm({ title: `Delete ${d.title}?`, description: `Its ${d.chunk_count} chunks leave the collection at once.`, confirmLabel: "Delete" });
+      const ok = await confirm({ tone: "destructive", title: `Delete ${d.title}?`, description: `Its ${d.chunk_count} chunks leave the collection at once.`, confirmLabel: "Delete" });
       if (!ok) return;
       const err = await call(`/api/live/knowledge/documents/${d.id}`, "DELETE");
       setNotice(err ? { text: err, strong: true } : { text: `Deleted ${d.title}.` });
@@ -232,7 +232,7 @@ export function CollectionPage({
           </div>
         </div>
         <div className="flex gap-2">
-          <Button type="button" variant="outline" size="sm" className="h-9" disabled={pending || docs.length === 0} onClick={reindexAll}>Reindex</Button>
+          <Button type="button" variant="outline" size="sm" className="h-9" disabled={pending || docs.length === 0} onClick={reindexAll}>Reindex…</Button>
           <DropdownMenu>
             <DropdownMenuTrigger asChild><Button type="button" variant="outline" size="icon" className="h-9 w-9" aria-label="More actions"><MoreHorizontal className="h-4 w-4" /></Button></DropdownMenuTrigger>
             <DropdownMenuContent align="end"><DropdownMenuItem onSelect={remove}>Delete collection…</DropdownMenuItem></DropdownMenuContent>
@@ -271,7 +271,7 @@ export function CollectionPage({
                   <span>{docMark(d)}</span>
                   <span className="flex justify-end gap-3 text-[12.5px]">
                     <button type="button" disabled={pending} onClick={() => act(() => call(`/api/live/knowledge/documents/${d.id}/reindex`, "POST"), `Reindexing ${d.title}.`)} className="text-secondary-foreground underline underline-offset-[3px] hover:text-foreground disabled:opacity-50">Reindex</button>
-                    <button type="button" disabled={pending} onClick={() => deleteDoc(d)} className="text-secondary-foreground underline underline-offset-[3px] hover:text-foreground disabled:opacity-50">Delete</button>
+                    <button type="button" disabled={pending} onClick={() => deleteDoc(d)} className="text-secondary-foreground underline underline-offset-[3px] hover:text-foreground disabled:opacity-50">Delete…</button>
                   </span>
                 </div>
               ))}

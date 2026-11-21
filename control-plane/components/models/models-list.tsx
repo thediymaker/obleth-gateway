@@ -130,6 +130,7 @@ export function ModelsList({
       if (kind === "delete") {
         const names = selectedRows.map((r) => r.name);
         const ok = await confirm({
+          tone: "destructive",
           title: `Delete ${ids.length} model${ids.length === 1 ? "" : "s"}?`,
           description: `${names.slice(0, 5).join(", ")}${names.length > 5 ? ` and ${names.length - 5} more` : ""}. Requests naming them start failing immediately. This cannot be undone.`,
           confirmLabel: "Delete",

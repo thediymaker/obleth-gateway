@@ -34,7 +34,7 @@ export function RecipesTab({ recipes, specs, models, onChanged }: { recipes: Rec
 
   function remove(c: RecipeCard) {
     start(async () => {
-      const ok = await confirm({ title: `Delete ${c.name ?? c.id}?`, description: "Deployments launched from it keep running; you just can't launch it again.", confirmLabel: "Delete" });
+      const ok = await confirm({ tone: "destructive", title: `Delete ${c.name ?? c.id}?`, description: "Deployments launched from it keep running; you just can't launch it again.", confirmLabel: "Delete" });
       if (!ok || !c.recipeId) return;
       const res = await deleteTemplateAction(c.recipeId);
       if (!res.ok) setNotice(res.error);
@@ -69,7 +69,7 @@ export function RecipesTab({ recipes, specs, models, onChanged }: { recipes: Rec
           ) : (
             <>
               <button type="button" onClick={() => setEditor({ open: true, initial: { id: c.recipeId, name: c.name ?? c.id, body: c.body ?? "" } })} className="text-secondary-foreground underline underline-offset-[3px] hover:text-foreground">Edit</button>
-              <button type="button" onClick={() => remove(c)} className="text-secondary-foreground underline underline-offset-[3px] hover:text-foreground">Delete</button>
+              <button type="button" onClick={() => remove(c)} className="text-secondary-foreground underline underline-offset-[3px] hover:text-foreground">Delete…</button>
             </>
           )}
         </span>

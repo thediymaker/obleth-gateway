@@ -99,6 +99,7 @@ export const LifecycleSection = memo(function LifecycleSection({
       const retiringNow = (status === "retired" || (status === "deprecated" && pastDate)) && effective !== "retired";
       if (retiringNow) {
         const ok = await confirm({
+          tone: "destructive",
           title: `Retire ${model.model_name} now?`,
           description: redirect && replacement
             ? `Requests naming it are answered by ${replacement} from now on.`

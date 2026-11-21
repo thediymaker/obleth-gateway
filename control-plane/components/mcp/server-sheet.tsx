@@ -77,7 +77,7 @@ export function ServerSheet({ row, models, tenants = [], onClose, onCheck, onCha
 
   function remove() {
     start(async () => {
-      const ok = await confirm({ title: `Remove ${s.name}?`, description: `${row.usedBy.length ? `${row.usedBy.length} model${row.usedBy.length === 1 ? " loses" : "s lose"} its tools. ` : ""}Its registration and key are deleted. This cannot be undone.`, confirmLabel: "Remove" });
+      const ok = await confirm({ tone: "destructive", title: `Remove ${s.name}?`, description: `${row.usedBy.length ? `${row.usedBy.length} model${row.usedBy.length === 1 ? " loses" : "s lose"} its tools. ` : ""}Its registration and key are deleted. This cannot be undone.`, confirmLabel: "Remove" });
       if (!ok) return;
       const res = await deleteMcpServerAction(s.id);
       if (!res.ok) return setError(res.error);

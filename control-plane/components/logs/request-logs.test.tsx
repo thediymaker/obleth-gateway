@@ -130,22 +130,22 @@ describe("the request log", () => {
   it("opens a request in the side panel with its account and numbers", async () => {
     await render();
     await act(async () => (host.querySelectorAll("tbody tr")[0] as HTMLElement).click());
-    const panel = host.querySelector('[role="dialog"]')!;
+    const panel = document.querySelector('[role="dialog"]')!;
     expect(panel.textContent).toContain("Answered in 2.4 s");
     expect(panel.textContent).toContain("First token after 400 ms, finished at 2.4 s.");
     expect(panel.textContent).toContain("canvas-tutor");
     // ↓ moves to the next request in the list.
     await act(async () => document.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown" })));
-    expect(host.querySelector('[role="dialog"]')!.textContent).toContain("Too many requests");
+    expect(document.querySelector('[role="dialog"]')!.textContent).toContain("Too many requests");
   });
 
   it("filters to a request's session from the panel", async () => {
     await render();
     await act(async () => (host.querySelectorAll("tbody tr")[0] as HTMLElement).click());
-    const button = [...host.querySelectorAll('[role="dialog"] button')].find((b) => b.textContent === "This session") as HTMLButtonElement;
+    const button = [...document.querySelectorAll('[role="dialog"] button')].find((b) => b.textContent === "This session") as HTMLButtonElement;
     await act(async () => button.click());
     await act(async () => { await new Promise((r) => setTimeout(r, 0)); });
-    expect(host.querySelector('[role="dialog"]')).toBeNull();
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
     expect(calls.some((c) => c.includes("session_id=sess_8f2c"))).toBe(true);
     expect(host.textContent).toContain("sess_8f2c");
   });

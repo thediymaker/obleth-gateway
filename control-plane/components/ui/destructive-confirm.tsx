@@ -20,8 +20,8 @@ export interface DestructiveConfirmProps {
   description: React.ReactNode;
   /** Word the user must type verbatim to unlock the action. */
   confirmWord?: string;
-  /** Label on the acknowledgement checkbox. */
-  checkboxLabel: string;
+  /** Label on an acknowledgement checkbox, when one is wanted as well. */
+  checkboxLabel?: string;
   /** Label on the destructive confirm button. */
   confirmLabel: string;
   /** Disables controls and shows progress while the action runs. */
@@ -29,9 +29,9 @@ export interface DestructiveConfirmProps {
   onConfirm: () => void;
 }
 
-/// A two-gate destructive confirmation: the user must both tick an
-/// acknowledgement box and type a confirmation word before the action button
-/// unlocks. Resets its internal gate state whenever it reopens.
+/// A typed destructive confirmation: the action button unlocks once the
+/// confirmation word (often the thing's own name) is typed, and the
+/// acknowledgement box is ticked when there is one. Resets whenever it reopens.
 export function DestructiveConfirm({
   open,
   onOpenChange,
@@ -45,6 +45,7 @@ export function DestructiveConfirm({
 }: DestructiveConfirmProps) {
   const [acked, setAcked] = React.useState(false);
   const [typed, setTyped] = React.useState("");
+  const typedId = React.useId();
 
   React.useEffect(() => {
     if (open) {
@@ -53,7 +54,7 @@ export function DestructiveConfirm({
     }
   }, [open]);
 
-  const unlocked = acked && typed.trim() === confirmWord;
+  const unlocked = (acked || !checkboxLabel) && typed.trim() === confirmWord;
 
   return (
     <Dialog open={open} onOpenChange={(o) => (pending ? null : onOpenChange(o))}>
@@ -68,23 +69,26 @@ export function DestructiveConfirm({
           </DialogDescription>
         </DialogHeader>
 
-        <label className="flex items-start gap-2 text-sm">
-          <input
-            type="checkbox"
-            className="mt-0.5 h-4 w-4 rounded border-border accent-[hsl(var(--destructive))]"
-            checked={acked}
-            disabled={pending}
-            onChange={(e) => setAcked(e.target.checked)}
-          />
-          <span>{checkboxLabel}</span>
-        </label>
+        {checkboxLabel && (
+          <label className="flex items-start gap-2 text-sm">
+            <input
+              type="checkbox"
+              className="mt-0.5 h-4 w-4 rounded border-border accent-[hsl(var(--destructive))]"
+              checked={acked}
+              disabled={pending}
+              onChange={(e) => setAcked(e.target.checked)}
+            />
+            <span>{checkboxLabel}</span>
+          </label>
+        )}
 
         <div className="space-y-1.5">
-          <label className="text-xs text-muted-foreground">
+          <label htmlFor={typedId} className="text-xs text-muted-foreground">
             Type <span className="font-mono font-semibold text-foreground">{confirmWord}</span> to
             confirm
           </label>
           <Input
+            id={typedId}
             value={typed}
             disabled={pending}
             onChange={(e) => setTyped(e.target.value)}

@@ -243,6 +243,7 @@ export function ModelPage({
   function remove() {
     start(async () => {
       const ok = await confirm({
+        tone: "destructive",
         title: `Delete ${model.model_name}?`,
         description: "Requests naming it start failing immediately. This cannot be undone.",
         confirmLabel: "Delete",

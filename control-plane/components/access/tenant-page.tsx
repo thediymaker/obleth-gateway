@@ -12,6 +12,7 @@ import { useFairshareLive } from "@/components/fairshare/hooks";
 import { Meter, Panel } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm-dialog";
+import { DestructiveConfirm } from "@/components/ui/destructive-confirm";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import {
   accessLabel,
@@ -159,6 +160,7 @@ export function TenantPage({
   const { confirm, confirmElement } = useConfirm();
   const [pending, start] = useTransition();
   const [notice, setNotice] = useState<{ text: string; strong?: boolean } | null>(null);
+  const [deleting, setDeleting] = useState(false);
   const [dirty, setDirty] = useState<string[]>([]);
   // Only this tenant's row: the rest of the view changing does not re-render the page.
   const fairshare = useFairshareLive({ select: (view) => view.tenants.find((t) => t.tenant_id === tenant.id) ?? null });
@@ -198,15 +200,12 @@ export function TenantPage({
 
   function remove() {
     start(async () => {
-      const ok = await confirm({
-        title: `Delete ${tenant.name}?`,
-        description: `Its ${keys.length} key${keys.length === 1 ? " is" : "s are"} deleted with it and stop working at once. Past usage stays in the logs. This cannot be undone.`,
-        confirmLabel: "Delete",
-      });
-      if (!ok) return;
       const result = await deleteTenantAction(tenant.id);
       if (result.ok) router.push("/tenants");
-      else setNotice({ text: `Delete failed: ${result.error}`, strong: true });
+      else {
+        setDeleting(false);
+        setNotice({ text: `Delete failed: ${result.error}`, strong: true });
+      }
     });
   }
 
@@ -238,6 +237,16 @@ export function TenantPage({
   return (
     <div className="mx-auto flex max-w-[1600px] flex-col gap-5">
       {confirmElement}
+      <DestructiveConfirm
+        open={deleting}
+        onOpenChange={setDeleting}
+        title={`Delete ${tenant.name}?`}
+        description={`Its ${keys.length} key${keys.length === 1 ? " is" : "s are"} deleted with it and stop working at once. Past usage stays in the logs. This cannot be undone.`}
+        confirmWord={tenant.name}
+        confirmLabel="Delete tenant"
+        pending={pending}
+        onConfirm={remove}
+      />
       <div className="flex flex-wrap items-end justify-between gap-4">
         <div className="flex min-w-0 flex-col gap-1.5">
           <p className="text-[12.5px] text-muted-foreground">
@@ -278,7 +287,7 @@ export function TenantPage({
               <DropdownMenuItem onSelect={() => router.push(`/keys?tenant=${tenant.id}`)}>All its keys</DropdownMenuItem>
               <DropdownMenuItem onSelect={() => { void navigator.clipboard?.writeText(tenant.id); }}>Copy the tenant id</DropdownMenuItem>
               <DropdownMenuSeparator />
-              <DropdownMenuItem onSelect={remove}>Delete tenant…</DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => setDeleting(true)}>Delete tenant…</DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
         </div>
