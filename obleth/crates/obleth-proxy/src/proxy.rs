@@ -881,7 +881,8 @@ async fn run_pipeline(
         // which asks for `Narration::Off` and builds no rejection/score data —
         // that is the whole cost story for this feature: zero by default.
         // `among`: how many models the pick was made among (those scored), for
-        // `x-obleth-auto-why`.
+        // `x-obleth-auto-why`, and the best of them that were not chosen, for
+        // `x-obleth-auto-next`.
         let (picked, among) = if let Some(ref mut t) = tracer {
             let (picked, mut explain) = crate::router::route(
                 pool,
@@ -896,7 +897,7 @@ async fn run_pipeline(
                 &intent,
             );
             explain.classifier_ms = classifier_ms;
-            let among = explain.scored.len();
+            let among = explain.among();
             let mut span = serde_json::to_value(&explain).unwrap_or_else(|_| {
                 serde_json::json!({
                     "chosen": explain.chosen,
@@ -965,7 +966,8 @@ async fn run_pipeline(
                 *auto_note = Some(crate::sticky::Note {
                     model: chosen.model_name.clone(),
                     reason,
-                    why: crate::sticky::why(&intent, &features, among),
+                    why: crate::sticky::why(&intent, &features, among.count),
+                    next: among.next,
                 });
                 model = chosen.model_name.clone();
                 // Candidates are real models only, never variants.

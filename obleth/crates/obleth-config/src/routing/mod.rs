@@ -820,9 +820,84 @@ pub fn select_model(
     .0
 }
 
-/// [`select_model`], and how many models the pick was made among: those that
-/// passed the hard filters and the difficulty floor and so were scored. That
-/// count is what `x-obleth-auto-why` reports, not the size of the registry.
+/// A model that was scored for an `auto` request and not chosen.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunnerUp {
+    pub model: String,
+    /// How far its score was from the chosen model's, never negative: `0.0` is
+    /// a tie, and a small figure says the pick could as well have gone here.
+    pub gap: f64,
+}
+
+/// How many runners-up an `auto` pick names.
+pub const RUNNERS_UP: usize = 2;
+
+/// What an `auto` pick was made among.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Among {
+    /// The models that were scored: those that passed the hard filters and the
+    /// difficulty floor.
+    pub count: usize,
+    /// The best-scored models that were not chosen, at most [`RUNNERS_UP`], in
+    /// the router's order.
+    pub next: Vec<RunnerUp>,
+}
+
+impl Among {
+    /// From the scored models in the router's order, as (name, score), and the
+    /// index of the one chosen.
+    pub fn of<'a>(
+        scored: impl ExactSizeIterator<Item = (&'a str, f64)>,
+        chosen: Option<usize>,
+    ) -> Self {
+        let count = scored.len();
+        let Some(chosen) = chosen else {
+            return Self {
+                count,
+                next: Vec::new(),
+            };
+        };
+        let mut picked = f64::NAN;
+        let mut others = Vec::with_capacity(RUNNERS_UP);
+        for (i, (model, score)) in scored.enumerate() {
+            if i == chosen {
+                picked = score;
+            } else if others.len() < RUNNERS_UP {
+                others.push((model, score));
+            } else if i > chosen {
+                break;
+            }
+        }
+        let next = others
+            .into_iter()
+            .map(|(model, score)| RunnerUp {
+                model: model.to_owned(),
+                gap: if picked.is_finite() && score.is_finite() {
+                    (picked - score).abs()
+                } else {
+                    0.0
+                },
+            })
+            .collect();
+        Self { count, next }
+    }
+}
+
+impl route_explain::RouteExplain {
+    /// What this pick was made among, the same as [`select_model_among`] gives
+    /// for the same evaluation.
+    pub fn among(&self) -> Among {
+        Among::of(
+            self.scored.iter().map(|s| (s.model.as_str(), s.score)),
+            self.scored.iter().position(|s| s.chosen),
+        )
+    }
+}
+
+/// [`select_model`], and what the pick was made among: how many models passed
+/// the hard filters and the difficulty floor and so were scored, which is the
+/// count `x-obleth-auto-why` reports (not the size of the registry), and the
+/// best of them that were not chosen, which `x-obleth-auto-next` names.
 #[allow(clippy::too_many_arguments)]
 pub fn select_model_among(
     candidates: &[Candidate],
@@ -835,7 +910,7 @@ pub fn select_model_among(
     weights: &RouterWeights,
     uniform: f64,
     difficulty: u8,
-) -> (Option<Arc<ResolvedModel>>, usize) {
+) -> (Option<Arc<ResolvedModel>>, Among) {
     let ev = evaluate(
         candidates,
         features,
@@ -849,10 +924,13 @@ pub fn select_model_among(
         difficulty,
         Narration::Off,
     );
-    (
-        ev.chosen.map(|i| ev.ordered[i].cand.model.clone()),
-        ev.ordered.len(),
-    )
+    let among = Among::of(
+        ev.ordered
+            .iter()
+            .map(|s| (s.cand.model.model_name.as_str(), s.score)),
+        ev.chosen,
+    );
+    (ev.chosen.map(|i| ev.ordered[i].cand.model.clone()), among)
 }
 
 /// Serve *and* explain one `auto` request from a single evaluation.
@@ -3092,7 +3170,18 @@ mod tests {
                 k.uniform,
                 k.difficulty,
             );
-            assert_eq!(among, ex.scored.len(), "[{label}]");
+            assert_eq!(among.count, ex.scored.len(), "[{label}]");
+            // The runners-up are the best of the rest, the same either way.
+            assert_eq!(among, ex.among(), "[{label}]");
+            assert_eq!(
+                among.next.len(),
+                ex.scored.len().saturating_sub(1).min(RUNNERS_UP),
+                "[{label}]"
+            );
+            for next in &among.next {
+                assert_ne!(Some(&next.model), ex.chosen.as_ref(), "[{label}]");
+                assert!(next.gap >= 0.0, "[{label}]");
+            }
             assert_self_consistent(&ex);
             outcomes.push(ex.chosen);
         }
@@ -3101,6 +3190,35 @@ mod tests {
         assert!(
             outcomes.len() >= 3,
             "the matrix must actually move the pick around, else it proves nothing; got {outcomes:?}"
+        );
+    }
+
+    #[test]
+    fn the_runners_up_are_the_best_of_the_rest_with_their_distance() {
+        let scored = [("a", 0.9), ("b", 0.85), ("c", 0.5), ("d", 0.1)];
+        let among = |chosen| Among::of(scored.iter().copied(), chosen);
+        let names = |a: &Among| a.next.iter().map(|n| n.model.clone()).collect::<Vec<_>>();
+        // The head of the list was chosen: the next two follow it.
+        let head = among(Some(0));
+        assert_eq!(head.count, 4);
+        assert_eq!(names(&head), ["b", "c"]);
+        assert!((head.next[0].gap - 0.05).abs() < 1e-9);
+        assert!((head.next[1].gap - 0.4).abs() < 1e-9);
+        // The draw moved the pick down the list: the ones it passed over are
+        // still the best of the rest, and the distance is never negative.
+        let sampled = among(Some(2));
+        assert_eq!(names(&sampled), ["a", "b"]);
+        assert!((sampled.next[0].gap - 0.4).abs() < 1e-9);
+        let last = among(Some(3));
+        assert_eq!(names(&last), ["a", "b"]);
+        // One model, or none chosen: nothing to name.
+        assert!(Among::of([("a", 0.9)].into_iter(), Some(0)).next.is_empty());
+        assert_eq!(
+            among(None),
+            Among {
+                count: 4,
+                next: Vec::new()
+            }
         );
     }
 

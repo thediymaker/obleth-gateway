@@ -18,6 +18,11 @@ pub(crate) const AUTO_REASON_HEADER: &str = "x-obleth-auto-reason";
 /// topics, how hard it looks and where that came from, what the model must be
 /// able to do, and how many models the pick was made among. See [`why`].
 pub(crate) const AUTO_WHY_HEADER: &str = "x-obleth-auto-why";
+/// Response header naming the models an `auto` request could also have gone
+/// to: the best-scored ones that were not chosen, each with how far its score
+/// was from the chosen model's. A client that wants a second opinion asks one
+/// of them by name; the gateway itself still answers with one model.
+pub(crate) const AUTO_NEXT_HEADER: &str = "x-obleth-auto-next";
 /// Request header a client sends when it sees the model it was given failing:
 /// `tool_loop` (repeating itself) or `complaint` (the person said it is
 /// wrong). Either moves the conversation up a level, as the gateway's own
@@ -336,6 +341,28 @@ pub(crate) struct Note {
     pub reason: Option<Reason>,
     /// How the request was read, as [`why`] writes it.
     pub why: String,
+    /// The best-scored models that were not chosen, for [`AUTO_NEXT_HEADER`].
+    pub next: Vec<obleth_config::routing::RunnerUp>,
+}
+
+/// The value of [`AUTO_NEXT_HEADER`]: `glm;gap=0.031, qwen;gap=0.120`, in the
+/// router's order. `gap` is the distance between that model's score and the
+/// chosen one's, to three places: `0.000` is a tie. A model whose name would
+/// break the list (a comma, a semicolon, or anything a header cannot carry) is
+/// left out. `None` when there is nothing to name: one model could serve the
+/// request, or the conversation kept the model it was on.
+pub(crate) fn next(runners: &[obleth_config::routing::RunnerUp]) -> Option<String> {
+    let parts: Vec<String> = runners
+        .iter()
+        .filter(|r| {
+            !r.model.is_empty()
+                && r.model
+                    .bytes()
+                    .all(|b| b.is_ascii_graphic() && b != b',' && b != b';')
+        })
+        .map(|r| format!("{};gap={:.3}", r.model, r.gap))
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(", "))
 }
 
 /// The value of [`AUTO_WHY_HEADER`]: `topics=coding+math; difficulty=2;
@@ -408,6 +435,9 @@ impl Note {
         if let Ok(v) = HeaderValue::from_str(&self.why) {
             resp.headers_mut().insert(AUTO_WHY_HEADER, v);
         }
+        if let Some(v) = next(&self.next).and_then(|v| HeaderValue::from_str(&v).ok()) {
+            resp.headers_mut().insert(AUTO_NEXT_HEADER, v);
+        }
     }
 }
 
@@ -461,6 +491,7 @@ mod tests {
             model: "glm".into(),
             reason: Some(Reason::Harder),
             why: "difficulty=3; from=heuristic; candidates=2".into(),
+            next: vec![runner("qwen", 0.0312)],
         }
         .apply_headers(&mut resp);
         let header = |name: &str| resp.headers().get(name).and_then(|v| v.to_str().ok());
@@ -470,6 +501,47 @@ mod tests {
             header(AUTO_WHY_HEADER),
             Some("difficulty=3; from=heuristic; candidates=2")
         );
+        assert_eq!(header(AUTO_NEXT_HEADER), Some("qwen;gap=0.031"));
+
+        // Nothing else could have served it: the header is left off.
+        let mut alone = Response::new(Body::empty());
+        Note {
+            model: "glm".into(),
+            reason: None,
+            why: "difficulty=1; from=default; candidates=1".into(),
+            next: Vec::new(),
+        }
+        .apply_headers(&mut alone);
+        assert!(alone.headers().get(AUTO_NEXT_HEADER).is_none());
+    }
+
+    fn runner(model: &str, gap: f64) -> obleth_config::routing::RunnerUp {
+        obleth_config::routing::RunnerUp {
+            model: model.into(),
+            gap,
+        }
+    }
+
+    #[test]
+    fn next_lists_the_runners_up_and_skips_a_name_that_would_break_the_list() {
+        assert_eq!(next(&[]), None);
+        assert_eq!(
+            next(&[runner("org/glm-5.3:latest", 0.0), runner("qwen_3", 0.12)]).as_deref(),
+            Some("org/glm-5.3:latest;gap=0.000, qwen_3;gap=0.120")
+        );
+        assert_eq!(
+            next(&[
+                runner("a,b", 0.1),
+                runner("c;d", 0.1),
+                runner("sp ace", 0.1),
+                runner("caf\u{e9}", 0.1),
+                runner("", 0.1),
+                runner("ok", 0.25),
+            ])
+            .as_deref(),
+            Some("ok;gap=0.250")
+        );
+        assert_eq!(next(&[runner("a,b", 0.1)]), None);
     }
 
     fn candidate(name: &str, level: u8) -> Candidate {
