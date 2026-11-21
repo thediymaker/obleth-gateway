@@ -54,6 +54,22 @@ import { cleanNamedNetworks, namedNetworksProblem, parseNamedNetworksField } fro
 import { tagsInclude } from "@/lib/utils";
 import { actionError, type ActionResult } from "@/lib/action-result";
 import { formatNumber } from "@/lib/format";
+import {
+  blankToUndef,
+  checkbox,
+  finiteNumber,
+  formNumber,
+  nonNegNumber,
+  numOr,
+  numOrNull,
+  optionalNonNegInt,
+  optionalNonNegNumber,
+  optionalPositiveInt,
+  optionalText,
+  positiveIntWithDefault,
+  requiredText,
+  trimmed,
+} from "@/lib/form-helpers";
 
 export type { ActionResult } from "@/lib/action-result";
 
@@ -88,19 +104,6 @@ async function deleteAndRevalidate(
 // and non-negative numeric fields.
 // ----------------------------------------------------------------------------
 
-/** Trim a FormData value to a string ("" when absent). */
-const trimmed = (v: unknown) => (v == null ? "" : String(v)).trim();
-/** Map "" / null to undefined so zod `.default()` and `.optional()` apply. */
-const blankToUndef = (v: unknown) => {
-  const s = trimmed(v);
-  return s === "" ? undefined : s;
-};
-
-const requiredText = (message: string) =>
-  z.preprocess(trimmed, z.string().min(1, message));
-const optionalText = z.preprocess(trimmed, z.string());
-const checkbox = z.preprocess((v) => v === "on", z.boolean());
-
 function normalizeModelApiName(value: unknown) {
   return trimmed(value)
     .toLowerCase()
@@ -109,28 +112,6 @@ function normalizeModelApiName(value: unknown) {
     .replace(/-+/g, "-")
     .replace(/^[.-]+|[.-]+$/g, "");
 }
-
-/** Optional positive integer (absent when the field is blank). */
-const optionalPositiveInt = z.preprocess(
-  blankToUndef,
-  z.coerce.number().int().positive().optional(),
-);
-/** Optional non-negative integer. */
-const optionalNonNegInt = z.preprocess(
-  blankToUndef,
-  z.coerce.number().int().nonnegative().optional(),
-);
-/** Optional non-negative number. */
-const optionalNonNegNumber = z.preprocess(
-  blankToUndef,
-  z.coerce.number().nonnegative().optional(),
-);
-/** Non-negative number with a default applied when the field is blank. */
-const nonNegNumber = (def: number) =>
-  z.preprocess(blankToUndef, z.coerce.number().nonnegative().default(def));
-/** Positive integer with a default applied when blank. */
-const positiveIntWithDefault = (def: number) =>
-  z.preprocess(blankToUndef, z.coerce.number().int().positive().default(def));
 
 const tenantCreateSchema = z.object({
   name: requiredText("Tenant name is required"),
@@ -567,7 +548,7 @@ export async function saveTenantSettingsAction(formData: FormData): Promise<Sett
         if (!Number.isInteger(weight) || weight < 1) return fail(section, "Weight must be a whole number of at least 1.");
         await obleth.setWeight(id, weight, audit);
       } else if (section === "quota") {
-        const tpm = numOrUndef(formData.get("tokens_per_minute")) ?? 0;
+        const tpm = finiteNumber(formData.get("tokens_per_minute")) ?? 0;
         const mif = numOrNull(formData.get("max_in_flight"));
         if (!Number.isInteger(tpm) || tpm < 0) return fail(section, "Token rate must be a whole number, or blank for no limit.");
         if (mif !== null && (!Number.isInteger(mif) || mif < 1)) return fail(section, "In flight must be at least 1, or blank for no limit.");
@@ -1999,10 +1980,7 @@ export async function saveSettingsAction(formData: FormData): Promise<SettingsSa
   const wanted = new Set(trimmed(formData.get("sections")).split(",").map((x) => x.trim()));
   const saved: SettingsPageSection[] = [];
   const g = (section: string, k: string) => formData.get(`${section}.${k}`);
-  const num = (section: string, k: string) => {
-    const raw = trimmed(g(section, k));
-    return raw === "" ? undefined : Number(raw);
-  };
+  const num = (section: string, k: string) => formNumber(g(section, k));
   const fail = (section: SettingsPageSection, error: string) => ({ ok: false as const, error: `${SETTINGS_PAGE_LABEL[section]}: ${error}`, saved });
 
   for (const section of SETTINGS_PAGE_ORDER.filter((x) => wanted.has(x))) {
@@ -2163,10 +2141,7 @@ export async function setKnowledgeEnabledAction(enabled: boolean): Promise<Actio
 
 /** The Knowledge page's retrieval settings form, saved as one. */
 export async function saveRetrievalSettingsAction(formData: FormData): Promise<SettingsSaveResult<"retrieval">> {
-  const num = (k: string) => {
-    const v = trimmed(formData.get(k));
-    return v === "" ? undefined : Number(v);
-  };
+  const num = (k: string) => formNumber(formData.get(k));
   const body: UpdateKnowledgeSettings = {
     enabled: formData.get("enabled") === "on",
     top_k: num("top_k"),
@@ -2388,12 +2363,6 @@ export async function testAlertAction(): Promise<
   }
 }
 
-function numOr(v: FormDataEntryValue | null, fallback: number): number {
-  if (v == null || v === "") return fallback;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : fallback;
-}
-
 // Collects checked tag checkboxes (named `tag_<name>`) from a model form,
 // folding in each tag's paired strength level (`tag_level_<name>`, 1-3) into
 // a `base:level` string, e.g. { tag_coding: "on", tag_level_coding: "3" } ->
@@ -2507,25 +2476,13 @@ function sessionAffinityFromForm(formData: FormData): ModelSessionAffinity {
   if (mode === "off") return { enabled: false };
   if (mode !== "on") return {};
   const out: ModelSessionAffinity = { enabled: true };
-  const hold = numOrUndef(formData.get("session_affinity_hold_ms"));
-  const held = numOrUndef(formData.get("session_affinity_max_held_percent"));
-  const bypass = numOrUndef(formData.get("session_affinity_max_bypass_secs"));
+  const hold = finiteNumber(formData.get("session_affinity_hold_ms"));
+  const held = finiteNumber(formData.get("session_affinity_max_held_percent"));
+  const bypass = finiteNumber(formData.get("session_affinity_max_bypass_secs"));
   if (hold !== undefined) out.hold_ms = hold;
   if (held !== undefined) out.max_held_percent = held;
   if (bypass !== undefined) out.max_bypass_secs = bypass;
   return out;
-}
-
-function numOrUndef(v: FormDataEntryValue | null): number | undefined {
-  if (v == null || v === "") return undefined;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : undefined;
-}
-
-function numOrNull(v: FormDataEntryValue | null): number | null {
-  if (v == null || v === "") return null;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
 }
 
 function datetimeOrNull(v: FormDataEntryValue | null): string | null {

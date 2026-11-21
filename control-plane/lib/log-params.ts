@@ -1,4 +1,5 @@
 import type { FaultSide, UsageLogParams, UsageLogStatus } from "@/lib/obleth";
+import { finiteNumber } from "@/lib/form-helpers";
 
 /** A query parameter's text, trimmed; absent or blank is `undefined`. */
 export function strParam(sp: URLSearchParams, name: string): string | undefined {
@@ -9,8 +10,7 @@ export function strParam(sp: URLSearchParams, name: string): string | undefined 
 export function numParam(sp: URLSearchParams, name: string): number | undefined;
 export function numParam(sp: URLSearchParams, name: string, fallback: number): number;
 export function numParam(sp: URLSearchParams, name: string, fallback?: number): number | undefined {
-  const v = sp.get(name)?.trim();
-  return v && Number.isFinite(Number(v)) ? Number(v) : fallback;
+  return finiteNumber(sp.get(name)) ?? fallback;
 }
 
 /** A UTC day, `YYYY-MM-DD`, `daysAgo` days before now. */
