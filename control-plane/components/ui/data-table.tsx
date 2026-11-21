@@ -55,12 +55,7 @@ export function DataTable({ label, columns, minWidth, empty, footer, framed = tr
 
 const CELL = "pr-3 first:pl-[18px] last:pr-[18px]";
 
-/**
- * A row. With `href` or `onOpen` the whole row opens it: a click anywhere
- * but on its own links, buttons and boxes, or Enter while it has focus.
- */
-export function DataRow({ href, onOpen, label, selected, muted, className, children }: {
-  href?: string;
+type RowProps = {
   onOpen?: () => void;
   /** What opening the row does, for screen readers: "Open chat-large". */
   label?: string;
@@ -68,9 +63,22 @@ export function DataRow({ href, onOpen, label, selected, muted, className, child
   muted?: boolean;
   className?: string;
   children: ReactNode;
-}) {
+};
+
+/**
+ * A row. With `href` or `onOpen` the whole row opens it: a click anywhere
+ * but on its own links, buttons and boxes, or Enter while it has focus.
+ */
+export function DataRow({ href, ...props }: RowProps & { href?: string }) {
+  return href ? <LinkRow href={href} {...props} /> : <Row {...props} />;
+}
+
+function LinkRow({ href, ...props }: RowProps & { href: string }) {
   const router = useRouter();
-  const open = href ? () => router.push(href) : onOpen;
+  return <Row {...props} onOpen={() => router.push(href)} />;
+}
+
+function Row({ onOpen: open, label, selected, muted, className, children }: RowProps) {
   const own = (target: EventTarget) => target instanceof Element && !!target.closest("a, button, input, label, select, textarea");
   return (
     <tr

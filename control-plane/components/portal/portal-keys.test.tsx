@@ -3,7 +3,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { PortalKeys } from "./portal-keys";
-import { disablePortalKey } from "@/app/(portal)/portal-actions";
+import { createPortalKey, deletePortalKey, disablePortalKey } from "@/app/(portal)/portal-actions";
 import type { ApiKey } from "@/lib/obleth";
 
 vi.mock("@/app/(portal)/portal-actions", () => ({
@@ -50,6 +50,8 @@ async function render(keys: ApiKey[]) {
 beforeEach(() => {
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
   vi.mocked(disablePortalKey).mockReset();
+  vi.mocked(deletePortalKey).mockReset();
+  vi.mocked(createPortalKey).mockReset();
   host = document.createElement("div");
   document.body.append(host);
   root = createRoot(host);
@@ -62,8 +64,8 @@ afterEach(async () => {
 
 it("asks before turning a key off, and cancel makes no call", async () => {
   await render([key({})]);
-  await act(async () => button("Disable")!.click());
-  expect(dialog()?.textContent).toContain('Turn off "lab-runner"?');
+  await act(async () => button("Turn off…")!.click());
+  expect(dialog()?.textContent).toContain("Turn off lab-runner?");
   await act(async () => button("Cancel")!.click());
   expect(dialog()).toBeNull();
   expect(disablePortalKey).not.toHaveBeenCalled();
@@ -72,7 +74,7 @@ it("asks before turning a key off, and cancel makes no call", async () => {
 it("turns the key off once confirmed", async () => {
   vi.mocked(disablePortalKey).mockResolvedValue({ ok: true });
   await render([key({})]);
-  await act(async () => button("Disable")!.click());
+  await act(async () => button("Turn off…")!.click());
   await act(async () => button("Turn off")!.click());
   expect(disablePortalKey).toHaveBeenCalledTimes(1);
   expect(disablePortalKey).toHaveBeenCalledWith("k1");
@@ -81,13 +83,35 @@ it("turns the key off once confirmed", async () => {
 it("shows the action's error on the key's row", async () => {
   vi.mocked(disablePortalKey).mockResolvedValue({ ok: false, error: "Key not found" });
   await render([key({})]);
-  await act(async () => button("Disable")!.click());
+  await act(async () => button("Turn off…")!.click());
   await act(async () => button("Turn off")!.click());
   expect(host.textContent).toContain("Key not found");
 });
 
-it("offers no Disable control for a key that is already off", async () => {
+it("offers no Turn off for a key that is already off, and says it is off", async () => {
   await render([key({ disabled: true })]);
-  expect(button("Disable")).toBeUndefined();
-  expect(button("Delete")).toBeDefined();
+  expect(button("Turn off…")).toBeUndefined();
+  expect(button("Delete…")).toBeDefined();
+  expect(document.querySelector("tbody tr")!.textContent).toContain("Off");
+});
+
+it("names only the key or the new key's name: the tenant always comes from the session", async () => {
+  vi.mocked(deletePortalKey).mockResolvedValue({ ok: true });
+  vi.mocked(createPortalKey).mockResolvedValue({ ok: true, secret: "obl-secret" });
+  await render([key({ tenant_id: "t1" })]);
+
+  await act(async () => button("Delete…")!.click());
+  expect(dialog()?.textContent).toContain("Delete lab-runner?");
+  await act(async () => button("Cancel")!.click());
+  expect(deletePortalKey).not.toHaveBeenCalled();
+  await act(async () => button("Delete…")!.click());
+  await act(async () => button("Delete")!.click());
+  expect(vi.mocked(deletePortalKey).mock.calls).toEqual([["k1"]]);
+
+  await act(async () => button("Make key")!.click());
+  const name = document.querySelector<HTMLInputElement>("#new-key-name")!;
+  name.value = "notebook";
+  await act(async () => { name.form!.requestSubmit(); });
+  expect(vi.mocked(createPortalKey).mock.calls).toEqual([["notebook"]]);
+  expect(document.body.textContent).toContain("obl-secret");
 });
