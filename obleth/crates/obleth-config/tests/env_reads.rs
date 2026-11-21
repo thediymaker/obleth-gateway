@@ -20,7 +20,11 @@ const ALLOWED: &[(&str, &str)] = &[
     ),
     (
         "obleth-store/src/lib.rs",
-        "CI and the encryption key, in tests only",
+        "CI, in tests only",
+    ),
+    (
+        "obleth-store/src/settings.rs",
+        "the encryption key, in tests only",
     ),
     (
         "obleth-telemetry/src/lib.rs",
