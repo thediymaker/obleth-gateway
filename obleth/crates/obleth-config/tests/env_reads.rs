@@ -18,10 +18,7 @@ const ALLOWED: &[(&str, &str)] = &[
         "obleth-store/src/crypto.rs",
         "OBLETH_ENCRYPTION_KEY: read where the cipher is built, failing the start when unusable",
     ),
-    (
-        "obleth-store/src/lib.rs",
-        "CI, in tests only",
-    ),
+    ("obleth-store/src/lib.rs", "CI, in tests only"),
     (
         "obleth-store/src/settings.rs",
         "the encryption key, in tests only",
