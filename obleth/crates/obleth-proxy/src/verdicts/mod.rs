@@ -591,7 +591,7 @@ fn estimate(
     users: &[String],
     images: usize,
 ) -> CostEstimate {
-    let image_tokens = (images as u32).saturating_mul(proxy::IMAGE_PART_TOKEN_ESTIMATE as u32);
+    let image_tokens = (images as u32).saturating_mul(obleth_tokenizer::IMAGE_PART_TOKENS);
     let system_tokens = tokenizer.count_text(system).saturating_add(image_tokens);
     let input_tokens = users
         .iter()
@@ -1844,7 +1844,7 @@ mod tests {
         assert_eq!(est.estimated_output_tokens, 2);
         // And the images, at the chat estimate's flat cost per image part.
         let est = estimate(&tokenizer, &system, &users, 2);
-        let per_image = proxy::IMAGE_PART_TOKEN_ESTIMATE as u32;
+        let per_image = obleth_tokenizer::IMAGE_PART_TOKENS;
         assert_eq!(est.input_tokens, 2 * (100 + 2 * per_image + 10 + 8));
     }
 

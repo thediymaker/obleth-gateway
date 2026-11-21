@@ -65,9 +65,21 @@ const DEFAULT_OUTPUT_CEILING: u32 = 512;
 /// Hard cap so a single unbounded request can't reserve the whole budget.
 const MAX_OUTPUT_CEILING: u32 = 8192;
 
+/// Flat input-token estimate for one image part. Images aren't tokenized
+/// here, and their real cost depends on the model, the resolution and the
+/// vision encoder, none of which the gateway knows ahead of the upstream. A
+/// round number: large enough that a handful of images still counts, small
+/// enough not to starve a single screenshot's request.
+pub const IMAGE_PART_TOKENS: u32 = 1500;
+
+/// The prompt's input tokens: message text with a small per-message overhead
+/// (or a completions `prompt`), plus the `tools` array and a flat cost per
+/// image part. Tools and images matter: an agent client's tool list alone can
+/// run 10-20k tokens, and an image part's few bytes of URL are nothing like
+/// its real cost once decoded.
 fn count_prompt_tokens<T: Tokenizer + ?Sized>(tk: &T, body: &Value) -> u32 {
     // `messages` (chat) or `prompt` (completions).
-    if let Some(messages) = body.get("messages").and_then(Value::as_array) {
+    let text = if let Some(messages) = body.get("messages").and_then(Value::as_array) {
         let mut total = 0u32;
         for msg in messages {
             if let Some(content) = msg.get("content") {
@@ -76,12 +88,65 @@ fn count_prompt_tokens<T: Tokenizer + ?Sized>(tk: &T, body: &Value) -> u32 {
             // small per-message overhead for role/formatting tokens
             total = total.saturating_add(4);
         }
-        return total;
+        total
+    } else if let Some(prompt) = body.get("prompt") {
+        count_content(tk, prompt)
+    } else {
+        0
+    };
+    text.saturating_add(tools_tokens(body))
+        .saturating_add(image_parts(body).saturating_mul(IMAGE_PART_TOKENS))
+}
+
+/// The `tools` array at about 3 characters a token, not the 4 of prose: it is
+/// JSON schema (short, punctuation- and digit-heavy field names), which
+/// tokenizes denser. It only needs the right order of magnitude.
+fn tools_tokens(body: &Value) -> u32 {
+    body.get("tools")
+        .map(|t| u32::try_from(serialized_len(t) / 3).unwrap_or(u32::MAX))
+        .unwrap_or(0)
+}
+
+/// `image_url` parts across the chat messages.
+fn image_parts(body: &Value) -> u32 {
+    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
+        return 0;
+    };
+    let count = messages
+        .iter()
+        .filter_map(|m| m.get("content").and_then(Value::as_array))
+        .flatten()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("image_url"))
+        .count();
+    u32::try_from(count).unwrap_or(u32::MAX)
+}
+
+/// The length `value` serializes to, counted without building the string.
+fn serialized_len(value: &Value) -> usize {
+    struct Counting(usize);
+    impl std::io::Write for Counting {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
-    if let Some(prompt) = body.get("prompt") {
-        return count_content(tk, prompt);
+    let mut counting = Counting(0);
+    // A `Value` always serializes; the writer never fails.
+    let _ = serde_json::to_writer(&mut counting, value);
+    counting.0
+}
+
+/// Output tokens for `chars` characters of generated text that the upstream
+/// reported no usage for, counted the way [`HeuristicTokenizer`] counts text
+/// (~4 characters a token, at least 1 for any text). None is 0.
+pub fn output_tokens_from_chars(chars: usize) -> u32 {
+    if chars == 0 {
+        return 0;
     }
-    0
+    u32::try_from(chars / 4).unwrap_or(u32::MAX).max(1)
 }
 
 fn count_content<T: Tokenizer + ?Sized>(tk: &T, content: &Value) -> u32 {
@@ -160,6 +225,57 @@ mod tests {
         let body = json!({"prompt": "x", "max_tokens": 999999});
         let est = tk.estimate_request(&body);
         assert_eq!(est.estimated_output_tokens, MAX_OUTPUT_CEILING);
+    }
+
+    #[test]
+    fn tools_count_at_three_characters_a_token() {
+        let tk = HeuristicTokenizer::new();
+        let plain = json!({"messages": [{"role": "user", "content": "hi"}]});
+        let mut with_tools = plain.clone();
+        with_tools["tools"] = json!([{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]);
+        let tools_len = with_tools["tools"].to_string().len() as u32;
+        assert_eq!(
+            tk.estimate_request(&with_tools).input_tokens,
+            tk.estimate_request(&plain).input_tokens + tools_len / 3
+        );
+    }
+
+    #[test]
+    fn each_image_part_counts_a_flat_amount() {
+        let tk = HeuristicTokenizer::new();
+        let body = json!({"messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "what is this"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+            ]},
+            {"role": "assistant", "content": "it's a cat"},
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "https://example.com/x.png"}}
+            ]}
+        ]});
+        let text_only = tk.count_text("what is this") + tk.count_text("it's a cat") + 3 * 4;
+        assert_eq!(
+            tk.estimate_request(&body).input_tokens,
+            text_only + 2 * IMAGE_PART_TOKENS
+        );
+    }
+
+    #[test]
+    fn the_tools_length_is_counted_not_built() {
+        let tools = json!([{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]);
+        assert_eq!(serialized_len(&tools), tools.to_string().len());
+    }
+
+    #[test]
+    fn output_from_characters_matches_the_text_count() {
+        assert_eq!(output_tokens_from_chars(0), 0);
+        assert_eq!(output_tokens_from_chars(3), 1);
+        assert_eq!(output_tokens_from_chars(400), 100);
+        let text = "x".repeat(400);
+        assert_eq!(
+            output_tokens_from_chars(400),
+            HeuristicTokenizer::new().count_text(&text)
+        );
     }
 
     #[test]

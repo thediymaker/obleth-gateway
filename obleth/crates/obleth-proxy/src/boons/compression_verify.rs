@@ -316,26 +316,11 @@ fn conversation_with_repeated_context() -> Value {
     })
 }
 
-/// Sum the heuristic token count across every message content segment of a body.
+/// The admission estimate's prompt count for a body.
 fn count_body_tokens(json: &Value) -> u32 {
-    let tk = HeuristicTokenizer::new();
-    let mut total = 0u32;
-    if let Some(msgs) = json.get("messages").and_then(|m| m.as_array()) {
-        for m in msgs {
-            match m.get("content") {
-                Some(Value::String(s)) => total += tk.count_text(s),
-                Some(Value::Array(parts)) => {
-                    for p in parts {
-                        if let Some(t) = p.get("text").and_then(|t| t.as_str()) {
-                            total += tk.count_text(t);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    total
+    HeuristicTokenizer::new()
+        .estimate_request(json)
+        .input_tokens
 }
 
 // ── Runner + metrics ─────────────────────────────────────────────────────────

@@ -219,9 +219,6 @@ pub(crate) struct PipelineInput {
     pub credential: Option<crate::jwt_auth::Credential>,
     /// The translated body, so the pipeline parses nothing.
     pub body: Option<serde_json::Value>,
-    /// The caller's input estimate, when it counts what the tokenizer does
-    /// not see (the Messages shim counts tools and images).
-    pub estimate: Option<u32>,
     /// A batch item's background admission.
     pub batch: Option<BackgroundShare>,
 }
@@ -233,14 +230,6 @@ impl PipelineInput {
             .get::<PipelineInput>()
             .cloned()
             .unwrap_or_default()
-    }
-
-    /// The estimate to reserve: the caller's input count when it gave one.
-    fn reserve(&self, mut est: CostEstimate) -> CostEstimate {
-        if let Some(input_tokens) = self.estimate {
-            est.input_tokens = input_tokens;
-        }
-        est
     }
 }
 
@@ -627,7 +616,6 @@ async fn messages_shim(
         streaming,
         credential,
         effort,
-        estimate,
     } = front;
     let query = strip_beta_query(parts.uri.query())
         .map(|q| format!("?{q}"))
@@ -650,7 +638,6 @@ async fn messages_shim(
         effort,
         credential: Some(credential),
         body: Some(chat_body),
-        estimate,
         batch: None,
     });
     let chat_req = Request::from_parts(parts, Body::empty());
@@ -716,8 +703,6 @@ struct MessagesFront {
     credential: crate::jwt_auth::Credential,
     /// `thinking` / `output_config.effort`, which chat has no spelling for.
     effort: Option<crate::reasoning::Requested>,
-    /// The input estimate with tools and images counted, for the reservation.
-    estimate: Option<u32>,
 }
 
 /// Anthropic's real `count_tokens` endpoint takes no `max_tokens` field, and
@@ -808,11 +793,8 @@ async fn messages_front(
     // every smaller candidate hard-filtered out by the router (503). Skipped
     // for `count_tokens`: its `max_tokens` is a backfilled placeholder, never
     // forwarded, and never dispatched to a pipeline that could reject it.
-    let mut estimate = None;
     if !count_tokens {
-        let text_est = state.tokenizer.estimate_request(&chat_body).input_tokens as u64;
-        let input_est = messages_input_estimate(&chat_body, text_est);
-        estimate = Some(u32::try_from(input_est).unwrap_or(u32::MAX));
+        let input_est = u64::from(state.tokenizer.estimate_request(&chat_body).input_tokens);
         let window = context_window_for(state, &served, effort.clone().ok().flatten()).await;
         let requested_max_tokens = chat_body
             .get("max_tokens")
@@ -848,7 +830,6 @@ async fn messages_front(
         streaming,
         credential,
         effort: crate::reasoning::Requested::of_surface(effort),
-        estimate,
     })
 }
 
@@ -932,69 +913,6 @@ fn context_overflow_response(message: &str) -> Response<Body> {
         "code": "context_length_exceeded",
     }});
     (StatusCode::BAD_REQUEST, axum::Json(body)).into_response()
-}
-
-/// Flat input-token estimate for one image part. Images aren't tokenized
-/// here, and their real cost depends on the model and the resolution.
-pub(crate) const IMAGE_PART_TOKEN_ESTIMATE: u64 = 1500;
-
-/// `estimate_request` counts message text only. That undercounts badly for a
-/// tool-heavy client: Claude Code's own `tools` array runs 10-20k tokens by
-/// itself, and an image part's few bytes of URL are nothing like its real
-/// cost once decoded. Left uncorrected, the clamp below admits a `max_tokens`
-/// the upstream still rejects on the real (text + tools + images) prompt.
-/// Not used for `count_tokens`'s reported figure: that endpoint's contract is
-/// "what the tokenizer counts", not this surface's own admission math.
-/// The length `value` serializes to, counted without building the string.
-fn serialized_len(value: &serde_json::Value) -> usize {
-    struct Counting(usize);
-    impl std::io::Write for Counting {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0 += buf.len();
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut counting = Counting(0);
-    // A `Value` always serializes; the writer never fails.
-    let _ = serde_json::to_writer(&mut counting, value);
-    counting.0
-}
-
-fn messages_input_estimate(chat_body: &serde_json::Value, text_estimate: u64) -> u64 {
-    // `to_string().len() / 3`, not the tokenizer's own chars-per-token-4
-    // heuristic: `tools` is JSON schema (short, punctuation- and
-    // digit-heavy — `{`, `"`, `:`, field names), which tokenizes denser than
-    // prose does, roughly 3 chars/token rather than 4. No finer estimate
-    // exists without a real tokenizer, and this only needs to be in the
-    // right order of magnitude to keep the clamp from admitting an
-    // upstream-rejecting value.
-    let tools_tokens = chat_body
-        .get("tools")
-        .map(|t| serialized_len(t) as u64 / 3)
-        .unwrap_or(0);
-    let image_count = chat_body
-        .get("messages")
-        .and_then(serde_json::Value::as_array)
-        .map(|messages| {
-            messages
-                .iter()
-                .filter_map(|m| m.get("content").and_then(serde_json::Value::as_array))
-                .flatten()
-                .filter(|part| {
-                    part.get("type").and_then(serde_json::Value::as_str) == Some("image_url")
-                })
-                .count() as u64
-        })
-        .unwrap_or(0);
-    // A round number, not a measurement: real per-image cost depends on
-    // resolution and the vision encoder, which this gateway has no way to
-    // know ahead of the upstream. Large enough that a handful of images still
-    // pushes the clamp, small enough not to starve `max_tokens` on a single
-    // screenshot.
-    text_estimate + tools_tokens + image_count * IMAGE_PART_TOKEN_ESTIMATE
 }
 
 /// Clamp a client-requested `max_tokens` to what the resolved model's context
@@ -1597,7 +1515,7 @@ async fn run_pipeline(
     // Cost estimate, computed once per request body. Re-estimated below only
     // when a boon actually rewrites the body; the later upstream model-name
     // swap does not affect it (the tokenizer ignores the `model` field).
-    let mut est = input.reserve(state.tokenizer.estimate_request(&json));
+    let mut est = state.tokenizer.estimate_request(&json);
 
     // The routed `auto` turn, stored once it is answered when stickiness is on.
     let mut sticky_turn: Option<crate::sticky::Turn> = None;
@@ -4303,7 +4221,7 @@ fn truncated_stream_billing(
     if streamed_chars == 0 {
         return (UpstreamUsage::default(), false);
     }
-    let output = u32::try_from(streamed_chars / 4).unwrap_or(u32::MAX).max(1);
+    let output = obleth_tokenizer::output_tokens_from_chars(streamed_chars);
     (UpstreamUsage::uncached(est.input_tokens, output), true)
 }
 
@@ -7740,9 +7658,9 @@ mod tests {
         forward_headers, has_input_guardrails, has_path_traversal, input_guardrails_unscannable,
         is_chat_path, is_forwarded, is_models_collection, is_models_endpoint,
         is_multipart_endpoint, is_retryable_status, looks_like_context_length_error,
-        messages_input_estimate, multipart_text_view, output_guardrails_unenforceable,
-        parse_multipart, prepare_upstream_body, redress_error, request_type_for_path,
-        requires_registered_model, resolve_conversation, response_cache_name, route_keeps_sessions,
+        multipart_text_view, output_guardrails_unenforceable, parse_multipart,
+        prepare_upstream_body, redress_error, request_type_for_path, requires_registered_model,
+        resolve_conversation, response_cache_name, route_keeps_sessions,
         should_translate_as_stream, strip_beta_query, strip_tool_strict, sure_overflow,
         tenant_active_now, MultipartField, RequestMeta, TooLong, END_USER_HEADER,
         REGISTERED_MODEL_PATHS, SEED_CAP,
@@ -9985,44 +9903,53 @@ mod tests {
         ));
     }
 
+    /// A conversation with tools and an image reserves the same whether it
+    /// arrives as chat completions or as Anthropic messages, and more than
+    /// the same conversation without them.
     #[test]
-    fn messages_input_estimate_adds_serialized_tools_length_over_three() {
-        let chat_body = serde_json::json!({
-            "messages": [{"role": "user", "content": "hi"}],
-            "tools": [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]
+    fn chat_and_messages_reserve_the_same_for_one_conversation() {
+        use obleth_tokenizer::Tokenizer;
+        let tk = obleth_tokenizer::HeuristicTokenizer::new();
+        let messages = serde_json::json!({
+            "model": "m",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "what is in this picture?"},
+                {"type": "image", "source": {"type": "url", "url": "https://example.com/x.png"}}
+            ]}],
+            "tools": [{"name": "lookup", "description": "Look a word up.",
+                       "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}}}]
         });
-        let tools_len = chat_body["tools"].to_string().len() as u64;
-        assert_eq!(messages_input_estimate(&chat_body, 10), 10 + tools_len / 3);
+        let chat = serde_json::json!({
+            "model": "m",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "what is in this picture?"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/x.png"}}
+            ]}],
+            "tools": [{"type": "function", "function": {"name": "lookup", "description": "Look a word up.",
+                       "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}}}]
+        });
+        let translated = crate::messages::to_chat_request(&messages).expect("translates");
+        let via_messages = tk.estimate_request(&translated);
+        let via_chat = tk.estimate_request(&chat);
+        assert_eq!(via_messages, via_chat);
 
-        // No `tools` at all: the estimate is the text estimate alone.
-        let no_tools = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
-        assert_eq!(messages_input_estimate(&no_tools, 10), 10);
+        let plain = serde_json::json!({
+            "model": "m",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "what is in this picture?"}]
+        });
+        let bare = tk.estimate_request(&plain).input_tokens;
+        assert!(via_chat.input_tokens > bare + obleth_tokenizer::IMAGE_PART_TOKENS);
     }
 
     #[test]
-    fn messages_input_estimate_adds_a_flat_cost_per_image_part() {
-        let chat_body = serde_json::json!({
-            "messages": [
-                {"role": "user", "content": [
-                    {"type": "text", "text": "what is this"},
-                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
-                ]},
-                {"role": "assistant", "content": "it's a cat"},
-                {"role": "user", "content": [
-                    {"type": "image_url", "image_url": {"url": "https://example.com/x.png"}}
-                ]}
-            ]
-        });
-        assert_eq!(messages_input_estimate(&chat_body, 100), 100 + 1500 * 2);
-    }
-
-    #[test]
-    fn messages_input_estimate_causes_clamping_that_the_text_only_estimate_would_miss() {
-        // Reproduces the failure mode this fix targets: a 40,960-token
-        // window, a small text prompt, and a ~60 KiB `tools` array (Claude
-        // Code sends its full tool list on every turn). The text-only
-        // tokenizer estimate alone leaves `max_tokens` unclamped; folding in
-        // the tools payload clamps it to what the window can actually hold.
+    fn the_tools_payload_clamps_max_tokens_that_a_text_only_estimate_would_not() {
+        // A 40,960-token window, a small text prompt, and a ~60 KiB `tools`
+        // array (Claude Code sends its full tool list on every turn). The
+        // text alone leaves `max_tokens` unclamped; the estimate, which
+        // counts the tools payload, clamps it to what the window can hold.
         let window = Some(40_960u64);
         let text_estimate = 500u64;
         let requested = 32_000u64;
@@ -10045,8 +9972,14 @@ mod tests {
             Ok(requested)
         );
 
-        // With the tools payload folded in: clamped to less than requested.
-        let combined = messages_input_estimate(&chat_body, text_estimate);
+        // With the tools payload counted: clamped to less than requested.
+        let combined = u64::from(
+            obleth_tokenizer::Tokenizer::estimate_request(
+                &obleth_tokenizer::HeuristicTokenizer::new(),
+                &chat_body,
+            )
+            .input_tokens,
+        );
         let clamped = clamp_max_tokens(requested, window, combined).expect("still fits");
         assert!(clamped < requested, "expected clamping, got {clamped}");
     }
@@ -12165,26 +12098,6 @@ mod pipeline_input_tests {
         assert_eq!(out.len(), 2);
     }
 
-    /// The reservation uses the shim's estimate, which counts tools and
-    /// images, when it gave one.
-    #[test]
-    fn the_reservation_estimate_is_the_callers_when_it_gave_one() {
-        let est = CostEstimate {
-            input_tokens: 10,
-            estimated_output_tokens: 5,
-        };
-        assert_eq!(PipelineInput::default().reserve(est).input_tokens, 10);
-        let input = PipelineInput {
-            estimate: Some(400),
-            ..PipelineInput::default()
-        };
-        let reserved = input.reserve(est);
-        assert_eq!(
-            (reserved.input_tokens, reserved.estimated_output_tokens),
-            (400, 5)
-        );
-    }
-
     /// The pipeline takes the caller's credential before it would read a
     /// bearer token, and parses no body when one was handed over.
     #[test]
@@ -12198,14 +12111,7 @@ mod pipeline_input_tests {
         };
         assert!(pos("input.credential.take()") < pos("bearer(&headers)"));
         assert!(pos("input.body.take()") < pos("read_body(body)"));
-        pos("input.reserve(");
         pos("input.surface");
-    }
-
-    #[test]
-    fn the_tools_length_is_counted_not_built() {
-        let tools = serde_json::json!([{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]);
-        assert_eq!(serialized_len(&tools), tools.to_string().len());
     }
 }
 

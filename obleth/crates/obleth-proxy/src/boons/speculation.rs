@@ -1957,8 +1957,7 @@ fn drive_stream(
         if !error_forwarded && (broke_off || (!done_seen && finish.is_none())) {
             let cont_out = match cont_usage {
                 Some(_) => cont.output,
-                None if cont_chars == 0 => 0,
-                None => u32::try_from(cont_chars / 4).unwrap_or(u32::MAX).max(1),
+                None => obleth_tokenizer::output_tokens_from_chars(cont_chars),
             };
             if let Ok(mut st) = stats.lock() {
                 st.usage =
