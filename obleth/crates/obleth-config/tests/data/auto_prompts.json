@@ -1,0 +1,1110 @@
+{
+ "about": "Prompts for scoring `auto`: each says which tier of model should answer it (1 light, 2 mid, 3 strong) and which of the router's topics it is about. The tier is a person's judgment of the least capable model that would answer well; see tests/auto_eval.rs.",
+ "cases": [
+  {
+   "id": "smalltalk-1",
+   "kind": "smalltalk",
+   "tier": 1,
+   "topics": [],
+   "turns": [
+    "Helloo"
+   ]
+  },
+  {
+   "id": "smalltalk-2",
+   "kind": "smalltalk",
+   "tier": 1,
+   "topics": [],
+   "turns": [
+    "hi"
+   ]
+  },
+  {
+   "id": "smalltalk-3",
+   "kind": "smalltalk",
+   "tier": 1,
+   "topics": [],
+   "turns": [
+    "Good morning!"
+   ]
+  },
+  {
+   "id": "smalltalk-4",
+   "kind": "smalltalk",
+   "tier": 1,
+   "topics": [],
+   "turns": [
+    "thanks, that's all"
+   ]
+  },
+  {
+   "id": "smalltalk-5",
+   "kind": "smalltalk",
+   "tier": 1,
+   "topics": [],
+   "turns": [
+    "ok"
+   ]
+  },
+  {
+   "id": "smalltalk-6",
+   "kind": "smalltalk",
+   "tier": 1,
+   "topics": [],
+   "turns": [
+    "Thank you so much, that fixed it."
+   ]
+  },
+  {
+   "id": "smalltalk-7",
+   "kind": "smalltalk",
+   "tier": 1,
+   "topics": [],
+   "turns": [
+    "are you there?"
+   ]
+  },
+  {
+   "id": "smalltalk-8",
+   "kind": "smalltalk",
+   "tier": 1,
+   "topics": [],
+   "turns": [
+    "lol nice"
+   ]
+  },
+  {
+   "id": "smalltalk-9",
+   "kind": "smalltalk",
+   "tier": 1,
+   "topics": [],
+   "turns": [
+    "What can you do?"
+   ]
+  },
+  {
+   "id": "smalltalk-10",
+   "kind": "smalltalk",
+   "tier": 1,
+   "topics": [],
+   "turns": [
+    "bye for now"
+   ]
+  },
+  {
+   "id": "fact-1",
+   "kind": "fact",
+   "tier": 1,
+   "topics": [],
+   "turns": [
+    "What is the capital of Australia?"
+   ]
+  },
+  {
+   "id": "fact-2",
+   "kind": "fact",
+   "tier": 1,
+   "topics": [],
+   "turns": [
+    "What does HPC stand for?"
+   ]
+  },
+  {
+   "id": "fact-3",
+   "kind": "fact",
+   "tier": 1,
+   "topics": [],
+   "turns": [
+    "Who wrote Pride and Prejudice?"
+   ]
+  },
+  {
+   "id": "fact-4",
+   "kind": "fact",
+   "tier": 1,
+   "topics": [],
+   "turns": [
+    "How many bytes are in a gibibyte?"
+   ]
+  },
+  {
+   "id": "fact-5",
+   "kind": "fact",
+   "tier": 1,
+   "topics": [],
+   "turns": [
+    "What year did the Apollo 11 landing happen?"
+   ]
+  },
+  {
+   "id": "fact-6",
+   "kind": "fact",
+   "tier": 1,
+   "topics": [],
+   "turns": [
+    "What's the difference between RAM and disk storage, in one sentence?"
+   ]
+  },
+  {
+   "id": "fact-7",
+   "kind": "fact",
+   "tier": 1,
+   "topics": [],
+   "turns": [
+    "Define 'idempotent'."
+   ]
+  },
+  {
+   "id": "fact-8",
+   "kind": "fact",
+   "tier": 1,
+   "topics": [],
+   "turns": [
+    "What port does SSH use by default?"
+   ]
+  },
+  {
+   "id": "fact-9",
+   "kind": "fact",
+   "tier": 1,
+   "topics": [],
+   "turns": [
+    "Is a tomato a fruit?"
+   ]
+  },
+  {
+   "id": "fact-10",
+   "kind": "fact",
+   "tier": 1,
+   "topics": [],
+   "turns": [
+    "What does the acronym MPI mean?"
+   ]
+  },
+  {
+   "id": "transform-1",
+   "kind": "transform",
+   "tier": 1,
+   "topics": [],
+   "turns": [
+    "Translate 'where is the train station' into Spanish."
+   ]
+  },
+  {
+   "id": "transform-2",
+   "kind": "transform",
+   "tier": 1,
+   "topics": [],
+   "turns": [
+    "Fix the grammar: 'me and him goes to the lab yesterday'."
+   ]
+  },
+  {
+   "id": "transform-3",
+   "kind": "transform",
+   "tier": 1,
+   "topics": [],
+   "turns": [
+    "Give me a synonym for 'important'."
+   ]
+  },
+  {
+   "id": "transform-4",
+   "kind": "transform",
+   "tier": 1,
+   "topics": [],
+   "turns": [
+    "Make this sentence shorter: 'In the event that it rains, the event will be moved indoors.'"
+   ]
+  },
+  {
+   "id": "transform-5",
+   "kind": "transform",
+   "tier": 1,
+   "topics": [],
+   "turns": [
+    "What's the plural of 'analysis'?"
+   ]
+  },
+  {
+   "id": "transform-6",
+   "kind": "transform",
+   "tier": 1,
+   "topics": [],
+   "turns": [
+    "Spell out 1,204 in words."
+   ]
+  },
+  {
+   "id": "lookup-code-1",
+   "kind": "lookup-code",
+   "tier": 1,
+   "topics": [
+    "coding"
+   ],
+   "turns": [
+    "What's the command to list files by size in Linux?"
+   ],
+   "note": "a one-line answer about code or a command"
+  },
+  {
+   "id": "lookup-code-2",
+   "kind": "lookup-code",
+   "tier": 1,
+   "topics": [
+    "coding"
+   ],
+   "turns": [
+    "How do I check my git branch?"
+   ],
+   "note": "a one-line answer about code or a command"
+  },
+  {
+   "id": "lookup-code-3",
+   "kind": "lookup-code",
+   "tier": 1,
+   "topics": [
+    "coding"
+   ],
+   "turns": [
+    "What does `chmod 755` do?"
+   ],
+   "note": "a one-line answer about code or a command"
+  },
+  {
+   "id": "lookup-code-4",
+   "kind": "lookup-code",
+   "tier": 1,
+   "topics": [
+    "coding"
+   ],
+   "turns": [
+    "How do I exit vim?"
+   ],
+   "note": "a one-line answer about code or a command"
+  },
+  {
+   "id": "lookup-code-5",
+   "kind": "lookup-code",
+   "tier": 1,
+   "topics": [
+    "coding"
+   ],
+   "turns": [
+    "What's the Python syntax for a list comprehension?"
+   ],
+   "note": "a one-line answer about code or a command"
+  },
+  {
+   "id": "lookup-code-6",
+   "kind": "lookup-code",
+   "tier": 1,
+   "topics": [
+    "coding"
+   ],
+   "turns": [
+    "How do I see my running Slurm jobs?"
+   ],
+   "note": "a one-line answer about code or a command"
+  },
+  {
+   "id": "lookup-code-7",
+   "kind": "lookup-code",
+   "tier": 1,
+   "topics": [
+    "coding"
+   ],
+   "turns": [
+    "What does `squeue -u $USER` show?"
+   ],
+   "note": "a one-line answer about code or a command"
+  },
+  {
+   "id": "lookup-code-8",
+   "kind": "lookup-code",
+   "tier": 1,
+   "topics": [
+    "coding"
+   ],
+   "turns": [
+    "How do I cancel a Slurm job?"
+   ],
+   "note": "a one-line answer about code or a command"
+  },
+  {
+   "id": "explain-1",
+   "kind": "explain",
+   "tier": 2,
+   "topics": [],
+   "turns": [
+    "Explain how TCP congestion control works, with an example."
+   ]
+  },
+  {
+   "id": "explain-2",
+   "kind": "explain",
+   "tier": 2,
+   "topics": [],
+   "turns": [
+    "Compare PostgreSQL and MySQL for a small web app: when would I pick each?"
+   ]
+  },
+  {
+   "id": "explain-3",
+   "kind": "explain",
+   "tier": 2,
+   "topics": [],
+   "turns": [
+    "Summarize the main causes of the 2008 financial crisis in a few paragraphs."
+   ]
+  },
+  {
+   "id": "explain-4",
+   "kind": "explain",
+   "tier": 2,
+   "topics": [],
+   "turns": [
+    "Explain the difference between a process and a thread, and when each is the right tool."
+   ]
+  },
+  {
+   "id": "explain-5",
+   "kind": "explain",
+   "tier": 2,
+   "topics": [],
+   "turns": [
+    "What are the pros and cons of containers versus virtual machines for a research cluster?"
+   ]
+  },
+  {
+   "id": "explain-6",
+   "kind": "explain",
+   "tier": 2,
+   "topics": [],
+   "turns": [
+    "Walk me through how HTTPS establishes a secure connection."
+   ]
+  },
+  {
+   "id": "explain-7",
+   "kind": "explain",
+   "tier": 2,
+   "topics": [],
+   "turns": [
+    "Explain what a p-value is and one common way people misread it."
+   ]
+  },
+  {
+   "id": "explain-8",
+   "kind": "explain",
+   "tier": 2,
+   "topics": [],
+   "turns": [
+    "How does garbage collection work in Java, at a high level?"
+   ]
+  },
+  {
+   "id": "code-1",
+   "kind": "code",
+   "tier": 2,
+   "topics": [
+    "coding"
+   ],
+   "turns": [
+    "Write a Python function that reads a CSV file and returns the mean of each numeric column."
+   ]
+  },
+  {
+   "id": "code-2",
+   "kind": "code",
+   "tier": 2,
+   "topics": [
+    "coding"
+   ],
+   "turns": [
+    "Write a bash script that backs up a directory to a dated tar.gz and deletes backups older than 30 days."
+   ]
+  },
+  {
+   "id": "code-3",
+   "kind": "code",
+   "tier": 2,
+   "topics": [
+    "coding"
+   ],
+   "turns": [
+    "I get `TypeError: 'NoneType' object is not subscriptable` on this line: `name = user['name']`. What's wrong and how do I fix it?"
+   ]
+  },
+  {
+   "id": "code-4",
+   "kind": "code",
+   "tier": 2,
+   "topics": [
+    "coding"
+   ],
+   "turns": [
+    "Write a SQL query that returns the top 5 customers by total order value in the last 90 days."
+   ]
+  },
+  {
+   "id": "code-5",
+   "kind": "code",
+   "tier": 2,
+   "topics": [
+    "coding"
+   ],
+   "turns": [
+    "Convert this for loop to a list comprehension and explain it:\n```python\nout = []\nfor x in xs:\n    if x % 2 == 0:\n        out.append(x * x)\n```"
+   ]
+  },
+  {
+   "id": "code-6",
+   "kind": "code",
+   "tier": 2,
+   "topics": [
+    "coding"
+   ],
+   "turns": [
+    "Write a Slurm batch script that requests one GPU for 4 hours and runs train.py with a conda environment."
+   ]
+  },
+  {
+   "id": "code-7",
+   "kind": "code",
+   "tier": 2,
+   "topics": [
+    "coding"
+   ],
+   "turns": [
+    "Write unit tests with pytest for a function `slugify(title)` that lowercases, trims and replaces spaces with dashes."
+   ]
+  },
+  {
+   "id": "code-8",
+   "kind": "code",
+   "tier": 2,
+   "topics": [
+    "coding"
+   ],
+   "turns": [
+    "Write a regex that matches US phone numbers in the forms 555-123-4567 and (555) 123-4567, and explain each part."
+   ]
+  },
+  {
+   "id": "code-9",
+   "kind": "code",
+   "tier": 2,
+   "topics": [
+    "coding"
+   ],
+   "turns": [
+    "Add retry with exponential backoff to this function:\n```python\ndef fetch(url):\n    return requests.get(url, timeout=5).json()\n```"
+   ]
+  },
+  {
+   "id": "code-10",
+   "kind": "code",
+   "tier": 2,
+   "topics": [
+    "coding"
+   ],
+   "turns": [
+    "Write a Dockerfile for a small FastAPI app that uses uvicorn."
+   ]
+  },
+  {
+   "id": "code-11",
+   "kind": "code",
+   "tier": 2,
+   "topics": [
+    "coding"
+   ],
+   "turns": [
+    "Explain what this awk command does: awk -F, 'NR>1 {s[$2]+=$3} END {for (k in s) print k, s[k]}' data.csv"
+   ]
+  },
+  {
+   "id": "code-12",
+   "kind": "code",
+   "tier": 2,
+   "topics": [
+    "coding"
+   ],
+   "turns": [
+    "Write a JavaScript function that debounces another function, with a short usage example."
+   ]
+  },
+  {
+   "id": "writing-1",
+   "kind": "writing",
+   "tier": 2,
+   "topics": [
+    "writing"
+   ],
+   "turns": [
+    "Write an email to my advisor asking to move our meeting from Tuesday to Thursday because of a conference."
+   ]
+  },
+  {
+   "id": "writing-2",
+   "kind": "writing",
+   "tier": 2,
+   "topics": [
+    "writing"
+   ],
+   "turns": [
+    "Write a cover letter for a research software engineer position; I have five years of Python and HPC experience."
+   ]
+  },
+  {
+   "id": "writing-3",
+   "kind": "writing",
+   "tier": 2,
+   "topics": [
+    "writing"
+   ],
+   "turns": [
+    "Rewrite this paragraph to be more professional: 'so basically the cluster was down all weekend and nobody told us which kinda sucks because we lost a bunch of jobs'"
+   ]
+  },
+  {
+   "id": "writing-4",
+   "kind": "writing",
+   "tier": 2,
+   "topics": [
+    "writing"
+   ],
+   "turns": [
+    "Write a 200-word blog post announcing our lab's new GPU nodes."
+   ]
+  },
+  {
+   "id": "writing-5",
+   "kind": "writing",
+   "tier": 2,
+   "topics": [
+    "writing"
+   ],
+   "turns": [
+    "Proofread this abstract and tighten this where you can: 'In this paper we presents a novel approach for to schedule jobs which is better than previous approach in many case.'"
+   ]
+  },
+  {
+   "id": "writing-6",
+   "kind": "writing",
+   "tier": 2,
+   "topics": [
+    "writing"
+   ],
+   "turns": [
+    "Write a short story about a robot that learns to paint, about 300 words."
+   ]
+  },
+  {
+   "id": "writing-7",
+   "kind": "writing",
+   "tier": 2,
+   "topics": [
+    "writing"
+   ],
+   "turns": [
+    "Draft a polite reply declining a meeting invitation, suggesting an email to follow up instead."
+   ]
+  },
+  {
+   "id": "writing-8",
+   "kind": "writing",
+   "tier": 2,
+   "topics": [
+    "writing"
+   ],
+   "turns": [
+    "Write a LinkedIn post about finishing my PhD in computational biology."
+   ]
+  },
+  {
+   "id": "math-1",
+   "kind": "math",
+   "tier": 2,
+   "topics": [
+    "math"
+   ],
+   "turns": [
+    "Solve for x: 3x^2 - 12x + 9 = 0, and show the steps."
+   ]
+  },
+  {
+   "id": "math-2",
+   "kind": "math",
+   "tier": 2,
+   "topics": [
+    "math"
+   ],
+   "turns": [
+    "Calculate the probability of getting exactly 3 heads in 5 fair coin flips."
+   ]
+  },
+  {
+   "id": "math-3",
+   "kind": "math",
+   "tier": 2,
+   "topics": [
+    "math"
+   ],
+   "turns": [
+    "What is the derivative of x^3 * sin(x)? Show the steps."
+   ]
+  },
+  {
+   "id": "math-4",
+   "kind": "math",
+   "tier": 2,
+   "topics": [
+    "math"
+   ],
+   "turns": [
+    "I have samples of 40 and 55 with means 12.1 and 13.4 and SDs 2.2 and 2.9. Which test compares them, and how do I calculate it?"
+   ]
+  },
+  {
+   "id": "math-5",
+   "kind": "math",
+   "tier": 2,
+   "topics": [
+    "math"
+   ],
+   "turns": [
+    "Calculate the determinant of the matrix [[2, 1], [5, 3]] and say what it tells me."
+   ]
+  },
+  {
+   "id": "math-6",
+   "kind": "math",
+   "tier": 2,
+   "topics": [
+    "math"
+   ],
+   "turns": [
+    "Convert 0.15 mol/L of NaCl to grams per liter and show the calculation."
+   ]
+  },
+  {
+   "id": "hpc-1",
+   "kind": "hpc",
+   "tier": 2,
+   "topics": [],
+   "turns": [
+    "My Slurm job is pending with reason (Resources). What does that mean and what can I change to start sooner?"
+   ]
+  },
+  {
+   "id": "hpc-2",
+   "kind": "hpc",
+   "tier": 2,
+   "topics": [],
+   "turns": [
+    "How do I choose between --ntasks and --cpus-per-task for an OpenMP program?"
+   ]
+  },
+  {
+   "id": "hpc-3",
+   "kind": "hpc",
+   "tier": 2,
+   "topics": [],
+   "turns": [
+    "Explain what a job array is and when I would use one instead of a loop in my batch script."
+   ]
+  },
+  {
+   "id": "code-hard-1",
+   "kind": "code-hard",
+   "tier": 3,
+   "topics": [
+    "coding"
+   ],
+   "turns": [
+    "Our Rust service deadlocks under load about once a day. It uses tokio with a Mutex around a connection pool and an mpsc channel to a writer task. How would you find the root cause, and what are the likely designs that avoid it?"
+   ]
+  },
+  {
+   "id": "code-hard-2",
+   "kind": "code-hard",
+   "tier": 3,
+   "topics": [
+    "coding"
+   ],
+   "turns": [
+    "Design a rate limiter for a multi-tenant API gateway that is fair across tenants, survives a node restart, and adds under 1 ms at p99. Compare token bucket in Redis with a local approximation and say which you would build."
+   ]
+  },
+  {
+   "id": "code-hard-3",
+   "kind": "code-hard",
+   "tier": 3,
+   "topics": [
+    "coding"
+   ],
+   "turns": [
+    "This panics in production and I can't reproduce it locally:\nthread 'tokio-runtime-worker' panicked at src/store.rs:412:17:\ncalled `Option::unwrap()` on a `None` value\nstack backtrace:\n   0: rust_begin_unwind\n   1: core::panicking::panic_fmt\n   2: store::Store::finish_turn\n   3: api::run_generation\nThe row should always exist because we insert it in the same transaction. What could make it missing?"
+   ]
+  },
+  {
+   "id": "code-hard-4",
+   "kind": "code-hard",
+   "tier": 3,
+   "topics": [
+    "coding"
+   ],
+   "turns": [
+    "Refactor a 2,000-line Python module that mixes database access, business rules and HTTP handlers into something testable. Give me the target structure, the order to do it in so the service keeps running, and the tests to write first."
+   ]
+  },
+  {
+   "id": "code-hard-5",
+   "kind": "code-hard",
+   "tier": 3,
+   "topics": [
+    "coding"
+   ],
+   "turns": [
+    "We migrate a 400 GB Postgres table to a partitioned one with no downtime. Writes are 2k/s. Lay out the plan step by step, including how to backfill, how to keep the two in sync, and how to roll back at each step."
+   ]
+  },
+  {
+   "id": "code-hard-6",
+   "kind": "code-hard",
+   "tier": 3,
+   "topics": [
+    "coding"
+   ],
+   "turns": [
+    "Why does this C++ code have a race condition, and how do I fix it without a global lock?\n```cpp\nstd::unordered_map<int, Session> sessions;\nvoid touch(int id) { sessions[id].last = now(); }\nvoid reap() { for (auto it = sessions.begin(); it != sessions.end();) { if (expired(it->second)) it = sessions.erase(it); else ++it; } }\n```"
+   ]
+  },
+  {
+   "id": "code-hard-7",
+   "kind": "code-hard",
+   "tier": 3,
+   "topics": [
+    "coding"
+   ],
+   "turns": [
+    "Optimize this query; it takes 40 seconds on 80M rows and the plan shows a sequential scan and a hash join that spills to disk:\n```sql\nSELECT u.id, count(*) FROM users u JOIN events e ON e.user_id = u.id WHERE e.created_at > now() - interval '7 days' AND u.plan = 'pro' GROUP BY u.id HAVING count(*) > 100;\n```\nExplain the trade-off of each index you propose."
+   ]
+  },
+  {
+   "id": "code-hard-8",
+   "kind": "code-hard",
+   "tier": 3,
+   "topics": [
+    "coding"
+   ],
+   "turns": [
+    "Design the schema and the consistency model for a collaborative document editor: several people typing at once, offline edits that merge later, and full history. Compare CRDTs with operational transforms for this."
+   ]
+  },
+  {
+   "id": "code-hard-9",
+   "kind": "code-hard",
+   "tier": 3,
+   "topics": [
+    "coding"
+   ],
+   "turns": [
+    "My MPI program scales to 64 ranks and then gets slower. It does a 3D stencil with halo exchange every step. What are the likely causes, how would I measure each one, and what would you change first?"
+   ]
+  },
+  {
+   "id": "code-hard-10",
+   "kind": "code-hard",
+   "tier": 3,
+   "topics": [
+    "coding"
+   ],
+   "turns": [
+    "Implement a lock-free single-producer single-consumer ring buffer in Rust, explain the memory orderings you chose and why weaker ones would be wrong."
+   ]
+  },
+  {
+   "id": "code-hard-11",
+   "kind": "code-hard",
+   "tier": 3,
+   "topics": [
+    "coding"
+   ],
+   "turns": [
+    "We see p99 latency spikes every 5 minutes in a Go service behind a load balancer. GC pauses look fine. Give me a systematic plan to find the root cause, with what each measurement would rule out."
+   ]
+  },
+  {
+   "id": "code-hard-12",
+   "kind": "code-hard",
+   "tier": 3,
+   "topics": [
+    "coding"
+   ],
+   "turns": [
+    "Write a parser and evaluator for arithmetic expressions with variables, functions and operator precedence, in TypeScript, with error messages that point at the column. Then explain how you would extend it to support user-defined functions."
+   ]
+  },
+  {
+   "id": "reason-hard-1",
+   "kind": "reason-hard",
+   "tier": 3,
+   "topics": [],
+   "turns": [
+    "I have to choose between building our own job scheduler extension and adopting an existing workflow engine for a 500-node research cluster. Lay out the decision: the trade-offs, what would change your answer, and the questions I should ask the users first."
+   ]
+  },
+  {
+   "id": "reason-hard-2",
+   "kind": "reason-hard",
+   "tier": 3,
+   "topics": [],
+   "turns": [
+    "Analyze why a randomized trial might show no effect when observational studies showed a strong one. Give the main explanations and how I would tell them apart with the data I likely have."
+   ]
+  },
+  {
+   "id": "reason-hard-3",
+   "kind": "reason-hard",
+   "tier": 3,
+   "topics": [],
+   "turns": [
+    "Plan a three-month research project to measure whether routing easy questions to small language models hurts answer quality. Include the design, the metrics, the confounders and what result would make you stop."
+   ]
+  },
+  {
+   "id": "reason-hard-4",
+   "kind": "reason-hard",
+   "tier": 3,
+   "topics": [],
+   "turns": [
+    "Explain why the P vs NP question matters in practice, what the strongest evidence for P != NP is, and where the common explanations of it go wrong."
+   ]
+  },
+  {
+   "id": "reason-hard-5",
+   "kind": "reason-hard",
+   "tier": 3,
+   "topics": [],
+   "turns": [
+    "Our lab's storage costs tripled in a year. Here is what we know: 60% is cold data nobody has read in 18 months, snapshots are kept forever, and three groups duplicate the same reference datasets. Propose a policy, the order to roll it out, and how to handle the groups who will object."
+   ]
+  },
+  {
+   "id": "reason-hard-6",
+   "kind": "reason-hard",
+   "tier": 3,
+   "topics": [],
+   "turns": [
+    "Critique this experimental design and propose a better one: we A/B test a new ranking model by showing it to users who opted into the beta and comparing their click rate with everyone else's."
+   ]
+  },
+  {
+   "id": "reason-hard-7",
+   "kind": "reason-hard",
+   "tier": 3,
+   "topics": [],
+   "turns": [
+    "Derive the trade-off between batch size and learning rate in SGD from first principles, and explain why the linear scaling rule breaks down for large batches."
+   ]
+  },
+  {
+   "id": "reason-hard-8",
+   "kind": "reason-hard",
+   "tier": 3,
+   "topics": [],
+   "turns": [
+    "Compare three ways to give an LLM agent long-term memory (vector retrieval, summaries, a knowledge graph), with the failure modes of each and how you would evaluate them against each other."
+   ]
+  },
+  {
+   "id": "math-hard-1",
+   "kind": "math-hard",
+   "tier": 3,
+   "topics": [
+    "math"
+   ],
+   "turns": [
+    "Prove that the square root of 2 is irrational, then generalize the proof to the square root of any prime."
+   ]
+  },
+  {
+   "id": "math-hard-2",
+   "kind": "math-hard",
+   "tier": 3,
+   "topics": [
+    "math"
+   ],
+   "turns": [
+    "Prove that every bounded monotone sequence of real numbers converges, and say exactly where completeness is used."
+   ]
+  },
+  {
+   "id": "math-hard-3",
+   "kind": "math-hard",
+   "tier": 3,
+   "topics": [
+    "math"
+   ],
+   "turns": [
+    "Solve the integral of x^2 * e^(-x^2) from 0 to infinity and justify each step."
+   ]
+  },
+  {
+   "id": "math-hard-4",
+   "kind": "math-hard",
+   "tier": 3,
+   "topics": [
+    "math"
+   ],
+   "turns": [
+    "Derive the closed form for the expected number of comparisons in randomized quicksort."
+   ]
+  },
+  {
+   "id": "math-hard-5",
+   "kind": "math-hard",
+   "tier": 3,
+   "topics": [
+    "math"
+   ],
+   "turns": [
+    "Prove that a graph is bipartite if and only if it has no odd cycle."
+   ]
+  },
+  {
+   "id": "hpc-hard-1",
+   "kind": "hpc-hard",
+   "tier": 3,
+   "topics": [],
+   "turns": [
+    "I need to run 10,000 short simulations (2 minutes each, 1 core) on a Slurm cluster that limits me to 1,000 queued jobs and has a 2-minute scheduling overhead per job. Design the submission strategy, compare job arrays, a task farm inside one allocation and GNU parallel, and tell me how to make it restartable."
+   ]
+  },
+  {
+   "id": "hpc-hard-2",
+   "kind": "hpc-hard",
+   "tier": 3,
+   "topics": [],
+   "turns": [
+    "My GPU training job gets 30% utilization on a node with 8 GPUs and 64 cores. Data is 2M small JPEGs on a parallel file system. Diagnose the likely bottlenecks in order and how to confirm each, then give the changes with the trade-offs."
+   ]
+  },
+  {
+   "id": "hpc-hard-3",
+   "kind": "hpc-hard",
+   "tier": 3,
+   "topics": [],
+   "turns": [
+    "Design a fair-share policy for a cluster shared by 12 research groups where two groups paid for 40% of the hardware, and explain how you would set the Slurm priority weights and why."
+   ]
+  },
+  {
+   "id": "followup-1",
+   "kind": "followup",
+   "tier": 3,
+   "topics": [
+    "coding"
+   ],
+   "turns": [
+    "Our Rust service deadlocks under load about once a day. It uses tokio with a Mutex around a connection pool and an mpsc channel to a writer task. How would you find the root cause?",
+    "Start by capturing a dump of every task's state when it hangs. The usual cause with this shape is holding the pool's Mutex across an await that waits on the channel, while the writer task waits for the pool...",
+    "continue"
+   ],
+   "note": "carries on a hard piece of work"
+  },
+  {
+   "id": "followup-2",
+   "kind": "followup",
+   "tier": 3,
+   "topics": [
+    "coding"
+   ],
+   "turns": [
+    "Our Rust service deadlocks under load about once a day. It uses tokio with a Mutex around a connection pool and an mpsc channel to a writer task. How would you find the root cause?",
+    "Start by capturing a dump of every task's state when it hangs. The usual cause with this shape is holding the pool's Mutex across an await that waits on the channel, while the writer task waits for the pool...",
+    "that didn't fix it, it still hangs"
+   ],
+   "note": "the last answer failed on a hard problem"
+  },
+  {
+   "id": "followup-3",
+   "kind": "followup",
+   "tier": 3,
+   "topics": [
+    "coding"
+   ],
+   "turns": [
+    "Our Rust service deadlocks under load about once a day. It uses tokio with a Mutex around a connection pool and an mpsc channel to a writer task. How would you find the root cause?",
+    "Start by capturing a dump of every task's state when it hangs. The usual cause with this shape is holding the pool's Mutex across an await that waits on the channel, while the writer task waits for the pool...",
+    "ok and what if the writer task is the one that panics?"
+   ],
+   "note": "a new hard question in the same thread"
+  },
+  {
+   "id": "followup-4",
+   "kind": "followup",
+   "tier": 2,
+   "topics": [
+    "coding"
+   ],
+   "turns": [
+    "Write a Python function that reads a CSV file and returns the mean of each numeric column.",
+    "```python\nimport csv\n\ndef column_means(path):\n    ...\n```",
+    "now make it skip empty cells"
+   ],
+   "note": "a small change to moderate work"
+  },
+  {
+   "id": "followup-5",
+   "kind": "followup",
+   "tier": 2,
+   "topics": [
+    "coding"
+   ],
+   "turns": [
+    "Write a Python function that reads a CSV file and returns the mean of each numeric column.",
+    "```python\nimport csv\n\ndef column_means(path):\n    ...\n```",
+    "try again, that crashes on the header row"
+   ]
+  },
+  {
+   "id": "followup-6",
+   "kind": "followup",
+   "tier": 1,
+   "topics": [],
+   "turns": [
+    "Our Rust service deadlocks under load about once a day. It uses tokio with a Mutex around a connection pool and an mpsc channel to a writer task. How would you find the root cause?",
+    "Start by capturing a dump of every task's state when it hangs. The usual cause with this shape is holding the pool's Mutex across an await that waits on the channel, while the writer task waits for the pool...",
+    "thanks, that makes sense"
+   ],
+   "note": "an acknowledgement, even after hard work"
+  },
+  {
+   "id": "followup-7",
+   "kind": "followup",
+   "tier": 1,
+   "topics": [],
+   "turns": [
+    "Write a Python function that reads a CSV file and returns the mean of each numeric column.",
+    "```python\nimport csv\n\ndef column_means(path):\n    ...\n```",
+    "great, thank you!"
+   ]
+  },
+  {
+   "id": "followup-8",
+   "kind": "followup",
+   "tier": 1,
+   "topics": [],
+   "turns": [
+    "What is the capital of Australia?",
+    "Canberra.",
+    "and New Zealand?"
+   ],
+   "note": "an easy follow-up to an easy question"
+  }
+ ]
+}
