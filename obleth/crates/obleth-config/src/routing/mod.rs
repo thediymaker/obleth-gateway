@@ -1151,6 +1151,8 @@ pub fn heuristic_intent(json: &serde_json::Value, est_input_tokens: u64) -> Inte
         .map(|m| message_text(m.get("content")))
         .find(|t| !t.trim().is_empty())
         .unwrap_or_default();
+    // How long the prompt is, before it is cut to what the scan reads.
+    let long_prompt = text.len() > HEURISTIC_MAX_BYTES;
     let text = head_bytes(&text, HEURISTIC_MAX_BYTES);
     let lower = text.to_ascii_lowercase();
 
@@ -1255,7 +1257,7 @@ pub fn heuristic_intent(json: &serde_json::Value, est_input_tokens: u64) -> Inte
         push("math");
     }
 
-    if est_input_tokens > 32_000 {
+    if est_input_tokens > HEURISTIC_LONG_CONTEXT_TOKENS {
         push("long-context");
     }
 
@@ -1291,9 +1293,12 @@ pub fn heuristic_intent(json: &serde_json::Value, est_input_tokens: u64) -> Inte
     {
         bump(2);
     }
-    // A long request is more work: the estimate covers the whole request, as
-    // the classifier's does, not only the turn read here.
-    if est_input_tokens > HEURISTIC_LONG_REQUEST_TOKENS {
+    // A long prompt is more work, and so is a request that fills a context
+    // window. The prompt is the turn read here, not the whole request: the
+    // system text and tool definitions a client sends with every message say
+    // nothing about how hard this one is, and counting them made every
+    // message from such a client, a greeting included, read as moderate.
+    if long_prompt || est_input_tokens > HEURISTIC_LONG_CONTEXT_TOKENS {
         bump(2);
     }
 
@@ -1304,11 +1309,12 @@ pub fn heuristic_intent(json: &serde_json::Value, est_input_tokens: u64) -> Inte
     }
 }
 
-/// Most bytes of the newest user turn the heuristic reads.
+/// Most bytes of the newest user turn the heuristic reads. A prompt longer
+/// than this is long enough to bump its difficulty.
 pub const HEURISTIC_MAX_BYTES: usize = 8_000;
-/// Estimated request tokens from which the heuristic counts a request as
-/// long enough to bump its difficulty (about 8 KB of text).
-pub const HEURISTIC_LONG_REQUEST_TOKENS: u64 = 2_000;
+/// Estimated tokens of the whole request from which the heuristic tags it
+/// `long-context` and bumps its difficulty.
+pub const HEURISTIC_LONG_CONTEXT_TOKENS: u64 = 32_000;
 
 /// True when `word` occurs in `text` as a whole word (a letter or digit on
 /// neither side), so "java" matches "a java class" and not "javascript", and
@@ -2161,6 +2167,33 @@ mod tests {
     fn heuristic_difficulty_rises_on_long_context() {
         let body = serde_json::json!({ "messages": [{"role":"user","content":"summarize"}] });
         assert!(heuristic_intent(&body, 60_000).difficulty >= 2);
+    }
+
+    #[test]
+    fn heuristic_difficulty_rises_on_a_long_prompt() {
+        let body =
+            serde_json::json!({ "messages": [{"role":"user","content":"word ".repeat(1_700)}] });
+        assert_eq!(heuristic_intent(&body, 2_200).difficulty, 2);
+        // Just under the length the scan reads: still a quiet prompt.
+        let body =
+            serde_json::json!({ "messages": [{"role":"user","content":"word ".repeat(1_600)}] });
+        assert_eq!(heuristic_intent(&body, 2_050).difficulty, 1);
+    }
+
+    #[test]
+    fn a_greeting_with_a_long_system_prompt_and_tools_is_still_simple() {
+        // What a chat client sends with every message: instructions and tool
+        // definitions, several thousand tokens of them, around one short turn.
+        let body = serde_json::json!({
+            "messages": [
+                {"role":"system","content":"You have tools. ".repeat(1_200)},
+                {"role":"user","content":"Helloo"},
+            ],
+            "tools": [{"type":"function","function":{"name":"run","description":"d".repeat(4_000)}}],
+        });
+        let intent = heuristic_intent(&body, 5_700);
+        assert_eq!(intent.difficulty, 1);
+        assert!(intent.tags.is_empty());
     }
 
     #[test]
