@@ -14,7 +14,7 @@ import { deploymentKey, deploymentRow } from "@/lib/deployments-model";
 import { logsHref } from "@/lib/log-links";
 import { modelHref } from "@/lib/models-model";
 import type { AuditEntry } from "@/lib/obleth";
-import { compact } from "@/lib/overview-model";
+import { compact } from "@/lib/format";
 import { poolOccupancy } from "@/lib/occupancy";
 import { getJson } from "@/lib/utils";
 

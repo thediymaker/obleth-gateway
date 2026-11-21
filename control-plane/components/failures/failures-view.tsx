@@ -19,7 +19,7 @@ import {
   type FailureRange,
 } from "@/lib/failures-model";
 import { logsHref } from "@/lib/log-links";
-import { compact } from "@/lib/overview-model";
+import { compact, formatNumber } from "@/lib/format";
 import type { UsageFailureGroup, UsageFailureGroups, UsageLogHistogram } from "@/lib/obleth";
 import { cn, getJson } from "@/lib/utils";
 
@@ -155,7 +155,7 @@ export function FailuresView({ initialRange, initial }: { initialRange: FailureR
           <Kpi
             label={`Platform failures · ${range}`}
             value={pct(data.platform_failures, data.requests)}
-            detail={`${data.platform_failures.toLocaleString()} of ${data.requests.toLocaleString()} requests`}
+            detail={`${formatNumber(data.platform_failures)} of ${formatNumber(data.requests)} requests`}
             trend={trend((b) => b.platform_errors ?? 0)}
             href={logsHref({ fault: "platform", window: range })}
             emphasis={data.platform_failures > 0}
@@ -163,14 +163,14 @@ export function FailuresView({ initialRange, initial }: { initialRange: FailureR
           <Kpi
             label={`Caller failures · ${range}`}
             value={pct(callers, data.requests)}
-            detail={`${callers.toLocaleString()} of ${data.requests.toLocaleString()} requests`}
+            detail={`${formatNumber(callers)} of ${formatNumber(data.requests)} requests`}
             trend={trend((b) => b.errors - (b.platform_errors ?? 0))}
             href={logsHref({ fault: "client", window: range })}
           />
           <Kpi
             label={`Requests · ${range}`}
             value={compact(data.requests)}
-            detail={`${data.failures.toLocaleString()} failed`}
+            detail={`${formatNumber(data.failures)} failed`}
             trend={trend((b) => b.requests)}
             href={logsHref({ window: range })}
           />

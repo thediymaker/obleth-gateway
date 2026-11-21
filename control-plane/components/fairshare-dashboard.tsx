@@ -25,7 +25,7 @@ import {
   type PoolTenantRow,
 } from "@/lib/fairshare-model";
 import type { FairshareLiveView } from "@/lib/obleth";
-import { cn, formatNumber } from "@/lib/utils";
+import { cn } from "@/lib/utils";
 import { HealthGlyph, Meter, Panel, PanelLink, Pill, SectionLabel } from "@/components/overview/ui";
 import { HelpTip } from "@/components/fairshare/help";
 import { RunningHistory } from "@/components/fairshare/history";
@@ -45,6 +45,7 @@ export {
   thinHistory,
 } from "@/lib/fairshare-model";
 import { modelHref } from "@/lib/model-links";
+import { formatNumber } from "@/lib/format";
 export type { FairshareLiveView, GroupFairshareView, KeyFairshareView, ModelPoolView, TenantFairshareView } from "@/lib/obleth";
 
 const FIRST_POOLS = 8;

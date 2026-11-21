@@ -4,7 +4,7 @@ import { useState } from "react";
 import { classLabel, classSide, SIDE_LABEL } from "@/lib/failure-classes";
 import { failuresOnly as onlyFailures, HTTP_REASONS, listOf, pickOne, type LogFilters, type MatchField } from "@/lib/logs-model";
 import type { UsageLogFacet, UsageLogFacets } from "@/lib/obleth";
-import { compact } from "@/lib/overview-model";
+import { compact, formatNumber } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
 const SHOWN = 5;
@@ -45,7 +45,7 @@ function List({
             type="button"
             aria-pressed={on}
             onClick={() => onPick(f)}
-            title={failuresOnly ? `${f.requests.toLocaleString()} failed` : `${f.requests.toLocaleString()} requests, ${f.errors.toLocaleString()} failed`}
+            title={failuresOnly ? `${formatNumber(f.requests)} failed` : `${formatNumber(f.requests)} requests, ${formatNumber(f.errors)} failed`}
             className={cn("grid w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2 rounded-md px-1.5 py-1 text-left text-[12.5px] hover:bg-muted/40", on && "bg-secondary")}
           >
             <span className={cn("truncate", mono && "font-mono text-[12px]")}>{label(f)}</span>

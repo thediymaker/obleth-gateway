@@ -14,6 +14,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Select } from "@/components/ui/select";
 import { PERIOD_OPTIONS, tenantHref } from "@/lib/access-model";
 import type { ApiKey, KeyListQuery, NamedNetwork, Tenant } from "@/lib/obleth";
+import { formatNumber } from "@/lib/format";
 
 /** " 2 failed: a (why); b (why)" after a bulk key action's count, or "" when none did. */
 export function bulkFailures(r: BulkKeyResult): string {
@@ -67,7 +68,7 @@ export function MoveDialog({
   const [pending, start] = useTransition();
   const [made, setMade] = useState<Tenant | { id: string; name: string } | null>(null);
   const others = tenants.filter((t) => !(from.length === 1 && t.id === from[0]));
-  const label = one ? (one.name || one.key_prefix) : `${count.toLocaleString()} key${count === 1 ? "" : "s"}`;
+  const label = one ? (one.name || one.key_prefix) : `${formatNumber(count)} key${count === 1 ? "" : "s"}`;
   const fromName = from.length === 1 ? tenants.find((t) => t.id === from[0])?.name : null;
 
   function submit() {
@@ -154,7 +155,7 @@ export function BudgetDialog({ open, onClose, keys, byFilter, onDone }: { open: 
     <Dialog open={open} onOpenChange={(v) => { if (!v) onClose(); }}>
       <DialogContent className="max-w-md">
         <DialogHeader>
-          <DialogTitle>Set a budget on {count.toLocaleString()} key{count === 1 ? "" : "s"}</DialogTitle>
+          <DialogTitle>Set a budget on {formatNumber(count)} key{count === 1 ? "" : "s"}</DialogTitle>
           <DialogDescription>Replaces each key&apos;s own budget. A key stops once it reaches a cap, until the period resets. Leave both blank to take budgets off.</DialogDescription>
         </DialogHeader>
         <div className="grid gap-3 sm:grid-cols-2">

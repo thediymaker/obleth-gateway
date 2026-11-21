@@ -11,12 +11,12 @@ import { useCharoStream, type ChatTurn } from "@/components/charo/use-charo-stre
 import { uuid } from "@/lib/uuid";
 import type { ModelRoute } from "@/lib/obleth";
 import { acceptsImages } from "@/lib/models-model";
-import { formatDurationMs } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import type { PendingAction, PlaygroundSession } from "./playground";
 import { conversationRows } from "./conversation-rows";
 import { MAX_LANES, ModelPicker } from "./model-picker";
-import { ModelAvatar, Pill, SectionLabel, SettingsPanel, SliderField, capabilities, formatCost, formatTokens, modelLabel, perMillion } from "./ui";
+import { ModelAvatar, Pill, SectionLabel, SettingsPanel, SliderField, capabilities, modelLabel } from "./ui";
+import { compact, formatMs, formatNumber, money, perMillion } from "@/lib/format";
 
 type Stream = ReturnType<typeof useCharoStream>;
 
@@ -51,10 +51,10 @@ function MetricsLine({ stats, highlight }: { stats: Stats; highlight?: Set<strin
   const hl = (k: string) => (highlight?.has(k) ? "text-foreground" : undefined);
   return (
     <span className="flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[11.5px] text-muted-foreground">
-      {stats.ttftMs !== undefined && <span className={hl("ttft")}>{formatDurationMs(stats.ttftMs)} to first token</span>}
+      {stats.ttftMs !== undefined && <span className={hl("ttft")}>{formatMs(stats.ttftMs)} to first token</span>}
       {stats.tps !== undefined && <span>{Math.round(stats.tps)} tok/s</span>}
-      {stats.outputTokens !== undefined && <span className={hl("tokens")}>{stats.inputTokens?.toLocaleString() ?? "—"} in · {stats.outputTokens.toLocaleString()} out</span>}
-      {stats.cost !== undefined && <span className={hl("cost")} title={stats.costEstimated ? "Estimated from the model's list price" : "From the gateway's accounting"}>{stats.costEstimated ? "≈ " : ""}{formatCost(stats.cost)}</span>}
+      {stats.outputTokens !== undefined && <span className={hl("tokens")}>{stats.inputTokens !== undefined ? formatNumber(stats.inputTokens) : "—"} in · {formatNumber(stats.outputTokens)} out</span>}
+      {stats.cost !== undefined && <span className={hl("cost")} title={stats.costEstimated ? "Estimated from the model's list price" : "From the gateway's accounting"}>{stats.costEstimated ? "≈ " : ""}{money(stats.cost, { precise: true })}</span>}
     </span>
   );
 }
@@ -415,7 +415,7 @@ function Answer({ card, name, model, temperature, stream, messages, stats, badge
 }) {
   const copy = () => void navigator.clipboard.writeText(messages.map((m) => m.content).join("\n\n")).catch(() => {});
   const label = modelLabel(name);
-  const meta = [temperature !== undefined ? `temp ${temperature}` : null, model?.context_window ? formatTokens(model.context_window) : null].filter(Boolean).join(" · ");
+  const meta = [temperature !== undefined ? `temp ${temperature}` : null, model?.context_window ? compact(model.context_window) : null].filter(Boolean).join(" · ");
   const actions = (
     <>
       <Button variant="ghost" size="icon" className="h-[30px] w-[30px] text-muted-foreground" title="Copy answer" aria-label="Copy answer" onClick={copy}><Copy className="h-3.5 w-3.5" /></Button>
@@ -499,7 +499,7 @@ function ChatSettings({ session, update, lanes, registry, onChangeModel, onAssis
               <div className="min-w-0 flex-1">
                 <div className="truncate text-[13.5px] font-semibold">{modelLabel(lanes[0] ?? "")}</div>
                 <div className="text-xs text-muted-foreground">
-                  {primary ? `${primary.model_type === "image" ? "Image" : "Chat"}${primary.context_window ? ` · ${formatTokens(primary.context_window)} context` : ""}`
+                  {primary ? `${primary.model_type === "image" ? "Image" : "Chat"}${primary.context_window ? ` · ${compact(primary.context_window)} context` : ""}`
                     : lanes[0] === "auto" ? "The gateway picks per request" : lanes[0] === "charo" ? "Guided tests and benchmarks" : ""}
                 </div>
               </div>
@@ -513,7 +513,7 @@ function ChatSettings({ session, update, lanes, registry, onChangeModel, onAssis
             {primary && (
               <div className="grid grid-cols-2 gap-2 text-xs">
                 {primary.model_type === "image"
-                  ? <div><div className="text-muted-foreground">Price</div><div className="font-mono">{primary.cost_per_image ? `$${+primary.cost_per_image.toPrecision(3)} / image` : "free"}</div></div>
+                  ? <div><div className="text-muted-foreground">Price</div><div className="font-mono">{primary.cost_per_image ? `${money(primary.cost_per_image, { precise: true })} / image` : "free"}</div></div>
                   : <>
                     <div><div className="text-muted-foreground">Input</div><div className="font-mono">{perMillion(primary.input_cost_per_token)} / 1M</div></div>
                     <div><div className="text-muted-foreground">Output</div><div className="font-mono">{perMillion(primary.output_cost_per_token)} / 1M</div></div>
@@ -534,7 +534,7 @@ function ChatSettings({ session, update, lanes, registry, onChangeModel, onAssis
                 <div key={name} className="flex items-center gap-2.5 rounded-lg border border-border px-2.5 py-2">
                   <ModelAvatar name={name} />
                   <span className="min-w-0 flex-1 truncate text-[13px]">{modelLabel(name)}</span>
-                  {m?.context_window ? <span className="font-mono text-[11.5px] text-muted-foreground">{formatTokens(m.context_window)}</span> : null}
+                  {m?.context_window ? <span className="font-mono text-[11.5px] text-muted-foreground">{compact(m.context_window)}</span> : null}
                 </div>
               );
             })}
@@ -546,7 +546,7 @@ function ChatSettings({ session, update, lanes, registry, onChangeModel, onAssis
       <section className="space-y-2">
         <div className="flex items-center justify-between">
           <SectionLabel htmlFor="playground-system-prompt">System prompt</SectionLabel>
-          <span className="font-mono text-[11px] text-muted-foreground">{g.systemPrompt.length.toLocaleString()} / 32,000</span>
+          <span className="font-mono text-[11px] text-muted-foreground">{formatNumber(g.systemPrompt.length)} / 32,000</span>
         </div>
         <textarea
           id="playground-system-prompt"
@@ -593,7 +593,7 @@ function ChatSettings({ session, update, lanes, registry, onChangeModel, onAssis
             value={g.maxTokens ?? ""}
             onChange={(e) => { const n = e.target.valueAsNumber; if (!e.target.value || (Number.isInteger(n) && n >= 1 && n <= 131072)) setGen({ maxTokens: e.target.value ? n : undefined }); }}
           />
-          <p className="text-[11.5px] text-muted-foreground">Up to {Math.min(ceiling, 131_072).toLocaleString()}{single && primary?.context_window ? " for this model" : ""}</p>
+          <p className="text-[11.5px] text-muted-foreground">Up to {formatNumber(Math.min(ceiling, 131_072))}{single && primary?.context_window ? " for this model" : ""}</p>
         </div>
       </section>
     </SettingsPanel>

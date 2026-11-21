@@ -8,7 +8,7 @@ import { Panel, Segmented } from "@/components/overview/ui";
 import type { ModelSpeedPoint } from "@/lib/obleth";
 import { linkTime, type LogsLink } from "@/lib/log-links";
 import { modelHref } from "@/lib/model-links";
-import { compact, formatMs } from "@/lib/overview-model";
+import { compact, formatMs, formatNumber } from "@/lib/format";
 import type { DayRange } from "@/lib/reports-model";
 import {
   bucketLabel,
@@ -83,7 +83,7 @@ function Detail({ row, bucket, onModel, logsFor, single }: { row: SpeedRow; buck
         </div>
         <p className="text-[12.5px] leading-relaxed text-secondary-foreground">{describeSpeed(row, bucket)}</p>
         <div className="flex flex-wrap gap-4 text-[12.5px] text-secondary-foreground">
-          <Link href={logsFor({ model: row.model })} className="hover:text-foreground">See its {row.requests.toLocaleString()} requests →</Link>
+          <Link href={logsFor({ model: row.model })} className="hover:text-foreground">See its {formatNumber(row.requests)} requests →</Link>
           <Link href={modelHref(row.model)} className="hover:text-foreground">Open the model →</Link>
           {!single && <button type="button" onClick={() => onModel(row.model)} className="hover:text-foreground">Report on this model only</button>}
         </div>
@@ -213,7 +213,7 @@ export function ModelSpeed({ range, previous, filters, against, retentionDays, m
                         </span>
                         <Squares count={starts.length}>
                           {r.cells.map((c, i) => c ? (
-                            <span key={starts[i]} title={`${bucketLabel(c.t, bucket)}: ${tps(c.tps)} tok/s, ${Math.round(c.ratio * 100)}% of its usual · ${c.rated.toLocaleString()} requests`} className="block h-[22px] rounded-[4px]" style={{ background: r.few ? "hsl(240 5% 13%)" : shade(c.ratio) }} />
+                            <span key={starts[i]} title={`${bucketLabel(c.t, bucket)}: ${tps(c.tps)} tok/s, ${Math.round(c.ratio * 100)}% of its usual · ${formatNumber(c.rated)} requests`} className="block h-[22px] rounded-[4px]" style={{ background: r.few ? "hsl(240 5% 13%)" : shade(c.ratio) }} />
                           ) : (
                             <span key={starts[i]} title={`${bucketLabel(starts[i], bucket)}: no requests`} className="block h-[22px] rounded-[4px] border border-dashed border-border" />
                           ))}

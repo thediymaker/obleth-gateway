@@ -27,9 +27,8 @@ import {
 } from "@/lib/access-model";
 import type { AdminUser } from "@/lib/auth/users";
 import { logsHref } from "@/lib/log-links";
-import { money } from "@/lib/models-model";
 import type { ApiKey, BudgetUsage, Tenant } from "@/lib/obleth";
-import { compact } from "@/lib/overview-model";
+import { compact, money } from "@/lib/format";
 import { cn, getJson } from "@/lib/utils";
 
 type NavId = "overview" | "profile" | "limits" | "hours" | "budget" | "models" | "guardrails" | "compression" | "advanced" | "keys" | "people" | "activity";

@@ -171,7 +171,7 @@ export function DataSection({ retention }: { retention: UsageRetentionView | nul
   const [notice, setNotice] = useState<{ text: string; strong?: boolean } | null>(null);
   const choices = [...new Set([...PRESETS, retention?.days ?? 180])].sort((a, b) => a - b);
 
-  function compact() {
+  function dropOld() {
     start(async () => {
       const ok = await confirm({ title: `Drop history older than ${retention?.days ?? days} days?`, description: "Request logs, reports and traces for those days are deleted now. This cannot be undone.", confirmLabel: "Drop it" });
       if (!ok) return;
@@ -209,7 +209,7 @@ export function DataSection({ retention }: { retention: UsageRetentionView | nul
         <p className="px-[18px] py-3 text-[12.5px] text-muted-foreground">The retention setting couldn&apos;t be read.</p>
       )}
       <Setting label="Drop old history now" hint="Drops the days past the window straight away. Asks first.">
-        <Button type="button" variant="outline" size="sm" className="self-start" disabled={pending || !retention} onClick={compact}>Drop what&apos;s past {retention?.days ?? days} days…</Button>
+        <Button type="button" variant="outline" size="sm" className="self-start" disabled={pending || !retention} onClick={dropOld}>Drop what&apos;s past {retention?.days ?? days} days…</Button>
       </Setting>
       <Setting label="Backup" hint="Your models, tenants, keys, MCP servers and settings as one file. Provider secrets stay encrypted, so restoring needs the same OBLETH_ENCRYPTION_KEY; alert credentials are included as stored.">
         <BackupRestore />

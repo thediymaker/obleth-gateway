@@ -25,7 +25,7 @@ import {
 } from "@/lib/key-access-model";
 import { ReportsTabs } from "@/components/reports/reports-tabs";
 import { logsHref } from "@/lib/log-links";
-import { compact } from "@/lib/overview-model";
+import { compact, formatNumber } from "@/lib/format";
 import type { KeyRejectionAgg, KeySource } from "@/lib/obleth";
 import { cn, getJson } from "@/lib/utils";
 
@@ -155,8 +155,8 @@ function KeyRow({ row, range, now, open, onToggle }: { row: KeyAccessRow; range:
                       {p.newCountry && <NewTag />}
                     </span>
                   </td>
-                  <td className="py-1.5 pr-3 text-right font-mono tabular-nums">{p.requests.toLocaleString()}</td>
-                  <td className="py-1.5 pr-3 text-right font-mono tabular-nums">{p.distinctIps.toLocaleString()}</td>
+                  <td className="py-1.5 pr-3 text-right font-mono tabular-nums">{formatNumber(p.requests)}</td>
+                  <td className="py-1.5 pr-3 text-right font-mono tabular-nums">{formatNumber(p.distinctIps)}</td>
                   <td className="py-1.5 text-right text-muted-foreground" title={stamp(p.lastSeenMs)}>{ago(p.lastSeenMs, now)}</td>
                 </tr>
               ))}
@@ -238,7 +238,7 @@ export function KeyAccessView({
           <h1 className="text-[26px] font-semibold tracking-tight">Reports</h1>
           <p className="mt-1 text-[13px] text-muted-foreground" role="status">
             {summary
-              ? `${summary.keys.toLocaleString()} keys were used from ${summary.networks.toLocaleString()} networks in ${words}.`
+              ? `${formatNumber(summary.keys)} keys were used from ${formatNumber(summary.networks)} networks in ${words}.`
               : query.isLoading
                 ? "Reading…"
                 : "Where keys were used from could not be read."}
@@ -263,11 +263,11 @@ export function KeyAccessView({
 
       {summary && (
         <div className={cn("grid grid-cols-2 gap-3 md:grid-cols-4", query.isPlaceholderData && "opacity-60")}>
-          <Kpi label={`Keys used · ${range}`} value={summary.keys.toLocaleString()} detail={`from ${summary.countries} ${summary.countries === 1 ? "country" : "countries"}`} trend={[]} />
-          <Kpi label={`Networks · ${range}`} value={summary.networks.toLocaleString()} detail="IPv4 /24 or IPv6 /48" trend={[]} />
+          <Kpi label={`Keys used · ${range}`} value={formatNumber(summary.keys)} detail={`from ${summary.countries} ${summary.countries === 1 ? "country" : "countries"}`} trend={[]} />
+          <Kpi label={`Networks · ${range}`} value={formatNumber(summary.networks)} detail="IPv4 /24 or IPv6 /48" trend={[]} />
           <Kpi
             label="From a new country"
-            value={summary.keysInNewCountry.toLocaleString()}
+            value={formatNumber(summary.keysInNewCountry)}
             detail={summary.keysInNewCountry ? "keys seen from a country for the first time" : "no key was seen anywhere new"}
             trend={[]}
             emphasis={summary.keysInNewCountry > 0}
@@ -369,7 +369,7 @@ export function KeyAccessView({
                       {r.network_name && <span className="mt-0.5 block text-xs text-muted-foreground">{r.network_name}</span>}
                     </td>
                     <td className={cn("py-[9px] pr-3", !r.client_country && "text-muted-foreground")}>{placeLabel(r.client_country, r.client_ip)}</td>
-                    <td className="py-[9px] pr-3 text-right font-mono text-xs tabular-nums">{r.count.toLocaleString()}</td>
+                    <td className="py-[9px] pr-3 text-right font-mono text-xs tabular-nums">{formatNumber(r.count)}</td>
                     <td className="py-[9px] pr-3 text-right text-xs text-muted-foreground" title={`First ${stamp(r.first_seen_ms)}, last ${stamp(r.last_seen_ms)}`}>{ago(r.last_seen_ms, now)}</td>
                     <td className="max-w-[18rem] truncate py-[9px] pr-[18px] text-xs text-muted-foreground" title={r.sample_user_agent}>{r.sample_user_agent || "—"}</td>
                   </tr>

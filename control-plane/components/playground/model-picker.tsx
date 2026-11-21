@@ -7,7 +7,8 @@ import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/compone
 import { lifecycleStatus } from "@/lib/models-model";
 import type { FairshareLiveView, ModelRoute } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
-import { ModelAvatar, Pill, SectionLabel, capabilities, formatTokens, modelLabel, perMillion } from "./ui";
+import { ModelAvatar, Pill, SectionLabel, capabilities, modelLabel } from "./ui";
+import { compact, money, perMillion } from "@/lib/format";
 
 export const MAX_LANES = 4;
 
@@ -188,7 +189,7 @@ export function ModelPicker({ open, onOpenChange, models, selected, locked, onCh
                           </span>
                           {e.kind === "special" && <span className="block truncate text-[11.5px] text-muted-foreground">{e.detail}</span>}
                         </span>
-                        {e.kind === "chat" && <span className="w-10 text-right font-mono text-[11.5px] text-muted-foreground">{formatTokens(e.model!.context_window)}</span>}
+                        {e.kind === "chat" && <span className="w-10 text-right font-mono text-[11.5px] text-muted-foreground">{compact(e.model!.context_window)}</span>}
                         {e.kind === "chat" && e.model && (
                           <span className="hidden gap-0.5 sm:flex" aria-hidden="true">
                             <Wrench className={cn("h-3.5 w-3.5", e.model.supports_function_calling ? "text-muted-foreground" : "text-muted/80")} />
@@ -254,10 +255,10 @@ function Detail({ entry, inFlight, cap }: { entry: Entry; inFlight?: number; cap
       {m && (
         <div className="grid grid-cols-2 gap-x-4 gap-y-3 text-xs">
           {m.model_type === "image" ? (
-            <Stat label="Price" value={m.cost_per_image ? `$${+m.cost_per_image.toPrecision(3)} / image` : "free"} />
+            <Stat label="Price" value={m.cost_per_image ? `${money(m.cost_per_image, { precise: true })} / image` : "free"} />
           ) : (
             <>
-              <Stat label="Context" value={`${formatTokens(m.context_window)} tokens`} />
+              <Stat label="Context" value={`${compact(m.context_window)} tokens`} />
               <Stat label="Type" value="Chat" plain />
               <Stat label="Input" value={`${perMillion(m.input_cost_per_token)} / 1M`} />
               <Stat label="Output" value={`${perMillion(m.output_cost_per_token)} / 1M`} />

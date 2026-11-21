@@ -12,7 +12,7 @@ import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { MCP_STATE_LABEL, probeLatency, type McpRow, type McpState } from "@/lib/mcp-model";
 import type { ModelRoute } from "@/lib/obleth";
-import { compact } from "@/lib/overview-model";
+import { compact } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
 /** Monochrome: filled dot answering, half dot old-style or checking, dashed off, white pill not answering. */

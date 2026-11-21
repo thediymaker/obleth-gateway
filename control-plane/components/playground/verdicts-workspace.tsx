@@ -10,6 +10,7 @@ import { cn } from "@/lib/utils";
 import type { PlaygroundSession } from "./playground";
 import { Segmented } from "./ui";
 import { useStoppable } from "./use-stoppable";
+import { formatNumber } from "@/lib/format";
 
 type QuestionDraft = NonNullable<PlaygroundSession["verdictQuestions"]>[number];
 
@@ -355,7 +356,7 @@ export function VerdictsWorkspace({ session, update, models, loading }: {
             placeholder={'My card was charged twice for order A-104.\n\n…or paste JSON: {"ticket": {...}, "order": {...}}\n\n…or add photos below.'}
             className={cn(fieldCls, "min-h-48 flex-1 resize-none p-3 font-mono text-xs leading-relaxed")}
             onChange={(e) => update({ verdictState: e.target.value })} />
-          <div className="flex justify-between text-[11.5px] text-muted-foreground"><span>{stateKind}</span><span className="font-mono">{stateText.length.toLocaleString()} chars</span></div>
+          <div className="flex justify-between text-[11.5px] text-muted-foreground"><span>{stateKind}</span><span className="font-mono">{formatNumber(stateText.length)} chars</span></div>
           <div className="flex flex-wrap items-center gap-2">
             {images.map((src, i) => (
               <div key={i} className="relative">

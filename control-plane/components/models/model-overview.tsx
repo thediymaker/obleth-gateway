@@ -4,14 +4,15 @@ import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import Link from "next/link";
 import { Area, ComposedChart, Line, ResponsiveContainer, Tooltip, XAxis, YAxis, CartesianGrid } from "recharts";
-import { axisTick, chartGrid, compactAxis, timeCursor } from "@/components/chart-tooltip";
+import { axisTick, chartGrid, timeCursor } from "@/components/chart-tooltip";
 import { Meter, Panel, Segmented } from "@/components/overview/ui";
 import { usePoolLoad } from "@/components/fairshare/hooks";
 import { Tile } from "@/components/models/ui";
 import { MODEL_SERIES_BUCKET_MS, priceLabel, RUNS_LABELS, tagLabels, type ModelOverviewData, type RunsOn } from "@/lib/models-model";
 import type { ModelCapacityStatus, ModelHealthCheck, ModelHealthSummary, ModelRoute, UsageLogHistogram } from "@/lib/obleth";
 import { logsHref } from "@/lib/log-links";
-import { changeLabel, compact, describeAudit, formatMs } from "@/lib/overview-model";
+import { changeLabel, describeAudit } from "@/lib/overview-model";
+import { compact, formatMs, formatNumber } from "@/lib/format";
 import { cn, getJson } from "@/lib/utils";
 import { auditHref } from "@/lib/audit-model";
 import { boonsWaitingOnFunctionCalling } from "@/lib/boon-availability";
@@ -59,7 +60,7 @@ function buildRows(data: ModelOverviewData, measure: Measure): Row[] {
 function ChartTip({ active, payload, measure }: { active?: boolean; payload?: { payload: Row }[]; measure: Measure }) {
   const row = payload?.[0]?.payload;
   if (!active || !row) return null;
-  const fmt = (v: number | null) => (v === null ? "—" : measure === "ttft" ? formatMs(v) : measure === "throughput" ? `${compact(v)} tok/s` : v.toLocaleString());
+  const fmt = (v: number | null) => (v === null ? "—" : measure === "ttft" ? formatMs(v) : measure === "throughput" ? `${compact(v)} tok/s` : formatNumber(v));
   return (
     <div className="min-w-40 rounded-lg border border-border bg-[hsl(240_5%_9%)] px-3 py-2 text-xs shadow-xl">
       <p className="mb-1.5 font-mono text-muted-foreground">{row.label}</p>
@@ -105,7 +106,7 @@ function TrafficChart({ overview }: { overview: OverviewRead }) {
               <ComposedChart data={rows} margin={{ top: 8, right: 4, left: 0, bottom: 0 }}>
                 <CartesianGrid {...chartGrid} vertical={false} />
                 <XAxis dataKey="label" tick={axisTick} axisLine={false} tickLine={false} minTickGap={56} height={20} />
-                <YAxis tick={axisTick} axisLine={false} tickLine={false} width={44} allowDecimals={false} tickFormatter={measure === "ttft" ? (v: number) => formatMs(v) : compactAxis} />
+                <YAxis tick={axisTick} axisLine={false} tickLine={false} width={44} allowDecimals={false} tickFormatter={measure === "ttft" ? (v: number) => formatMs(v) : compact} />
                 <Tooltip cursor={timeCursor} content={<ChartTip measure={measure} />} />
                 <Area type="monotone" dataKey="cur" stroke="none" fill={CURRENT} fillOpacity={0.07} isAnimationActive={false} connectNulls={measure === "requests"} />
                 <Line type="monotone" dataKey="prev" stroke={PREVIOUS} strokeWidth={2} strokeDasharray="5 4" dot={false} isAnimationActive={false} connectNulls={measure === "requests"} />

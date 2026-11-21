@@ -9,10 +9,11 @@ import { Button } from "@/components/ui/button";
 import { classLabel, ERROR_CLASSES, failureReason, isErrorClass } from "@/lib/failure-classes";
 import { logsHref } from "@/lib/log-links";
 import { modelHref } from "@/lib/model-links";
-import { cost, describeRequest, duration, effortText, helperCallsParams, helperPurpose, HTTP_REASONS, isFailure, servedRequest, timeSplit, type LogFilters } from "@/lib/logs-model";
+import { describeRequest, effortText, helperCallsParams, helperPurpose, HTTP_REASONS, isFailure, servedRequest, timeSplit, type LogFilters } from "@/lib/logs-model";
 import type { SpanEntry, UsageLogEntry } from "@/lib/obleth";
 import { parseAttrs, parseRouteExplain, spanHint, spanLabel, timeline, type SpanNode } from "@/lib/trace-model";
 import { cn } from "@/lib/utils";
+import { formatMs, formatNumber, money } from "@/lib/format";
 
 function stamp(ms: number) {
   const d = new Date(ms);
@@ -22,7 +23,7 @@ function stamp(ms: number) {
 function title(row: UsageLogEntry): string {
   if (isFailure(row)) return classLabel(row.error_class) || HTTP_REASONS[row.status_code] || `Failed with HTTP ${row.status_code}`;
   if (row.cache_status === "hit") return "Answered from the cache";
-  return `Answered in ${duration(row.total_ms)}`;
+  return `Answered in ${formatMs(row.total_ms)}`;
 }
 
 function Fact({ label, children, mono, wide }: { label: string; children: React.ReactNode; mono?: boolean; wide?: boolean }) {
@@ -54,7 +55,7 @@ export function StepDetail({ node, onClose }: { node: SpanNode; onClose: () => v
           {spanHint(span.span_name) && <p className="text-xs text-muted-foreground">{spanHint(span.span_name)}</p>}
         </div>
         <div className="flex items-center gap-3">
-          <span className="font-mono text-xs text-muted-foreground">{duration(span.duration_ms)}{span.status === "error" ? " · error" : ""}</span>
+          <span className="font-mono text-xs text-muted-foreground">{formatMs(span.duration_ms)}{span.status === "error" ? " · error" : ""}</span>
           <button type="button" onClick={onClose} aria-label="Close step details" className="text-muted-foreground hover:text-foreground"><X className="h-3.5 w-3.5" /></button>
         </div>
       </div>
@@ -93,7 +94,7 @@ export function StepDetail({ node, onClose }: { node: SpanNode; onClose: () => v
                     <span className="h-full flex-1 bg-muted-foreground/60" />
                   </span>
                 </span>
-                <span className="truncate font-mono text-muted-foreground" title={String(raw.tools ?? "")}>{duration(toolMs)} + {duration(modelMs)}{raw.tools ? ` · ${raw.tools}` : ""}</span>
+                <span className="truncate font-mono text-muted-foreground" title={String(raw.tools ?? "")}>{formatMs(toolMs)} + {formatMs(modelMs)}{raw.tools ? ` · ${raw.tools}` : ""}</span>
               </div>
             );
           })}
@@ -222,7 +223,7 @@ export function RequestPanel({
         <section aria-label="Timeline" className="space-y-2">
           <div className="flex items-baseline justify-between">
             <p className="text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">Timeline</p>
-            <p className="text-[11.5px] text-muted-foreground">one scale · {duration(tl?.totalMs ?? row.total_ms)} in all{traced ? " · click a step for its details" : row.has_trace ? "" : " · not traced"}</p>
+            <p className="text-[11.5px] text-muted-foreground">one scale · {formatMs(tl?.totalMs ?? row.total_ms)} in all{traced ? " · click a step for its details" : row.has_trace ? "" : " · not traced"}</p>
           </div>
           {tl ? (
             <div className="space-y-1">
@@ -241,7 +242,7 @@ export function RequestPanel({
                     <span className="relative h-2.5 rounded-[3px] bg-muted/40">
                       <span className={cn("absolute inset-y-0 rounded-[3px]", err ? "bg-foreground" : "bg-muted-foreground")} style={{ left: `${s.left}%`, width: `${s.width}%` }} />
                     </span>
-                    <span className="text-right font-mono text-xs text-muted-foreground">{duration(s.node.span.duration_ms)}</span>
+                    <span className="text-right font-mono text-xs text-muted-foreground">{formatMs(s.node.span.duration_ms)}</span>
                   </button>
                 );
               })}
@@ -258,7 +259,7 @@ export function RequestPanel({
                   <span className="relative h-2.5 rounded-[3px] bg-muted/40">
                     <span className={cn("absolute inset-y-0 rounded-[3px]", failed && label === "Until the first token" ? "bg-foreground" : "bg-muted-foreground")} style={{ left: `${split.total ? ((from as number) / split.total) * 100 : 0}%`, width: `${split.total ? Math.max(((ms as number) / split.total) * 100, (ms as number) > 0 ? 0.6 : 0) : 0}%` }} />
                   </span>
-                  <span className="text-right font-mono text-xs text-muted-foreground">{duration(ms as number)}</span>
+                  <span className="text-right font-mono text-xs text-muted-foreground">{formatMs(ms as number)}</span>
                 </div>
               ))}
             </div>
@@ -281,7 +282,7 @@ export function RequestPanel({
                       <span className="font-mono">{h.model}</span> · {helperPurpose(h.request_type)}
                       {isFailure(h) && <span className="font-semibold"> · failed with HTTP {h.status_code}</span>}
                     </span>
-                    <span className="font-mono text-xs text-muted-foreground">{h.total_tokens.toLocaleString()} {h.total_tokens === 1 ? "token" : "tokens"} · {cost(h.cost_usd)}</span>
+                    <span className="font-mono text-xs text-muted-foreground">{formatNumber(h.total_tokens)} {h.total_tokens === 1 ? "token" : "tokens"} · {money(h.cost_usd, { precise: true })}</span>
                   </Link>
                 </li>
               ))}
@@ -290,14 +291,14 @@ export function RequestPanel({
         )}
 
         <dl aria-label="Numbers" className="grid grid-cols-2 gap-x-5 sm:grid-cols-4">
-          <Fact label="Tokens in" mono>{row.input_tokens.toLocaleString()}</Fact>
-          <Fact label="Tokens out" mono>{row.output_tokens.toLocaleString()}</Fact>
-          {row.cached_input_tokens != null && <Fact label="Cached input tokens" mono>{row.cached_input_tokens.toLocaleString()}</Fact>}
-          <Fact label="Cost" mono>{cost(row.cost_usd)}</Fact>
+          <Fact label="Tokens in" mono>{formatNumber(row.input_tokens)}</Fact>
+          <Fact label="Tokens out" mono>{formatNumber(row.output_tokens)}</Fact>
+          {row.cached_input_tokens != null && <Fact label="Cached input tokens" mono>{formatNumber(row.cached_input_tokens)}</Fact>}
+          <Fact label="Cost" mono>{money(row.cost_usd, { precise: true })}</Fact>
           <Fact label="Energy" mono>{row.energy_wh > 0 ? `${row.energy_wh.toFixed(2)} Wh · ${row.co2_g.toFixed(2)} g CO₂` : "—"}</Fact>
-          <Fact label="Waited for a slot" mono>{duration(row.queue_wait_ms)}</Fact>
-          <Fact label="First token" mono>{row.ttft_ms > 0 ? duration(row.ttft_ms) : row.streamed === false ? "Not streamed" : "—"}</Fact>
-          <Fact label="Total" mono>{duration(row.total_ms)}</Fact>
+          <Fact label="Waited for a slot" mono>{formatMs(row.queue_wait_ms)}</Fact>
+          <Fact label="First token" mono>{row.ttft_ms > 0 ? formatMs(row.ttft_ms) : row.streamed === false ? "Not streamed" : "—"}</Fact>
+          <Fact label="Total" mono>{formatMs(row.total_ms)}</Fact>
           <Fact label="Type">{helperPurpose(row.request_type)}</Fact>
           {row.model_family && (
             <Fact label="Called as" wide>

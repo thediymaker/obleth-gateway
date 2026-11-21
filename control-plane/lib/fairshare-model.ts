@@ -8,9 +8,9 @@ import type {
   TenantFairshareView,
 } from "@/lib/obleth";
 import { isAboveShare, isWaitingBelowShare } from "@/lib/fairshare";
-import { formatNumber } from "@/lib/utils";
 import { isBenchmarkRoute } from "@/lib/overview-model";
 import { poolOccupancy } from "@/lib/occupancy";
+import { formatNumber } from "@/lib/format";
 
 // ---------------------------------------------------------------------------
 // Scope and gateway modes

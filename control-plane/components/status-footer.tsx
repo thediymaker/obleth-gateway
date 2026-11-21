@@ -3,7 +3,8 @@
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { cn, formatCurrency, formatNumber } from "@/lib/utils";
+import { formatNumber, money } from "@/lib/format";
+import { cn } from "@/lib/utils";
 import type { OverviewSummary } from "@/lib/overview-summary";
 
 const POLL_MS = 30_000;
@@ -92,7 +93,7 @@ export function StatusFooter() {
           <Divider />
           <Metric
             label="Cost"
-            value={summary.hasPricing ? formatCurrency(summary.cost) : "--"}
+            value={summary.hasPricing ? money(summary.cost) : "--"}
             detail={summary.hasPricing ? undefined : "no pricing"}
           />
           <Divider />

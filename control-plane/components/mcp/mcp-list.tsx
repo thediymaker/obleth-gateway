@@ -12,7 +12,7 @@ import { Button } from "@/components/ui/button";
 import type { McpServerTestRow } from "@/lib/charo/mcp/types";
 import { buildMcpRows, mcpLine, probeLatency, toolCapable } from "@/lib/mcp-model";
 import type { DailyStatsView, McpServer, ModelRoute } from "@/lib/obleth";
-import { compact } from "@/lib/overview-model";
+import { compact } from "@/lib/format";
 import { cn, getJson } from "@/lib/utils";
 
 const COLS = "grid-cols-[minmax(0,1.1fr)_150px_70px_minmax(0,1.4fr)_110px_minmax(0,1.2fr)_96px]";

@@ -10,6 +10,7 @@ import type {
 import { belowShareInPools, countsScope } from "@/lib/fairshare";
 import { modelHref } from "@/lib/model-links";
 import { poolOccupancy } from "@/lib/occupancy";
+import { formatNumber } from "@/lib/format";
 
 /** The Overview's one time control. Every tile, chart and table follows it. */
 export type OverviewRange = "1h" | "24h" | "7d";
@@ -178,7 +179,7 @@ export interface AttentionItem {
   actions: { label: string; href: string; primary?: boolean }[];
 }
 
-const plural = (n: number, one: string, many = `${one}s`) => `${n.toLocaleString()} ${n === 1 ? one : many}`;
+const plural = (n: number, one: string, many = `${one}s`) => `${formatNumber(n)} ${n === 1 ? one : many}`;
 
 function ago(iso: string | null | undefined, now: number): string | null {
   if (!iso) return null;
@@ -220,7 +221,7 @@ export function buildAttention(fleet: FleetTile[], fairshare: FairshareLiveView 
       badge: "Full",
       urgent: true,
       title: `${t.name} is at capacity and queuing`,
-      detail: `${t.inFlight.toLocaleString()} of ${t.cap.toLocaleString()} slots in use · ${t.queued.toLocaleString()} queued`,
+      detail: `${formatNumber(t.inFlight)} of ${formatNumber(t.cap)} slots in use · ${formatNumber(t.queued)} queued`,
       actions: [{ label: "Open the pool", href: `/fairshare?pool=${encodeURIComponent(t.name)}`, primary: true }, { label: "Capacity", href: modelHref(t.name, "capacity") }],
     });
   }
@@ -247,7 +248,7 @@ export function buildAttention(fleet: FleetTile[], fairshare: FairshareLiveView 
       badge: "Below share",
       urgent: false,
       title: `${t.name || "A tenant"} is waiting below its fair share${model === null ? "" : ` on ${model}`}`,
-      detail: `${plural(t.queued, "request")} queued${here} while it holds ${plural(t.in_flight, "slot")} against a fair share of ${Math.floor(t.expected_slots).toLocaleString()}`,
+      detail: `${plural(t.queued, "request")} queued${here} while it holds ${plural(t.in_flight, "slot")} against a fair share of ${formatNumber(Math.floor(t.expected_slots))}`,
       actions: model === null
         ? [{ label: "Open Fairshare", href: "/fairshare" }]
         : [{ label: "Open the pool", href: `/fairshare?pool=${encodeURIComponent(model)}`, primary: true }],
@@ -274,18 +275,3 @@ export function describeAudit(entry: AuditEntry, names: { models: Map<string, st
   return { actor: entry.actor || "system", action, target };
 }
 
-export function compact(n: number): string {
-  if (!Number.isFinite(n)) return "0";
-  const abs = Math.abs(n);
-  if (abs >= 1e9) return `${+(n / 1e9).toFixed(abs >= 1e10 ? 0 : 1)}B`;
-  if (abs >= 1e6) return `${+(n / 1e6).toFixed(abs >= 1e7 ? 0 : 1)}M`;
-  if (abs >= 1e3) return `${+(n / 1e3).toFixed(abs >= 1e4 ? 0 : 1)}K`;
-  return String(Math.round(n));
-}
-
-export function formatMs(ms: number): string {
-  if (!ms || !Number.isFinite(ms)) return "—";
-  if (ms >= 60_000) return `${+(ms / 60_000).toFixed(1)} min`;
-  if (ms >= 1000) return `${+(ms / 1000).toFixed(ms >= 10_000 ? 0 : 1)} s`;
-  return `${Math.round(ms)} ms`;
-}

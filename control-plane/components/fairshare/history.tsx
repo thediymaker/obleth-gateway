@@ -2,9 +2,10 @@
 
 import { memo, useMemo, useState } from "react";
 import { Area, AreaChart, Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { axisTick, chartGrid, compactAxis, timeCursor } from "@/components/chart-tooltip";
+import { axisTick, chartGrid, timeCursor } from "@/components/chart-tooltip";
 import { GROUP_TONES, MAX_CHART_ROWS, OTHER_TONE, thinHistory, type GroupHistoryPoint, type GroupKey } from "@/lib/fairshare-model";
 import { Panel, Segmented } from "@/components/overview/ui";
+import { compact, formatNumber } from "@/lib/format";
 
 type Window = "15m" | "1h";
 const WINDOW_MS: Record<Window, number> = { "15m": 900_000, "1h": 3_600_000 };
@@ -19,10 +20,10 @@ function HistoryTooltip({ active, payload, series }: { active?: boolean; payload
     <div className="min-w-44 rounded-lg border border-border bg-[hsl(240_5%_9%)] px-3 py-2 text-xs shadow-xl">
       <p className="mb-1.5 font-mono text-muted-foreground">{row.time}</p>
       {[...series].reverse().map((s) => (
-        <div key={s.key} className="flex items-center gap-2"><span className="h-2 w-2 rounded-sm" style={{ background: s.tone }} /><span className="text-muted-foreground">{s.name}</span><span className="ml-auto pl-6 font-mono tabular-nums">{Number(row[s.key] ?? 0).toLocaleString()}</span></div>
+        <div key={s.key} className="flex items-center gap-2"><span className="h-2 w-2 rounded-sm" style={{ background: s.tone }} /><span className="text-muted-foreground">{s.name}</span><span className="ml-auto pl-6 font-mono tabular-nums">{formatNumber(Number(row[s.key] ?? 0))}</span></div>
       ))}
-      <div className="mt-1 flex justify-between gap-6 border-t border-border pt-1"><span>Running</span><span className="font-mono tabular-nums">{total.toLocaleString()}</span></div>
-      <div className="flex justify-between gap-6 text-muted-foreground"><span>Waiting</span><span className="font-mono tabular-nums">{Number(row.queued).toLocaleString()}</span></div>
+      <div className="mt-1 flex justify-between gap-6 border-t border-border pt-1"><span>Running</span><span className="font-mono tabular-nums">{formatNumber(total)}</span></div>
+      <div className="flex justify-between gap-6 text-muted-foreground"><span>Waiting</span><span className="font-mono tabular-nums">{formatNumber(Number(row.queued))}</span></div>
     </div>
   );
 }
@@ -99,7 +100,7 @@ export const RunningHistory = memo(function RunningHistory({ history, groups, ol
                 <AreaChart data={rows} syncId="fairshare-history" margin={{ top: 6, right: 4, left: 0, bottom: 0 }}>
                   <CartesianGrid {...chartGrid} vertical={false} />
                   <XAxis dataKey="time" hide />
-                  <YAxis tick={axisTick} axisLine={false} tickLine={false} width={44} allowDecimals={false} tickFormatter={compactAxis} />
+                  <YAxis tick={axisTick} axisLine={false} tickLine={false} width={44} allowDecimals={false} tickFormatter={compact} />
                   <Tooltip cursor={timeCursor} content={<HistoryTooltip series={series} />} />
                   {series.map((s) => (
                     <Area key={s.key} type="monotone" dataKey={s.key} name={s.name} stackId="running" stroke="hsl(240 5% 7%)" strokeWidth={2} fill={s.tone} fillOpacity={1} isAnimationActive={false} />
@@ -109,7 +110,7 @@ export const RunningHistory = memo(function RunningHistory({ history, groups, ol
             </div>
             <div className="flex items-center justify-between pl-11 pt-1 text-xs">
               <span className="text-secondary-foreground">Waiting</span>
-              <span className="text-muted-foreground">{peak ? <>Peak <span className="text-foreground">{peak.queued.toLocaleString()}</span> at {peak.time}</> : "Nothing waited in this window"}</span>
+              <span className="text-muted-foreground">{peak ? <>Peak <span className="text-foreground">{formatNumber(peak.queued)}</span> at {peak.time}</> : "Nothing waited in this window"}</span>
             </div>
             <div className="h-[60px]">
               <ResponsiveContainer width="100%" height="100%">

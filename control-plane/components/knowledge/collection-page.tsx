@@ -19,11 +19,10 @@ import { useConfirm } from "@/components/ui/confirm-dialog";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Select } from "@/components/ui/select";
 import { actionError } from "@/lib/action-result";
-import { formatBytes } from "@/lib/format";
+import { compact, formatBytes, formatNumber } from "@/lib/format";
 import { COLLECTION_STATUS_LABEL, collectionGlyph, collectionHref, collectionStatus, injectionSkipReason, retrievalUse } from "@/lib/knowledge-format";
 import { modelHref } from "@/lib/models-model";
 import type { AuditEntry, DailyStatsView, KnowledgeCollection, KnowledgeDocument, KnowledgeHit, KnowledgeSettingsView, ModelRoute } from "@/lib/obleth";
-import { compact } from "@/lib/overview-model";
 import { cn, getJson } from "@/lib/utils";
 
 const DOC_COLS = "grid-cols-[minmax(0,1fr)_90px_70px_minmax(110px,160px)_150px]";
@@ -71,7 +70,7 @@ function SearchPanel({ collection, documents, settings }: { collection: Knowledg
     <section id="search" aria-label="Try a search" className="scroll-mt-24 rounded-xl border border-border bg-card px-[18px] pb-3 pt-4">
       <h2 className="text-sm font-semibold">Try a search</h2>
       <p className="mt-0.5 text-xs text-muted-foreground">
-        What a model would be handed for a question, with the current retrieval settings{settings ? `: top ${settings.top_k}, score at least ${settings.min_score}, up to ${settings.max_context_tokens.toLocaleString()} tokens` : ""}.
+        What a model would be handed for a question, with the current retrieval settings{settings ? `: top ${settings.top_k}, score at least ${settings.min_score}, up to ${formatNumber(settings.max_context_tokens)} tokens` : ""}.
       </p>
       {neverIndexed ? (
         <p className="mt-3 text-[12.5px] text-secondary-foreground">Nothing is indexed yet. Upload a document and wait for it to show Indexed.</p>

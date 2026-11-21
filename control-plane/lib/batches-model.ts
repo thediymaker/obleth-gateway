@@ -1,4 +1,5 @@
 import type { AdminBatch, BatchStatus } from "@/lib/obleth";
+import { formatNumber } from "@/lib/format";
 
 /** Statuses that still have work ahead of them. */
 const ACTIVE: BatchStatus[] = ["validating", "in_progress", "finalizing", "cancelling"];
@@ -98,7 +99,7 @@ export function batchState(b: AdminBatch, now: number): BatchState {
       return {
         label: "Running",
         tone: "running",
-        detail: eta != null ? `About ${duration(eta)} left at this pace` : `${remaining.toLocaleString()} requests to go`,
+        detail: eta != null ? `About ${duration(eta)} left at this pace` : `${formatNumber(remaining)} requests to go`,
       };
     }
     case "finalizing":
@@ -107,7 +108,7 @@ export function batchState(b: AdminBatch, now: number): BatchState {
       return {
         label: "Done",
         tone: b.failed > 0 ? "problem" : "done",
-        detail: b.failed > 0 ? `${b.failed.toLocaleString()} request${b.failed === 1 ? "" : "s"} failed` : null,
+        detail: b.failed > 0 ? `${formatNumber(b.failed)} request${b.failed === 1 ? "" : "s"} failed` : null,
       };
     case "failed":
       return { label: "Couldn't start", tone: "problem", detail: firstError(b) ?? "The input file had errors" };
@@ -115,7 +116,7 @@ export function batchState(b: AdminBatch, now: number): BatchState {
       return {
         label: "Ran out of time",
         tone: "problem",
-        detail: `${remaining.toLocaleString()} request${remaining === 1 ? "" : "s"} didn't run before the ${b.completion_window} deadline`,
+        detail: `${formatNumber(remaining)} request${remaining === 1 ? "" : "s"} didn't run before the ${b.completion_window} deadline`,
       };
     case "cancelling":
       return { label: "Cancelling", tone: "stopped", detail: "Requests already running finish first" };

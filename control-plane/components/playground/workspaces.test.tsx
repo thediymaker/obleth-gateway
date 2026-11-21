@@ -71,7 +71,7 @@ describe("UnifiedWorkspace", () => {
 
     expect(host.textContent).toContain("You · sent to 2 models");
     expect(host.textContent?.match(/Which is faster\?/g)).toHaveLength(1);
-    expect(card("alpha").textContent).toContain("300ms to first token");
+    expect(card("alpha").textContent).toContain("300 ms to first token");
     expect(card("alpha").textContent).toContain("50 tok/s"); // 50 tokens over the 1 s after the first
     expect(card("alpha").textContent).toContain("Fastest first token");
     expect(card("beta").textContent).toContain("Fewest tokens");

@@ -1,4 +1,5 @@
 import type { AdminUser } from "@/lib/auth/users";
+import { compact, money } from "@/lib/format";
 import { keyQueryParams, type KeyListQuery } from "@/lib/key-query";
 import { networksSummary } from "@/lib/key-networks";
 import type { ApiKey, BudgetUsage, FairshareLiveView, KeyUsageSummary, NamedNetwork, Tenant, UsageAgg, WeeklyWindow } from "@/lib/obleth";
@@ -183,17 +184,6 @@ export interface BudgetView {
   resetsAt: Date | null;
 }
 
-function money(v: number) {
-  return v >= 100 ? `$${Math.round(v).toLocaleString()}` : `$${v.toFixed(v >= 10 ? 0 : 2)}`;
-}
-
-function tokensShort(n: number) {
-  if (n >= 1e9) return `${+(n / 1e9).toFixed(1)}B`;
-  if (n >= 1e6) return `${+(n / 1e6).toFixed(1)}M`;
-  if (n >= 1e3) return `${+(n / 1e3).toFixed(1)}K`;
-  return String(n);
-}
-
 const PERIOD_WORD: Record<string, string> = { monthly: "this month", term: "this term", lifetime: "so far" };
 
 /** A capped budget's use in its own period, from the gateway's counters. */
@@ -204,7 +194,7 @@ export function budgetView(u: BudgetUsage | undefined, now = new Date()): Budget
   const byCost = u.budget_cost_usd != null && (costShare >= tokenShare || u.budget_tokens == null);
   const label = byCost
     ? `${money(u.used_cost_usd)} of ${money(u.budget_cost_usd!)} ${PERIOD_WORD[u.period] ?? ""}`.trim()
-    : `${tokensShort(u.used_tokens)} of ${tokensShort(u.budget_tokens!)} tokens ${PERIOD_WORD[u.period] ?? ""}`.trim();
+    : `${compact(u.used_tokens)} of ${compact(u.budget_tokens!)} tokens ${PERIOD_WORD[u.period] ?? ""}`.trim();
   const resetsAt = u.resets_at ? new Date(u.resets_at) : null;
   let pace: string | null = null;
   if (u.period === "monthly" && u.period_start && resetsAt) {
@@ -212,7 +202,7 @@ export function budgetView(u: BudgetUsage | undefined, now = new Date()): Budget
     const elapsed = (now.getTime() - start) / (resetsAt.getTime() - start);
     if (elapsed > 0.1 && elapsed < 1) {
       const projected = (byCost ? u.used_cost_usd : u.used_tokens) / elapsed;
-      pace = `on pace for ${byCost ? money(projected) : `${tokensShort(Math.round(projected))} tokens`}`;
+      pace = `on pace for ${byCost ? money(projected) : `${compact(Math.round(projected))} tokens`}`;
     }
   }
   return { share: Math.max(costShare, tokenShare), label, pace, resetsAt };
@@ -309,7 +299,7 @@ export function sortTenants(rows: TenantRow[], sort: TenantSort): TenantRow[] {
 
 /** "200K tok/min · 8 in flight", or "No limits". */
 export function limitsLabel(t: Pick<Tenant, "tokens_per_minute" | "max_in_flight">): string {
-  const parts = [t.tokens_per_minute > 0 ? `${tokensShort(t.tokens_per_minute)} tok/min` : null, t.max_in_flight ? `${t.max_in_flight} in flight` : null].filter(Boolean);
+  const parts = [t.tokens_per_minute > 0 ? `${compact(t.tokens_per_minute)} tok/min` : null, t.max_in_flight ? `${t.max_in_flight} in flight` : null].filter(Boolean);
   return parts.length ? parts.join(" · ") : "No limits";
 }
 

@@ -11,8 +11,7 @@ import { GROUP_TONES, OTHER_TONE, groupShares } from "@/lib/fairshare-model";
 import { Meter, Panel, Pill } from "@/components/overview/ui";
 import { cn } from "@/lib/utils";
 import { FAIRSHARE_POLL_MS, useFairshareLive } from "./hooks";
-
-const pct = (n: number) => `${Math.round(n * 100)}%`;
+import { percent } from "@/lib/format";
 
 /**
  * Group weights, with what an edit would do before it is saved: each group's
@@ -66,7 +65,7 @@ export function FairshareGroups({ groups, tenants }: { groups: FairshareGroup[];
   });
 
   const summary = changed.length
-    ? `${changed.map((n) => `${n} ${weightOf(n)} → ${draftOf(n)}`).join(", ")}. In a full pool with these groups busy, ${names.filter((n) => shareOf(before, n) !== shareOf(after, n)).map((n) => `${n} goes from ${pct(shareOf(before, n))} to ${pct(shareOf(after, n))}`).join(", ")}. Running requests are not affected.`
+    ? `${changed.map((n) => `${n} ${weightOf(n)} → ${draftOf(n)}`).join(", ")}. In a full pool with these groups busy, ${names.filter((n) => shareOf(before, n) !== shareOf(after, n)).map((n) => `${n} goes from ${percent(shareOf(before, n))} to ${percent(shareOf(after, n))}`).join(", ")}. Running requests are not affected.`
     : "";
 
   return (
@@ -100,10 +99,10 @@ export function FairshareGroups({ groups, tenants }: { groups: FairshareGroup[];
                         className="h-8 w-16 rounded-lg border border-border bg-background text-center font-mono text-[13px] outline-none focus:ring-1 focus:ring-ring" />
                       {edited && <span className="text-xs text-muted-foreground">was {weightOf(name)}</span>}
                     </span>
-                    <span className="font-mono text-[13px]">{from !== to && <span className="mr-1.5 text-muted-foreground line-through">{pct(from)}</span>}{pct(to)}</span>
+                    <span className="font-mono text-[13px]">{from !== to && <span className="mr-1.5 text-muted-foreground line-through">{percent(from)}</span>}{percent(to)}</span>
                     <span className="flex flex-col gap-1.5">
                       <span className="relative block"><Meter value={using} max={1} className="h-2.5" /><span className="absolute -top-1 h-[18px] w-0.5 bg-foreground" style={{ left: `${Math.min(100, to * 100)}%` }} aria-hidden="true" /></span>
-                      <span className="text-xs text-muted-foreground">{pct(using)} · {note}</span>
+                      <span className="text-xs text-muted-foreground">{percent(using)} · {note}</span>
                     </span>
                     <span className="text-[13px] text-secondary-foreground">{activeMembers.length} active <span className="text-muted-foreground">of {members.length}</span></span>
                     <button type="button" aria-label={`${expanded ? "Hide" : "Show"} ${name} tenants`} aria-expanded={expanded} onClick={() => setOpen(expanded ? null : name)} className="flex h-8 w-8 items-center justify-center rounded-lg text-muted-foreground hover:bg-accent hover:text-foreground">

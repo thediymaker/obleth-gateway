@@ -61,7 +61,7 @@ import { logsHref } from "@/lib/log-links";
 import { modelHref } from "@/lib/models-model";
 import type { AuditEntry, ManagedModelSpec, ModelReplica } from "@/lib/obleth";
 import { PORT_WINDOW } from "@/lib/managed-model-schema";
-import { compact } from "@/lib/overview-model";
+import { compact } from "@/lib/format";
 import { sbatchLines, stripSbatchDirectives, type PlacementKey, type SbatchLine } from "@/lib/sbatch-directives";
 import { useClusterResources } from "@/lib/use-cluster-resources";
 import { useLatestCallback } from "@/lib/use-latest-callback";

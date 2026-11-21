@@ -192,28 +192,6 @@ export function SliderField({ id, label, value, display, min, max, step, onChang
   );
 }
 
-/** "131K", "8K", "1M" — context windows the way people say them. */
-export function formatTokens(n: number): string {
-  if (!n) return "—";
-  if (n >= 1_000_000) return `${+(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1000) return `${Math.round(n / 1000)}K`;
-  return String(n);
-}
-
-/** Price per million tokens, trimmed: "$0.20", "$0.0015". */
-export function perMillion(perToken: number): string {
-  const v = perToken * 1_000_000;
-  if (!v) return "free";
-  return `$${v >= 0.01 ? v.toFixed(2) : +v.toPrecision(2)}`;
-}
-
-/** Small dollar amounts without a wall of zeros: "$0.0003", "$1.24". */
-export function formatCost(usd: number): string {
-  if (!Number.isFinite(usd) || usd <= 0) return "$0";
-  if (usd >= 0.01) return `$${usd.toFixed(2)}`;
-  return `$${+usd.toPrecision(2)}`;
-}
-
 /** Capability flags a model advertises, in the order the picker shows them. */
 export function capabilities(m: ModelRoute | undefined) {
   if (!m) return [];

@@ -2,7 +2,8 @@
 
 import { memo, useMemo, useState } from "react";
 import { ChevronDown } from "lucide-react";
-import { compact, formatMs, modelTypeLabel, RANGE_LABEL, type FleetTile, type OverviewRange } from "@/lib/overview-model";
+import { modelTypeLabel, RANGE_LABEL, type FleetTile, type OverviewRange } from "@/lib/overview-model";
+import { compact, formatMs, formatNumber } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { HealthGlyph, Meter, Panel, PanelLink, Pill, SectionLabel, Segmented } from "./ui";
 
@@ -135,15 +136,15 @@ export function RightNow({ capacity, fleet, onOpen }: { capacity: LiveCapacity; 
     >
       <div className="flex flex-col gap-2.5 px-[18px] pt-4">
         <div className="flex items-baseline gap-2.5">
-          <span className="text-[40px] font-semibold leading-none tabular-nums">{capacity.inFlight.toLocaleString()}</span>
-          <span className="text-[13px] text-muted-foreground">in flight of {capacity.slots.toLocaleString()} slots</span>
+          <span className="text-[40px] font-semibold leading-none tabular-nums">{formatNumber(capacity.inFlight)}</span>
+          <span className="text-[13px] text-muted-foreground">in flight of {formatNumber(capacity.slots)} slots</span>
           <span className="ml-auto font-mono text-[13px]">{pct}%</span>
         </div>
         <Meter value={capacity.inFlight} max={capacity.slots} className="h-2" />
         <div className="grid grid-cols-3 gap-2 pt-1">
-          <div><div className="text-lg font-semibold tabular-nums">{capacity.queued.toLocaleString()}</div><div className="text-[11.5px] text-muted-foreground">queued</div></div>
-          <div><div className="text-lg font-semibold tabular-nums">{capacity.activeTenants.toLocaleString()}</div><div className="text-[11.5px] text-muted-foreground">tenants active</div></div>
-          <div><div className="text-lg font-semibold tabular-nums">{capacity.belowShare.toLocaleString()}</div><div className="text-[11.5px] text-muted-foreground">below fair share</div></div>
+          <div><div className="text-lg font-semibold tabular-nums">{formatNumber(capacity.queued)}</div><div className="text-[11.5px] text-muted-foreground">queued</div></div>
+          <div><div className="text-lg font-semibold tabular-nums">{formatNumber(capacity.activeTenants)}</div><div className="text-[11.5px] text-muted-foreground">tenants active</div></div>
+          <div><div className="text-lg font-semibold tabular-nums">{formatNumber(capacity.belowShare)}</div><div className="text-[11.5px] text-muted-foreground">below fair share</div></div>
         </div>
       </div>
       <SectionLabel className="px-[18px] pb-2 pt-[18px]">Busiest models</SectionLabel>

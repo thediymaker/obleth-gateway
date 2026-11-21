@@ -7,7 +7,7 @@ import { useQuery } from "@tanstack/react-query";
 import type { DateRange } from "react-day-picker";
 import { Bar, CartesianGrid, ComposedChart, Line, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { ArrowDown, ArrowUp, Download, Search } from "lucide-react";
-import { axisTick, chartGrid, compactAxis } from "@/components/chart-tooltip";
+import { axisTick, chartGrid } from "@/components/chart-tooltip";
 import { ExportSheet } from "@/components/reports/export-sheet";
 import { ModelSpeed } from "@/components/reports/model-speed";
 import { ReportsTabs } from "@/components/reports/reports-tabs";
@@ -20,7 +20,7 @@ import { Select } from "@/components/ui/select";
 import type { UsageDailyGroupBy, UsageDailyRow } from "@/lib/obleth";
 import type { KeyOption, Named } from "@/lib/logs-model";
 import { linkTime, logsHref, type LogsLink } from "@/lib/log-links";
-import { compact, formatMs } from "@/lib/overview-model";
+import { compact, formatMs, formatNumber, money, oneDecimal } from "@/lib/format";
 import {
   buildChart,
   change,
@@ -49,19 +49,12 @@ import { ReadNotice, readFailed, ReadFailedNote, readProblem } from "@/component
 
 const PREVIOUS = "hsl(240 4% 46%)";
 
-function money(v: number) {
-  if (!v) return "$0";
-  if (v < 0.01) return "< $0.01";
-  if (v >= 10_000) return `$${compact(v)}`;
-  return `$${v.toLocaleString(undefined, { minimumFractionDigits: v >= 100 ? 0 : 2, maximumFractionDigits: v >= 100 ? 0 : 2 })}`;
-}
-
 function energy(wh: number) {
-  return wh >= 1000 ? `${(wh / 1000).toLocaleString(undefined, { maximumFractionDigits: 1 })} kWh` : `${Math.round(wh)} Wh`;
+  return wh >= 1000 ? `${oneDecimal(wh / 1000)} kWh` : `${Math.round(wh)} Wh`;
 }
 
 function co2(g: number) {
-  return g >= 1000 ? `${(g / 1000).toLocaleString(undefined, { maximumFractionDigits: 1 })} kg` : `${Math.round(g)} g`;
+  return g >= 1000 ? `${oneDecimal(g / 1000)} kg` : `${Math.round(g)} g`;
 }
 
 function useDaily(range: DayRange | null, filters: { tenantId: string; keyId: string; model: string }, group: UsageDailyGroupBy, enabled = true) {
@@ -303,7 +296,7 @@ export function ReportsDashboard({ tenants, keys, models, retentionDays = null, 
                 >
                   <CartesianGrid {...chartGrid} vertical={false} />
                   <XAxis dataKey="tick" tick={axisTick} axisLine={false} tickLine={false} minTickGap={24} height={20} />
-                  <YAxis tick={axisTick} axisLine={false} tickLine={false} width={52} tickFormatter={(v: number) => (measure === "spend" ? `$${compactAxis(v)}` : measure === "ttft" ? formatMs(v) : compactAxis(v))} />
+                  <YAxis tick={axisTick} axisLine={false} tickLine={false} width={52} tickFormatter={(v: number) => (measure === "spend" ? money(v) : measure === "ttft" ? formatMs(v) : compact(v))} />
                   <Tooltip cursor={{ fill: "hsl(240 4% 16% / 0.5)" }} content={<ChartTip measure={measure} series={chart.series} />} />
                   {chart.series.length ? (
                     chart.series.map((s, i) => <Bar key={s.id} dataKey={s.id} stackId="split" fill={s.color} isAnimationActive={false} radius={i === chart.series.length - 1 ? [3, 3, 0, 0] : 0} />)
@@ -409,11 +402,11 @@ export function ReportsDashboard({ tenants, keys, models, retentionDays = null, 
                       {r.sublabel && <span className="ml-2 font-mono text-[11.5px] text-muted-foreground">{r.sublabel}</span>}
                     </td>
                     <td className="py-2.5 pr-3 text-right font-mono text-[12px]">
-                      <Link href={logsFor(rowLink(r), rowDays(r))} onClick={(e) => e.stopPropagation()} className="underline-offset-2 hover:underline" title="See these requests">{r.requests.toLocaleString()}</Link>
+                      <Link href={logsFor(rowLink(r), rowDays(r))} onClick={(e) => e.stopPropagation()} className="underline-offset-2 hover:underline" title="See these requests">{formatNumber(r.requests)}</Link>
                     </td>
                     <td className="py-2.5 pr-3 text-right font-mono text-[12px] text-muted-foreground">
                       {r.error_requests > 0 ? (
-                        <Link href={logsFor({ ...rowLink(r), status: "error" }, rowDays(r))} onClick={(e) => e.stopPropagation()} className="text-foreground underline-offset-2 hover:underline" title="See the failed requests">{r.error_requests.toLocaleString()}</Link>
+                        <Link href={logsFor({ ...rowLink(r), status: "error" }, rowDays(r))} onClick={(e) => e.stopPropagation()} className="text-foreground underline-offset-2 hover:underline" title="See the failed requests">{formatNumber(r.error_requests)}</Link>
                       ) : "0"}
                     </td>
                     <td className="py-2.5 pr-3 text-right font-mono text-[12px]">{compact(r.input_tokens)}</td>
@@ -433,7 +426,7 @@ export function ReportsDashboard({ tenants, keys, models, retentionDays = null, 
               {shownRows.length < labeled.length && (
                 <tr className="border-t border-border/70">
                   <td colSpan={9} className="py-2.5 text-center">
-                    <Button variant="ghost" size="sm" onClick={() => setShowAllRows(true)}>Show all {labeled.length.toLocaleString()} {groupInfo.plural}</Button>
+                    <Button variant="ghost" size="sm" onClick={() => setShowAllRows(true)}>Show all {formatNumber(labeled.length)} {groupInfo.plural}</Button>
                   </td>
                 </tr>
               )}
@@ -445,8 +438,8 @@ export function ReportsDashboard({ tenants, keys, models, retentionDays = null, 
               <tfoot>
                 <tr className="border-t border-border bg-muted/20 font-medium">
                   <td className="py-2.5 pl-[18px] pr-3">{q ? `${labeled.length} matching ${groupInfo.plural}` : `All ${labeled.length} ${groupInfo.plural}`}</td>
-                  <td className="py-2.5 pr-3 text-right font-mono text-[12px]">{tableTotal.requests.toLocaleString()}</td>
-                  <td className="py-2.5 pr-3 text-right font-mono text-[12px]">{tableTotal.failed.toLocaleString()}</td>
+                  <td className="py-2.5 pr-3 text-right font-mono text-[12px]">{formatNumber(tableTotal.requests)}</td>
+                  <td className="py-2.5 pr-3 text-right font-mono text-[12px]">{formatNumber(tableTotal.failed)}</td>
                   <td className="py-2.5 pr-3 text-right font-mono text-[12px]">{compact(tableTotal.inputTokens)}</td>
                   <td className="py-2.5 pr-3 text-right font-mono text-[12px]">{compact(tableTotal.outputTokens)}</td>
                   <td className="py-2.5 pr-3 text-right font-mono text-[12px]">{money(tableTotal.cost)}</td>

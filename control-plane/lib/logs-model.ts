@@ -1,5 +1,6 @@
 import { parseClasses, parseFault } from "@/lib/failure-classes";
 import type { ApiKey, SpanEntry, Tenant, UsageLogEntry } from "@/lib/obleth";
+import { formatMs } from "@/lib/format";
 
 /**
  * The Request logs page's pure logic: filters and the search box's tokens,
@@ -346,13 +347,6 @@ export function when(ts: number, now = Date.now()): string {
     : d.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
 }
 
-export function duration(ms: number): string {
-  if (!Number.isFinite(ms) || ms <= 0) return "0 ms";
-  if (ms < 1000) return `${Math.round(ms)} ms`;
-  if (ms < 60_000) return `${+(ms / 1000).toFixed(ms < 10_000 ? 2 : 1)} s`;
-  return `${+(ms / 60_000).toFixed(1)} min`;
-}
-
 /** A bar's width as people say it: "15 s", "minute", "30 min", "6 h", "day". */
 export function bucketLabel(ms: number): string {
   if (ms === 60_000) return "minute";
@@ -362,18 +356,6 @@ export function bucketLabel(ms: number): string {
   if (ms < 3_600_000) return `${Math.round(ms / 60_000)} min`;
   if (ms < 86_400_000) return `${Math.round(ms / 3_600_000)} h`;
   return `${Math.round(ms / 86_400_000)} days`;
-}
-
-export function tokens(n: number): string {
-  if (n >= 1e6) return `${+(n / 1e6).toFixed(1)}M`;
-  if (n >= 1e3) return `${+(n / 1e3).toFixed(1)}K`;
-  return String(n);
-}
-
-export function cost(usd: number): string {
-  if (!usd) return "$0";
-  if (usd < 0.0001) return "< $0.0001";
-  return `$${usd < 1 ? usd.toFixed(4) : usd.toFixed(2)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -479,7 +461,7 @@ export function describeRequest(row: UsageLogEntry, spans: SpanEntry[] = []): st
   // it made itself on a boon's behalf.
   if (decision === "rejected") parts.push("Turned away at admission.");
   else if (decision === "boon") parts.push("A call the gateway made itself, for a boon.");
-  else if (row.queue_wait_ms > 0) parts.push(`Waited ${duration(row.queue_wait_ms)} for a slot in the ${row.model} pool.`);
+  else if (row.queue_wait_ms > 0) parts.push(`Waited ${formatMs(row.queue_wait_ms)} for a slot in the ${row.model} pool.`);
   else if (decision) parts.push("Admitted straight away.");
 
   const route = find("auto_route");
@@ -496,11 +478,11 @@ export function describeRequest(row: UsageLogEntry, spans: SpanEntry[] = []): st
     const tried = targets > 1 ? `, with ${targets} endpoints to try` : "";
     if (isFailure(row)) {
       const who = up ? "The upstream" : "The gateway";
-      parts.push(`${who} answered ${row.status_code}${HTTP_REASONS[row.status_code] ? ` (${HTTP_REASONS[row.status_code]})` : ""} after ${duration(row.total_ms)}${tried}.`);
+      parts.push(`${who} answered ${row.status_code}${HTTP_REASONS[row.status_code] ? ` (${HTTP_REASONS[row.status_code]})` : ""} after ${formatMs(row.total_ms)}${tried}.`);
     } else if (row.output_tokens > 0 && row.ttft_ms > 0 && row.total_ms - row.ttft_ms > 50) {
-      parts.push(`First token after ${duration(row.ttft_ms)}, finished at ${duration(row.total_ms)}${tried}.`);
+      parts.push(`First token after ${formatMs(row.ttft_ms)}, finished at ${formatMs(row.total_ms)}${tried}.`);
     } else {
-      parts.push(`Answered in ${duration(row.total_ms)}${tried}.`);
+      parts.push(`Answered in ${formatMs(row.total_ms)}${tried}.`);
     }
   }
   if (isFailure(row) && !row.cost_usd) parts.push("Nothing was billed.");

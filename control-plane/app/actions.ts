@@ -53,6 +53,7 @@ import { keyPrefixProblem } from "@/lib/key-prefix";
 import { cleanNamedNetworks, namedNetworksProblem, parseNamedNetworksField } from "@/lib/named-networks";
 import { tagsInclude } from "@/lib/utils";
 import { actionError, type ActionResult } from "@/lib/action-result";
+import { formatNumber } from "@/lib/format";
 
 export type { ActionResult } from "@/lib/action-result";
 
@@ -695,7 +696,7 @@ async function targetIds(target: KeyTarget): Promise<string[]> {
     cursor = page.next ?? undefined;
   } while (cursor);
   if (ids.length !== target.expected) {
-    throw new Error(`${ids.length.toLocaleString()} keys match now, not the ${target.expected.toLocaleString()} you were shown. Nothing was changed; look again and retry.`);
+    throw new Error(`${formatNumber(ids.length)} keys match now, not the ${formatNumber(target.expected)} you were shown. Nothing was changed; look again and retry.`);
   }
   return ids;
 }

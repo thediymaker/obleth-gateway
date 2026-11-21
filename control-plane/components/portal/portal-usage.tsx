@@ -10,8 +10,8 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { CodeBlock, CopyButton } from "@/components/portal/copy-button";
 import type { KeyUsageSummary, UsageAgg, UsageLogEntry } from "@/lib/obleth";
-import { formatDurationMs } from "@/lib/format";
-import { cn, formatCurrency, formatNumber } from "@/lib/utils";
+import { cn } from "@/lib/utils";
+import { formatMs, formatNumber, money } from "@/lib/format";
 
 export function PortalUsage({
   usage,
@@ -150,7 +150,7 @@ export function PortalUsage({
             <MiniMetric label="Input tokens" value={formatNumber(total.input_tokens)} />
             <MiniMetric label="Output tokens" value={formatNumber(total.output_tokens)} />
             <MiniMetric label="Total tokens" value={formatNumber(total.total_tokens)} />
-            <MiniMetric label="Estimated cost" value={formatCurrency(totalCost)} />
+            <MiniMetric label="Estimated cost" value={money(totalCost)} />
           </div>
         </CardContent>
       </Card>
@@ -175,7 +175,7 @@ function RecentRow({ row }: { row: UsageLogEntry }) {
         <span className="block max-w-[12rem] truncate text-xs">{row.key_name || row.key_prefix || "unknown"}</span>
       </td>
       <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">{formatNumber(row.total_tokens)}</td>
-      <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">{formatDurationMs(row.total_ms)}</td>
+      <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">{formatMs(row.total_ms)}</td>
       <td className="px-4 py-2">
         <div className="flex items-center gap-2">
           <span className="font-mono text-xs text-muted-foreground">{row.request_id.slice(0, 8)}</span>
@@ -202,8 +202,8 @@ function RecentCard({ row }: { row: UsageLogEntry }) {
       </div>
       <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
         <MiniMetric label="Tokens" value={formatNumber(row.total_tokens)} />
-        <MiniMetric label="Duration" value={formatDurationMs(row.total_ms)} />
-        <MiniMetric label="Cost" value={formatCurrency(row.cost_usd)} />
+        <MiniMetric label="Duration" value={formatMs(row.total_ms)} />
+        <MiniMetric label="Cost" value={money(row.cost_usd)} />
         <MiniMetric label="Key" value={row.key_name || row.key_prefix || "unknown"} />
       </div>
       <div className="mt-3 flex items-center gap-2">
@@ -233,7 +233,7 @@ function KeyUsageRow({ row }: { row: KeyUsageSummary }) {
       <div className="grid grid-cols-3 gap-2 text-xs">
         <MiniMetric label="Requests" value={formatNumber(row.requests)} />
         <MiniMetric label="Tokens" value={formatNumber(row.total_tokens)} />
-        <MiniMetric label="Cost" value={formatCurrency(row.cost_usd)} />
+        <MiniMetric label="Cost" value={money(row.cost_usd)} />
       </div>
     </div>
   );

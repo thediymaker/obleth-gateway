@@ -19,6 +19,7 @@ import {
 } from "@/lib/reports-model";
 import { ALL_COLUMNS, COLUMN_LABELS, exportCell, type ExportColumn } from "@/lib/usage-export";
 import { cn, getJson } from "@/lib/utils";
+import { formatNumber } from "@/lib/format";
 
 const PREVIEW_ROWS = 5;
 
@@ -108,7 +109,7 @@ export function ExportSheet({
             <Button type="button" variant="outline" onClick={onClose}>Cancel</Button>
             <Button type="button" onClick={download} disabled={ordered.length === 0}>
               <Download className="h-3.5 w-3.5" />
-              Download CSV{count !== undefined ? ` · ${count.toLocaleString()} row${count === 1 ? "" : "s"}` : ""}
+              Download CSV{count !== undefined ? ` · ${formatNumber(count)} row${count === 1 ? "" : "s"}` : ""}
             </Button>
           </div>
         </div>
@@ -157,7 +158,7 @@ export function ExportSheet({
       <section className="flex flex-col gap-2.5 border-t border-border px-6 py-5">
         <div className="flex justify-between">
           <p className="text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">Preview</p>
-          <p className="text-xs text-muted-foreground">{count === undefined ? "Counting rows…" : `first ${Math.min(PREVIEW_ROWS, count)} of ${count.toLocaleString()} rows`}</p>
+          <p className="text-xs text-muted-foreground">{count === undefined ? "Counting rows…" : `first ${Math.min(PREVIEW_ROWS, count)} of ${formatNumber(count)} rows`}</p>
         </div>
         <div className="overflow-x-auto rounded-xl border border-border">
           <table className="w-full text-xs">

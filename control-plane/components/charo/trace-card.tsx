@@ -1,8 +1,7 @@
 "use client";
 
 import type { TraceSummary } from "@/lib/charo/trace";
-import { formatDurationMs } from "@/lib/format";
-import { formatCurrency } from "@/lib/utils";
+import { formatMs, money } from "@/lib/format";
 import Link from "next/link";
 import type { ChatTurn } from "./use-charo-stream";
 
@@ -36,7 +35,7 @@ export function TraceCard({
     return (
       <p className="font-mono text-[10.5px] text-muted-foreground/70">
         {pending ? "trace pending — telemetry still flushing…" : "no trace available"}
-        {metrics && <span className="block">{metrics.outputTokens ?? "—"} output tokens · TTFT {metrics.ttftMs === undefined ? "—" : formatDurationMs(metrics.ttftMs)} · {formatDurationMs(metrics.totalMs)} total</span>}
+        {metrics && <span className="block">{metrics.outputTokens ?? "—"} output tokens · TTFT {metrics.ttftMs === undefined ? "—" : formatMs(metrics.ttftMs)} · {formatMs(metrics.totalMs)} total</span>}
         {requestId && <Link className="ml-2 underline" href={`/logs?requestId=${encodeURIComponent(requestId)}`}>Inspect request</Link>}
       </p>
     );
@@ -49,10 +48,10 @@ export function TraceCard({
 
   const stats = [
     `tok ${metrics?.inputTokens ?? trace.inputTokens}/${metrics?.outputTokens ?? trace.outputTokens}`,
-    `ttft ${formatDurationMs(metrics?.ttftMs ?? trace.ttftMs)}`,
-    `total ${formatDurationMs(metrics?.totalMs ?? trace.totalMs)}`,
+    `ttft ${formatMs(metrics?.ttftMs ?? trace.ttftMs)}`,
+    `total ${formatMs(metrics?.totalMs ?? trace.totalMs)}`,
     `cache ${trace.cacheStatus}`,
-    trace.accountingAvailable === false ? "cost unavailable" : formatCurrency(trace.costUsd),
+    trace.accountingAvailable === false ? "cost unavailable" : money(trace.costUsd, { precise: true }),
     ...(trace.energyWh === undefined ? [] : [`${trace.energyWh.toFixed(4)} Wh`]),
     ...(isError ? [`http ${trace.statusCode || "—"}`] : []),
   ];

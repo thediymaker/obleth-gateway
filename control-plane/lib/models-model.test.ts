@@ -113,9 +113,9 @@ describe("types, places and prices", () => {
   });
 
   it("prices each type in the unit it bills by", () => {
-    expect(priceLabel(model({ input_cost_per_token: 0.0000006, output_cost_per_token: 0.0000025 }))).toBe("$0.6 · $2.5");
+    expect(priceLabel(model({ input_cost_per_token: 0.0000006, output_cost_per_token: 0.0000025 }))).toBe("$0.60 · $2.50");
     expect(priceLabel(model({ model_type: "image", cost_per_image: 0.04 }))).toBe("$0.04 / image");
-    expect(priceLabel(model({ model_type: "video", cost_per_video: 2 }))).toBe("$2 / video");
+    expect(priceLabel(model({ model_type: "video", cost_per_video: 2 }))).toBe("$2.00 / video");
     expect(priceLabel(model({ model_type: "audio_transcription", cost_per_audio_second: 0.0001 }))).toBe("$0.006 / min");
     expect(priceLabel(model())).toBeNull();
     // A search costs nothing, whatever token prices a row carries.

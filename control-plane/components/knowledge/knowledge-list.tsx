@@ -11,10 +11,9 @@ import { Field, SelectField } from "@/components/models/fields";
 import { Notice, Sheet, Tile } from "@/components/models/ui";
 import { Pill } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
-import { formatBytes } from "@/lib/format";
+import { compact, formatBytes } from "@/lib/format";
 import type { KnowledgeData } from "@/lib/knowledge-data";
 import { COLLECTION_STATUS_LABEL, collectionGlyph, collectionHref, collectionStatus, retrievalUse } from "@/lib/knowledge-format";
-import { compact } from "@/lib/overview-model";
 import { cn } from "@/lib/utils";
 
 const COLS = "grid-cols-[minmax(0,1.5fr)_130px_70px_70px_minmax(0,1fr)_minmax(0,1fr)_120px_90px]";

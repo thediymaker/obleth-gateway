@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { ChevronDown } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { formatNumber } from "@/lib/format";
 
 /** "Thought for 4.2 s" / "Thought for 1 min 12 s". */
 export function thoughtFor(ms: number): string {
@@ -37,7 +38,7 @@ export function ThinkingBlock({ text, active, ms }: { text: string; active: bool
         className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] text-muted-foreground hover:text-foreground"
       >
         <span className="font-medium">{label}</span>
-        <span className="tabular-nums">{words.toLocaleString()} word{words === 1 ? "" : "s"}</span>
+        <span className="tabular-nums">{formatNumber(words)} word{words === 1 ? "" : "s"}</span>
         <ChevronDown className={cn("ml-auto h-3.5 w-3.5 transition-transform", open && "rotate-180")} aria-hidden="true" />
       </button>
       {open && (

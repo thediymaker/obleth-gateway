@@ -17,6 +17,7 @@ import type {
   UsageModelAgg,
 } from "@/lib/obleth";
 import { healthState, isBenchmarkRoute, type HealthState } from "@/lib/overview-model";
+import { money, perMillion } from "@/lib/format";
 import { poolOccupancy } from "@/lib/occupancy";
 import { parseTagLevel, TAG_LEVEL_LABELS } from "@/lib/utils";
 
@@ -123,35 +124,27 @@ export function awaitingFirstPass<T extends { status: string }>(checks: T[]): { 
 // Prices and labels
 // ---------------------------------------------------------------------------
 
-export function money(value: number): string {
-  if (!Number.isFinite(value) || value <= 0) return "$0";
-  if (value >= 100) return `$${Math.round(value)}`;
-  if (value >= 1) return `$${+value.toFixed(2)}`;
-  if (value >= 0.01) return `$${+value.toFixed(3)}`;
-  return `$${+value.toPrecision(2)}`;
-}
-
 /** The model's price in the unit its type bills by, or null when none is set. */
 export function priceLabel(model: Pick<ModelRoute, "model_type" | "input_cost_per_token" | "output_cost_per_token" | "cost_per_image" | "cost_per_video" | "cost_per_character" | "cost_per_audio_second">): string | null {
-  const perM = (v: number) => money(v * 1_000_000);
+  const price = (v: number) => money(v, { precise: true });
   switch (model.model_type) {
     case "image":
-      return model.cost_per_image > 0 ? `${money(model.cost_per_image)} / image` : null;
+      return model.cost_per_image > 0 ? `${price(model.cost_per_image)} / image` : null;
     case "video":
-      return model.cost_per_video > 0 ? `${money(model.cost_per_video)} / video` : null;
+      return model.cost_per_video > 0 ? `${price(model.cost_per_video)} / video` : null;
     case "mesh":
-      return model.cost_per_video > 0 ? `${money(model.cost_per_video)} / mesh` : null;
+      return model.cost_per_video > 0 ? `${price(model.cost_per_video)} / mesh` : null;
     case "audio_speech":
-      return model.cost_per_character > 0 ? `${perM(model.cost_per_character)} / 1M chars` : null;
+      return model.cost_per_character > 0 ? `${perMillion(model.cost_per_character)} / 1M chars` : null;
     case "audio_transcription":
-      return model.cost_per_audio_second > 0 ? `${money(model.cost_per_audio_second * 60)} / min` : null;
+      return model.cost_per_audio_second > 0 ? `${price(model.cost_per_audio_second * 60)} / min` : null;
     case "embedding":
-      return model.input_cost_per_token > 0 ? `${perM(model.input_cost_per_token)} / 1M` : null;
+      return model.input_cost_per_token > 0 ? `${perMillion(model.input_cost_per_token)} / 1M` : null;
     case "search":
       return null;
     default:
       if (model.input_cost_per_token <= 0 && model.output_cost_per_token <= 0) return null;
-      return `${perM(model.input_cost_per_token)} · ${perM(model.output_cost_per_token)}`;
+      return `${perMillion(model.input_cost_per_token)} · ${perMillion(model.output_cost_per_token)}`;
   }
 }
 

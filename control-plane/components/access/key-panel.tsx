@@ -18,9 +18,8 @@ import { describeIdentityKey } from "@/lib/key-kind";
 import { COUNTRIES_HINT, countriesText, countryName, NETWORKS_HINT, networksSummary, networksText } from "@/lib/key-networks";
 import { lastUsed, tenantHref, type KeyRow } from "@/lib/access-model";
 import { logsHref } from "@/lib/log-links";
-import { money } from "@/lib/models-model";
 import type { ApiKey, NamedNetwork, Tenant, UsageDailyRow } from "@/lib/obleth";
-import { compact } from "@/lib/overview-model";
+import { compact, money } from "@/lib/format";
 import { cn, getJson } from "@/lib/utils";
 
 const DAY_MS = 86_400_000;

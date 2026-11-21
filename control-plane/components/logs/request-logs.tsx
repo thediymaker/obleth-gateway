@@ -9,41 +9,12 @@ import { Segmented } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Select } from "@/components/ui/select";
-import {
-  bucketFor,
-  bucketLabel,
-  cost,
-  DEFAULT_LOG_FILTERS,
-  duration,
-  fillHistogram,
-  filtersActive,
-  isFailure,
-  listLabel,
-  listOf,
-  LOG_WINDOWS,
-  loadViews,
-  logParams,
-  parseSearch,
-  pickOne,
-  storeViews,
-  timeSplit,
-  tokens,
-  typeOptions,
-  when,
-  windowRange,
-  withPatterns,
-  MAX_MATCHES,
-  type HistogramBucket,
-  type KeyOption,
-  type LogFilters,
-  type LogWindowId,
-  type Named,
-  type SavedView,
-} from "@/lib/logs-model";
+import { bucketFor, bucketLabel, DEFAULT_LOG_FILTERS, fillHistogram, filtersActive, isFailure, listLabel, listOf, LOG_WINDOWS, loadViews, logParams, parseSearch, pickOne, storeViews, timeSplit, typeOptions, when, windowRange, withPatterns, MAX_MATCHES, type HistogramBucket, type KeyOption, type LogFilters, type LogWindowId, type Named, type SavedView } from "@/lib/logs-model";
 import { classLabel, classSide, failureReason, SIDE_PHRASE } from "@/lib/failure-classes";
 import type { UsageLogEntry, UsageLogFacets, UsageLogHistogram } from "@/lib/obleth";
 import { cn, getJson } from "@/lib/utils";
 import { readFailed, readProblem } from "@/components/ui/read-state";
+import { compact, formatMs, formatNumber, money } from "@/lib/format";
 
 const PAGE = 50;
 const LIVE_MS = 5_000;
@@ -168,18 +139,18 @@ const Row = memo(function Row({ row, selected, onOpen, now }: { row: UsageLogEnt
         <span className="block truncate">{row.tenant_name || row.tenant_id.slice(0, 8)}</span>
         <span className="block truncate font-mono text-[11.5px] text-muted-foreground">{row.key_name || "—"}{row.key_prefix ? ` · ${row.key_prefix}` : ""}</span>
       </td>
-      <td className="whitespace-nowrap py-2 pr-3 text-right font-mono text-[12px]">{tokens(row.input_tokens)} → {tokens(row.output_tokens)}</td>
+      <td className="whitespace-nowrap py-2 pr-3 text-right font-mono text-[12px]">{compact(row.input_tokens)} → {compact(row.output_tokens)}</td>
       <td className="py-2 pr-3">
-        <div className="flex items-center gap-2.5" title={row.ttft_ms > 0 ? `waited ${duration(t.wait)} · first token after ${duration(t.wait + t.first)} · ${duration(t.total)} in all` : `waited ${duration(t.wait)} · ${duration(t.total)} in all${row.streamed === false ? " · not streamed" : ""}`}>
+        <div className="flex items-center gap-2.5" title={`${t.wait > 0 ? `waited ${formatMs(t.wait)} · ` : ""}${row.ttft_ms > 0 ? `first token after ${formatMs(t.wait + t.first)} · ${formatMs(t.total)} in all` : `${formatMs(t.total)} in all${row.streamed === false ? " · not streamed" : ""}`}`}>
           <span className="flex h-1.5 min-w-[6rem] flex-1 overflow-hidden rounded-full bg-muted/50">
             <span className="bg-muted-foreground/40" style={{ width: pct(t.wait) }} />
             <span className="bg-muted-foreground" style={{ width: pct(t.first) }} />
             <span className={failed ? "bg-foreground" : "bg-secondary-foreground"} style={{ width: pct(t.rest) }} />
           </span>
-          <span className="w-14 text-right font-mono text-[12px]">{duration(row.total_ms)}</span>
+          <span className="w-14 text-right font-mono text-[12px]">{formatMs(row.total_ms)}</span>
         </div>
       </td>
-      <td className="whitespace-nowrap py-2 pr-3 text-right font-mono text-[12px] text-secondary-foreground">{cost(row.cost_usd)}</td>
+      <td className="whitespace-nowrap py-2 pr-3 text-right font-mono text-[12px] text-secondary-foreground">{money(row.cost_usd, { precise: true })}</td>
       <td className="w-8 py-2 pr-[18px] text-center text-muted-foreground" title={row.has_trace ? "Traced" : undefined}>{row.has_trace ? "◇" : ""}</td>
     </tr>
   );
@@ -357,7 +328,7 @@ export function RequestLogs({
         <div className="min-w-0">
           <h1 className="text-[26px] font-semibold tracking-tight">Request logs</h1>
           <p className="mt-1 text-[13px] text-muted-foreground">
-            {readFailed(histogram) ? readProblem(histogram, "the request count") : histogram.isLoading ? "Counting…" : `${total.toLocaleString()} requests ${winLabel}${total ? ` · ${((failedCount / total) * 100).toFixed(1)}% failed` : ""}${total && failedCount && split ? `, ${((platformCount / total) * 100).toFixed(1)}% ${SIDE_PHRASE.platform}` : ""}`}
+            {readFailed(histogram) ? readProblem(histogram, "the request count") : histogram.isLoading ? "Counting…" : `${formatNumber(total)} requests ${winLabel}${total ? ` · ${((failedCount / total) * 100).toFixed(1)}% failed` : ""}${total && failedCount && split ? `, ${((platformCount / total) * 100).toFixed(1)}% ${SIDE_PHRASE.platform}` : ""}`}
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -488,7 +459,7 @@ export function RequestLogs({
         )}
         {rows.length > 0 && (
           <div className="flex items-center justify-between border-t border-border px-[18px] py-3 text-[12.5px] text-muted-foreground">
-            <span>{rows.length.toLocaleString()} shown of {total.toLocaleString()} {winLabel} · ◇ traced</span>
+            <span>{formatNumber(rows.length)} shown of {formatNumber(total)} {winLabel} · ◇ traced</span>
             <Button type="button" variant="outline" size="sm" disabled={lastPage || loadingOlder} onClick={loadOlder}>{loadingOlder ? "Loading…" : lastPage ? "That's all" : "Load older"}</Button>
           </div>
         )}

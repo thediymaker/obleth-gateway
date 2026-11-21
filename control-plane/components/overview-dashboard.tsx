@@ -5,16 +5,8 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { RefreshCw } from "lucide-react";
 import type { CapacityDiscoveryView, FairshareLiveView, LiveStats, ModelHealthSummary, ModelRoute } from "@/lib/obleth";
 import type { OverviewContext, OverviewWindow } from "@/lib/overview-data";
-import {
-  PREVIOUS_LABEL,
-  buildAttention,
-  buildFleet,
-  buildSeries,
-  changeLabel,
-  compact,
-  formatMs,
-  type OverviewRange,
-} from "@/lib/overview-model";
+import { PREVIOUS_LABEL, buildAttention, buildFleet, buildSeries, changeLabel, type OverviewRange } from "@/lib/overview-model";
+import { compact, formatMs, formatNumber, money } from "@/lib/format";
 import { countsScope, tenantsBelowShare } from "@/lib/fairshare";
 import { logsHref } from "@/lib/log-links";
 import { cn, getJson } from "@/lib/utils";
@@ -49,10 +41,6 @@ function liveCapacity(view?: FairshareLiveView, stats?: LiveStats): LiveCapacity
     activeTenants: view?.tenants.filter((t) => t.in_flight > 0 || t.queued > 0).length ?? 0,
     belowShare: tenantsBelowShare(view, { background: false }).size,
   };
-}
-
-function money(v: number) {
-  return `$${v >= 1000 ? compact(v) : v.toFixed(2)}`;
 }
 
 export function OverviewDashboard({
@@ -122,8 +110,8 @@ export function OverviewDashboard({
   const errorDetail = !hasErrors
     ? "Needs a newer gateway"
     : split
-      ? `${s.platformErrors.toLocaleString()} of ${s.requests.toLocaleString()} requests · ${callerErrors ? `${callerErrors.toLocaleString()} caller failure${callerErrors === 1 ? "" : "s"}` : "no caller failures"}`
-      : `${s.errors.toLocaleString()} failed${prev && prevErrorRate ? ` · was ${prevErrorRate.toFixed(prevErrorRate < 1 ? 2 : 1)}%` : ""}`;
+      ? `${formatNumber(s.platformErrors)} of ${formatNumber(s.requests)} requests · ${callerErrors ? `${formatNumber(callerErrors)} caller failure${callerErrors === 1 ? "" : "s"}` : "no caller failures"}`
+      : `${formatNumber(s.errors)} failed${prev && prevErrorRate ? ` · was ${prevErrorRate.toFixed(prevErrorRate < 1 ? 2 : 1)}%` : ""}`;
   const serving = fleet.filter((t) => t.health === "healthy" || t.health === "unknown").length;
   const pct = (v: number) => `${v.toFixed(v < 1 ? 2 : 1)}%`;
   const updatedAt = Math.max(windowQuery.dataUpdatedAt, fairshareQuery.dataUpdatedAt);
@@ -147,7 +135,7 @@ export function OverviewDashboard({
               ? <Pill inverted>{items.length} need{items.length === 1 ? "s" : ""} attention</Pill>
               : <><HealthGlyph state="healthy" className="h-[9px] w-[9px]" /><strong className="font-semibold text-foreground">All systems normal</strong></>}
             <span>
-              {serving} of {fleet.length} models serving · {capacity.inFlight.toLocaleString()} in flight · {capacity.queued ? <strong className="font-semibold text-foreground">{capacity.queued.toLocaleString()} queued</strong> : "nothing queued"}
+              {serving} of {fleet.length} models serving · {formatNumber(capacity.inFlight)} in flight · {capacity.queued ? <strong className="font-semibold text-foreground">{formatNumber(capacity.queued)} queued</strong> : "nothing queued"}
             </span>
           </div>
         </div>
@@ -169,7 +157,7 @@ export function OverviewDashboard({
           <Kpi
             label={`Platform failures · ${win.range}`}
             value={pct(errorRate)}
-            valueTitle={`${s.platformErrors.toLocaleString()} of ${s.requests.toLocaleString()} requests failed on the platform's side`}
+            valueTitle={`${formatNumber(s.platformErrors)} of ${formatNumber(s.requests)} requests failed on the platform's side`}
             valueHref={logsHref({ fault: "platform", window: win.range })}
             detail={errorDetail}
             trend={series.map((p) => p.platformErrors)}

@@ -13,7 +13,8 @@ import { StreamingPlayer } from "@/lib/playground/speech-player";
 import { WavParseError, WavStreamParser, pcm16Bytes, wavBlob, type WavFormat } from "@/lib/playground/wav-stream";
 import { cn } from "@/lib/utils";
 import { SPEECH_TEXT_MAX_LENGTH, type PlaygroundSession } from "./playground";
-import { ModelAvatar, Pill, RunError, SectionLabel, SettingsPanel, formatCost, perMillion } from "./ui";
+import { ModelAvatar, Pill, RunError, SectionLabel, SettingsPanel } from "./ui";
+import { formatNumber, money, perMillion } from "@/lib/format";
 
 // Rows longer than this start clamped, with a "Show all" toggle.
 const CLAMP_CHARS = 280;
@@ -473,9 +474,9 @@ export function SpeechWorkspace({
               )}
               <div className="flex-1" />
               <span className="font-mono text-[11.5px] tabular-nums text-muted-foreground" title="Characters, out of the most one reading can take">
-                {text.length.toLocaleString("en-US")} / {SPEECH_TEXT_MAX_LENGTH.toLocaleString("en-US")}
+                {formatNumber(text.length)} / {formatNumber(SPEECH_TEXT_MAX_LENGTH)}
               </span>
-              {perChar > 0 && chars > 0 && <span className="font-mono text-[11.5px] text-muted-foreground" title="List price × characters">≈ {formatCost(perChar * chars)}</span>}
+              {perChar > 0 && chars > 0 && <span className="font-mono text-[11.5px] text-muted-foreground" title="List price × characters">≈ {money(perChar * chars, { precise: true })}</span>}
               {busy ? (
                 <Button id="speech-stop" variant="outline" className="h-9" onClick={stop}><Square className="h-3 w-3" />Stop</Button>
               ) : (
@@ -596,7 +597,7 @@ function Metrics({ run }: { run: Run }) {
   if (run.audioSeconds > 0) parts.push(`${formatSeconds(run.audioSeconds)} of audio`);
   if (run.generationMs !== undefined) parts.push(`made in ${formatSeconds(run.generationMs / 1000)}`);
   if (run.generationMs && run.audioSeconds > 0) parts.push(formatSpeed(run.audioSeconds / (run.generationMs / 1000)));
-  if (run.costUsd > 0 && run.status !== "error") parts.push(formatCost(run.costUsd));
+  if (run.costUsd > 0 && run.status !== "error") parts.push(money(run.costUsd, { precise: true }));
   if (!parts.length) return null;
   return (
     <p className="flex flex-wrap gap-x-3 text-[12px] text-muted-foreground" aria-label="Reading details">

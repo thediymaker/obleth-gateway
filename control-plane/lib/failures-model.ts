@@ -1,6 +1,7 @@
 import { logsHref } from "@/lib/log-links";
 import { NIL_REQUEST_ID } from "@/lib/logs-model";
 import type { UsageFailureGroup, UsageFailureGroups } from "@/lib/obleth";
+import { formatNumber } from "@/lib/format";
 
 /**
  * The Failures page's pure logic: its ranges, the headline sentence, how
@@ -31,7 +32,7 @@ export type FailureSide = "all" | "platform" | "client";
  * callers", or what the window holds when nothing failed.
  */
 export function failureHeadline(data: Pick<UsageFailureGroups, "requests" | "failures" | "platform_failures">, range: FailureRange): string {
-  const n = (v: number) => v.toLocaleString();
+  const n = (v: number) => formatNumber(v);
   if (!data.requests) return `No requests in ${rangeOf(range).words}`;
   if (!data.failures) return `None of ${n(data.requests)} ${data.requests === 1 ? "request" : "requests"} failed`;
   const callers = Math.max(0, data.failures - data.platform_failures);

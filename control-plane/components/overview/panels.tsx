@@ -5,7 +5,8 @@ import Link from "next/link";
 import type { AuditEntry, CacheStats, RouterReadinessView, TenantFairshareView } from "@/lib/obleth";
 import type { OverviewSummary } from "@/lib/overview-summary";
 import type { OverviewTenantRow, OverviewWindow } from "@/lib/overview-data";
-import { compact, describeAudit, RANGE_LABEL, type AttentionItem, type OverviewRange } from "@/lib/overview-model";
+import { describeAudit, RANGE_LABEL, type AttentionItem, type OverviewRange } from "@/lib/overview-model";
+import { compact, money } from "@/lib/format";
 import { logsHref } from "@/lib/log-links";
 import { cn } from "@/lib/utils";
 import { HealthGlyph, Meter, Panel, PanelLink, Pill, SectionLabel } from "./ui";
@@ -106,7 +107,6 @@ export function TopTenants({ window, live }: { window: OverviewWindow; live: Map
   const rows = window.tenants;
   const top = rows[0]?.requests ?? 0;
   const cols = "grid-cols-[minmax(0,1fr)_4.5rem_4rem_4.5rem_3.5rem]";
-  const money = (v: number) => `$${v >= 100 ? v.toFixed(0) : v.toFixed(2)}`;
   const line = (r: Pick<OverviewTenantRow, "requests" | "tokens" | "cost">, now: number | string, name: React.ReactNode, key: string, muted = false, tenantId?: string) => (
     <div key={key} className={cn("grid items-center gap-3 border-t border-border px-[18px] py-[9px] text-[13px]", cols, muted && "text-muted-foreground")}>
       {name}
@@ -190,7 +190,7 @@ export function FooterTiles({ summary, cache, readiness, range }: { summary: Ove
       <Link href="/settings?tab=energy" className={tile}>
         <SectionLabel>Energy · {suffix}</SectionLabel>
         <span className="text-xl font-semibold">{summary.energyWh > 0 ? `${summary.energyWh >= 1000 ? (summary.energyWh / 1000).toFixed(1) : summary.energyWh.toFixed(0)} ${summary.energyWh >= 1000 ? "kWh" : "Wh"}` : "Not measured"}</span>
-        <span className="truncate text-xs text-muted-foreground">{summary.energyWh > 0 ? `${summary.co2G >= 1000 ? `${(summary.co2G / 1000).toFixed(1)} kg` : `${summary.co2G.toFixed(0)} g`} CO₂${summary.energyCostUsd > 0 ? ` · $${summary.energyCostUsd.toFixed(2)} at the set rate` : ""}` : "Turn on energy tracking in Settings"}</span>
+        <span className="truncate text-xs text-muted-foreground">{summary.energyWh > 0 ? `${summary.co2G >= 1000 ? `${(summary.co2G / 1000).toFixed(1)} kg` : `${summary.co2G.toFixed(0)} g`} CO₂${summary.energyCostUsd > 0 ? ` · ${money(summary.energyCostUsd)} at the set rate` : ""}` : "Turn on energy tracking in Settings"}</span>
       </Link>
       <Link href="/settings?tab=routing" className={tile}>
         <SectionLabel>Routing readiness</SectionLabel>

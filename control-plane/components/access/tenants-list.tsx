@@ -28,9 +28,8 @@ import {
 } from "@/lib/access-model";
 import type { AdminUser } from "@/lib/auth/users";
 import { logsHref } from "@/lib/log-links";
-import { money } from "@/lib/models-model";
 import type { BudgetUsage, Tenant, UsageAgg } from "@/lib/obleth";
-import { compact } from "@/lib/overview-model";
+import { compact, money } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
 const HAS_OPTIONS: { value: TenantHas; label: string }[] = [

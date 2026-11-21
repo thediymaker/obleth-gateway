@@ -17,7 +17,8 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { CodeBlock, CopyButton } from "@/components/portal/copy-button";
 import type { PortalModelSummary } from "@/components/portal/portal-model-summary";
 import type { Tenant } from "@/lib/obleth";
-import { formatNumber, parseTagLevel, tagsInclude } from "@/lib/utils";
+import { parseTagLevel, tagsInclude } from "@/lib/utils";
+import { formatNumber } from "@/lib/format";
 
 export type { PortalModelSummary };
 

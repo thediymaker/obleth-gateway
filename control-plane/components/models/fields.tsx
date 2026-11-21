@@ -868,7 +868,7 @@ export function toPlainDecimal(value: number): string {
 }
 
 /** A per-token price as a per-million figure for editing: 0.0000006 → "0.6". */
-export function perMillion(costPerToken: number): string {
+export function toPerMillion(costPerToken: number): string {
   if (!Number.isFinite(costPerToken) || costPerToken <= 0) return "";
   return toPlainDecimal(Number((costPerToken * 1_000_000).toPrecision(12)));
 }

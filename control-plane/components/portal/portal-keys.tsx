@@ -39,7 +39,8 @@ import { useConfirm } from "@/components/ui/confirm-dialog";
 import { CodeBlock, CopyButton } from "@/components/portal/copy-button";
 import type { ApiKey, KeyUsageSummary } from "@/lib/obleth";
 import { describeIdentityKey } from "@/lib/key-kind";
-import { cn, formatCurrency, formatNumber } from "@/lib/utils";
+import { cn } from "@/lib/utils";
+import { formatNumber, money } from "@/lib/format";
 
 export function PortalKeys({
   keys,
@@ -188,7 +189,7 @@ export function PortalKeys({
         <StatCard icon={KeyRound} label="Keys" value={formatNumber(keys.length)} hint={`${formatNumber(activeCount)} active`} />
         <StatCard icon={Activity} label="Requests" value={formatNumber(totalRequests)} hint="recent window" />
         <StatCard icon={CheckCircle2} label="Tokens" value={formatNumber(totalTokens)} hint="input and output" />
-        <StatCard icon={ShieldCheck} label="Cost" value={formatCurrency(totalCost)} hint="estimated" />
+        <StatCard icon={ShieldCheck} label="Cost" value={money(totalCost)} hint="estimated" />
       </div>
 
       <Card>
@@ -299,7 +300,7 @@ function KeyRow({
         <div className="grid grid-cols-2 gap-2 text-xs sm:grid-cols-4 lg:grid-cols-2 xl:grid-cols-4">
           <MiniMetric label="Requests" value={formatNumber(Number(usage?.requests ?? 0))} />
           <MiniMetric label="Tokens" value={formatNumber(Number(usage?.total_tokens ?? 0))} />
-          <MiniMetric label="Cost" value={formatCurrency(Number(usage?.cost_usd ?? 0))} />
+          <MiniMetric label="Cost" value={money(Number(usage?.cost_usd ?? 0))} />
           <MiniMetric label="Last used" value={formatLastUsed(usage?.last_used_ms)} />
         </div>
 

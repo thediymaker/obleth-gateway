@@ -26,7 +26,7 @@ import { tenantHref } from "@/lib/access-model";
 import { logsHref } from "@/lib/log-links";
 import { modelHref } from "@/lib/model-links";
 import type { AdminBatch, AdminBatchList } from "@/lib/obleth";
-import { compact } from "@/lib/overview-model";
+import { compact, formatNumber } from "@/lib/format";
 import { cn, getJson } from "@/lib/utils";
 import { ListFooter } from "@/components/ui/list-footer";
 import { ReadNotice } from "@/components/ui/read-state";
@@ -204,7 +204,7 @@ export function BatchesView({ initial, initialFilter }: { initial: AdminBatchLis
                   <span className="flex min-w-0 flex-col gap-1.5">
                     <Progress b={b} tone={s.tone} />
                     <span className="flex justify-between gap-2 font-mono text-[11.5px] text-secondary-foreground">
-                      <span>{doneOf(b).toLocaleString()} of {b.total.toLocaleString()}{b.failed ? ` · ${b.failed.toLocaleString()} failed` : ""}</span>
+                      <span>{formatNumber(doneOf(b))} of {formatNumber(b.total)}{b.failed ? ` · ${formatNumber(b.failed)} failed` : ""}</span>
                       <span className="text-foreground">{percentOf(b)}%</span>
                     </span>
                   </span>

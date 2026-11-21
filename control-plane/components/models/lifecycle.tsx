@@ -9,6 +9,7 @@ import { useConfirm } from "@/components/ui/confirm-dialog";
 import { logsHref } from "@/lib/log-links";
 import { dateInputValue, lifecycleDate, lifecycleStatus, retireAtFromInput, retiredMessage } from "@/lib/models-model";
 import type { LifecycleStatus, ModelRoute, UsageLogFacet } from "@/lib/obleth";
+import { formatNumber } from "@/lib/format";
 
 /** A model the replacement picker may offer. */
 export interface LifecycleCandidate {
@@ -234,7 +235,7 @@ export const LifecycleSection = memo(function LifecycleSection({
             {callers.slice(0, 8).map((c) => (
               <li key={c.value} className="flex items-baseline justify-between gap-4">
                 <Link href={logsHref({ model: model.model_name, key: c.value, window: "30d" })} className="truncate hover:underline">{c.label || c.value}</Link>
-                <span className="shrink-0 tabular-nums text-muted-foreground">{c.requests.toLocaleString()} {c.requests === 1 ? "request" : "requests"}</span>
+                <span className="shrink-0 tabular-nums text-muted-foreground">{formatNumber(c.requests)} {c.requests === 1 ? "request" : "requests"}</span>
               </li>
             ))}
             {callers.length > 8 && (

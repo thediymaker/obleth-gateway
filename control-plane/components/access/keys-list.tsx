@@ -27,9 +27,8 @@ import {
 } from "@/lib/access-model";
 import type { KeyPageData } from "@/lib/key-page-data";
 import { logsHref } from "@/lib/log-links";
-import { money } from "@/lib/models-model";
 import type { ApiKey, KeyStats, NamedNetwork, Tenant } from "@/lib/obleth";
-import { compact } from "@/lib/overview-model";
+import { compact, formatNumber, money } from "@/lib/format";
 import { cn, getJson } from "@/lib/utils";
 
 const SORTS: { value: KeySort; label: string }[] = [
@@ -261,11 +260,11 @@ export function KeysList({
     return {
       target: { filter: allMatching.filter, expected: count },
       count,
-      words: `Every key ${keyFiltersWords(applied, tenantName)}${hidden ? `: ${hidden.toLocaleString()} of them are not loaded on this page` : ""}.`,
+      words: `Every key ${keyFiltersWords(applied, tenantName)}${hidden ? `: ${formatNumber(hidden)} of them are not loaded on this page` : ""}.`,
     };
   }
 
-  const plural = (n: number) => `${n.toLocaleString()} key${n === 1 ? "" : "s"}`;
+  const plural = (n: number) => `${formatNumber(n)} key${n === 1 ? "" : "s"}`;
 
   function bulkDisabled(disabled: boolean) {
     start(async () => {
@@ -375,7 +374,7 @@ export function KeysList({
         <div role="region" aria-label="Selected keys" className="sticky top-2 z-20 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-muted-foreground/60 bg-card px-4 py-2.5 shadow-xl">
           <span className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[13px]">
             {allMatching ? (
-              <span>All <b className="font-semibold">{allMatching.count.toLocaleString()}</b> keys {keyFiltersWords(applied, tenantName) === "every key" ? "" : `${keyFiltersWords(applied, tenantName)} `}selected</span>
+              <span>All <b className="font-semibold">{formatNumber(allMatching.count)}</b> keys {keyFiltersWords(applied, tenantName) === "every key" ? "" : `${keyFiltersWords(applied, tenantName)} `}selected</span>
             ) : (
               <span><b className="font-semibold">{selected.size}</b> selected</span>
             )}

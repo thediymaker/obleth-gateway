@@ -14,8 +14,9 @@ import { keyRowLabel, previewTenantWeight, tenantKeys, tenantPools } from "@/lib
 import { Pill, SectionLabel, Sparkline } from "@/components/overview/ui";
 import { cn } from "@/lib/utils";
 import type { TenantSeriesRow } from "./hooks";
+import { formatNumber } from "@/lib/format";
 
-const slots = (n: number) => (n >= 10 ? Math.round(n) : Math.round(n * 10) / 10).toLocaleString();
+const slots = (n: number) => formatNumber(n >= 10 ? Math.round(n) : Math.round(n * 10) / 10);
 
 /** "Below share on chat-large", or "Below share in 3 pools". */
 export function belowShareLabel(models: (string | null)[]): string {
@@ -102,10 +103,10 @@ function Body({ tenant, view, keys, series }: { tenant: TenantFairshareView; vie
           <DialogClose className="flex h-8 w-8 items-center justify-center rounded-lg text-muted-foreground hover:bg-accent hover:text-foreground" aria-label="Close"><X className="h-4 w-4" /></DialogClose>
         </div>
         <div className="flex flex-wrap gap-2">
-          {tenant.queued > 0 && <Pill>{tenant.queued.toLocaleString()} waiting</Pill>}
+          {tenant.queued > 0 && <Pill>{formatNumber(tenant.queued)} waiting</Pill>}
           {shortIn.length > 0 && <Pill inverted>{belowShareLabel(shortIn)}</Pill>}
           {!tenant.queued && <Pill>No queued requests</Pill>}
-          <Pill>{tenant.in_flight.toLocaleString()} running</Pill>
+          <Pill>{formatNumber(tenant.in_flight)} running</Pill>
           <Link href="/tenants" className="inline-flex h-[22px] items-center rounded-full border border-border px-2 text-[11.5px] font-medium hover:bg-accent">Open tenant ›</Link>
           <Link href={logsHref({ team: tenant.tenant_id, window: "1h" })} className="inline-flex h-[22px] items-center rounded-full border border-border px-2 text-[11.5px] font-medium hover:bg-accent">Its requests ›</Link>
         </div>
@@ -127,7 +128,7 @@ function Body({ tenant, view, keys, series }: { tenant: TenantFairshareView; vie
               {preview.length === 0 && <div className="border-t border-border px-3.5 py-2.5 text-[12.5px] text-muted-foreground">Not active in any pool right now, so nothing moves until it is.</div>}
               {preview.map((p) => (
                 <div key={p.model} className="grid grid-cols-[minmax(0,1fr)_7rem_3.5rem] gap-2.5 border-t border-border px-3.5 py-2 text-[13px]">
-                  <span className="truncate">{p.model} <span className="text-muted-foreground">· {p.cap.toLocaleString()} slots</span></span>
+                  <span className="truncate">{p.model} <span className="text-muted-foreground">· {formatNumber(p.cap)} slots</span></span>
                   <span className="text-right font-mono text-xs"><span className="text-muted-foreground">{slots(p.from)} →</span> {slots(p.to)}</span>
                   <span className={cn("text-right font-mono text-xs", Math.abs(p.to - p.from) < 0.5 && "text-muted-foreground")}>{p.to - p.from >= 0 ? "+" : "−"}{slots(Math.abs(p.to - p.from))}</span>
                 </div>
@@ -178,7 +179,7 @@ function Body({ tenant, view, keys, series }: { tenant: TenantFairshareView; vie
         </section>
 
         <section className="space-y-2">
-          <div className="flex justify-between"><SectionLabel>Requests · last 30 minutes</SectionLabel><span className="text-xs text-muted-foreground">{requests.toLocaleString()}</span></div>
+          <div className="flex justify-between"><SectionLabel>Requests · last 30 minutes</SectionLabel><span className="text-xs text-muted-foreground">{formatNumber(requests)}</span></div>
           <Sparkline values={trend.map((r) => Number(r.requests))} className="h-14" label={`${tenant.name} requests over the last 30 minutes`} />
         </section>
       </div>

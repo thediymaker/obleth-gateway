@@ -2,8 +2,9 @@
 
 import { memo, useMemo, useState } from "react";
 import { Area, Bar, BarChart, ComposedChart, Line, ResponsiveContainer, Tooltip, XAxis, YAxis, CartesianGrid } from "recharts";
-import { axisTick, chartGrid, compactAxis, timeCursor } from "@/components/chart-tooltip";
-import { BUCKET_LABEL, PREVIOUS_LABEL, RANGE_BUCKET_MS, RANGE_LABEL, compact, formatMs, type OverviewRange, type SeriesPoint } from "@/lib/overview-model";
+import { axisTick, chartGrid, timeCursor } from "@/components/chart-tooltip";
+import { BUCKET_LABEL, PREVIOUS_LABEL, RANGE_BUCKET_MS, RANGE_LABEL, type OverviewRange, type SeriesPoint } from "@/lib/overview-model";
+import { compact, formatMs, formatNumber } from "@/lib/format";
 import { Panel, Segmented } from "./ui";
 
 type Measure = "requests" | "tokens" | "latency";
@@ -25,7 +26,7 @@ interface Row { t: number; label: string; cur: number | null; prev: number | nul
 function TrafficTooltip({ active, payload, measure, range, split }: { active?: boolean; payload?: { payload: Row }[]; measure: Measure; range: OverviewRange; split: boolean }) {
   const row = payload?.[0]?.payload;
   if (!active || !row) return null;
-  const fmt = (v: number | null) => (v === null ? "—" : measure === "latency" ? formatMs(v) : v.toLocaleString());
+  const fmt = (v: number | null) => (v === null ? "—" : measure === "latency" ? formatMs(v) : formatNumber(v));
   const end = timeLabel(row.t + RANGE_BUCKET_MS[range], range);
   return (
     <div className="min-w-44 rounded-lg border border-border bg-[hsl(240_5%_9%)] px-3 py-2 text-xs shadow-xl">
@@ -34,11 +35,11 @@ function TrafficTooltip({ active, payload, measure, range, split }: { active?: b
       <div className="flex justify-between gap-6 text-muted-foreground"><span>{PREVIOUS_LABEL[range].replace(/^\w/, (c) => c.toUpperCase())}</span><span className="font-mono tabular-nums">{fmt(row.prev)}</span></div>
       {split ? (
         <>
-          <div className="mt-1 flex justify-between gap-6"><span>Failed on the platform</span><span className="font-mono tabular-nums">{row.platform.toLocaleString()}</span></div>
-          <div className="flex justify-between gap-6 text-muted-foreground"><span>Failed from callers</span><span className="font-mono tabular-nums">{row.caller.toLocaleString()}</span></div>
+          <div className="mt-1 flex justify-between gap-6"><span>Failed on the platform</span><span className="font-mono tabular-nums">{formatNumber(row.platform)}</span></div>
+          <div className="flex justify-between gap-6 text-muted-foreground"><span>Failed from callers</span><span className="font-mono tabular-nums">{formatNumber(row.caller)}</span></div>
         </>
       ) : (
-        <div className="mt-1 flex justify-between gap-6 text-muted-foreground"><span>Failed</span><span className="font-mono tabular-nums">{row.errors.toLocaleString()}</span></div>
+        <div className="mt-1 flex justify-between gap-6 text-muted-foreground"><span>Failed</span><span className="font-mono tabular-nums">{formatNumber(row.errors)}</span></div>
       )}
     </div>
   );
@@ -99,7 +100,7 @@ export const TrafficPanel = memo(function TrafficPanel({ series, range, hasError
                 <ComposedChart data={rows} syncId="overview-traffic" margin={{ top: 8, right: 4, left: 0, bottom: 0 }}>
                   <CartesianGrid {...chartGrid} vertical={false} />
                   <XAxis dataKey="label" hide />
-                  <YAxis tick={axisTick} axisLine={false} tickLine={false} width={44} allowDecimals={false} tickFormatter={measure === "latency" ? (v: number) => formatMs(v) : compactAxis} />
+                  <YAxis tick={axisTick} axisLine={false} tickLine={false} width={44} allowDecimals={false} tickFormatter={measure === "latency" ? (v: number) => formatMs(v) : compact} />
                   <Tooltip cursor={timeCursor} content={<TrafficTooltip measure={measure} range={range} split={split} />} />
                   <Area type="monotone" dataKey="cur" name="This window" stroke="none" fill={CURRENT} fillOpacity={0.07} isAnimationActive={false} connectNulls={measure !== "latency"} />
                   <Line type="monotone" dataKey="prev" name="Previous" stroke={PREVIOUS} strokeWidth={2} strokeDasharray="5 4" dot={false} activeDot={{ r: 4, strokeWidth: 2, stroke: "hsl(240 5% 7%)" }} isAnimationActive={false} connectNulls={measure !== "latency"} />
@@ -112,13 +113,13 @@ export const TrafficPanel = memo(function TrafficPanel({ series, range, hasError
                 Failed requests
                 {hasErrors && split && (
                   <span className="flex items-center gap-3 text-muted-foreground">
-                    <span className="inline-flex items-center gap-1.5"><span className="h-2 w-2 rounded-[2px]" style={{ background: CURRENT }} />Platform {totalPlatform.toLocaleString()}</span>
-                    <span className="inline-flex items-center gap-1.5"><span className="h-2 w-2 rounded-[2px]" style={{ background: CURRENT, opacity: CALLER_OPACITY }} />Callers {(totalErrors - totalPlatform).toLocaleString()}</span>
+                    <span className="inline-flex items-center gap-1.5"><span className="h-2 w-2 rounded-[2px]" style={{ background: CURRENT }} />Platform {formatNumber(totalPlatform)}</span>
+                    <span className="inline-flex items-center gap-1.5"><span className="h-2 w-2 rounded-[2px]" style={{ background: CURRENT, opacity: CALLER_OPACITY }} />Callers {formatNumber(totalErrors - totalPlatform)}</span>
                   </span>
                 )}
               </span>
               <span className="text-muted-foreground">
-                {!hasErrors ? "Needs a newer gateway" : peak ? <>Peak <span className="text-foreground">{peak.errors.toLocaleString()}</span> at {peak.label} · {totalErrors.toLocaleString()} total</> : `${totalErrors.toLocaleString()} total`}
+                {!hasErrors ? "Needs a newer gateway" : peak ? <>Peak <span className="text-foreground">{formatNumber(peak.errors)}</span> at {peak.label} · {formatNumber(totalErrors)} total</> : `${formatNumber(totalErrors)} total`}
               </span>
             </div>
             <div className="h-[72px]">

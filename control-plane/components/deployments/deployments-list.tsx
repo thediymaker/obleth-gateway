@@ -33,7 +33,7 @@ import {
 } from "@/lib/deployments-model";
 import { logsHref } from "@/lib/log-links";
 import { MODEL_TYPE_NAMES } from "@/lib/models-model";
-import { compact } from "@/lib/overview-model";
+import { compact } from "@/lib/format";
 import { poolOccupancy } from "@/lib/occupancy";
 import { useClusterResources } from "@/lib/use-cluster-resources";
 import { cn, getJson } from "@/lib/utils";

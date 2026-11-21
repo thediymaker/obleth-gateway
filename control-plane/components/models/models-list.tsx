@@ -39,7 +39,8 @@ import {
   type TypeGroup,
 } from "@/lib/models-model";
 import type { CacheStats, ModelFamily, ModelHealthSummary, ModelRoute, UsageModelAgg } from "@/lib/obleth";
-import { compact, formatMs, isBenchmarkRoute } from "@/lib/overview-model";
+import { isBenchmarkRoute } from "@/lib/overview-model";
+import { compact, formatMs } from "@/lib/format";
 import { logsHref } from "@/lib/log-links";
 import { cn, getJson } from "@/lib/utils";
 import { ReadNotice, readFailed } from "@/components/ui/read-state";

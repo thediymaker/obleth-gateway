@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import { formatNumber } from "@/lib/format";
 
 /**
  * The line under a list that holds only part of its rows: how many are shown,
@@ -26,7 +27,7 @@ export function ListFooter({ shown, total, noun, more, loading, onMore, action =
   if (!more && !note) return null;
   return (
     <div className={cn("flex flex-wrap items-center justify-between gap-2 border-t border-border px-[18px] py-2.5 text-[12px] text-muted-foreground", className)}>
-      <span>{shown.toLocaleString()}{total != null ? ` of ${total.toLocaleString()}` : ""} {noun} shown{note ? ` · ${note}` : ""}</span>
+      <span>{formatNumber(shown)}{total != null ? ` of ${formatNumber(total)}` : ""} {noun} shown{note ? ` · ${note}` : ""}</span>
       {more && onMore && (
         <Button type="button" size="sm" variant="outline" className="h-8" onClick={onMore} disabled={loading}>
           {loading ? "Loading…" : action}

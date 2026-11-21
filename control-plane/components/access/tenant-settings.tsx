@@ -8,7 +8,7 @@ import { BudgetBar, SettingsCard } from "@/components/access/ui";
 import { WeekGrid } from "@/components/access/week-grid";
 import { SelectField, Setting, Switch, TextArea, TextField } from "@/components/models/fields";
 import { clockIn, groupShare, isTimeZone, PERIOD_OPTIONS, utcToZoned, zonedToUtc, type BudgetView } from "@/lib/access-model";
-import { money } from "@/lib/models-model";
+import { money } from "@/lib/format";
 import type { Tenant } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
 

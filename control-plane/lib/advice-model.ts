@@ -1,5 +1,6 @@
 import type { AdviceFindingView, AdviceFixView, AdviceJudgmentView, AdviceLogsView, AdviceReportView, SnoozedAdviceView } from "@/lib/obleth";
 import { logsHref } from "@/lib/log-links";
+import { percent } from "@/lib/format";
 
 const BOON_LABEL: Record<string, string> = {
   vision: "the vision boon",
@@ -33,17 +34,13 @@ export function fixConfirm(fix: AdviceFixView): { title: string; description: st
   };
 }
 
-function pct(p: number): string {
-  return `${Math.round(p * 100)}%`;
-}
-
 /** The judge's view, in one sentence. */
 export function judgeLine(j: AdviceJudgmentView): string {
   const parts = [
-    `users affected ${pct(j.hurting_users)}`,
-    `worth acting on today ${pct(j.worth_acting)}`,
+    `users affected ${percent(j.hurting_users)}`,
+    `worth acting on today ${percent(j.worth_acting)}`,
   ];
-  if (j.fix_is_safe !== undefined) parts.push(`the fix is safe ${pct(j.fix_is_safe)}`);
+  if (j.fix_is_safe !== undefined) parts.push(`the fix is safe ${percent(j.fix_is_safe)}`);
   return `${j.model} rates it: ${parts.join(", ")}.`;
 }
 

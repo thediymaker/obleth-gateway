@@ -10,8 +10,9 @@ import { uuid } from "@/lib/uuid";
 import type { ModelRoute } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
 import type { PlaygroundSession } from "./playground";
-import { ModelAvatar, Pill, RunError, SectionLabel, Segmented, SettingsPanel, formatCost } from "./ui";
+import { ModelAvatar, Pill, RunError, SectionLabel, Segmented, SettingsPanel } from "./ui";
 import { useStoppable } from "./use-stoppable";
+import { money } from "@/lib/format";
 
 // Sizes offered in the picker. Deliberately a superset of the boon's default
 // allowed list: the playground drives the image model directly, so it is not
@@ -320,7 +321,7 @@ export function ImageWorkspace({
                 </DropdownMenuContent>
               </DropdownMenu>
               <div className="flex-1" />
-              {perImage > 0 && <span className="font-mono text-[11.5px] text-muted-foreground" title="List price × images">≈ {formatCost(perImage * count)}</span>}
+              {perImage > 0 && <span className="font-mono text-[11.5px] text-muted-foreground" title="List price × images">≈ {money(perImage * count, { precise: true })}</span>}
               {busy
                 ? <Button id="image-stop" variant="outline" className="h-9" onClick={active.stop}><Loader2 className="h-4 w-4 animate-spin" />Stop</Button>
                 : <Button id="image-generate" className="h-9" disabled={!target || !prompt.trim()} onClick={submit}>Generate</Button>}
@@ -351,7 +352,7 @@ export function ImageWorkspace({
               searchPlaceholder="Filter models"
               options={imageModels.map((m) => ({ value: m.model_name, label: m.model_name }))}
             />
-            {target && <p className="text-xs text-muted-foreground">{perImage > 0 ? `$${+perImage.toPrecision(3)} per image` : "No price set"}</p>}
+            {target && <p className="text-xs text-muted-foreground">{perImage > 0 ? `${money(perImage, { precise: true })} per image` : "No price set"}</p>}
           </section>
 
           <section className="space-y-2.5">

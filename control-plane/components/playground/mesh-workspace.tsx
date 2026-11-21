@@ -10,7 +10,8 @@ import type { ModelRoute } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
 import type { PlaygroundSession } from "./playground";
 import { MeshViewer } from "./mesh-viewer";
-import { ModelAvatar, RunError, SectionLabel, Segmented, SettingsPanel, formatCost } from "./ui";
+import { ModelAvatar, RunError, SectionLabel, Segmented, SettingsPanel } from "./ui";
+import { money } from "@/lib/format";
 
 export const MESH_QUALITIES = [
   { value: "512", label: "Fast", hint: "512 voxels: about a third of the time, softer detail" },
@@ -243,7 +244,7 @@ export function MeshWorkspace({
                         {job.texture && <span>{job.texture}px texture</span>}
                         <span>seed {job.seed ?? "random"}</span>
                         {l?.status !== "gone" && <span>{fmtElapsed(elapsed)}</span>}
-                        {perMesh > 0 && <span>{formatCost(perMesh)}</span>}
+                        {perMesh > 0 && <span>{money(perMesh, { precise: true })}</span>}
                       </div>
                     </div>
                     {done && l.glbUrl && (
@@ -311,7 +312,7 @@ export function MeshWorkspace({
                 </DropdownMenuContent>
               </DropdownMenu>
               <div className="flex-1" />
-              {perMesh > 0 && <span className="font-mono text-[11.5px] text-muted-foreground" title="List price per mesh">≈ {formatCost(perMesh)}</span>}
+              {perMesh > 0 && <span className="font-mono text-[11.5px] text-muted-foreground" title="List price per mesh">≈ {money(perMesh, { precise: true })}</span>}
               <Button className="h-9" disabled={submitting || !target || !source} onClick={() => void submit()}>
                 {submitting && <Loader2 className="h-4 w-4 animate-spin" />}
                 Generate 3D
@@ -344,7 +345,7 @@ export function MeshWorkspace({
               searchPlaceholder="Filter models"
               options={meshModels.map((m) => ({ value: m.model_name, label: m.model_name }))}
             />
-            {target && <p className="text-xs text-muted-foreground">{perMesh > 0 ? `$${+perMesh.toPrecision(3)} per mesh` : "No price set"}</p>}
+            {target && <p className="text-xs text-muted-foreground">{perMesh > 0 ? `${money(perMesh, { precise: true })} per mesh` : "No price set"}</p>}
           </section>
 
           <section className="space-y-2.5">

@@ -10,7 +10,6 @@ import {
   ChangesContext,
   ChatCapabilityFields,
   MODEL_TYPE_OPTIONS,
-  perMillion,
   fromPerMillion,
   QUANTIZATION_HINT,
   QUANTIZATION_OPTIONS,
@@ -18,6 +17,7 @@ import {
   SelectField,
   Setting,
   Switch,
+  toPerMillion,
   TextArea,
   TextField,
   toPlainDecimal,
@@ -51,7 +51,7 @@ function Section({ id, title, description, children }: { id: SettingsSectionId; 
  * exactly, so opening the page never reads as a change.
  */
 function PriceInput({ name, label, value, perM }: { name: string; label: string; value: number; perM: boolean }) {
-  const start = perM ? perMillion(value) : value > 0 ? toPlainDecimal(value) : "";
+  const start = perM ? toPerMillion(value) : value > 0 ? toPlainDecimal(value) : "";
   const [shown, setShown] = useState(start);
   const stored = shown === start ? toPlainDecimal(value) : perM ? fromPerMillion(shown) || "0" : shown.trim() || "0";
   return (
