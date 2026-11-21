@@ -1,6 +1,6 @@
 import type { AdviceFindingView, AdviceFixView, AdviceJudgmentView, AdviceLogsView, AdviceReportView, SnoozedAdviceView } from "@/lib/obleth";
 import { logsHref } from "@/lib/log-links";
-import { percent } from "@/lib/format";
+import { ago, dateLabel, percent } from "@/lib/format";
 
 const BOON_LABEL: Record<string, string> = {
   vision: "the vision boon",
@@ -54,7 +54,7 @@ export function splitAdvice(report: AdviceReportView | null): { needs: AdviceFin
 }
 
 function day(ms: number): string {
-  return new Date(ms).toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  return dateLabel(ms);
 }
 
 /** "Back on Nov 13 · set aside by a@b" or "Dismissed by a@b on Nov 6". */
@@ -65,9 +65,7 @@ export function snoozedLine(s: SnoozedAdviceView): string {
 
 /** Where the report's numbers come from, and who ordered it. */
 export function adviceSource(report: AdviceReportView, now = Date.now()): string {
-  const mins = Math.max(0, Math.round((now - report.generated_at_ms) / 60_000));
-  const when = mins === 0 ? "just now" : `${mins} min ago`;
-  const base = `From the last ${report.window_hours} hours of requests, checked ${when}.`;
+  const base = `From the last ${report.window_hours} hours of requests, checked ${ago(report.generated_at_ms, now)}.`;
   if (report.judge.model) {
     const state = report.judge.pending ? "; it is still judging some findings" : report.judge.error ? `; its last pass failed: ${report.judge.error}` : "";
     return `${base} Ordered by ${report.judge.model}${state}.`;

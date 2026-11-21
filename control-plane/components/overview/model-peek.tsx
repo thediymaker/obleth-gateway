@@ -7,7 +7,7 @@ import { Dialog, DialogClose, DialogDescription, DialogPortal, DialogOverlay, Di
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import type { AuditEntry, ModelHealthDetail, ModelRoute, ModelUsageTimePoint, UsageBreakdownEntry, UsageModelAgg } from "@/lib/obleth";
 import { describeAudit, modelTypeLabel, RANGE_BUCKET_MS, RANGE_LABEL, RANGE_MS, type FleetTile, type OverviewRange } from "@/lib/overview-model";
-import { compact, formatMs } from "@/lib/format";
+import { clock, clockSeconds, compact, dateTime, formatMs } from "@/lib/format";
 import { cn, getJson } from "@/lib/utils";
 import { HealthGlyph, Meter, Pill, SectionLabel, Sparkline } from "./ui";
 import { modelHref } from "@/lib/model-links";
@@ -113,12 +113,12 @@ export function ModelPeek({ tile, model, usage, audit, range, onClose }: {
                     <>
                       <div className="flex gap-[3px]" role="img" aria-label={`${checks.filter((c) => c.status === "healthy").length} of ${checks.length} recent checks passed`}>
                         {checks.map((c) => (
-                          <span key={c.id} title={`${new Date(c.checked_at).toLocaleTimeString()} · ${c.status}${c.http_status ? ` · HTTP ${c.http_status}` : ""}${c.latency_ms ? ` · ${c.latency_ms} ms` : ""}`}
+                          <span key={c.id} title={`${clockSeconds(c.checked_at)} · ${c.status}${c.http_status ? ` · HTTP ${c.http_status}` : ""}${c.latency_ms ? ` · ${c.latency_ms} ms` : ""}`}
                             className={cn("block h-[18px] flex-1 rounded-sm", c.status === "healthy" ? ((c.latency_ms ?? 0) > 1000 ? "bg-muted-foreground" : "bg-secondary-foreground") : "border border-foreground bg-transparent")} />
                         ))}
                       </div>
                       <p className="text-xs text-muted-foreground">
-                        {lastCheck ? `Last check ${new Date(lastCheck.checked_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}${lastCheck.http_status ? ` · HTTP ${lastCheck.http_status}` : ""}${lastCheck.latency_ms ? ` in ${lastCheck.latency_ms} ms` : ""}` : ""} · hollow bars failed, darker bars took over 1 s
+                        {lastCheck ? `Last check ${clock(lastCheck.checked_at)}${lastCheck.http_status ? ` · HTTP ${lastCheck.http_status}` : ""}${lastCheck.latency_ms ? ` in ${lastCheck.latency_ms} ms` : ""}` : ""} · hollow bars failed, darker bars took over 1 s
                       </p>
                     </>
                   )}
@@ -138,7 +138,7 @@ export function ModelPeek({ tile, model, usage, audit, range, onClose }: {
                     <SectionLabel>Recent changes</SectionLabel>
                     {changes.map((e) => {
                       const d = describeAudit(e, { models: new Map(), tenants: new Map() });
-                      return <p key={e.id} className="text-[13px] text-secondary-foreground">{d.actor.replace(/@.*/, "")} {d.action} <span className="text-muted-foreground">· {new Date(e.ts).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</span></p>;
+                      return <p key={e.id} className="text-[13px] text-secondary-foreground">{d.actor.replace(/@.*/, "")} {d.action} <span className="text-muted-foreground">· {dateTime(e.ts)}</span></p>;
                     })}
                   </section>
                 )}

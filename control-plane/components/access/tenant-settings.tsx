@@ -8,7 +8,7 @@ import { BudgetBar, SettingsCard } from "@/components/access/ui";
 import { WeekGrid } from "@/components/access/week-grid";
 import { SelectField, Setting, Switch, TextArea, TextField } from "@/components/models/fields";
 import { clockIn, groupShare, isTimeZone, PERIOD_OPTIONS, utcToZoned, zonedToUtc, type BudgetView } from "@/lib/access-model";
-import { money } from "@/lib/format";
+import { dateLabel, money } from "@/lib/format";
 import type { Tenant } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
 
@@ -153,7 +153,7 @@ function BudgetFields({ tenant, budget }: { tenant: Tenant; budget: (BudgetView 
         <TextField name="budget_tokens" label="Token cap" type="number" min={0} step={1} value={tokens} onChange={(e) => setTokens(e.target.value)} placeholder="No cap" mono className="w-44" />
       </Setting>
       {period !== "monthly" && (cost || tokens) && (
-        <Setting id="set-budget-restart" label="Start a new period" hint={tenant.budget_started_at ? `This one began ${new Date(tenant.budget_started_at).toLocaleDateString()}.` : "Counting starts now."} fields={["budget_restart"]}>
+        <Setting id="set-budget-restart" label="Start a new period" hint={tenant.budget_started_at ? `This one began ${dateLabel(tenant.budget_started_at, { year: true })}.` : "Counting starts now."} fields={["budget_restart"]}>
           <Switch name="budget_restart" label="Start counting again from now" defaultChecked={false} />
         </Setting>
       )}

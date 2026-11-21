@@ -5,7 +5,8 @@ import { Plus, Search, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type { PlaygroundSession } from "./playground";
-import { modeInfo, modelLabel, shortAgo } from "./ui";
+import { modeInfo, modelLabel } from "./ui";
+import { ago } from "@/lib/format";
 
 const DAY = 86_400_000;
 
@@ -32,7 +33,7 @@ function subtitle(s: PlaygroundSession, now: number): string {
     const lanes = (s.recipients ?? s.models.map((_, i) => i)).map((i) => s.models[i]).filter(Boolean);
     detail = lanes.length > 1 ? `${lanes.length} models` : modelLabel(lanes[0] ?? "");
   }
-  return [s.launcher ? "New" : mode, detail, shortAgo(s.updatedAt, now)].filter(Boolean).join(" · ");
+  return [s.launcher ? "New" : mode, detail, ago(s.updatedAt, now, { short: true })].filter(Boolean).join(" · ");
 }
 
 export function SessionsRail({ sessions, active, onSelect, onCreate, onRemove, onImport, canCreate }: {

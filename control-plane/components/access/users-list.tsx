@@ -17,6 +17,7 @@ import { lastUsed, reachLabel, reachOf, tenantHref, type Reach } from "@/lib/acc
 import type { AdminUser } from "@/lib/auth/users";
 import { useLatestCallback } from "@/lib/use-latest-callback";
 import { cn } from "@/lib/utils";
+import { dateLabel } from "@/lib/format";
 
 type Show = "everyone" | "admins" | "portal" | "none";
 
@@ -30,7 +31,7 @@ const COLS = "grid-cols-[minmax(0,1.5fr)_80px_90px_minmax(0,1fr)_minmax(0,1.2fr)
 function joined(at: AdminUser["createdAt"]): string {
   if (!at) return "—";
   const d = new Date(at);
-  return Number.isNaN(d.getTime()) ? "—" : d.toLocaleDateString([], { month: "short", day: "numeric", year: d.getFullYear() === new Date().getFullYear() ? undefined : "numeric" });
+  return Number.isNaN(d.getTime()) ? "—" : dateLabel(d, { year: d.getFullYear() !== new Date().getFullYear() });
 }
 
 function signedIn(at: AdminUser["createdAt"]): string {

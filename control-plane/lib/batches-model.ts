@@ -1,5 +1,5 @@
 import type { AdminBatch, BatchStatus } from "@/lib/obleth";
-import { formatNumber } from "@/lib/format";
+import { duration, formatNumber } from "@/lib/format";
 
 /** Statuses that still have work ahead of them. */
 const ACTIVE: BatchStatus[] = ["validating", "in_progress", "finalizing", "cancelling"];
@@ -17,18 +17,6 @@ export function doneOf(b: Pick<AdminBatch, "completed" | "failed">): number {
 export function percentOf(b: Pick<AdminBatch, "completed" | "failed" | "total">): number {
   if (b.total <= 0) return 0;
   return Math.min(100, Math.floor((doneOf(b) / b.total) * 100));
-}
-
-/** A length of time in words: "45 s", "12 min", "3 h 5 min", "2 d 4 h". */
-export function duration(secs: number): string {
-  const s = Math.max(0, Math.round(secs));
-  if (s < 60) return `${s} s`;
-  const m = Math.round(s / 60);
-  if (m < 60) return `${m} min`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return m % 60 ? `${h} h ${m % 60} min` : `${h} h`;
-  const d = Math.floor(h / 24);
-  return h % 24 ? `${d} d ${h % 24} h` : `${d} d`;
 }
 
 function secsBetween(from: string | null | undefined, now: number): number | null {
@@ -92,14 +80,14 @@ export function batchState(b: AdminBatch, now: number): BatchState {
         return {
           label: "Waiting for capacity",
           tone: "waiting",
-          detail: `Nothing has finished in ${idle != null ? duration(idle) : "a while"}. Batches run only while no one is waiting for the model, so it is likely busy.`,
+          detail: `Nothing has finished in ${idle != null ? duration(idle * 1000) : "a while"}. Batches run only while no one is waiting for the model, so it is likely busy.`,
         };
       }
       const eta = etaSecs(b, now);
       return {
         label: "Running",
         tone: "running",
-        detail: eta != null ? `About ${duration(eta)} left at this pace` : `${formatNumber(remaining)} requests to go`,
+        detail: eta != null ? `About ${duration(eta * 1000)} left at this pace` : `${formatNumber(remaining)} requests to go`,
       };
     }
     case "finalizing":

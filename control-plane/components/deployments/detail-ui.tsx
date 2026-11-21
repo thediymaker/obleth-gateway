@@ -6,6 +6,7 @@ import { useFairshareHistory, usePoolLoad } from "@/components/fairshare/hooks";
 import { Meter, Panel } from "@/components/overview/ui";
 import type { AuditEntry, ModelRoute, UsageLogHistogram } from "@/lib/obleth";
 import { getJson } from "@/lib/utils";
+import { clock, dateTime } from "@/lib/format";
 
 const DAY_MS = 86_400_000;
 
@@ -73,7 +74,7 @@ export const InFlightChart = memo(function InFlightChart({ model, cap }: { model
             <div className="relative flex h-[150px] items-end gap-[2px] border-b border-border" aria-label={`Peak ${peak} in flight`}>
               {cap > 0 && <span className="absolute inset-x-0 border-t border-dashed border-muted-foreground/60" style={{ bottom: `${(cap / max) * 100}%` }} aria-hidden />}
               {bars.map((b, i) => (
-                <span key={i} className="flex h-full flex-1 flex-col justify-end" title={`${new Date(b.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}: ${b.inFlight} in flight${b.queued ? `, ${b.queued} waiting` : ""}`}>
+                <span key={i} className="flex h-full flex-1 flex-col justify-end" title={`${clock(b.ts)}: ${b.inFlight} in flight${b.queued ? `, ${b.queued} waiting` : ""}`}>
                   {b.queued > 0 && <span className="block rounded-t-[2px] bg-foreground" style={{ height: `${(b.queued / max) * 100}%` }} />}
                   <span className="block bg-muted-foreground/70" style={{ height: `${(b.inFlight / max) * 100}%` }} />
                 </span>
@@ -116,7 +117,7 @@ export function ChangesList({ changes }: { changes: AuditEntry[] }) {
             const detail = e.action === "put_managed_model" ? `${d.target_replicas ?? "?"} replica${d.target_replicas === 1 ? "" : "s"}${d.partition ? ` on ${d.partition}` : ""}${d.enabled === false ? ", paused" : ""}` : "";
             return (
               <div key={e.id} className="grid grid-cols-[140px_minmax(0,1fr)_minmax(0,220px)] gap-3 border-t border-border py-2 text-[12.5px] first:border-t-0">
-                <span className="font-mono text-[11.5px] text-muted-foreground">{new Date(e.ts).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</span>
+                <span className="font-mono text-[11.5px] text-muted-foreground">{dateTime(e.ts)}</span>
                 <span className="truncate">{ACTION_WORDS[e.action] ?? e.action.replace(/_/g, " ")}{detail && <span className="text-muted-foreground"> · {detail}</span>}</span>
                 <span className="truncate text-right text-muted-foreground">{e.actor}</span>
               </div>

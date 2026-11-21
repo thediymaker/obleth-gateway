@@ -10,7 +10,7 @@ import type {
 import { isAboveShare, isWaitingBelowShare } from "@/lib/fairshare";
 import { isBenchmarkRoute } from "@/lib/overview-model";
 import { poolOccupancy } from "@/lib/occupancy";
-import { formatNumber } from "@/lib/format";
+import { clockSeconds, formatNumber } from "@/lib/format";
 
 // ---------------------------------------------------------------------------
 // Scope and gateway modes
@@ -130,7 +130,7 @@ function formatPointTime(tsMs: number): string {
   let label = timeLabelCache.get(tsMs);
   if (label === undefined) {
     if (timeLabelCache.size >= TIME_LABEL_CACHE_MAX) timeLabelCache.clear();
-    label = new Date(tsMs).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    label = clockSeconds(tsMs);
     timeLabelCache.set(tsMs, label);
   }
   return label;

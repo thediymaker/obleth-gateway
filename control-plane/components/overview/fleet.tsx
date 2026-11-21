@@ -3,7 +3,7 @@
 import { memo, useMemo, useState } from "react";
 import { ChevronDown } from "lucide-react";
 import { modelTypeLabel, RANGE_LABEL, type FleetTile, type OverviewRange } from "@/lib/overview-model";
-import { compact, formatMs, formatNumber } from "@/lib/format";
+import { clock, compact, formatMs, formatNumber } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { HealthGlyph, Meter, Panel, PanelLink, Pill, SectionLabel, Segmented } from "./ui";
 
@@ -16,7 +16,7 @@ function tileNote(t: FleetTile): string {
   }
   if (t.attention === "full") return `${t.inFlight}/${t.cap} · ${t.queued} queued`;
   if (t.health === "maintenance") {
-    const until = t.healthRow?.maintenance_until ? new Date(t.healthRow.maintenance_until).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : null;
+    const until = t.healthRow?.maintenance_until ? clock(t.healthRow.maintenance_until) : null;
     return until ? `Maintenance · ${until}` : "Maintenance";
   }
   if (t.health === "unknown" && !t.requests) return "Awaiting first check";

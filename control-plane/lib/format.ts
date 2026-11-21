@@ -66,6 +66,101 @@ export function percent(share: number): string {
   return `${Math.round(p)}%`;
 }
 
+// ---------------------------------------------------------------------------
+// Time. Pages that render on the server pass `now` from the client where they
+// already do, so the server and browser renders agree.
+// ---------------------------------------------------------------------------
+
+/** A moment as the APIs send it: epoch ms, an ISO string, or a Date. */
+export type Moment = number | string | Date;
+
+const toDate = (at: Moment) => (at instanceof Date ? at : new Date(at));
+const valid = (d: Date) => !Number.isNaN(d.getTime());
+
+/** Any date or time in en-US, for the rare format the helpers below don't cover. */
+export function formatDate(at: Moment, options: Intl.DateTimeFormatOptions): string {
+  const d = toDate(at);
+  return valid(d) ? d.toLocaleString("en-US", options) : "—";
+}
+
+/** "2:20 PM". */
+export function clock(at: Moment): string {
+  return formatDate(at, { hour: "numeric", minute: "2-digit" });
+}
+
+/** "2:20:05 PM", for logs and anything that happens seconds apart. */
+export function clockSeconds(at: Moment): string {
+  return formatDate(at, { hour: "numeric", minute: "2-digit", second: "2-digit" });
+}
+
+/** "Nov 12", or "Nov 12, 2025" with `year`. `utc` reads a calendar day stored as UTC midnight. */
+export function dateLabel(at: Moment, opts: { year?: boolean; utc?: boolean } = {}): string {
+  return formatDate(at, { month: "short", day: "numeric", ...(opts.year ? { year: "numeric" } : {}), ...(opts.utc ? { timeZone: "UTC" } : {}) });
+}
+
+/** "Nov 12, 2:20 PM". */
+export function dateTime(at: Moment): string {
+  return formatDate(at, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+}
+
+/** "Nov 12, 2025, 2:20:05 PM": the whole moment, for a title attribute. */
+export function fullDateTime(at: Moment): string {
+  return formatDate(at, { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit", second: "2-digit" });
+}
+
+/** "2:20 PM" today, "Nov 12, 2:20 PM" on another day. */
+export function clockOrDate(at: Moment, now: number): string {
+  const d = toDate(at);
+  return d.toDateString() === new Date(now).toDateString() ? clock(d) : dateTime(d);
+}
+
+const DAY_S = 86_400;
+
+/**
+ * How long ago, in words: "just now", "40 s ago", "4 min ago", "3 h ago",
+ * "2 d ago", and the date past 60 days. `short` is for narrow columns: "now",
+ * "40s", "4m", "3h", "2d". No time reads "never" ("" when short); a time in
+ * the future reads "just now", since clocks drift a little.
+ */
+export function ago(at: Moment | null | undefined, now: number, opts: { short?: boolean } = {}): string {
+  if (at === null || at === undefined || at === "" || at === 0) return opts.short ? "" : "never";
+  const d = toDate(at);
+  if (!valid(d)) return opts.short ? "" : "never";
+  const s = Math.max(0, Math.floor((now - d.getTime()) / 1000));
+  const short = opts.short;
+  if (s < (short ? 60 : 5)) return short ? "now" : "just now";
+  if (s < 60) return `${s} s ago`;
+  if (s < 3600) return short ? `${Math.floor(s / 60)}m` : `${Math.floor(s / 60)} min ago`;
+  if (s < DAY_S) return short ? `${Math.floor(s / 3600)}h` : `${Math.floor(s / 3600)} h ago`;
+  if (s < 60 * DAY_S) return short ? `${Math.floor(s / DAY_S)}d` : `${Math.floor(s / DAY_S)} d ago`;
+  return dateLabel(d, { year: d.getFullYear() !== new Date(now).getFullYear() });
+}
+
+/** How long ago a count of seconds back from now was: the APIs that report
+ * "last seen N s ago" as a number. No number reads "never". */
+export function secsAgo(secs: number | null | undefined, now = Date.now()): string {
+  return secs === null || secs === undefined ? "never" : ago(now - secs * 1000, now);
+}
+
+/** A request's time in a log: "12 s ago", "4 min ago", then the clock, or the date and clock on another day. */
+export function whenLogged(at: Moment, now: number): string {
+  const s = Math.floor((now - toDate(at).getTime()) / 1000);
+  return s < 3600 ? ago(at, now) : clockOrDate(at, now);
+}
+
+/** A length of time in words: "45 s", "6 min 24 s", "12 min", "3 h 5 min", "2 d 4 h". */
+export function duration(ms: number): string {
+  const s = Math.max(0, Math.round((Number.isFinite(ms) ? ms : 0) / 1000));
+  if (s < 60) return `${s} s`;
+  if (s < 600) return s % 60 ? `${Math.floor(s / 60)} min ${s % 60} s` : `${s / 60} min`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m} min`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return m % 60 ? `${h} h ${m % 60} min` : `${h} h`;
+  const d = Math.floor(h / 24);
+  return h % 24 ? `${d} d ${h % 24} h` : `${d} d`;
+}
+
 export function clamp(n: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, n));
 }

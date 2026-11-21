@@ -17,7 +17,7 @@ import type {
   UsageModelAgg,
 } from "@/lib/obleth";
 import { healthState, isBenchmarkRoute, type HealthState } from "@/lib/overview-model";
-import { money, perMillion } from "@/lib/format";
+import { dateLabel, money, perMillion } from "@/lib/format";
 import { poolOccupancy } from "@/lib/occupancy";
 import { parseTagLevel, TAG_LEVEL_LABELS } from "@/lib/utils";
 
@@ -587,7 +587,7 @@ export function acceptsImages(
 
 /** "Oct 19, 2026", read in UTC like the gateway's dates. */
 export function lifecycleDate(iso: string): string {
-  return new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric", timeZone: "UTC" });
+  return dateLabel(iso, { year: true, utc: true });
 }
 
 /** The one-word badge for each status in the models list. */

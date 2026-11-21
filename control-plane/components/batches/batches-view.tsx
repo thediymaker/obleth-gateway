@@ -9,36 +9,18 @@ import { cancelBatchAction } from "@/app/(dashboard)/batches/batches-actions";
 import { Tile } from "@/components/models/ui";
 import { Segmented } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
-import {
-  BATCH_FILTERS,
-  batchName,
-  batchState,
-  doneOf,
-  duration,
-  filterCount,
-  isActive,
-  ownerOf,
-  percentOf,
-  type BatchFilter,
-  type BatchTone,
-} from "@/lib/batches-model";
+import { BATCH_FILTERS, batchName, batchState, doneOf, filterCount, isActive, ownerOf, percentOf, type BatchFilter, type BatchTone } from "@/lib/batches-model";
 import { tenantHref } from "@/lib/access-model";
 import { logsHref } from "@/lib/log-links";
 import { modelHref } from "@/lib/model-links";
 import type { AdminBatch, AdminBatchList } from "@/lib/obleth";
-import { compact, formatNumber } from "@/lib/format";
+import { ago, compact, formatNumber } from "@/lib/format";
 import { cn, getJson } from "@/lib/utils";
 import { ListFooter } from "@/components/ui/list-footer";
 import { ReadNotice } from "@/components/ui/read-state";
 import { StatusText, type StatusGlyph } from "@/components/ui/status";
 
 const COLS = "grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)_minmax(0,0.9fr)_minmax(220px,1.6fr)_minmax(0,1.3fr)_88px]";
-
-function since(iso: string | null, now: number): string {
-  if (!iso) return "";
-  const s = (now - Date.parse(iso)) / 1000;
-  return Number.isFinite(s) ? `${duration(s)} ago` : "";
-}
 
 /** The progress bar: succeeded solid, failed hatched, the rest empty. */
 function Progress({ b, tone }: { b: AdminBatch; tone: BatchTone }) {
@@ -179,7 +161,7 @@ export function BatchesView({ initial, initialFilter }: { initial: AdminBatchLis
                     <span className="truncate font-medium" title={name ?? b.id}>{name ?? <span className="font-mono text-[12.5px]">{b.id}</span>}</span>
                     <span className="truncate text-[11.5px] text-muted-foreground">
                       {name && <span className="font-mono">{b.id} · </span>}
-                      {since(b.created_at, now)}
+                      {ago(b.created_at, now)}
                     </span>
                   </span>
                   <span className="flex min-w-0 flex-col">
@@ -200,7 +182,7 @@ export function BatchesView({ initial, initialFilter }: { initial: AdminBatchLis
                   <span className="flex min-w-0 flex-col items-start gap-0.5">
                     <StateLabel tone={s.tone} label={s.label} />
                     {s.detail && <span className="line-clamp-2 max-w-full text-[11.5px] leading-snug text-muted-foreground" title={s.detail}>{s.detail}</span>}
-                    {!s.detail && b.finished_at && <span className="text-[11.5px] text-muted-foreground">{since(b.finished_at, now)}</span>}
+                    {!s.detail && b.finished_at && <span className="text-[11.5px] text-muted-foreground">{ago(b.finished_at, now)}</span>}
                   </span>
                   <span className="flex justify-end gap-1">
                     {(b.status === "in_progress" || b.status === "validating") ? (

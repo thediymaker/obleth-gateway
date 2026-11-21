@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { failureHeadline, groupLogsHref, groupsFor, seenAgo, share, trendOf, TREND_POINTS } from "./failures-model";
+import { failureHeadline, groupLogsHref, groupsFor, share, trendOf, TREND_POINTS } from "./failures-model";
 import { NIL_REQUEST_ID } from "./logs-model";
 import type { UsageFailureGroup } from "./obleth";
 
@@ -39,14 +39,6 @@ describe("a failure group", () => {
     expect(groupsFor(groups, "all")).toHaveLength(2);
     expect(groupsFor(groups, "platform").map((g) => g.error_class)).toEqual(["capacity"]);
     expect(groupsFor(groups, "client").map((g) => g.error_class)).toEqual(["client_input"]);
-  });
-
-  it("says how long ago it was seen", () => {
-    const now = 10 * 86_400_000;
-    expect(seenAgo(now - 12_000, now)).toBe("12 s ago");
-    expect(seenAgo(now - 4 * 60_000, now)).toBe("4 min ago");
-    expect(seenAgo(now - 3 * 3_600_000, now)).toBe("3 h ago");
-    expect(seenAgo(now - 3 * 86_400_000, now)).toBe("3 days ago");
   });
 
   it("lays the histogram's buckets out as a trend, zero where a bucket was left out", () => {

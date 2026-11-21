@@ -203,13 +203,3 @@ export function capabilities(m: ModelRoute | undefined) {
     { key: "vision", label: "Vision", on: m.supports_vision },
   ];
 }
-
-/** "now", "12m", "3h", "2d" — compact enough for the session rail. */
-export function shortAgo(ts: number | undefined, now = Date.now()): string {
-  if (!ts) return "";
-  const s = Math.max(0, Math.round((now - ts) / 1000));
-  if (s < 60) return "now";
-  if (s < 3600) return `${Math.floor(s / 60)}m`;
-  if (s < 86_400) return `${Math.floor(s / 3600)}h`;
-  return `${Math.floor(s / 86_400)}d`;
-}

@@ -12,7 +12,7 @@ import { MODEL_SERIES_BUCKET_MS, priceLabel, RUNS_LABELS, tagLabels, type ModelO
 import type { ModelCapacityStatus, ModelHealthCheck, ModelHealthSummary, ModelRoute, UsageLogHistogram } from "@/lib/obleth";
 import { logsHref } from "@/lib/log-links";
 import { changeLabel, describeAudit } from "@/lib/overview-model";
-import { compact, formatMs, formatNumber } from "@/lib/format";
+import { ago, clock, compact, formatMs, formatNumber, fullDateTime } from "@/lib/format";
 import { cn, getJson } from "@/lib/utils";
 import { auditHref } from "@/lib/audit-model";
 import { boonsWaitingOnFunctionCalling } from "@/lib/boon-availability";
@@ -22,16 +22,6 @@ import { activeDot, axisTick, chartGrid, seriesCurrent, seriesPrevious, timeCurs
 const DAY_MS = 86_400_000;
 
 type Measure = "requests" | "ttft" | "throughput";
-
-/** "40 s", "5 min", "3 h", "2 d". */
-export function ago(ts: string | number | null | undefined, now = Date.now()): string {
-  if (!ts) return "never";
-  const s = Math.max(0, Math.round((now - new Date(ts).getTime()) / 1000));
-  if (s < 60) return `${s} s ago`;
-  if (s < 3600) return `${Math.round(s / 60)} min ago`;
-  if (s < 86_400) return `${Math.round(s / 3600)} h ago`;
-  return `${Math.round(s / 86_400)} d ago`;
-}
 
 function interval(secs: number) {
   return secs % 3600 === 0 ? `${secs / 3600} h` : secs % 60 === 0 ? `${secs / 60} min` : `${secs} s`;
@@ -51,7 +41,7 @@ function buildRows(data: ModelOverviewData, measure: Measure): Row[] {
   };
   const rows: Row[] = [];
   for (let t = start; t <= data.now; t += b) {
-    rows.push({ t, label: new Date(t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }), cur: pick(t), prev: pick(t - DAY_MS) });
+    rows.push({ t, label: clock(t), cur: pick(t), prev: pick(t - DAY_MS) });
   }
   return rows;
 }
@@ -138,12 +128,12 @@ export function HealthTicks({ checks, summary }: { checks: ModelHealthCheck[]; s
         <p className="text-xs text-muted-foreground">No checks yet.</p>
       ) : (
         <div className="flex h-[18px] gap-[3px]" role="img" aria-label={`${recent.length} recent checks, ${failed} failed`}>
-          {recent.map((c) => <span key={c.id} title={`${new Date(c.checked_at).toLocaleString()} · ${c.status}${c.latency_ms != null ? ` · ${c.latency_ms} ms` : ""}`} className={cn("block flex-1 rounded-[2px]", TICK[c.status] ?? "border border-muted-foreground/50")} />)}
+          {recent.map((c) => <span key={c.id} title={`${fullDateTime(c.checked_at)} · ${c.status}${c.latency_ms != null ? ` · ${c.latency_ms} ms` : ""}`} className={cn("block flex-1 rounded-[2px]", TICK[c.status] ?? "border border-muted-foreground/50")} />)}
         </div>
       )}
       <p className="text-xs text-secondary-foreground">
         {summary.last_checked_at ? (
-          <>Last check {ago(summary.last_checked_at)}{summary.last_http_status ? ` · HTTP ${summary.last_http_status}` : ""}{summary.last_latency_ms != null ? ` in ${summary.last_latency_ms} ms` : ""}</>
+          <>Last check {ago(summary.last_checked_at, Date.now())}{summary.last_http_status ? ` · HTTP ${summary.last_http_status}` : ""}{summary.last_latency_ms != null ? ` in ${summary.last_latency_ms} ms` : ""}</>
         ) : "Not checked yet"}
       </p>
       {summary.last_message && summary.status !== "healthy" && <p className="text-xs text-muted-foreground">{summary.last_message}</p>}

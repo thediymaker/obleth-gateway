@@ -1,6 +1,7 @@
 import type { UsageDailyGroupBy, UsageDailyRow } from "@/lib/obleth";
 import type { ExportColumn } from "@/lib/usage-export";
 import { seriesRest, seriesTones } from "@/lib/chart-style";
+import { dateLabel } from "@/lib/format";
 
 /**
  * The Reports page's pure logic: date ranges and the period before, totals,
@@ -53,7 +54,7 @@ function addDays(s: string, n: number): string {
 
 /** A day's short label ("Sep 3"), read as the UTC day it is. */
 export function dayLabel(day: string, year = false): string {
-  return parseDay(day).toLocaleDateString([], { month: "short", day: "numeric", timeZone: "UTC", ...(year ? { year: "numeric" } : {}) });
+  return dateLabel(parseDay(day), { utc: true, year });
 }
 
 export function daysBetween(r: DayRange): number {

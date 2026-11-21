@@ -28,7 +28,7 @@ import {
 import type { AdminUser } from "@/lib/auth/users";
 import { logsHref } from "@/lib/log-links";
 import type { ApiKey, BudgetUsage, Tenant } from "@/lib/obleth";
-import { compact, money } from "@/lib/format";
+import { compact, dateLabel, dateTime, formatDate, money } from "@/lib/format";
 import { cn, getJson } from "@/lib/utils";
 import { StatusDot } from "@/components/ui/status";
 
@@ -179,7 +179,7 @@ function DayChart({ days, tenantId }: { days: TenantDay[]; tenantId: string }) {
   const fmt = (v: number) => (measure === "spend" ? money(v) : compact(v));
   const total = days.reduce((n, d) => n + value(d), 0);
   const h = hover !== null ? days[hover] : null;
-  const dayLabel = (day: string) => new Date(`${day}T12:00:00Z`).toLocaleDateString([], { month: "short", day: "numeric" });
+  const dayLabel = (day: string) => dateLabel(new Date(`${day}T12:00:00Z`));
   const ticks = days.filter((_, i) => i % 7 === 0 || i === days.length - 1);
   return (
     <Panel
@@ -437,13 +437,13 @@ export function TenantPage({
                 detail={data?.failed24h ? `${pct(failShare)}${data.topFailure ? ` · mostly ${data.topFailure.status_code} on ${data.topFailure.model}` : ""}` : data ? "none" : null}
               />
               <div className={cn("flex min-w-0 flex-col gap-1 rounded-xl border bg-card px-4 py-3", budget && budget.share >= 0.8 ? "border-muted-foreground" : "border-border")}>
-                <span className="text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">Budget{usage?.period === "monthly" ? ` · ${new Date().toLocaleDateString([], { month: "long" })}` : ""}</span>
+                <span className="text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">Budget{usage?.period === "monthly" ? ` · ${formatDate(new Date(), { month: "long" })}` : ""}</span>
                 {budget ? (
                   <>
                     <span className="truncate text-[15px] font-semibold leading-[30px]">{budget.label}</span>
                     <BudgetBar share={budget.share} />
                     <span className="truncate text-xs text-muted-foreground">
-                      {[budget.pace, budget.resetsAt ? `resets ${budget.resetsAt.toLocaleDateString([], { month: "short", day: "numeric" })}` : null].filter(Boolean).join(" · ") || " "}
+                      {[budget.pace, budget.resetsAt ? `resets ${dateLabel(budget.resetsAt)}` : null].filter(Boolean).join(" · ") || " "}
                     </span>
                   </>
                 ) : (
@@ -557,7 +557,7 @@ export function TenantPage({
               ) : (
                 data.audit.map((e, i) => (
                   <div key={i} className="grid grid-cols-[150px_minmax(0,1fr)_auto] gap-3 border-t border-border py-2 text-[12.5px] first:border-t-0">
-                    <span className="font-mono text-[11.5px] text-muted-foreground">{new Date(e.ts).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</span>
+                    <span className="font-mono text-[11.5px] text-muted-foreground">{dateTime(e.ts)}</span>
                     <span className="truncate">{e.action.replace(/_/g, " ")}</span>
                     <span className="truncate text-muted-foreground">{e.actor}</span>
                   </div>

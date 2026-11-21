@@ -25,7 +25,7 @@ import {
 } from "@/lib/key-access-model";
 import { ReportsTabs } from "@/components/reports/reports-tabs";
 import { logsHref } from "@/lib/log-links";
-import { compact, formatNumber } from "@/lib/format";
+import { ago, compact, formatNumber, fullDateTime } from "@/lib/format";
 import type { KeyRejectionAgg, KeySource } from "@/lib/obleth";
 import { cn, getJson } from "@/lib/utils";
 
@@ -46,17 +46,6 @@ const SORTS: { value: KeyAccessSort; label: string }[] = [
 ];
 
 const LOG_WINDOW: Record<KeyAccessRange, "24h" | "7d" | "30d"> = { "24h": "24h", "7d": "7d", "30d": "30d" };
-
-function ago(ms: number, now: number): string {
-  if (!ms) return "—";
-  const s = Math.max(0, (now - ms) / 1000);
-  if (s < 60) return "just now";
-  if (s < 3600) return `${Math.round(s / 60)}m ago`;
-  if (s < 86_400) return `${Math.round(s / 3600)}h ago`;
-  return `${Math.round(s / 86_400)}d ago`;
-}
-
-const stamp = (ms: number) => (ms ? new Date(ms).toLocaleString() : "");
 
 function NewTag({ children = "New" }: { children?: string }) {
   return (
@@ -121,7 +110,7 @@ function KeyRow({ row, range, now, open, onToggle }: { row: KeyAccessRow; range:
           {row.places.length}
         </span>
         <Where row={row} />
-        <span className="text-right text-xs text-muted-foreground" title={stamp(row.lastSeenMs)}>{ago(row.lastSeenMs, now)}</span>
+        <span className="text-right text-xs text-muted-foreground" title={row.lastSeenMs ? fullDateTime(row.lastSeenMs) : undefined}>{ago(row.lastSeenMs, now)}</span>
       </button>
       {open && (
         <div className="bg-muted/15 px-[18px] pb-3 pt-1">
@@ -153,7 +142,7 @@ function KeyRow({ row, range, now, open, onToggle }: { row: KeyAccessRow; range:
                   </td>
                   <td className="py-1.5 pr-3 text-right font-mono tabular-nums">{formatNumber(p.requests)}</td>
                   <td className="py-1.5 pr-3 text-right font-mono tabular-nums">{formatNumber(p.distinctIps)}</td>
-                  <td className="py-1.5 text-right text-muted-foreground" title={stamp(p.lastSeenMs)}>{ago(p.lastSeenMs, now)}</td>
+                  <td className="py-1.5 text-right text-muted-foreground" title={p.lastSeenMs ? fullDateTime(p.lastSeenMs) : undefined}>{ago(p.lastSeenMs, now)}</td>
                 </tr>
               ))}
             </tbody>
@@ -366,7 +355,7 @@ export function KeyAccessView({
                     </td>
                     <td className={cn("py-[9px] pr-3", !r.client_country && "text-muted-foreground")}>{placeLabel(r.client_country, r.client_ip)}</td>
                     <td className="py-[9px] pr-3 text-right font-mono text-xs tabular-nums">{formatNumber(r.count)}</td>
-                    <td className="py-[9px] pr-3 text-right text-xs text-muted-foreground" title={`First ${stamp(r.first_seen_ms)}, last ${stamp(r.last_seen_ms)}`}>{ago(r.last_seen_ms, now)}</td>
+                    <td className="py-[9px] pr-3 text-right text-xs text-muted-foreground" title={`First ${fullDateTime(r.first_seen_ms)}, last ${fullDateTime(r.last_seen_ms)}`}>{ago(r.last_seen_ms, now)}</td>
                     <td className="max-w-[18rem] truncate py-[9px] pr-[18px] text-xs text-muted-foreground" title={r.sample_user_agent}>{r.sample_user_agent || "—"}</td>
                   </tr>
                 ))}

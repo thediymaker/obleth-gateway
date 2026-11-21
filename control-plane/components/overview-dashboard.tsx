@@ -6,7 +6,7 @@ import { RefreshCw } from "lucide-react";
 import type { FairshareLiveView, LiveStats, ModelHealthSummary, ModelRoute } from "@/lib/obleth";
 import type { OverviewContext, OverviewWindow } from "@/lib/overview-data";
 import { PREVIOUS_LABEL, buildAttention, buildFleet, buildSeries, changeLabel, type OverviewRange } from "@/lib/overview-model";
-import { compact, formatMs, formatNumber, money } from "@/lib/format";
+import { clockSeconds, compact, formatMs, formatNumber, money } from "@/lib/format";
 import { countsScope, tenantsBelowShare } from "@/lib/fairshare";
 import { logsHref } from "@/lib/log-links";
 import { cn, getJson } from "@/lib/utils";
@@ -141,7 +141,7 @@ export function OverviewDashboard({
           </div>
         </div>
         <div className="flex items-center gap-2.5">
-          <span className="text-xs text-muted-foreground">{updatedAt ? `Updated ${new Date(updatedAt).toLocaleTimeString()}` : ""}</span>
+          <span className="text-xs text-muted-foreground">{updatedAt ? `Updated ${clockSeconds(updatedAt)}` : ""}</span>
           <Segmented label="Time range" value={range} onChange={setRange} options={[{ value: "1h", label: "1h" }, { value: "24h", label: "24h" }, { value: "7d", label: "7d" }]} />
           <button type="button" onClick={refreshAll} aria-label="Refresh" title="Refresh" className="flex h-[34px] w-[34px] items-center justify-center rounded-lg border border-border text-muted-foreground hover:bg-accent hover:text-foreground">
             <RefreshCw className={cn("h-3.5 w-3.5", fetching && "animate-spin")} />

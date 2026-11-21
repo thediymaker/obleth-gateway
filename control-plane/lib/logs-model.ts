@@ -335,18 +335,6 @@ export function timeSplit(row: Pick<UsageLogEntry, "queue_wait_ms" | "ttft_ms" |
   return { wait, first, rest, total };
 }
 
-/** "12 s ago", "4 min ago", then the clock time for anything older than an hour. */
-export function when(ts: number, now = Date.now()): string {
-  const s = Math.max(0, Math.round((now - ts) / 1000));
-  if (s < 60) return `${s} s ago`;
-  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
-  const d = new Date(ts);
-  const sameDay = new Date(now).toDateString() === d.toDateString();
-  return sameDay
-    ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-    : d.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
-}
-
 /** A bar's width as people say it: "15 s", "minute", "30 min", "6 h", "day". */
 export function bucketLabel(ms: number): string {
   if (ms === 60_000) return "minute";

@@ -13,12 +13,7 @@ import { describeRequest, effortText, helperCallsParams, helperPurpose, HTTP_REA
 import type { SpanEntry, UsageLogEntry } from "@/lib/obleth";
 import { parseAttrs, parseRouteExplain, spanHint, spanLabel, timeline, type SpanNode } from "@/lib/trace-model";
 import { cn, getJson } from "@/lib/utils";
-import { formatMs, formatNumber, money } from "@/lib/format";
-
-function stamp(ms: number) {
-  const d = new Date(ms);
-  return `${d.toLocaleDateString([], { month: "short", day: "numeric" })}, ${d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}.${String(d.getMilliseconds()).padStart(3, "0")}`;
-}
+import { clockSeconds, dateLabel, formatMs, formatNumber, money } from "@/lib/format";
 
 function title(row: UsageLogEntry): string {
   if (isFailure(row)) return classLabel(row.error_class) || HTTP_REASONS[row.status_code] || `Failed with HTTP ${row.status_code}`;
@@ -167,7 +162,7 @@ export function RequestPanel({
               <h2 className="truncate text-lg font-semibold">{title(row)}</h2>
             </div>
             <p className="truncate text-[12.5px] text-muted-foreground">
-              {stamp(row.ts_ms)} · <span className="font-mono">{row.model}</span> · {row.tenant_name || row.tenant_id.slice(0, 8)}
+              {`${dateLabel(row.ts_ms)}, ${clockSeconds(row.ts_ms)}`} · <span className="font-mono">{row.model}</span> · {row.tenant_name || row.tenant_id.slice(0, 8)}
               {row.key_name && <> · {row.key_name} <span className="font-mono">{row.key_prefix}</span></>}
             </p>
           </div>

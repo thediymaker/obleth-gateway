@@ -2,6 +2,7 @@ import type { DeploymentData } from "@/lib/deployments-data";
 import type { CapacityDiscoveryModelView, ClusterResources, ManagedModelSpec, ModelReplica, ModelRoute, SlurmSettingsView } from "@/lib/obleth";
 import { STATUS_LABELS } from "@/lib/models-model";
 import { type StatusGlyph } from "@/components/ui/status";
+import { clockOrDate } from "@/lib/format";
 
 /**
  * The Deployments pages' pure logic: which models are deployments, what state
@@ -159,13 +160,6 @@ export function pauseOf(spec: Partial<Pick<ManagedModelSpec, "paused_reason" | "
   return { reason: spec.paused_reason?.trim() || "Too many launches failed.", until: valid };
 }
 
-/** "2:20 PM" today, "Nov 12, 2:20 PM" on another day. */
-export function clockLabel(at: Date | string, now = Date.now()): string {
-  const d = typeof at === "string" ? new Date(at) : at;
-  const sameDay = new Date(now).toDateString() === d.toDateString();
-  return sameDay ? d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : d.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
-}
-
 /** The healthy-replica count at which Models calls the model healthy (at least 1). */
 export function healthyFloor(spec: Partial<Pick<ManagedModelSpec, "min_replicas">>): number {
   return Math.max(1, Math.floor(spec.min_replicas ?? 1) || 1);
@@ -182,7 +176,7 @@ export function managedState(spec: SpecForState, replicas: Pick<ModelReplica, "s
   if (!spec.enabled) return { state: "off", why: c.healthy + c.queued + c.running + c.draining > 0 ? "stopping its jobs" : null, attention: false };
   const pause = pauseOf(spec, now);
   if (pause) {
-    const when = pause.until ? `tries again at ${clockLabel(pause.until, now)}` : "waits for you";
+    const when = pause.until ? `tries again at ${clockOrDate(pause.until, now)}` : "waits for you";
     return { state: "stopped", why: `launches paused, ${when}${c.healthy ? ` · ${c.healthy} still serving` : ""}`, attention: true };
   }
   if (!pausesOnFailures(spec) && spec.max_job_failures > 0 && c.lost >= spec.max_job_failures) {
@@ -251,9 +245,9 @@ export function jobEndLine(endsAt: string | null | undefined, handoffMins: numbe
   const end = new Date(endsAt);
   if (Number.isNaN(end.getTime())) return null;
   const hand = handoffMins ?? 0;
-  if (hand <= 0) return `Time limit at ${clockLabel(end, now)}; a new job is submitted when this one ends.`;
+  if (hand <= 0) return `Time limit at ${clockOrDate(end, now)}; a new job is submitted when this one ends.`;
   const start = new Date(end.getTime() - hand * 60_000);
-  return start.getTime() <= now ? `Time limit at ${clockLabel(end, now)}; a replacement has been submitted.` : `Time limit at ${clockLabel(end, now)}; a replacement starts at ${clockLabel(start, now)}.`;
+  return start.getTime() <= now ? `Time limit at ${clockOrDate(end, now)}; a replacement has been submitted.` : `Time limit at ${clockOrDate(end, now)}; a replacement starts at ${clockOrDate(start, now)}.`;
 }
 
 /** A watched Kubernetes deployment's state, from what discovery last saw. */
@@ -654,8 +648,8 @@ export function tokenExpiry(s: Pick<SlurmSettingsView, "jwt_set"> & Partial<Pick
   const secs = s.jwt_expires_in_secs ?? (at && !Number.isNaN(at.getTime()) ? (at.getTime() - now) / 1000 : null);
   if (secs == null) return s.jwt_expires_at === null || s.jwt_expires_in_secs === null ? { text: "The Slurm token doesn't expire.", attention: false, expired: false } : null;
   const who = s.jwt_user ? ` for ${s.jwt_user}` : "";
-  const when = at && !Number.isNaN(at.getTime()) ? ` (${clockLabel(at, now)})` : "";
-  if (secs <= 0) return { text: `The Slurm token${who} has expired${at ? ` at ${clockLabel(at, now)}` : ""}, so obleth can't launch or check jobs.`, attention: true, expired: true };
+  const when = at && !Number.isNaN(at.getTime()) ? ` (${clockOrDate(at, now)})` : "";
+  if (secs <= 0) return { text: `The Slurm token${who} has expired${at ? ` at ${clockOrDate(at, now)}` : ""}, so obleth can't launch or check jobs.`, attention: true, expired: true };
   return { text: `The Slurm token${who} expires in ${roughDuration(secs)}${when}.`, attention: secs < 3 * 86_400, expired: false };
 }
 
@@ -683,18 +677,6 @@ export function provisionerHealth(s: SlurmSettingsView | null | undefined): Prov
 
 /** How to start the provisioner, for each way obleth ships. */
 export const START_PROVISIONER = "Start obleth-provisioner: on Kubernetes set provisioner.enabled=true; with Docker Compose add slurm to COMPOSE_PROFILES; with systemd enable obleth-provisioner.service.";
-
-/** "18 h 04 m", "6 m 24 s". */
-export function duration(ms: number): string {
-  const s = Math.max(0, Math.floor(ms / 1000));
-  const d = Math.floor(s / 86_400);
-  const h = Math.floor((s % 86_400) / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  if (d) return `${d} d ${h} h`;
-  if (h) return `${h} h ${String(m).padStart(2, "0")} m`;
-  if (m) return `${m} m ${String(s % 60).padStart(2, "0")} s`;
-  return `${s} s`;
-}
 
 /** A deployment's page address. */
 export function deploymentHref(name: string, section?: string): string {

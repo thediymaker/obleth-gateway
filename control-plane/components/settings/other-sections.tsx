@@ -14,6 +14,7 @@ import { KEY_PREFIX_MAX, keyPrefixExample, keyPrefixProblem } from "@/lib/key-pr
 import { describeEnergyTest, describeResync } from "@/lib/settings-model";
 import { cn } from "@/lib/utils";
 import { StatusPill } from "@/components/ui/status";
+import { dateLabel } from "@/lib/format";
 
 /** Reads power from Prometheus to put watts, cost and CO₂ on Reports and the Overview. */
 export function EnergySection({ settings }: { settings: EnergySettingsView }) {
@@ -246,7 +247,7 @@ export function AboutSection({ version, slurm, compressor }: { version: VersionI
   return (
     <SettingsCard id="about" title="About">
       <Row label="Gateway" mark={version.updateAvailable ? <Pill inverted>{version.latest} is out</Pill> : <StatusPill glyph="on">{version.latest ? "Latest" : "Running"}</StatusPill>}>
-        {g ? <><span className="font-mono text-[12px]">{g.version}{sha(g.git_sha)}</span>{g.built_at && <span className="text-muted-foreground"> · built {new Date(g.built_at).toLocaleDateString([], { month: "short", day: "numeric" })}</span>}</> : <span className="text-muted-foreground">Couldn&apos;t be reached</span>}
+        {g ? <><span className="font-mono text-[12px]">{g.version}{sha(g.git_sha)}</span>{g.built_at && <span className="text-muted-foreground"> · built {dateLabel(g.built_at)}</span>}</> : <span className="text-muted-foreground">Couldn&apos;t be reached</span>}
       </Row>
       <Row label="Control plane" mark={mismatch ? <Pill inverted>Differs from the gateway</Pill> : <StatusPill glyph="on">Matches</StatusPill>}>
         <span className="font-mono text-[12px]">{version.controlPlane.version}{sha(version.controlPlane.sha)}</span>

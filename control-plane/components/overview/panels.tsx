@@ -6,7 +6,7 @@ import type { AuditEntry, CacheStats, RouterReadinessView, TenantFairshareView }
 import type { OverviewSummary } from "@/lib/overview-summary";
 import type { OverviewTenantRow, OverviewWindow } from "@/lib/overview-data";
 import { describeAudit, RANGE_LABEL, type AttentionItem, type OverviewRange } from "@/lib/overview-model";
-import { compact, money } from "@/lib/format";
+import { ago, compact, fullDateTime, money } from "@/lib/format";
 import { logsHref } from "@/lib/log-links";
 import { cn } from "@/lib/utils";
 import { HealthGlyph, Meter, Panel, PanelLink, Pill, SectionLabel } from "./ui";
@@ -142,14 +142,6 @@ export function TopTenants({ window, live }: { window: OverviewWindow; live: Map
   );
 }
 
-function agoShort(iso: string, now: number) {
-  const s = Math.max(0, (now - new Date(iso).getTime()) / 1000);
-  if (!Number.isFinite(s)) return "";
-  if (s < 3600) return `${Math.max(1, Math.round(s / 60))}m`;
-  if (s < 86_400) return `${Math.round(s / 3600)}h`;
-  return `${Math.round(s / 86_400)}d`;
-}
-
 export function RecentChanges({ audit, models, tenants }: { audit: AuditEntry[]; models: Map<string, string>; tenants: Map<string, string> }) {
   const now = Date.now();
   return (
@@ -165,7 +157,7 @@ export function RecentChanges({ audit, models, tenants }: { audit: AuditEntry[];
             <li key={e.id} className="grid grid-cols-[1.5rem_minmax(0,1fr)_2.5rem] items-center gap-3 border-t border-border px-[18px] py-[9px] text-[13px]">
               <span className={cn("flex h-6 w-6 items-center justify-center rounded-full text-[10.5px] font-semibold", system ? "border border-dashed border-muted-foreground/60" : "bg-secondary")} aria-hidden="true">{initials}</span>
               <span className="min-w-0 truncate" title={`${d.actor} ${d.action} ${d.target}`}><strong className="font-medium">{d.actor.replace(/@.*/, "")}</strong> <span className="text-muted-foreground">{d.action}</span> {d.target}</span>
-              <span className="text-right font-mono text-xs text-muted-foreground" title={new Date(e.ts).toLocaleString()}>{agoShort(e.ts, now)}</span>
+              <span className="text-right font-mono text-xs text-muted-foreground" title={fullDateTime(e.ts)}>{ago(e.ts, now, { short: true })}</span>
             </li>
           );
         })}

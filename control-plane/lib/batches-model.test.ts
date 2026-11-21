@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { batchName, batchState, duration, etaSecs, filterCount, isActive, ownerOf, percentOf } from "@/lib/batches-model";
+import { batchName, batchState, etaSecs, filterCount, isActive, ownerOf, percentOf } from "@/lib/batches-model";
 import type { AdminBatch } from "@/lib/obleth";
 
 const NOW = Date.parse("2026-11-07T12:00:00Z");
@@ -35,13 +35,6 @@ describe("batches model", () => {
     expect(percentOf(batch({ completed: 240, failed: 10 }))).toBe(25);
     expect(percentOf(batch({ total: 0 }))).toBe(0);
     expect(percentOf(batch({ completed: 999 }))).toBe(99);
-  });
-
-  it("says durations in words", () => {
-    expect(duration(45)).toBe("45 s");
-    expect(duration(12 * 60)).toBe("12 min");
-    expect(duration(3 * 3600 + 5 * 60)).toBe("3 h 5 min");
-    expect(duration(2 * 86400)).toBe("2 d");
   });
 
   it("estimates the time left from the pace so far", () => {

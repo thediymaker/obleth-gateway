@@ -1,6 +1,7 @@
 import type { ModelSpeedPoint } from "@/lib/obleth";
 import { daysBetween, eachDay, type DayRange } from "@/lib/reports-model";
 import { linkTime } from "@/lib/log-links";
+import { dateLabel, formatDate } from "@/lib/format";
 
 /**
  * The Reports page's model speed section: one row per model with its speed
@@ -128,8 +129,8 @@ export const SHADE_STEPS = [1, 0.85, 0.73, 0.62, 0.5].map(shade);
 export function bucketLabel(t: number, bucket: SpeedBucket): string {
   const d = new Date(t);
   return bucket === "day"
-    ? d.toLocaleDateString([], { month: "short", day: "numeric", timeZone: "UTC" })
-    : `${d.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", timeZone: "UTC" })} UTC`;
+    ? dateLabel(d, { utc: true })
+    : `${formatDate(d, { month: "short", day: "numeric", hour: "numeric", timeZone: "UTC" })} UTC`;
 }
 
 /** The header's label over each square: a full date where a month or day starts, else just the day or hour. */
@@ -138,9 +139,9 @@ export function columnLabels(starts: number[], bucket: SpeedBucket): string[] {
   return starts.map((t, i) => {
     if (i % every) return "";
     const d = new Date(t);
-    const date = () => d.toLocaleDateString([], { month: "short", day: "numeric", timeZone: "UTC" });
+    const date = () => dateLabel(d, { utc: true });
     if (bucket === "day") return i === 0 || d.getUTCDate() === 1 ? date() : String(d.getUTCDate());
-    return i === 0 || d.getUTCHours() === 0 ? date() : d.toLocaleTimeString([], { hour: "numeric", timeZone: "UTC" });
+    return i === 0 || d.getUTCHours() === 0 ? date() : formatDate(d, { hour: "numeric", timeZone: "UTC" });
   });
 }
 

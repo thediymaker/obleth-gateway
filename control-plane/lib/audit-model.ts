@@ -1,4 +1,5 @@
 import type { AuditEntry } from "@/lib/obleth";
+import { dateLabel } from "@/lib/format";
 
 /**
  * The Audit page's pure logic: each event as a sentence with the thing's
@@ -368,7 +369,7 @@ export function dayLabel(ts: string, now = new Date()): string {
   yesterday.setDate(now.getDate() - 1);
   if (same(d, now)) return "Today";
   if (same(d, yesterday)) return "Yesterday";
-  return d.toLocaleDateString([], { month: "short", day: "numeric", year: d.getFullYear() === now.getFullYear() ? undefined : "numeric" });
+  return dateLabel(d, { year: d.getFullYear() !== now.getFullYear() });
 }
 
 export function toCsv(entries: AuditEntry[], names: Record<string, string>): string {

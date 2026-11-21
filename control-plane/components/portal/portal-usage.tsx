@@ -11,7 +11,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { CodeBlock, CopyButton } from "@/components/portal/copy-button";
 import type { KeyUsageSummary, UsageAgg, UsageLogEntry } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
-import { formatMs, formatNumber, money } from "@/lib/format";
+import { ago, clockSeconds, formatDate, formatMs, formatNumber, money } from "@/lib/format";
 
 export function PortalUsage({
   usage,
@@ -227,7 +227,7 @@ function KeyUsageRow({ row }: { row: KeyUsageSummary }) {
           )}
         </div>
         <p className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground">
-          {row.key_id.slice(0, 8)} / {formatLastUsed(row.last_used_ms)}
+          {row.key_id.slice(0, 8)} / {ago(row.last_used_ms, Date.now())}
         </p>
       </div>
       <div className="grid grid-cols-3 gap-2 text-xs">
@@ -299,22 +299,8 @@ function TimeStamp({ ms, align = "left" }: { ms: number; align?: "left" | "right
   const date = new Date(ms);
   return (
     <span className={cn("flex flex-col text-xs leading-tight", align === "right" ? "items-end text-right" : "items-start")}>
-      <span>{date.toLocaleDateString([], { month: "2-digit", day: "2-digit", year: "2-digit" })}</span>
-      <span>{date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</span>
+      <span>{formatDate(date, { month: "2-digit", day: "2-digit", year: "2-digit" })}</span>
+      <span>{clockSeconds(date)}</span>
     </span>
   );
-}
-
-function formatLastUsed(ms?: number): string {
-  if (!ms || ms <= 0) return "Never";
-  const diff = Date.now() - ms;
-  if (diff < 0) return "Just now";
-  const min = Math.floor(diff / 60_000);
-  if (min < 1) return "Just now";
-  if (min < 60) return `${min}m ago`;
-  const hours = Math.floor(min / 60);
-  if (hours < 24) return `${hours}h ago`;
-  const days = Math.floor(hours / 24);
-  if (days < 7) return `${days}d ago`;
-  return new Date(ms).toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" });
 }

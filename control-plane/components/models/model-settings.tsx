@@ -31,6 +31,7 @@ import { changedFields, changedSections, changeSummary, checkStatusLabel, fieldS
 import type { McpServer, ModelHealthCheck, ModelHealthSummary, ModelRoute } from "@/lib/obleth";
 import { upstreamHeadersText } from "@/lib/upstream-headers";
 import { cn } from "@/lib/utils";
+import { dateTime } from "@/lib/format";
 
 /** A settings card on the model page; `data-section` lets the page find which cards hold changes. */
 function Section({ id, title, description, children }: { id: SettingsSectionId; title: string; description?: ReactNode; children: ReactNode }) {
@@ -574,7 +575,7 @@ function RecentChecks({ checks }: { checks: ModelHealthCheck[] }) {
         <tbody>
           {checks.slice(0, 20).map((c) => (
             <tr key={c.id} className="border-b border-border/60 last:border-b-0">
-              <td className="whitespace-nowrap py-1.5 pl-3 pr-3 tabular-nums text-muted-foreground">{new Date(c.checked_at).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</td>
+              <td className="whitespace-nowrap py-1.5 pl-3 pr-3 tabular-nums text-muted-foreground">{dateTime(c.checked_at)}</td>
               <td className={cn("py-1.5 pr-3", c.status === "unhealthy" && "font-semibold")}>{checkStatusLabel(c.status)}{c.trigger !== "scheduled" ? <span className="text-muted-foreground"> · {c.trigger}</span> : null}</td>
               <td className="py-1.5 pr-3 tabular-nums text-muted-foreground">{c.http_status ?? "—"}</td>
               <td className="py-1.5 pr-3 tabular-nums text-muted-foreground">{c.latency_ms == null ? "—" : `${c.latency_ms} ms`}</td>

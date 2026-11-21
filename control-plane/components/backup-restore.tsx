@@ -7,6 +7,7 @@ import { restoreBackupAction } from "@/app/actions";
 import type { ConfigBackup, RestoreCounts, RestoreReport } from "@/lib/obleth";
 import { Button } from "@/components/ui/button";
 import { DestructiveConfirm } from "@/components/ui/destructive-confirm";
+import { fullDateTime } from "@/lib/format";
 
 const ENTITIES = [
   ["fairshare_groups", "Fairshare groups"],
@@ -173,7 +174,7 @@ export function BackupRestore() {
             preview ? (
               <>
                 <p>
-                  Backup from {new Date(preview.exported_at).toLocaleString()} (gateway{" "}
+                  Backup from {fullDateTime(preview.exported_at)} (gateway{" "}
                   {preview.gateway_version}) containing{" "}
                   {previewCounts.length > 0
                     ? previewCounts.map((e) => `${e.count} ${e.label.toLowerCase()}`).join(", ")

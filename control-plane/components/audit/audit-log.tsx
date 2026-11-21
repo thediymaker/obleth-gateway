@@ -36,6 +36,7 @@ import {
 } from "@/lib/audit-model";
 import type { AuditEntry } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
+import { clock, clockSeconds, dateTime } from "@/lib/format";
 
 function initials(actor: string): string {
   if (!isPerson(actor)) return actor.slice(0, 2);
@@ -82,7 +83,7 @@ function Detail({ e, prev }: { e: AuditEntry; prev: AuditEntry | undefined }) {
         ))
       )}
       <div className="flex flex-wrap justify-between gap-2 pt-1.5 text-[11.5px] text-muted-foreground">
-        <span>{prev ? `Compared with the change before it, ${new Date(prev.ts).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}` : "No earlier change to compare with in view"} · event #{e.id}</span>
+        <span>{prev ? `Compared with the change before it, ${dateTime(prev.ts)}` : "No earlier change to compare with in view"} · event #{e.id}</span>
         <button type="button" onClick={() => setRaw((v) => !v)} className="text-secondary-foreground underline underline-offset-[3px] hover:text-foreground">{raw ? "Fields" : "Raw JSON"}</button>
       </div>
     </div>
@@ -92,7 +93,7 @@ function Detail({ e, prev }: { e: AuditEntry; prev: AuditEntry | undefined }) {
 /** One burst of changes. Memoised: typing a search or opening another line leaves it alone. */
 const GroupLine = memo(function GroupLine({ g, names, alive, previous, open, onToggle }: { g: AuditGroup; names: Record<string, string>; alive: Set<string>; previous: Map<number, AuditEntry>; open: boolean; onToggle: (id: number) => void }) {
   const e = g.events[0];
-  const time = new Date(e.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const time = clock(e.ts);
   const single = g.events.length === 1;
   const sum = burstSummary(g, names);
   const tail = single ? tailOf(e, names) : null;
@@ -130,7 +131,7 @@ const GroupLine = memo(function GroupLine({ g, names, alive, previous, open, onT
             const c = changeLine(x, previous.get(x.id));
             return (
               <div key={x.id} className="grid grid-cols-[56px_minmax(0,1fr)] gap-3 border-t border-border py-1.5 text-[12.5px] first:border-t-0">
-                <span className="font-mono text-[11px] text-muted-foreground">{new Date(x.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</span>
+                <span className="font-mono text-[11px] text-muted-foreground">{clockSeconds(x.ts)}</span>
                 <span className="min-w-0 truncate"><Thing e={x} names={names} alive={alive} />{c && <span className="text-muted-foreground"> · {c}</span>}</span>
               </div>
             );

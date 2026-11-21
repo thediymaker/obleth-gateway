@@ -22,6 +22,7 @@ import type {
   ModelRoute,
 } from "@/lib/obleth";
 import { cn, getJson } from "@/lib/utils";
+import { dateTime } from "@/lib/format";
 
 const CAPACITY_MODES = ["static", "tuned", "discovered"] as const;
 export type CapacityMode = (typeof CAPACITY_MODES)[number];
@@ -271,7 +272,7 @@ export function capacityInFlight(
 }
 
 function formatTime(value: string) {
-  return new Date(value).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  return dateTime(value);
 }
 
 export function CapacityDiscoveryStatus({

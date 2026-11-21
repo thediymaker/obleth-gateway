@@ -5,7 +5,7 @@ import { Area, AreaChart, Bar, BarChart, CartesianGrid, ResponsiveContainer, Too
 import { TooltipRow, TooltipShell } from "@/components/chart-tooltip";
 import { GROUP_TONES, MAX_CHART_ROWS, OTHER_TONE, thinHistory, type GroupHistoryPoint, type GroupKey } from "@/lib/fairshare-model";
 import { Panel, Segmented } from "@/components/overview/ui";
-import { compact, formatNumber } from "@/lib/format";
+import { clock, compact, formatNumber } from "@/lib/format";
 import { axisTick, barCursor, chartGrid, timeCursor } from "@/lib/chart-style";
 
 type Window = "15m" | "1h";
@@ -69,7 +69,7 @@ export const RunningHistory = memo(function RunningHistory({ history, groups, ol
   const subtitle = disabled
     ? "History disabled (OBLETH_FAIRSHARE_HISTORY_SECS=0)"
     : oldestTs
-      ? `Requests holding a slot, stacked by group · ${scopeLabel}${gateways} · History since ${new Date(oldestTs).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
+      ? `Requests holding a slot, stacked by group · ${scopeLabel}${gateways} · History since ${clock(oldestTs)}`
       : `Requests holding a slot, stacked by group · ${scopeLabel}${gateways}`;
 
   return (

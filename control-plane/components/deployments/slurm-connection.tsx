@@ -7,10 +7,11 @@ import { Setting, Switch, TextField } from "@/components/models/fields";
 import { Notice, Sheet } from "@/components/models/ui";
 import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm-dialog";
-import { duration, MINT_TOKEN, START_PROVISIONER, tokenExpiry } from "@/lib/deployments-model";
+import { MINT_TOKEN, START_PROVISIONER, tokenExpiry } from "@/lib/deployments-model";
 import { cn } from "@/lib/utils";
 import type { NodeAlias, SlurmHealthView, SlurmSettingsView, UpdateSlurmSettings } from "@/lib/obleth";
 import { StatusDot } from "@/components/ui/status";
+import { dateTime, secsAgo } from "@/lib/format";
 
 const FIELDS = ["enabled", "url", "api_version", "user", "jwt", "aliases", "cache_dir", "images_dir", "images", "log_dir", "setup", "hf_token", "hf_clear"];
 const LABELS: Record<string, string> = { enabled: "Slurm", url: "slurmrestd URL", api_version: "API version", user: "Slurm user", jwt: "JWT", aliases: "Node addresses", cache_dir: "Weight cache", images_dir: "Images folder", images: "Image per engine", log_dir: "Job logs", setup: "Load before launch", hf_token: "Hugging Face token", hf_clear: "Hugging Face token" };
@@ -36,17 +37,12 @@ export function apiVersionLine(s: Pick<SlurmSettingsView, "slurmrestd_api_versio
   return [mismatch, mismatch ? null : using, served].filter(Boolean).join(" ") || null;
 }
 
-function since(secs: number | null): string {
-  if (secs == null) return "never";
-  return secs < 5 ? "just now" : `${duration(secs * 1000)} ago`;
-}
-
 /** What the provisioner is doing, in one line, from what it last reported. */
 export function provisionerLine(s: SlurmSettingsView): { glyph: "on" | "half" | "off"; text: string; detail?: string } {
   if (!s.provisioner_running) {
     return {
       glyph: "off",
-      text: s.provisioner_last_seen_secs == null ? "No provisioner has run yet, so nothing is launched" : `The provisioner stopped. It was last seen ${since(s.provisioner_last_seen_secs)}`,
+      text: s.provisioner_last_seen_secs == null ? "No provisioner has run yet, so nothing is launched" : `The provisioner stopped. It was last seen ${secsAgo(s.provisioner_last_seen_secs)}`,
       detail: `Saving here only stores the connection; the obleth-provisioner process launches the jobs. ${START_PROVISIONER}`,
     };
   }
@@ -54,12 +50,12 @@ export function provisionerLine(s: SlurmSettingsView): { glyph: "on" | "half" | 
   if (failing) {
     return {
       glyph: "half",
-      text: `The provisioner is running, but its passes are failing. Its last good pass was ${since(s.provisioner_last_ok_secs)}`,
+      text: `The provisioner is running, but its passes are failing. Its last good pass was ${secsAgo(s.provisioner_last_ok_secs)}`,
       detail: `${s.provisioner_tick_detail ? `${s.provisioner_tick_detail.replace(/\.?$/, ".")} ` : ""}Replica states on Deployments are frozen until this clears. Test the connection below to see why.`,
     };
   }
   const version = s.provisioner_version ? ` · ${s.provisioner_version}${s.provisioner_git_sha ? ` ${s.provisioner_git_sha.slice(0, 7)}` : ""}` : "";
-  return { glyph: "on", text: `Provisioner checked in ${since(s.provisioner_last_seen_secs)}${s.provisioner_tick_status === "idle" ? ", with nothing to do" : ""}${version}` };
+  return { glyph: "on", text: `Provisioner checked in ${secsAgo(s.provisioner_last_seen_secs)}${s.provisioner_tick_status === "idle" ? ", with nothing to do" : ""}${version}` };
 }
 
 /** How obleth reaches slurmrestd to launch models as jobs. Moved here from Settings. */
@@ -264,7 +260,7 @@ function HealthResult({ health }: { health: SlurmHealthView }) {
         {jwt && jwt.set && !jwt.expired ? <Ok /> : <Bad>{jwt?.set ? "expired" : "missing"}</Bad>}
         <span className="font-medium">JWT</span>
         <span className="text-muted-foreground">
-          {!jwt?.set ? "not set" : jwt.expires_at ? `${jwt.expired ? "expired" : "expires"} ${new Date(jwt.expires_at).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}` : "valid, no expiry"}
+          {!jwt?.set ? "not set" : jwt.expires_at ? `${jwt.expired ? "expired" : "expires"} ${dateTime(jwt.expires_at)}` : "valid, no expiry"}
         </span>
       </span>
       {!!health.problems?.length && (

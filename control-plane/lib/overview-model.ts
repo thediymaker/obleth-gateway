@@ -10,7 +10,7 @@ import type {
 import { belowShareInPools, countsScope } from "@/lib/fairshare";
 import { modelHref } from "@/lib/model-links";
 import { poolOccupancy } from "@/lib/occupancy";
-import { formatNumber } from "@/lib/format";
+import { ago, clock, formatNumber } from "@/lib/format";
 
 /** The Overview's one time control. Every tile, chart and table follows it. */
 export type OverviewRange = "1h" | "24h" | "7d";
@@ -181,15 +181,6 @@ export interface AttentionItem {
 
 const plural = (n: number, one: string, many = `${one}s`) => `${formatNumber(n)} ${n === 1 ? one : many}`;
 
-function ago(iso: string | null | undefined, now: number): string | null {
-  if (!iso) return null;
-  const s = Math.max(0, Math.round((now - new Date(iso).getTime()) / 1000));
-  if (!Number.isFinite(s)) return null;
-  if (s < 90) return `${s} s ago`;
-  if (s < 5400) return `${Math.round(s / 60)} min ago`;
-  return `${Math.round(s / 3600)} h ago`;
-}
-
 /**
  * What the Overview says needs a person, most urgent first: failing models,
  * full pools that are queuing, then tenants waiting below their fair share,
@@ -203,7 +194,7 @@ export function buildAttention(fleet: FleetTile[], fairshare: FairshareLiveView 
     const parts = [
       h?.consecutive_failures ? `${plural(h.consecutive_failures, "failed check")} in a row` : "Failing its health check",
       h?.last_http_status ? `last check HTTP ${h.last_http_status}${h.last_message ? ` “${h.last_message.slice(0, 80)}”` : ""}` : h?.last_message ? `“${h.last_message.slice(0, 80)}”` : null,
-      ago(h?.last_checked_at, now),
+      h?.last_checked_at ? ago(h.last_checked_at, now) : null,
     ].filter(Boolean);
     items.push({
       key: `down:${t.name}`,
@@ -257,7 +248,7 @@ export function buildAttention(fleet: FleetTile[], fairshare: FairshareLiveView 
   const watching = [
     ...fleet.filter((f) => f.health === "unknown").map((f) => `${f.name} has no health data yet`),
     ...fleet.filter((f) => f.health === "maintenance").map((f) => {
-      const until = f.healthRow?.maintenance_until ? new Date(f.healthRow.maintenance_until).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : null;
+      const until = f.healthRow?.maintenance_until ? clock(f.healthRow.maintenance_until) : null;
       return `${f.name} is in maintenance${until ? ` until ${until}` : ""}`;
     }),
   ];
@@ -274,4 +265,3 @@ export function describeAudit(entry: AuditEntry, names: { models: Map<string, st
   const action = entry.action.replace(/[_-]+/g, " ").trim().toLowerCase();
   return { actor: entry.actor || "system", action, target };
 }
-

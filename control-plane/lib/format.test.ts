@@ -1,7 +1,7 @@
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { clamp, compact, formatBytes, formatMs, formatNumber, money, oneDecimal, percent, perMillion } from "./format";
+import { ago, clamp, clock, clockOrDate, compact, dateLabel, dateTime, duration, formatBytes, formatMs, formatNumber, money, oneDecimal, percent, perMillion, secsAgo, whenLogged } from "./format";
 
 describe("compact", () => {
   it.each([
@@ -83,6 +83,68 @@ describe("percent", () => {
   });
 });
 
+describe("ago", () => {
+  const now = Date.UTC(2026, 10, 20, 15, 0, 0);
+  it.each([
+    [0, "just now", "now"],
+    [59, "59 s ago", "now"],
+    [60, "1 min ago", "1m"],
+    [59 * 60, "59 min ago", "59m"],
+    [23 * 3600, "23 h ago", "23h"],
+    [2 * 86_400, "2 d ago", "2d"],
+  ])("%s s back reads %s, short %s", (secs, long, short) => {
+    expect(ago(now - secs * 1000, now)).toBe(long);
+    expect(ago(new Date(now - secs * 1000).toISOString(), now, { short: true })).toBe(short);
+  });
+
+  it("gives the date past 60 days, with the year when it differs", () => {
+    expect(ago(now - 400 * 86_400_000, now)).toBe(dateLabel(now - 400 * 86_400_000, { year: true }));
+    expect(ago(now - 400 * 86_400_000, now)).toMatch(/2025$/);
+  });
+
+  it("reads a future time as just now, and no time as never", () => {
+    expect(ago(now + 30_000, now)).toBe("just now");
+    expect(ago(null, now)).toBe("never");
+    expect(ago(undefined, now, { short: true })).toBe("");
+    expect(ago("not a date", now)).toBe("never");
+    expect(secsAgo(null, now)).toBe("never");
+    expect(secsAgo(240, now)).toBe("4 min ago");
+  });
+
+  it("a log line is ago within the hour, then the clock", () => {
+    expect(whenLogged(now - 12_000, now)).toBe("12 s ago");
+    expect(whenLogged(now - 2 * 3_600_000, now)).toBe(clockOrDate(now - 2 * 3_600_000, now));
+  });
+});
+
+describe("duration", () => {
+  it.each([
+    [0, "0 s"],
+    [45_000, "45 s"],
+    [384_000, "6 min 24 s"],
+    [720_000, "12 min"],
+    [3 * 3_600_000 + 5 * 60_000, "3 h 5 min"],
+    [2 * 86_400_000, "2 d"],
+    [2 * 86_400_000 + 4 * 3_600_000, "2 d 4 h"],
+  ])("%s ms reads %s", (ms, out) => {
+    expect(duration(ms)).toBe(out);
+  });
+});
+
+describe("dates and clocks", () => {
+  it("are always written the en-US way", () => {
+    const at = new Date(2026, 10, 12, 14, 20, 5);
+    expect(clock(at)).toBe("2:20 PM");
+    expect(dateLabel(at)).toBe("Nov 12");
+    expect(dateLabel(at, { year: true })).toBe("Nov 12, 2026");
+    expect(dateTime(at)).toBe("Nov 12, 2:20 PM");
+    expect(clockOrDate(at, at.getTime() + 60_000)).toBe("2:20 PM");
+    expect(clockOrDate(at, at.getTime() + 2 * 86_400_000)).toBe("Nov 12, 2:20 PM");
+    expect(dateLabel("2026-11-12T00:00:00Z", { utc: true })).toBe("Nov 12");
+    expect(dateLabel("garbage")).toBe("—");
+  });
+});
+
 describe("counts", () => {
   it("groups thousands in en-US whatever the browser's locale", () => {
     expect(formatNumber(1234567)).toBe("1,234,567");
@@ -144,11 +206,14 @@ describe("one home for number formatting", () => {
   });
 
   it("numbers are not formatted in the browser's locale", () => {
-    const browserLocale = /\.toLocaleString\((?:\)|undefined)/;
-    const isDate = /Date\(/;
-    const offenders = sources
-      .filter((p) => readFileSync(p, "utf8").split("\n").some((line) => browserLocale.test(line) && !isDate.test(line)))
-      .map((p) => p.slice(root.length + 1));
+    const browserLocale = /\.toLocale(?:Date|Time)?String\(/;
+    const offenders = sources.filter((p) => browserLocale.test(readFileSync(p, "utf8"))).map((p) => p.slice(root.length + 1));
+    expect(offenders).toEqual([]);
+  });
+
+  it("no other file defines its own time-ago or duration helper", () => {
+    const retired = /\b(?:function\s+(?:ago|agoShort|timeAgo|shortAgo|seenAgo|formatLastUsed|clockLabel|duration|since|stamp)\s*\(|const\s+(?:ago|agoShort|timeAgo|shortAgo|seenAgo|formatLastUsed|clockLabel|duration|since|stamp)\s*=\s*\()/;
+    const offenders = sources.filter((p) => retired.test(readFileSync(p, "utf8"))).map((p) => p.slice(root.length + 1));
     expect(offenders).toEqual([]);
   });
 });

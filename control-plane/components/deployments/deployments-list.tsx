@@ -33,7 +33,7 @@ import {
 } from "@/lib/deployments-model";
 import { logsHref } from "@/lib/log-links";
 import { MODEL_TYPE_NAMES } from "@/lib/models-model";
-import { compact } from "@/lib/format";
+import { compact, secsAgo } from "@/lib/format";
 import { poolOccupancy } from "@/lib/occupancy";
 import { useClusterResources } from "@/lib/use-cluster-resources";
 import { cn, getJson } from "@/lib/utils";
@@ -41,13 +41,6 @@ import { ReadNotice } from "@/components/ui/read-state";
 import { StatusDot } from "@/components/ui/status";
 
 const COLS = "grid-cols-[minmax(0,1.4fr)_minmax(130px,0.9fr)_150px_minmax(0,1.4fr)_130px_84px_84px]";
-
-function ago(secs: number | null | undefined): string {
-  if (secs == null) return "never";
-  if (secs < 60) return `${Math.round(secs)} s ago`;
-  if (secs < 3600) return `${Math.round(secs / 60)} min ago`;
-  return `${Math.round(secs / 3600)} h ago`;
-}
 
 /** The 24 h request counts come from ClickHouse, so they refresh once a minute
  *  while the fleet itself refreshes every 15 seconds. */
@@ -187,7 +180,7 @@ export function DeploymentsList({ initial, recipes: initialRecipes, tab: initial
                 {slurmOn && (
                   <span className="inline-flex items-center gap-2 text-xs text-secondary-foreground">
                     <StatusDot glyph={data.slurm?.provisioner_running ? (data.slurm.provisioner_tick_status === "error" ? "half" : "on") : "off"} className="h-[7px] w-[7px]" />
-                    {data.slurm?.provisioner_running ? `Provisioner checked in ${ago(data.slurm.provisioner_last_seen_secs)}${data.slurm.provisioner_tick_status === "error" ? ", and its last pass failed" : ""}` : prov.kind === "never" ? "No provisioner has run yet" : `Provisioner stopped, last seen ${ago(data.slurm?.provisioner_last_seen_secs)}`}
+                    {data.slurm?.provisioner_running ? `Provisioner checked in ${secsAgo(data.slurm.provisioner_last_seen_secs)}${data.slurm.provisioner_tick_status === "error" ? ", and its last pass failed" : ""}` : prov.kind === "never" ? "No provisioner has run yet" : `Provisioner stopped, last seen ${secsAgo(data.slurm?.provisioner_last_seen_secs)}`}
                   </span>
                 )}
               </div>

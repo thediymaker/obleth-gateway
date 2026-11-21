@@ -33,9 +33,7 @@ import {
   accountsFor,
   deploymentKey,
   deploymentRow,
-  clockLabel,
   countReplicas,
-  duration,
   jobEndLine,
   pauseOf,
   pendingReason,
@@ -62,7 +60,7 @@ import { logsHref } from "@/lib/log-links";
 import { modelHref } from "@/lib/models-model";
 import type { AuditEntry, ManagedModelSpec, ModelReplica } from "@/lib/obleth";
 import { PORT_WINDOW } from "@/lib/managed-model-schema";
-import { compact } from "@/lib/format";
+import { clock, clockOrDate, compact, duration } from "@/lib/format";
 import { sbatchLines, stripSbatchDirectives, type PlacementKey, type SbatchLine } from "@/lib/sbatch-directives";
 import { useClusterResources } from "@/lib/use-cluster-resources";
 import { useLatestCallback } from "@/lib/use-latest-callback";
@@ -674,7 +672,7 @@ export function ManagedPage({ modelId, initial, changes }: { modelId: string; in
           <p className="text-[15px] font-semibold">{pause_ || stopped ? `obleth stopped launching ${model.model_name}` : `Slurm refuses ${model.model_name}'s job`}</p>
           {pause_ ? (
             <p className="max-w-3xl text-[13px] text-secondary-foreground">
-              {pause_.reason.replace(/\.?$/, ".")} {pause_.until ? `obleth tries again at ${clockLabel(pause_.until)}, or now if you say so.` : "It waits for you."}
+              {pause_.reason.replace(/\.?$/, ".")} {pause_.until ? `obleth tries again at ${clockOrDate(pause_.until, Date.now())}, or now if you say so.` : "It waits for you."}
               {counts.healthy ? ` ${counts.healthy} replica${counts.healthy === 1 ? " is" : "s are"} still serving.` : " Nothing is serving; requests get 503 until a replica is healthy."}
             </p>
           ) : stopped && !refusal ? (
@@ -754,7 +752,7 @@ export function ManagedPage({ modelId, initial, changes }: { modelId: string; in
                       <span className="truncate font-mono text-[12px]">{r.nodes || "—"}</span>
                       <span className="truncate" title={r.state_detail ?? r.last_message ?? undefined}>{r.state_detail || r.last_message || "job gone"}</span>
                       <span className="font-mono text-[12px]">{r.job_started_at ? duration(new Date(r.updated_at).getTime() - new Date(r.job_started_at).getTime()) : "—"}</span>
-                      <span className="font-mono text-[12px] text-muted-foreground">{new Date(r.updated_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
+                      <span className="font-mono text-[12px] text-muted-foreground">{clock(r.updated_at)}</span>
                     </div>
                   ))}
                   <p className="border-t border-border pt-2 text-xs text-muted-foreground"><JobOutput dir={spec.log_output_dir} /></p>

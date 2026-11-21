@@ -19,7 +19,7 @@ import { COUNTRIES_HINT, countriesText, countryName, NETWORKS_HINT, networksSumm
 import { lastUsed, tenantHref, type KeyRow } from "@/lib/access-model";
 import { logsHref } from "@/lib/log-links";
 import type { ApiKey, NamedNetwork, Tenant, UsageDailyRow } from "@/lib/obleth";
-import { compact, money } from "@/lib/format";
+import { compact, dateLabel, money } from "@/lib/format";
 import { cn, getJson } from "@/lib/utils";
 import { StatusDot } from "@/components/ui/status";
 
@@ -180,7 +180,7 @@ export function KeyPanel({
     });
   }
 
-  const made = k.created_at ? new Date(k.created_at).toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" }) : null;
+  const made = k.created_at ? dateLabel(k.created_at, { year: true }) : null;
 
   return (
     <>
@@ -242,7 +242,7 @@ export function KeyPanel({
                 <div className="flex flex-wrap items-baseline justify-between gap-2 text-[13px]">
                   <span className="font-medium">{row.budget.label}</span>
                   <span className="text-xs text-muted-foreground">
-                    {Math.round(row.budget.share * 100)}%{row.budget.resetsAt ? ` · resets ${row.budget.resetsAt.toLocaleDateString([], { month: "short", day: "numeric" })}` : ""}{row.budget.pace ? ` · ${row.budget.pace}` : ""}
+                    {Math.round(row.budget.share * 100)}%{row.budget.resetsAt ? ` · resets ${dateLabel(row.budget.resetsAt)}` : ""}{row.budget.pace ? ` · ${row.budget.pace}` : ""}
                   </span>
                 </div>
                 <BudgetBar share={row.budget.share} />

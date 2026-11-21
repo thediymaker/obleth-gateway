@@ -40,7 +40,7 @@ import { CodeBlock, CopyButton } from "@/components/portal/copy-button";
 import type { ApiKey, KeyUsageSummary } from "@/lib/obleth";
 import { describeIdentityKey } from "@/lib/key-kind";
 import { cn } from "@/lib/utils";
-import { formatNumber, money } from "@/lib/format";
+import { ago, formatNumber, money } from "@/lib/format";
 
 export function PortalKeys({
   keys,
@@ -301,7 +301,7 @@ function KeyRow({
           <MiniMetric label="Requests" value={formatNumber(Number(usage?.requests ?? 0))} />
           <MiniMetric label="Tokens" value={formatNumber(Number(usage?.total_tokens ?? 0))} />
           <MiniMetric label="Cost" value={money(Number(usage?.cost_usd ?? 0))} />
-          <MiniMetric label="Last used" value={formatLastUsed(usage?.last_used_ms)} />
+          <MiniMetric label="Last used" value={ago(usage?.last_used_ms, Date.now())} />
         </div>
 
         <div className="flex flex-wrap items-center gap-2 lg:justify-end">
@@ -384,18 +384,4 @@ function buildSnippets(gatewayBase: string, modelName: string) {
       `  --post-data='${payload}'`,
     ].join(" \\\n"),
   };
-}
-
-function formatLastUsed(ms?: number): string {
-  if (!ms || ms <= 0) return "Never";
-  const diff = Date.now() - ms;
-  if (diff < 0) return "Just now";
-  const min = Math.floor(diff / 60_000);
-  if (min < 1) return "Just now";
-  if (min < 60) return `${min}m ago`;
-  const hours = Math.floor(min / 60);
-  if (hours < 24) return `${hours}h ago`;
-  const days = Math.floor(hours / 24);
-  if (days < 7) return `${days}d ago`;
-  return new Date(ms).toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" });
 }

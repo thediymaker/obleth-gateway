@@ -4,7 +4,7 @@ import { memo, useMemo, useState } from "react";
 import { Area, Bar, BarChart, ComposedChart, Line, ResponsiveContainer, Tooltip, XAxis, YAxis, CartesianGrid } from "recharts";
 import { TooltipRow, TooltipShell } from "@/components/chart-tooltip";
 import { BUCKET_LABEL, PREVIOUS_LABEL, RANGE_BUCKET_MS, RANGE_LABEL, type OverviewRange, type SeriesPoint } from "@/lib/overview-model";
-import { compact, formatMs, formatNumber } from "@/lib/format";
+import { clock, compact, formatDate, formatMs, formatNumber } from "@/lib/format";
 import { Panel, Segmented } from "./ui";
 import { activeDot, axisTick, barCursor, chartGrid, seriesCurrent, seriesPrevious, timeCursor } from "@/lib/chart-style";
 
@@ -16,8 +16,8 @@ const CALLER_OPACITY = 0.28;
 function timeLabel(t: number, range: OverviewRange) {
   const d = new Date(t);
   return range === "7d"
-    ? d.toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" })
-    : d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    ? formatDate(d, { weekday: "short", hour: "numeric", minute: "2-digit" })
+    : clock(d);
 }
 
 interface Row { t: number; label: string; cur: number | null; prev: number | null; errors: number; platform: number; caller: number; peak: boolean }

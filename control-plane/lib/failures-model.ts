@@ -47,14 +47,6 @@ export function share(part: number, whole: number): string {
 }
 
 /** "12 s ago", "4 min ago", "3 h ago", "2 days ago". */
-export function seenAgo(ms: number, now = Date.now()): string {
-  const s = Math.max(0, Math.round((now - ms) / 1000));
-  if (s < 60) return `${s} s ago`;
-  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
-  if (s < 86_400 * 2) return `${Math.floor(s / 3600)} h ago`;
-  return `${Math.floor(s / 86_400)} days ago`;
-}
-
 /** A failure without a key (refused before one was read) carries the nil id. */
 export const hasKey = (g: Pick<UsageFailureGroup, "key_id">) => !!g.key_id && g.key_id !== NIL_REQUEST_ID;
 

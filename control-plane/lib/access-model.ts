@@ -1,5 +1,5 @@
 import type { AdminUser } from "@/lib/auth/users";
-import { compact, money } from "@/lib/format";
+import { compact, dateLabel, money } from "@/lib/format";
 import { keyQueryParams, type KeyListQuery } from "@/lib/key-query";
 import { networksSummary } from "@/lib/key-networks";
 import type { ApiKey, BudgetUsage, FairshareLiveView, KeyUsageSummary, NamedNetwork, Tenant, UsageAgg, WeeklyWindow } from "@/lib/obleth";
@@ -127,8 +127,8 @@ export function windowsSummary(windows: WeeklyWindow[] | null | undefined): stri
 export function accessLabel(t: Pick<Tenant, "timezone" | "active_from" | "active_until" | "weekly_windows">, now = new Date()): string {
   const state = accessState(t, now);
   if (state === "always") return "Always";
-  if (state === "not-yet") return `Opens ${new Date(t.active_from!).toLocaleDateString([], { month: "short", day: "numeric" })}`;
-  if (state === "ended") return `Ended ${new Date(t.active_until!).toLocaleDateString([], { month: "short", day: "numeric" })}`;
+  if (state === "not-yet") return `Opens ${dateLabel(t.active_from!)}`;
+  if (state === "ended") return `Ended ${dateLabel(t.active_until!)}`;
   const hours = t.weekly_windows?.length ? windowsSummary(t.weekly_windows) : "Open";
   return `${hours} · ${state === "open" ? "open now" : "closed now"}`;
 }

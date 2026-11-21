@@ -13,13 +13,12 @@ import {
   groupsFor,
   hasKey,
   rangeOf,
-  seenAgo,
   trendOf,
   TREND_POINTS,
   type FailureRange,
 } from "@/lib/failures-model";
 import { logsHref } from "@/lib/log-links";
-import { compact, formatNumber } from "@/lib/format";
+import { ago, compact, formatNumber } from "@/lib/format";
 import type { UsageFailureGroup, UsageFailureGroups, UsageLogHistogram } from "@/lib/obleth";
 import { cn, getJson } from "@/lib/utils";
 
@@ -31,13 +30,6 @@ const pct = (part: number, whole: number) => {
   const v = whole ? (part / whole) * 100 : 0;
   return `${v.toFixed(v < 1 ? 2 : 1)}%`;
 };
-
-function agoShort(ms: number, now: number) {
-  const s = Math.max(0, (now - ms) / 1000);
-  if (s < 3600) return `${Math.max(1, Math.round(s / 60))}m`;
-  if (s < 86_400) return `${Math.round(s / 3600)}h`;
-  return `${Math.round(s / 86_400)}d`;
-}
 
 /** One repeated failure: what it was and on which model, its share of the side, then who and why. */
 function GroupRow({ g, top, range, now }: { g: UsageFailureGroup; top: number; range: FailureRange; now: number }) {
@@ -57,7 +49,7 @@ function GroupRow({ g, top, range, now }: { g: UsageFailureGroup; top: number; r
         </span>
       </span>
       <Link href={groupLogsHref(g, range)} title="See these requests" className="text-right font-mono text-xs tabular-nums underline-offset-2 hover:underline">{compact(g.requests)}</Link>
-      <span className="text-right font-mono text-xs text-muted-foreground" title={`First ${seenAgo(g.first_ms, now)}, last ${seenAgo(g.last_ms, now)}`}>{agoShort(g.last_ms, now)}</span>
+      <span className="text-right font-mono text-xs text-muted-foreground" title={`First ${ago(g.first_ms, now)}, last ${ago(g.last_ms, now)}`}>{ago(g.last_ms, now, { short: true })}</span>
     </li>
   );
 }

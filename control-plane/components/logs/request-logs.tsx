@@ -9,12 +9,12 @@ import { Segmented } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Select } from "@/components/ui/select";
-import { bucketFor, bucketLabel, DEFAULT_LOG_FILTERS, fillHistogram, filtersActive, isFailure, listLabel, listOf, LOG_WINDOWS, loadViews, logParams, parseSearch, pickOne, storeViews, timeSplit, typeOptions, when, windowRange, withPatterns, MAX_MATCHES, type HistogramBucket, type KeyOption, type LogFilters, type LogWindowId, type Named, type SavedView } from "@/lib/logs-model";
+import { bucketFor, bucketLabel, DEFAULT_LOG_FILTERS, fillHistogram, filtersActive, isFailure, listLabel, listOf, LOG_WINDOWS, loadViews, logParams, parseSearch, pickOne, storeViews, timeSplit, typeOptions, windowRange, withPatterns, MAX_MATCHES, type HistogramBucket, type KeyOption, type LogFilters, type LogWindowId, type Named, type SavedView } from "@/lib/logs-model";
 import { classLabel, classSide, failureReason, SIDE_PHRASE } from "@/lib/failure-classes";
 import type { UsageLogEntry, UsageLogFacets, UsageLogHistogram } from "@/lib/obleth";
 import { cn, getJson } from "@/lib/utils";
 import { readFailed, readProblem } from "@/components/ui/read-state";
-import { compact, formatMs, formatNumber, money } from "@/lib/format";
+import { clock, compact, dateLabel, dateTime, formatMs, formatNumber, fullDateTime, money, whenLogged } from "@/lib/format";
 
 const PAGE = 50;
 const LIVE_MS = 5_000;
@@ -52,7 +52,7 @@ function Strip({ buckets, bucketMs, split, loading, onZoom }: { buckets: Histogr
   };
   const lo = drag ? Math.min(drag.a, drag.b) : -1;
   const hi = drag ? Math.max(drag.a, drag.b) : -1;
-  const label = (t: number) => new Date(t).toLocaleString([], bucketMs >= 86_400_000 ? { month: "short", day: "numeric" } : { hour: "2-digit", minute: "2-digit" });
+  const label = (t: number) => (bucketMs >= 86_400_000 ? dateLabel(t) : clock(t));
   const ticks = buckets.length > 4 ? [0, 0.25, 0.5, 0.75].map((f) => buckets[Math.floor(f * (buckets.length - 1))]) : [];
   return (
     <section aria-label="Requests over time" className="rounded-xl border border-border bg-card px-[18px] pb-2.5 pt-3">
@@ -88,7 +88,7 @@ function Strip({ buckets, bucketMs, split, loading, onZoom }: { buckets: Histogr
           const caller = b.errors - platform;
           const failed = !b.errors ? "" : split ? `, ${b.errors} failed (${platform} on the platform, ${caller} from callers)` : `, ${b.errors} failed`;
           return (
-            <div key={b.bucket_ms} title={`${new Date(b.bucket_ms).toLocaleString()} · ${b.requests} requests${failed}`} className={cn("flex h-full flex-1 flex-col justify-end", i >= lo && i <= hi && "bg-muted/60")}>
+            <div key={b.bucket_ms} title={`${fullDateTime(b.bucket_ms)} · ${b.requests} requests${failed}`} className={cn("flex h-full flex-1 flex-col justify-end", i >= lo && i <= hi && "bg-muted/60")}>
               <span className="block rounded-t-[1px] bg-foreground" style={{ height: `${(platform / max) * 100}%` }} />
               <span className="block bg-muted-foreground" style={{ height: `${(caller / max) * 100}%` }} />
               <span className={cn("block", split ? "bg-muted-foreground/35" : "bg-muted-foreground/60")} style={{ height: `${((b.requests - b.errors) / max) * 100}%` }} />
@@ -118,7 +118,7 @@ const Row = memo(function Row({ row, selected, onOpen, now }: { row: UsageLogEnt
   const pct = (ms: number) => `${t.total ? (ms / t.total) * 100 : 0}%`;
   return (
     <tr onClick={() => onOpen(row.request_id)} className={cn("cursor-pointer border-t border-border/70 transition-colors hover:bg-muted/30", selected && "bg-secondary")}>
-      <td className="whitespace-nowrap py-2 pl-[18px] pr-3 font-mono text-[12px] text-muted-foreground" title={new Date(row.ts_ms).toLocaleString()}>{when(row.ts_ms, now ?? Date.now())}</td>
+      <td className="whitespace-nowrap py-2 pl-[18px] pr-3 font-mono text-[12px] text-muted-foreground" title={fullDateTime(row.ts_ms)}>{whenLogged(row.ts_ms, now ?? Date.now())}</td>
       <td className="max-w-[18rem] py-2 pr-3">
         <span className="flex min-w-0 items-center gap-2">
           <span className={cn("inline-flex h-5 shrink-0 items-center rounded-full border px-1.5 font-mono text-[11px]", failed ? "border-foreground bg-foreground font-semibold text-background" : "border-border text-secondary-foreground")}>{row.status_code}</span>
@@ -310,9 +310,8 @@ export function RequestLogs({
     const label = listLabel(filters, field, noun);
     return label ? [{ value: filters[field], label }] : [];
   };
-  const at = (t: number) => new Date(t).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
   const sameDay = new Date(range.since).toDateString() === new Date(range.until).toDateString();
-  const winLabel = filters.window === "custom" ? `between ${at(range.since)} and ${sameDay ? new Date(range.until).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : at(range.until)}` : `in the last ${{ "15m": "15 minutes", "1h": "hour", "24h": "24 hours", "7d": "7 days", "30d": "30 days" }[filters.window]}`;
+  const winLabel = filters.window === "custom" ? `between ${dateTime(range.since)} and ${sameDay ? clock(range.until) : dateTime(range.until)}` : `in the last ${{ "15m": "15 minutes", "1h": "hour", "24h": "24 hours", "7d": "7 days", "30d": "30 days" }[filters.window]}`;
   const saveView = () => {
     const name = naming?.trim();
     if (!name) return;
