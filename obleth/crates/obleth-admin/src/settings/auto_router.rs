@@ -37,6 +37,9 @@ pub struct AutoRouterSettingsView {
     pub default_soft_cap: u32,
     pub temperature: f64,
     pub difficulty_enabled: bool,
+    /// With tiering on, serve each request from the lowest tier that meets
+    /// its difficulty and has room.
+    pub right_size_enabled: bool,
     /// `"hybrid" | "derived" | "declared"`.
     pub tier_source: String,
     /// Keep a conversation on the model that answered its last turn until
@@ -66,6 +69,7 @@ impl AutoRouterSettingsView {
             default_soft_cap: s.default_soft_cap,
             temperature: s.temperature,
             difficulty_enabled: s.difficulty_enabled,
+            right_size_enabled: s.right_size_enabled,
             tier_source: tier_source_as_str(s.tier_source).to_string(),
             sticky_enabled: s.sticky_enabled,
             messages_default_model: s.messages_default_model.clone(),
@@ -95,6 +99,8 @@ pub struct UpdateAutoRouterSettings {
     pub temperature: Option<f64>,
     #[serde(default)]
     pub difficulty_enabled: Option<bool>,
+    #[serde(default)]
+    pub right_size_enabled: Option<bool>,
     /// `"hybrid" | "derived" | "declared"`. Unrecognized or absent values
     /// leave the persisted `tier_source` untouched.
     #[serde(default)]
@@ -158,6 +164,9 @@ fn merge_auto_router(
         difficulty_enabled: body
             .difficulty_enabled
             .unwrap_or(existing.difficulty_enabled),
+        right_size_enabled: body
+            .right_size_enabled
+            .unwrap_or(existing.right_size_enabled),
         tier_source: body
             .tier_source
             .as_deref()
@@ -219,6 +228,7 @@ pub(crate) async fn put_auto_router_settings(
                 "default_soft_cap": settings.default_soft_cap,
                 "temperature": settings.temperature,
                 "difficulty_enabled": settings.difficulty_enabled,
+                "right_size_enabled": settings.right_size_enabled,
                 "tier_source": tier_source_as_str(settings.tier_source),
                 "messages_default_model": settings.messages_default_model,
                 "verdicts_default_model": settings.verdicts_default_model,
@@ -284,6 +294,8 @@ pub struct SimulateRouteRequest {
     pub temperature: Option<f64>,
     #[serde(default)]
     pub difficulty_enabled: Option<bool>,
+    #[serde(default)]
+    pub right_size_enabled: Option<bool>,
     /// Pretend this many requests are in flight per model. **Absent means the
     /// live fleet load**, which is what the gateway itself scores against —
     /// this field is a what-if override, not the default.
@@ -361,6 +373,7 @@ pub(crate) async fn simulate_route(
             default_soft_cap: body.default_soft_cap,
             temperature: body.temperature,
             difficulty_enabled: body.difficulty_enabled,
+            right_size_enabled: body.right_size_enabled,
             ..Default::default()
         },
     );

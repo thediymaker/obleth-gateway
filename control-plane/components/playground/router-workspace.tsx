@@ -68,6 +68,7 @@ export function RouterWorkspace({ session, update, settingsOpen = true, onOpenSe
   const [softCap, setSoftCap] = useState(8);
   const [temperature, setTemperature] = useState(0);
   const [difficultyEnabled, setDifficultyEnabled] = useState(false);
+  const [rightSize, setRightSize] = useState(false);
 
   const [baseline, setBaseline] = useState<RouteExplainView | null>(null);
   const [edited, setEdited] = useState<RouteExplainView | null>(null);
@@ -114,6 +115,7 @@ export function RouterWorkspace({ session, update, settingsOpen = true, onOpenSe
       default_soft_cap: Math.round(softCap),
       temperature,
       difficulty_enabled: difficultyEnabled,
+      right_size_enabled: difficultyEnabled && rightSize,
     };
     // Reports whether this run actually landed a fresh baseline/edited pair,
     // so callers (Apply to gateway) can state what happened instead of
@@ -133,6 +135,7 @@ export function RouterWorkspace({ session, update, settingsOpen = true, onOpenSe
         setSoftCap(b.weights.soft_cap);
         setTemperature(b.temperature);
         setDifficultyEnabled(b.weights.difficulty_enabled);
+        setRightSize(b.weights.right_size ?? false);
       }
     } catch (err) {
       if ((err as Error).name !== "AbortError") { setError((err as Error).message || "Unable to reach the gateway."); ok = false; }
@@ -143,7 +146,7 @@ export function RouterWorkspace({ session, update, settingsOpen = true, onOpenSe
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     prompt, tenantId, effort, maxTokens, needsFunctionCalling, needsToolChoice, needsResponseSchema,
-    classifyLive, capacityWeight, costWeight, tagWeight, softCap, temperature, difficultyEnabled,
+    classifyLive, capacityWeight, costWeight, tagWeight, softCap, temperature, difficultyEnabled, rightSize,
   ]);
 
   // Debounce every input, including range-input drags (which fire per frame)
@@ -161,7 +164,8 @@ export function RouterWorkspace({ session, update, settingsOpen = true, onOpenSe
     Math.abs(tagWeight - baseline.weights.tag) > EPSILON ||
     Math.abs(softCap - baseline.weights.soft_cap) > EPSILON ||
     Math.abs(temperature - baseline.temperature) > EPSILON ||
-    difficultyEnabled !== baseline.weights.difficulty_enabled
+    difficultyEnabled !== baseline.weights.difficulty_enabled ||
+    (difficultyEnabled && rightSize) !== (baseline.weights.right_size ?? false)
   );
   // Three states, not two: without a baseline (nothing fetched yet, or the
   // last fetch failed) there is nothing to claim parity with, so "matches
@@ -178,6 +182,7 @@ export function RouterWorkspace({ session, update, settingsOpen = true, onOpenSe
       default_soft_cap: Math.round(softCap),
       temperature,
       difficulty_enabled: difficultyEnabled,
+      right_size_enabled: difficultyEnabled && rightSize,
     });
     setApplying(false);
     if (!result.ok) { setApplyStatus(result.error); return; }
@@ -207,6 +212,7 @@ export function RouterWorkspace({ session, update, settingsOpen = true, onOpenSe
     setSoftCap(baseline.weights.soft_cap);
     setTemperature(baseline.temperature);
     setDifficultyEnabled(baseline.weights.difficulty_enabled);
+    setRightSize(baseline.weights.right_size ?? false);
   }
 
   const current = edited ?? baseline;
@@ -218,6 +224,7 @@ export function RouterWorkspace({ session, update, settingsOpen = true, onOpenSe
     { label: "Temperature", from: baseline.temperature.toFixed(2), to: temperature.toFixed(2) },
     { label: "Default soft cap", from: String(baseline.weights.soft_cap), to: String(Math.round(softCap)) },
     { label: "Difficulty tiering", from: baseline.weights.difficulty_enabled ? "on" : "off", to: difficultyEnabled ? "on" : "off" },
+    { label: "Smallest sufficient tier", from: baseline.weights.right_size ? "on" : "off", to: difficultyEnabled && rightSize ? "on" : "off" },
   ].filter((c) => c.from !== c.to);
   /** The live value to strike through beside a slider, only when the draft differs. */
   const liveOf = (live: number | undefined, edited: number, digits = 2) =>
@@ -299,6 +306,15 @@ export function RouterWorkspace({ session, update, settingsOpen = true, onOpenSe
               <span>Difficulty tiering{baseline && difficultyEnabled !== baseline.weights.difficulty_enabled && <span className="ml-1.5 text-[11.5px] text-muted-foreground">live: {baseline.weights.difficulty_enabled ? "on" : "off"}</span>}</span>
               <Switch label="Difficulty tiering" checked={difficultyEnabled} onChange={setDifficultyEnabled} />
             </div>
+            {difficultyEnabled && (
+              <div className="flex items-center justify-between gap-3 text-[13px]">
+                <span title="Serve each request from the lowest tier that meets its difficulty and has room. Off, any tier at or above it competes.">
+                  Smallest sufficient tier{baseline && rightSize !== (baseline.weights.right_size ?? false) && <span className="ml-1.5 text-[11.5px] text-muted-foreground">live: {baseline.weights.right_size ? "on" : "off"}</span>}
+                  <span className="block text-[11.5px] text-muted-foreground">Keeps strong models for the requests that need them</span>
+                </span>
+                <Switch label="Smallest sufficient tier" checked={rightSize} onChange={setRightSize} />
+              </div>
+            )}
             <div className="flex items-center justify-between gap-3 text-[13px]">
               <span title="Derive tags and difficulty with the live classifier model (one small model call per simulation), exactly as serving does. Off, a keyword heuristic is used.">
                 Live classifier <span className="block text-[11.5px] text-muted-foreground">One small model call per simulation</span>

@@ -33,6 +33,7 @@
 //! uniform draw — stay in `obleth-proxy`, which re-exports everything here so no
 //! data-plane call site has to name a different path.
 
+mod reading;
 pub mod route_explain;
 pub mod sticky;
 
@@ -56,6 +57,9 @@ pub struct RouterWeights {
     // `difficulty_enabled` gates the tier filter in `select_model`.
     pub temperature: f64,
     pub difficulty_enabled: bool,
+    /// With tiering on, serve a request from the lowest tier that meets its
+    /// difficulty and has room, instead of from any tier at or above it.
+    pub right_size: bool,
 }
 
 impl RouterWeights {
@@ -71,6 +75,7 @@ impl RouterWeights {
             },
             temperature: s.temperature.max(0.0),
             difficulty_enabled: s.difficulty_enabled,
+            right_size: s.difficulty_enabled && s.right_size_enabled,
         }
     }
 
@@ -183,12 +188,25 @@ pub fn derive_levels(candidates: &mut [Candidate], source: crate::TierSource) {
                 // Fewer than three members: rank order, not three bands.
                 (rank + 1) as u8
             };
-            let declared = candidates[i]
-                .model
-                .declared_levels
-                .iter()
-                .find(|(d, _)| d == domain)
-                .map(|(_, l)| *l);
+            // A request with no topic is ranked on a model's overall strength:
+            // the best level it declares anywhere. Without this every model
+            // held the same level on the general domain, and the difficulty
+            // of a request that named no topic changed nothing.
+            let declared = if domain == GENERAL_DOMAIN {
+                candidates[i]
+                    .model
+                    .declared_levels
+                    .iter()
+                    .map(|(_, l)| *l)
+                    .max()
+            } else {
+                candidates[i]
+                    .model
+                    .declared_levels
+                    .iter()
+                    .find(|(d, _)| d == domain)
+                    .map(|(_, l)| *l)
+            };
             let level = match source {
                 TierSource::Derived => derived,
                 TierSource::Declared => declared.unwrap_or(1),
@@ -291,7 +309,7 @@ impl BoonGrants {
 /// Every hard-filter reason string, in the order the filters are applied. A
 /// candidate is attributed to the *first* filter it fails, so this order is
 /// part of the explanation's contract, not just presentation.
-const REJECTION_REASONS: [&str; 13] = [
+const REJECTION_REASONS: [&str; 15] = [
     "disabled",
     "staged",
     "retiring",
@@ -305,6 +323,8 @@ const REJECTION_REASONS: [&str; 13] = [
     "vision",
     "tenant_allowlist",
     "below_tier_floor",
+    "tier_full",
+    "above_needed_tier",
 ];
 
 /// Expected completion length, in tokens, for a model the gateway has not yet
@@ -633,6 +653,51 @@ fn evaluate<'a>(
                 reject("below_tier_floor", &c.model.model_name);
             }
             kept
+        }
+    } else {
+        eligible
+    };
+
+    // ---- stage 2b: the smallest sufficient tier ----
+    // The floor says what a request needs. A model above it costs more and
+    // gives the request nothing it asked for, so with `right_size` the request
+    // is served from the lowest tier at or above the floor that has a model
+    // with room. A tier whose models are all at their caps gives way to the
+    // next one up: load spills upward, never down. When no tier has room,
+    // every survivor competes as before.
+    let eligible: Vec<&Candidate> = if weights.right_size && weights.difficulty_enabled {
+        let has_room = |c: &Candidate| {
+            let in_flight = busyness.get(&c.model.model_name).copied().unwrap_or(0) as f64;
+            let cap = match c.model.max_in_flight {
+                Some(cap) if cap > 0 => cap as f64,
+                _ => weights.soft_cap,
+            };
+            in_flight < cap
+        };
+        let mut tiers: Vec<u8> = eligible.iter().map(|c| c.strength(&tier_domains)).collect();
+        tiers.sort_unstable();
+        tiers.dedup();
+        let target = tiers.into_iter().find(|tier| {
+            eligible
+                .iter()
+                .any(|c| c.strength(&tier_domains) == *tier && has_room(c))
+        });
+        match target {
+            Some(target) => {
+                let mut kept = Vec::with_capacity(eligible.len());
+                for c in eligible {
+                    let strength = c.strength(&tier_domains);
+                    if strength == target {
+                        kept.push(c);
+                    } else if strength < target {
+                        reject("tier_full", &c.model.model_name);
+                    } else {
+                        reject("above_needed_tier", &c.model.model_name);
+                    }
+                }
+                kept
+            }
+            None => eligible,
         }
     } else {
         eligible
@@ -1053,6 +1118,7 @@ fn narrate(
             tag: weights.tag,
             soft_cap: weights.soft_cap,
             difficulty_enabled: weights.difficulty_enabled,
+            right_size: weights.right_size,
         },
         temperature: weights.temperature,
         // Echoed verbatim, including at temperature 0 where it was ignored, so
@@ -1144,17 +1210,17 @@ pub fn heuristic_intent(json: &serde_json::Value, est_input_tokens: u64) -> Inte
         .filter(|m| role(m) == "user")
         .collect();
     let has_image = user_turns.iter().any(|m| has_image_part(m));
-    let text = user_turns
+    // What the person said, oldest first, as far back as the classifier reads.
+    let mut said: Vec<String> = user_turns
         .iter()
         .rev()
         .take(CLASSIFIER_LOOKBACK_TURNS)
         .map(|m| message_text(m.get("content")))
-        .find(|t| !t.trim().is_empty())
-        .unwrap_or_default();
-    // How long the prompt is, before it is cut to what the scan reads.
-    let long_prompt = text.len() > HEURISTIC_MAX_BYTES;
+        .filter(|t| !t.trim().is_empty())
+        .collect();
+    said.reverse();
+    let text = said.last().cloned().unwrap_or_default();
     let text = head_bytes(&text, HEURISTIC_MAX_BYTES);
-    let lower = text.to_ascii_lowercase();
 
     let mut tags: Vec<String> = Vec::new();
     let mut push = |t: &str| {
@@ -1167,6 +1233,41 @@ pub fn heuristic_intent(json: &serde_json::Value, est_input_tokens: u64) -> Inte
     if has_image {
         push("vision");
     }
+    let mut topics = heuristic_topics(text);
+    // A short follow-up ("continue", "that still fails") is about what the
+    // request before it was about.
+    if topics.is_empty() && said.len() > 1 {
+        let lower = text.to_ascii_lowercase();
+        if reading::follows_on(lower.trim()) && !reading::is_pleasantry(lower.trim()) {
+            topics = heuristic_topics(head_bytes(&said[said.len() - 2], HEURISTIC_MAX_BYTES));
+        }
+    }
+    for topic in topics {
+        push(topic);
+    }
+
+    if est_input_tokens > HEURISTIC_LONG_CONTEXT_TOKENS {
+        push("long-context");
+    }
+
+    // Difficulty from what the words show: see `reading`. The middle is the
+    // default, so a request that shows nothing is neither sent to the weakest
+    // models nor to the strongest. Only the person's own turns are read: the
+    // system text and tool definitions a client sends with every message say
+    // nothing about how hard this one is.
+    let difficulty = reading::difficulty(&said);
+
+    Intent {
+        tags,
+        difficulty,
+        source: IntentSource::Heuristic,
+    }
+}
+
+/// The topics one message is about, from the fixed vocabulary.
+fn heuristic_topics(text: &str) -> Vec<&'static str> {
+    let lower = text.to_ascii_lowercase();
+    let mut topics = Vec::new();
 
     let code_signal = text.contains("```")
         || [
@@ -1178,6 +1279,7 @@ pub fn heuristic_intent(json: &serde_json::Value, est_input_tokens: u64) -> Inte
             "public ",
             "const ",
             "=> ",
+            "c++",
         ]
         .iter()
         .any(|k| lower.contains(k))
@@ -1193,18 +1295,96 @@ pub fn heuristic_intent(json: &serde_json::Value, est_input_tokens: u64) -> Inte
             "java",
             "sql",
             "regex",
+            "script",
+            "query",
+            "dockerfile",
+            "docker",
+            "bash",
+            "awk",
+            "pytest",
+            "unit tests",
+            "git",
+            "vim",
+            "chmod",
+            "syntax",
+            "api",
+            "schema",
+            "parser",
+            "mutex",
+            "deadlock",
+            "deadlocks",
+            "race condition",
+            "lock-free",
+            "refactor",
+            "postgres",
+            "postgresql",
+            "mysql",
+            "golang",
+            "go service",
+            "tokio",
+            "panicked",
+            "traceback",
+            "pandas",
+            "numpy",
+            "dataframe",
+            "df",
+            "flask",
+            "django",
+            "react",
+            "npm",
+            "pip",
+            "conda",
+            "json",
+            "yaml",
+            "endpoint",
+            "lambda",
+            "loop",
+            "typeerror",
+            "exception",
+            "segfault",
+            "compiler",
+            "makefile",
+            "cmake",
+            "kubectl",
+            "linux",
+            "command",
+            "terminal",
+            "shell",
+            "ssh",
+            "tar",
+            "grep",
+            "sed",
+            "cron",
+            "etl",
+            "openmp",
         ]
         .iter()
-        .any(|k| has_word(&lower, k));
+        .any(|k| has_word(&lower, k))
+        // Text that is itself code or a command line: a call, an option, a
+        // source file.
+        || ["`", "()", "):", " == ", "::", "->"]
+            .iter()
+            .any(|k| lower.contains(k))
+        || lower
+            .split_whitespace()
+            .any(|w| w.len() > 3 && w.starts_with("--") && w.as_bytes()[2].is_ascii_alphabetic())
+        || [".py", ".js", ".ts", ".rs", ".go", ".cpp", ".sh", ".sql"].iter().any(|ext| {
+            lower.match_indices(ext).any(|(at, _)| {
+                lower[at + ext.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !c.is_alphanumeric())
+            })
+        });
     if code_signal {
-        push("coding");
+        topics.push("coding");
     }
 
     // Prose to write or edit. Phrases rather than single words, and never
     // alongside a code signal: "write" and "email" alone match "write a SQL
     // query" and "validate an email address" just as well.
     let writing_signal = !code_signal
-        && [
+        && ([
             "short story",
             "poem",
             "sonnet",
@@ -1228,11 +1408,50 @@ pub fn heuristic_intent(json: &serde_json::Value, est_input_tokens: u64) -> Inte
             "fix the grammar",
             "more diplomatic",
             "more professional",
+            "draft a",
+            "polite reply",
+            "translate",
+            "grammar",
+            "less rude",
+            "more polite",
+            "more formal",
+            "friendlier",
+            " tone",
+            "shorten",
+            "tighten",
         ]
         .iter()
-        .any(|k| lower.contains(k));
+        .any(|k| lower.contains(k))
+            // A piece of prose asked for by its kind: "write a short
+            // thank-you note", "need a linkedin post".
+            || (["write", "draft", "compose", "need a", "need an", "give me a"]
+                .iter()
+                .any(|k| lower.contains(k))
+                && [
+                    "note",
+                    "letter",
+                    "email",
+                    "message",
+                    "description",
+                    "post",
+                    "bio",
+                    "speech",
+                    "toast",
+                    "abstract",
+                    "paragraph",
+                    "caption",
+                    "announcement",
+                    "blurb",
+                    "apology",
+                    "invitation",
+                    "story",
+                    "article",
+                    "slogan",
+                ]
+                .iter()
+                .any(|k| has_word(&lower, k))));
     if writing_signal {
-        push("writing");
+        topics.push("writing");
     }
 
     let math_signal = [
@@ -1246,74 +1465,59 @@ pub fn heuristic_intent(json: &serde_json::Value, est_input_tokens: u64) -> Inte
         "algebra",
         "calculus",
         "matrix",
+        "prove",
+        "proof",
+        "determinant",
+        "irrational",
+        "converges",
+        "closed form",
     ]
     .iter()
     .any(|k| has_word(&lower, k))
         || (lower.contains('=')
             && lower
                 .chars()
-                .any(|c| matches!(c, '+' | '-' | '*' | '/' | '^' | '∫' | '√' | '∑')));
-    if math_signal {
-        push("math");
+                .any(|c| matches!(c, '+' | '-' | '*' | '/' | '^' | '∫' | '√' | '∑')))
+        || [
+            "calculation",
+            "critical points",
+            "standard deviation",
+            "variance",
+            "p-value",
+            "confidence interval",
+            "eigenvalue",
+            "polynomial",
+            "logarithm",
+        ]
+        .iter()
+        .any(|k| lower.contains(k))
+        // A quantity asked for from figures given: a word problem.
+        || (reading::figures(&lower) >= 2
+            && [
+                "how high",
+                "how far",
+                "how fast",
+                "how likely",
+                "what's the chance",
+                "what is the chance",
+                "what are the chances",
+                "what fraction",
+                "what percent",
+            ]
+            .iter()
+            .any(|k| lower.contains(k)));
+    // Beside code, only a proof is mathematics: "solve" and "matrix" are
+    // everyday words there.
+    if math_signal && !(code_signal && !lower.contains("prove that") && !lower.contains("proof")) {
+        topics.push("math");
     }
-
-    if est_input_tokens > HEURISTIC_LONG_CONTEXT_TOKENS {
-        push("long-context");
-    }
-
-    // Difficulty from the same scan. Each signal is a cheap proxy for effort;
-    // absence of signal means 1, so a quiet prompt always routes cheap.
-    let mut difficulty: u8 = 1;
-    let mut bump = |to: u8| {
-        if to > difficulty {
-            difficulty = to;
-        }
-    };
-    if lower.contains("stack backtrace")
-        || lower.contains("traceback (most recent call last)")
-        || lower.contains("panicked at")
-        || lower.contains("segmentation fault")
-    {
-        bump(3);
-    }
-    if [
-        "why does",
-        "race condition",
-        "deadlock",
-        "optimize",
-        "refactor",
-        "prove",
-        "derive",
-        "explain why",
-        "trade-off",
-        "root cause",
-    ]
-    .iter()
-    .any(|k| lower.contains(k))
-    {
-        bump(2);
-    }
-    // A long prompt is more work, and so is a request that fills a context
-    // window. The prompt is the turn read here, not the whole request: the
-    // system text and tool definitions a client sends with every message say
-    // nothing about how hard this one is, and counting them made every
-    // message from such a client, a greeting included, read as moderate.
-    if long_prompt || est_input_tokens > HEURISTIC_LONG_CONTEXT_TOKENS {
-        bump(2);
-    }
-
-    Intent {
-        tags,
-        difficulty,
-        source: IntentSource::Heuristic,
-    }
+    topics
 }
 
-/// Most bytes of the newest user turn the heuristic reads. A prompt longer
-/// than this is long enough to bump its difficulty.
+/// Most bytes of the newest user turn the heuristic reads.
 pub const HEURISTIC_MAX_BYTES: usize = 8_000;
 /// Estimated tokens of the whole request from which the heuristic tags it
-/// `long-context` and bumps its difficulty.
+/// `long-context`.
 pub const HEURISTIC_LONG_CONTEXT_TOKENS: u64 = 32_000;
 
 /// True when `word` occurs in `text` as a whole word (a letter or digit on
@@ -2170,14 +2374,10 @@ mod tests {
     }
 
     #[test]
-    fn heuristic_difficulty_rises_on_a_long_prompt() {
+    fn heuristic_difficulty_is_moderate_for_a_long_prompt_that_shows_nothing_else() {
         let body =
             serde_json::json!({ "messages": [{"role":"user","content":"word ".repeat(1_700)}] });
         assert_eq!(heuristic_intent(&body, 2_200).difficulty, 2);
-        // Just under the length the scan reads: still a quiet prompt.
-        let body =
-            serde_json::json!({ "messages": [{"role":"user","content":"word ".repeat(1_600)}] });
-        assert_eq!(heuristic_intent(&body, 2_050).difficulty, 1);
     }
 
     #[test]
@@ -2896,6 +3096,140 @@ mod tests {
             chosen.model_name, "strong",
             "a hard question with no topic tag must still reach a strong model"
         );
+    }
+
+    fn right_sizing() -> RouterWeights {
+        RouterWeights {
+            difficulty_enabled: true,
+            right_size: true,
+            ..Default::default()
+        }
+    }
+
+    /// Three coding models, one a tier, where the strongest is also the
+    /// cheapest: on cost alone it would win every request.
+    fn ladder() -> Vec<Candidate> {
+        vec![
+            tiered("weak", 0.000_100, &[("coding", 1)]),
+            tiered("middling", 0.000_010, &[("coding", 2)]),
+            tiered("strong", 0.000_001, &[("coding", 3)]),
+        ]
+    }
+
+    fn right_sized(busy: &[(&str, usize)], difficulty: u8) -> route_explain::RouteExplain {
+        let busyness: HashMap<String, usize> =
+            busy.iter().map(|(m, n)| (m.to_string(), *n)).collect();
+        explain_selection(
+            &ladder(),
+            &RequestFeatures::default(),
+            &busyness,
+            &HashMap::new(),
+            None,
+            &["coding".to_string()],
+            BoonGrants::default(),
+            &right_sizing(),
+            0.0,
+            &intent_at(difficulty),
+        )
+    }
+
+    fn rejected_as<'a>(explain: &'a route_explain::RouteExplain, reason: &str) -> Vec<&'a str> {
+        explain
+            .rejected
+            .iter()
+            .filter(|r| r.reason == reason)
+            .flat_map(|r| r.models.iter().map(String::as_str))
+            .collect()
+    }
+
+    #[test]
+    fn without_right_sizing_an_easy_request_can_land_on_the_strongest_model() {
+        let desired = vec!["coding".to_string()];
+        let chosen = select_model(
+            &ladder(),
+            &RequestFeatures::default(),
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            &desired,
+            BoonGrants::default(),
+            &tiering_on(),
+            0.0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            chosen.model_name, "strong",
+            "the floor alone keeps every tier above it in the running"
+        );
+    }
+
+    #[test]
+    fn right_sizing_serves_each_difficulty_from_its_own_tier() {
+        for (difficulty, model) in [(1, "weak"), (2, "middling"), (3, "strong")] {
+            let explain = right_sized(&[], difficulty);
+            assert_self_consistent(&explain);
+            assert_eq!(
+                explain.chosen.as_deref(),
+                Some(model),
+                "difficulty {difficulty}"
+            );
+        }
+        let easy = right_sized(&[], 1);
+        assert_eq!(
+            rejected_as(&easy, "above_needed_tier"),
+            vec!["middling", "strong"]
+        );
+        assert!(rejected_as(&easy, "tier_full").is_empty());
+    }
+
+    #[test]
+    fn a_full_tier_spills_to_the_next_one_up() {
+        // The soft cap is 8 requests in flight for a model with no cap of its own.
+        let explain = right_sized(&[("weak", 8)], 1);
+        assert_self_consistent(&explain);
+        assert_eq!(explain.chosen.as_deref(), Some("middling"));
+        assert_eq!(rejected_as(&explain, "tier_full"), vec!["weak"]);
+        assert_eq!(rejected_as(&explain, "above_needed_tier"), vec!["strong"]);
+    }
+
+    #[test]
+    fn right_sizing_never_spills_below_the_floor() {
+        let explain = right_sized(&[("strong", 8)], 3);
+        assert_self_consistent(&explain);
+        assert_eq!(
+            explain.chosen.as_deref(),
+            Some("strong"),
+            "a hard request waits on the strong model, it does not drop a tier"
+        );
+        assert_eq!(
+            rejected_as(&explain, "below_tier_floor"),
+            vec!["weak", "middling"]
+        );
+    }
+
+    #[test]
+    fn when_every_tier_is_full_all_of_them_compete() {
+        let explain = right_sized(&[("weak", 8), ("middling", 8), ("strong", 8)], 1);
+        assert_self_consistent(&explain);
+        assert!(explain.chosen.is_some());
+        assert!(rejected_as(&explain, "tier_full").is_empty());
+        assert!(rejected_as(&explain, "above_needed_tier").is_empty());
+    }
+
+    #[test]
+    fn right_sizing_needs_the_difficulty_floor_to_be_on() {
+        let settings = crate::AutoRouterSettings {
+            right_size_enabled: true,
+            ..Default::default()
+        };
+        assert!(!RouterWeights::from_settings(&settings).right_size);
+        let settings = crate::AutoRouterSettings {
+            right_size_enabled: true,
+            difficulty_enabled: true,
+            ..Default::default()
+        };
+        assert!(RouterWeights::from_settings(&settings).right_size);
     }
 
     #[test]

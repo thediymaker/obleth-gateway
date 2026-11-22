@@ -32,6 +32,7 @@ function makeExplain(body: SimulateRouteRequest): RouteExplainView {
       tag: body.tag_weight ?? 0.5,
       soft_cap: body.default_soft_cap ?? 8,
       difficulty_enabled: body.difficulty_enabled ?? false,
+      right_size: body.right_size_enabled ?? false,
     },
     temperature: body.temperature ?? 0,
     uniform: body.uniform ?? 0,

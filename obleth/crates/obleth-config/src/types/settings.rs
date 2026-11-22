@@ -335,6 +335,12 @@ pub struct AutoRouterSettings {
     pub temperature: f64,
     /// When false, the difficulty tier filter is skipped entirely.
     pub difficulty_enabled: bool,
+    /// With `difficulty_enabled`, serve each request from the lowest tier that
+    /// meets its difficulty and has room, instead of from any tier at or above
+    /// it: a simple request goes to a light model, a hard one to a strong one,
+    /// and a busy tier spills to the next one up. Off, difficulty is a floor
+    /// only.
+    pub right_size_enabled: bool,
     pub tier_source: TierSource,
     /// When true, a conversation stays on the model that answered its last
     /// turn until there is evidence that model is not doing a good job, and
@@ -361,6 +367,7 @@ impl Default for AutoRouterSettings {
             default_soft_cap: 8,
             temperature: 0.0,
             difficulty_enabled: false,
+            right_size_enabled: false,
             tier_source: TierSource::default(),
             sticky_enabled: false,
             messages_default_model: None,

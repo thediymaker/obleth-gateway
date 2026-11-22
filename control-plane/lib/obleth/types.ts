@@ -1724,6 +1724,8 @@ export interface AutoRouterSettingsView {
   default_soft_cap: number;
   temperature: number;
   difficulty_enabled: boolean;
+  /** Serve each request from the lowest tier that meets it; needs difficulty_enabled. */
+  right_size_enabled: boolean;
   tier_source: "hybrid" | "derived" | "declared";
   sticky_enabled: boolean;
   messages_default_model: string | null;
@@ -1740,6 +1742,7 @@ export interface UpdateAutoRouterSettings {
   default_soft_cap?: number;
   temperature?: number;
   difficulty_enabled?: boolean;
+  right_size_enabled?: boolean;
   tier_source?: "hybrid" | "derived" | "declared";
   sticky_enabled?: boolean;
   messages_default_model?: string | null;
@@ -1851,6 +1854,8 @@ export interface RouteWeightsView {
   tag: number;
   soft_cap: number;
   difficulty_enabled: boolean;
+  /** Requests go to the lowest tier that meets them. Absent on decisions recorded before the setting existed. */
+  right_size?: boolean;
 }
 
 /// One `auto` routing decision, explained. The same shape is returned by
@@ -1898,6 +1903,7 @@ export interface SimulateRouteRequest {
   default_soft_cap?: number;
   temperature?: number;
   difficulty_enabled?: boolean;
+  right_size_enabled?: boolean;
   /** Omit to score against the live fleet load, as the gateway itself does. */
   busyness?: Record<string, number>;
   /**

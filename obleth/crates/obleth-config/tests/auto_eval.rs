@@ -1,7 +1,7 @@
 //! A scorecard for `auto`: does it read a request for what it is, and does it
 //! then send it to a model of the right size?
 //!
-//! `tests/data/auto_prompts.json` holds prompts a person has labelled with the
+//! `tests/data/auto_prompts*.json` hold prompts a person has labelled with the
 //! tier of model that should answer (1 light, 2 mid, 3 strong: the least
 //! capable model that would answer well) and the router's topics they are
 //! about. Each prompt is put through the same two steps a request takes, the
@@ -13,7 +13,10 @@
 //!   a long system text and tool definitions.
 //!
 //! and against two fleets: one with tiers declared and no prices, as a fleet
-//! of self-hosted models has, and the same fleet with prices.
+//! of self-hosted models has, and the same fleet with prices. The pick is made
+//! both ways the router can make it: with difficulty as a floor only, and
+//! right-sized (`right_size_enabled`), where a request goes to the lowest tier
+//! that meets it.
 //!
 //! The pick is sampled, so each prompt is routed many times over evenly spaced
 //! draws and scored by the share of them that went to each size of model.
@@ -31,8 +34,12 @@
 //! cargo test -p obleth-config --test auto_eval -- --nocapture
 //! ```
 //!
-//! [`BAR`] is what the router must not fall below. It starts at what the
-//! router scored when this was written and is raised as the router improves.
+//! There are two sets of prompts ([`SETS`]): the one the reading's rules
+//! were written against, and a held-out one written by someone who had not
+//! seen the rules. The second is the honest score: rules that look for
+//! particular words and shapes do far better on the prompts they were shaped
+//! on than on new ones. Each set has a bar the router must not fall below,
+//! set a little under what it scored and raised as the router improves.
 
 use obleth_config::routing::{
     derive_levels, heuristic_intent, route, BoonGrants, Candidate, RequestFeatures, RouterWeights,
@@ -68,8 +75,8 @@ const DRAWS: usize = 200;
 /// request, in estimated tokens.
 const CHAT_OVERHEAD_TOKENS: u64 = 5_700;
 
-fn cases() -> Vec<Case> {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/auto_prompts.json");
+fn cases(file: &str) -> Vec<Case> {
+    let path = format!("{}/tests/data/{file}", env!("CARGO_MANIFEST_DIR"));
     let text = std::fs::read_to_string(path).expect("the labelled prompts");
     let set: Set = serde_json::from_str(&text).expect("the labelled prompts parse");
     for case in &set.cases {
@@ -149,10 +156,11 @@ fn fleet(name: &'static str, priced: bool) -> Fleet {
 
 /// The router as an operator who uses tiers sets it: the shipped weights, with
 /// the difficulty floor on and a little sampling to spread load.
-fn weights() -> RouterWeights {
+fn weights(right_size: bool) -> RouterWeights {
     RouterWeights {
         temperature: 0.2,
         difficulty_enabled: true,
+        right_size,
         ..RouterWeights::default()
     }
 }
@@ -206,11 +214,11 @@ struct Outcome {
     models: usize,
 }
 
-fn run(case: &Case, envelope: Envelope, fleet: &Fleet) -> Outcome {
+fn run(case: &Case, envelope: Envelope, fleet: &Fleet, right_size: bool) -> Outcome {
     let (body, tokens) = request(case, envelope);
     let intent = heuristic_intent(&body, tokens);
     let features = RequestFeatures::from_request(&body, tokens, 0);
-    let weights = weights();
+    let weights = weights(right_size);
     let mut served = [0usize; 3];
     let mut seen: Vec<String> = Vec::new();
     for draw in 0..DRAWS {
@@ -265,7 +273,24 @@ struct Score {
     models_per_prompt: f64,
 }
 
-fn score(cases: &[Case], envelope: Envelope, fleet: &Fleet, detail: bool) -> Score {
+/// The start of the message being routed, on one line.
+fn shown(case: &Case) -> String {
+    case.turns
+        .last()
+        .unwrap()
+        .chars()
+        .take(110)
+        .collect::<String>()
+        .replace('\n', " ")
+}
+
+fn score(
+    cases: &[Case],
+    envelope: Envelope,
+    fleet: &Fleet,
+    right_size: bool,
+    detail: bool,
+) -> Score {
     let n = cases.len() as f64;
     let mut s = Score::default();
     let (mut found, mut labelled, mut both) = (0.0, 0.0, 0.0);
@@ -275,8 +300,9 @@ fn score(cases: &[Case], envelope: Envelope, fleet: &Fleet, detail: bool) -> Sco
     // The reading against the label: rows are the label, columns the reading.
     let mut confusion = [[0usize; 3]; 3];
     let mut worst: Vec<(f64, String)> = Vec::new();
+    let mut off_topic: Vec<String> = Vec::new();
     for case in cases {
-        let out = run(case, envelope, fleet);
+        let out = run(case, envelope, fleet, right_size);
         let tier = case.tier as usize;
         let read = out.difficulty.clamp(1, 3) as usize;
         confusion[tier - 1][read - 1] += 1;
@@ -289,6 +315,22 @@ fn score(cases: &[Case], envelope: Envelope, fleet: &Fleet, detail: bool) -> Sco
             labelled += f64::from(has);
             found += f64::from(got);
             both += f64::from(has && got);
+        }
+        let mut read_topics: Vec<&str> = TOPICS
+            .into_iter()
+            .filter(|t| out.tags.iter().any(|tag| tag == t))
+            .collect();
+        let mut labelled_topics: Vec<&str> = case.topics.iter().map(String::as_str).collect();
+        read_topics.sort_unstable();
+        labelled_topics.sort_unstable();
+        if read_topics != labelled_topics {
+            off_topic.push(format!(
+                "{:<16} labelled {:<12} read {:<12} {}",
+                case.id,
+                format!("{labelled_topics:?}"),
+                format!("{read_topics:?}"),
+                shown(case),
+            ));
         }
         let right = out.served[tier - 1];
         let under: f64 = out.served[..tier - 1].iter().sum();
@@ -323,7 +365,7 @@ fn score(cases: &[Case], envelope: Envelope, fleet: &Fleet, detail: bool) -> Sco
                 out.served[0] * 100.0,
                 out.served[1] * 100.0,
                 out.served[2] * 100.0,
-                case.turns.last().unwrap().chars().take(48).collect::<String>().replace('\n', " "),
+                shown(case),
             ),
         ));
     }
@@ -339,10 +381,21 @@ fn score(cases: &[Case], envelope: Envelope, fleet: &Fleet, detail: bool) -> Sco
     s.weak_on_hard /= f64::max(hard, 1.0);
     s.models_per_prompt /= n;
     if detail {
-        println!("\n== {} envelope, fleet {} ==", envelope.name(), fleet.name);
+        println!(
+            "\n== {} envelope, fleet {}, {} ==",
+            envelope.name(),
+            fleet.name,
+            picking(right_size)
+        );
         println!("reading (rows: labelled tier; columns: read as 1, 2, 3)");
         for (i, row) in confusion.iter().enumerate() {
-            println!("  tier {}: {:>4} {:>4} {:>4}", i + 1, row[0], row[1], row[2]);
+            println!(
+                "  tier {}: {:>4} {:>4} {:>4}",
+                i + 1,
+                row[0],
+                row[1],
+                row[2]
+            );
         }
         println!("by kind            n  read right  right-sized  under  over");
         for (kind, row) in &kinds {
@@ -357,17 +410,22 @@ fn score(cases: &[Case], envelope: Envelope, fleet: &Fleet, detail: bool) -> Sco
             );
         }
         worst.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-        println!("furthest from the label:");
-        for (_, line) in worst.iter().take(12) {
+        println!("served by the wrong size of model, worst first:");
+        for (_, line) in worst.iter().filter(|(cost, _)| *cost > 0.0) {
+            println!("  {line}");
+        }
+        println!("topics read differently from the label:");
+        for line in &off_topic {
             println!("  {line}");
         }
     }
     s
 }
 
-/// What the router must not fall below, for a chat client on a fleet with
-/// tiers and no prices: the case this scorecard was written for. Raise these
-/// as the router improves; never lower one without saying why here.
+/// What the router must not fall below on one set of prompts, for a chat
+/// client on a fleet with tiers and no prices, picking the smallest sufficient
+/// tier: the case this scorecard was written for. Raise these as the router
+/// improves; never lower one without saying why here.
 struct Bar {
     read_right: f64,
     right_sized: f64,
@@ -376,56 +434,144 @@ struct Bar {
     weak_on_hard: f64,
 }
 
-/// As the router scored when the scorecard was written (shares, rounded so
-/// that only a real change trips them).
-const BAR: Bar = Bar {
-    read_right: 0.0,
-    right_sized: 0.0,
-    under_served: 1.0,
-    strong_on_simple: 1.0,
-    weak_on_hard: 1.0,
-};
+/// A set of labelled prompts and the bar the router is held to on it.
+struct PromptSet {
+    name: &'static str,
+    file: &'static str,
+    bar: Bar,
+}
+
+/// The two sets. The rules that read a request were written against the
+/// first, so its score flatters them; the second was written by someone who
+/// had not seen the rules and is never used to tune them, so it is the one to
+/// believe. A prompt the router gets wrong in the held-out set is fixed by a
+/// better rule, not by a rule for that prompt, and new prompts go in the
+/// first set.
+///
+/// Each bar is a little under what the router scored when it was set, so that
+/// only a real change trips it.
+const SETS: [PromptSet; 2] = [
+    // Scored 94% read right, 94% right-sized, 2% under-served, none of the
+    // simple on a strong model, 8% of the hard on a weaker one.
+    PromptSet {
+        name: "tuned on",
+        file: "auto_prompts.json",
+        bar: Bar {
+            read_right: 0.92,
+            right_sized: 0.92,
+            under_served: 0.04,
+            strong_on_simple: 0.01,
+            weak_on_hard: 0.10,
+        },
+    },
+    // Scored 68% read right, 68% right-sized, 15% under-served, none of the
+    // simple on a strong model, 45% of the hard on a weaker one. On the same
+    // prompts the router before this reading scored 40%, 37%, 23%, 22% and
+    // 74%.
+    PromptSet {
+        name: "held out",
+        file: "auto_prompts_held_out.json",
+        bar: Bar {
+            read_right: 0.66,
+            right_sized: 0.66,
+            under_served: 0.17,
+            strong_on_simple: 0.01,
+            weak_on_hard: 0.47,
+        },
+    },
+];
+
+/// How the pick is made: any tier at or above the request's (a floor), or
+/// the lowest tier that meets it (right-sized).
+fn picking(right_size: bool) -> &'static str {
+    if right_size {
+        "right-sized"
+    } else {
+        "floor only"
+    }
+}
 
 #[test]
 fn auto_reads_requests_and_sizes_models_no_worse_than_the_bar() {
-    let cases = cases();
-    let fleets = [fleet("tiers, no prices", false), fleet("tiers and prices", true)];
-    println!("{} labelled prompts, {DRAWS} draws each", cases.len());
-    let mut table = Vec::new();
-    for fleet in &fleets {
-        for envelope in [Envelope::Bare, Envelope::Chat] {
-            // The full detail for the case the bar is set on; the rest in the table.
-            let detail = envelope == Envelope::Chat && fleet.name == fleets[0].name;
-            table.push((envelope, fleet.name, score(&cases, envelope, fleet, detail)));
+    let fleets = [
+        fleet("tiers, no prices", false),
+        fleet("tiers and prices", true),
+    ];
+    let mut failures = Vec::new();
+    for set in &SETS {
+        let cases = cases(set.file);
+        println!(
+            "\n#### {}: {} labelled prompts, {DRAWS} draws each",
+            set.name,
+            cases.len()
+        );
+        let mut table = Vec::new();
+        for fleet in &fleets {
+            for (envelope, right_size) in [
+                (Envelope::Bare, false),
+                (Envelope::Chat, false),
+                (Envelope::Chat, true),
+            ] {
+                // The full detail for the case the bar is set on; the rest in the table.
+                let detail = right_size && fleet.name == fleets[0].name;
+                let scored = score(&cases, envelope, fleet, right_size, detail);
+                table.push((envelope, fleet.name, right_size, scored));
+            }
+        }
+        println!("\n== summary, {} ==", set.name);
+        println!("envelope  fleet              picking      read right  low  high | topics found  true | right-sized  under  over | strong on simple  weak on hard | models per prompt");
+        for (envelope, fleet, right_size, s) in &table {
+            println!(
+                "{:<8}  {:<17}  {:<11}  {:>9.0}%  {:>2.0}%  {:>3.0}% | {:>11.0}%  {:>3.0}% | {:>10.0}%  {:>4.0}%  {:>3.0}% | {:>15.0}%  {:>11.0}% | {:>6.1}",
+                envelope.name(),
+                fleet,
+                picking(*right_size),
+                s.read_right * 100.0,
+                s.read_low * 100.0,
+                s.read_high * 100.0,
+                s.topic_recall * 100.0,
+                s.topic_precision * 100.0,
+                s.right_sized * 100.0,
+                s.under_served * 100.0,
+                s.over_served * 100.0,
+                s.strong_on_simple * 100.0,
+                s.weak_on_hard * 100.0,
+                s.models_per_prompt,
+            );
+        }
+        let (_, _, _, chat) = table
+            .iter()
+            .find(|(envelope, fleet, right_size, _)| {
+                *envelope == Envelope::Chat && *fleet == fleets[0].name && *right_size
+            })
+            .unwrap();
+        let bar = &set.bar;
+        for (held, what) in [
+            (
+                chat.read_right >= bar.read_right,
+                "difficulty is read right less often",
+            ),
+            (
+                chat.right_sized >= bar.right_sized,
+                "fewer requests reach a model of their size",
+            ),
+            (
+                chat.under_served <= bar.under_served,
+                "more requests reach too weak a model",
+            ),
+            (
+                chat.strong_on_simple <= bar.strong_on_simple,
+                "more simple requests reach a strong model",
+            ),
+            (
+                chat.weak_on_hard <= bar.weak_on_hard,
+                "more hard requests reach a weaker model",
+            ),
+        ] {
+            if !held {
+                failures.push(format!("{}: {what}: {chat:?}", set.name));
+            }
         }
     }
-    println!("\n== summary ==");
-    println!("envelope  fleet              read right  low  high | topics found  true | right-sized  under  over | strong on simple  weak on hard | models per prompt");
-    for (envelope, fleet, s) in &table {
-        println!(
-            "{:<8}  {:<17}  {:>9.0}%  {:>2.0}%  {:>3.0}% | {:>11.0}%  {:>3.0}% | {:>10.0}%  {:>4.0}%  {:>3.0}% | {:>15.0}%  {:>11.0}% | {:>6.1}",
-            envelope.name(),
-            fleet,
-            s.read_right * 100.0,
-            s.read_low * 100.0,
-            s.read_high * 100.0,
-            s.topic_recall * 100.0,
-            s.topic_precision * 100.0,
-            s.right_sized * 100.0,
-            s.under_served * 100.0,
-            s.over_served * 100.0,
-            s.strong_on_simple * 100.0,
-            s.weak_on_hard * 100.0,
-            s.models_per_prompt,
-        );
-    }
-    let (_, _, chat) = table
-        .iter()
-        .find(|(envelope, fleet, _)| *envelope == Envelope::Chat && *fleet == fleets[0].name)
-        .unwrap();
-    assert!(chat.read_right >= BAR.read_right, "difficulty is read right less often: {chat:?}");
-    assert!(chat.right_sized >= BAR.right_sized, "fewer requests reach a model of their size: {chat:?}");
-    assert!(chat.under_served <= BAR.under_served, "more requests reach too weak a model: {chat:?}");
-    assert!(chat.strong_on_simple <= BAR.strong_on_simple, "more simple requests reach a strong model: {chat:?}");
-    assert!(chat.weak_on_hard <= BAR.weak_on_hard, "more hard requests reach a weaker model: {chat:?}");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

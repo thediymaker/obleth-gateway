@@ -6,7 +6,7 @@ export const alerts = (over: Partial<AlertSettingsView> = {}): AlertSettingsView
 
 export const router = (over: Partial<AutoRouterSettingsView> = {}): AutoRouterSettingsView => ({
   classifier_enabled: true, classifier_model: "router-classifier-v2", classifier_timeout_ms: 2500, available_tags: ["coding", "math"],
-  capacity_weight: 0.6, cost_weight: 0.4, tag_weight: 0.5, default_soft_cap: 8, temperature: 0, difficulty_enabled: true, tier_source: "hybrid", sticky_enabled: false,
+  capacity_weight: 0.6, cost_weight: 0.4, tag_weight: 0.5, default_soft_cap: 8, temperature: 0, difficulty_enabled: true, right_size_enabled: false, tier_source: "hybrid", sticky_enabled: false,
   messages_default_model: "glm-5-3-flash", verdicts_default_model: null, ...over,
 }) as AutoRouterSettingsView;
 
