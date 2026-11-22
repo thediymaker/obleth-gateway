@@ -42,7 +42,8 @@
 //! set a little under what it scored and raised as the router improves.
 
 use obleth_config::routing::{
-    derive_levels, heuristic_intent, route, BoonGrants, Candidate, RequestFeatures, RouterWeights,
+    derive_levels, heuristic_intent, is_small_talk, route, BoonGrants, Candidate, RequestFeatures,
+    RouterWeights,
 };
 use obleth_config::{ResolvedModel, TierSource};
 use serde::Deserialize;
@@ -488,6 +489,24 @@ fn picking(right_size: bool) -> &'static str {
         "right-sized"
     } else {
         "floor only"
+    }
+}
+
+/// The classifier is not asked about small talk, so a prompt that needs more
+/// than a light model must never be taken for it.
+#[test]
+fn nothing_that_needs_more_than_a_light_model_is_taken_for_small_talk() {
+    for set in SETS {
+        for case in cases(set.file) {
+            let (body, _) = request(&case, Envelope::Chat);
+            assert!(
+                case.tier == 1 || !is_small_talk(&body),
+                "{} ({}) is labelled tier {} and was taken for small talk",
+                case.id,
+                set.name,
+                case.tier
+            );
+        }
     }
 }
 

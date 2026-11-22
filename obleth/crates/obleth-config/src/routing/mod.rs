@@ -1189,6 +1189,22 @@ pub fn difficulty_from_header(raw: Option<&str>) -> Option<u8> {
     }
 }
 
+/// Whether the newest thing the person said is small talk: a greeting, a
+/// thanks, an acknowledgement. There is nothing to ask a classifier about
+/// such a message, so [`classifier_prompts`] has none for it, and the message
+/// does not take the topic or the difficulty of the turn before it, as a
+/// follow-up with no topic of its own otherwise would.
+pub fn is_small_talk(json: &serde_json::Value) -> bool {
+    messages(json)
+        .iter()
+        .rev()
+        .find(|m| role(m) == "user")
+        .is_some_and(|m| {
+            let text = message_text(m.get("content")).to_ascii_lowercase();
+            !has_image_part(m) && reading::is_pleasantry(text.trim())
+        })
+}
+
 /// Cheap, dependency-free intent derived from the request body: which topics
 /// it touches, and how hard it looks. Used as a fallback when the classifier
 /// is disabled, unconfigured, or unavailable so `auto` routing still gets a
@@ -1587,7 +1603,8 @@ pub const CLASSIFIER_LOOKBACK_TURNS: usize = 3;
 const GENERAL_TAG: &str = "general";
 
 /// The classifier prompts for a chat body: one per user turn, newest first,
-/// at most [`CLASSIFIER_LOOKBACK_TURNS`].
+/// at most [`CLASSIFIER_LOOKBACK_TURNS`]. None when the newest thing the
+/// person said is small talk ([`is_small_talk`]): the heuristics read it.
 ///
 /// Each prompt is the leading system text plus a single user message, so a
 /// conversation that opens with "hello" and moves on to code is classified as
@@ -1607,7 +1624,9 @@ const GENERAL_TAG: &str = "general";
 /// instructions do not decide the topic; `Some(0)` reads no system text.
 pub fn classifier_prompts(json: &serde_json::Value, system_tail: Option<usize>) -> Vec<String> {
     let messages = messages(json);
-    if messages.is_empty() {
+    // Small talk is read by rule: asking about it costs a call, and the answer
+    // for a message with no topic would be the turn before it.
+    if messages.is_empty() || is_small_talk(json) {
         return Vec::new();
     }
 
@@ -2229,6 +2248,38 @@ mod tests {
         )
         .unwrap();
         assert_eq!(chosen.model_name, "cheap");
+    }
+
+    #[test]
+    fn small_talk_is_the_newest_message_alone() {
+        let chat = |turns: &[(&str, &str)]| {
+            let messages: Vec<serde_json::Value> = turns
+                .iter()
+                .map(|(role, content)| serde_json::json!({"role": role, "content": content}))
+                .collect();
+            serde_json::json!({"messages": messages})
+        };
+        assert!(is_small_talk(&chat(&[("user", "Helloo")])));
+        assert!(is_small_talk(&chat(&[
+            ("system", "You write Rust."),
+            ("user", "Why does this deadlock only under load?"),
+            (
+                "assistant",
+                "Because the two locks are taken in opposite orders."
+            ),
+            ("user", "thanks, that makes sense"),
+        ])));
+        // A greeting that opens a conversation is not what the next turn is.
+        assert!(!is_small_talk(&chat(&[
+            ("user", "hi"),
+            ("assistant", "Hello!"),
+            ("user", "Why does this deadlock only under load?"),
+        ])));
+        assert!(!is_small_talk(&chat(&[(
+            "user",
+            "thanks, now make it thread-safe"
+        )])));
+        assert!(!is_small_talk(&chat(&[("system", "hello")])));
     }
 
     #[test]
@@ -3991,9 +4042,20 @@ mod tests {
         // A cut inside a multi-byte character moves forward to its end.
         let body = serde_json::json!({"messages": [
             {"role": "system", "content": "tools ééé"},
-            {"role": "user", "content": "hi"}
+            {"role": "user", "content": "name it"}
         ]});
-        assert_eq!(classifier_prompts(&body, Some(5)), vec!["éé\nhi"]);
+        assert_eq!(classifier_prompts(&body, Some(5)), vec!["éé\nname it"]);
+    }
+
+    #[test]
+    fn classifier_prompts_are_none_for_small_talk() {
+        let body = serde_json::json!({"messages": [
+            {"role": "system", "content": "You help with poems."},
+            {"role": "user", "content": "write a villanelle about the tide"},
+            {"role": "assistant", "content": "Here it is."},
+            {"role": "user", "content": "thank you!"}
+        ]});
+        assert!(classifier_prompts(&body, None).is_empty());
     }
 
     #[test]

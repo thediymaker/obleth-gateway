@@ -189,13 +189,19 @@ async fn call_brain(
     available_tags: &[String],
     timeout: Duration,
 ) -> anyhow::Result<Intent> {
+    let questions = routing_questions(available_tags);
+    let outcomes = ask(http, brain, prompt, questions, timeout).await?;
+    Ok(intent_from_outcomes(&outcomes))
+}
+
+/// What one classification asks: the difficulty score, then a yes/no per tag.
+fn routing_questions(available_tags: &[String]) -> Vec<(String, Question)> {
     let mut questions: Vec<(String, Question)> =
         vec![(DIFFICULTY_ID.to_string(), difficulty_question())];
     for tag in available_tags.iter().take(MAX_TAG_QUESTIONS) {
         questions.push((format!("tag:{tag}"), tag_question(tag)));
     }
-    let outcomes = ask(http, brain, prompt, questions, timeout).await?;
-    Ok(intent_from_outcomes(&outcomes))
+    questions
 }
 
 /// Ask the brain `questions` about `prompt`, one single-token call each,
@@ -313,20 +319,13 @@ fn complaint_from_outcomes(outcomes: &[QuestionOutcome]) -> Option<f64> {
 /// difficulty 1 — so a confused brain makes routing cheaper, never more
 /// expensive.
 fn intent_from_outcomes(outcomes: &[QuestionOutcome]) -> Intent {
-    let mut difficulty = 1u8;
+    let difficulty = difficulty_from_outcomes(outcomes).unwrap_or(1);
     let mut chosen: Vec<(String, f64)> = Vec::new();
     for outcome in outcomes {
         let Ok(success) = &outcome.result else {
             continue;
         };
-        if outcome.id == DIFFICULTY_ID {
-            // Labels as [`difficulty_question`] renders them: A/B/C = 1/2/3.
-            let labels: Vec<String> = ["A", "B", "C"].iter().map(|s| s.to_string()).collect();
-            let (masses, in_set) = answers::label_masses(&success.entries, &labels, false);
-            if let Ok(scored) = answers::score_masses(&masses, in_set) {
-                difficulty = ((scored.argmax as u8) + 1).clamp(1, obleth_config::MAX_TIER_LEVEL);
-            }
-        } else if let Some(tag) = outcome.id.strip_prefix("tag:") {
+        if let Some(tag) = outcome.id.strip_prefix("tag:") {
             let labels: Vec<String> = ["yes", "no"].iter().map(|s| s.to_string()).collect();
             let (masses, in_set) = answers::label_masses(&success.entries, &labels, true);
             if let Ok(scored) = answers::score_masses(&masses, in_set) {
@@ -346,6 +345,18 @@ fn intent_from_outcomes(outcomes: &[QuestionOutcome]) -> Intent {
     }
 }
 
+/// The difficulty question's answer, or `None` when the call failed or the
+/// brain put its first token outside the level labels.
+fn difficulty_from_outcomes(outcomes: &[QuestionOutcome]) -> Option<u8> {
+    let outcome = outcomes.iter().find(|o| o.id == DIFFICULTY_ID)?;
+    let success = outcome.result.as_ref().ok()?;
+    // Labels as [`difficulty_question`] renders them: A/B/C = 1/2/3.
+    let labels: Vec<String> = ["A", "B", "C"].iter().map(|s| s.to_string()).collect();
+    let (masses, in_set) = answers::label_masses(&success.entries, &labels, false);
+    let scored = answers::score_masses(&masses, in_set).ok()?;
+    Some(((scored.argmax as u8) + 1).clamp(1, obleth_config::MAX_TIER_LEVEL))
+}
+
 /// Drop the weaker tag of each [`obleth_config::EXCLUSIVE_TAG_PAIRS`] pair
 /// when both were chosen. `chosen` is sorted strongest first, so the weaker
 /// one is whichever comes later. Runs before the cap, so the slot it frees
@@ -359,6 +370,9 @@ fn drop_exclusive_losers(chosen: &mut Vec<(String, f64)>) {
         }
     }
 }
+
+#[cfg(test)]
+mod eval;
 
 #[cfg(test)]
 mod tests {
@@ -551,7 +565,7 @@ mod tests {
         );
     }
 
-    fn brain(api_base: &str) -> ResolvedModel {
+    pub(super) fn brain(api_base: &str) -> ResolvedModel {
         ResolvedModel {
             description: String::new(),
             model_name: "brain-test".to_string(),

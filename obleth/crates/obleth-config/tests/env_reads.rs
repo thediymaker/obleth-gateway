@@ -7,6 +7,10 @@ use std::path::{Path, PathBuf};
 /// Files that may read the environment themselves, and why.
 const ALLOWED: &[(&str, &str)] = &[
     (
+        "obleth-proxy/src/classifier/eval.rs",
+        "OBLETH_EVAL_*: the brain an opt-in test scores, in tests only",
+    ),
+    (
         "obleth-proxy/src/replicas.rs",
         "HOSTNAME: the pod's own name, the replica identity",
     ),
