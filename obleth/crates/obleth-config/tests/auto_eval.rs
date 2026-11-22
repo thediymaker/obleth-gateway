@@ -40,6 +40,11 @@
 //! particular words and shapes do far better on the prompts they were shaped
 //! on than on new ones. Each set has a bar the router must not fall below,
 //! set a little under what it scored and raised as the router improves.
+//!
+//! This scores the reading the gateway makes without a classifier. With one
+//! set, the classifier reads the request and these rules answer only what it
+//! does not; `classifier::eval` in obleth-proxy scores a classifier model on
+//! the same prompts.
 
 use obleth_config::routing::{
     derive_levels, heuristic_intent, is_small_talk, route, BoonGrants, Candidate, RequestFeatures,
@@ -465,19 +470,20 @@ const SETS: [PromptSet; 2] = [
             weak_on_hard: 0.10,
         },
     },
-    // Scored 68% read right, 68% right-sized, 15% under-served, none of the
-    // simple on a strong model, 45% of the hard on a weaker one. On the same
-    // prompts the router before this reading scored 40%, 37%, 23%, 22% and
-    // 74%.
+    // Scored 71% read right, 71% right-sized, 14% under-served, none of the
+    // simple on a strong model, 41% of the hard on a weaker one. On the first
+    // half of these prompts the router before this reading scored 40%, 37%,
+    // 23%, 22% and 74%. A classifier reads them far better than these rules
+    // do: `classifier::eval` in obleth-proxy scores one on the same prompts.
     PromptSet {
         name: "held out",
         file: "auto_prompts_held_out.json",
         bar: Bar {
-            read_right: 0.66,
-            right_sized: 0.66,
-            under_served: 0.17,
+            read_right: 0.69,
+            right_sized: 0.69,
+            under_served: 0.16,
             strong_on_simple: 0.01,
-            weak_on_hard: 0.47,
+            weak_on_hard: 0.43,
         },
     },
 ];

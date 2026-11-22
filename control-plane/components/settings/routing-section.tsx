@@ -77,7 +77,7 @@ export function RoutingSection({ settings, models, readiness }: { settings: Auto
           </label>
         ))}
       </Setting>
-      <Setting id="set-classifier" label="Classifier" hint="A small model that reads each request and names its kind (coding, math…). Off, routing guesses from the text." fields={["routing.classifier_enabled", "routing.classifier_model", "routing.classifier_timeout_ms"]}>
+      <Setting id="set-classifier" label="Classifier" hint="A fast model that reads each request and says how hard it is and what it is about (coding, math…). Off, routing reads both from the text by rule." fields={["routing.classifier_enabled", "routing.classifier_model", "routing.classifier_timeout_ms"]}>
         <div className="flex flex-wrap items-center gap-2.5">
           <Switch name="routing.classifier_enabled" label="Use a classifier" checked={classifierOn} onChange={setClassifierOn} />
           <div className="w-64"><SelectField name="routing.classifier_model" label="Classifier model" value={classifier} onChange={setClassifier} options={[{ value: "", label: "None" }, ...names.map((n) => ({ value: n, label: n }))]} /></div>

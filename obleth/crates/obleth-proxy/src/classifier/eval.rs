@@ -4,11 +4,15 @@
 //! The prompts are the labelled ones `obleth-config`'s `auto_eval` scores the
 //! heuristics on (`tests/data/auto_prompts*.json`): each says which tier of
 //! model should answer it and which topics it is about. Every prompt goes the
-//! way a request does, through [`classifier_prompts`], [`classify_turns`] and
-//! the same single-token questions, so what is scored is what the gateway
-//! asks. The heuristics read the same prompts beside it, and so does the
-//! order the gateway uses: the classifier's answer, or the heuristics' when it
-//! gives none or is not asked, as for small talk.
+//! way a request does, through [`classifier_prompt`] and the same single-token
+//! questions, so what is scored is what the gateway asks. Three readings are
+//! reported side by side:
+//!
+//! - **the classifier's own**, on the prompts it is asked about and answers;
+//! - **the heuristics'**, on every prompt;
+//! - **the gateway's**: the classifier's answer where it gave one and the
+//!   heuristics' where it did not, as for small talk, which it is not asked
+//!   about.
 //!
 //! It needs a model, so it runs only when asked for:
 //!
@@ -21,22 +25,28 @@
 //!   `api_base` is given;
 //! - `OBLETH_EVAL_MODEL`: the model name that address serves it under;
 //! - `OBLETH_EVAL_KEY`: a bearer key, when the address wants one;
-//! - `OBLETH_EVAL_CONCURRENCY`: prompts in flight at once (default 4). Each is
-//!   ten questions sent together, as in the gateway;
+//! - `OBLETH_EVAL_CONCURRENCY`: prompts in flight at once (default 1, which
+//!   times a classification as a lone request sees it). Each is two questions
+//!   sent together, as in the gateway;
 //! - `OBLETH_EVAL_BAR`: the share of held-out prompts whose difficulty must be
-//!   read right, such as `0.85`. Without it the test only reports.
+//!   read right, such as `0.9`. Without it the test only reports;
+//! - `OBLETH_EVAL_PROMPTS`: a file of your own labelled prompts, in the format
+//!   of the two sets, scored after them.
 //!
 //! Accuracy is measured with a long timeout, apart from speed. The report then
 //! says how long a classification took and what share came back inside the
 //! default `classifier_timeout_ms`, which is what a request would wait.
+//!
+//! Which model reads requests best is not obvious from its size, and the
+//! wording of the questions suits some models better than others: score a
+//! brain before setting it as the classifier.
 
 use super::*;
-use crate::router::{classifier_prompts, classify_turns, heuristic_intent, is_small_talk};
+use crate::router::{classifier_prompt, heuristic_intent, is_small_talk, Intent};
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::time::Instant;
 
 #[derive(Deserialize)]
@@ -65,11 +75,8 @@ const LABELLED_TOPICS: [&str; 3] = ["coding", "math", "writing"];
 /// Long enough that a slow brain still answers: speed is reported apart.
 const PATIENCE: Duration = Duration::from_secs(60);
 
-fn cases(file: &str) -> Vec<Case> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../obleth-config/tests/data")
-        .join(file);
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+fn cases(path: &std::path::Path) -> Vec<Case> {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     serde_json::from_str::<Set>(&text)
         .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
         .cases
@@ -109,19 +116,17 @@ impl From<Intent> for Reading {
 
 /// How a prompt was read each way.
 struct Read {
-    /// The classifier's own answer; `None` when it gave no tags at all, which
-    /// is the shape of a failure.
-    classifier: Option<Reading>,
+    /// What the classifier said; `None` when it was not asked.
+    classified: Option<Classified>,
     heuristics: Reading,
+    /// What the gateway routes on: the two settled.
+    gateway: Reading,
     /// The newest message is small talk, which the gateway reads by rule.
     small_talk: bool,
     /// Questions whose call failed.
-    unanswered: usize,
-    /// Classifications whose difficulty question had no usable answer, which
-    /// the gateway reads as difficulty 1.
-    no_difficulty: usize,
-    /// How long each fan-out took, in milliseconds.
-    took: Vec<f64>,
+    failed: usize,
+    /// How long the classification took, in milliseconds.
+    took: Option<f64>,
 }
 
 #[derive(Default)]
@@ -200,42 +205,34 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
 /// Read one case the way a request is read.
 async fn read(http: &reqwest::Client, brain: &ResolvedModel, tags: &[String], case: &Case) -> Read {
     let (body, tokens) = request(case);
-    let unanswered = Mutex::new(0usize);
-    let no_difficulty = Mutex::new(0usize);
-    let took = Mutex::new(Vec::new());
-    let classified = classify_turns(classifier_prompts(&body, Some(0)), |prompt| {
-        let (unanswered, no_difficulty, took) = (&unanswered, &no_difficulty, &took);
-        async move {
-            let started = Instant::now();
-            let outcomes = ask(http, brain, &prompt, routing_questions(tags), PATIENCE).await;
-            took.lock()
-                .unwrap()
-                .push(started.elapsed().as_secs_f64() * 1000.0);
-            match outcomes {
-                Ok(outcomes) => {
-                    *unanswered.lock().unwrap() +=
-                        outcomes.iter().filter(|o| o.result.is_err()).count();
-                    if difficulty_from_outcomes(&outcomes).is_none() {
-                        *no_difficulty.lock().unwrap() += 1;
-                    }
-                    intent_from_outcomes(&outcomes)
-                }
-                Err(_) => {
-                    *unanswered.lock().unwrap() += tags.len() + 1;
-                    *no_difficulty.lock().unwrap() += 1;
-                    Intent::default()
-                }
+    let heuristics = heuristic_intent(&body, tokens);
+    let (mut classified, mut failed, mut took) = (None, 0, None);
+    if let Some(prompt) = classifier_prompt(&body, Some(0)) {
+        let started = Instant::now();
+        let outcomes = ask(http, brain, &prompt, routing_questions(tags), PATIENCE).await;
+        took = Some(started.elapsed().as_secs_f64() * 1000.0);
+        classified = Some(match outcomes {
+            Ok(outcomes) => {
+                failed = outcomes.iter().filter(|o| o.result.is_err()).count();
+                classified_from_outcomes(&outcomes, tags)
             }
-        }
-    })
-    .await;
+            Err(_) => {
+                failed = routing_questions(tags).len();
+                Classified::default()
+            }
+        });
+    }
     Read {
-        classifier: classified.map(Reading::from),
-        heuristics: heuristic_intent(&body, tokens).into(),
+        gateway: classified
+            .clone()
+            .unwrap_or_default()
+            .settle(heuristics.clone())
+            .into(),
+        classified,
+        heuristics: heuristics.into(),
         small_talk: is_small_talk(&body),
-        unanswered: unanswered.into_inner().unwrap(),
-        no_difficulty: no_difficulty.into_inner().unwrap(),
-        took: took.into_inner().unwrap(),
+        failed,
+        took,
     }
 }
 
@@ -252,7 +249,7 @@ async fn the_classifier_reads_the_labelled_prompts() {
     brain.api_key = var("OBLETH_EVAL_KEY");
     let concurrency: usize = var("OBLETH_EVAL_CONCURRENCY")
         .and_then(|v| v.parse().ok())
-        .unwrap_or(4)
+        .unwrap_or(1)
         .max(1);
     let bar: Option<f64> = var("OBLETH_EVAL_BAR").and_then(|v| v.parse().ok());
     let budget = AutoRouterSettings::default().classifier_timeout_ms as f64;
@@ -264,11 +261,19 @@ async fn the_classifier_reads_the_labelled_prompts() {
 
     println!(
         "\nclassifier scorecard: {model} at {base}, {} questions a prompt",
-        tags.len() + 1
+        routing_questions(&tags).len()
     );
     let mut held_out_right = None;
-    for (name, file) in SETS {
-        let cases = cases(file);
+    let data = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../obleth-config/tests/data");
+    let mut sets: Vec<(&str, PathBuf)> = SETS
+        .iter()
+        .map(|(name, file)| (*name, data.join(file)))
+        .collect();
+    if let Some(own) = var("OBLETH_EVAL_PROMPTS") {
+        sets.push(("your prompts", PathBuf::from(own)));
+    }
+    for (name, path) in sets {
+        let cases = cases(&path);
         let (http, brain, tags) = (&http, &brain, &tags);
         let mut reads: Vec<(usize, Read)> = futures::stream::iter(cases.iter().enumerate())
             .map(|(i, case)| async move { (i, read(http, brain, tags, case).await) })
@@ -279,41 +284,47 @@ async fn the_classifier_reads_the_labelled_prompts() {
 
         let (mut classifier, mut heuristics, mut gateway) =
             (Tally::default(), Tally::default(), Tally::default());
-        let (mut silent, mut unanswered, mut no_difficulty, mut small_talk) =
-            (0usize, 0usize, 0usize, 0usize);
+        let (mut not_asked, mut small_talk, mut no_difficulty, mut no_topic, mut failed) =
+            (0usize, 0usize, 0usize, 0usize, 0usize);
         let mut took: Vec<f64> = Vec::new();
         let mut misses: Vec<String> = Vec::new();
         for (i, read) in &reads {
             let case = &cases[*i];
             heuristics.add(case, &read.heuristics);
-            unanswered += read.unanswered;
-            no_difficulty += read.no_difficulty;
+            gateway.add(case, &read.gateway);
+            failed += read.failed;
             small_talk += read.small_talk as usize;
-            took.extend(&read.took);
-            match &read.classifier {
-                Some(reading) => {
-                    classifier.add(case, reading);
-                    gateway.add(case, reading);
-                    if reading.difficulty != case.tier {
-                        misses.push(format!(
-                            "      {:<24} labelled {}, read {} (heuristics {})  {:?}",
-                            case.id,
-                            case.tier,
-                            reading.difficulty,
-                            read.heuristics.difficulty,
-                            case.turns
-                                .last()
-                                .map(|t| t.chars().take(90).collect::<String>())
-                        ));
-                    }
-                }
-                None => {
-                    silent += 1;
-                    gateway.add(case, &read.heuristics);
-                }
+            took.extend(read.took);
+            let Some(classified) = &read.classified else {
+                not_asked += 1;
+                continue;
+            };
+            no_difficulty += classified.difficulty.is_none() as usize;
+            no_topic += classified.tags.is_none() as usize;
+            if let (Some(difficulty), Some(tags)) = (classified.difficulty, &classified.tags) {
+                classifier.add(
+                    case,
+                    &Reading {
+                        difficulty,
+                        tags: tags.clone(),
+                    },
+                );
+            }
+            if read.gateway.difficulty != case.tier {
+                misses.push(format!(
+                    "      {:<24} labelled {}, read {} (heuristics {})  {:?}",
+                    case.id,
+                    case.tier,
+                    read.gateway.difficulty,
+                    read.heuristics.difficulty,
+                    case.turns
+                        .last()
+                        .map(|t| t.chars().take(90).collect::<String>())
+                        .unwrap_or_default()
+                ));
             }
         }
-        took.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        took.sort_by(|a, b| a.total_cmp(b));
         let inside = took.iter().filter(|ms| **ms <= budget).count();
 
         println!("\n{name}: {} prompts", cases.len());
@@ -321,7 +332,7 @@ async fn the_classifier_reads_the_labelled_prompts() {
         println!("{}", heuristics.line("heuristics"));
         println!("{}", gateway.line("as the gateway reads"));
         println!(
-            "  left to the heuristics: {silent} prompts ({small_talk} of them small talk, not asked about); no difficulty answer on {no_difficulty} classifications; {unanswered} calls failed"
+            "  not asked: {not_asked} ({small_talk} small talk); no difficulty answer: {no_difficulty}; no topic answer: {no_topic}; calls failed: {failed}"
         );
         println!(
             "  a classification took p50 {:.0} ms, p95 {:.0} ms, {:.0}% inside the default {budget:.0} ms",
@@ -330,7 +341,7 @@ async fn the_classifier_reads_the_labelled_prompts() {
             100.0 * Tally::share(inside, took.len()),
         );
         if !misses.is_empty() {
-            println!("    difficulty the classifier read differently from the label:");
+            println!("    difficulty the gateway read differently from the label:");
             for miss in &misses {
                 println!("{miss}");
             }

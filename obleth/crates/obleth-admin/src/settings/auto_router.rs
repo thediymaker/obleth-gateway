@@ -341,9 +341,9 @@ pub struct SimulateRouteRequest {
 ///
 /// Intent comes from `heuristic_intent` plus the optional `effort` override
 /// unless the body sets `classify: true`. Then the live classifier reads the
-/// same per-turn prompts the data plane builds ([`classifier_prompts`]), walks
-/// them the same way ([`classify_turns`]), and is offered the same tags, the
-/// candidates' tags under the tenant's allowlist. `tag_source` and
+/// same prompt the data plane builds ([`classifier_prompt`]), is offered the
+/// same tags, the candidates' tags under the tenant's allowlist, and what it
+/// leaves unanswered is the heuristics', as on the data plane. `tag_source` and
 /// `difficulty_source` say which one ran, so the dashboard never implies a
 /// classification that did not happen.
 ///
@@ -433,7 +433,7 @@ pub(crate) async fn simulate_route(
     features.needs_tool_choice |= body.needs_tool_choice;
     features.needs_response_schema |= body.needs_response_schema;
 
-    let mut intent = None;
+    let mut classified = Classified::default();
     if body.classify {
         if let Some(classify) = state.classify.as_ref() {
             let settings = state
@@ -458,18 +458,16 @@ pub(crate) async fn simulate_route(
                     }
                 }
                 if !menu.is_empty() {
-                    // `None` is the classifier's failure shape; heuristics take
-                    // over below, exactly as on the data plane.
-                    intent =
-                        classify_turns(classifier_prompts(&json, body.classify_system), |prompt| {
-                            classify(prompt, menu.clone())
-                        })
-                        .await;
+                    if let Some(prompt) = classifier_prompt(&json, body.classify_system) {
+                        classified = classify(prompt, menu).await;
+                    }
                 }
             }
         }
     }
-    let mut intent = intent.unwrap_or_else(|| heuristic_intent(&json, est_input_tokens));
+    // No answer is the classifier's failure shape; the heuristics take over,
+    // exactly as on the data plane.
+    let mut intent = classified.settle(heuristic_intent(&json, est_input_tokens));
     if let Some(difficulty) = difficulty_from_header(body.effort.as_deref()) {
         intent.difficulty = difficulty;
         intent.source = IntentSource::Header;

@@ -69,8 +69,8 @@ use axum::{Json, Router};
 use obleth_config::network::{NamedNetwork, NetworkNames};
 use obleth_config::routing::route_explain::RouteExplain;
 use obleth_config::routing::{
-    classifier_prompts, classify_turns, difficulty_from_header, explain_selection,
-    heuristic_intent, BoonGrants, IntentSource, RequestFeatures, RouterWeights,
+    classifier_prompt, difficulty_from_header, explain_selection, heuristic_intent, BoonGrants,
+    Classified, IntentSource, RequestFeatures, RouterWeights,
 };
 use obleth_config::{
     hash_api_key, ApiKey, DeploymentLaunch, FairshareGroup, ManagedModelSpec, McpServer,
@@ -250,15 +250,15 @@ impl AdminState {
 }
 
 /// A boxed call into the data plane's classifier: `(prompt, available_tags)`
-/// to the derived [`obleth_config::routing::Intent`]. Timeout, caching and
-/// every failure-lowers-difficulty guarantee live behind the closure, in the
-/// classifier itself.
+/// to what it said ([`obleth_config::routing::Classified`]). Timeout and
+/// caching live behind the closure, in the classifier itself; an unanswered
+/// question comes back as no answer, for the heuristics to settle.
 pub type ClassifyFn = std::sync::Arc<
     dyn Fn(
             String,
             Vec<String>,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = obleth_config::routing::Intent> + Send>,
+            Box<dyn std::future::Future<Output = obleth_config::routing::Classified> + Send>,
         > + Send
         + Sync,
 >;

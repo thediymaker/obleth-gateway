@@ -1,24 +1,34 @@
-//! Tiny-model intent classifier for `auto` routing.
+//! The intent classifier for `auto` routing.
 //!
-//! When enabled and configured, an `auto` request is first shown to a small,
-//! fast model (the "brain", e.g. a sub-1B model) whose only job is to map the
-//! prompt to one or more routing tags from the fixed vocabulary. Those tags
-//! bias [`crate::router::select_model`] toward the best-matched model.
+//! When enabled and configured, an `auto` request is first shown to a fast
+//! model (the "brain") whose only job is to say how hard the request is and
+//! what it is about. Those answers pick the tier of model and bias
+//! [`crate::router::select_model`] toward the best-matched one.
 //!
-//! The brain is asked verdict-style (see [`crate::verdicts`]): one greedy
-//! single-token call per routing tag (a yes/no) plus one for difficulty (a
-//! 3-level score), fanned out concurrently over a byte-identical prompt
-//! prefix, with the answer read off the first token's `top_logprobs`. This
-//! replaced a free-text "reply with a JSON object" call: it cannot come back
-//! unparseable, costs one output token per question instead of ~48 total,
-//! and yields real probabilities, so tag selection is a threshold instead of
-//! a substring match.
+//! The brain is asked verdict-style (see [`crate::verdicts`]), two questions
+//! sent together over a byte-identical prompt prefix, each a greedy
+//! single-token call whose answer is read off the first token's
+//! `top_logprobs`:
+//!
+//! - **difficulty**, a score over three levels that spell out what a light, a
+//!   mid and a strong model are for;
+//! - **topic**, one choice among the routing tags that name a subject, with
+//!   `general` for none of them.
+//!
+//! An earlier design asked one yes/no per routing tag, ten calls a request.
+//! Asked cold, models say yes to most tags or to none, and ten calls took
+//! longer than the timeout allows; one choice names the topic more reliably
+//! and the two calls come back in about the time of one. What the levels say
+//! matters as much as which model reads them: the same models read difficulty
+//! right far more often with the levels spelled out than with "simple",
+//! "moderate" and "hard". `classifier::eval` scores a brain on labelled
+//! prompts; run it before changing a word here.
 //!
 //! The classifier is deliberately defensive: it is hard-timeout bounded, caches
-//! results, and returns an empty tag list (difficulty 1) on any error so an
-//! `auto` request is never blocked or failed, and never routed more expensive,
-//! because the brain is slow or down. Callers fall back to cheap heuristics
-//! (see [`crate::router::heuristic_intent`]) in that case.
+//! results, and returns no answer on any error, so an `auto` request is never
+//! blocked or failed because the brain is slow or down. Callers settle what it
+//! returns against the heuristics ([`Classified::settle`]), which answer
+//! whatever the brain did not.
 
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -28,7 +38,7 @@ use arc_swap::ArcSwap;
 use moka::future::Cache;
 use obleth_config::{AutoRouterSettings, ResolvedModel};
 
-use crate::router::Intent;
+use crate::router::Classified;
 use crate::verdicts::prompt::{self as vprompt, LabelSemantics};
 use crate::verdicts::types::Question;
 use crate::verdicts::{answers, fan_out, QuestionCall, QuestionOutcome, SharedPrompt};
@@ -37,8 +47,10 @@ use crate::verdicts::{answers, fan_out, QuestionCall, QuestionOutcome, SharedPro
 #[derive(Clone)]
 pub struct Classifier {
     settings: Arc<ArcSwap<AutoRouterSettings>>,
-    /// hash(brain + prompt + available tags) -> classified intent.
-    cache: Cache<u64, Intent>,
+    /// hash(brain + prompt + available tags) -> what the brain said.
+    cache: Cache<u64, Classified>,
+    /// hash(brain + prompt + categories) -> the categories that apply.
+    categories: Cache<u64, Vec<String>>,
     /// hash(brain + message) -> p(the message says the last answer was wrong).
     complaints: Cache<u64, Option<f64>>,
 }
@@ -48,6 +60,10 @@ impl Classifier {
         Self {
             settings: Arc::new(ArcSwap::from_pointee(initial)),
             cache: Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(Duration::from_secs(300))
+                .build(),
+            categories: Cache::builder()
                 .max_capacity(10_000)
                 .time_to_live(Duration::from_secs(300))
                 .build(),
@@ -68,54 +84,90 @@ impl Classifier {
         self.settings.store(Arc::new(settings));
     }
 
-    /// Classify `prompt` into a subset of `available_tags` (plus a difficulty)
-    /// using `brain`.
+    /// Ask `brain` how hard `prompt` is and which of `available_tags` it is
+    /// about.
     ///
-    /// Returns `Intent::default()` (empty tags, difficulty 1) on timeout,
-    /// transport error, or unparseable output; callers should treat empty tags
-    /// as "no signal" and fall back to heuristics. Every failure path lowers
-    /// difficulty rather than raising it.
+    /// Returns no answer (`Classified::default()`) on timeout or transport
+    /// error, and no answer for a question whose reply was not one of its
+    /// labels; callers settle the rest from the heuristics.
     pub async fn classify(
         &self,
         http: &reqwest::Client,
         brain: &ResolvedModel,
         prompt: &str,
         available_tags: &[String],
-    ) -> Intent {
-        if available_tags.is_empty() {
-            return Intent::default();
-        }
-
+    ) -> Classified {
         let key = cache_key(&brain.model_name, prompt, available_tags);
         if let Some(hit) = self.cache.get(&key).await {
             return hit;
         }
 
         let timeout = Duration::from_millis(self.settings().classifier_timeout_ms.max(1));
-        let intent = match tokio::time::timeout(
+        let classified = match tokio::time::timeout(
             timeout,
             call_brain(http, brain, prompt, available_tags, timeout),
         )
         .await
         {
-            Ok(Ok(intent)) => intent,
+            Ok(Ok(classified)) => classified,
             Ok(Err(e)) => {
                 tracing::debug!(error = %e, model = %brain.model_name, "classifier call failed");
-                Intent::default()
+                Classified::default()
             }
             Err(_) => {
                 tracing::debug!(model = %brain.model_name, "classifier call timed out");
-                Intent::default()
+                Classified::default()
             }
         };
 
-        // Cache even empty/default results briefly to avoid hammering a flaky brain.
-        self.cache.insert(key, intent.clone()).await;
-        intent
+        // Cache even an empty result briefly to avoid hammering a flaky brain.
+        self.cache.insert(key, classified.clone()).await;
+        classified
     }
 }
 
 impl Classifier {
+    /// Which of `categories` describe `prompt`, strongest first, at most
+    /// three: one yes/no question per category, for a caller with its own
+    /// vocabulary (the speculation boon's category gates). Empty on timeout,
+    /// transport error, or when the brain says yes to none.
+    pub async fn categories(
+        &self,
+        http: &reqwest::Client,
+        brain: &ResolvedModel,
+        prompt: &str,
+        categories: &[String],
+    ) -> Vec<String> {
+        if categories.is_empty() {
+            return Vec::new();
+        }
+        let key = cache_key(&brain.model_name, prompt, categories);
+        if let Some(hit) = self.categories.get(&key).await {
+            return hit;
+        }
+        let timeout = Duration::from_millis(self.settings().classifier_timeout_ms.max(1));
+        let questions: Vec<(String, Question)> = categories
+            .iter()
+            .take(MAX_CATEGORY_QUESTIONS)
+            .map(|c| (format!("tag:{c}"), category_question(c)))
+            .collect();
+        let chosen =
+            match tokio::time::timeout(timeout, ask(http, brain, prompt, questions, timeout)).await
+            {
+                Ok(Ok(outcomes)) => categories_from_outcomes(&outcomes),
+                Ok(Err(e)) => {
+                    tracing::debug!(error = %e, model = %brain.model_name, "category call failed");
+                    Vec::new()
+                }
+                Err(_) => {
+                    tracing::debug!(model = %brain.model_name, "category call timed out");
+                    Vec::new()
+                }
+            };
+        self.categories.insert(key, chosen.clone()).await;
+        chosen
+    }
+
     /// p(yes) that `message` says the previous answer was wrong, did not
     /// work, or missed what was asked; `None` when the brain gave no usable
     /// answer. Bounded by the same timeout as [`Classifier::classify`].
@@ -162,46 +214,101 @@ fn cache_key(brain: &str, prompt: &str, available_tags: &[String]) -> u64 {
     hasher.finish()
 }
 
-/// Cap on tag questions per classification. Each tag is one single-token
-/// call; a vocabulary larger than this stops being a routing signal, so the
-/// extra tags are simply not asked about (they can still arrive via
-/// heuristics).
-const MAX_TAG_QUESTIONS: usize = 16;
+/// Cap on category questions per call. Each category is one single-token
+/// call; the ones past the cap are not asked about.
+const MAX_CATEGORY_QUESTIONS: usize = 16;
 
-/// Above this renormalized p(yes) a tag question counts as "the tag applies".
-const TAG_THRESHOLD: f64 = 0.5;
+/// Above this renormalized p(yes) a category question counts as "it applies".
+const CATEGORY_THRESHOLD: f64 = 0.5;
 
-/// The fixed question id for the difficulty score; tag questions use
-/// `tag:<name>`.
+/// The fixed question id for the difficulty score.
 const DIFFICULTY_ID: &str = "difficulty";
+
+/// The fixed question id for the topic choice.
+const TOPIC_ID: &str = "topic";
 
 /// The question id for "does the user say the last answer was wrong".
 const COMPLAINT_ID: &str = "complaint";
 
-/// Ask the brain one single-token verdict question per available tag plus one
-/// for difficulty, concurrently, and assemble the [`Intent`] from the
-/// first-token label distributions. Thinking and harmony-format brains are
-/// carried by the same learned retries as `/v1/verdicts` ([`fan_out`]).
+/// The share of the answer that must be on "strong" for a request to be read
+/// as hard. Below an even three-way split on purpose: a hard request sent to a
+/// weaker model costs the person the answer, an ordinary one sent to a
+/// stronger model costs the fleet a little.
+const HARD_THRESHOLD: f64 = 0.3;
+
+/// A second topic is named beside the first when it holds at least this share
+/// of the answer: a request that is about two things evenly.
+const SECOND_TOPIC_THRESHOLD: f64 = 0.3;
+
+/// The routing tags that name what a request is about, and how each is put to
+/// the brain. `general` is the answer for none of the others. The remaining
+/// tags are not asked about: `vision` and `long-context` show in the request
+/// itself, and `fast` describes a model, not a request.
+const TOPICS: [(&str, &str); 6] = [
+    (
+        "coding",
+        "code, scripts, queries, commands or configuration to write, read, fix or run",
+    ),
+    (
+        "creative",
+        "fiction, verse, jokes, role-play or other imaginative writing",
+    ),
+    (
+        GENERAL_TOPIC,
+        "none of the others: conversation, a question of fact, advice, an explanation",
+    ),
+    (
+        "math",
+        "a calculation, an equation, a proof, statistics or a word problem with quantities",
+    ),
+    (
+        "reasoning",
+        "a puzzle, a plan, an analysis or a decision to think through that is neither code nor math",
+    ),
+    (
+        "writing",
+        "prose to draft, edit, shorten, translate or proofread: an email, a letter, an essay, a post",
+    ),
+];
+
+/// The topic that stands for "none of the others". It is always on offer, so
+/// the brain is never made to pick a subject a request does not have.
+const GENERAL_TOPIC: &str = "general";
+
+/// Ask the brain its two questions about `prompt`, together, and read the
+/// answers off the first-token label distributions. Thinking and
+/// harmony-format brains are carried by the same learned retries as
+/// `/v1/verdicts` ([`fan_out`]).
 async fn call_brain(
     http: &reqwest::Client,
     brain: &ResolvedModel,
     prompt: &str,
     available_tags: &[String],
     timeout: Duration,
-) -> anyhow::Result<Intent> {
+) -> anyhow::Result<Classified> {
     let questions = routing_questions(available_tags);
     let outcomes = ask(http, brain, prompt, questions, timeout).await?;
-    Ok(intent_from_outcomes(&outcomes))
+    Ok(classified_from_outcomes(&outcomes, available_tags))
 }
 
-/// What one classification asks: the difficulty score, then a yes/no per tag.
+/// What one classification asks: the difficulty score, and the topic choice
+/// when a model on offer carries a tag that names a subject.
 fn routing_questions(available_tags: &[String]) -> Vec<(String, Question)> {
-    let mut questions: Vec<(String, Question)> =
-        vec![(DIFFICULTY_ID.to_string(), difficulty_question())];
-    for tag in available_tags.iter().take(MAX_TAG_QUESTIONS) {
-        questions.push((format!("tag:{tag}"), tag_question(tag)));
+    let mut questions = vec![(DIFFICULTY_ID.to_string(), difficulty_question())];
+    if let Some(topic) = topic_question(available_tags) {
+        questions.push((TOPIC_ID.to_string(), topic));
     }
     questions
+}
+
+/// The topics on offer for `available_tags`, in the order their labels are
+/// assigned: the tags that name a subject, and `general` always.
+fn topics_on_offer(available_tags: &[String]) -> Vec<&'static str> {
+    TOPICS
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| *name == GENERAL_TOPIC || available_tags.iter().any(|t| t == name))
+        .collect()
 }
 
 /// Ask the brain `questions` about `prompt`, one single-token call each,
@@ -267,27 +374,75 @@ async fn ask(
     Ok(outcomes)
 }
 
-/// Difficulty as a 3-level score question; level i maps to difficulty i.
+/// Difficulty as a 3-level score question; level i maps to difficulty i. Each
+/// level says what that size of model is for, in the terms of the requests
+/// that reach it.
 fn difficulty_question() -> Question {
     Question::Score {
-        instructions: serde_json::json!("How hard is this request to answer well?"),
+        instructions: serde_json::json!("Which level of model does this request need?"),
         criteria: vec![
-            serde_json::json!("Simple or factual — a small model answers it well"),
-            serde_json::json!("Moderate — needs solid general capability"),
-            serde_json::json!("Hard — needs careful, multi-step reasoning"),
+            serde_json::json!(
+                "Light: small talk, a quick fact or a definition, the name of a command, or a tiny edit to a short text given in the request"
+            ),
+            serde_json::json!(
+                "Mid: everyday work such as writing or explaining code, drafting or revising a text, a routine calculation, a summary or step-by-step instructions"
+            ),
+            serde_json::json!(
+                "Strong: hard reasoning such as a proof or a derivation, tracking down an intermittent or unexplained fault, designing a system, weighing trade-offs among several options, or building something with many strict requirements at once"
+            ),
         ],
     }
 }
 
-/// One yes/no per routing tag, judged independently so unrelated tags never
-/// compete for one answer slot.
-fn tag_question(tag: &str) -> Question {
+/// One choice among the topics on offer, or `None` when `general` would be
+/// the only option: there is then nothing to ask.
+fn topic_question(available_tags: &[String]) -> Option<Question> {
+    let offered = topics_on_offer(available_tags);
+    if offered.len() < 2 {
+        return None;
+    }
+    Some(Question::Choice {
+        instructions: serde_json::json!("What is this request mainly about?"),
+        criteria: TOPICS
+            .iter()
+            .filter(|(name, _)| offered.contains(name))
+            .map(|(name, what)| (name.to_string(), serde_json::json!(what)))
+            .collect(),
+    })
+}
+
+/// One yes/no per category, judged independently so unrelated categories
+/// never compete for one answer slot.
+fn category_question(category: &str) -> Question {
     Question::Boolean {
         instructions: serde_json::json!(format!(
-            "Does the routing tag '{tag}' describe this request?"
+            "Does the routing tag '{category}' describe this request?"
         )),
         criteria: None,
     }
+}
+
+/// The categories whose p(yes) clears [`CATEGORY_THRESHOLD`], strongest
+/// first, capped at 3. A failed question is a category that does not apply.
+fn categories_from_outcomes(outcomes: &[QuestionOutcome]) -> Vec<String> {
+    let labels: Vec<String> = ["yes", "no"].iter().map(|s| s.to_string()).collect();
+    let mut chosen: Vec<(String, f64)> = Vec::new();
+    for outcome in outcomes {
+        let (Ok(success), Some(category)) = (&outcome.result, outcome.id.strip_prefix("tag:"))
+        else {
+            continue;
+        };
+        let (masses, in_set) = answers::label_masses(&success.entries, &labels, true);
+        if let Ok(scored) = answers::score_masses(&masses, in_set) {
+            if scored.probs[0] > CATEGORY_THRESHOLD {
+                chosen.push((category.to_string(), scored.probs[0]));
+            }
+        }
+    }
+    chosen.sort_by(|a, b| b.1.total_cmp(&a.1));
+    drop_exclusive_losers(&mut chosen);
+    chosen.truncate(3);
+    chosen.into_iter().map(|(c, _)| c).collect()
 }
 
 /// Whether the user is reporting a problem with the answer they got.
@@ -312,49 +467,71 @@ fn complaint_from_outcomes(outcomes: &[QuestionOutcome]) -> Option<f64> {
         .map(|scored| scored.probs[0])
 }
 
-/// Assemble tags and difficulty from the per-question outcomes: tags whose
-/// p(yes) clears [`TAG_THRESHOLD`], strongest first, capped at 3; difficulty
-/// from the score question's argmax. Every failure path yields less — a
-/// failed tag question is an unselected tag, a failed difficulty question is
-/// difficulty 1 — so a confused brain makes routing cheaper, never more
-/// expensive.
-fn intent_from_outcomes(outcomes: &[QuestionOutcome]) -> Intent {
-    let difficulty = difficulty_from_outcomes(outcomes).unwrap_or(1);
-    let mut chosen: Vec<(String, f64)> = Vec::new();
-    for outcome in outcomes {
-        let Ok(success) = &outcome.result else {
-            continue;
-        };
-        if let Some(tag) = outcome.id.strip_prefix("tag:") {
-            let labels: Vec<String> = ["yes", "no"].iter().map(|s| s.to_string()).collect();
-            let (masses, in_set) = answers::label_masses(&success.entries, &labels, true);
-            if let Ok(scored) = answers::score_masses(&masses, in_set) {
-                if scored.probs[0] > TAG_THRESHOLD {
-                    chosen.push((tag.to_string(), scored.probs[0]));
-                }
-            }
-        }
-    }
-    chosen.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    drop_exclusive_losers(&mut chosen);
-    chosen.truncate(3);
-    Intent {
-        tags: chosen.into_iter().map(|(t, _)| t).collect(),
-        difficulty,
-        source: crate::router::IntentSource::Classifier,
+/// What the brain said, from the per-question outcomes. A question with no
+/// usable answer leaves its part `None`, for the heuristics to settle.
+fn classified_from_outcomes(outcomes: &[QuestionOutcome], available_tags: &[String]) -> Classified {
+    Classified {
+        difficulty: difficulty_from_outcomes(outcomes),
+        tags: topics_from_outcomes(outcomes, available_tags),
     }
 }
 
 /// The difficulty question's answer, or `None` when the call failed or the
-/// brain put its first token outside the level labels.
+/// brain put its first token outside the level labels. Level 3 at
+/// [`HARD_THRESHOLD`] of the answer; otherwise the likelier of 1 and 2.
 fn difficulty_from_outcomes(outcomes: &[QuestionOutcome]) -> Option<u8> {
     let outcome = outcomes.iter().find(|o| o.id == DIFFICULTY_ID)?;
     let success = outcome.result.as_ref().ok()?;
     // Labels as [`difficulty_question`] renders them: A/B/C = 1/2/3.
     let labels: Vec<String> = ["A", "B", "C"].iter().map(|s| s.to_string()).collect();
     let (masses, in_set) = answers::label_masses(&success.entries, &labels, false);
-    let scored = answers::score_masses(&masses, in_set).ok()?;
-    Some(((scored.argmax as u8) + 1).clamp(1, obleth_config::MAX_TIER_LEVEL))
+    let probs = answers::score_masses(&masses, in_set).ok()?.probs;
+    Some(if probs[2] >= HARD_THRESHOLD {
+        3
+    } else if probs[0] >= probs[1] {
+        1
+    } else {
+        2
+    })
+}
+
+/// The topic question's answer as routing tags, strongest first: the chosen
+/// topic, and a second when the answer is split between two. `general` is a
+/// tag only when it is the first choice: beside a subject it adds nothing.
+/// `None` when the question was not asked, its call failed, or the brain put
+/// its first token outside the option labels.
+fn topics_from_outcomes(
+    outcomes: &[QuestionOutcome],
+    available_tags: &[String],
+) -> Option<Vec<String>> {
+    let outcome = outcomes.iter().find(|o| o.id == TOPIC_ID)?;
+    let success = outcome.result.as_ref().ok()?;
+    let offered = topics_on_offer(available_tags);
+    // Labels as [`topic_question`] renders them: a letter per option, in the
+    // options' sorted order, which is the order of [`TOPICS`].
+    let labels: Vec<String> = (0..offered.len())
+        .map(|i| ((b'A' + i as u8) as char).to_string())
+        .collect();
+    let (masses, in_set) = answers::label_masses(&success.entries, &labels, false);
+    let probs = answers::score_masses(&masses, in_set).ok()?.probs;
+    let mut ranked: Vec<(&str, f64)> = offered.iter().copied().zip(probs).collect();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+    let mut chosen: Vec<(String, f64)> = vec![(ranked[0].0.to_string(), ranked[0].1)];
+    if let Some((second, p)) = ranked.get(1) {
+        if *p >= SECOND_TOPIC_THRESHOLD && *second != GENERAL_TOPIC {
+            chosen.push((second.to_string(), *p));
+        }
+    }
+    drop_exclusive_losers(&mut chosen);
+    Some(
+        chosen
+            .into_iter()
+            .map(|(topic, _)| topic)
+            // `general` is always offered; it is a tag only where a model carries it.
+            .filter(|topic| available_tags.contains(topic))
+            .collect(),
+    )
 }
 
 /// Drop the weaker tag of each [`obleth_config::EXCLUSIVE_TAG_PAIRS`] pair
@@ -414,68 +591,148 @@ mod tests {
         }
     }
 
+    fn tags(names: &[&str]) -> Vec<String> {
+        names.iter().map(|t| t.to_string()).collect()
+    }
+
     #[test]
-    fn tags_above_threshold_are_chosen_strongest_first_and_capped_at_three() {
+    fn the_levels_map_to_difficulty_and_hard_needs_less_than_half() {
+        let read = |entries: &[(&str, f64)]| {
+            difficulty_from_outcomes(&[ok_outcome("difficulty", entries)])
+        };
+        assert_eq!(read(&[(" A", -0.1), (" B", -2.5), (" C", -5.0)]), Some(1));
+        assert_eq!(read(&[(" B", -0.1), (" A", -2.0), (" C", -3.0)]), Some(2));
+        assert_eq!(read(&[(" C", -0.05), (" B", -3.0), (" A", -4.0)]), Some(3));
+        // Mid is the likeliest level, but a third of the answer says strong:
+        // the request is read as hard.
+        assert_eq!(
+            read(&[
+                ("B", 0.55f64.ln()),
+                ("C", 0.35f64.ln()),
+                ("A", 0.10f64.ln())
+            ]),
+            Some(3)
+        );
+        assert_eq!(
+            read(&[
+                ("B", 0.65f64.ln()),
+                ("C", 0.25f64.ln()),
+                ("A", 0.10f64.ln())
+            ]),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn the_topic_is_the_chosen_option_among_the_tags_on_offer() {
+        // Offered: coding (A), general (B), math (C), writing (D).
+        let menu = tags(&["writing", "coding", "fast", "general", "math", "vision"]);
+        let read =
+            |entries: &[(&str, f64)]| topics_from_outcomes(&[ok_outcome("topic", entries)], &menu);
+        assert_eq!(read(&[(" C", -0.05), (" A", -3.5)]), Some(tags(&["math"])));
+        assert_eq!(
+            read(&[(" B", -0.05), (" A", -3.5)]),
+            Some(tags(&["general"]))
+        );
+        // An even split between two subjects names both, strongest first.
+        assert_eq!(
+            read(&[
+                ("A", 0.55f64.ln()),
+                ("C", 0.40f64.ln()),
+                ("B", 0.05f64.ln())
+            ]),
+            Some(tags(&["coding", "math"]))
+        );
+        // `general` beside a subject adds nothing.
+        assert_eq!(
+            read(&[("A", 0.55f64.ln()), ("B", 0.45f64.ln())]),
+            Some(tags(&["coding"]))
+        );
+    }
+
+    #[test]
+    fn coding_and_writing_keep_only_the_stronger() {
+        // "Write a SQL query": the answer is split between coding and
+        // writing. They are never applied together, so the stronger stays.
+        let menu = tags(&["coding", "writing"]);
+        // Offered: coding (A), general (B), writing (C).
+        let outcomes = [ok_outcome(
+            "topic",
+            &[("A", 0.6f64.ln()), ("C", 0.4f64.ln())],
+        )];
+        assert_eq!(
+            topics_from_outcomes(&outcomes, &menu),
+            Some(tags(&["coding"]))
+        );
+    }
+
+    #[test]
+    fn general_is_always_offered_and_is_a_tag_only_where_a_model_carries_it() {
+        // No model is tagged `general`: a request about none of the subjects
+        // is answered, and has no tags.
+        let menu = tags(&["coding", "math"]);
+        assert_eq!(topics_on_offer(&menu), ["coding", "general", "math"]);
+        let outcomes = [ok_outcome("topic", &[(" B", -0.05), (" A", -3.5)])];
+        assert_eq!(topics_from_outcomes(&outcomes, &menu), Some(vec![]));
+    }
+
+    #[test]
+    fn the_topic_is_not_asked_when_no_tag_on_offer_names_a_subject() {
+        let menu = tags(&["fast", "vision", "long-context", "general"]);
+        let questions = routing_questions(&menu);
+        assert_eq!(questions.len(), 1);
+        assert_eq!(questions[0].0, "difficulty");
+        assert_eq!(routing_questions(&tags(&["coding"])).len(), 2);
+    }
+
+    #[test]
+    fn failures_and_out_of_set_answers_are_no_answer() {
+        // A failed difficulty call and a topic whose answer mass is entirely
+        // off the labels (a rambling brain): neither is read as anything, so
+        // the heuristics settle both.
         let outcomes = vec![
-            ok_outcome("difficulty", &[(" B", -0.1), (" A", -2.0), (" C", -3.0)]),
+            failed_outcome("difficulty"),
+            ok_outcome("topic", &[("The", -0.1), ("Request", -2.0)]),
+        ];
+        assert_eq!(
+            classified_from_outcomes(&outcomes, &tags(&["coding", "math"])),
+            Classified::default()
+        );
+        // One answered, one not: the answered one stands.
+        let outcomes = vec![
+            failed_outcome("topic"),
+            ok_outcome("difficulty", &[(" C", -0.1), (" B", -3.0)]),
+        ];
+        assert_eq!(
+            classified_from_outcomes(&outcomes, &tags(&["coding", "math"])),
+            Classified {
+                difficulty: Some(3),
+                tags: None
+            }
+        );
+    }
+
+    #[test]
+    fn categories_above_the_threshold_are_chosen_strongest_first_and_capped_at_three() {
+        let outcomes = vec![
             ok_outcome("tag:coding", &[(" yes", -0.1), (" no", -2.5)]),
             ok_outcome("tag:math", &[(" no", -0.05), (" yes", -3.0)]),
             ok_outcome("tag:vision", &[(" yes", -0.3), (" no", -1.6)]),
             ok_outcome("tag:tools", &[(" yes", -0.2), (" no", -1.9)]),
             ok_outcome("tag:creative", &[(" yes", -0.25), (" no", -1.8)]),
-        ];
-        let intent = intent_from_outcomes(&outcomes);
-        // Five tags say yes-ish, but math says no, and only the strongest
-        // three survive, ordered by p(yes).
-        assert_eq!(intent.tags, vec!["coding", "tools", "creative"]);
-        assert_eq!(intent.difficulty, 2, "argmax level B = difficulty 2");
-        assert!(matches!(
-            intent.source,
-            crate::router::IntentSource::Classifier
-        ));
-    }
-
-    #[test]
-    fn coding_and_writing_keep_only_the_stronger() {
-        // "Write a SQL query": the classifier says yes to writing almost as
-        // readily as to coding. Coding is stronger, so writing goes, and the
-        // freed slot goes to the next tag.
-        let code = vec![
-            ok_outcome("tag:coding", &[(" yes", -0.01), (" no", -5.0)]),
-            ok_outcome("tag:writing", &[(" yes", -0.05), (" no", -3.0)]),
-            ok_outcome("tag:general", &[(" yes", -0.07), (" no", -2.7)]),
-            ok_outcome("tag:reasoning", &[(" yes", -0.4), (" no", -1.2)]),
+            failed_outcome("tag:legal"),
+            // Exactly 0.5 is not above the threshold.
+            ok_outcome("tag:fast", &[(" yes", -1.0), (" no", -1.0)]),
         ];
         assert_eq!(
-            intent_from_outcomes(&code).tags,
-            vec!["coding", "general", "reasoning"]
+            categories_from_outcomes(&outcomes),
+            vec!["coding", "tools", "creative"]
         );
-
-        // "Write the README intro": prose first, so writing stays.
-        let prose = vec![
-            ok_outcome("tag:coding", &[(" yes", -0.6), (" no", -0.8)]),
-            ok_outcome("tag:writing", &[(" yes", -0.02), (" no", -4.0)]),
-            ok_outcome("tag:general", &[(" yes", -0.1), (" no", -2.4)]),
-        ];
+        let q = category_question("coding");
         assert_eq!(
-            intent_from_outcomes(&prose).tags,
-            vec!["writing", "general"]
+            vprompt::render_user(&q, &vprompt::labels_for(&q)),
+            "# Question\nDoes the routing tag 'coding' describe this request?\n\nAnswer \"yes\" or \"no\"."
         );
-    }
-
-    #[test]
-    fn failures_and_out_of_set_answers_yield_the_cheap_default() {
-        // A failed difficulty call, a failed tag call, and a tag whose answer
-        // mass is entirely off the labels (a rambling brain) — nothing is
-        // selected and routing stays cheap.
-        let outcomes = vec![
-            failed_outcome("difficulty"),
-            failed_outcome("tag:coding"),
-            ok_outcome("tag:math", &[("The", -0.1), ("Request", -2.0)]),
-        ];
-        let intent = intent_from_outcomes(&outcomes);
-        assert!(intent.tags.is_empty());
-        assert_eq!(intent.difficulty, 1);
     }
 
     #[test]
@@ -496,15 +753,6 @@ mod tests {
     }
 
     #[test]
-    fn a_borderline_tag_below_the_threshold_is_not_selected() {
-        // p(yes) renormalizes to exactly 0.5 — not strictly above the
-        // threshold, so the tag does not apply.
-        let outcomes = vec![ok_outcome("tag:coding", &[(" yes", -1.0), (" no", -1.0)])];
-        let intent = intent_from_outcomes(&outcomes);
-        assert!(intent.tags.is_empty());
-    }
-
-    #[test]
     fn the_complaint_answer_is_its_yes_probability_or_none_on_failure() {
         let yes =
             complaint_from_outcomes(&[ok_outcome("complaint", &[(" yes", -0.1), (" no", -3.0)])]);
@@ -516,20 +764,14 @@ mod tests {
         assert_eq!(complaint_from_outcomes(&[]), None);
     }
 
-    #[test]
-    fn difficulty_is_clamped_to_the_tier_ceiling() {
-        let outcomes = vec![ok_outcome(
-            "difficulty",
-            &[(" C", -0.05), (" B", -3.0), (" A", -4.0)],
-        )];
-        assert_eq!(intent_from_outcomes(&outcomes).difficulty, 3);
-    }
-
-    /// The exact strings the brain is sent, pinned so they cannot drift away
-    /// from the training-time renderer that reproduces them, which carries
-    /// these same literals. A distilled classifier is trained on these bytes; changing one here without regenerating its training data
-    /// silently degrades the deployed model, so this test is a deliberate
-    /// cross-repository tripwire, not a tautology. Update both together.
+    /// The exact strings the brain is sent, pinned so that nobody changes
+    /// them by accident. What they say decides how well a brain reads
+    /// requests, and differently for each model: score the brain with
+    /// `classifier::eval` before and after any change here. A classifier
+    /// distilled for the gateway is trained on these bytes, so changing one
+    /// without regenerating its training data silently degrades it: this test
+    /// is a deliberate cross-repository tripwire, not a tautology. Update both
+    /// together.
     #[test]
     fn the_rendered_prompts_match_the_training_goldens() {
         let system = format!(
@@ -545,24 +787,49 @@ mod tests {
              # Request\nWrite a Rust function that parses JSON"
         );
 
-        let q = tag_question("coding");
-        let rendered = vprompt::render_user(&q, &vprompt::labels_for(&q));
-        assert_eq!(
-            rendered,
-            "# Question\nDoes the routing tag 'coding' describe this request?\n\nAnswer \"yes\" or \"no\"."
-        );
-
         let d = difficulty_question();
         let labels = vprompt::labels_for(&d);
         assert_eq!(labels.labels, ["A", "B", "C"]);
         assert_eq!(
             vprompt::render_user(&d, &labels),
-            "# Question\nHow hard is this request to answer well?\n\n# Levels\n\
-             A) level 1 — Simple or factual — a small model answers it well\n\
-             B) level 2 — Moderate — needs solid general capability\n\
-             C) level 3 — Hard — needs careful, multi-step reasoning\n\
+            "# Question\nWhich level of model does this request need?\n\n# Levels\n\
+             A) level 1 — Light: small talk, a quick fact or a definition, the name of a command, or a tiny edit to a short text given in the request\n\
+             B) level 2 — Mid: everyday work such as writing or explaining code, drafting or revising a text, a routine calculation, a summary or step-by-step instructions\n\
+             C) level 3 — Strong: hard reasoning such as a proof or a derivation, tracking down an intermittent or unexplained fault, designing a system, weighing trade-offs among several options, or building something with many strict requirements at once\n\
              \nAnswer with the letter of the level that best matches."
         );
+
+        let all: Vec<String> = obleth_config::MODEL_TAGS
+            .iter()
+            .map(|t| t.to_string())
+            .collect();
+        let t = topic_question(&all).unwrap();
+        let labels = vprompt::labels_for(&t);
+        assert_eq!(labels.labels, ["A", "B", "C", "D", "E", "F"]);
+        assert_eq!(
+            vprompt::render_user(&t, &labels),
+            "# Question\nWhat is this request mainly about?\n\n# Options\n\
+             A) coding — code, scripts, queries, commands or configuration to write, read, fix or run\n\
+             B) creative — fiction, verse, jokes, role-play or other imaginative writing\n\
+             C) general — none of the others: conversation, a question of fact, advice, an explanation\n\
+             D) math — a calculation, an equation, a proof, statistics or a word problem with quantities\n\
+             E) reasoning — a puzzle, a plan, an analysis or a decision to think through that is neither code nor math\n\
+             F) writing — prose to draft, edit, shorten, translate or proofread: an email, a letter, an essay, a post\n\
+             \nAnswer with the letter of the best option."
+        );
+    }
+
+    /// The labels are read back by position, so the topics must be listed in
+    /// the order the options are lettered: sorted by name.
+    #[test]
+    fn the_topics_are_listed_in_the_order_their_options_are_lettered() {
+        let names: Vec<&str> = TOPICS.iter().map(|(name, _)| *name).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted);
+        for name in names {
+            assert!(obleth_config::is_valid_tag(name), "{name} is a routing tag");
+        }
     }
 
     pub(super) fn brain(api_base: &str) -> ResolvedModel {
@@ -641,10 +908,10 @@ mod tests {
                         "choices": [{
                             "message": {"role": "assistant", "content": "x"},
                             "logprobs": {"content": [{
-                                "token": " yes", "logprob": -0.05,
+                                "token": " A", "logprob": -0.05,
                                 "top_logprobs": [
-                                    {"token": " yes", "logprob": -0.05},
-                                    {"token": " no", "logprob": -3.5}
+                                    {"token": " A", "logprob": -0.05},
+                                    {"token": " B", "logprob": -3.5}
                                 ]
                             }]},
                             "finish_reason": "length"
@@ -675,7 +942,7 @@ mod tests {
         // mock brain out.
         let settings: AutoRouterSettings =
             serde_json::from_value(serde_json::json!({ "classifier_timeout_ms": 10_000 })).unwrap();
-        let intent = Classifier::new(settings)
+        let classified = Classifier::new(settings)
             .classify(
                 &reqwest::Client::new(),
                 &slurm_brain,
@@ -683,11 +950,14 @@ mod tests {
                 &["coding".to_string()],
             )
             .await;
-        assert!(
-            hits.load(Ordering::SeqCst) >= 2,
-            "every question reaches the endpoint (a non-label answer is retried)"
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "both questions reach the endpoint"
         );
-        assert_eq!(intent.tags, vec!["coding"]);
+        // "A" is level 1, and the first of the options coding and general.
+        assert_eq!(classified.difficulty, Some(1));
+        assert_eq!(classified.tags, Some(vec!["coding".to_string()]));
     }
 
     /// A canned brain: answers every single-token question by looking at
@@ -706,20 +976,18 @@ mod tests {
                     assert_eq!(body["max_tokens"], 1, "single-token calls only");
                     assert_eq!(body["logprobs"], true);
                     let question = body["messages"][1]["content"].as_str().unwrap();
-                    let top = if question.contains("How hard") {
+                    let top = if question.contains("Which level of model") {
                         serde_json::json!([
                             {"token": " C", "logprob": -0.1},
                             {"token": " A", "logprob": -3.0}
                         ])
-                    } else if question.contains("\'coding\'") {
-                        serde_json::json!([
-                            {"token": " yes", "logprob": -0.05},
-                            {"token": " no", "logprob": -3.5}
-                        ])
                     } else {
+                        // The topic: coding (A), general (B), math (C).
+                        assert!(question.contains("A) coding"));
+                        assert!(question.contains("C) math"));
                         serde_json::json!([
-                            {"token": " no", "logprob": -0.05},
-                            {"token": " yes", "logprob": -3.5}
+                            {"token": " A", "logprob": -0.05},
+                            {"token": " B", "logprob": -3.5}
                         ])
                     };
                     axum::Json(serde_json::json!({
@@ -747,7 +1015,7 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "classifier_timeout_ms": 10_000 })).unwrap();
         let classifier = Classifier::new(settings);
         let tags = vec!["coding".to_string(), "math".to_string()];
-        let intent = classifier
+        let classified = classifier
             .classify(
                 &reqwest::Client::new(),
                 &brain(&format!("http://{addr}/v1")),
@@ -755,12 +1023,12 @@ mod tests {
                 &tags,
             )
             .await;
-        assert_eq!(intent.tags, vec!["coding"]);
-        assert_eq!(intent.difficulty, 3, "argmax level C");
+        assert_eq!(classified.tags, Some(vec!["coding".to_string()]));
+        assert_eq!(classified.difficulty, Some(3), "level C");
         assert_eq!(
             hits.load(Ordering::SeqCst),
-            3,
-            "one call per tag plus difficulty"
+            2,
+            "one call for difficulty and one for the topic"
         );
 
         // The result is cached: a second classify makes no upstream calls.
@@ -772,7 +1040,7 @@ mod tests {
                 &tags,
             )
             .await;
-        assert_eq!(again.tags, vec!["coding"]);
-        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        assert_eq!(again, classified);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 }
