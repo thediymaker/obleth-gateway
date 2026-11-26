@@ -67,6 +67,7 @@ import { Notice } from "@/components/ui/notice";
 import { Tile } from "@/components/ui/tile";
 import { SettingsCard } from "@/components/ui/settings-card";
 import { SettingsForm } from "@/components/ui/settings-form";
+import { Switch } from "@/components/ui/switch";
 import { SectionLabel } from "@/components/ui/section-label";
 
 type Card = "script" | "placement" | "service";
@@ -74,7 +75,7 @@ type Card = "script" | "placement" | "service";
 function cardOf(name: string): Card | null {
   if (name === "slurm_script_body" || name === "slurm_log_output_dir") return "script";
   if (["slurm_partition", "slurm_gres", "slurm_cpus_per_task", "slurm_mem", "slurm_nodes", "slurm_account", "slurm_qos", "slurm_time_limit", "slurm_constraints", "slurm_exclude"].includes(name)) return "placement";
-  if (["slurm_serving_port", "slurm_health_path", "slurm_min_replicas", "slurm_max_job_failures", "slurm_startup_timeout_mins", "slurm_handoff_mins"].includes(name)) return "service";
+  if (["slurm_serving_port", "slurm_health_path", "slurm_min_replicas", "slurm_max_job_failures", "slurm_startup_timeout_mins", "slurm_handoff_mins", "slurm_replica_api_key"].includes(name)) return "service";
   return null;
 }
 
@@ -97,6 +98,7 @@ const LABELS: Record<string, string> = {
   slurm_max_job_failures: "Stop after failed launches",
   slurm_startup_timeout_mins: "Give up loading after",
   slurm_handoff_mins: "Start a replacement",
+  slurm_replica_api_key: "API key per replica",
 };
 
 const STEPS: { phase: ReplicaPhase; label: string }[] = [
@@ -435,6 +437,12 @@ const DeploymentSettings = memo(function DeploymentSettings({ modelId, name, spe
         {spec.handoff_mins !== undefined && (
           <Setting id="set-handoff" label="Start a replacement" hint="Minutes before a serving job's time limit that obleth starts its replacement; the old job stops once the new one serves. Set 0 to turn this off." fields={["slurm_handoff_mins"]} was={{ field: "slurm_handoff_mins" }}>
             <TextField name="slurm_handoff_mins" label="Start a replacement" inputMode="numeric" defaultValue={spec.handoff_mins} mono className="w-20" />
+          </Setting>
+        )}
+        {spec.replica_api_key !== undefined && (
+          <Setting id="set-replica-key" label="API key per replica" hint={<>obleth starts each job with a random API key of its own and sends it with every request, so the server answers obleth and nothing else that can reach its port. vLLM and llama.cpp read the key on their own; another server&apos;s script must pass it <code className="font-mono">$OBLETH_REPLICA_API_KEY</code>. Replicas already running keep what they started with, so restart them to apply a change.</>} fields={["slurm_replica_api_key"]} was={{ field: "slurm_replica_api_key", checkbox: true }}>
+            <input type="hidden" name="slurm_has_replica_api_key" value="1" />
+            <Switch name="slurm_replica_api_key" label="API key per replica" defaultChecked={spec.replica_api_key} />
           </Setting>
         )}
       </SettingsCard>

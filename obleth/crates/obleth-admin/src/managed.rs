@@ -51,6 +51,10 @@ pub(crate) struct PutManagedModel {
     /// is submitted. 0 turns the handoff off.
     #[serde(default = "default_handoff_mins")]
     handoff_mins: i64,
+    /// Start each replica with an API key of its own, so its server answers
+    /// only the gateway. Off unless set.
+    #[serde(default)]
+    replica_api_key: bool,
 }
 
 fn default_startup_timeout_mins() -> i64 {
@@ -154,6 +158,7 @@ mod managed_spec_tests {
         );
         assert_eq!(b.partition, "", "empty partition uses the cluster default");
         assert_eq!(b.startup_timeout_mins, 60);
+        assert!(!b.replica_api_key, "replicas get no key unless asked");
         assert_eq!(b.handoff_mins, 15);
         let zero = spec(serde_json::json!({ "target_replicas": 0, "min_replicas": 0 }));
         assert!(
@@ -238,6 +243,21 @@ pub(crate) struct CreateReplica {
     /// Where the job's output goes.
     #[serde(default)]
     log_path: Option<String>,
+    /// The API key the job's server was started with, when the deployment
+    /// gives each replica one. Stored encrypted and never returned on a
+    /// replica; only `GET /api/v1/replicas/resolved` reads it back.
+    #[serde(default)]
+    api_key: Option<String>,
+}
+
+/// A replica as the provisioner reads it: the replica, and the API key its
+/// server was started with.
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct ResolvedReplica {
+    #[serde(flatten)]
+    replica: ModelReplica,
+    /// Null for a replica started without a key.
+    api_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -370,6 +390,7 @@ pub(crate) async fn put_managed_model(
             launcher_spec: body.launcher_spec,
             startup_timeout_mins: body.startup_timeout_mins,
             handoff_mins: body.handoff_mins,
+            replica_api_key: body.replica_api_key,
         })
         .await?;
     state
@@ -625,6 +646,28 @@ pub(crate) async fn list_all_replicas(
     Ok(Json(state.store.all_replicas().await?))
 }
 
+#[utoipa::path(get, path = "/api/v1/replicas/resolved", tag = "models",
+    responses((status = 200, body = [ResolvedReplica])))]
+pub(crate) async fn list_all_replicas_resolved(
+    State(state): State<AdminState>,
+) -> Result<Json<Vec<ResolvedReplica>>> {
+    // Provisioner-facing, like the resolved Slurm settings: every replica
+    // with its API key in full, which the provisioner needs to probe the
+    // server and to register its endpoint. The other replica routes never
+    // return a key.
+    let mut keys = state.store.replica_api_keys().await?;
+    let replicas = state.store.all_replicas().await?;
+    Ok(Json(
+        replicas
+            .into_iter()
+            .map(|replica| ResolvedReplica {
+                api_key: keys.remove(&replica.id),
+                replica,
+            })
+            .collect(),
+    ))
+}
+
 #[utoipa::path(post, path = "/api/v1/models/{id}/replicas", tag = "models",
     request_body = CreateReplica,
     responses((status = 200, body = ModelReplica)))]
@@ -641,6 +684,7 @@ pub(crate) async fn create_replica(
             &body.slurm_job_id,
             body.port_base,
             body.log_path.as_deref(),
+            body.api_key.as_deref(),
         )
         .await?;
     state

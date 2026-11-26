@@ -487,6 +487,9 @@ export interface ManagedModelSpec {
   /** Minutes before a healthy job's time limit that its replacement is
    *  submitted; 0 turns handoff off. Absent from older gateways. */
   handoff_mins?: number;
+  /** Each replica's job is started with an API key of its own, which its
+   *  server then requires. Absent from older gateways. */
+  replica_api_key?: boolean;
   /** Why submits are paused after too many failed launches or refused
    *  submits; null when they aren't. Absent from older gateways. */
   paused_reason?: string | null;
@@ -522,6 +525,7 @@ export interface PutManagedModel {
   /** Older gateways ignore these; the gateway applies its defaults when omitted. */
   startup_timeout_mins?: number;
   handoff_mins?: number;
+  replica_api_key?: boolean;
 }
 
 export type ClusterResources = {

@@ -72,6 +72,10 @@ struct Memory {
     probe_seen: HashMap<Uuid, ProbeResult>,
     /// Unmanaged models whose drain was logged, so it is logged once.
     draining: HashSet<Uuid>,
+    /// For each serving replica that was started with an API key: whether
+    /// its server turns away a request that carries none. Asked once, when
+    /// the replica is first seen healthy.
+    key_refusal: HashMap<Uuid, bool>,
 }
 
 /// What a tick's probe of one running replica found.
@@ -96,6 +100,8 @@ struct ReplicaProbe {
     port_base: i64,
     reported_port: Option<i64>,
     result: ProbeResult,
+    /// Set on the tick the question was asked: see `Memory::key_refusal`.
+    refuses_without_key: Option<bool>,
 }
 
 /// Record a probe result; true when it differs from the replica's last one
@@ -135,6 +141,8 @@ struct UncertainSubmit {
     /// `<working dir>/<job name>`: the job's output is `<this>-<id>.out`.
     log_prefix: String,
     at: DateTime<Utc>,
+    /// The API key the job was submitted with, if any.
+    api_key: Option<String>,
 }
 
 #[tokio::main]
@@ -670,19 +678,24 @@ async fn tick(
 
     // Probe every running replica of every model at once (bounded), so the
     // probes take about one probe timeout however many replicas there are.
+    let key_asked = &mem.key_refusal;
     let probes: Vec<ReplicaProbe> = stream::iter(
         work.iter()
             .enumerate()
             .flat_map(|(i, w)| w.replicas.iter().map(move |r| (i, w, r))),
     )
-    .map(|(i, w, r)| probe_replica(cfg, http, resolver, i, w, r, &jobs))
+    .map(|(i, w, r)| probe_replica(cfg, http, resolver, i, w, r, &jobs, key_asked))
     .buffer_unordered(PROBE_REPLICAS_AT_ONCE)
     .filter_map(|p| async move { p })
     .collect()
     .await;
     let probed: HashSet<Uuid> = probes.iter().map(|p| p.replica_id).collect();
     mem.probe_seen.retain(|id, _| probed.contains(id));
+    mem.key_refusal.retain(|id, _| probed.contains(id));
     for p in probes {
+        if let Some(refuses) = p.refuses_without_key {
+            mem.key_refusal.insert(p.replica_id, refuses);
+        }
         log_probe(
             &p,
             probe_changed(&mut mem.probe_seen, p.replica_id, &p.result),
@@ -699,6 +712,25 @@ async fn tick(
                 );
             }
             ProbeResult::NotYet | ProbeResult::NoHost => {}
+        }
+    }
+    // A replica that was started with a key but serves without one: its job
+    // script never gave the key to the server. One sentence per model, every
+    // tick until the replica is gone.
+    for w in &work {
+        let open = w
+            .replicas
+            .iter()
+            .any(|r| mem.key_refusal.get(&r.id) == Some(&false));
+        if open {
+            warnings.push(format!(
+                "A replica of {} was started with an API key, but its server answers requests \
+                 that carry none, so anything that can reach its port can use it. Give \
+                 {} to the server in the job script (vLLM and llama.cpp read it on their own), \
+                 then restart the replica.",
+                w.identity.name,
+                slurm::REPLICA_API_KEY_ENV
+            ));
         }
     }
 
@@ -806,6 +838,14 @@ async fn tick(
             } else {
                 0
             };
+            // For a deployment that gives each replica its own API key: a
+            // new key for the job a Submit starts, and the key a replica was
+            // started with when it is promoted.
+            let replica_key = match action {
+                Action::Submit if spec.replica_api_key => Some(slurm::new_replica_api_key()),
+                Action::Promote { replica_id, .. } => replica_key_of(&w.replicas, *replica_id),
+                _ => None,
+            };
             match executor::apply(
                 action,
                 spec.model_id,
@@ -817,6 +857,7 @@ async fn tick(
                 slurm,
                 obleth,
                 resolver,
+                replica_key.as_deref(),
             )
             .await
             {
@@ -849,6 +890,7 @@ async fn tick(
                                         job_name: job.name,
                                         port_base,
                                         at: now,
+                                        api_key: replica_key.clone(),
                                     },
                                 );
                                 stop_submits = true;
@@ -878,7 +920,7 @@ async fn tick(
                         {
                             outcome.served = true;
                         }
-                        spawn_warmup(cfg, http, resolver, api_base, &w.identity).await;
+                        spawn_warmup(cfg, http, resolver, api_base, &w.identity, replica_key).await;
                     }
                 }
             }
@@ -970,6 +1012,12 @@ async fn tick(
                 slurm,
                 obleth,
                 resolver,
+                // No Promote fires here, but if one did it would need the key.
+                match action {
+                    Action::Promote { replica_id, .. } => replica_key_of(&replicas, *replica_id),
+                    _ => None,
+                }
+                .as_deref(),
             )
             .await
             {
@@ -1084,6 +1132,7 @@ async fn adopt_lost_submits(
                 &found_job.job_id,
                 u.port_base,
                 Some(&log_path),
+                u.api_key.as_deref(),
             )
             .await
         {
@@ -1103,6 +1152,7 @@ async fn adopt_lost_submits(
                     state: ReplicaState::Pending,
                     port_base: u.port_base,
                     log_path: Some(log_path),
+                    api_key: u.api_key.clone(),
                     ..Default::default()
                 });
                 warnings.push(format!(
@@ -1133,6 +1183,7 @@ async fn adopt_lost_submits(
 /// in its comment when it did, else every port of its window, all at once. A
 /// port passes when the health path answers and the server lists this model
 /// (or lists none). `None` for a replica with nothing to probe.
+#[allow(clippy::too_many_arguments)]
 async fn probe_replica(
     cfg: &ProvisionerConfig,
     http: &reqwest::Client,
@@ -1141,6 +1192,7 @@ async fn probe_replica(
     w: &ModelWork<'_>,
     r: &ReplicaView,
     jobs: &HashMap<String, JobInfo>,
+    key_asked: &HashMap<Uuid, bool>,
 ) -> Option<ReplicaProbe> {
     if !r.state.is_live() {
         return None;
@@ -1155,6 +1207,7 @@ async fn probe_replica(
         port_base: r.port_base,
         reported_port: job.reported_port,
         result,
+        refuses_without_key: None,
     };
     // The batch host runs the server; for a multi-node job the node list
     // alone does not say which one.
@@ -1186,6 +1239,7 @@ async fn probe_replica(
                 &w.spec.health_path,
                 expected,
                 cfg.health_timeout_secs,
+                r.api_key.as_deref(),
             )
             .await;
             (p, res)
@@ -1205,11 +1259,29 @@ async fn probe_replica(
             _ => None,
         })
         .min_by_key(|(p, _)| *p);
-    Some(probe(match (serving, other) {
+    let mut found = probe(match (serving, other) {
         (Some(p), _) => ProbeResult::Healthy(p),
         (None, Some((p, list))) => ProbeResult::OtherModel(p, list),
         (None, None) => ProbeResult::NotYet,
-    }))
+    });
+    // A serving replica that was started with a key: ask once whether the
+    // server really requires it.
+    if let (Some(p), true) = (
+        serving,
+        r.api_key.is_some() && !key_asked.contains_key(&r.id),
+    ) {
+        found.refuses_without_key =
+            probe::refuses_without_key(http, &host, p, cfg.health_timeout_secs).await;
+    }
+    Some(found)
+}
+
+/// The API key replica `id` was started with, if it has one.
+fn replica_key_of(replicas: &[ReplicaView], id: Uuid) -> Option<String> {
+    replicas
+        .iter()
+        .find(|r| r.id == id)
+        .and_then(|r| r.api_key.clone())
 }
 
 /// Record the model's failure count and pause state when this tick changed
@@ -1252,6 +1324,7 @@ async fn spawn_warmup(
     resolver: &resolve::HostResolver,
     api_base: &str,
     identity: &ModelIdentity,
+    api_key: Option<String>,
 ) {
     if cfg.warmup_timeout_secs == 0 {
         return;
@@ -1264,7 +1337,9 @@ async fn spawn_warmup(
     let prefer = identity.served_names();
     let budget = Duration::from_secs(cfg.warmup_timeout_secs);
     tokio::spawn(async move {
-        match warmup::warm_up_preferring(&http, &api_base, &prefer, budget).await {
+        match warmup::warm_up_preferring(&http, &api_base, &prefer, budget, api_key.as_deref())
+            .await
+        {
             Ok(()) => tracing::info!(model = %model_name, %api_base, "warmup inference completed"),
             Err(e) => tracing::warn!(
                 model = %model_name, %api_base, error = %e,
@@ -1358,6 +1433,8 @@ mod tests {
         by_name: Mutex<Vec<JobInfo>>,
         cancelled: Mutex<Vec<String>>,
         submitted: Mutex<Vec<String>>,
+        /// The API key each submitted job carried.
+        submitted_keys: Mutex<Vec<Option<String>>>,
         submit_gets_no_answer: AtomicBool,
         cancel_refused: AtomicBool,
         /// How long each job lookup takes.
@@ -1370,6 +1447,10 @@ mod tests {
             job: &JobSubmit,
         ) -> anyhow::Result<obleth_provisioner::slurm::SubmittedJob> {
             self.submitted.lock().unwrap().push(job.name.clone());
+            self.submitted_keys
+                .lock()
+                .unwrap()
+                .push(job.api_key.clone());
             if self.submit_gets_no_answer.load(Ordering::SeqCst) {
                 return Err(SlurmApiError {
                     kind: SlurmErrorKind::NoAnswer,
@@ -1686,6 +1767,57 @@ mod tests {
         assert_eq!(created.len(), 1);
         assert_eq!(created[0].1, "4242");
         assert!(!mem.uncertain.contains_key(&model_id));
+    }
+
+    /// A deployment that gives replicas their own API key: every job is
+    /// submitted with a key of its own, recorded on its replica. Without the
+    /// switch no job carries one.
+    #[tokio::test]
+    async fn a_deployment_with_replica_keys_starts_each_job_with_its_own() {
+        let slurm = FakeSlurm::default();
+        let obleth = MockObleth::default();
+        let mut keyed = managed(2);
+        keyed.replica_api_key = true;
+        *obleth.managed.lock().unwrap() = vec![keyed];
+        run_tick(&slurm, &obleth).await.unwrap();
+        let sent = slurm.submitted_keys.lock().unwrap().clone();
+        assert_eq!(sent.len(), 2);
+        assert!(sent.iter().all(|k| k.is_some()), "{sent:?}");
+        assert_ne!(sent[0], sent[1], "each replica has its own key");
+        assert_eq!(*obleth.replica_keys.lock().unwrap(), sent);
+
+        let slurm = FakeSlurm::default();
+        let obleth = MockObleth::default();
+        *obleth.managed.lock().unwrap() = vec![managed(1)];
+        run_tick(&slurm, &obleth).await.unwrap();
+        assert_eq!(*slurm.submitted_keys.lock().unwrap(), vec![None]);
+        assert_eq!(*obleth.replica_keys.lock().unwrap(), vec![None]);
+    }
+
+    /// A job whose submit answer was lost is tracked with the key it was
+    /// submitted with, not a new one its server never saw.
+    #[tokio::test]
+    async fn an_adopted_job_keeps_the_key_it_was_submitted_with() {
+        let slurm = FakeSlurm::default();
+        slurm.submit_gets_no_answer.store(true, Ordering::SeqCst);
+        let obleth = MockObleth::default();
+        let mut spec = managed(1);
+        spec.replica_api_key = true;
+        *obleth.managed.lock().unwrap() = vec![spec];
+        let mut mem = Memory::default();
+        run_tick_with(&slurm, &obleth, &mut mem).await.unwrap();
+        let sent = slurm.submitted_keys.lock().unwrap()[0].clone();
+        assert!(sent.is_some());
+
+        slurm.submit_gets_no_answer.store(false, Ordering::SeqCst);
+        slurm.by_name.lock().unwrap().push(JobInfo {
+            job_id: "4242".into(),
+            state: JobState::Pending,
+            ..Default::default()
+        });
+        run_tick_with(&slurm, &obleth, &mut mem).await.unwrap();
+        assert_eq!(slurm.submitted.lock().unwrap().len(), 1, "no second job");
+        assert_eq!(*obleth.replica_keys.lock().unwrap(), vec![sent]);
     }
 
     #[tokio::test]

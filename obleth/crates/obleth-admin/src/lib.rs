@@ -515,6 +515,7 @@ pub fn router(state: AdminState) -> Router {
             put(set_managed_backoff),
         )
         .route("/api/v1/replicas", get(list_all_replicas))
+        .route("/api/v1/replicas/resolved", get(list_all_replicas_resolved))
         .route("/api/v1/endpoints", get(list_all_endpoints))
         .route(
             "/api/v1/replicas/:id",

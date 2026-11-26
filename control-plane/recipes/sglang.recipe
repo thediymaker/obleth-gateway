@@ -66,10 +66,18 @@ if [ -n "$IMAGE" ]; then
   read -r -a RUN <<< "${OBLETH_CONTAINER_RUN:-apptainer exec --nv}"
   RUN+=(--bind "$HF_HOME" "$IMAGE")
 fi
+# When the deployment gives each replica its own API key, the server requires
+# it. SGLang takes a key only as an argument, so it shows in the node's
+# process list (vLLM and llama.cpp read theirs from the environment).
+KEY=()
+if [ -n "${OBLETH_REPLICA_API_KEY:-}" ]; then
+  KEY=(--api-key "$OBLETH_REPLICA_API_KEY")
+fi
 exec ${RUN[@]+"${RUN[@]}"} python3 -m sglang.launch_server \
   --model-path {{model}} \
   --served-model-name {{api_model_name}} \
   --host 0.0.0.0 --port "$OBLETH_SERVING_PORT" \
   --tp "${SLURM_GPUS_ON_NODE:-1}" \
   --context-length {{context}} \
+  ${KEY[@]+"${KEY[@]}"} \
   {{extra}}

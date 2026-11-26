@@ -293,6 +293,18 @@ describe("what a deployment's page reports from a newer gateway", () => {
     expect(retryDeploymentAction).toHaveBeenCalledWith("m1");
   });
 
+  it.each([
+    ["an older gateway", undefined, null],
+    ["the setting off", false, false],
+    ["the setting on", true, true],
+  ])("offers an API key per replica only when the gateway has the setting: %s", async (_case, stored, shown) => {
+    await render(<ManagedPage modelId="m1" initial={one({ specs: [newer(stored === undefined ? {} : { replica_api_key: stored })], replicas: [] })} changes={[]} />);
+    const key = host.querySelector<HTMLInputElement>('input[name="slurm_replica_api_key"]');
+    expect(key ? key.checked : null).toBe(shown);
+    // A switch that is off sends nothing, so the form says when it carries one.
+    expect(host.querySelector('input[name="slurm_has_replica_api_key"]') !== null).toBe(shown !== null);
+  });
+
   it("puts a refused submit in a sentence with what to change, never the raw body alone", async () => {
     await render(<ManagedPage modelId="m1" initial={one({ specs: [newer({ last_provision_error: "Slurm rejected the job: Requested node configuration is not available." })], replicas: [] })} changes={[]} />);
     const why = host.querySelector('[aria-label="Why it stopped"]')!;

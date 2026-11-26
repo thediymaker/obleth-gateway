@@ -131,7 +131,23 @@ token, and slurmctld.
 `gres`, `nodes`, `constraints`, `exclude`, `account`, `qos`, `time_limit`,
 `cpus_per_task`, `mem`, `image`, `preamble`, `launch_command`, `script_body`,
 `log_output_dir`, `serving_port`, `health_path`, `target_replicas`,
-`min_replicas`, `max_job_failures`, `startup_timeout_mins` and `handoff_mins`.
+`min_replicas`, `max_job_failures`, `startup_timeout_mins`, `handoff_mins` and
+`replica_api_key`.
+
+**An API key per replica** (`replica_api_key`, off by default). With it on,
+every job the provisioner submits for that model gets a random key of its own
+in the job's environment: `OBLETH_REPLICA_API_KEY`, and the same value as
+`VLLM_API_KEY` and `LLAMA_API_KEY`, which vLLM and llama.cpp read on their
+own. The key is never written into the job script. The gateway stores it
+encrypted with the replica, the provisioner sends it on the model-list probe
+and the warm-up, and the replica's endpoint is registered with it, so the
+gateway sends it with every request. The server then answers the gateway and
+nothing else that can reach its port on the cluster network. Any other
+server's script has to hand it the key (the SGLang recipe passes
+`--api-key "$OBLETH_REPLICA_API_KEY"`, which shows in the node's process
+list); when a replica started with a key answers a request that carries none,
+the provisioner says so in its warnings. Replicas keep the key, or the lack of
+one, they started with, so restart or roll them after changing the setting.
 
 ## Network
 

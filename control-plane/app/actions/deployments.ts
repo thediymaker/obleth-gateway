@@ -122,6 +122,7 @@ function specToPut(s: ManagedModelSpec): PutManagedModel {
     // Sent only when the gateway reported them, so an older one isn't sent fields it doesn't know.
     ...(s.startup_timeout_mins !== undefined ? { startup_timeout_mins: s.startup_timeout_mins } : {}),
     ...(s.handoff_mins !== undefined ? { handoff_mins: s.handoff_mins } : {}),
+    ...(s.replica_api_key !== undefined ? { replica_api_key: s.replica_api_key } : {}),
   };
 }
 
@@ -188,6 +189,8 @@ export async function saveDeploymentSettingsAction(formData: FormData): Promise<
       max_job_failures: int("max_job_failures"),
       ...(text("startup_timeout_mins") ? { startup_timeout_mins: int("startup_timeout_mins") } : {}),
       ...(text("handoff_mins") ? { handoff_mins: int("handoff_mins") } : {}),
+      // A switch that is off sends nothing, so the form says when it carries one.
+      ...(text("has_replica_api_key") ? { replica_api_key: text("replica_api_key") === "on" } : {}),
     };
   });
   return res.ok ? { ok: true } : { ok: false, error: res.error, saved: [] };

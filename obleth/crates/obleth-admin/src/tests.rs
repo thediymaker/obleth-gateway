@@ -1213,6 +1213,90 @@ async fn replica_restart_is_surge_first_and_delete_cancels_live_rows() {
     t.store.delete_model(model.id).await.ok();
 }
 
+/// A deployment can give each replica its own API key. The switch is off
+/// unless set, and a replica's key is returned only on the provisioner's
+/// list, never on a replica.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_replicas_api_key_is_read_back_only_on_the_resolved_list() {
+    let Some(t) = test_admin_app().await else {
+        eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+        return;
+    };
+    let name = format!("slurm-{}", Uuid::new_v4());
+    let model = fixture_model(&t.store, &name, 0.0).await;
+    let put = |body: serde_json::Value| {
+        json_request("PUT", &format!("/api/v1/models/{}/managed", model.id), body)
+    };
+    let (status, body) = send(
+        &t.app,
+        put(serde_json::json!({ "serving_port": 8000, "launch_command": "serve" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["replica_api_key"], false, "off unless asked for");
+    let (status, body) = send(
+        &t.app,
+        put(serde_json::json!({
+            "serving_port": 8000, "launch_command": "serve", "replica_api_key": true,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["replica_api_key"], true);
+
+    let key = format!("obl-replica-{}", Uuid::new_v4().simple());
+    let create = |body: serde_json::Value| {
+        json_request(
+            "POST",
+            &format!("/api/v1/models/{}/replicas", model.id),
+            body,
+        )
+    };
+    let (status, keyed) = send(
+        &t.app,
+        create(serde_json::json!({ "slurm_job_id": "81", "port_base": 8000, "api_key": key })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{keyed}");
+    assert!(!keyed.to_string().contains(&key), "{keyed}");
+    let (status, plain) = send(
+        &t.app,
+        create(serde_json::json!({ "slurm_job_id": "82", "port_base": 8008 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{plain}");
+
+    // The lists the dashboard reads carry no key.
+    for path in [
+        "/api/v1/replicas".to_string(),
+        format!("/api/v1/models/{}/replicas", model.id),
+    ] {
+        let (status, body) =
+            send(&t.app, json_request("GET", &path, serde_json::Value::Null)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!body.to_string().contains(&key), "{path}");
+    }
+    // The provisioner's list carries each replica with its key.
+    let (status, body) = send(
+        &t.app,
+        json_request("GET", "/api/v1/replicas/resolved", serde_json::Value::Null),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let row = |id: &serde_json::Value| {
+        body.as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == *id)
+            .cloned()
+            .expect("replica listed")
+    };
+    assert_eq!(row(&keyed["id"])["api_key"], key);
+    assert_eq!(row(&keyed["id"])["slurm_job_id"], "81");
+    assert!(row(&plain["id"])["api_key"].is_null());
+    t.store.delete_model(model.id).await.ok();
+}
+
 /// Rejected request fields go through create, update, their own endpoint
 /// and the read views, checked and normalized on every write.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

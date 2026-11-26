@@ -48,6 +48,8 @@ pub struct UpsertManagedModel {
     pub startup_timeout_mins: i64,
     /// Minutes before the time limit a replacement starts; 0 is off.
     pub handoff_mins: i64,
+    /// Start each replica with its own API key.
+    pub replica_api_key: bool,
 }
 
 /// Provisioner-reported replica details. `None` keeps the stored value.
@@ -107,6 +109,7 @@ fn managed_model_from_row(row: &PgRow) -> Result<ManagedModelSpec> {
         last_provision_error_at: row.try_get("last_provision_error_at")?,
         startup_timeout_mins: row.try_get("startup_timeout_mins")?,
         handoff_mins: row.try_get("handoff_mins")?,
+        replica_api_key: row.try_get("replica_api_key")?,
         paused_reason: row.try_get("paused_reason")?,
         paused_until: row.try_get("paused_until")?,
         failed_launches: row.try_get("failed_launches")?,
@@ -282,7 +285,7 @@ impl Store {
              script_body, serving_port, \
              health_path, target_replicas, min_replicas, max_job_failures, launcher_spec, \
              last_provision_error, last_provision_error_at, startup_timeout_mins, handoff_mins, \
-             paused_reason, paused_until, failed_launches, backoff_step, created_at, updated_at \
+             replica_api_key, paused_reason, paused_until, failed_launches, backoff_step, created_at, updated_at \
              from managed_models where model_id = $1",
         )
         .bind(model_id)
@@ -311,7 +314,7 @@ impl Store {
              script_body, serving_port, \
              health_path, target_replicas, min_replicas, max_job_failures, launcher_spec, \
              last_provision_error, last_provision_error_at, startup_timeout_mins, handoff_mins, \
-             paused_reason, paused_until, failed_launches, backoff_step, created_at, updated_at \
+             replica_api_key, paused_reason, paused_until, failed_launches, backoff_step, created_at, updated_at \
              from managed_models order by model_id",
         )
         .fetch_all(&self.pool)
@@ -326,8 +329,8 @@ impl Store {
                  account, qos, time_limit, cpus_per_task, mem, image, preamble, log_output_dir,
                  launch_command, script_body,
                  serving_port, health_path, target_replicas, min_replicas, max_job_failures, launcher_spec,
-                 startup_timeout_mins, handoff_mins)
-             values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+                 startup_timeout_mins, handoff_mins, replica_api_key)
+             values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
              on conflict (model_id) do update set
                 enabled = excluded.enabled, partition = excluded.partition,
                 gres = excluded.gres, nodes = excluded.nodes,
@@ -343,13 +346,14 @@ impl Store {
                 max_job_failures = excluded.max_job_failures,
                 launcher_spec = excluded.launcher_spec,
                 startup_timeout_mins = excluded.startup_timeout_mins,
-                handoff_mins = excluded.handoff_mins, updated_at = now()
+                handoff_mins = excluded.handoff_mins,
+                replica_api_key = excluded.replica_api_key, updated_at = now()
              returning model_id, enabled, partition, gres, nodes, constraints, exclude, account, \
              qos, time_limit, cpus_per_task, mem, image, preamble, log_output_dir, launch_command, \
              script_body, serving_port, \
              health_path, target_replicas, min_replicas, max_job_failures, launcher_spec, \
              last_provision_error, last_provision_error_at, startup_timeout_mins, handoff_mins, \
-             paused_reason, paused_until, failed_launches, backoff_step, created_at, updated_at",
+             replica_api_key, paused_reason, paused_until, failed_launches, backoff_step, created_at, updated_at",
         )
         .bind(m.model_id)
         .bind(m.enabled)
@@ -380,6 +384,7 @@ impl Store {
         .bind(m.launcher_spec.as_ref().map(sqlx::types::Json))
         .bind(m.startup_timeout_mins.max(0))
         .bind(m.handoff_mins.max(0))
+        .bind(m.replica_api_key)
         .fetch_one(&self.pool)
         .await?;
         managed_model_from_row(&row)
@@ -489,19 +494,23 @@ impl Store {
         slurm_job_id: &str,
         port_base: Option<i64>,
     ) -> Result<ModelReplica> {
-        self.create_replica_with_log(model_id, slurm_job_id, port_base, None)
+        self.create_replica_with_log(model_id, slurm_job_id, port_base, None, None)
             .await
     }
 
     /// [`create_replica`](Self::create_replica), also recording where the
-    /// job's output goes.
+    /// job's output goes and the API key its server was started with. The
+    /// key is stored encrypted and read back only by
+    /// [`replica_api_keys`](Self::replica_api_keys).
     pub async fn create_replica_with_log(
         &self,
         model_id: Uuid,
         slurm_job_id: &str,
         port_base: Option<i64>,
         log_path: Option<&str>,
+        api_key: Option<&str>,
     ) -> Result<ModelReplica> {
+        let api_key = cipher().encrypt_opt(api_key.map(str::trim).filter(|k| !k.is_empty()));
         // The launch row keeps the launcher panel state with environment
         // values and secret-looking inputs hidden: launch history outlives
         // the deployment.
@@ -524,10 +533,11 @@ impl Store {
         // retried insert the launch row already exists and is left alone.
         let row = sqlx::query(
             "with r as (
-                insert into model_replicas (id, model_id, slurm_job_id, port_base, log_path)
-                values ($1, $2, $3, $4, $6)
+                insert into model_replicas (id, model_id, slurm_job_id, port_base, log_path, api_key)
+                values ($1, $2, $3, $4, $6, $7)
                 on conflict (model_id, slurm_job_id) do update set
                     log_path = coalesce(model_replicas.log_path, excluded.log_path),
+                    api_key = coalesce(model_replicas.api_key, excluded.api_key),
                     updated_at = now()
                 returning id, model_id, slurm_job_id, nodes, endpoint_id, state,
                           last_message, port_base, cancel_requested, replace_requested, job_started_at,
@@ -554,9 +564,26 @@ impl Store {
         .bind(port_base)
         .bind(launcher_spec.map(sqlx::types::Json))
         .bind(log_path)
+        .bind(api_key)
         .fetch_one(&self.pool)
         .await?;
         replica_from_row(&row)
+    }
+
+    /// The API key of every replica that was started with one, by replica
+    /// id. For the provisioner, which probes and registers the replicas;
+    /// replica rows themselves never carry the key.
+    pub async fn replica_api_keys(&self) -> Result<HashMap<Uuid, String>> {
+        let rows = sqlx::query("select id, api_key from model_replicas where api_key is not null")
+            .fetch_all(&self.pool)
+            .await?;
+        let mut out = HashMap::with_capacity(rows.len());
+        for row in &rows {
+            if let Some(key) = cipher().decrypt_opt(row.try_get("api_key")?)? {
+                out.insert(row.try_get("id")?, key);
+            }
+        }
+        Ok(out)
     }
 
     /// Flag a replica for surge-first replacement: the provisioner submits a
@@ -1037,6 +1064,7 @@ mod tests {
                 launcher_spec: Some(serde_json::json!({"backendId":"llamacpp"})),
                 startup_timeout_mins: 60,
                 handoff_mins: 15,
+                replica_api_key: false,
             })
             .await
             .expect("upsert");
@@ -1105,6 +1133,7 @@ mod tests {
                 launcher_spec: None,
                 startup_timeout_mins: 60,
                 handoff_mins: 15,
+                replica_api_key: false,
             })
             .await
             .expect("managed");
@@ -1181,6 +1210,7 @@ mod tests {
                 launcher_spec: None,
                 startup_timeout_mins: 60,
                 handoff_mins: 15,
+                replica_api_key: false,
             })
             .await
             .expect("managed");
@@ -1212,6 +1242,7 @@ mod tests {
             launcher_spec: Some(serde_json::json!({ "env": { "HF_TOKEN": "s3cret" } })),
             startup_timeout_mins: 30,
             handoff_mins: 0,
+            replica_api_key: false,
         };
         let m = store
             .upsert_managed_model(zero.clone())
@@ -1256,11 +1287,33 @@ mod tests {
             .expect("none"));
 
         let r = store
-            .create_replica_with_log(model.id, "j-backoff", Some(8000), Some("/tmp/x-1.out"))
+            .create_replica_with_log(
+                model.id,
+                "j-backoff",
+                Some(8000),
+                Some("/tmp/x-1.out"),
+                None,
+            )
             .await
             .expect("replica");
         assert_eq!(r.log_path.as_deref(), Some("/tmp/x-1.out"));
         assert!(!r.replace_requested);
+        // A replica started with its own API key: the key is read back only
+        // by `replica_api_keys`, and a retried insert keeps it.
+        let keyed = store
+            .create_replica_with_log(model.id, "j-keyed", Some(8010), None, Some(" k-one "))
+            .await
+            .expect("keyed replica");
+        let again = store
+            .create_replica_with_log(model.id, "j-keyed", Some(8010), None, None)
+            .await
+            .expect("retried insert");
+        assert_eq!(again.id, keyed.id);
+        let keys = store.replica_api_keys().await.expect("keys");
+        assert_eq!(keys.get(&keyed.id).map(String::as_str), Some("k-one"));
+        assert!(!keys.contains_key(&r.id), "no key unless started with one");
+        assert!(!serde_json::to_string(&keyed).unwrap().contains("k-one"));
+        store.delete_replica(keyed.id).await.expect("delete keyed");
         // The launch row hides environment values.
         let spec: serde_json::Value =
             sqlx::query_scalar::<_, sqlx::types::Json<serde_json::Value>>(
@@ -1657,6 +1710,7 @@ mod tests {
                 launcher_spec: Some(serde_json::json!({"source":"recipe","recipe_id":recipe_id})),
                 startup_timeout_mins: 60,
                 handoff_mins: 15,
+                replica_api_key: false,
             })
             .await
             .expect("upsert managed");
