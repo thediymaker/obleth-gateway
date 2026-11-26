@@ -28,6 +28,8 @@ export interface ServingFields {
   serve_from: number;
   stop_after_failed_launches: number;
   health_path: string;
+  /** Start each replica's job with an API key of its own, which its server then requires. */
+  replica_api_key: boolean;
 }
 
 export interface DeployForm {
@@ -74,6 +76,7 @@ export function baselineForm(recipeId: string, p: RecipeDeployPreview, cv: Clust
       serve_from: 1,
       stop_after_failed_launches: p.maxJobFailures ?? 2,
       health_path: p.healthPath,
+      replica_api_key: p.replicaApiKey ?? false,
     },
     ...(overrides.modelType && overrides.modelType !== p.modelType ? { model_type: overrides.modelType } : {}),
   };
@@ -126,6 +129,7 @@ export function toOverrides(form: DeployForm): DeployOverrides {
     target_replicas: target,
     min_replicas: Math.min(Math.max(1, Math.floor(form.serving.serve_from) || 1), target),
     max_job_failures: Math.max(0, Math.floor(form.serving.stop_after_failed_launches) || 0),
+    replica_api_key: form.serving.replica_api_key === true,
     inputs: form.inputs,
     env: Object.fromEntries(Object.entries(form.env).filter(([k]) => k.trim())),
   };
@@ -221,12 +225,14 @@ function editDistance(a: string, b: string): number {
 // ---------------------------------------------------------------------------
 
 const SLURM_KEYS: (keyof SlurmFields)[] = ["partition", "account", "qos", "time_limit", "nodes", "gres", "cpus_per_task", "mem", "constraints", "exclude", "log_output_dir"];
-const SERVING_KEYS: (keyof ServingFields)[] = ["keep_running", "serve_from", "stop_after_failed_launches", "health_path"];
+const SERVING_KEYS: (keyof ServingFields)[] = ["keep_running", "serve_from", "stop_after_failed_launches", "health_path", "replica_api_key"];
+const BOOLEAN = new Set(["serving.replica_api_key"]);
 const NUMERIC = new Set(["slurm.nodes", "slurm.cpus_per_task", "serving.keep_running", "serving.serve_from", "serving.stop_after_failed_launches"]);
 
 /** A value as YAML should show it: numbers as numbers, flags as booleans. */
 function yamlValue(path: FieldPath, v: unknown): unknown {
   if (NUMERIC.has(path) && v !== "" && v != null && Number.isFinite(Number(v))) return Number(v);
+  if (BOOLEAN.has(path)) return v === true;
   if (path.startsWith("inputs.") && (v === "true" || v === "false")) return v === "true";
   if (path.startsWith("inputs.") && typeof v === "string" && /^-?\d+(\.\d+)?$/.test(v)) return Number(v);
   return v;
@@ -327,7 +333,13 @@ export function yamlToForm(text: string, base: DeployForm, inputNames: string[])
         form = { ...form, env };
         continue;
       }
-      if (NUMERIC.has(path)) {
+      if (BOOLEAN.has(path)) {
+        if (typeof raw !== "boolean") {
+          problems.push({ line, message: `${k} should be true or false` });
+          continue;
+        }
+        form = setField(form, path, raw);
+      } else if (NUMERIC.has(path)) {
         if (str !== "" && !Number.isFinite(Number(str))) {
           problems.push({ line, message: `${k} should be a number` });
           continue;

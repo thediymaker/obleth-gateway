@@ -80,6 +80,8 @@ export function savedRecipeText(source: string, form: DeployForm, as: SaveAs): s
   h.set("min_replicas", form.serving.serve_from);
   h.set("max_job_failures", form.serving.stop_after_failed_launches);
   h.set("health_path", form.serving.health_path);
+  if (form.serving.replica_api_key) h.set("replica_api_key", true);
+  else h.delete("replica_api_key");
   // Edit env in place so the recipe's comments on its variables survive.
   const env = Object.fromEntries(Object.entries(form.env).filter(([k]) => k.trim()));
   const envNode = h.get("env", true);

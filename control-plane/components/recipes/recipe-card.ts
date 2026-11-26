@@ -14,6 +14,8 @@ export interface RecipeDeployPreview {
   healthPath: string;
   targetReplicas: number;
   maxJobFailures: number;
+  /** The recipe starts each replica with an API key of its own. */
+  replicaApiKey?: boolean;
   partition: string;
   gres?: string;
   cpusPerTask?: number | null;

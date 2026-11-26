@@ -302,7 +302,7 @@ export async function saveRecipeFromDeploymentAction(modelId: string, name: stri
         log_output_dir: spec.log_output_dir ?? "",
       },
       env: { ...(ls.env ?? recipe.header.env ?? {}) },
-      serving: { keep_running: spec.target_replicas, serve_from: spec.min_replicas, stop_after_failed_launches: spec.max_job_failures, health_path: spec.health_path },
+      serving: { keep_running: spec.target_replicas, serve_from: spec.min_replicas, stop_after_failed_launches: spec.max_job_failures, health_path: spec.health_path, replica_api_key: spec.replica_api_key ?? false },
     };
     const model_ = recipe.header.kind === "engine" ? ls.inputs?.model : undefined;
     // The script it runs: changed on the deployment's page after launch (the

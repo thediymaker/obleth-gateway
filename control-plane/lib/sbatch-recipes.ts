@@ -39,6 +39,8 @@ export interface RecipeHeader {
   min_replicas?: number;
   target_replicas?: number;
   max_job_failures?: number;
+  /** Start each replica's job with an API key of its own. */
+  replica_api_key?: boolean;
   partition?: string;
   gres?: string;
   cpus_per_task?: number;
@@ -118,7 +120,7 @@ export { MODEL_NAME_RE, MODEL_NAME_RULE };
 export const HEADER_KEYS = [
   "name", "description", "engine", "kind", "model", "weights_gb", "requires",
   "model_type", "api_model_name", "context_window", "capabilities",
-  "port", "health_path", "target_replicas", "min_replicas", "max_job_failures",
+  "port", "health_path", "target_replicas", "min_replicas", "max_job_failures", "replica_api_key",
   "partition", "account", "qos", "time_limit", "nodes", "node_options", "node_notes",
   "gres", "cpus_per_task", "mem", "constraints", "exclude", "log_output_dir",
   "based_on", "env", "tested", "inputs", "variables",
@@ -241,6 +243,7 @@ const HeaderSchema = z
     min_replicas: z.coerce.number().int().positive().optional(),
     target_replicas: z.coerce.number().int().nonnegative().default(1),
     max_job_failures: z.coerce.number().int().nonnegative().default(2),
+    replica_api_key: z.boolean().optional(),
     partition: z.string().optional(),
     gres: z.string().optional(),
     cpus_per_task: z.coerce.number().int().positive().optional(),
@@ -484,6 +487,8 @@ export interface DeployOverrides {
   health_path?: string;
   min_replicas?: number;
   max_job_failures?: number;
+  /** Start each replica's job with an API key of its own; `undefined` keeps the recipe's choice. */
+  replica_api_key?: boolean;
   /** Input values by name. `variables` is the older name for the same thing. */
   inputs?: Record<string, string>;
   variables?: Record<string, string>;
@@ -595,6 +600,8 @@ export function buildManagedFromRecipe(
     min_replicas: overrides.min_replicas ?? h.min_replicas ?? 1,
     target_replicas: targetReplicas,
     max_job_failures: overrides.max_job_failures ?? h.max_job_failures ?? 2,
+    // Sent only when on: off is what the gateway assumes.
+    ...((overrides.replica_api_key ?? h.replica_api_key) ? { replica_api_key: true } : {}),
     launcher_spec: {
       source: "recipe",
       recipe_id: recipe.id,
@@ -670,6 +677,7 @@ export function buildDeployPreview(recipe: ParsedRecipe): RecipeDeployPreview | 
     healthPath: m.health_path ?? "/health",
     targetReplicas: m.target_replicas ?? 1,
     maxJobFailures: m.max_job_failures ?? 2,
+    replicaApiKey: m.replica_api_key ?? false,
     contextWindow: payload.createBody.context_window,
     capabilities: MODEL_CAPABILITIES.filter((c) => (payload.createBody as Record<string, unknown>)[`supports_${c}`] === true),
     partition: m.partition,
