@@ -127,7 +127,7 @@ pub(crate) async fn complaint(
     {
         return false;
     }
-    let Some(name) = settings.classifier_model.as_deref() else {
+    let Some(name) = settings.classifier_brain() else {
         return false;
     };
     if name == crate::router::AUTO_MODEL_NAME {

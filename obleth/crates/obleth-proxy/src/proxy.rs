@@ -3372,7 +3372,7 @@ pub(crate) async fn derive_intent(
 ) -> crate::router::Intent {
     let mut classified = crate::router::Classified::default();
     if !skip_classifier && settings.classifier_active() && !available_tags.is_empty() {
-        if let Some(name) = settings.classifier_model.as_deref() {
+        if let Some(name) = settings.classifier_brain() {
             if name != crate::router::AUTO_MODEL_NAME {
                 if let Some(prompt) = crate::router::classifier_prompt(json, classify_system) {
                     if let Some(brain) = resolve_model(state, name).await {
@@ -3426,7 +3426,7 @@ pub async fn classify_for_simulate(
     if !settings.classifier_active() || available_tags.is_empty() {
         return none;
     }
-    let Some(name) = settings.classifier_model.as_deref() else {
+    let Some(name) = settings.classifier_brain() else {
         return none;
     };
     if name == crate::router::AUTO_MODEL_NAME || prompt.trim().is_empty() {

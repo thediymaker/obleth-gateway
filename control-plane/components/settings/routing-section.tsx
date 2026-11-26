@@ -77,10 +77,10 @@ export function RoutingSection({ settings, models, readiness }: { settings: Auto
           </label>
         ))}
       </Setting>
-      <Setting id="set-classifier" label="Classifier" hint="A fast model that reads each request and says how hard it is and what it is about (coding, math…). Off, routing reads both from the text by rule." fields={["routing.classifier_enabled", "routing.classifier_model", "routing.classifier_timeout_ms"]}>
+      <Setting id="set-classifier" label="Classifier" hint="A fast model that reads each request and says how hard it is and what it is about (coding, math…). It asks the default model for verdicts unless you pick another. Off, or with neither set, routing reads both from the text by rule." fields={["routing.classifier_enabled", "routing.classifier_model", "routing.classifier_timeout_ms"]}>
         <div className="flex flex-wrap items-center gap-2.5">
           <Switch name="routing.classifier_enabled" label="Use a classifier" checked={classifierOn} onChange={setClassifierOn} />
-          <div className="w-64"><SelectField name="routing.classifier_model" label="Classifier model" value={classifier} onChange={setClassifier} options={[{ value: "", label: "None" }, ...names.map((n) => ({ value: n, label: n }))]} /></div>
+          <div className="w-64"><SelectField name="routing.classifier_model" label="Classifier model" value={classifier} onChange={setClassifier} options={[{ value: "", label: verdicts ? `Verdicts default (${verdicts})` : "Verdicts default (none set)" }, ...names.map((n) => ({ value: n, label: n }))]} /></div>
           <span className="text-xs text-muted-foreground">gives up after</span>
           <TextField name="routing.classifier_timeout_ms" label="Classifier timeout" inputMode="numeric" defaultValue={settings.classifier_timeout_ms} mono className="w-24" />
           <span className="text-xs text-muted-foreground">ms</span>

@@ -314,9 +314,11 @@ pub struct AutoRouterSettings {
     /// derive intent tags. When false (or unavailable) the router falls back to
     /// cheap heuristics, then capacity/cost scoring.
     pub classifier_enabled: bool,
-    /// `model_name` of the registered model used as the classifier "brain"
-    /// (e.g. a sub-1B model). `None` disables the model call regardless of
-    /// `classifier_enabled`.
+    /// `model_name` of the registered model used as the classifier "brain".
+    /// `None` means the classifier asks `verdicts_default_model`, the model
+    /// the gateway answers verdicts with: the classifier's questions are
+    /// verdicts. With neither set there is no model call, whatever
+    /// `classifier_enabled` says.
     pub classifier_model: Option<String>,
     /// Hard timeout for the classifier call. On timeout the router falls back
     /// to heuristics so an `auto` request is never blocked on the brain.
@@ -377,13 +379,18 @@ impl Default for AutoRouterSettings {
 }
 
 impl AutoRouterSettings {
-    /// True when the classifier is both enabled and points at a model.
+    /// The model the classifier asks: `classifier_model` when one is named,
+    /// else the default model for verdicts.
+    pub fn classifier_brain(&self) -> Option<&str> {
+        fn named(model: &Option<String>) -> Option<&str> {
+            model.as_deref().map(str::trim).filter(|m| !m.is_empty())
+        }
+        named(&self.classifier_model).or_else(|| named(&self.verdicts_default_model))
+    }
+
+    /// True when the classifier is both enabled and has a model to ask.
     pub fn classifier_active(&self) -> bool {
-        self.classifier_enabled
-            && self
-                .classifier_model
-                .as_ref()
-                .is_some_and(|m| !m.trim().is_empty())
+        self.classifier_enabled && self.classifier_brain().is_some()
     }
 }
 
@@ -1142,6 +1149,29 @@ mod tests {
         assert_eq!(s.temperature, 0.0);
         assert!(!s.difficulty_enabled);
         assert_eq!(s.tier_source, TierSource::Hybrid);
+    }
+
+    #[test]
+    fn the_classifier_asks_the_verdicts_default_model_when_it_names_none() {
+        let mut s = AutoRouterSettings {
+            classifier_enabled: true,
+            ..Default::default()
+        };
+        assert_eq!(s.classifier_brain(), None);
+        assert!(!s.classifier_active(), "no model to ask");
+
+        s.verdicts_default_model = Some("judge".into());
+        assert_eq!(s.classifier_brain(), Some("judge"));
+        assert!(s.classifier_active());
+
+        // A model named for the classifier wins; a blank one names none.
+        s.classifier_model = Some("brain".into());
+        assert_eq!(s.classifier_brain(), Some("brain"));
+        s.classifier_model = Some("  ".into());
+        assert_eq!(s.classifier_brain(), Some("judge"));
+
+        s.classifier_enabled = false;
+        assert!(!s.classifier_active());
     }
 
     #[test]

@@ -93,16 +93,18 @@ pub fn build_readiness(settings: &AutoRouterSettings, candidates: &[Candidate]) 
             severity: "info",
             code: "classifier_off",
             title: "Auto routing is using keyword heuristics only".to_string(),
-            detail: "No classifier model is configured, so request intent comes from a \
-                     fixed keyword scan. Enabling a small, fast registered model as the \
-                     classifier makes tagging much more reliable."
+            detail: "The classifier is off, or has no model to ask, so request intent \
+                     comes from a fixed keyword scan. Turn the classifier on: it asks the \
+                     default model for verdicts unless you name another, and reads \
+                     difficulty and topic far more reliably."
                 .to_string(),
             models: Vec::new(),
         });
-    } else if let Some(name) = settings.classifier_model.as_deref() {
-        let registered = candidates
-            .iter()
-            .find(|c| c.model.model_name == name && c.model.enabled);
+    } else if let Some(name) = settings.classifier_brain() {
+        let registered = candidates.iter().find(|c| {
+            c.model.enabled
+                && (c.model.model_name == name || c.model.aliases.iter().any(|a| a == name))
+        });
         if name == "auto" {
             findings.push(ReadinessFinding {
                 severity: "warn",
@@ -405,6 +407,25 @@ mod tests {
             ..Default::default()
         };
         let r = build_readiness(&missing, &cands);
+        assert!(codes(&r).contains(&"classifier_missing"));
+
+        // With no classifier model named, the verdicts default is the one
+        // asked, and the one checked.
+        let by_default = AutoRouterSettings {
+            classifier_enabled: true,
+            verdicts_default_model: Some("m".to_string()),
+            ..Default::default()
+        };
+        let r = build_readiness(&by_default, &cands);
+        assert!(r.classifier_active);
+        assert!(!codes(&r).contains(&"classifier_off"));
+        assert!(!codes(&r).contains(&"classifier_missing"));
+        let by_missing_default = AutoRouterSettings {
+            classifier_enabled: true,
+            verdicts_default_model: Some("ghost".to_string()),
+            ..Default::default()
+        };
+        let r = build_readiness(&by_missing_default, &cands);
         assert!(codes(&r).contains(&"classifier_missing"));
 
         let is_auto = AutoRouterSettings {
