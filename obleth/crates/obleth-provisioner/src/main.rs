@@ -725,9 +725,10 @@ async fn tick(
         if open {
             warnings.push(format!(
                 "A replica of {} was started with an API key, but its server answers requests \
-                 that carry none, so anything that can reach its port can use it. Give \
-                 {} to the server in the job script (vLLM and llama.cpp read it on their own), \
-                 then restart the replica.",
+                 that carry none, so anything that can reach its port can use it. vLLM and \
+                 llama.cpp read the key from VLLM_API_KEY and LLAMA_API_KEY unless the job \
+                 script unsets or replaces them; another server needs ${} passed to it. Fix \
+                 the script, then restart the replica.",
                 w.identity.name,
                 slurm::REPLICA_API_KEY_ENV
             ));
