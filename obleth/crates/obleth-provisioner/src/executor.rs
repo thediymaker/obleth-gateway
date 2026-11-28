@@ -21,6 +21,10 @@ use obleth_config::ManagedModelSpec;
 /// it in `main.rs` (rather than recomputing here) keeps multiple `Submit`s in the
 /// same tick, and every model's replicas, on windows of their own. Ignored for
 /// non-`Submit` actions.
+///
+/// `replica_key` is the replica's own API key, when its deployment gives
+/// replicas one: for `Submit` the new key the job's server is to require, for
+/// `Promote` the key the replica was started with, registered on its endpoint.
 #[allow(clippy::too_many_arguments)]
 pub async fn apply(
     action: &Action,
@@ -33,13 +37,15 @@ pub async fn apply(
     slurm: &dyn SlurmClient,
     obleth: &dyn OblethClient,
     resolver: &HostResolver,
+    replica_key: Option<&str>,
 ) -> anyhow::Result<Option<String>> {
     match action {
         Action::Submit => {
             let spec = submit_spec.ok_or_else(|| {
                 anyhow::anyhow!("Submit requires a managed spec (model {model_id})")
             })?;
-            let job = job_submit_from_spec(spec, model_name, job_prefix, port_base, port_span);
+            let mut job = job_submit_from_spec(spec, model_name, job_prefix, port_base, port_span);
+            job.api_key = replica_key.map(str::to_string);
             let job_id = match slurm.submit(&job).await {
                 Ok(submitted) => {
                     for note in &submitted.notes {
@@ -63,7 +69,7 @@ pub async fn apply(
             // the cluster for orphans — so cancel it (compensating action).
             let log_path = crate::slurm::job_log_path(&job, &job_id);
             if let Err(e) = obleth
-                .create_replica(model_id, &job_id, port_base, Some(&log_path))
+                .create_replica(model_id, &job_id, port_base, Some(&log_path), replica_key)
                 .await
             {
                 match slurm.cancel(&job_id).await {
@@ -109,7 +115,7 @@ pub async fn apply(
                 }
                 None => {
                     obleth
-                        .create_endpoint(model_id, &name, &ip_api_base)
+                        .create_endpoint(model_id, &name, &ip_api_base, replica_key)
                         .await?
                 }
             };
@@ -399,11 +405,47 @@ mod tests {
             &slurm,
             &obleth,
             &resolver(),
+            None,
         )
         .await
         .unwrap();
         assert_eq!(slurm.submitted.lock().unwrap().len(), 1);
         assert_eq!(obleth.created_replicas.lock().unwrap().len(), 1);
+        // No key unless the caller makes one for the job.
+        assert_eq!(slurm.submitted.lock().unwrap()[0].api_key, None);
+        assert_eq!(*obleth.replica_keys.lock().unwrap(), vec![None]);
+    }
+
+    #[tokio::test]
+    async fn a_submit_with_a_key_starts_the_job_with_it_and_records_it() {
+        let slurm = mock_slurm();
+        let obleth = MockObleth::default();
+        let s = spec();
+        apply(
+            &Action::Submit,
+            s.model_id,
+            "nemotron",
+            Some(&s),
+            "obleth-",
+            8,
+            8000,
+            &slurm,
+            &obleth,
+            &resolver(),
+            Some("obl-replica-k1"),
+        )
+        .await
+        .unwrap();
+        let submitted = slurm.submitted.lock().unwrap();
+        assert_eq!(submitted[0].api_key.as_deref(), Some("obl-replica-k1"));
+        assert!(
+            !submitted[0].script.contains("obl-replica-k1"),
+            "the key goes in the job's environment, never in its script"
+        );
+        assert_eq!(
+            *obleth.replica_keys.lock().unwrap(),
+            vec![Some("obl-replica-k1".to_string())]
+        );
     }
 
     #[tokio::test]
@@ -427,6 +469,7 @@ mod tests {
             &slurm,
             &obleth,
             &resolver(),
+            None,
         )
         .await;
         assert!(err.is_err(), "Submit must propagate the record failure");
@@ -452,6 +495,7 @@ mod tests {
             &slurm,
             &obleth,
             &resolver(),
+            None,
         )
         .await;
         assert!(err.is_err(), "Submit must fail without a spec");
@@ -488,9 +532,16 @@ mod tests {
             &slurm,
             &obleth,
             &resolver,
+            Some("obl-replica-k1"),
         )
         .await
         .unwrap();
+        // The endpoint carries the key the replica was started with, so the
+        // gateway can reach a server that requires it.
+        assert_eq!(
+            *obleth.endpoint_keys.lock().unwrap(),
+            vec![Some("obl-replica-k1".to_string())]
+        );
         let eps = obleth.created_endpoints.lock().unwrap();
         assert_eq!(eps.len(), 1);
         assert_eq!(
@@ -542,6 +593,7 @@ mod tests {
             &slurm,
             &obleth,
             &resolver(),
+            None,
         )
         .await
         .unwrap();
@@ -581,6 +633,7 @@ mod tests {
             &slurm,
             &obleth,
             &resolver(),
+            None,
         )
         .await
         .unwrap();
@@ -622,6 +675,7 @@ mod tests {
             &slurm,
             &obleth,
             &resolver(),
+            None,
         )
         .await
         .unwrap();
@@ -663,6 +717,7 @@ mod tests {
             &slurm,
             &obleth,
             &resolver(),
+            None,
         )
         .await
         .unwrap();
@@ -689,6 +744,7 @@ mod tests {
             &slurm,
             &obleth,
             &resolver(),
+            None,
         )
         .await;
         assert!(err.is_err(), "submit rejection propagates");
@@ -715,6 +771,7 @@ mod tests {
             &slurm,
             &obleth,
             &resolver(),
+            None,
         )
         .await
         .unwrap();
@@ -741,6 +798,7 @@ mod tests {
             slurm,
             obleth,
             &resolver(),
+            None,
         )
         .await
     }

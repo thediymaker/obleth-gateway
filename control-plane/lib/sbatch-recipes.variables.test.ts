@@ -67,6 +67,20 @@ const recipeWithBody = (body: string) =>
     ].join("\n"),
   );
 
+describe("an API key per replica", () => {
+  const recipe = (header: string[] = []) =>
+    parseRecipe("t", ["---", "name: T", "engine: vllm", "model_type: chat", "api_model_name: m", "port: 8000", ...header, "---", "vllm serve m --port $OBLETH_SERVING_PORT"].join("\n"));
+
+  it("is off unless the recipe or the launch asks for it, and the launch wins", () => {
+    expect(buildManagedFromRecipe(recipe(), {}).managedBody).not.toHaveProperty("replica_api_key");
+    expect(buildManagedFromRecipe(recipe(), { replica_api_key: true }).managedBody.replica_api_key).toBe(true);
+    const keyed = recipe(["replica_api_key: true"]);
+    expect(keyed.valid).toBe(true);
+    expect(buildManagedFromRecipe(keyed, {}).managedBody.replica_api_key).toBe(true);
+    expect(buildManagedFromRecipe(keyed, { replica_api_key: false }).managedBody).not.toHaveProperty("replica_api_key");
+  });
+});
+
 describe("recipe variable substitution", () => {
   it("substitutes declared {{vars}} and leaves shell ${} alone", () => {
     const r = recipeWithBody("run {{image}} --tag {{ tag }} --home ${HOME}");

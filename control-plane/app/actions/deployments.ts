@@ -122,6 +122,7 @@ function specToPut(s: ManagedModelSpec): PutManagedModel {
     // Sent only when the gateway reported them, so an older one isn't sent fields it doesn't know.
     ...(s.startup_timeout_mins !== undefined ? { startup_timeout_mins: s.startup_timeout_mins } : {}),
     ...(s.handoff_mins !== undefined ? { handoff_mins: s.handoff_mins } : {}),
+    ...(s.replica_api_key !== undefined ? { replica_api_key: s.replica_api_key } : {}),
   };
 }
 
@@ -188,6 +189,8 @@ export async function saveDeploymentSettingsAction(formData: FormData): Promise<
       max_job_failures: int("max_job_failures"),
       ...(text("startup_timeout_mins") ? { startup_timeout_mins: int("startup_timeout_mins") } : {}),
       ...(text("handoff_mins") ? { handoff_mins: int("handoff_mins") } : {}),
+      // A switch that is off sends nothing, so the form says when it carries one.
+      ...(text("has_replica_api_key") ? { replica_api_key: text("replica_api_key") === "on" } : {}),
     };
   });
   return res.ok ? { ok: true } : { ok: false, error: res.error, saved: [] };
@@ -299,7 +302,7 @@ export async function saveRecipeFromDeploymentAction(modelId: string, name: stri
         log_output_dir: spec.log_output_dir ?? "",
       },
       env: { ...(ls.env ?? recipe.header.env ?? {}) },
-      serving: { keep_running: spec.target_replicas, serve_from: spec.min_replicas, stop_after_failed_launches: spec.max_job_failures, health_path: spec.health_path },
+      serving: { keep_running: spec.target_replicas, serve_from: spec.min_replicas, stop_after_failed_launches: spec.max_job_failures, health_path: spec.health_path, replica_api_key: spec.replica_api_key ?? false },
     };
     const model_ = recipe.header.kind === "engine" ? ls.inputs?.model : undefined;
     // The script it runs: changed on the deployment's page after launch (the

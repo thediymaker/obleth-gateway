@@ -33,6 +33,7 @@
 //! uniform draw — stay in `obleth-proxy`, which re-exports everything here so no
 //! data-plane call site has to name a different path.
 
+mod reading;
 pub mod route_explain;
 pub mod sticky;
 
@@ -56,6 +57,9 @@ pub struct RouterWeights {
     // `difficulty_enabled` gates the tier filter in `select_model`.
     pub temperature: f64,
     pub difficulty_enabled: bool,
+    /// With tiering on, serve a request from the lowest tier that meets its
+    /// difficulty and has room, instead of from any tier at or above it.
+    pub right_size: bool,
 }
 
 impl RouterWeights {
@@ -71,6 +75,7 @@ impl RouterWeights {
             },
             temperature: s.temperature.max(0.0),
             difficulty_enabled: s.difficulty_enabled,
+            right_size: s.difficulty_enabled && s.right_size_enabled,
         }
     }
 
@@ -183,12 +188,25 @@ pub fn derive_levels(candidates: &mut [Candidate], source: crate::TierSource) {
                 // Fewer than three members: rank order, not three bands.
                 (rank + 1) as u8
             };
-            let declared = candidates[i]
-                .model
-                .declared_levels
-                .iter()
-                .find(|(d, _)| d == domain)
-                .map(|(_, l)| *l);
+            // A request with no topic is ranked on a model's overall strength:
+            // the best level it declares anywhere. Without this every model
+            // held the same level on the general domain, and the difficulty
+            // of a request that named no topic changed nothing.
+            let declared = if domain == GENERAL_DOMAIN {
+                candidates[i]
+                    .model
+                    .declared_levels
+                    .iter()
+                    .map(|(_, l)| *l)
+                    .max()
+            } else {
+                candidates[i]
+                    .model
+                    .declared_levels
+                    .iter()
+                    .find(|(d, _)| d == domain)
+                    .map(|(_, l)| *l)
+            };
             let level = match source {
                 TierSource::Derived => derived,
                 TierSource::Declared => declared.unwrap_or(1),
@@ -291,7 +309,7 @@ impl BoonGrants {
 /// Every hard-filter reason string, in the order the filters are applied. A
 /// candidate is attributed to the *first* filter it fails, so this order is
 /// part of the explanation's contract, not just presentation.
-const REJECTION_REASONS: [&str; 13] = [
+const REJECTION_REASONS: [&str; 15] = [
     "disabled",
     "staged",
     "retiring",
@@ -305,6 +323,8 @@ const REJECTION_REASONS: [&str; 13] = [
     "vision",
     "tenant_allowlist",
     "below_tier_floor",
+    "tier_full",
+    "above_needed_tier",
 ];
 
 /// Expected completion length, in tokens, for a model the gateway has not yet
@@ -638,6 +658,51 @@ fn evaluate<'a>(
         eligible
     };
 
+    // ---- stage 2b: the smallest sufficient tier ----
+    // The floor says what a request needs. A model above it costs more and
+    // gives the request nothing it asked for, so with `right_size` the request
+    // is served from the lowest tier at or above the floor that has a model
+    // with room. A tier whose models are all at their caps gives way to the
+    // next one up: load spills upward, never down. When no tier has room,
+    // every survivor competes as before.
+    let eligible: Vec<&Candidate> = if weights.right_size && weights.difficulty_enabled {
+        let has_room = |c: &Candidate| {
+            let in_flight = busyness.get(&c.model.model_name).copied().unwrap_or(0) as f64;
+            let cap = match c.model.max_in_flight {
+                Some(cap) if cap > 0 => cap as f64,
+                _ => weights.soft_cap,
+            };
+            in_flight < cap
+        };
+        let mut tiers: Vec<u8> = eligible.iter().map(|c| c.strength(&tier_domains)).collect();
+        tiers.sort_unstable();
+        tiers.dedup();
+        let target = tiers.into_iter().find(|tier| {
+            eligible
+                .iter()
+                .any(|c| c.strength(&tier_domains) == *tier && has_room(c))
+        });
+        match target {
+            Some(target) => {
+                let mut kept = Vec::with_capacity(eligible.len());
+                for c in eligible {
+                    let strength = c.strength(&tier_domains);
+                    if strength == target {
+                        kept.push(c);
+                    } else if strength < target {
+                        reject("tier_full", &c.model.model_name);
+                    } else {
+                        reject("above_needed_tier", &c.model.model_name);
+                    }
+                }
+                kept
+            }
+            None => eligible,
+        }
+    } else {
+        eligible
+    };
+
     // ---- stage 3: scoring ----
     // Cost is estimated PER REQUEST, not per token: unit prices weighted by
     // the request's prompt estimate and each model's observed completion
@@ -820,9 +885,84 @@ pub fn select_model(
     .0
 }
 
-/// [`select_model`], and how many models the pick was made among: those that
-/// passed the hard filters and the difficulty floor and so were scored. That
-/// count is what `x-obleth-auto-why` reports, not the size of the registry.
+/// A model that was scored for an `auto` request and not chosen.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunnerUp {
+    pub model: String,
+    /// How far its score was from the chosen model's, never negative: `0.0` is
+    /// a tie, and a small figure says the pick could as well have gone here.
+    pub gap: f64,
+}
+
+/// How many runners-up an `auto` pick names.
+pub const RUNNERS_UP: usize = 2;
+
+/// What an `auto` pick was made among.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Among {
+    /// The models that were scored: those that passed the hard filters and the
+    /// difficulty floor.
+    pub count: usize,
+    /// The best-scored models that were not chosen, at most [`RUNNERS_UP`], in
+    /// the router's order.
+    pub next: Vec<RunnerUp>,
+}
+
+impl Among {
+    /// From the scored models in the router's order, as (name, score), and the
+    /// index of the one chosen.
+    pub fn of<'a>(
+        scored: impl ExactSizeIterator<Item = (&'a str, f64)>,
+        chosen: Option<usize>,
+    ) -> Self {
+        let count = scored.len();
+        let Some(chosen) = chosen else {
+            return Self {
+                count,
+                next: Vec::new(),
+            };
+        };
+        let mut picked = f64::NAN;
+        let mut others = Vec::with_capacity(RUNNERS_UP);
+        for (i, (model, score)) in scored.enumerate() {
+            if i == chosen {
+                picked = score;
+            } else if others.len() < RUNNERS_UP {
+                others.push((model, score));
+            } else if i > chosen {
+                break;
+            }
+        }
+        let next = others
+            .into_iter()
+            .map(|(model, score)| RunnerUp {
+                model: model.to_owned(),
+                gap: if picked.is_finite() && score.is_finite() {
+                    (picked - score).abs()
+                } else {
+                    0.0
+                },
+            })
+            .collect();
+        Self { count, next }
+    }
+}
+
+impl route_explain::RouteExplain {
+    /// What this pick was made among, the same as [`select_model_among`] gives
+    /// for the same evaluation.
+    pub fn among(&self) -> Among {
+        Among::of(
+            self.scored.iter().map(|s| (s.model.as_str(), s.score)),
+            self.scored.iter().position(|s| s.chosen),
+        )
+    }
+}
+
+/// [`select_model`], and what the pick was made among: how many models passed
+/// the hard filters and the difficulty floor and so were scored, which is the
+/// count `x-obleth-auto-why` reports (not the size of the registry), and the
+/// best of them that were not chosen, which `x-obleth-auto-next` names.
 #[allow(clippy::too_many_arguments)]
 pub fn select_model_among(
     candidates: &[Candidate],
@@ -835,7 +975,7 @@ pub fn select_model_among(
     weights: &RouterWeights,
     uniform: f64,
     difficulty: u8,
-) -> (Option<Arc<ResolvedModel>>, usize) {
+) -> (Option<Arc<ResolvedModel>>, Among) {
     let ev = evaluate(
         candidates,
         features,
@@ -849,10 +989,13 @@ pub fn select_model_among(
         difficulty,
         Narration::Off,
     );
-    (
-        ev.chosen.map(|i| ev.ordered[i].cand.model.clone()),
-        ev.ordered.len(),
-    )
+    let among = Among::of(
+        ev.ordered
+            .iter()
+            .map(|s| (s.cand.model.model_name.as_str(), s.score)),
+        ev.chosen,
+    );
+    (ev.chosen.map(|i| ev.ordered[i].cand.model.clone()), among)
 }
 
 /// Serve *and* explain one `auto` request from a single evaluation.
@@ -975,6 +1118,7 @@ fn narrate(
             tag: weights.tag,
             soft_cap: weights.soft_cap,
             difficulty_enabled: weights.difficulty_enabled,
+            right_size: weights.right_size,
         },
         temperature: weights.temperature,
         // Echoed verbatim, including at temperature 0 where it was ignored, so
@@ -1045,6 +1189,22 @@ pub fn difficulty_from_header(raw: Option<&str>) -> Option<u8> {
     }
 }
 
+/// Whether the newest thing the person said is small talk: a greeting, a
+/// thanks, an acknowledgement. There is nothing to ask a classifier about
+/// such a message, so [`classifier_prompts`] has none for it, and the message
+/// does not take the topic or the difficulty of the turn before it, as a
+/// follow-up with no topic of its own otherwise would.
+pub fn is_small_talk(json: &serde_json::Value) -> bool {
+    messages(json)
+        .iter()
+        .rev()
+        .find(|m| role(m) == "user")
+        .is_some_and(|m| {
+            let text = message_text(m.get("content")).to_ascii_lowercase();
+            !has_image_part(m) && reading::is_pleasantry(text.trim())
+        })
+}
+
 /// Cheap, dependency-free intent derived from the request body: which topics
 /// it touches, and how hard it looks. Used as a fallback when the classifier
 /// is disabled, unconfigured, or unavailable so `auto` routing still gets a
@@ -1066,15 +1226,17 @@ pub fn heuristic_intent(json: &serde_json::Value, est_input_tokens: u64) -> Inte
         .filter(|m| role(m) == "user")
         .collect();
     let has_image = user_turns.iter().any(|m| has_image_part(m));
-    let text = user_turns
+    // What the person said, oldest first, as far back as the classifier reads.
+    let mut said: Vec<String> = user_turns
         .iter()
         .rev()
         .take(CLASSIFIER_LOOKBACK_TURNS)
         .map(|m| message_text(m.get("content")))
-        .find(|t| !t.trim().is_empty())
-        .unwrap_or_default();
+        .filter(|t| !t.trim().is_empty())
+        .collect();
+    said.reverse();
+    let text = said.last().cloned().unwrap_or_default();
     let text = head_bytes(&text, HEURISTIC_MAX_BYTES);
-    let lower = text.to_ascii_lowercase();
 
     let mut tags: Vec<String> = Vec::new();
     let mut push = |t: &str| {
@@ -1087,6 +1249,41 @@ pub fn heuristic_intent(json: &serde_json::Value, est_input_tokens: u64) -> Inte
     if has_image {
         push("vision");
     }
+    let mut topics = heuristic_topics(text);
+    // A short follow-up ("continue", "that still fails") is about what the
+    // request before it was about.
+    if topics.is_empty() && said.len() > 1 {
+        let lower = text.to_ascii_lowercase();
+        if reading::follows_on(lower.trim()) && !reading::is_pleasantry(lower.trim()) {
+            topics = heuristic_topics(head_bytes(&said[said.len() - 2], HEURISTIC_MAX_BYTES));
+        }
+    }
+    for topic in topics {
+        push(topic);
+    }
+
+    if est_input_tokens > HEURISTIC_LONG_CONTEXT_TOKENS {
+        push("long-context");
+    }
+
+    // Difficulty from what the words show: see `reading`. The middle is the
+    // default, so a request that shows nothing is neither sent to the weakest
+    // models nor to the strongest. Only the person's own turns are read: the
+    // system text and tool definitions a client sends with every message say
+    // nothing about how hard this one is.
+    let difficulty = reading::difficulty(&said);
+
+    Intent {
+        tags,
+        difficulty,
+        source: IntentSource::Heuristic,
+    }
+}
+
+/// The topics one message is about, from the fixed vocabulary.
+fn heuristic_topics(text: &str) -> Vec<&'static str> {
+    let lower = text.to_ascii_lowercase();
+    let mut topics = Vec::new();
 
     let code_signal = text.contains("```")
         || [
@@ -1098,6 +1295,7 @@ pub fn heuristic_intent(json: &serde_json::Value, est_input_tokens: u64) -> Inte
             "public ",
             "const ",
             "=> ",
+            "c++",
         ]
         .iter()
         .any(|k| lower.contains(k))
@@ -1113,18 +1311,96 @@ pub fn heuristic_intent(json: &serde_json::Value, est_input_tokens: u64) -> Inte
             "java",
             "sql",
             "regex",
+            "script",
+            "query",
+            "dockerfile",
+            "docker",
+            "bash",
+            "awk",
+            "pytest",
+            "unit tests",
+            "git",
+            "vim",
+            "chmod",
+            "syntax",
+            "api",
+            "schema",
+            "parser",
+            "mutex",
+            "deadlock",
+            "deadlocks",
+            "race condition",
+            "lock-free",
+            "refactor",
+            "postgres",
+            "postgresql",
+            "mysql",
+            "golang",
+            "go service",
+            "tokio",
+            "panicked",
+            "traceback",
+            "pandas",
+            "numpy",
+            "dataframe",
+            "df",
+            "flask",
+            "django",
+            "react",
+            "npm",
+            "pip",
+            "conda",
+            "json",
+            "yaml",
+            "endpoint",
+            "lambda",
+            "loop",
+            "typeerror",
+            "exception",
+            "segfault",
+            "compiler",
+            "makefile",
+            "cmake",
+            "kubectl",
+            "linux",
+            "command",
+            "terminal",
+            "shell",
+            "ssh",
+            "tar",
+            "grep",
+            "sed",
+            "cron",
+            "etl",
+            "openmp",
         ]
         .iter()
-        .any(|k| has_word(&lower, k));
+        .any(|k| has_word(&lower, k))
+        // Text that is itself code or a command line: a call, an option, a
+        // source file.
+        || ["`", "()", "):", " == ", "::", "->"]
+            .iter()
+            .any(|k| lower.contains(k))
+        || lower
+            .split_whitespace()
+            .any(|w| w.len() > 3 && w.starts_with("--") && w.as_bytes()[2].is_ascii_alphabetic())
+        || [".py", ".js", ".ts", ".rs", ".go", ".cpp", ".sh", ".sql"].iter().any(|ext| {
+            lower.match_indices(ext).any(|(at, _)| {
+                lower[at + ext.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !c.is_alphanumeric())
+            })
+        });
     if code_signal {
-        push("coding");
+        topics.push("coding");
     }
 
     // Prose to write or edit. Phrases rather than single words, and never
     // alongside a code signal: "write" and "email" alone match "write a SQL
     // query" and "validate an email address" just as well.
     let writing_signal = !code_signal
-        && [
+        && ([
             "short story",
             "poem",
             "sonnet",
@@ -1148,11 +1424,50 @@ pub fn heuristic_intent(json: &serde_json::Value, est_input_tokens: u64) -> Inte
             "fix the grammar",
             "more diplomatic",
             "more professional",
+            "draft a",
+            "polite reply",
+            "translate",
+            "grammar",
+            "less rude",
+            "more polite",
+            "more formal",
+            "friendlier",
+            " tone",
+            "shorten",
+            "tighten",
         ]
         .iter()
-        .any(|k| lower.contains(k));
+        .any(|k| lower.contains(k))
+            // A piece of prose asked for by its kind: "write a short
+            // thank-you note", "need a linkedin post".
+            || (["write", "draft", "compose", "need a", "need an", "give me a"]
+                .iter()
+                .any(|k| lower.contains(k))
+                && [
+                    "note",
+                    "letter",
+                    "email",
+                    "message",
+                    "description",
+                    "post",
+                    "bio",
+                    "speech",
+                    "toast",
+                    "abstract",
+                    "paragraph",
+                    "caption",
+                    "announcement",
+                    "blurb",
+                    "apology",
+                    "invitation",
+                    "story",
+                    "article",
+                    "slogan",
+                ]
+                .iter()
+                .any(|k| has_word(&lower, k))));
     if writing_signal {
-        push("writing");
+        topics.push("writing");
     }
 
     let math_signal = [
@@ -1166,71 +1481,60 @@ pub fn heuristic_intent(json: &serde_json::Value, est_input_tokens: u64) -> Inte
         "algebra",
         "calculus",
         "matrix",
+        "prove",
+        "proof",
+        "determinant",
+        "irrational",
+        "converges",
+        "closed form",
     ]
     .iter()
     .any(|k| has_word(&lower, k))
         || (lower.contains('=')
             && lower
                 .chars()
-                .any(|c| matches!(c, '+' | '-' | '*' | '/' | '^' | '∫' | '√' | '∑')));
-    if math_signal {
-        push("math");
+                .any(|c| matches!(c, '+' | '-' | '*' | '/' | '^' | '∫' | '√' | '∑')))
+        || [
+            "calculation",
+            "critical points",
+            "standard deviation",
+            "variance",
+            "p-value",
+            "confidence interval",
+            "eigenvalue",
+            "polynomial",
+            "logarithm",
+        ]
+        .iter()
+        .any(|k| lower.contains(k))
+        // A quantity asked for from figures given: a word problem.
+        || (reading::figures(&lower) >= 2
+            && [
+                "how high",
+                "how far",
+                "how fast",
+                "how likely",
+                "what's the chance",
+                "what is the chance",
+                "what are the chances",
+                "what fraction",
+                "what percent",
+            ]
+            .iter()
+            .any(|k| lower.contains(k)));
+    // Beside code, only a proof is mathematics: "solve" and "matrix" are
+    // everyday words there.
+    if math_signal && !(code_signal && !lower.contains("prove that") && !lower.contains("proof")) {
+        topics.push("math");
     }
-
-    if est_input_tokens > 32_000 {
-        push("long-context");
-    }
-
-    // Difficulty from the same scan. Each signal is a cheap proxy for effort;
-    // absence of signal means 1, so a quiet prompt always routes cheap.
-    let mut difficulty: u8 = 1;
-    let mut bump = |to: u8| {
-        if to > difficulty {
-            difficulty = to;
-        }
-    };
-    if lower.contains("stack backtrace")
-        || lower.contains("traceback (most recent call last)")
-        || lower.contains("panicked at")
-        || lower.contains("segmentation fault")
-    {
-        bump(3);
-    }
-    if [
-        "why does",
-        "race condition",
-        "deadlock",
-        "optimize",
-        "refactor",
-        "prove",
-        "derive",
-        "explain why",
-        "trade-off",
-        "root cause",
-    ]
-    .iter()
-    .any(|k| lower.contains(k))
-    {
-        bump(2);
-    }
-    // A long request is more work: the estimate covers the whole request, as
-    // the classifier's does, not only the turn read here.
-    if est_input_tokens > HEURISTIC_LONG_REQUEST_TOKENS {
-        bump(2);
-    }
-
-    Intent {
-        tags,
-        difficulty,
-        source: IntentSource::Heuristic,
-    }
+    topics
 }
 
 /// Most bytes of the newest user turn the heuristic reads.
 pub const HEURISTIC_MAX_BYTES: usize = 8_000;
-/// Estimated request tokens from which the heuristic counts a request as
-/// long enough to bump its difficulty (about 8 KB of text).
-pub const HEURISTIC_LONG_REQUEST_TOKENS: u64 = 2_000;
+/// Estimated tokens of the whole request from which the heuristic tags it
+/// `long-context`.
+pub const HEURISTIC_LONG_CONTEXT_TOKENS: u64 = 32_000;
 
 /// True when `word` occurs in `text` as a whole word (a letter or digit on
 /// neither side), so "java" matches "a java class" and not "javascript", and
@@ -1290,37 +1594,53 @@ pub fn classify_system_from_header(raw: Option<&str>) -> Option<usize> {
 /// Most bytes of request text one classifier call reads.
 pub const CLASSIFIER_PROMPT_MAX_BYTES: usize = 2_000;
 
-/// How many user turns, newest first, the classifier may read for one
-/// request. See [`classify_turns`].
+/// How many user turns, newest first, are read for one request.
 pub const CLASSIFIER_LOOKBACK_TURNS: usize = 3;
 
 /// The tag every chat request touches. A classification that names nothing
 /// more specific says nothing about where the request should go.
 const GENERAL_TAG: &str = "general";
 
-/// The classifier prompts for a chat body: one per user turn, newest first,
-/// at most [`CLASSIFIER_LOOKBACK_TURNS`].
+/// The longest newest message, in bytes, that is shown with the request it
+/// follows. A longer message says what it wants by itself.
+const FOLLOW_UP_MAX_BYTES: usize = 240;
+
+/// Most bytes of the earlier request a follow-up is shown with.
+const FOLLOWED_MAX_BYTES: usize = 600;
+
+/// An earlier message shorter than this is passed over for the one before it
+/// when there is one: "continue" and "try again" do not say what the
+/// conversation is about.
+const FOLLOWED_MIN_BYTES: usize = 25;
+
+/// The tags the classifier is not asked about, because the request itself
+/// shows them: an image part, or its size.
+const TAGS_READ_FROM_THE_REQUEST: [&str; 2] = ["vision", "long-context"];
+
+/// What the classifier is shown for a chat body: the newest thing the person
+/// said, with the leading system text before it. `None` when there is nothing
+/// to ask about: no user text, or small talk ([`is_small_talk`]), which the
+/// heuristics read.
 ///
-/// Each prompt is the leading system text plus a single user message, so a
-/// conversation that opens with "hello" and moves on to code is classified as
-/// code. Earlier turns are never mixed into the newest one: given both, the
-/// classifier follows the earlier topic, and a request for a script that comes
-/// after a request for a poem would route as `writing`. Tool results are not
-/// user turns, so an agent's tool loop keeps the classification of the
-/// request that started it.
+/// A short message ("continue", "that didn't fix it", "now make it skip empty
+/// cells") is as hard as the request it follows and about the same thing, so
+/// it is shown with that request, named as the earlier one, after it: the
+/// newest message comes first and decides when it changes the subject. A
+/// longer message is shown alone. Tool results are not user turns, so an
+/// agent's tool loop keeps the classification of the request that started it.
 ///
-/// The user message has first claim on [`CLASSIFIER_PROMPT_MAX_BYTES`] and the
-/// system text gets what is left, so a long system prompt cannot push the
+/// The person's text has first claim on [`CLASSIFIER_PROMPT_MAX_BYTES`] and
+/// the system text gets what is left, so a long system prompt cannot push the
 /// request itself out of view.
 ///
 /// `system_tail` is the client's [`CLASSIFY_SYSTEM_HEADER`]: only that many
 /// bytes at the end of the system text are read. A client whose system text is
 /// mostly its own instructions (tools, display formats) sends it, so those
 /// instructions do not decide the topic; `Some(0)` reads no system text.
-pub fn classifier_prompts(json: &serde_json::Value, system_tail: Option<usize>) -> Vec<String> {
+pub fn classifier_prompt(json: &serde_json::Value, system_tail: Option<usize>) -> Option<String> {
     let messages = messages(json);
-    if messages.is_empty() {
-        return Vec::new();
+    if messages.is_empty() || is_small_talk(json) {
+        return None;
     }
 
     let mut system: Vec<String> = Vec::new();
@@ -1343,57 +1663,81 @@ pub fn classifier_prompts(json: &serde_json::Value, system_tail: Option<usize>) 
         None => system,
     };
 
-    messages
+    // What the person said, newest first.
+    let said: Vec<String> = messages
         .iter()
         .rev()
         .filter(|msg| role(msg) == "user")
         .map(|msg| classifier_message_text(msg.get("content")))
         .filter(|text| !text.trim().is_empty())
         .take(CLASSIFIER_LOOKBACK_TURNS)
-        .map(|text| {
-            let user = head_bytes(text.trim(), CLASSIFIER_PROMPT_MAX_BYTES);
-            let room = CLASSIFIER_PROMPT_MAX_BYTES.saturating_sub(user.len() + 1);
-            let system = head_bytes(system, room).trim_end();
-            if system.is_empty() {
-                user.to_string()
-            } else {
-                format!("{system}\n{user}")
-            }
-        })
-        .collect()
+        .collect();
+    let newest = head_bytes(said.first()?.trim(), CLASSIFIER_PROMPT_MAX_BYTES);
+    let mut request = newest.to_string();
+    if newest.len() <= FOLLOW_UP_MAX_BYTES {
+        let earlier: Vec<&str> = said[1..]
+            .iter()
+            .map(|text| text.trim())
+            .filter(|text| !reading::is_pleasantry(&text.to_ascii_lowercase()))
+            .collect();
+        let followed = earlier
+            .iter()
+            .find(|text| text.len() >= FOLLOWED_MIN_BYTES)
+            .or(earlier.first());
+        if let Some(followed) = followed {
+            request.push_str("\n\n(This follows the person's earlier request: ");
+            request.push_str(head_bytes(followed, FOLLOWED_MAX_BYTES));
+            request.push(')');
+        }
+    }
+
+    let room = CLASSIFIER_PROMPT_MAX_BYTES.saturating_sub(request.len() + 1);
+    let system = head_bytes(system, room).trim_end();
+    Some(if system.is_empty() {
+        request
+    } else {
+        format!("{system}\n{request}")
+    })
 }
 
-/// Classify an `auto` request turn by turn, newest first, and return the first
-/// answer that names a topic.
-///
-/// A short follow-up such as "make it shorter" or "thanks" has no topic of its
-/// own and classifies as `general`, which on its own would move a coding
-/// conversation to a general model halfway through. So when the newest turn
-/// names nothing more specific than `general`, the turn before it decides,
-/// back to [`CLASSIFIER_LOOKBACK_TURNS`]. Those turns were classified when they
-/// were sent, so while the conversation is active this is usually a cache hit.
-/// If no turn names a topic, the newest turn's answer stands.
-///
-/// No tags at all is the classifier's failure shape. It ends the walk with
-/// `None` so the caller falls back to heuristics: a slow or broken classifier
-/// costs one timeout, never several.
-pub async fn classify_turns<F, Fut>(prompts: Vec<String>, mut classify: F) -> Option<Intent>
-where
-    F: FnMut(String) -> Fut,
-    Fut: std::future::Future<Output = Intent>,
-{
-    let mut newest: Option<Intent> = None;
-    for prompt in prompts {
-        let intent = classify(prompt).await;
-        if intent.tags.is_empty() {
-            break;
+/// What a classifier said about a request. Each part is `None` when its
+/// question went unanswered: the call failed or timed out, the brain's first
+/// token was not an answer label, or the question was not asked.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Classified {
+    pub difficulty: Option<u8>,
+    /// The topics, strongest first. `Some` and empty when the brain answered
+    /// and the request is about none of the tags on offer.
+    pub tags: Option<Vec<String>>,
+}
+
+impl Classified {
+    /// The intent to route on: the classifier's answer where it gave one, the
+    /// heuristics' where it did not. A classifier that is slow, down or
+    /// confused therefore costs nothing but its timeout: the request is read
+    /// as it would be with no classifier at all, never as easier than it is.
+    ///
+    /// The tags a request shows by itself, an image or its size, are the
+    /// heuristics' to give either way: the classifier is not asked about them.
+    pub fn settle(self, heuristics: Intent) -> Intent {
+        if self.difficulty.is_none() && self.tags.is_none() {
+            return heuristics;
         }
-        if intent.tags.iter().any(|t| t != GENERAL_TAG) {
-            return Some(intent);
+        let mut tags = match self.tags {
+            Some(tags) => tags,
+            None => heuristics.tags.clone(),
+        };
+        for tag in &heuristics.tags {
+            if TAGS_READ_FROM_THE_REQUEST.contains(&tag.as_str()) && !tags.contains(tag) {
+                tags.push(tag.clone());
+            }
         }
-        newest.get_or_insert(intent);
+        Intent {
+            tags,
+            difficulty: self.difficulty.unwrap_or(heuristics.difficulty),
+            source: IntentSource::Classifier,
+        }
     }
-    newest
 }
 
 /// A message's text: a string, or its text parts joined.
@@ -1944,6 +2288,38 @@ mod tests {
     }
 
     #[test]
+    fn small_talk_is_the_newest_message_alone() {
+        let chat = |turns: &[(&str, &str)]| {
+            let messages: Vec<serde_json::Value> = turns
+                .iter()
+                .map(|(role, content)| serde_json::json!({"role": role, "content": content}))
+                .collect();
+            serde_json::json!({"messages": messages})
+        };
+        assert!(is_small_talk(&chat(&[("user", "Helloo")])));
+        assert!(is_small_talk(&chat(&[
+            ("system", "You write Rust."),
+            ("user", "Why does this deadlock only under load?"),
+            (
+                "assistant",
+                "Because the two locks are taken in opposite orders."
+            ),
+            ("user", "thanks, that makes sense"),
+        ])));
+        // A greeting that opens a conversation is not what the next turn is.
+        assert!(!is_small_talk(&chat(&[
+            ("user", "hi"),
+            ("assistant", "Hello!"),
+            ("user", "Why does this deadlock only under load?"),
+        ])));
+        assert!(!is_small_talk(&chat(&[(
+            "user",
+            "thanks, now make it thread-safe"
+        )])));
+        assert!(!is_small_talk(&chat(&[("system", "hello")])));
+    }
+
+    #[test]
     fn heuristic_intent_detects_code_and_vision() {
         let body = serde_json::json!({
             "messages": [
@@ -2083,6 +2459,29 @@ mod tests {
     fn heuristic_difficulty_rises_on_long_context() {
         let body = serde_json::json!({ "messages": [{"role":"user","content":"summarize"}] });
         assert!(heuristic_intent(&body, 60_000).difficulty >= 2);
+    }
+
+    #[test]
+    fn heuristic_difficulty_is_moderate_for_a_long_prompt_that_shows_nothing_else() {
+        let body =
+            serde_json::json!({ "messages": [{"role":"user","content":"word ".repeat(1_700)}] });
+        assert_eq!(heuristic_intent(&body, 2_200).difficulty, 2);
+    }
+
+    #[test]
+    fn a_greeting_with_a_long_system_prompt_and_tools_is_still_simple() {
+        // What a chat client sends with every message: instructions and tool
+        // definitions, several thousand tokens of them, around one short turn.
+        let body = serde_json::json!({
+            "messages": [
+                {"role":"system","content":"You have tools. ".repeat(1_200)},
+                {"role":"user","content":"Helloo"},
+            ],
+            "tools": [{"type":"function","function":{"name":"run","description":"d".repeat(4_000)}}],
+        });
+        let intent = heuristic_intent(&body, 5_700);
+        assert_eq!(intent.difficulty, 1);
+        assert!(intent.tags.is_empty());
     }
 
     #[test]
@@ -2787,6 +3186,140 @@ mod tests {
         );
     }
 
+    fn right_sizing() -> RouterWeights {
+        RouterWeights {
+            difficulty_enabled: true,
+            right_size: true,
+            ..Default::default()
+        }
+    }
+
+    /// Three coding models, one a tier, where the strongest is also the
+    /// cheapest: on cost alone it would win every request.
+    fn ladder() -> Vec<Candidate> {
+        vec![
+            tiered("weak", 0.000_100, &[("coding", 1)]),
+            tiered("middling", 0.000_010, &[("coding", 2)]),
+            tiered("strong", 0.000_001, &[("coding", 3)]),
+        ]
+    }
+
+    fn right_sized(busy: &[(&str, usize)], difficulty: u8) -> route_explain::RouteExplain {
+        let busyness: HashMap<String, usize> =
+            busy.iter().map(|(m, n)| (m.to_string(), *n)).collect();
+        explain_selection(
+            &ladder(),
+            &RequestFeatures::default(),
+            &busyness,
+            &HashMap::new(),
+            None,
+            &["coding".to_string()],
+            BoonGrants::default(),
+            &right_sizing(),
+            0.0,
+            &intent_at(difficulty),
+        )
+    }
+
+    fn rejected_as<'a>(explain: &'a route_explain::RouteExplain, reason: &str) -> Vec<&'a str> {
+        explain
+            .rejected
+            .iter()
+            .filter(|r| r.reason == reason)
+            .flat_map(|r| r.models.iter().map(String::as_str))
+            .collect()
+    }
+
+    #[test]
+    fn without_right_sizing_an_easy_request_can_land_on_the_strongest_model() {
+        let desired = vec!["coding".to_string()];
+        let chosen = select_model(
+            &ladder(),
+            &RequestFeatures::default(),
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            &desired,
+            BoonGrants::default(),
+            &tiering_on(),
+            0.0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            chosen.model_name, "strong",
+            "the floor alone keeps every tier above it in the running"
+        );
+    }
+
+    #[test]
+    fn right_sizing_serves_each_difficulty_from_its_own_tier() {
+        for (difficulty, model) in [(1, "weak"), (2, "middling"), (3, "strong")] {
+            let explain = right_sized(&[], difficulty);
+            assert_self_consistent(&explain);
+            assert_eq!(
+                explain.chosen.as_deref(),
+                Some(model),
+                "difficulty {difficulty}"
+            );
+        }
+        let easy = right_sized(&[], 1);
+        assert_eq!(
+            rejected_as(&easy, "above_needed_tier"),
+            vec!["middling", "strong"]
+        );
+        assert!(rejected_as(&easy, "tier_full").is_empty());
+    }
+
+    #[test]
+    fn a_full_tier_spills_to_the_next_one_up() {
+        // The soft cap is 8 requests in flight for a model with no cap of its own.
+        let explain = right_sized(&[("weak", 8)], 1);
+        assert_self_consistent(&explain);
+        assert_eq!(explain.chosen.as_deref(), Some("middling"));
+        assert_eq!(rejected_as(&explain, "tier_full"), vec!["weak"]);
+        assert_eq!(rejected_as(&explain, "above_needed_tier"), vec!["strong"]);
+    }
+
+    #[test]
+    fn right_sizing_never_spills_below_the_floor() {
+        let explain = right_sized(&[("strong", 8)], 3);
+        assert_self_consistent(&explain);
+        assert_eq!(
+            explain.chosen.as_deref(),
+            Some("strong"),
+            "a hard request waits on the strong model, it does not drop a tier"
+        );
+        assert_eq!(
+            rejected_as(&explain, "below_tier_floor"),
+            vec!["weak", "middling"]
+        );
+    }
+
+    #[test]
+    fn when_every_tier_is_full_all_of_them_compete() {
+        let explain = right_sized(&[("weak", 8), ("middling", 8), ("strong", 8)], 1);
+        assert_self_consistent(&explain);
+        assert!(explain.chosen.is_some());
+        assert!(rejected_as(&explain, "tier_full").is_empty());
+        assert!(rejected_as(&explain, "above_needed_tier").is_empty());
+    }
+
+    #[test]
+    fn right_sizing_needs_the_difficulty_floor_to_be_on() {
+        let settings = crate::AutoRouterSettings {
+            right_size_enabled: true,
+            ..Default::default()
+        };
+        assert!(!RouterWeights::from_settings(&settings).right_size);
+        let settings = crate::AutoRouterSettings {
+            right_size_enabled: true,
+            difficulty_enabled: true,
+            ..Default::default()
+        };
+        assert!(RouterWeights::from_settings(&settings).right_size);
+    }
+
     #[test]
     fn tiering_disabled_ignores_difficulty_entirely() {
         let cands = vec![
@@ -3092,7 +3625,18 @@ mod tests {
                 k.uniform,
                 k.difficulty,
             );
-            assert_eq!(among, ex.scored.len(), "[{label}]");
+            assert_eq!(among.count, ex.scored.len(), "[{label}]");
+            // The runners-up are the best of the rest, the same either way.
+            assert_eq!(among, ex.among(), "[{label}]");
+            assert_eq!(
+                among.next.len(),
+                ex.scored.len().saturating_sub(1).min(RUNNERS_UP),
+                "[{label}]"
+            );
+            for next in &among.next {
+                assert_ne!(Some(&next.model), ex.chosen.as_ref(), "[{label}]");
+                assert!(next.gap >= 0.0, "[{label}]");
+            }
             assert_self_consistent(&ex);
             outcomes.push(ex.chosen);
         }
@@ -3101,6 +3645,35 @@ mod tests {
         assert!(
             outcomes.len() >= 3,
             "the matrix must actually move the pick around, else it proves nothing; got {outcomes:?}"
+        );
+    }
+
+    #[test]
+    fn the_runners_up_are_the_best_of_the_rest_with_their_distance() {
+        let scored = [("a", 0.9), ("b", 0.85), ("c", 0.5), ("d", 0.1)];
+        let among = |chosen| Among::of(scored.iter().copied(), chosen);
+        let names = |a: &Among| a.next.iter().map(|n| n.model.clone()).collect::<Vec<_>>();
+        // The head of the list was chosen: the next two follow it.
+        let head = among(Some(0));
+        assert_eq!(head.count, 4);
+        assert_eq!(names(&head), ["b", "c"]);
+        assert!((head.next[0].gap - 0.05).abs() < 1e-9);
+        assert!((head.next[1].gap - 0.4).abs() < 1e-9);
+        // The draw moved the pick down the list: the ones it passed over are
+        // still the best of the rest, and the distance is never negative.
+        let sampled = among(Some(2));
+        assert_eq!(names(&sampled), ["a", "b"]);
+        assert!((sampled.next[0].gap - 0.4).abs() < 1e-9);
+        let last = among(Some(3));
+        assert_eq!(names(&last), ["a", "b"]);
+        // One model, or none chosen: nothing to name.
+        assert!(Among::of([("a", 0.9)].into_iter(), Some(0)).next.is_empty());
+        assert_eq!(
+            among(None),
+            Among {
+                count: 4,
+                next: Vec::new()
+            }
         );
     }
 
@@ -3469,46 +4042,138 @@ mod tests {
     }
 
     #[test]
-    fn classifier_prompts_start_from_the_newest_user_turn() {
+    fn the_classifier_is_shown_the_newest_user_turn() {
         let body = serde_json::json!({
             "messages": [
                 {"role": "system", "content": "Be brief."},
                 {"role": "user", "content": "hello"},
                 {"role": "assistant", "content": "Hi! How can I help?"},
-                {"role": "user", "content": [{"type": "text", "text": "Write a Rust function"}]}
+                {"role": "user", "content": [{"type": "text", "text": "Write a Rust function that parses a config file, reports the line of the first error, and keeps going so that every error in the file is listed, with tests for a missing value, a duplicate key, an unterminated string and a section opened twice"}]}
             ]
         });
+        // A message this long says what it wants alone; and a greeting is
+        // never the request a message follows.
+        let prompt = classifier_prompt(&body, None).unwrap();
+        assert!(prompt.starts_with("Be brief.\nWrite a Rust function"));
+        assert!(!prompt.contains("earlier request"));
+    }
+
+    #[test]
+    fn a_short_message_is_shown_with_the_request_it_follows() {
+        let chat = |turns: &[&str]| {
+            let messages: Vec<serde_json::Value> = turns
+                .iter()
+                .enumerate()
+                .map(|(i, t)| serde_json::json!({"role": if i % 2 == 0 { "user" } else { "assistant" }, "content": t}))
+                .collect();
+            serde_json::json!({ "messages": messages })
+        };
         assert_eq!(
-            classifier_prompts(&body, None),
-            vec!["Be brief.\nWrite a Rust function", "Be brief.\nhello"]
+            classifier_prompt(
+                &chat(&[
+                    "Our Rust service deadlocks under load about once a day.",
+                    "Take the locks in one order.",
+                    "that didn't fix it, it still hangs"
+                ]),
+                None
+            )
+            .unwrap(),
+            "that didn't fix it, it still hangs\n\n(This follows the person's earlier request: Our Rust service deadlocks under load about once a day.)"
+        );
+        // "try again" does not say what the conversation is about, so the
+        // request before it is the one shown.
+        assert_eq!(
+            classifier_prompt(
+                &chat(&[
+                    "Write a Python function that reads a CSV.",
+                    "def read(path): ...",
+                    "try again",
+                    "def read(path): ...",
+                    "continue"
+                ]),
+                None
+            )
+            .unwrap(),
+            "continue\n\n(This follows the person's earlier request: Write a Python function that reads a CSV.)"
+        );
+        // A short earlier request is still the one followed when it is all there is.
+        assert_eq!(
+            classifier_prompt(&chat(&["Capital of Peru?", "Lima.", "and of Chile?"]), None)
+                .unwrap(),
+            "and of Chile?\n\n(This follows the person's earlier request: Capital of Peru?)"
+        );
+        // A thanks in between is not a request.
+        assert_eq!(
+            classifier_prompt(
+                &chat(&[
+                    "Write a Python function that reads a CSV.",
+                    "def read(path): ...",
+                    "thanks!",
+                    "You're welcome.",
+                    "now skip empty cells"
+                ]),
+                None
+            )
+            .unwrap(),
+            "now skip empty cells\n\n(This follows the person's earlier request: Write a Python function that reads a CSV.)"
+        );
+        // The first message of a conversation follows nothing.
+        assert_eq!(
+            classifier_prompt(&chat(&["continue"]), None).unwrap(),
+            "continue"
         );
     }
 
     #[test]
-    fn classifier_prompts_read_only_the_system_tail_the_client_names() {
+    fn the_request_a_message_follows_is_cut_to_its_share() {
+        let long = "x".repeat(5_000);
         let body = serde_json::json!({"messages": [
-            {"role": "system", "content": "Use the run_command tool to build code.\n\nYou help with poems."},
+            {"role": "user", "content": long},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "continue"}
+        ]});
+        let prompt = classifier_prompt(&body, None).unwrap();
+        assert!(prompt.starts_with("continue\n\n(This follows"));
+        assert!(prompt.len() < FOLLOWED_MAX_BYTES + 100);
+    }
+
+    #[test]
+    fn the_classifier_reads_only_the_system_tail_the_client_names() {
+        let body = serde_json::json!({"messages": [
+            {"role": "system", "content": "You are an agent with twelve coding tools.\nYou help with poems."},
             {"role": "user", "content": "brainstorm names for a bakery"}
         ]});
         assert_eq!(
-            classifier_prompts(&body, Some("You help with poems.".len())),
-            vec!["You help with poems.\nbrainstorm names for a bakery"]
+            classifier_prompt(&body, Some("You help with poems.".len())).unwrap(),
+            "You help with poems.\nbrainstorm names for a bakery"
         );
         assert_eq!(
-            classifier_prompts(&body, Some(0)),
-            vec!["brainstorm names for a bakery"]
+            classifier_prompt(&body, Some(0)).unwrap(),
+            "brainstorm names for a bakery"
         );
         // A tail longer than the system text reads all of it.
         assert_eq!(
-            classifier_prompts(&body, Some(10_000)),
-            classifier_prompts(&body, None)
+            classifier_prompt(&body, Some(10_000)),
+            classifier_prompt(&body, None)
         );
         // A cut inside a multi-byte character moves forward to its end.
         let body = serde_json::json!({"messages": [
             {"role": "system", "content": "tools ééé"},
-            {"role": "user", "content": "hi"}
+            {"role": "user", "content": "name it"}
         ]});
-        assert_eq!(classifier_prompts(&body, Some(5)), vec!["éé\nhi"]);
+        assert_eq!(classifier_prompt(&body, Some(5)).unwrap(), "éé\nname it");
+    }
+
+    #[test]
+    fn the_classifier_is_not_asked_about_small_talk() {
+        let body = serde_json::json!({"messages": [
+            {"role": "system", "content": "You help with poems."},
+            {"role": "user", "content": "write a villanelle about the tide"},
+            {"role": "assistant", "content": "Here it is."},
+            {"role": "user", "content": "thank you!"}
+        ]});
+        assert!(classifier_prompt(&body, None).is_none());
+        assert!(classifier_prompt(&serde_json::json!({"messages": []}), None).is_none());
     }
 
     #[test]
@@ -3520,7 +4185,7 @@ mod tests {
     }
 
     #[test]
-    fn classifier_prompts_skip_tool_results_and_turns_without_text() {
+    fn the_classifier_prompt_skips_tool_results_and_turns_without_text() {
         let body = serde_json::json!({
             "messages": [
                 {"role": "user", "content": "fix the failing build"},
@@ -3534,21 +4199,8 @@ mod tests {
             ]
         });
         assert_eq!(
-            classifier_prompts(&body, None),
-            vec!["fix the failing build"]
-        );
-    }
-
-    #[test]
-    fn classifier_prompts_look_back_a_bounded_number_of_turns() {
-        let messages: Vec<serde_json::Value> = (0..CLASSIFIER_LOOKBACK_TURNS + 2)
-            .map(|i| serde_json::json!({"role": "user", "content": format!("turn {i}")}))
-            .collect();
-        let prompts = classifier_prompts(&serde_json::json!({ "messages": messages }), None);
-        assert_eq!(prompts.len(), CLASSIFIER_LOOKBACK_TURNS);
-        assert_eq!(
-            prompts[0],
-            format!("turn {}", CLASSIFIER_LOOKBACK_TURNS + 1)
+            classifier_prompt(&body, None).unwrap(),
+            "fix the failing build"
         );
     }
 
@@ -3560,11 +4212,10 @@ mod tests {
                 {"role": "user", "content": "Write a Rust function that parses JSON"}
             ]
         });
-        let prompts = classifier_prompts(&body, None);
-        assert_eq!(prompts.len(), 1);
-        assert!(prompts[0].starts_with("You are a course assistant."));
-        assert!(prompts[0].ends_with("\nWrite a Rust function that parses JSON"));
-        assert!(prompts[0].len() <= CLASSIFIER_PROMPT_MAX_BYTES);
+        let prompt = classifier_prompt(&body, None).unwrap();
+        assert!(prompt.starts_with("You are a course assistant."));
+        assert!(prompt.ends_with("\nWrite a Rust function that parses JSON"));
+        assert!(prompt.len() <= CLASSIFIER_PROMPT_MAX_BYTES);
     }
 
     #[test]
@@ -3575,87 +4226,62 @@ mod tests {
                 {"role": "user", "content": "é".repeat(CLASSIFIER_PROMPT_MAX_BYTES)}
             ]
         });
-        let prompts = classifier_prompts(&body, None);
-        assert!(prompts[0].len() <= CLASSIFIER_PROMPT_MAX_BYTES);
-        assert!(
-            prompts[0].starts_with('é'),
-            "no room left for the system text"
-        );
+        let prompt = classifier_prompt(&body, None).unwrap();
+        assert!(prompt.len() <= CLASSIFIER_PROMPT_MAX_BYTES);
+        assert!(prompt.starts_with('é'), "no room left for the system text");
     }
 
-    fn classified(tags: &[&str], difficulty: u8) -> Intent {
+    fn read_by_rule(tags: &[&str], difficulty: u8) -> Intent {
         Intent {
             tags: tags.iter().map(|t| t.to_string()).collect(),
             difficulty,
-            source: IntentSource::Classifier,
+            source: IntentSource::Heuristic,
         }
     }
 
-    /// Run `classify_turns` over canned answers, one per turn, newest first.
-    /// Returns its result and how many turns it asked about.
-    fn walk(answers: &[Intent]) -> (Option<Intent>, usize) {
-        let prompts: Vec<String> = (0..answers.len()).map(|i| i.to_string()).collect();
-        let mut asked = 0;
-        let out = {
-            let fut = classify_turns(prompts, |p| {
-                asked += 1;
-                std::future::ready(answers[p.parse::<usize>().unwrap()].clone())
-            });
-            let mut fut = std::pin::pin!(fut);
-            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-            let std::task::Poll::Ready(out) = std::future::Future::poll(fut.as_mut(), &mut cx)
-            else {
-                panic!("ready answers cannot leave the walk pending");
-            };
-            out
-        };
-        (out, asked)
+    fn classified(difficulty: Option<u8>, tags: Option<&[&str]>) -> Classified {
+        Classified {
+            difficulty,
+            tags: tags.map(|tags| tags.iter().map(|t| t.to_string()).collect()),
+        }
     }
 
     #[test]
-    fn a_topic_on_the_newest_turn_decides_alone() {
-        let (out, asked) = walk(&[
-            classified(&["coding", "general"], 2),
-            classified(&["writing"], 1),
-        ]);
-        assert_eq!(out.unwrap().tags, vec!["coding", "general"]);
-        assert_eq!(asked, 1);
+    fn the_classifiers_answers_stand_where_it_gave_them() {
+        let intent = classified(Some(3), Some(&["math"])).settle(read_by_rule(&["coding"], 2));
+        assert_eq!(intent.tags, vec!["math"]);
+        assert_eq!(intent.difficulty, 3);
+        assert_eq!(intent.source, IntentSource::Classifier);
+
+        // An answer of "none of these topics" is an answer.
+        let intent = classified(Some(1), Some(&[])).settle(read_by_rule(&["coding"], 2));
+        assert!(intent.tags.is_empty());
+        assert_eq!(intent.difficulty, 1);
     }
 
     #[test]
-    fn a_follow_up_without_a_topic_keeps_the_conversation_s_topic() {
-        let (out, asked) = walk(&[classified(&["general"], 1), classified(&["coding"], 2)]);
-        let out = out.unwrap();
-        assert_eq!(out.tags, vec!["coding"]);
-        assert_eq!(out.difficulty, 2);
-        assert_eq!(asked, 2);
+    fn an_unanswered_question_is_the_heuristics_to_answer() {
+        // No difficulty answer: the request is not read as easy for that.
+        let intent = classified(None, Some(&["coding"])).settle(read_by_rule(&["coding"], 3));
+        assert_eq!(intent.difficulty, 3);
+        assert_eq!(intent.source, IntentSource::Classifier);
+
+        // No topic answer.
+        let intent = classified(Some(2), None).settle(read_by_rule(&["math"], 1));
+        assert_eq!(intent.tags, vec!["math"]);
+        assert_eq!(intent.difficulty, 2);
+
+        // No answer at all: the heuristics' reading, named as theirs.
+        let intent = Classified::default().settle(read_by_rule(&["writing"], 2));
+        assert_eq!(intent.tags, vec!["writing"]);
+        assert_eq!(intent.difficulty, 2);
+        assert_eq!(intent.source, IntentSource::Heuristic);
     }
 
     #[test]
-    fn with_no_topic_anywhere_the_newest_answer_stands() {
-        let (out, asked) = walk(&[
-            classified(&["general"], 1),
-            classified(&["general"], 2),
-            classified(&["general"], 3),
-        ]);
-        assert_eq!(out.unwrap().difficulty, 1);
-        assert_eq!(asked, 3);
-    }
-
-    #[test]
-    fn a_failed_classification_ends_the_walk() {
-        // Newest turn failed: heuristics take over, older turns are not asked.
-        let (out, asked) = walk(&[classified(&[], 1), classified(&["coding"], 2)]);
-        assert!(out.is_none());
-        assert_eq!(asked, 1);
-
-        // An older turn failed: the newest answer stands.
-        let (out, asked) = walk(&[
-            classified(&["general"], 1),
-            classified(&[], 1),
-            classified(&["coding"], 2),
-        ]);
-        assert_eq!(out.unwrap().tags, vec!["general"]);
-        assert_eq!(asked, 2);
+    fn what_the_request_itself_shows_is_kept_beside_the_classifiers_topics() {
+        let intent = classified(Some(2), Some(&["coding"]))
+            .settle(read_by_rule(&["vision", "math", "long-context"], 2));
+        assert_eq!(intent.tags, vec!["coding", "vision", "long-context"]);
     }
 }

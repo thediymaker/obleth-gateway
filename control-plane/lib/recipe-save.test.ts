@@ -28,6 +28,14 @@ describe("save as recipe", () => {
     expect(text).toContain("# First start downloads 352 GB");
   });
 
+  it("keeps an API key per replica when the launch had it on, and leaves the key out otherwise", () => {
+    const as = { name: "Saved", basedOn: recipe.id, clusterResolved: inputDefaults(recipe.header!.inputs, cv, 4) };
+    const keyed = savedRecipeText(source, setField(form, "serving.replica_api_key", true), as);
+    expect(parseRecipe("saved", keyed).header!.replica_api_key).toBe(true);
+    expect(buildDeployPreview(parseRecipe("saved", keyed))!.replicaApiKey).toBe(true);
+    expect(savedRecipeText(source, form, as)).not.toContain("replica_api_key");
+  });
+
   it("sets this node count's entry of a per-node default", () => {
     const src = "---\nname: t\nengine: vllm\nmodel_type: chat\napi_model_name: t\nport: 8000\ninputs:\n  - name: gb\n    type: number\n    default: 270\n    by_nodes: { \"1\": 270, \"4\": 20 }\n---\nrun {{gb}} --port $OBLETH_SERVING_PORT\n";
     const r = parseRecipe("t", src);

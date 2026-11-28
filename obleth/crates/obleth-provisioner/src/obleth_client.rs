@@ -82,23 +82,27 @@ pub trait OblethClient: Send + Sync {
     /// Every replica row across all models — used to reconcile orphans and drain
     /// models that have left the managed set.
     async fn list_all_replicas(&self) -> anyhow::Result<Vec<ReplicaView>>;
-    /// Record a new replica and where its job's output goes.
+    /// Record a new replica, where its job's output goes and the API key
+    /// its server was started with (if the deployment gives replicas one).
     async fn create_replica(
         &self,
         model_id: Uuid,
         slurm_job_id: &str,
         port_base: i64,
         log_path: Option<&str>,
+        api_key: Option<&str>,
     ) -> anyhow::Result<Uuid>;
     /// Apply one update to a replica row; an empty patch sends nothing.
     async fn patch_replica(&self, replica_id: Uuid, patch: &ReplicaPatch) -> anyhow::Result<()>;
     async fn delete_replica(&self, replica_id: Uuid) -> anyhow::Result<()>;
-    /// Register a live replica as a model endpoint; returns the endpoint id.
+    /// Register a live replica as a model endpoint, with the API key its
+    /// server requires (if any); returns the endpoint id.
     async fn create_endpoint(
         &self,
         model_id: Uuid,
         name: &str,
         api_base: &str,
+        api_key: Option<&str>,
     ) -> anyhow::Result<Uuid>;
     /// List this model's endpoints, including the gateway's health verdict for
     /// each (see `EndpointView` — the real-inference signal self-heal folds in).
@@ -240,6 +244,7 @@ fn replica_views_from_json(rows: &[serde_json::Value]) -> Vec<ReplicaView> {
             port: r.get("port").and_then(|x| x.as_i64()),
             nodes: text("nodes"),
             log_path: text("log_path"),
+            api_key: text("api_key"),
         });
     }
     out
@@ -472,8 +477,25 @@ impl OblethClient for HttpObleth {
     }
 
     async fn list_all_replicas(&self) -> anyhow::Result<Vec<ReplicaView>> {
-        let rows = self.get_array("/replicas").await?;
-        Ok(replica_views_from_json(&rows))
+        // The provisioner-facing list carries each replica's API key. A
+        // gateway from before that route existed (mid-upgrade) answers 404;
+        // its replicas have no keys, so the plain list is the same thing.
+        let resp = self
+            .req(reqwest::Method::GET, "/replicas/resolved")
+            .send()
+            .await?;
+        if matches!(
+            resp.status(),
+            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+        ) {
+            let rows = self.get_array("/replicas").await?;
+            return Ok(replica_views_from_json(&rows));
+        }
+        // Strict, as in `get_array`: an error must not read as "no replicas".
+        match resp.error_for_status()?.json().await? {
+            serde_json::Value::Array(rows) => Ok(replica_views_from_json(&rows)),
+            _ => anyhow::bail!("GET /replicas/resolved: expected an array"),
+        }
     }
 
     async fn delete_replica(&self, replica_id: Uuid) -> anyhow::Result<()> {
@@ -495,13 +517,18 @@ impl OblethClient for HttpObleth {
         model_id: Uuid,
         name: &str,
         api_base: &str,
+        api_key: Option<&str>,
     ) -> anyhow::Result<Uuid> {
+        let mut body = serde_json::json!({ "name": name, "api_base": api_base, "enabled": true });
+        if let Some(key) = api_key {
+            body["api_key"] = serde_json::json!(key);
+        }
         let v: serde_json::Value = self
             .req(
                 reqwest::Method::POST,
                 &format!("/models/{model_id}/endpoints"),
             )
-            .json(&serde_json::json!({ "name": name, "api_base": api_base, "enabled": true }))
+            .json(&body)
             .send()
             .await?
             .error_for_status()?
@@ -627,17 +654,22 @@ impl OblethClient for HttpObleth {
         slurm_job_id: &str,
         port_base: i64,
         log_path: Option<&str>,
+        api_key: Option<&str>,
     ) -> anyhow::Result<Uuid> {
+        let mut body = serde_json::json!({
+            "slurm_job_id": slurm_job_id,
+            "port_base": port_base,
+            "log_path": log_path,
+        });
+        if let Some(key) = api_key {
+            body["api_key"] = serde_json::json!(key);
+        }
         let v: serde_json::Value = self
             .req(
                 reqwest::Method::POST,
                 &format!("/models/{model_id}/replicas"),
             )
-            .json(&serde_json::json!({
-                "slurm_job_id": slurm_job_id,
-                "port_base": port_base,
-                "log_path": log_path,
-            }))
+            .json(&body)
             .send()
             .await?
             .error_for_status()?
@@ -952,6 +984,9 @@ pub struct MockObleth {
     pub replicas: std::sync::Mutex<Vec<ReplicaView>>,
     pub created_replicas: std::sync::Mutex<Vec<(Uuid, String, i64)>>, // (model_id, slurm_job_id, port_base)
     pub created_endpoints: std::sync::Mutex<Vec<(Uuid, String, String)>>, // (model_id, name, api_base)
+    /// The API key each created replica and endpoint was given, in order.
+    pub replica_keys: std::sync::Mutex<Vec<Option<String>>>,
+    pub endpoint_keys: std::sync::Mutex<Vec<Option<String>>>,
     pub deleted_endpoints: std::sync::Mutex<Vec<Uuid>>,
     pub updated_endpoints: std::sync::Mutex<Vec<(Uuid, String)>>, // (endpoint_id, new api_base)
     pub deleted_replicas: std::sync::Mutex<Vec<Uuid>>,
@@ -1024,6 +1059,7 @@ impl OblethClient for MockObleth {
         slurm_job_id: &str,
         port_base: i64,
         _log_path: Option<&str>,
+        api_key: Option<&str>,
     ) -> anyhow::Result<Uuid> {
         if self
             .fail_create_replica
@@ -1035,6 +1071,10 @@ impl OblethClient for MockObleth {
             .lock()
             .unwrap()
             .push((model_id, slurm_job_id.to_string(), port_base));
+        self.replica_keys
+            .lock()
+            .unwrap()
+            .push(api_key.map(str::to_string));
         Ok(Uuid::new_v4())
     }
     async fn patch_replica(&self, replica_id: Uuid, patch: &ReplicaPatch) -> anyhow::Result<()> {
@@ -1053,12 +1093,17 @@ impl OblethClient for MockObleth {
         model_id: Uuid,
         name: &str,
         api_base: &str,
+        api_key: Option<&str>,
     ) -> anyhow::Result<Uuid> {
         self.created_endpoints.lock().unwrap().push((
             model_id,
             name.to_string(),
             api_base.to_string(),
         ));
+        self.endpoint_keys
+            .lock()
+            .unwrap()
+            .push(api_key.map(str::to_string));
         Ok(Uuid::new_v4())
     }
     async fn list_endpoints(

@@ -32,6 +32,7 @@ export function RoutingSection({ settings, models, readiness }: { settings: Auto
   const [anthropic, setAnthropic] = useState(settings.messages_default_model ?? "");
   const [verdicts, setVerdicts] = useState(settings.verdicts_default_model ?? "");
   const [sticky, setSticky] = useState(settings.sticky_enabled);
+  const [rightSize, setRightSize] = useState(settings.right_size_enabled);
   const [advanced, setAdvanced] = useState(false);
   const profile = routerProfileOf(v);
   const set = <K extends keyof RouterValues>(k: K, value: RouterValues[K]) => setV((x) => ({ ...x, [k]: value }));
@@ -76,19 +77,20 @@ export function RoutingSection({ settings, models, readiness }: { settings: Auto
           </label>
         ))}
       </Setting>
-      <Setting id="set-classifier" label="Classifier" hint="A small model that reads each request and names its kind (coding, math…). Off, routing guesses from the text." fields={["routing.classifier_enabled", "routing.classifier_model", "routing.classifier_timeout_ms"]}>
+      <Setting id="set-classifier" label="Classifier" hint="A fast model that reads each request and says how hard it is and what it is about (coding, math…). It asks the default model for verdicts unless you pick another. Off, or with neither set, routing reads both from the text by rule." fields={["routing.classifier_enabled", "routing.classifier_model", "routing.classifier_timeout_ms"]}>
         <div className="flex flex-wrap items-center gap-2.5">
           <Switch name="routing.classifier_enabled" label="Use a classifier" checked={classifierOn} onChange={setClassifierOn} />
-          <div className="w-64"><SelectField name="routing.classifier_model" label="Classifier model" value={classifier} onChange={setClassifier} options={[{ value: "", label: "None" }, ...names.map((n) => ({ value: n, label: n }))]} /></div>
+          <div className="w-64"><SelectField name="routing.classifier_model" label="Classifier model" value={classifier} onChange={setClassifier} options={[{ value: "", label: verdicts ? `Verdicts default (${verdicts})` : "Verdicts default (none set)" }, ...names.map((n) => ({ value: n, label: n }))]} /></div>
           <span className="text-xs text-muted-foreground">gives up after</span>
           <TextField name="routing.classifier_timeout_ms" label="Classifier timeout" inputMode="numeric" defaultValue={settings.classifier_timeout_ms} mono className="w-24" />
           <span className="text-xs text-muted-foreground">ms</span>
         </div>
       </Setting>
-      <Setting id="set-difficulty" label="Hard questions" hint="Send harder questions to stronger models." fields={["routing.difficulty", "routing.tier_source"]}>
+      <Setting id="set-difficulty" label="Hard questions" hint="Send harder questions to stronger models. With the second switch on, easier questions also stay off the strong models: each request goes to the lowest tier that meets it and has room, and moves up a tier only when that one is full." fields={["routing.difficulty", "routing.tier_source", "routing.right_size"]}>
         <div className="flex flex-wrap items-center gap-2.5">
           <Switch name="routing.difficulty" label="Send hard questions to stronger models" checked={v.difficulty} onChange={(on) => set("difficulty", on)} />
           {v.difficulty && <div className="w-60"><SelectField label="How strength is judged" value={v.tier_source} onChange={(t) => set("tier_source", t as RouterValues["tier_source"])} options={TIERS} /></div>}
+          {v.difficulty && <Switch name="routing.right_size" label="Keep easier questions on smaller models" checked={rightSize} onChange={setRightSize} />}
         </div>
       </Setting>
       <Setting id="set-sticky" label="Conversations" hint="Keep each conversation on the model that answered it. Move up to a stronger model only when an answer goes wrong: the user says so, asks for a retry, or an agent's tools keep failing." fields={["routing.sticky"]}>

@@ -14,6 +14,7 @@ import type { ClusterResources } from "@/lib/obleth";
 import { inputDefault, inputSource, type ClusterValues, type RecipeInput } from "@/lib/recipe-inputs";
 import { cn } from "@/lib/utils";
 import { Segmented } from "@/components/ui/segmented";
+import { Switch } from "@/components/ui/switch";
 
 const SOURCE_LABEL: Record<Source, string> = { recipe: "Recipe", cluster: "Cluster default", learned: "Learned", changed: "Changed", default: "Slurm default" };
 
@@ -22,6 +23,14 @@ const input = "h-9 rounded-lg border border-input bg-background px-3 text-[13px]
 function SourceTag({ source, saved }: { source: Source; saved: boolean }) {
   const label = source === "recipe" && saved ? "Saved" : SOURCE_LABEL[source];
   return <span className={cn("whitespace-nowrap pt-2 text-right text-[11.5px]", source === "changed" ? "font-medium text-foreground" : source === "learned" ? "text-foreground underline decoration-dotted underline-offset-[3px]" : "text-muted-foreground")}>{label}</span>;
+}
+
+/** What an engine does with a replica's API key, for the launch form's hint. */
+export function replicaKeyNote(engine: string): string {
+  if (engine === "vllm" || engine === "llamacpp") return `${engineName(engine)} reads the key from the job's environment on its own.`;
+  if (engine === "sglang") return "SGLang takes the key as an argument, so it shows in the node's process list.";
+  if (engine === "ollama") return "Ollama has no API key to set, so its server would still answer without one.";
+  return "The job script must pass $OBLETH_REPLICA_API_KEY to the server.";
 }
 
 function Row({ label, hint, source, saved, problem, children }: { label: string; hint?: ReactNode; source?: Source; saved: boolean; problem?: string; children: ReactNode }) {
@@ -298,6 +307,9 @@ export function Configure(props: ConfigureProps) {
               </Row>
               <Row label="Health check" hint="The path obleth checks until the model answers. obleth passes each job a free port as $OBLETH_SERVING_PORT, and the server must listen on it." source={sourceOf("serving.health_path")} saved={saved} problem={problemAt("serving.health_path")}>
                 <input aria-label="Health path" value={form.serving.health_path} onChange={(e) => set("serving.health_path", e.target.value)} className={cn(input, "w-56 font-mono text-[12.5px]")} />
+              </Row>
+              <Row label="API key per replica" hint={<>obleth starts each job with a random API key of its own and sends it with every request, so the server answers obleth and nothing else that can reach its port. Leave it off where only obleth can reach the nodes. {replicaKeyNote(p.engine)}</>} source={sourceOf("serving.replica_api_key")} saved={saved}>
+                <Switch label="API key per replica" checked={form.serving.replica_api_key} onChange={(on) => set("serving.replica_api_key", on)} />
               </Row>
             </Section>
           </>

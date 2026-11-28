@@ -37,6 +37,9 @@ pub struct AutoRouterSettingsView {
     pub default_soft_cap: u32,
     pub temperature: f64,
     pub difficulty_enabled: bool,
+    /// With tiering on, serve each request from the lowest tier that meets
+    /// its difficulty and has room.
+    pub right_size_enabled: bool,
     /// `"hybrid" | "derived" | "declared"`.
     pub tier_source: String,
     /// Keep a conversation on the model that answered its last turn until
@@ -66,6 +69,7 @@ impl AutoRouterSettingsView {
             default_soft_cap: s.default_soft_cap,
             temperature: s.temperature,
             difficulty_enabled: s.difficulty_enabled,
+            right_size_enabled: s.right_size_enabled,
             tier_source: tier_source_as_str(s.tier_source).to_string(),
             sticky_enabled: s.sticky_enabled,
             messages_default_model: s.messages_default_model.clone(),
@@ -95,6 +99,8 @@ pub struct UpdateAutoRouterSettings {
     pub temperature: Option<f64>,
     #[serde(default)]
     pub difficulty_enabled: Option<bool>,
+    #[serde(default)]
+    pub right_size_enabled: Option<bool>,
     /// `"hybrid" | "derived" | "declared"`. Unrecognized or absent values
     /// leave the persisted `tier_source` untouched.
     #[serde(default)]
@@ -158,6 +164,9 @@ fn merge_auto_router(
         difficulty_enabled: body
             .difficulty_enabled
             .unwrap_or(existing.difficulty_enabled),
+        right_size_enabled: body
+            .right_size_enabled
+            .unwrap_or(existing.right_size_enabled),
         tier_source: body
             .tier_source
             .as_deref()
@@ -219,6 +228,7 @@ pub(crate) async fn put_auto_router_settings(
                 "default_soft_cap": settings.default_soft_cap,
                 "temperature": settings.temperature,
                 "difficulty_enabled": settings.difficulty_enabled,
+                "right_size_enabled": settings.right_size_enabled,
                 "tier_source": tier_source_as_str(settings.tier_source),
                 "messages_default_model": settings.messages_default_model,
                 "verdicts_default_model": settings.verdicts_default_model,
@@ -284,6 +294,8 @@ pub struct SimulateRouteRequest {
     pub temperature: Option<f64>,
     #[serde(default)]
     pub difficulty_enabled: Option<bool>,
+    #[serde(default)]
+    pub right_size_enabled: Option<bool>,
     /// Pretend this many requests are in flight per model. **Absent means the
     /// live fleet load**, which is what the gateway itself scores against —
     /// this field is a what-if override, not the default.
@@ -329,9 +341,9 @@ pub struct SimulateRouteRequest {
 ///
 /// Intent comes from `heuristic_intent` plus the optional `effort` override
 /// unless the body sets `classify: true`. Then the live classifier reads the
-/// same per-turn prompts the data plane builds ([`classifier_prompts`]), walks
-/// them the same way ([`classify_turns`]), and is offered the same tags, the
-/// candidates' tags under the tenant's allowlist. `tag_source` and
+/// same prompt the data plane builds ([`classifier_prompt`]), is offered the
+/// same tags, the candidates' tags under the tenant's allowlist, and what it
+/// leaves unanswered is the heuristics', as on the data plane. `tag_source` and
 /// `difficulty_source` say which one ran, so the dashboard never implies a
 /// classification that did not happen.
 ///
@@ -361,6 +373,7 @@ pub(crate) async fn simulate_route(
             default_soft_cap: body.default_soft_cap,
             temperature: body.temperature,
             difficulty_enabled: body.difficulty_enabled,
+            right_size_enabled: body.right_size_enabled,
             ..Default::default()
         },
     );
@@ -420,7 +433,7 @@ pub(crate) async fn simulate_route(
     features.needs_tool_choice |= body.needs_tool_choice;
     features.needs_response_schema |= body.needs_response_schema;
 
-    let mut intent = None;
+    let mut classified = Classified::default();
     if body.classify {
         if let Some(classify) = state.classify.as_ref() {
             let settings = state
@@ -445,18 +458,16 @@ pub(crate) async fn simulate_route(
                     }
                 }
                 if !menu.is_empty() {
-                    // `None` is the classifier's failure shape; heuristics take
-                    // over below, exactly as on the data plane.
-                    intent =
-                        classify_turns(classifier_prompts(&json, body.classify_system), |prompt| {
-                            classify(prompt, menu.clone())
-                        })
-                        .await;
+                    if let Some(prompt) = classifier_prompt(&json, body.classify_system) {
+                        classified = classify(prompt, menu).await;
+                    }
                 }
             }
         }
     }
-    let mut intent = intent.unwrap_or_else(|| heuristic_intent(&json, est_input_tokens));
+    // No answer is the classifier's failure shape; the heuristics take over,
+    // exactly as on the data plane.
+    let mut intent = classified.settle(heuristic_intent(&json, est_input_tokens));
     if let Some(difficulty) = difficulty_from_header(body.effort.as_deref()) {
         intent.difficulty = difficulty;
         intent.source = IntentSource::Header;

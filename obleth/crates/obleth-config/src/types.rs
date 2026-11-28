@@ -485,6 +485,15 @@ pub struct ManagedModelSpec {
     /// replacement serves. 0 turns the handoff off.
     #[serde(default = "default_handoff_mins")]
     pub handoff_mins: i64,
+    /// Start each replica with an API key of its own. The provisioner makes
+    /// a random key for every job and passes it in the job's environment as
+    /// `OBLETH_REPLICA_API_KEY` (and as `VLLM_API_KEY` and `LLAMA_API_KEY`,
+    /// which vLLM and llama.cpp read on their own), then registers the
+    /// replica's endpoint with that key, so the server answers the gateway
+    /// and nothing else that can reach its port. Off by default; replicas
+    /// already running keep the key, or the lack of one, they started with.
+    #[serde(default)]
+    pub replica_api_key: bool,
     /// Serialized launcher panel state (backend id + knob values + envelope) used to
     /// repopulate the dashboard edit view. Metadata only; does not affect provisioning.
     #[serde(default)]
@@ -556,6 +565,7 @@ impl Default for ManagedModelSpec {
             max_job_failures: 0,
             startup_timeout_mins: DEFAULT_STARTUP_TIMEOUT_MINS,
             handoff_mins: DEFAULT_HANDOFF_MINS,
+            replica_api_key: false,
             launcher_spec: None,
             last_provision_error: None,
             last_provision_error_at: None,

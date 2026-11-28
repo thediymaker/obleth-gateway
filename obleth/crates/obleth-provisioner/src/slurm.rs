@@ -669,7 +669,24 @@ pub fn job_submit_from_spec(
         mem_mb: spec.mem.as_deref().and_then(parse_mem_mb),
         log_output_dir: spec.log_output_dir.trim().to_string(),
         script,
+        api_key: None,
     }
+}
+
+/// The job environment variable that carries a replica's API key.
+pub const REPLICA_API_KEY_ENV: &str = "OBLETH_REPLICA_API_KEY";
+
+/// The same key under the names vLLM and llama.cpp read on their own, so
+/// their servers require it with no change to the job script.
+const ENGINE_API_KEY_ENVS: [&str; 2] = ["VLLM_API_KEY", "LLAMA_API_KEY"];
+
+/// A new random API key for one replica: two random UUIDs, as hex.
+pub fn new_replica_api_key() -> String {
+    format!(
+        "obl-replica-{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
 }
 
 fn non_empty(v: &Option<String>) -> Option<String> {
@@ -1036,6 +1053,9 @@ fn no_val(number: i64) -> serde_json::Value {
 /// `HUGGING_FACE_HUB_TOKEN` in the job `environment`, never in the script
 /// body, which Slurm keeps on disk and shows in `scontrol write batch_script`.
 ///
+/// A job with an `api_key` gets it the same way, as `OBLETH_REPLICA_API_KEY`
+/// and under the names vLLM and llama.cpp read.
+///
 /// Every field is a job_desc_msg field in v0.0.40 through v0.0.45. The script
 /// goes in `job.script` (the top-level `script` is deprecated). Optional
 /// fields are omitted when unset so they do not override cluster defaults.
@@ -1050,6 +1070,12 @@ pub fn submit_body(job: &JobSubmit, hf_token: &str) -> serde_json::Value {
     if !hf_token.is_empty() {
         environment.push(format!("HF_TOKEN={hf_token}"));
         environment.push(format!("HUGGING_FACE_HUB_TOKEN={hf_token}"));
+    }
+    if let Some(key) = job.api_key.as_deref().filter(|k| !k.is_empty()) {
+        environment.push(format!("{REPLICA_API_KEY_ENV}={key}"));
+        for name in ENGINE_API_KEY_ENVS {
+            environment.push(format!("{name}={key}"));
+        }
     }
     let cwd = job_working_dir(job);
     let mut spec = serde_json::json!({
@@ -2001,6 +2027,44 @@ mod tests {
             .iter()
             .any(|e| e.starts_with("HF_TOKEN=") || e.starts_with("HUGGING_FACE_HUB_TOKEN=")));
         assert!(env.iter().any(|e| e.starts_with("PATH=")));
+    }
+
+    #[test]
+    fn submit_body_carries_a_replica_key_in_the_environment_only() {
+        let environment = |job: &JobSubmit| -> Vec<String> {
+            submit_body(job, "")["job"]["environment"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect()
+        };
+        let mut job = job_submit_from_spec(&spec(), "nemotron", "obleth-", 8000, 8);
+        // No key unless the job was given one.
+        assert!(!environment(&job).iter().any(|e| e.contains("API_KEY")));
+
+        let key = new_replica_api_key();
+        job.api_key = Some(key.clone());
+        let env = environment(&job);
+        // Under obleth's own name, and under the names vLLM and llama.cpp
+        // read, so those servers require the key with no script change.
+        for name in ["OBLETH_REPLICA_API_KEY", "VLLM_API_KEY", "LLAMA_API_KEY"] {
+            assert!(env.contains(&format!("{name}={key}")), "{name} in {env:?}");
+        }
+        let body = submit_body(&job, "");
+        assert!(
+            !body["job"]["script"].as_str().unwrap().contains(&key),
+            "the key must not be written into the script"
+        );
+    }
+
+    #[test]
+    fn replica_keys_are_long_and_never_repeat() {
+        let (a, b) = (new_replica_api_key(), new_replica_api_key());
+        assert_ne!(a, b);
+        assert!(a.starts_with("obl-replica-") && a.len() == "obl-replica-".len() + 64);
+        // Plain enough for an environment value and an HTTP header.
+        assert!(a.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
     }
 
     #[test]

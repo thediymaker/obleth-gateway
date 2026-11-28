@@ -99,6 +99,10 @@ pub struct JobSubmit {
     pub log_output_dir: String,
     /// Shell script the job runs (the container command, image and <launch_command>).
     pub script: String,
+    /// The API key the job's server is to require, for a deployment that
+    /// gives each replica one. Passed in the job's environment, never in the
+    /// script.
+    pub api_key: Option<String>,
 }
 
 /// A replica row's state, as the provisioner reads and writes it. The
@@ -182,6 +186,9 @@ pub struct ReplicaView {
     pub nodes: Option<String>,
     /// Where the job's output goes, when known.
     pub log_path: Option<String>,
+    /// The API key the replica's server was started with, if any. Sent on
+    /// the model-list probe and the warmup, and registered on its endpoint.
+    pub api_key: Option<String>,
 }
 
 impl ReplicaView {

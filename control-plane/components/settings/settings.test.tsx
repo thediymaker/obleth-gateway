@@ -121,6 +121,17 @@ describe("the Settings page", () => {
     expect(saved().get("routing.difficulty")).toBeNull();
   });
 
+  it("keeps easier questions on smaller models, where hard ones go to stronger", async () => {
+    // The fixture's router has difficulty on; the second switch is only offered then.
+    await render(<SettingsPage data={settingsData()} />);
+    await act(async () => host.querySelector<HTMLInputElement>('input[name="routing.right_size"]')!.click());
+    await frame();
+    await act(async () => button("Save changes").click());
+    expect(saved().get("sections")).toBe("routing");
+    expect(saved().get("routing.right_size")).toBe("on");
+    expect(saved().get("routing.difficulty")).toBe("on");
+  });
+
   it("turns on staying with a model for the conversation", async () => {
     await render(<SettingsPage data={settingsData()} />);
     await act(async () => host.querySelector<HTMLInputElement>('input[name="routing.sticky"]')!.click());

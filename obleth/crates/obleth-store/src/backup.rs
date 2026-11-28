@@ -730,9 +730,9 @@ impl Store {
                      qos, time_limit, cpus_per_task, mem, image, preamble, log_output_dir,
                      launch_command, script_body, serving_port, health_path, target_replicas,
                      min_replicas, max_job_failures, launcher_spec, startup_timeout_mins,
-                     handoff_mins, created_at)
+                     handoff_mins, created_at, replica_api_key)
                  values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
-                         $20,$21,$22,$23,$24,$25,$26)
+                         $20,$21,$22,$23,$24,$25,$26,$27)
                  on conflict (model_id) do update set
                     enabled = excluded.enabled, partition = excluded.partition,
                     gres = excluded.gres, nodes = excluded.nodes,
@@ -749,7 +749,8 @@ impl Store {
                     max_job_failures = excluded.max_job_failures,
                     launcher_spec = excluded.launcher_spec,
                     startup_timeout_mins = excluded.startup_timeout_mins,
-                    handoff_mins = excluded.handoff_mins, updated_at = now()
+                    handoff_mins = excluded.handoff_mins,
+                    replica_api_key = excluded.replica_api_key, updated_at = now()
                  returning (xmax = 0) as inserted",
             )
             .bind(m.model_id)
@@ -778,6 +779,7 @@ impl Store {
             .bind(m.startup_timeout_mins.max(0))
             .bind(m.handoff_mins.max(0))
             .bind(m.created_at)
+            .bind(m.replica_api_key)
             .fetch_one(&mut *tx)
             .await
             .map_err(restore_db_error)?;
@@ -1216,6 +1218,7 @@ mod tests {
                 launcher_spec: None,
                 startup_timeout_mins: 45,
                 handoff_mins: 10,
+                replica_api_key: true,
             })
             .await
             .expect("upsert managed");
@@ -1259,6 +1262,7 @@ mod tests {
         assert_eq!(managed.target_replicas, 2);
         assert_eq!(managed.startup_timeout_mins, 45);
         assert_eq!(managed.handoff_mins, 10);
+        assert!(managed.replica_api_key);
         assert!(data.recipes.iter().any(|r| r.id == recipe.id));
         assert!(data.model_endpoints.iter().any(|e| e.id == endpoint.id));
         assert!(

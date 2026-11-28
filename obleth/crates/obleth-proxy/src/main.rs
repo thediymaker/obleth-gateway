@@ -767,7 +767,9 @@ async fn main() -> anyhow::Result<()> {
             move |prompt: String, tags: Vec<String>| {
                 let st = st.clone();
                 Box::pin(async move { proxy::classify_for_simulate(&st, prompt, tags).await })
-                    as std::pin::Pin<Box<dyn std::future::Future<Output = router::Intent> + Send>>
+                    as std::pin::Pin<
+                        Box<dyn std::future::Future<Output = router::Classified> + Send>,
+                    >
             }
         })),
         capacity_discovery: capacity_discovery.clone(),

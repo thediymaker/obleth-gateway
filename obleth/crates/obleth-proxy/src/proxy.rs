@@ -881,7 +881,8 @@ async fn run_pipeline(
         // which asks for `Narration::Off` and builds no rejection/score data —
         // that is the whole cost story for this feature: zero by default.
         // `among`: how many models the pick was made among (those scored), for
-        // `x-obleth-auto-why`.
+        // `x-obleth-auto-why`, and the best of them that were not chosen, for
+        // `x-obleth-auto-next`.
         let (picked, among) = if let Some(ref mut t) = tracer {
             let (picked, mut explain) = crate::router::route(
                 pool,
@@ -896,7 +897,7 @@ async fn run_pipeline(
                 &intent,
             );
             explain.classifier_ms = classifier_ms;
-            let among = explain.scored.len();
+            let among = explain.among();
             let mut span = serde_json::to_value(&explain).unwrap_or_else(|_| {
                 serde_json::json!({
                     "chosen": explain.chosen,
@@ -965,7 +966,8 @@ async fn run_pipeline(
                 *auto_note = Some(crate::sticky::Note {
                     model: chosen.model_name.clone(),
                     reason,
-                    why: crate::sticky::why(&intent, &features, among),
+                    why: crate::sticky::why(&intent, &features, among.count),
+                    next: among.next,
                 });
                 model = chosen.model_name.clone();
                 // Candidates are real models only, never variants.
@@ -3350,11 +3352,12 @@ pub(crate) fn union_candidate_tags(
     out
 }
 
-/// Routing intent for an `auto` request. Precedence: explicit header, then the
-/// classifier brain (when enabled, configured, resolvable, and not itself
-/// `auto`), then cheap heuristics, then a neutral default. Every fallback
-/// lowers difficulty rather than raising it, so a slow or broken brain makes
-/// routing cheaper and never silently more expensive.
+/// Routing intent for an `auto` request. An explicit effort header sets the
+/// difficulty. Otherwise the classifier brain is asked (when enabled,
+/// configured, resolvable, and not itself `auto`), and the heuristics answer
+/// whatever it did not: all of it when the brain is off, slow or down, and
+/// small talk always. A slow or broken brain therefore costs its timeout and
+/// nothing else: the request is read as it would be with no classifier.
 // Each argument is one independent input to the routing decision.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn derive_intent(
@@ -3367,36 +3370,24 @@ pub(crate) async fn derive_intent(
     classify_system: Option<usize>,
     skip_classifier: bool,
 ) -> crate::router::Intent {
-    let forced = crate::router::difficulty_from_header(effort_header);
-
+    let mut classified = crate::router::Classified::default();
     if !skip_classifier && settings.classifier_active() && !available_tags.is_empty() {
-        if let Some(name) = settings.classifier_model.as_deref() {
+        if let Some(name) = settings.classifier_brain() {
             if name != crate::router::AUTO_MODEL_NAME {
-                if let Some(brain) = resolve_model(state, name).await {
-                    let brain = &brain;
-                    let prompts = crate::router::classifier_prompts(json, classify_system);
-                    let classified = crate::router::classify_turns(prompts, |prompt| async move {
-                        state
+                if let Some(prompt) = crate::router::classifier_prompt(json, classify_system) {
+                    if let Some(brain) = resolve_model(state, name).await {
+                        classified = state
                             .classifier
-                            .classify(&state.http, brain, &prompt, available_tags)
-                            .await
-                    })
-                    .await;
-                    if let Some(mut intent) = classified {
-                        if let Some(d) = forced {
-                            intent.difficulty = d;
-                            intent.source = crate::router::IntentSource::Header;
-                        }
-                        return intent;
+                            .classify(&state.http, &brain, &prompt, available_tags)
+                            .await;
                     }
                 }
             }
         }
     }
 
-    // Heuristic fallback (also used when the classifier is off or returns empty).
-    let mut intent = crate::router::heuristic_intent(json, est_input_tokens);
-    if let Some(d) = forced {
+    let mut intent = classified.settle(crate::router::heuristic_intent(json, est_input_tokens));
+    if let Some(d) = crate::router::difficulty_from_header(effort_header) {
         intent.difficulty = d;
         intent.source = crate::router::IntentSource::Header;
     }
@@ -3422,31 +3413,28 @@ fn message_text(content: Option<&serde_json::Value>) -> String {
 
 /// Bridge for the admin simulate endpoint: run the live intent classifier
 /// exactly as `derive_intent` would — same brain resolution, same shared
-/// cache, same timeout — on an already-built prompt and tag menu. Returns
-/// `Intent::default()` (empty tags) when the classifier is off, unconfigured,
-/// or unresolvable, which is the same "no signal, fall back to heuristics"
-/// shape the data plane reads.
+/// cache, same timeout — on an already-built prompt and tag menu. Returns no
+/// answer when the classifier is off, unconfigured, or unresolvable, which is
+/// what the data plane settles from the heuristics.
 pub async fn classify_for_simulate(
     state: &AppState,
     prompt: String,
     available_tags: Vec<String>,
-) -> crate::router::Intent {
+) -> crate::router::Classified {
     let settings = state.classifier.settings();
+    let none = crate::router::Classified::default();
     if !settings.classifier_active() || available_tags.is_empty() {
-        return crate::router::Intent::default();
+        return none;
     }
-    let Some(name) = settings.classifier_model.as_deref() else {
-        return crate::router::Intent::default();
+    let Some(name) = settings.classifier_brain() else {
+        return none;
     };
-    if name == crate::router::AUTO_MODEL_NAME {
-        return crate::router::Intent::default();
+    if name == crate::router::AUTO_MODEL_NAME || prompt.trim().is_empty() {
+        return none;
     }
     let Some(brain) = resolve_model(state, name).await else {
-        return crate::router::Intent::default();
+        return none;
     };
-    if prompt.trim().is_empty() {
-        return crate::router::Intent::default();
-    }
     state
         .classifier
         .classify(&state.http, &brain, &prompt, &available_tags)

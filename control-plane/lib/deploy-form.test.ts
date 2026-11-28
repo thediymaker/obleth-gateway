@@ -65,6 +65,22 @@ describe("the deploy form", () => {
     expect(back.form).toEqual(f);
   });
 
+  it("offers an API key per replica: off unless the recipe or the launch turns it on", () => {
+    expect(base.serving.replica_api_key).toBe(false);
+    expect(toOverrides(base).replica_api_key).toBe(false);
+    expect(baselineForm("nemotron", { ...p, replicaApiKey: true }, cv).serving.replica_api_key).toBe(true);
+    const on = setField(base, "serving.replica_api_key", true);
+    expect(changedPaths(on, base)).toEqual(["serving.replica_api_key"]);
+    expect(toOverrides(on).replica_api_key).toBe(true);
+    // In the YAML view it is a boolean, written only when it differs from the recipe.
+    expect(formToYaml(base, base)).not.toContain("replica_api_key");
+    const text = formToYaml(on, base);
+    expect(text).toContain("replica_api_key: true");
+    expect(yamlToForm(text, base, ["offload_gb", "mtp"]).form).toEqual(on);
+    const bad = yamlToForm("serving:\n  replica_api_key: sometimes\n", base, ["offload_gb", "mtp"]);
+    expect(bad.problems).toEqual([{ line: 2, message: "replica_api_key should be true or false" }]);
+  });
+
   it("points at the line of an unknown key or bad value", () => {
     const res = yamlToForm("recipe: nemotron\nslurm:\n  nodes: many\ninputs:\n  context: 1\n", base, ["offload_gb", "mtp"]);
     expect(res.form).toBeNull();

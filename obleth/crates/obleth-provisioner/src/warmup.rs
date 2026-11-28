@@ -34,24 +34,30 @@ pub async fn warm_up(
     api_base: &str,
     budget: Duration,
 ) -> anyhow::Result<()> {
-    warm_up_preferring(http, api_base, &[], budget).await
+    warm_up_preferring(http, api_base, &[], budget, None).await
 }
 
 /// [`warm_up`], warming the listed model whose id is one of `prefer` (the
 /// model the replica was launched for) when the server lists several.
+/// `api_key` is the replica's own API key, sent as a bearer token on both
+/// requests when it has one.
 pub async fn warm_up_preferring(
     http: &reqwest::Client,
     api_base: &str,
     prefer: &[String],
     budget: Duration,
+    api_key: Option<&str>,
 ) -> anyhow::Result<()> {
+    let with_key = |request: reqwest::RequestBuilder| match api_key {
+        Some(key) => request.bearer_auth(key),
+        None => request,
+    };
     let base = api_base.trim_end_matches('/');
 
     // 1. Discover the served model id. Inference servers expose exactly the
     //    model(s) they are serving here; we warm the first one.
     let models_url = format!("{base}/models");
-    let models: serde_json::Value = http
-        .get(&models_url)
+    let models: serde_json::Value = with_key(http.get(&models_url))
         .timeout(budget)
         .send()
         .await
@@ -85,7 +91,7 @@ pub async fn warm_up_preferring(
         "temperature": 0,
         "stream": false,
     });
-    http.post(&chat_url)
+    with_key(http.post(&chat_url))
         .timeout(budget)
         .json(&body)
         .send()
@@ -205,6 +211,46 @@ mod tests {
             !hits.iter().any(|p| p.ends_with("/chat/completions")),
             "must not fire a completion when discovery failed; got {hits:?}"
         );
+    }
+
+    /// A replica started with an API key is warmed with it: both requests
+    /// carry the key as a bearer token.
+    #[tokio::test]
+    async fn warm_up_sends_the_replicas_key() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_task = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let seen = seen_task.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..n]).to_lowercase();
+                    seen.lock()
+                        .unwrap()
+                        .push(head.contains("authorization: bearer k1"));
+                    let json = r#"{"data":[{"id":"served-model"}]}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
+                        json.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        let http = reqwest::Client::new();
+        warm_up_preferring(
+            &http,
+            &format!("http://{addr}/v1"),
+            &[],
+            Duration::from_secs(5),
+            Some("k1"),
+        )
+        .await
+        .expect("warmup with a key");
+        assert_eq!(*seen.lock().unwrap(), vec![true, true]);
     }
 
     #[tokio::test]

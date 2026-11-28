@@ -1308,12 +1308,11 @@ async fn cascade(
                     let vocab: Vec<String> =
                         s.category_gates.iter().map(|g| g.tag.clone()).collect();
                     let prompt = last_user_text(&plan.messages);
-                    let intent = req
+                    tags = req
                         .state
                         .classifier
-                        .classify(&req.state.http, &brain, &prompt, &vocab)
+                        .categories(&req.state.http, &brain, &prompt, &vocab)
                         .await;
-                    tags = intent.tags;
                 }
                 _ => {
                     tracing::warn!(

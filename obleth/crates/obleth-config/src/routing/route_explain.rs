@@ -97,4 +97,6 @@ pub struct WeightsView {
     pub tag: f64,
     pub soft_cap: f64,
     pub difficulty_enabled: bool,
+    /// Requests are served from the lowest tier that meets them.
+    pub right_size: bool,
 }

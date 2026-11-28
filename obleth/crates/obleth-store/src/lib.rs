@@ -134,6 +134,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     migration!("0047_batch_item_indexes"),
     migration!("0048_schema_tidy"),
     migration!("0049_knowledge_document_bytes"),
+    migration!("0050_replica_api_key"),
 ];
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`

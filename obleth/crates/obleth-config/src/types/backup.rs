@@ -110,6 +110,8 @@ pub struct ManagedModelBackup {
     #[serde(default = "default_handoff_mins")]
     pub handoff_mins: i64,
     #[serde(default)]
+    pub replica_api_key: bool,
+    #[serde(default)]
     #[schema(value_type = Option<Object>)]
     pub launcher_spec: Option<serde_json::Value>,
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -142,6 +144,7 @@ impl From<&ManagedModelSpec> for ManagedModelBackup {
             max_job_failures: m.max_job_failures,
             startup_timeout_mins: m.startup_timeout_mins,
             handoff_mins: m.handoff_mins,
+            replica_api_key: m.replica_api_key,
             launcher_spec: m.launcher_spec.clone(),
             created_at: m.created_at,
         }
